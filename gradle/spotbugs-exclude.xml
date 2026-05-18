@@ -559,6 +559,15 @@ For a detailed description of spotbugs bug categories, see https://spotbugs.read
     </Match>
 
     <Match>
+        <!-- HttpServlet extends Serializable, but Kafka's embedded Jetty never serializes servlet instances.
+             KafkaHttpServlet keeps non-Serializable collaborators (KafkaHttpBridge, ObjectMapper) as regular
+             instance fields rather than transient ones, because the alternative (transient) would just trade
+             SE_BAD_FIELD for SE_TRANSIENT_FIELD_NOT_RESTORED. -->
+        <Class name="org.apache.kafka.network.http.KafkaHttpServlet"/>
+        <Bug pattern="SE_BAD_FIELD"/>
+    </Match>
+
+    <Match>
         <!-- Suppress warning about SING_SINGLETON_HAS_NONPRIVATE_CONSTRUCTOR in multiple class -->
         <Or>
             <Class name="org.apache.kafka.common.Node"/>

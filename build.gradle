@@ -982,12 +982,20 @@ project(':server') {
     implementation libs.jacksonDatabind
     implementation libs.metrics
     implementation libs.slf4jApi
+    // HTTP bridge: embedded Jetty inside the broker for the /v1/topics/* endpoints.
+    implementation (libs.jettyServer) {
+      exclude module: 'slf4j-api'
+    }
+    implementation (libs.jettyServlet) {
+      exclude module: 'slf4j-api'
+    }
 
     testImplementation project(':clients').sourceSets.test.output
 
     testImplementation libs.mockitoCore
     testImplementation libs.junitJupiter
     testImplementation testLog4j2Libs
+    testImplementation libs.jettyClient
 
     testRuntimeOnly runtimeTestLibs
   }
