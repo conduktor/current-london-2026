@@ -806,6 +806,13 @@ class KafkaApis(val requestChannel: RequestChannel,
         }
       }
 
+      // Reserved-form rejections are already INVALID_TOPIC_EXCEPTION entries
+      // that bypassed replicaManager — they're not in physicalResponseStatus,
+      // so the acks=0 close-on-error decision below must observe them
+      // separately, otherwise a tenant producing only reserved-form names
+      // with acks=0 would get a silent no-op instead of a connection close.
+      if (invalidLogicalTopicResponses.nonEmpty) errorInResponse = true
+
       // OUT rewrite — only the response map keys (TopicPartitions) carry
       // names; the PartitionResponse values are shared by reference, so the
       // currentLeader info set above is preserved on the rekeyed entries.

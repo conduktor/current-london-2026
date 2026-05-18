@@ -11832,6 +11832,38 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testProduceTenantRejectsReservedPhysicalFormLogicalNameWithAcksZeroClosesConnection(): Unit = {
+    // acks=0 path: reserved-form rejections are emitted into invalidLogicalTopicResponses,
+    // a side channel that bypasses replicaManager and therefore is absent from
+    // physicalResponseStatus. Without an explicit signal the standard ack=0
+    // "errors → close" branch falls through to sendNoOpResponseExemptThrottle
+    // and the client never learns its produce was refused — silent data loss.
+    // The acks=0 close-on-error decision must observe these rejections too.
+    val produceRequest = buildSingleTopicProduceRequest("acme.orders", acks = 0.toShort)
+    val request = buildRequest(
+      produceRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), any[Long])).thenReturn(0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    kafkaApis = createKafkaApis(
+      authorizer = None,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    verify(requestChannel).closeConnection(
+      ArgumentMatchers.eq(request),
+      any[java.util.Map[Errors, Integer]]())
+    verify(requestChannel, never()).sendResponse(any(), any(), any())
+    verify(replicaManager, never()).handleProduceAppend(
+      anyLong, anyShort, anyBoolean(), any(), any(), any(), any(), any(), any(), any())
+  }
+
+  @Test
   def testCreateTopicsTenantRejectsReservedPhysicalFormLogicalName(): Unit = {
     // CreateTopics is the loudest auto-pollution vector — the controller would
     // happily materialise "acme.acme.orders" for tenant acme. The broker must
