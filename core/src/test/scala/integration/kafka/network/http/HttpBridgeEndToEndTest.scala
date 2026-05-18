@@ -143,6 +143,143 @@ class HttpBridgeEndToEndTest {
   }
 
   @Test
+  def sseStreamsPostedRecordsAcrossReplayAndLiveBoundary(): Unit = {
+    // PROMPT.md AC6 / FS6: a real-broker check that the SSE endpoint streams the historical backlog AND continues
+    // to deliver new records produced after the consumer is already attached, without a reconnect. We attach the SSE
+    // consumer first, then post two records (so they show up in "replay" mode for the consumer's offset=0 starting
+    // point), wait for those to land on the wire, then post a third record AFTER the consumer has consumed the first
+    // two — and assert the third arrives on the same socket. That third arrival is the "no reconnect transition"
+    // contract: replay-phase and live-phase are the same connection.
+    val cluster = new KafkaClusterTestKit.Builder(
+      new TestKitNodes.Builder()
+        .setNumBrokerNodes(1)
+        .setNumControllerNodes(1)
+        .build())
+      .setConfigProp(SocketServerConfigs.HTTP_BRIDGE_ENABLED_CONFIG, "true")
+      .setConfigProp(SocketServerConfigs.HTTP_BRIDGE_HOST_CONFIG, "127.0.0.1")
+      .setConfigProp(SocketServerConfigs.HTTP_BRIDGE_PORT_CONFIG, "0")
+      .build()
+    val topicName = "http-bridge-sse"
+    try {
+      cluster.format()
+      cluster.startup()
+      cluster.waitForReadyBrokers()
+
+      val broker = cluster.brokers().get(0)
+      TestUtils.waitUntilTrue(() => broker.brokerState == BrokerState.RUNNING, "Broker never reached RUNNING.")
+      TestUtils.waitUntilTrue(() => broker.httpBridgeServer != null && broker.httpBridgeServer.boundPort() > 0,
+        "HTTP bridge never bound its port.")
+      val bridgePort = broker.httpBridgeServer.boundPort()
+
+      createTopic(cluster, topicName, partitions = 1)
+
+      // Seed two records BEFORE the SSE consumer connects — these will be the replay-phase backlog.
+      val seedBody =
+        s"""
+           |{
+           |  "records": [
+           |    { "partition": 0, "value": { "type": "STRING", "data": "replay-1" } },
+           |    { "partition": 0, "value": { "type": "STRING", "data": "replay-2" } }
+           |  ]
+           |}
+           |""".stripMargin
+      val seedResp = postJson(s"http://127.0.0.1:$bridgePort/v1/topics/$topicName/records", seedBody)
+      assertEquals(200, seedResp.statusCode(),
+        s"seed produce must succeed before opening the SSE stream, body=${seedResp.body()}")
+
+      // Open the SSE stream. Use HttpURLConnection because the JDK HttpClient buffers small responses too aggressively
+      // for a streaming assertion — raw connection gives us byte-by-byte control over what's on the socket.
+      val url = new java.net.URL(
+        s"http://127.0.0.1:$bridgePort/v1/topics/$topicName/records?partition=0&from=earliest")
+      val conn = url.openConnection().asInstanceOf[java.net.HttpURLConnection]
+      conn.setRequestMethod("GET")
+      conn.setRequestProperty("Accept", "text/event-stream")
+      conn.setConnectTimeout(5000)
+      conn.setReadTimeout(15000)
+      conn.connect()
+      assertEquals(200, conn.getResponseCode)
+      val contentType = conn.getHeaderField("Content-Type")
+      assertTrue(contentType.startsWith("text/event-stream"),
+        s"expected text/event-stream content-type, got: $contentType")
+
+      val reader = new java.io.BufferedReader(
+        new java.io.InputStreamReader(conn.getInputStream, java.nio.charset.StandardCharsets.UTF_8))
+      try {
+        val replayed = readSseEvents(reader, expected = 2)
+        // Replay-phase: both seeded records arrived in order. We extract the value.data field, which the bridge encoded
+        // via ValueSerializer.encode → STRING envelope (the UTF-8-valid branch).
+        assertEquals(Seq("replay-1", "replay-2"),
+          replayed.map(_.data.get("value").get("data").asText()),
+          "replay phase must deliver the seeded records in order")
+        // Each event's `id:` carries the broker-assigned offset; first two are 0 and 1.
+        assertEquals(Seq("0", "1"), replayed.map(_.id.getOrElse("")),
+          "every replay-phase event must carry the broker's offset as `id:` so Last-Event-ID can resume the stream")
+
+        // Now post a third record AFTER the consumer has already received the backlog — this is the live-tail event.
+        val liveBody =
+          s"""
+             |{
+             |  "records": [
+             |    { "partition": 0, "value": { "type": "STRING", "data": "live-3" } }
+             |  ]
+             |}
+             |""".stripMargin
+        val liveResp = postJson(s"http://127.0.0.1:$bridgePort/v1/topics/$topicName/records", liveBody)
+        assertEquals(200, liveResp.statusCode(),
+          s"live-phase produce must succeed while SSE consumer is attached, body=${liveResp.body()}")
+
+        val live = readSseEvents(reader, expected = 1)
+        assertEquals(Seq("live-3"), live.map(_.data.get("value").get("data").asText()),
+          "live phase must deliver the record produced after the consumer connected — no reconnection")
+        // Offset on the live record matches what the broker actually assigned (third record on this partition → 2).
+        assertEquals(2L, live.head.data.get("offset").asLong(),
+          "live-phase record's offset must be the broker's actual assignment, not a fabricated one")
+        // The reconnect contract: ids form a strictly monotonic sequence (0, 1, 2) across replay→live with no gaps. A
+        // client that disconnected after id=1 can resume with Last-Event-ID: 1 and pick up cleanly at id=2.
+        val allIds = (replayed ++ live).flatMap(_.id).map(_.toLong)
+        assertEquals(Seq(0L, 1L, 2L), allIds,
+          "ids must be strictly monotonic with no gaps across the replay→live boundary — Last-Event-ID contract")
+      } finally {
+        reader.close()
+        conn.disconnect()
+      }
+    } finally {
+      cluster.close()
+    }
+  }
+
+  /** A single parsed SSE event: the optional `id:` line and the JSON `data:` payload. */
+  private case class SseEvent(id: Option[String], data: JsonNode)
+
+  /**
+   * Pulls `expected` SSE events off the reader. The bridge writes each event as `id: N\ndata: {json}\n\n`; we
+   * accumulate `id:` and `data:` lines and emit an event whenever we hit the blank-line frame terminator. `:`-comments
+   * (the connect prelude) and unknown framing lines are skipped.
+   */
+  private def readSseEvents(reader: java.io.BufferedReader, expected: Int): Seq[SseEvent] = {
+    val out = scala.collection.mutable.ArrayBuffer.empty[SseEvent]
+    var pendingId: Option[String] = None
+    var pendingData: Option[String] = None
+    while (out.size < expected) {
+      val line = reader.readLine()
+      if (line == null) {
+        throw new java.io.EOFException(s"SSE stream closed after ${out.size}/$expected events")
+      }
+      if (line.isEmpty) {
+        pendingData.foreach { d => out += SseEvent(pendingId, mapper.readTree(d)) }
+        pendingId = None
+        pendingData = None
+      } else if (line.startsWith("id: ")) {
+        pendingId = Some(line.substring(4))
+      } else if (line.startsWith("data: ")) {
+        pendingData = Some(line.substring(6))
+      }
+      // `event:` and `:`-comments are skipped — they're framing, not payload.
+    }
+    out.toSeq
+  }
+
+  @Test
   def multiPartitionMixedResultReturns207(): Unit = {
     // Spec scenario FS1 (PROMPT.md:42): a POST that targets 3 partitions where one fails returns HTTP 207 with a
     // body listing each partition's outcome. We trigger the failure by writing to a partition that doesn't exist on
