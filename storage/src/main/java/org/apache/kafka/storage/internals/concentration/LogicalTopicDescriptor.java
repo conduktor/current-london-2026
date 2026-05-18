@@ -16,6 +16,8 @@
  */
 package org.apache.kafka.storage.internals.concentration;
 
+import org.apache.kafka.common.internals.Topic;
+
 import java.util.Objects;
 
 /**
@@ -36,6 +38,29 @@ public record LogicalTopicDescriptor(
         }
         if (backingTopic.isBlank()) {
             throw new IllegalArgumentException("backingTopic must not be blank");
+        }
+        // Enforce the same name rules stock Kafka applies on CreateTopics: length, allowed chars,
+        // reserved names. Without this an operator could declare "logical:foo" (invalid char) or a
+        // 300-character name, and the protocol layer would then reject every produce/fetch with a
+        // confusing INVALID_TOPIC_EXCEPTION at request time instead of at declare time.
+        Topic.validate(logicalName, "logicalName", message -> {
+            throw new IllegalArgumentException(message);
+        });
+        Topic.validate(backingTopic, "backingTopic", message -> {
+            throw new IllegalArgumentException(message);
+        });
+        // Reject declarations that would shadow internal topics. The METADATA path stamps
+        // isInternal=false on synthesized logical responses (KafkaApis.scala), so a logical
+        // declaration named "__consumer_offsets" would surface to clients as a normal topic and
+        // mis-route group coordinator traffic. Same reasoning for the backing topic — concentration
+        // is for application data, not for piling tenant payload onto coordinator state.
+        if (Topic.isInternal(logicalName)) {
+            throw new IllegalArgumentException(
+                "logicalName must not shadow a Kafka internal topic; received '" + logicalName + "'");
+        }
+        if (Topic.isInternal(backingTopic)) {
+            throw new IllegalArgumentException(
+                "backingTopic must not be a Kafka internal topic; received '" + backingTopic + "'");
         }
         if (logicalName.equals(backingTopic)) {
             throw new IllegalArgumentException(

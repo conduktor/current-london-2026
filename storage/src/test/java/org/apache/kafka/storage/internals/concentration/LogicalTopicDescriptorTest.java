@@ -98,6 +98,43 @@ public class LogicalTopicDescriptorTest {
     }
 
     @Test
+    public void rejectsLogicalNameShadowingInternalTopics() {
+        // METADATA synthesis stamps isInternal=false for logical topics, so a logical declaration
+        // named "__consumer_offsets" would route group-coordinator traffic into the kernel — fail
+        // the declaration at startup instead of producing a runtime shadowing bug.
+        assertThrows(IllegalArgumentException.class,
+            () -> new LogicalTopicDescriptor("__consumer_offsets", 1000, "backing", 4));
+        assertThrows(IllegalArgumentException.class,
+            () -> new LogicalTopicDescriptor("__transaction_state", 1000, "backing", 4));
+        assertThrows(IllegalArgumentException.class,
+            () -> new LogicalTopicDescriptor("__share_group_state", 1000, "backing", 4));
+    }
+
+    @Test
+    public void rejectsBackingTopicEqualToInternalTopic() {
+        // Concentration is for application data; piling tenant payload onto a coordinator state
+        // topic would corrupt cluster operation. Fail loudly at declare.
+        assertThrows(IllegalArgumentException.class,
+            () -> new LogicalTopicDescriptor("orders", 1000, "__consumer_offsets", 4));
+    }
+
+    @Test
+    public void rejectsInvalidTopicNameCharacters() {
+        // Match stock CreateTopics name validation — fail at declare, not on every produce.
+        assertThrows(IllegalArgumentException.class,
+            () -> new LogicalTopicDescriptor("orders:foo", 1000, "backing", 4));
+        assertThrows(IllegalArgumentException.class,
+            () -> new LogicalTopicDescriptor("orders", 1000, "backing/x", 4));
+    }
+
+    @Test
+    public void rejectsOverLongTopicName() {
+        String longName = "a".repeat(250);
+        assertThrows(IllegalArgumentException.class,
+            () -> new LogicalTopicDescriptor(longName, 1000, "backing", 4));
+    }
+
+    @Test
     public void equalityIsValueBased() {
         LogicalTopicDescriptor a = new LogicalTopicDescriptor("orders", 1000, "backing", 4);
         LogicalTopicDescriptor b = new LogicalTopicDescriptor("orders", 1000, "backing", 4);
