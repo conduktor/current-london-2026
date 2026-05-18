@@ -12330,4 +12330,103 @@ class KafkaApisTest extends Logging {
       "privileged caller on tenant listener must be refused on non-v1 APIs without ever reaching the handler")
   }
 
+  @Test
+  def testInitProducerIdTenantAllowsIdempotentProducer(): Unit = {
+    // Modern Java producers default to enable.idempotence=true and call
+    // InitProducerId at start-up with transactionalId=null to obtain a
+    // producer id + epoch. Refusing this on tenant-bound listeners would
+    // break stock clients — the v1 scope explicitly carries idempotent
+    // producers, only transactions are excluded.
+    val initRequest = new InitProducerIdRequest.Builder(new InitProducerIdRequestData()
+      .setTransactionalId(null)
+      .setTransactionTimeoutMs(TimeUnit.MINUTES.toMillis(1).toInt)
+      .setProducerId(RecordBatch.NO_PRODUCER_ID)
+      .setProducerEpoch(RecordBatch.NO_PRODUCER_EPOCH))
+      .build()
+    val request = buildRequest(initRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    val responseCallback: ArgumentCaptor[InitProducerIdResult => Unit] =
+      ArgumentCaptor.forClass(classOf[InitProducerIdResult => Unit])
+    val requestLocal = RequestLocal.withThreadConfinedCaching
+    when(txnCoordinator.handleInitProducerId(
+      ArgumentMatchers.eq(null.asInstanceOf[String]),
+      anyInt(),
+      ArgumentMatchers.eq(Option.empty),
+      responseCallback.capture(),
+      ArgumentMatchers.eq(requestLocal)
+    )).thenAnswer(_ => responseCallback.getValue.apply(InitProducerIdResult(42L, 0.toShort, Errors.NONE)))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleInitProducerIdRequest(request, requestLocal)
+
+    val response = verifyNoThrottling[InitProducerIdResponse](request)
+    assertEquals(Errors.NONE.code, response.data.errorCode,
+      "idempotent InitProducerId from a tenant principal must succeed")
+    assertEquals(42L, response.data.producerId)
+    verify(txnCoordinator).handleInitProducerId(
+      ArgumentMatchers.eq(null.asInstanceOf[String]),
+      anyInt(),
+      ArgumentMatchers.eq(Option.empty),
+      any[InitProducerIdResult => Unit](),
+      ArgumentMatchers.eq(requestLocal))
+  }
+
+  @Test
+  def testInitProducerIdTenantRejectsTransactionalProducer(): Unit = {
+    // Transactions are deliberately out of v1 scope: the __transaction_state
+    // log is shared across tenants, so accepting a tenant-scoped
+    // transactionalId would let acme and beta name-collide on the same
+    // coordinator record. Refuse the transactional path with the standard
+    // TRANSACTIONAL_ID_AUTHORIZATION_FAILED so clients fall back cleanly,
+    // and never reach the txn coordinator.
+    val initRequest = new InitProducerIdRequest.Builder(new InitProducerIdRequestData()
+      .setTransactionalId("my-txn")
+      .setTransactionTimeoutMs(TimeUnit.MINUTES.toMillis(1).toInt)
+      .setProducerId(RecordBatch.NO_PRODUCER_ID)
+      .setProducerEpoch(RecordBatch.NO_PRODUCER_EPOCH))
+      .build()
+    val request = buildRequest(initRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleInitProducerIdRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[InitProducerIdResponse](request)
+    assertEquals(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.code, response.data.errorCode,
+      "transactional InitProducerId from a tenant must be refused before reaching the coordinator")
+    verify(txnCoordinator, never()).handleInitProducerId(
+      any[String](), anyInt(), any[Option[ProducerIdAndEpoch]](),
+      any[InitProducerIdResult => Unit](), any[RequestLocal]())
+  }
+
+  @Test
+  def testInitProducerIdPrivilegedCallerOnTenantBoundListenerIsRefused(): Unit = {
+    // The standing trap: a super-user without a `__tenant_` prefix lands on
+    // the tenant-bound listener. Without the unsafe-context guard the broker
+    // would happily allocate a producer id under the listener's tenant
+    // binding, letting that caller produce into acme's topics afterwards.
+    val initRequest = new InitProducerIdRequest.Builder(new InitProducerIdRequestData()
+      .setTransactionalId(null)
+      .setTransactionTimeoutMs(TimeUnit.MINUTES.toMillis(1).toInt)
+      .setProducerId(RecordBatch.NO_PRODUCER_ID)
+      .setProducerEpoch(RecordBatch.NO_PRODUCER_EPOCH))
+      .build()
+    val request = buildRequest(initRequest,
+      listenerName = TENANT_LISTENER,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "Alice")) // no tenant prefix
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleInitProducerIdRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[InitProducerIdResponse](request)
+    assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED.code, response.data.errorCode,
+      "privileged caller on a tenant listener must be refused at the InitProducerId guard")
+    verify(txnCoordinator, never()).handleInitProducerId(
+      any[String](), anyInt(), any[Option[ProducerIdAndEpoch]](),
+      any[InitProducerIdResult => Unit](), any[RequestLocal]())
+  }
+
 }

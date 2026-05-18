@@ -2231,6 +2231,26 @@ class KafkaApis(val requestChannel: RequestChannel,
     val initProducerIdRequest = request.body[InitProducerIdRequest]
     val transactionalId = initProducerIdRequest.data.transactionalId
 
+    // Tenant-scope guard. INIT_PRODUCER_ID is admitted into TENANT_ALLOWED_APIS
+    // so that the default idempotent producer (transactionalId == null) can
+    // bootstrap, but transactions are explicitly out of v1 scope. Refuse the
+    // transactional path early — before the request reaches the txn
+    // coordinator, which would otherwise persist a tenant-scoped txn record
+    // into the shared __transaction_state log under a logical id chosen by
+    // the tenant.
+    val tenantCtx = tenantContextFor(request)
+    if (tenantCtx.isUnsafe) {
+      val err =
+        if (transactionalId != null) Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED
+        else Errors.CLUSTER_AUTHORIZATION_FAILED
+      requestHelper.sendErrorResponseMaybeThrottle(request, err.exception)
+      return
+    }
+    if (tenantCtx.effectiveTenant.isPresent && transactionalId != null) {
+      requestHelper.sendErrorResponseMaybeThrottle(request, Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.exception)
+      return
+    }
+
     if (transactionalId != null) {
       if (!authHelper.authorize(request.context, WRITE, TRANSACTIONAL_ID, transactionalId)) {
         requestHelper.sendErrorResponseMaybeThrottle(request, Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.exception)
@@ -4210,6 +4230,12 @@ object KafkaApis {
   // handler leak physical names or pollute another tenant's namespace.
   // SASL_HANDSHAKE / SASL_AUTHENTICATE / API_VERSIONS happen during connection
   // setup before a tenant identity is meaningful and must remain reachable.
+  // INIT_PRODUCER_ID is admitted because modern Java producers default to
+  // idempotent mode (enable.idempotence=true) and call InitProducerId at
+  // start-up with a null transactionalId — refusing it here would make a
+  // stock producer unable to bootstrap. The transactional path is still
+  // blocked inside handleInitProducerIdRequest (transactionalId != null)
+  // because v1 explicitly excludes transactions for tenants.
   // Note: ListTopics is the all-topics variant of Metadata and is covered by
   // ApiKeys.METADATA.
   private[server] val TENANT_ALLOWED_APIS: Set[ApiKeys] = Set(
@@ -4218,6 +4244,7 @@ object KafkaApis {
     ApiKeys.METADATA,
     ApiKeys.CREATE_TOPICS,
     ApiKeys.DELETE_TOPICS,
+    ApiKeys.INIT_PRODUCER_ID,
     ApiKeys.SASL_HANDSHAKE,
     ApiKeys.SASL_AUTHENTICATE,
     ApiKeys.API_VERSIONS
