@@ -7,9 +7,10 @@ branch toward the feature described in `PROMPT.md`.
 
 | Layer | Status | Lives in |
 |---|---|---|
-| Pure-Java concentration kernel | **Done.** Built TDD-first, 83 tests green. | `storage/src/main/java/org/apache/kafka/storage/internals/concentration/` |
-| `ConcentrationKernel` facade (single broker-facing surface) | **Done.** 17 facade tests. | `storage/src/main/java/.../concentration/ConcentrationKernel.java` |
+| Pure-Java concentration kernel | **Done.** Built TDD-first, 91 tests green. | `storage/src/main/java/org/apache/kafka/storage/internals/concentration/` |
+| `ConcentrationKernel` facade (single broker-facing surface) | **Done.** 21 facade tests. | `storage/src/main/java/.../concentration/ConcentrationKernel.java` |
 | Kernel-level integration tests | **Done.** Six PROMPT scenarios covered. | `storage/src/test/java/.../concentration/ConcentrationKernelIntegrationTest.java` |
+| Production-readiness audit fixes | **Done.** Four blocking findings closed: facade-vs-close race, descriptorsFor immutability, sidecar-constructor FD leak, unbounded growth (added `removeLogicalPartition`). | — |
 | Broker glue (produce/fetch/admin/DeleteRecords hooks) | **Not started.** Kernel facade ready; seam map below. | — |
 | End-to-end test with a real broker | **Not started.** Depends on broker glue. | — |
 | Audit fleet (Codex + Gemini) per PROMPT §"After every major phase" | **Partially.** In-fleet sub-agents have audited the kernel twice; Codex/Gemini are unreachable from this CLI environment and that limitation is recorded in commit bodies rather than fabricated. | — |
@@ -69,6 +70,12 @@ ConcentrationKernel          facade — single broker-facing surface, lifecycle-
   IOException or RuntimeException from sidecar.append, the tracker reservation is rolled back
   before the exception is rethrown. Honours the "no offset gaps" invariant at the boundary
   where the broker meets the kernel.
+- **Bounded growth via `removeLogicalPartition`.** Both `ConcentrationKernel.sidecars` and
+  `LogicalOffsetTracker.states` only grow over the broker's lifetime without an explicit
+  teardown API. `ConcentrationKernel.removeLogicalPartition(topic, partition)` closes the
+  sidecar handle, drops the tracker state (under its partition lock so any in-flight
+  reservation has finished by then), and deletes the on-disk sidecar file. Caller contract:
+  the broker must have stopped serving the partition first.
 
 ### PROMPT functional scenarios → tests
 
@@ -168,7 +175,7 @@ JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 \
   ./gradlew :storage:test --tests 'org.apache.kafka.storage.internals.concentration.*'
 ```
 
-83 tests, all green at HEAD.
+91 tests, all green at HEAD.
 
 ## File layout
 
@@ -188,10 +195,10 @@ storage/src/main/java/org/apache/kafka/storage/internals/concentration/
 storage/src/test/java/org/apache/kafka/storage/internals/concentration/
 ├── BackingScanRecovererTest.java               (7 tests)
 ├── ConcentrationKernelIntegrationTest.java     (6 tests — PROMPT scenarios)
-├── ConcentrationKernelTest.java               (17 tests — facade contract)
-├── LogicalOffsetTrackerTest.java              (15 tests)
+├── ConcentrationKernelTest.java               (21 tests — facade contract)
+├── LogicalOffsetTrackerTest.java              (18 tests)
 ├── LogicalPartitionMapperTest.java             (5 tests)
-├── LogicalSidecarIndexTest.java               (13 tests)
+├── LogicalSidecarIndexTest.java               (14 tests)
 ├── LogicalTopicDescriptorTest.java            (10 tests)
 └── LogicalTopicRegistryTest.java              (10 tests)
 ```
@@ -199,11 +206,22 @@ storage/src/test/java/org/apache/kafka/storage/internals/concentration/
 ## Production-readiness honest assessment
 
 The kernel itself is production-shape: thread-safe, lifecycle-managed, fail-loud on corruption,
-no swallowed exceptions, no per-append fsync, dense O(1) sidecar lookup. It has been audited
-twice by an in-fleet sub-agent; the audit fixes that landed include `volatile` on the tracker's
-lock-free reader fields, a file-descriptor leak fix in the recovery path, and a swap from
-`RuntimeException("CorruptIndexException")` to the actual `org.apache.kafka.storage.internals.log.CorruptIndexException`
-type (the local Kafka idiom).
+no swallowed exceptions, no per-append fsync, dense O(1) sidecar lookup, bounded growth.
+It has been audited three times by in-fleet sub-agents. Audit fixes landed so far:
+
+- `volatile` on the tracker's lock-free reader fields (initial audit)
+- File-descriptor leak fix in `BackingScanRecoverer.recoverFromScan` (initial audit)
+- Swap from `RuntimeException("CorruptIndexException")` to the actual
+  `org.apache.kafka.storage.internals.log.CorruptIndexException` type (initial audit)
+- Race between `sidecarFor()`'s slow-path insert and `close()`'s iterate-and-clear, fixed via
+  double-checked locking on the kernel monitor (second audit)
+- `descriptorsFor` immutability via `List.copyOf` rather than a leaky `Collection` view
+  (second audit)
+- `LogicalSidecarIndex` constructor FD leak when `CorruptIndexException` or `readEntryAt`
+  throws after `new RandomAccessFile`, fixed with try/close/rethrow + addSuppressed (third
+  audit; regression-pinned by `constructorFailureReleasesFileDescriptor` hammering 2000x)
+- Unbounded growth of the `sidecars` and `states` maps, fixed with
+  `ConcentrationKernel.removeLogicalPartition` (third audit)
 
 What the kernel does **not** yet give you is an end-to-end broker that stock clients can
 produce to. That work — wiring per the seam map above — is multi-week per PROMPT's own
