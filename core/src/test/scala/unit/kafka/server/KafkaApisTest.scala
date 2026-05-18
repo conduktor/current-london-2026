@@ -758,6 +758,143 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testCreateTopicsShadowReturnsAuthFailedForUnauthorizedNames(): Unit = {
+    // r15 BLOCKER N1: the shadow-rejection short-circuit must not bypass the controller's
+    // CreateTopics authorization. A caller without CREATE on the cluster nor CREATE on the
+    // colliding topic must receive TOPIC_AUTHORIZATION_FAILED — not TOPIC_ALREADY_EXISTS —
+    // otherwise the shadow path leaks the declared-logical-topic set to unauthenticated
+    // clients (info disclosure) and silently flips the controller's auth verdict (ACL bypass).
+    when(concentrationKernel.allDeclaredLogicalTopicNames())
+      .thenReturn(Set("orders", "events").asJava)
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
+
+    val authorizer: Authorizer = mock(classOf[Authorizer])
+    // DENY everything: no CLUSTER#CREATE, no TOPIC#CREATE for "orders" or "events".
+    when(authorizer.authorize(any[RequestContext], any[util.List[Action]]))
+      .thenAnswer { invocation =>
+        invocation.getArgument(1).asInstanceOf[util.List[Action]].asScala
+          .map(_ => AuthorizationResult.DENIED).asJava
+      }
+
+    val requestData = new CreateTopicsRequestData()
+    requestData.topics().add(new CreatableTopic().setName("orders").setNumPartitions(1).setReplicationFactor(1.toShort))
+    requestData.topics().add(new CreatableTopic().setName("events").setNumPartitions(1).setReplicationFactor(1.toShort))
+    val request = buildRequest(new CreateTopicsRequest.Builder(requestData).build())
+
+    kafkaApis = createKafkaApis(authorizer = Some(authorizer))
+    kafkaApis.handle(request, RequestLocal.withThreadConfinedCaching)
+
+    // Every requested name collides AND is unauthorized — no forward.
+    verify(forwardingManager, never).forwardRequest(
+      any[RequestChannel.Request](),
+      any[Option[AbstractResponse] => Unit]()
+    )
+    verify(forwardingManager, never).forwardRequest(
+      any[RequestChannel.Request](),
+      any[AbstractRequest](),
+      any[Option[AbstractResponse] => Unit]()
+    )
+
+    val response = verifyNoThrottling[CreateTopicsResponse](request)
+    val byName = response.data.topics().iterator().asScala.map(t => t.name() -> t.errorCode()).toMap
+    assertEquals(2, byName.size)
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED.code, byName("orders"),
+      "unauthorized colliding name must surface as AUTH_FAILED (not ALREADY_EXISTS) to avoid leaking the declared set")
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED.code, byName("events"))
+  }
+
+  @Test
+  def testCreateTopicsShadowMixesAuthFailedAndAlreadyExistsAndForwardsRemainder(): Unit = {
+    // r15 BLOCKER N1: mixed scenario — three requested topics:
+    //   - "orders" (logical, caller has TOPIC#CREATE)        => TOPIC_ALREADY_EXISTS
+    //   - "events" (logical, caller LACKS TOPIC#CREATE)      => TOPIC_AUTHORIZATION_FAILED
+    //   - "items"  (non-shadowed, forwarded to controller)   => controller verdict (NONE here)
+    when(concentrationKernel.allDeclaredLogicalTopicNames())
+      .thenReturn(Set("orders", "events").asJava)
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
+
+    val authorizer: Authorizer = mock(classOf[Authorizer])
+    when(authorizer.authorize(any[RequestContext], any[util.List[Action]]))
+      .thenAnswer { invocation =>
+        invocation.getArgument(1).asInstanceOf[util.List[Action]].asScala.map { action =>
+          // CLUSTER#CREATE denied; TOPIC#CREATE allowed for "orders" only.
+          if (action.resourcePattern().resourceType() == ResourceType.CLUSTER) AuthorizationResult.DENIED
+          else if (action.resourcePattern().name() == "orders") AuthorizationResult.ALLOWED
+          else AuthorizationResult.DENIED
+        }.asJava
+      }
+
+    val requestData = new CreateTopicsRequestData()
+    requestData.topics().add(new CreatableTopic().setName("orders").setNumPartitions(1).setReplicationFactor(1.toShort))
+    requestData.topics().add(new CreatableTopic().setName("events").setNumPartitions(1).setReplicationFactor(1.toShort))
+    requestData.topics().add(new CreatableTopic().setName("items").setNumPartitions(1).setReplicationFactor(1.toShort))
+    val request = buildRequest(new CreateTopicsRequest.Builder(requestData).build())
+
+    kafkaApis = createKafkaApis(authorizer = Some(authorizer))
+    val forwardedBody: ArgumentCaptor[AbstractRequest] = ArgumentCaptor.forClass(classOf[AbstractRequest])
+    val forwardCallback: ArgumentCaptor[Option[AbstractResponse] => Unit] =
+      ArgumentCaptor.forClass(classOf[Option[AbstractResponse] => Unit])
+
+    kafkaApis.handle(request, RequestLocal.withThreadConfinedCaching)
+
+    verify(forwardingManager).forwardRequest(
+      ArgumentMatchers.eq(request),
+      forwardedBody.capture(),
+      forwardCallback.capture()
+    )
+
+    // Only the non-shadowed name is forwarded; the controller does its own auth.
+    val forwarded = forwardedBody.getValue.asInstanceOf[CreateTopicsRequest]
+    val forwardedNames = forwarded.data.topics().iterator().asScala.map(_.name()).toSet
+    assertEquals(Set("items"), forwardedNames)
+
+    val controllerResponseData = new CreateTopicsResponseData()
+    controllerResponseData.topics().add(new CreatableTopicResult().setName("items").setErrorCode(Errors.NONE.code))
+    forwardCallback.getValue.apply(Some(new CreateTopicsResponse(controllerResponseData)))
+
+    val response = verifyNoThrottling[CreateTopicsResponse](request)
+    val byName = response.data.topics().iterator().asScala.map(t => t.name() -> t.errorCode()).toMap
+    assertEquals(3, byName.size)
+    assertEquals(Errors.NONE.code, byName("items"))
+    assertEquals(Errors.TOPIC_ALREADY_EXISTS.code, byName("orders"),
+      "authorized colliding name must surface as ALREADY_EXISTS")
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED.code, byName("events"),
+      "unauthorized colliding name must surface as AUTH_FAILED")
+  }
+
+  @Test
+  def testCreateTopicsShadowAllowsClusterAuthToShortCircuit(): Unit = {
+    // r15 BLOCKER N1: a caller with CLUSTER#CREATE is authorized for any topic name. The
+    // interceptor must NOT call the TOPIC-level filter (would duplicate auth work) and must
+    // surface ALREADY_EXISTS for shadowed names — same as the pre-N1 behavior.
+    when(concentrationKernel.allDeclaredLogicalTopicNames())
+      .thenReturn(Collections.singleton[String]("orders"))
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
+
+    val authorizer: Authorizer = mock(classOf[Authorizer])
+    when(authorizer.authorize(any[RequestContext], any[util.List[Action]]))
+      .thenAnswer { invocation =>
+        invocation.getArgument(1).asInstanceOf[util.List[Action]].asScala.map { action =>
+          // CLUSTER#CREATE allowed; bail out so the per-topic filter is never invoked.
+          if (action.resourcePattern().resourceType() == ResourceType.CLUSTER) AuthorizationResult.ALLOWED
+          else AuthorizationResult.DENIED
+        }.asJava
+      }
+
+    val requestData = new CreateTopicsRequestData()
+    requestData.topics().add(new CreatableTopic().setName("orders").setNumPartitions(1).setReplicationFactor(1.toShort))
+    val request = buildRequest(new CreateTopicsRequest.Builder(requestData).build())
+
+    kafkaApis = createKafkaApis(authorizer = Some(authorizer))
+    kafkaApis.handle(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[CreateTopicsResponse](request)
+    val byName = response.data.topics().iterator().asScala.map(t => t.name() -> t.errorCode()).toMap
+    assertEquals(1, byName.size)
+    assertEquals(Errors.TOPIC_ALREADY_EXISTS.code, byName("orders"))
+  }
+
+  @Test
   def testFindCoordinatorAutoTopicCreationForOffsetTopic(): Unit = {
     testFindCoordinatorWithTopicCreation(CoordinatorType.GROUP)
   }

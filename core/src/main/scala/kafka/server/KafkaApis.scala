@@ -157,13 +157,23 @@ class KafkaApis(val requestChannel: RequestChannel,
    * topic still rejects a second create attempt — the controller would reject it as duplicate
    * too, but we surface the more specific reason.
    *
-   * <p>Behaviour matrix:
+   * <p>Authorization: mirrors the controller's CreateTopics precedence
+   * ({@link ControllerApis#createTopics}). Callers with {@code CLUSTER#CREATE} are authorized for
+   * any name; otherwise per-topic {@code TOPIC#CREATE} is required. Without honoring this here,
+   * an unauthenticated client could probe the declared-logical-topic set by submitting
+   * CreateTopics and observing the {@code TOPIC_ALREADY_EXISTS} short-circuit verdicts
+   * (information disclosure), and a partially-authorized client would receive
+   * {@code TOPIC_ALREADY_EXISTS} on shadowed names where the controller would have returned
+   * {@code TOPIC_AUTHORIZATION_FAILED} (ACL bypass — r15 BLOCKER N1).
+   *
+   * <p>Behaviour matrix (per requested name):
    * <ul>
-   *   <li>No collisions: forward unchanged.</li>
-   *   <li>All requested topics collide: synthesize a response with one
-   *       {@code TOPIC_ALREADY_EXISTS} entry per topic; do not forward.</li>
-   *   <li>Mixed: mutate the request body to remove colliding entries, forward the remainder,
-   *       inject the collision entries into the controller's response before returning.</li>
+   *   <li>Not colliding: forwarded to the controller, which applies its own auth check.</li>
+   *   <li>Colliding and caller authorized for the name: short-circuited to
+   *       {@code TOPIC_ALREADY_EXISTS}.</li>
+   *   <li>Colliding and caller NOT authorized for the name: short-circuited to
+   *       {@code TOPIC_AUTHORIZATION_FAILED} — same verdict the controller would emit, which
+   *       prevents the shadow path from leaking the declared name.</li>
    * </ul>
    */
   private def maybeForwardCreateTopicsRejectingLogicalShadow(request: RequestChannel.Request): Unit = {
@@ -174,35 +184,57 @@ class KafkaApis(val requestChannel: RequestChannel,
       return
     }
 
-    val removed = scala.collection.mutable.ArrayBuffer[String]()
-    val iter = createTopicsRequest.data.topics().iterator()
-    while (iter.hasNext) {
-      val t = iter.next()
-      if (declared.contains(t.name)) {
-        removed += t.name
-        iter.remove()
-      }
-    }
-
-    if (removed.isEmpty) {
+    val collidingNames: Set[String] = createTopicsRequest.data.topics().asScala
+      .map(_.name).filter(declared.contains).toSet
+    if (collidingNames.isEmpty) {
       forwardToController(request)
       return
     }
 
-    val errorMsg = "Topic name collides with a declared logical topic on this broker; " +
+    // Auth check on colliding names only — non-colliding names get auth'd by the controller when
+    // we forward, so we don't want to double-log. logIfDenied=false on the CLUSTER probe matches
+    // the controller's own pattern (ControllerApis.handleCreateTopics) and avoids spamming logs
+    // for the common case where the caller has TOPIC-level CREATE but not CLUSTER-level.
+    val hasClusterAuth = authHelper.authorize(request.context, CREATE, CLUSTER, CLUSTER_NAME,
+      logIfDenied = false)
+    val authorizedColliding: Set[String] =
+      if (hasClusterAuth) collidingNames
+      else authHelper.filterByAuthorized(request.context, CREATE, TOPIC, collidingNames)(identity)
+
+    val removedAuthorized = scala.collection.mutable.ArrayBuffer[String]()
+    val removedUnauthorized = scala.collection.mutable.ArrayBuffer[String]()
+    val iter = createTopicsRequest.data.topics().iterator()
+    while (iter.hasNext) {
+      val t = iter.next()
+      if (collidingNames.contains(t.name)) {
+        if (authorizedColliding.contains(t.name)) removedAuthorized += t.name
+        else removedUnauthorized += t.name
+        iter.remove()
+      }
+    }
+
+    val shadowErrorMsg = "Topic name collides with a declared logical topic on this broker; " +
       "refusing to create a physical topic that would shadow it."
 
-    if (createTopicsRequest.data.topics().isEmpty) {
-      // Every requested topic collided — short-circuit without involving the controller. Build a
-      // CreateTopicsResponse with TOPIC_ALREADY_EXISTS per shadowed name, matching the per-topic
-      // response shape stock controllers emit for duplicate-name failures.
-      val responseData = new CreateTopicsResponseData()
-      removed.foreach { name =>
-        responseData.topics().add(new CreateTopicsResponseData.CreatableTopicResult()
+    def appendShadowEntries(response: CreateTopicsResponseData): Unit = {
+      removedAuthorized.foreach { name =>
+        response.topics().add(new CreateTopicsResponseData.CreatableTopicResult()
           .setName(name)
           .setErrorCode(Errors.TOPIC_ALREADY_EXISTS.code)
-          .setErrorMessage(errorMsg))
+          .setErrorMessage(shadowErrorMsg))
       }
+      removedUnauthorized.foreach { name =>
+        response.topics().add(new CreateTopicsResponseData.CreatableTopicResult()
+          .setName(name)
+          .setErrorCode(Errors.TOPIC_AUTHORIZATION_FAILED.code)
+          .setErrorMessage("Authorization failed."))
+      }
+    }
+
+    if (createTopicsRequest.data.topics().isEmpty) {
+      // Every requested topic collided — short-circuit without involving the controller.
+      val responseData = new CreateTopicsResponseData()
+      appendShadowEntries(responseData)
       requestHelper.sendMaybeThrottle(request, new CreateTopicsResponse(responseData))
       return
     }
@@ -211,12 +243,7 @@ class KafkaApis(val requestChannel: RequestChannel,
     // into the response so the client sees the full per-topic verdict.
     forwardingManager.forwardRequest(request, createTopicsRequest, {
       case Some(response: CreateTopicsResponse) =>
-        removed.foreach { name =>
-          response.data.topics().add(new CreateTopicsResponseData.CreatableTopicResult()
-            .setName(name)
-            .setErrorCode(Errors.TOPIC_ALREADY_EXISTS.code)
-            .setErrorMessage(errorMsg))
-        }
+        appendShadowEntries(response.data)
         requestHelper.sendForwardedResponse(request, response)
       case Some(other) =>
         // Controller returned a non-CreateTopics response (e.g., an error envelope). Forward
