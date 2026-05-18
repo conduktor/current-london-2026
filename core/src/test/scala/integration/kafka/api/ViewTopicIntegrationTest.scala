@@ -282,6 +282,109 @@ class ViewTopicIntegrationTest extends IntegrationTestHarness {
   }
 
   @Test
+  def testViewOverMultiPartitionBacking(): Unit = {
+    // Multi-partition: most pre-existing tests are single-partition so the partition mapping
+    // (viewTpId.partition -> backingTpId.partition) is never exercised. This test produces with
+    // explicit partition assignment to all three backing partitions and asserts the view
+    // returns the predicate-matching records at their SOURCE offsets, partitioned correctly.
+    val numPartitions = 3
+    createTopic(backingTopic, numPartitions = numPartitions, replicationFactor = 1)
+    val viewProps = new Properties()
+    viewProps.setProperty(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, backingTopic)
+    viewProps.setProperty(ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.color == 'red'")
+    viewProps.setProperty(ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+    createTopic(viewTopic, numPartitions = numPartitions, replicationFactor = 1, topicConfig = viewProps)
+
+    val producer = createProducer()
+    // Spread records explicitly across partitions so each backing partition has its own
+    // density and sparseness pattern.
+    val plan: Seq[(Int, String)] = Seq(
+      (0, "red"), (0, "blue"), (0, "red"),         // p0: matches at 0, 2
+      (1, "blue"), (1, "blue"), (1, "red"),        // p1: match at 2
+      (2, "red"),  (2, "red"),  (2, "blue")        // p2: matches at 0, 1
+    )
+    plan.foreach { case (p, c) =>
+      producer.send(new ProducerRecord[Array[Byte], Array[Byte]](backingTopic, p, null, jsonBytes(c))).get()
+    }
+
+    val consumer = createConsumer(configOverrides = newGroupConfig("multi-part-view"))
+    try {
+      val tps = (0 until numPartitions).map(p => new TopicPartition(viewTopic, p))
+      consumer.assign(java.util.Arrays.asList(tps: _*))
+      consumer.seekToBeginning(java.util.Arrays.asList(tps: _*))
+
+      // Total expected matches across all partitions: p0=2, p1=1, p2=2 = 5.
+      val collected = scala.collection.mutable.ArrayBuffer.empty[(Int, Long, String)]
+      val deadline = System.currentTimeMillis() + 15_000
+      while (collected.size < 5 && System.currentTimeMillis() < deadline) {
+        val records = consumer.poll(Duration.ofMillis(500))
+        val it = records.iterator()
+        while (it.hasNext) {
+          val r = it.next()
+          collected += ((r.partition(), r.offset(), MiniJson.parse(new String(r.value(), "UTF-8")).get("color")))
+        }
+      }
+
+      val byPart = collected.groupBy(_._1).map { case (p, recs) => p -> recs.map(t => (t._2, t._3)).sortBy(_._1) }
+      // Partition 0: red at source offsets 0 and 2 (offset 1 was 'blue' and dropped).
+      assertEquals(Seq((0L, "red"), (2L, "red")), byPart.getOrElse(0, Seq.empty),
+        "view partition 0 must mirror backing-topic partition 0 with sparse offsets")
+      // Partition 1: red at source offset 2.
+      assertEquals(Seq((2L, "red")), byPart.getOrElse(1, Seq.empty),
+        "view partition 1 must filter blue out and return only red at source offset 2")
+      // Partition 2: red at source offsets 0 and 1.
+      assertEquals(Seq((0L, "red"), (1L, "red")), byPart.getOrElse(2, Seq.empty),
+        "view partition 2 must return red at source offsets 0 and 1")
+    } finally {
+      consumer.close(Duration.ofSeconds(5))
+    }
+  }
+
+  @Test
+  def testViewOverCompactedBackingTopic(): Unit = {
+    // Compact-policy backing topics are common (event-sourcing, latest-value, KTable replay).
+    // The view must apply the predicate without crashing or being misled by compaction markers.
+    // This test does NOT try to drive compaction itself — that requires log-cleaner tuning that
+    // is brittle in a short integration test. The point is to assert the FILTER PATH is policy-
+    // agnostic: with cleanup.policy=compact set on the backing topic, the existing red/blue mix
+    // is filtered identically.
+    val compactBacking = "compact-backing"
+    val compactView = "compact-view"
+    val compactProps = new Properties()
+    compactProps.setProperty(org.apache.kafka.common.config.TopicConfig.CLEANUP_POLICY_CONFIG, "compact")
+    createTopic(compactBacking, numPartitions = 1, replicationFactor = 1, topicConfig = compactProps)
+    val viewProps = new Properties()
+    viewProps.setProperty(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, compactBacking)
+    viewProps.setProperty(ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.color == 'red'")
+    viewProps.setProperty(ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+    createTopic(compactView, numPartitions = 1, replicationFactor = 1, topicConfig = viewProps)
+
+    val producer = createProducer()
+    // Compaction needs keys. Different keys per record means none of the records is a duplicate
+    // candidate — the test stays deterministic regardless of whether the log cleaner ran during
+    // the test window. The point is the filter does its job on a compact-cleanup log.
+    val plan = Seq(
+      ("k0", "red"), ("k1", "blue"), ("k2", "red"), ("k3", "green"), ("k4", "red"))
+    plan.foreach { case (k, c) =>
+      producer.send(new ProducerRecord[Array[Byte], Array[Byte]](
+        compactBacking, 0, k.getBytes("UTF-8"), jsonBytes(c))).get()
+    }
+
+    val consumer = createConsumer(configOverrides = newGroupConfig("compact-view"))
+    try {
+      val tp = new TopicPartition(compactView, 0)
+      consumer.assign(Collections.singletonList(tp))
+      consumer.seekToBeginning(Collections.singletonList(tp))
+      val matched = pollUntil(consumer, expectedCount = 3, timeout = Duration.ofSeconds(15))
+      assertEquals(Seq(0L, 2L, 4L), matched.map(_._1),
+        "view over compact-policy backing must still return source-offset-sparse red records")
+      assertEquals(Seq("red", "red", "red"), matched.map(_._2.get("color")))
+    } finally {
+      consumer.close(Duration.ofSeconds(5))
+    }
+  }
+
+  @Test
   def testViewFilterHandlesCompressedBatches(): Unit = {
     createTopic(backingTopic)
     createViewTopic(viewTopic, backingTopic, "body.color == 'red'")
