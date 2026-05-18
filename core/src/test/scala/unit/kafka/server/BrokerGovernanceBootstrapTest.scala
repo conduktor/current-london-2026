@@ -1501,6 +1501,54 @@ class BrokerGovernanceBootstrapTest {
       "absent log must not emit a drift WARN")
   }
 
+  // ── Round-15 HIGH-2: poisoned-record WARN must be LogSafe-sanitised ─────
+
+  @Test
+  def sanitizePoisonMessageStripsCrlfAndControlChars(): Unit = {
+    // Attacker-controlled record bytes can land in the exception message
+    // text of Jackson / GovernanceLoader / codec layers. Without
+    // sanitisation, a CR/LF + control-char payload in t.getMessage forges
+    // a log line of the attacker's choosing. The helper used by the
+    // catch block in BrokerGovernanceBootstrap.replay() must collapse
+    // CR/LF, strip C0/C1 controls, and preserve the exception class
+    // verbatim as a trusted diagnostic anchor.
+    val rm = mock(classOf[ReplicaManager])
+    val engine = new RuleEngine()
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp)
+
+    val poison = new RuntimeException(
+      "field 'x' bad value: \r\n2026-05-19 22:00 INFO  forged: admin-bypass")
+    val out = boot.sanitizePoisonMessage(poison)
+
+    assertTrue(out.startsWith("java.lang.RuntimeException: "),
+      s"exception class must lead, got: $out")
+    // The security invariant is that an attacker cannot break out onto a
+    // new log line. LogSafe collapses CR/LF into the literal escape
+    // sequences (backslash-u escapes) -- the diagnostic text is preserved
+    // (operators need to see what the loader rejected), but the
+    // structural framing of broker.log is intact.
+    assertFalse(out.contains("\r"),
+      s"raw CR must not survive sanitisation, got: $out")
+    assertFalse(out.contains("\n"),
+      s"raw LF must not survive sanitisation, got: $out")
+    assertTrue(out.contains("\\u000D") || out.contains("\\u000A"),
+      s"CR/LF must appear as escape sequences in the sanitised output, got: $out")
+  }
+
+  @Test
+  def sanitizePoisonMessageHandlesNullMessageGracefully(): Unit = {
+    // Throwable.getMessage may be null. The helper must not NPE — the
+    // WARN line still needs to emit *something* useful for the operator.
+    val rm = mock(classOf[ReplicaManager])
+    val engine = new RuleEngine()
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp)
+
+    val poison = new NullPointerException()
+    val out = boot.sanitizePoisonMessage(poison)
+    assertTrue(out.startsWith("java.lang.NullPointerException: "),
+      s"exception class must lead even when getMessage is null, got: $out")
+  }
+
   // ── Round-15 BLOCKER-2: __governance partition-count runtime drift ──────
 
   @Test

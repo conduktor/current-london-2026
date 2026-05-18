@@ -21,7 +21,7 @@ import kafka.utils.Logging
 
 import org.apache.kafka.common.TopicPartition
 import org.apache.kafka.common.utils.Utils
-import org.apache.kafka.server.rules.{GovernanceLoader, GovernanceTopic, RuleEngine}
+import org.apache.kafka.server.rules.{GovernanceLoader, GovernanceTopic, LogSafe, RuleEngine}
 import org.apache.kafka.server.storage.log.FetchIsolation
 import org.apache.kafka.server.util.KafkaScheduler
 
@@ -961,7 +961,7 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
             } catch {
               case t: Throwable =>
                 warn(s"skipping poisoned __governance record at offset " +
-                  s"${rec.offset()}: ${t.toString}")
+                  s"${rec.offset()}: ${sanitizePoisonMessage(t)}")
             }
             if (didApply) {
               applied += 1
@@ -979,4 +979,24 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
     if (buf == null) return null
     Utils.toArray(buf.duplicate())
   }
+
+  /**
+   * Round-15 HIGH-2 (recent-changes sub-agent): the catch block around
+   * {@link GovernanceLoader#apply} fires on producer-controlled record
+   * content. If the upstream exception's {@code getMessage} embeds
+   * attacker-chosen bytes — Jackson parse errors quote offending input,
+   * and codec exceptions rethrow wrapping their cause — passing
+   * {@code t.toString} into the WARN line would inject forged log records
+   * into broker.log (CR/LF, ANSI escapes, bidi-isolate codepoints, …).
+   *
+   * <p>The fix is two-part: emit the exception {@code Class.getName}
+   * unsanitised (always a trusted JVM-class identifier) so the operator
+   * gets a clean diagnostic anchor, then run {@code getMessage} through
+   * {@link LogSafe#sanitize} which collapses CR/LF, strips C0/C1 controls
+   * and bidi-isolate codepoints, and bounds the length to
+   * {@link LogSafe#MAX_LEN}. Visible for tests so a regression can pin
+   * the exact post-sanitisation output without intercepting SLF4J.
+   */
+  private[server] def sanitizePoisonMessage(t: Throwable): String =
+    s"${t.getClass.getName}: ${LogSafe.sanitize(t.getMessage)}"
 }
