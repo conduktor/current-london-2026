@@ -4532,6 +4532,85 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testFetchAtV12CollisionBetweenViewAndBackingIsRejected(): Unit = {
+    // Regression for Codex Blocker C: Fetch v12 has no topic-id field in the wire format, so the
+    // FetchContext surfaces entries with Uuid.ZERO_UUID. The view-redirect path resolves the
+    // backing's *real* Uuid via metadataCache.getTopicId, producing a TopicIdPartition whose
+    // topicId differs from the direct backing entry's ZERO_UUID even though both name the same
+    // log. A TopicIdPartition-keyed collision check would compare them unequal and silently miss
+    // the collision; we'd then route both to the replica layer, and the response callback would
+    // apply the view filter to the direct backing fetch — leaking the view's identity into a
+    // fetch the consumer never asked to be filtered. Keying on TopicPartition (name+partition)
+    // catches the collision regardless of fetch version.
+    val viewTopic = "v"
+    val backingTopic = "b"
+    val viewTopicId = Uuid.randomUuid()
+    val backingTopicId = Uuid.randomUuid()
+
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, backingTopic)
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.keep == true")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+
+    addTopicToMetadataCache(viewTopic, numPartitions = 1, topicId = viewTopicId)
+    addTopicToMetadataCache(backingTopic, numPartitions = 1, topicId = backingTopicId)
+
+    // Mimic v12 wire arrival: both entries carry Uuid.ZERO_UUID, matching what
+    // FetchRequest.fetchData() produces when no topic-id field is on the wire.
+    val viewTpIdZero = new TopicIdPartition(Uuid.ZERO_UUID, new TopicPartition(viewTopic, 0))
+    val backingTpIdZero = new TopicIdPartition(Uuid.ZERO_UUID, new TopicPartition(backingTopic, 0))
+
+    // The direct backing entry still has to reach ReplicaManager; the test cares about the view's
+    // INVALID_REQUEST, not the direct fetch's payload, so any plausible callback is fine.
+    when(replicaManager.fetchMessages(
+      any[FetchParams],
+      any[Seq[(TopicIdPartition, FetchRequest.PartitionData)]],
+      any[ReplicaQuota],
+      any[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]()
+    )).thenAnswer(invocation => {
+      val partitions = invocation.getArgument(1).asInstanceOf[Seq[(TopicIdPartition, FetchRequest.PartitionData)]]
+      val callback = invocation.getArgument(3).asInstanceOf[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]
+      callback(partitions.map { case (tp, _) =>
+        tp -> new FetchPartitionData(Errors.NONE, 0L, 0L, MemoryRecords.EMPTY,
+          Optional.empty(), OptionalLong.empty(), Optional.empty(), OptionalInt.empty(), false)
+      })
+    })
+
+    val fetchData = new util.LinkedHashMap[TopicIdPartition, FetchRequest.PartitionData]()
+    fetchData.put(viewTpIdZero, new FetchRequest.PartitionData(Uuid.ZERO_UUID, 0, 0, 1000, Optional.empty()))
+    fetchData.put(backingTpIdZero, new FetchRequest.PartitionData(Uuid.ZERO_UUID, 0, 0, 1000, Optional.empty()))
+    val fetchDataBuilder = new util.LinkedHashMap[TopicPartition, FetchRequest.PartitionData]()
+    fetchDataBuilder.put(viewTpIdZero.topicPartition, new FetchRequest.PartitionData(Uuid.ZERO_UUID, 0, 0, 1000, Optional.empty()))
+    fetchDataBuilder.put(backingTpIdZero.topicPartition, new FetchRequest.PartitionData(Uuid.ZERO_UUID, 0, 0, 1000, Optional.empty()))
+    val fetchMetadata = new JFetchMetadata(0, 0)
+    val fetchContext = new FullFetchContext(time, new FetchSessionCacheShard(1000, 100),
+      fetchMetadata, fetchData, true, false)
+    when(fetchManager.newContext(any[Short], any[JFetchMetadata], any[Boolean],
+      any[util.Map[TopicIdPartition, FetchRequest.PartitionData]],
+      any[util.List[TopicIdPartition]],
+      any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    // Build at v12 so the wire-level effect matches the test scenario name.
+    val fetchRequest = new FetchRequest.Builder(12, 12, -1, -1, 100, 0, fetchDataBuilder).build()
+    val request = buildRequest(fetchRequest)
+    kafkaApis = createKafkaApis(configRepository = configRepository)
+    kafkaApis.handleFetchRequest(request)
+
+    val response = verifyNoThrottling[FetchResponse](request)
+    val responseData = response.responseData(metadataCache.topicIdsToNames(), 12)
+    val viewPartitionData = responseData.get(viewTpIdZero.topicPartition)
+    assertEquals(Errors.INVALID_REQUEST.code, viewPartitionData.errorCode,
+      "v12 view side must be rejected with INVALID_REQUEST when its backing is also a direct " +
+        "fetch target in the same request — collision detection must not depend on topic IDs")
+    val backingPartitionData = responseData.get(backingTpIdZero.topicPartition)
+    assertEquals(Errors.NONE.code, backingPartitionData.errorCode,
+      "the direct backing entry must NOT be rejected — only the view side fails on collision")
+  }
+
+  @Test
   def testFetchFromViewWithUncompilablePredicateReturnsInvalidRequest(): Unit = {
     // If a view config carrying a CEL predicate that the compiler rejects somehow slipped past
     // LogConfig validation (which is supposed to prevent this), the fetch path must fail safely

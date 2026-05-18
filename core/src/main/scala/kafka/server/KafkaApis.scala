@@ -677,7 +677,15 @@ class KafkaApis(val requestChannel: RequestChannel,
       // We materialize the classification map so the second pass can detect collisions between
       // views' backing TpIds and other entries' direct TpIds regardless of request order.
       val classified = new mutable.ArrayBuffer[(TopicIdPartition, FetchRequest.PartitionData, Either[Exception, Optional[ViewSpec]])](interesting.size)
-      val directTpIds = mutable.Set[TopicIdPartition]()
+      // Keyed by TopicPartition (name+partition), not TopicIdPartition, so the collision check
+      // works for Fetch v12 and older. v12's wire format has no topic ID field, so its entries
+      // arrive with Uuid.ZERO_UUID (see FetchRequest.fetchData), while the view-redirect path
+      // builds backingTpId via metadataCache.getTopicId(...) which returns the real Uuid. A
+      // TopicIdPartition-keyed set would compare unequal between those two and silently miss the
+      // collision — letting the dispatch hit the "duplicate entries by name" failure mode this
+      // pass is meant to prevent. Topic NAMES are unique within the broker at any given moment,
+      // so the (name, partition) tuple is the right collision key regardless of fetch version.
+      val directTpIds = mutable.Set[TopicPartition]()
       interesting.foreach { case (tpId, data) =>
         val result: Either[Exception, Optional[ViewSpec]] = try {
           Right(viewRegistry.viewFor(tpId.topic))
@@ -686,7 +694,7 @@ class KafkaApis(val requestChannel: RequestChannel,
         }
         classified += ((tpId, data, result))
         result match {
-          case Right(opt) if !opt.isPresent => directTpIds.add(tpId)
+          case Right(opt) if !opt.isPresent => directTpIds.add(tpId.topicPartition)
           case _ => // view, or threw — not a direct fetch
         }
       }
@@ -714,7 +722,7 @@ class KafkaApis(val requestChannel: RequestChannel,
               erroneous += viewTpId -> FetchResponse.partitionResponse(viewTpId, Errors.UNKNOWN_TOPIC_OR_PARTITION)
             } else {
               val backingTpId = new TopicIdPartition(metadataCache.getTopicId(backingName), backingTp)
-              if (directTpIds.contains(backingTpId)) {
+              if (directTpIds.contains(backingTp)) {
                 // The view redirects to a backing TpId that is ALSO requested directly in this same
                 // FetchRequest. Routing both would produce duplicate backingTpId entries in `rewritten`
                 // (the replica layer is keyed by TopicIdPartition) and the response callback would apply
