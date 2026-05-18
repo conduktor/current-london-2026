@@ -456,8 +456,33 @@ class LogConfigTest {
   @Test
   def testCompressionPolicyConfigDefault(): Unit = {
     val logConfig = new LogConfig(new Properties())
-    assertEquals(CompressionPolicy.NONE, logConfig.compressionPolicy,
-      "Default compression.policy should be NONE so behaviour is identical to vanilla Kafka")
+    // assertSame, not assertEquals: the Scala enforcement loop in KafkaApis short-circuits
+    // with `policy eq CompressionPolicy.NONE` (reference equality) on the default topic, so
+    // the LogConfig boundary must surface the singleton instance — not just an equal-by-value
+    // copy. assertEquals would still pass for a fresh CompressionPolicy(Kind.NONE, "none", emptySet),
+    // and a future refactor that broke singleton identity would slip through silently.
+    assertSame(CompressionPolicy.NONE, logConfig.compressionPolicy,
+      "Default compression.policy must return the CompressionPolicy.NONE singleton so the " +
+        "KafkaApis eq-NONE fast-path keeps short-circuiting on every default topic")
+  }
+
+  @Test
+  def testCompressionPolicyConfigKeywordValuesReturnSingletons(): Unit = {
+    // Same invariant for explicitly-set keyword values, not just the default. parse() returning
+    // a fresh-but-equal instance for "required" or "forbidden" would not break correctness
+    // (isViolatedBy is dispatched on kind, not identity) but the test exists to lock the
+    // invariant down so a future refactor cannot regress it.
+    Seq(
+      ("none", CompressionPolicy.NONE),
+      ("required", CompressionPolicy.REQUIRED),
+      ("forbidden", CompressionPolicy.FORBIDDEN),
+      (" REQUIRED ", CompressionPolicy.REQUIRED) // case-insensitive + whitespace must still hit the singleton
+    ).foreach { case (configValue, expected) =>
+      val props = new Properties()
+      props.setProperty(LogConfig.COMPRESSION_POLICY_CONFIG, configValue)
+      assertSame(expected, new LogConfig(props).compressionPolicy,
+        s"compression.policy=$configValue must return the well-known singleton instance")
+    }
   }
 
   @ParameterizedTest

@@ -72,8 +72,13 @@ public final class CompressionPolicy {
     public static final CompressionPolicy REQUIRED = new CompressionPolicy(Kind.REQUIRED, "required", Collections.emptySet());
     public static final CompressionPolicy FORBIDDEN = new CompressionPolicy(Kind.FORBIDDEN, "forbidden", Collections.emptySet());
 
-    private static final List<CompressionPolicy> WELL_KNOWN = Arrays.asList(NONE, REQUIRED, FORBIDDEN);
-    private static final List<String> WELL_KNOWN_NAMES = Arrays.asList(NONE.value, REQUIRED.value, FORBIDDEN.value);
+    private static final List<CompressionPolicy> WELL_KNOWN =
+        Collections.unmodifiableList(Arrays.asList(NONE, REQUIRED, FORBIDDEN));
+    // unmodifiableList because names() exposes this directly to callers (validator toString,
+    // tests, doc generation) — they must not be able to mutate the static list and corrupt
+    // future calls. Arrays.asList alone is fixed-size but still allows set(int, T).
+    private static final List<String> WELL_KNOWN_NAMES =
+        Collections.unmodifiableList(Arrays.asList(NONE.value, REQUIRED.value, FORBIDDEN.value));
 
     private final Kind kind;
     private final String value;

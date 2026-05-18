@@ -223,8 +223,16 @@ other policies.
 
 Allow-list values cover the "I want to accept some codecs but not others"
 use case that the three keywords cannot express on their own (e.g. accept
-`lz4` and `zstd` but reject `gzip` for CPU-cost reasons, or accept exactly
-one codec to keep on-disk batches homogeneous for downstream readers).
+`lz4` and `zstd` but reject `gzip` for CPU-cost reasons).
+
+Caveat (same shape as the one on `forbidden`): an allow-list gates the
+*entry* codec only. The separate, pre-existing topic-level
+`compression.type` config can still rewrite incoming batches on the way to
+the log (e.g. `compression.type=gzip` recompresses everything to gzip
+regardless of the allow-list). Operators who need the on-disk codec to
+match the entry codec must set `compression.type=producer` (or
+`compression.type=uncompressed`) alongside the allow-list — for the same
+reason as the `forbidden` shape.
 
 ### `CompressionPolicy` value class
 
