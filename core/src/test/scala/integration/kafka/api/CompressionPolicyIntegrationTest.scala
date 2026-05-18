@@ -608,6 +608,99 @@ class CompressionPolicyIntegrationTest extends QuorumTestHarness {
     }
   }
 
+  /**
+   * Allow-list happy path: a topic created with `compression.policy=gzip,lz4` accepts a producer
+   * configured for either codec in the list. Pins that the validator switch (from a fixed
+   * enumeration of "none/required/forbidden" to a delegated parse) actually propagates
+   * allow-list values into the topic's effective config and through to the enforcement loop.
+   */
+  @ParameterizedTest
+  @ValueSource(strings = Array("gzip", "lz4"))
+  def testCompressionPolicyAllowListAcceptsCodecInList(codec: String): Unit = {
+    val topic = s"allow-list-$codec"
+    val admin = TestUtils.createAdminClient(Seq(broker),
+      ListenerName.forSecurityProtocol(SecurityProtocol.PLAINTEXT))
+    try {
+      val cfg = new Properties()
+      cfg.put(LogConfig.COMPRESSION_POLICY_CONFIG, "gzip,lz4")
+      TestUtils.createTopicWithAdmin(admin, topic, Seq(broker), controllerServers, topicConfig = cfg)
+    } finally {
+      admin.close()
+    }
+
+    val producer = newProducer(TestUtils.plaintextBootstrapServers(Seq(broker)), codec)
+    try {
+      val meta = producer.send(new ProducerRecord(topic, "v".getBytes)).get()
+      assertEquals(0L, meta.offset(),
+        s"codec=$codec is in the allow-list gzip,lz4 and must append at offset 0")
+    } finally {
+      producer.close()
+    }
+  }
+
+  /**
+   * Allow-list rejection path: a topic created with `compression.policy=gzip,lz4` must reject
+   * a codec NOT in the list (e.g. zstd) with `INVALID_RECORD`, and must also reject the
+   * uncompressed codec (the allow-list cannot contain `none`). This is the pair that
+   * distinguishes an allow-list from `compression.policy=required`.
+   */
+  @ParameterizedTest
+  @ValueSource(strings = Array("zstd", "snappy", "none"))
+  def testCompressionPolicyAllowListRejectsCodecNotInList(codec: String): Unit = {
+    val topic = s"allow-list-reject-$codec"
+    val admin = TestUtils.createAdminClient(Seq(broker),
+      ListenerName.forSecurityProtocol(SecurityProtocol.PLAINTEXT))
+    try {
+      val cfg = new Properties()
+      cfg.put(LogConfig.COMPRESSION_POLICY_CONFIG, "gzip,lz4")
+      TestUtils.createTopicWithAdmin(admin, topic, Seq(broker), controllerServers, topicConfig = cfg)
+    } finally {
+      admin.close()
+    }
+
+    val producer = newProducer(TestUtils.plaintextBootstrapServers(Seq(broker)), codec)
+    try {
+      val ex = assertThrows(classOf[ExecutionException],
+        () => producer.send(new ProducerRecord(topic, "v".getBytes)).get())
+      assertTrue(ex.getCause.isInstanceOf[InvalidRecordException],
+        s"codec=$codec is not in allow-list gzip,lz4 and must be rejected with INVALID_RECORD; got: ${ex.getCause}")
+    } finally {
+      producer.close()
+    }
+  }
+
+  /**
+   * Pins that an allow-list value round-trips through DescribeConfigs byte-for-byte: the
+   * validator validates without transforming, so the on-disk topic config preserves exactly
+   * what the operator set. This matters for IaC diffing and dashboards — drift between the
+   * input string and the value surfaced back to tooling would generate spurious "config has
+   * changed" alerts on every reconciliation pass.
+   */
+  @Test
+  def testCompressionPolicyAllowListRoundTripsThroughDescribeConfigs(): Unit = {
+    val topic = "allow-list-describe"
+    val admin = TestUtils.createAdminClient(Seq(broker),
+      ListenerName.forSecurityProtocol(SecurityProtocol.PLAINTEXT))
+    try {
+      // Mix of upper/lower case and inner spaces: parse() tolerates this, and we want to
+      // confirm DescribeConfigs surfaces it verbatim rather than echoing the normalised form.
+      val originalValue = "GZIP, LZ4 , zstd"
+      val cfg = new Properties()
+      cfg.put(LogConfig.COMPRESSION_POLICY_CONFIG, originalValue)
+      TestUtils.createTopicWithAdmin(admin, topic, Seq(broker), controllerServers, topicConfig = cfg)
+
+      val topicResource = new ConfigResource(ConfigResource.Type.TOPIC, topic)
+      val described = admin.describeConfigs(Collections.singletonList(topicResource)).all().get()
+      val entry = described.get(topicResource).get(LogConfig.COMPRESSION_POLICY_CONFIG)
+      assertNotNull(entry, "compression.policy must appear in describeConfigs output")
+      assertEquals(originalValue, entry.value(),
+        "describeConfigs must surface the original allow-list value byte-for-byte so " +
+          "operator tooling and IaC diffing see exactly what was set")
+    } finally {
+      admin.close()
+    }
+  }
+
   private def newProducer(bootstrap: String, compression: String): KafkaProducer[Array[Byte], Array[Byte]] = {
     val props = new Properties()
     props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrap)

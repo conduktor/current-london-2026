@@ -466,11 +466,42 @@ class LogConfigTest {
     val props = new Properties()
     props.setProperty(LogConfig.COMPRESSION_POLICY_CONFIG, value)
     val logConfig = new LogConfig(props)
-    assertEquals(CompressionPolicy.forName(value), logConfig.compressionPolicy)
+    assertEquals(CompressionPolicy.parse(value), logConfig.compressionPolicy)
   }
 
   @ParameterizedTest
-  @ValueSource(strings = Array("yes", "123", "", "always", "optional", "NONE", "Required"))
+  @ValueSource(strings = Array("NONE", "Required", "  forbidden  "))
+  def testCompressionPolicyConfigIsCaseInsensitiveAndTrims(value: String): Unit = {
+    // The validator delegates to CompressionPolicy.parse, which lowercases and trims;
+    // operators should not be forced to remember casing. Pin that here so the LogConfig
+    // boundary stays aligned with parse() semantics.
+    val props = new Properties()
+    props.setProperty(LogConfig.COMPRESSION_POLICY_CONFIG, value)
+    val logConfig = new LogConfig(props)
+    assertEquals(CompressionPolicy.parse(value), logConfig.compressionPolicy)
+  }
+
+  @ParameterizedTest
+  @ValueSource(strings = Array("gzip", "lz4", "gzip,lz4", "gzip,snappy,lz4,zstd", "GZIP,LZ4"))
+  def testCompressionPolicyConfigAcceptsAllowList(value: String): Unit = {
+    // Allow-list values are unbounded, so the validator cannot enumerate them; it must accept
+    // anything parse() accepts. This pins that the validator delegation actually works for the
+    // allow-list shape, not just the three well-known short names.
+    val props = new Properties()
+    props.setProperty(LogConfig.COMPRESSION_POLICY_CONFIG, value)
+    val logConfig = new LogConfig(props)
+    val parsed = CompressionPolicy.parse(value)
+    assertEquals(parsed, logConfig.compressionPolicy)
+    assertEquals(CompressionPolicy.Kind.ALLOW_LIST, logConfig.compressionPolicy.kind)
+  }
+
+  @ParameterizedTest
+  @ValueSource(strings = Array(
+    "yes", "123", "", "always", "optional",
+    "gzip,",          // trailing-comma must not be silently tolerated
+    "gzip,bogus",     // unknown codec inside an otherwise-valid list
+    "gzip,none",      // operators must use compression.policy=forbidden, not a none-in-list trick
+    "gzip,gzip"))     // duplicate codec
   def testCompressionPolicyConfigRejectsUnknownValues(value: String): Unit = {
     val props = new Properties()
     props.setProperty(LogConfig.COMPRESSION_POLICY_CONFIG, value)

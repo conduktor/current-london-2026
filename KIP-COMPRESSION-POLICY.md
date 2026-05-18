@@ -45,11 +45,9 @@ admin APIs. That is the gap this KIP fills.
 
 ### Non-goals
 
-- This KIP does **not** propose a "minimum compression ratio" check or a
-  specific codec requirement (`require gzip`, `require zstd`). It draws two
-  hard lines — "any compression" (`required`) and "no compression" (`forbidden`).
-  A codec allow-list is sketched in `## Future Work` as a backwards-compatible
-  extension.
+- This KIP does **not** propose a "minimum compression ratio" check. Codec
+  selection is supported via a comma-separated allow-list (`compression.policy=gzip,lz4,zstd`);
+  see `## Proposed changes` § codec allow-list.
 - This KIP does **not** modify the `clients/` module. Producers continue to
   build batches exactly as they do today; the policy is enforced server-side and
   surfaced through the existing `INVALID_RECORD` error code.
@@ -71,11 +69,11 @@ A single new topic-level config is added. There are **no** new broker configs,
 | --- | --- |
 | Type | `STRING` |
 | Default | `"none"` |
-| Valid values | `"none"`, `"required"`, `"forbidden"` |
+| Valid values | `"none"`, `"required"`, `"forbidden"`, **or** a non-empty comma-separated allow-list of codec names from `[gzip, snappy, lz4, zstd]` (e.g. `"gzip,lz4"`). |
 | Importance | `MEDIUM` |
 | Server default override | none (this config has no `compression.policy.default` cluster-level fallback) |
 | Dynamic | yes (settable via `incrementalAlterConfigs`) |
-| Doc | "Server-side policy for the compression of producer batches. `none` (default) preserves vanilla behaviour. `required` rejects produce requests whose batches carry `compression.type=none`; `forbidden` is the mirror image and rejects produce requests whose batches carry any non-`none` `compression.type`. Both rejections surface as INVALID_RECORD on a per-partition basis. Enforced in the produce request handler, so replication, transaction-state, and group-coordinator appends bypass the check by construction." |
+| Doc | "Server-side policy for the compression of producer batches. `none` (default) preserves vanilla behaviour. `required` rejects produce requests whose batches carry `compression.type=none`; `forbidden` rejects produce requests whose batches carry any non-`none` `compression.type`. A comma-separated list of codec names (e.g. `gzip,lz4`) rejects every batch whose codec is not in the list. All rejections surface as INVALID_RECORD on a per-partition basis. Enforced in the produce request handler, so replication, transaction-state, and group-coordinator appends bypass the check by construction." |
 
 The config key is the bare string `"compression.policy"` — the same string an
 operator passes to `kafka-configs.sh --add-config` or a programmatic client
@@ -186,10 +184,15 @@ see `## Rejected alternatives`.
 `compression.policy` is registered exactly like any other topic config:
 
 - Added to `LogConfig.SERVER_CONFIG_DEF` and the per-topic `LogConfigDef`.
-- The valid-value validator (`ConfigDef.ValidString.in("none", "required", "forbidden")`)
-  rejects unknown values at **both** the CreateTopic and AlterConfig boundary.
-  An unknown value fails the Admin API future with
-  `InvalidConfigurationException`; the topic is not created (or not altered).
+- A custom `ConfigDef.Validator` (`COMPRESSION_POLICY_VALIDATOR`) delegates to
+  `CompressionPolicy.parse(String)` so the validator and the runtime parser
+  never drift apart. It rejects unknown values at **both** the CreateTopic and
+  AlterConfig boundary: unknown keyword, unknown codec name inside an
+  allow-list, an empty allow-list, a duplicate codec inside the list, or
+  `none` listed inside an allow-list (operators are directed to
+  `compression.policy=forbidden` for the "no compression" intent). An unknown
+  value fails the Admin API future with `InvalidConfigurationException`; the
+  topic is not created (or not altered).
 - The config is in `CONFIGS_WITH_NO_SERVER_DEFAULTS`. This KIP deliberately
   does **not** introduce a cluster-level fallback (`compression.policy.default`).
   Doing so would make it possible to flip the policy for every topic on a
@@ -204,26 +207,53 @@ see `## Rejected alternatives`.
 - The config respects `validateOnly=true` (pinned by
   `testValidateOnlyAlterConfigRejectsBadValueAndPreservesState`).
 
-### `CompressionPolicy` enum
+### Codec allow-list
 
-A new enum `org.apache.kafka.storage.internals.log.CompressionPolicy` carries
-the three valid values:
+In addition to the three keyword shapes (`none`, `required`, `forbidden`), the
+config accepts a comma-separated allow-list of codec names drawn from
+`[gzip, snappy, lz4, zstd]`. The list is non-empty, deduplicated, and may not
+include `none` (the operator-facing intent for "no compression accepted" is
+`compression.policy=forbidden`). Whitespace around commas is tolerated; the
+parser is case-insensitive over codec names; the original (unnormalised) value
+is preserved verbatim through `describeConfigs` so IaC diffs and dashboards
+see exactly what was set. A batch is accepted iff its `compressionType` is
+present in the parsed `Set<CompressionType>`; otherwise the broker emits
+`INVALID_RECORD` per-partition through the same handler-level path as the
+other policies.
+
+Allow-list values cover the "I want to accept some codecs but not others"
+use case that the three keywords cannot express on their own (e.g. accept
+`lz4` and `zstd` but reject `gzip` for CPU-cost reasons, or accept exactly
+one codec to keep on-disk batches homogeneous for downstream readers).
+
+### `CompressionPolicy` value class
+
+`org.apache.kafka.storage.internals.log.CompressionPolicy` is a final value
+class (not an enum) so the keyword and allow-list shapes share one type:
 
 ```java
-public enum CompressionPolicy {
-    NONE("none")          { public boolean isViolatedBy(CompressionType c) { return false; } },
-    REQUIRED("required")  { public boolean isViolatedBy(CompressionType c) { return c == CompressionType.NONE; } },
-    FORBIDDEN("forbidden"){ public boolean isViolatedBy(CompressionType c) { return c != CompressionType.NONE; } };
+public final class CompressionPolicy {
+    public enum Kind { NONE, REQUIRED, FORBIDDEN, ALLOW_LIST }
 
-    public String value();                                   // "none" / "required" / "forbidden"
-    public abstract boolean isViolatedBy(CompressionType);   // policy check
-    public static List<String> names();                      // for the validator
-    public static CompressionPolicy forName(String);         // parse from config
+    public static final CompressionPolicy NONE      = new CompressionPolicy(Kind.NONE, "none", emptySet());
+    public static final CompressionPolicy REQUIRED  = new CompressionPolicy(Kind.REQUIRED, "required", emptySet());
+    public static final CompressionPolicy FORBIDDEN = new CompressionPolicy(Kind.FORBIDDEN, "forbidden", emptySet());
+
+    public String value();                          // round-trips through parse()
+    public Kind kind();                              // for switch-style consumers
+    public Set<CompressionType> allowedCodecs();     // non-empty only for ALLOW_LIST
+    public boolean isViolatedBy(CompressionType);    // dispatched on kind
+    public static List<String> names();              // ["none", "required", "forbidden"] — allow-lists are unbounded, validated by parse() rather than enumerated
+    public static CompressionPolicy parse(String);   // parse-or-throw
+    public static CompressionPolicy forName(String); // backwards-compat alias for parse()
 }
 ```
 
-The enum lives under `storage/internals/log` because it is a server-side concept
-keyed off the topic config. It is **internal** (not under
+The three well-known shapes are exposed as `static final` singletons so the
+Scala enforcement loop can keep using its `policy eq CompressionPolicy.NONE`
+reference-equality fast-path — `parse("none")` returns the singleton, not a
+fresh copy. The class lives under `storage/internals/log` because it is a
+server-side concept keyed off the topic config. It is **internal** (not under
 `org.apache.kafka.common`); clients have no reason to depend on it.
 
 ## Compatibility, deprecation, and migration plan
@@ -346,9 +376,11 @@ The implementation in this branch is covered by three test suites:
 
 | Layer | File | What it pins |
 | --- | --- | --- |
-| Unit (config) | `LogConfigTest` | Config name registered; default is `none`; valid values accepted; invalid values rejected with `ConfigException`. |
+| Unit (config) | `LogConfigTest` | Config name registered; default is `none`; the three keyword values accepted; case-insensitive and whitespace-trim acceptance; allow-list values accepted; malformed values (unknown codec, trailing-comma, `none` inside list, duplicates) rejected with `ConfigException`. |
+| Unit (policy)  | `CompressionPolicyTest` | The three well-known names parse to the singleton instances (load-bearing for the `eq NONE` fast path); allow-list parsing accepts single + multi codec values; reject paths for empty/malformed tokens, null input, unknown codec names, `none`-in-allow-list, and duplicate codecs. |
 | Unit (handler) | `KafkaApisTest` (`testCompressionPolicy*`) | Default policy lets uncompressed through; required rejects uncompressed with `INVALID_RECORD`; required accepts compressed; forbidden rejects compressed with `INVALID_RECORD` (and increments the rejection meter); forbidden accepts uncompressed; mixed-topic per-partition shape with `ArgumentCaptor` proving the rejected partition is excluded from `handleProduceAppend`; downstream `CORRUPT_MESSAGE` is not masked; the per-topic and all-topics `BatchesRejectedByCompressionPolicyPerSec` meter increments on rejection and stays flat on acceptance. |
-| Integration | `CompressionPolicyIntegrationTest` | End-to-end against a real broker: required/lz4/open topic shape, mixed-topic per-partition end-to-end, CreateTopic + AlterConfig API-boundary rejection of unknown values, full compression-type matrix (gzip/snappy/lz4/zstd all pass under `required`; all four are rejected under `forbidden`), AlterConfig reverse-flip and DELETE-reset lifecycle, `describeConfigs` round-trip, `validateOnly` rejection preserves state, idempotent producer honours the policy. |
+| Integration | `CompressionPolicyIntegrationTest` | End-to-end against a real broker: required/lz4/open topic shape, mixed-topic per-partition end-to-end, CreateTopic + AlterConfig API-boundary rejection of unknown values, full compression-type matrix (gzip/snappy/lz4/zstd all pass under `required`; all four are rejected under `forbidden`), allow-list accept (codec-in-list) + reject (codec-not-in-list, uncompressed), DescribeConfigs verbatim round-trip of an allow-list value, AlterConfig reverse-flip and DELETE-reset lifecycle, `describeConfigs` round-trip, `validateOnly` rejection preserves state, `validateOnly` with good value does not commit, idempotent producer honours the policy, retry-with-compression after a required rejection. |
+| JMH bench | `CompressionPolicyEnforcementBenchmark` | Steady-state cost of the enforcement loop (Java mirror of the Scala loop). `NONE` is the constant-time fast-path; `REQUIRED` with compressed and `FORBIDDEN` with uncompressed are the hot paths that scan every batch. |
 
 Coverage gaps deliberately left for future work, not blockers for the MVP:
 
@@ -359,9 +391,6 @@ Coverage gaps deliberately left for future work, not blockers for the MVP:
   the leader, so a replicated topic with RF>1 would only confirm that the
   leader's broker rejects — no new wiring is exercised. Future work if a
   regression makes the case load-bearing.
-- **JMH micro-benchmark** for the hot-path lookup. The implementation is
-  designed to be allocation-free (see `## Proposed changes` § enforcement
-  placement, last bullet), and a JMH bench would pin a regression budget.
 
 ## Future work
 
@@ -373,19 +402,7 @@ Strictly orthogonal extensions, each of which would be its own KIP:
    matching the convention every other dynamic topic config follows. The MVP
    omits this only because the spec forbids `clients/` modifications; the
    change itself is a one-line additive constant with no behavioural impact.
-1. **Codec allow-list** (`compression.policy=gzip,zstd`). Extend the
-   `compression.policy` config to accept a comma-separated codec list in
-   addition to the three keyword values (`none` / `required` / `forbidden`).
-   `CompressionPolicy` would resolve at config-load time into a
-   `Set<CompressionType>` of allowed codecs; the `isViolatedBy` check becomes
-   `!allowed.contains(batchCompression)`. The `INVALID_RECORD` error code is
-   reused. Fully backwards compatible with the three keyword values defined
-   by this KIP (treat them as the degenerate sets `{any}`, `{any non-NONE}`,
-   and `{NONE}` respectively). This requires turning `CompressionPolicy`
-   from a closed enum into a value class with a `kind` + `allowedCodecs`
-   field, and replacing the `ValidString.in(...)` validator with a custom
-   `ConfigDef.Validator` implementation.
-2. **Cluster-level default** (`compression.policy.default` broker config).
+1. **Cluster-level default** (`compression.policy.default` broker config).
    Lets an operator turn enforcement on cluster-wide and opt individual
    topics out, instead of opting in. Deliberately left out of MVP because
    it changes the default-deny / default-allow choice for every topic on
@@ -419,12 +436,13 @@ Items closed since the initial KIP-MVP cut (no longer Future Work):
 
 For reviewers reading the diff in this branch:
 
-- Enum: `storage/src/main/java/org/apache/kafka/storage/internals/log/CompressionPolicy.java`
-- Config registration: `storage/src/main/java/org/apache/kafka/storage/internals/log/LogConfig.java` (the `COMPRESSION_POLICY_CONFIG` constant, the `LogConfigDef.define(...)` line, the `CONFIGS_WITH_NO_SERVER_DEFAULTS` set, and the constructor assignment).
+- Value class (kind + allow-list + parser): `storage/src/main/java/org/apache/kafka/storage/internals/log/CompressionPolicy.java`
+- Config registration & validator: `storage/src/main/java/org/apache/kafka/storage/internals/log/LogConfig.java` (the `COMPRESSION_POLICY_CONFIG` constant, the `COMPRESSION_POLICY_VALIDATOR` delegating to `CompressionPolicy.parse(String)`, the `LogConfigDef.define(...)` line, the `CONFIGS_WITH_NO_SERVER_DEFAULTS` set, and the constructor assignment).
 - Hot-path lookup: `core/src/main/scala/kafka/server/ReplicaManager.scala` (`compressionPolicy(topicPartition)`).
 - Enforcement: `core/src/main/scala/kafka/server/KafkaApis.scala` (`enforceCompressionPolicy` invoked from `handleProduceRequest` immediately after `validateRecords`).
-- Unit tests: `core/src/test/scala/unit/kafka/log/LogConfigTest.scala`, `core/src/test/scala/unit/kafka/server/KafkaApisTest.scala`.
+- Unit tests: `core/src/test/scala/unit/kafka/log/LogConfigTest.scala`, `core/src/test/scala/unit/kafka/server/KafkaApisTest.scala`, `storage/src/test/java/org/apache/kafka/storage/internals/log/CompressionPolicyTest.java`.
 - Integration tests: `core/src/test/scala/integration/kafka/api/CompressionPolicyIntegrationTest.scala`.
+- JMH bench: `jmh-benchmarks/src/main/java/org/apache/kafka/jmh/server/CompressionPolicyEnforcementBenchmark.java`.
 
 The branch is `experiment/compression-policy`. The spec it was built from is
 `PROMPT.md` at the repo root.

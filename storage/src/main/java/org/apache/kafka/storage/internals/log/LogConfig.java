@@ -129,16 +129,48 @@ public class LogConfig extends AbstractConfig {
     // unmodified clients can continue to read and write topics that use it.
     public static final String COMPRESSION_POLICY_CONFIG = "compression.policy";
     public static final String COMPRESSION_POLICY_DOC =
-            "Server-side policy for the compression of producer batches. " +
+            "Server-side policy for the compression of producer batches. Four shapes are valid: " +
             "<code>none</code> (default) preserves vanilla behaviour. " +
             "<code>required</code> rejects produce requests whose batches carry " +
             "<code>compression.type=none</code>; <code>forbidden</code> is the mirror image and " +
             "rejects produce requests whose batches carry any non-<code>none</code> " +
-            "<code>compression.type</code>. Both rejections surface as INVALID_RECORD on a " +
-            "per-partition basis. " +
+            "<code>compression.type</code>. A non-empty comma-separated allow-list of codec " +
+            "names (e.g. <code>gzip,lz4,zstd</code>) accepts only batches whose " +
+            "<code>compression.type</code> appears in the list and rejects every other codec. " +
+            "The allow-list may not include <code>none</code>; use <code>forbidden</code> for " +
+            "that. All rejections surface as INVALID_RECORD on a per-partition basis. " +
             "Enforced in the produce request handler, so replication, transaction-state, " +
             "and group-coordinator appends bypass the check by construction.";
     public static final String DEFAULT_COMPRESSION_POLICY = CompressionPolicy.NONE.value();
+
+    /**
+     * Custom validator for {@link #COMPRESSION_POLICY_CONFIG}. Delegates to
+     * {@link CompressionPolicy#parse(String)}, which accepts the three well-known short names
+     * ({@code none}, {@code required}, {@code forbidden}) and any non-empty comma-separated
+     * allow-list of codec names from {@code [gzip, snappy, lz4, zstd]}. A plain
+     * {@code ValidString.in(...)} validator cannot express the allow-list shape because the
+     * set of valid values is unbounded.
+     */
+    private static final ConfigDef.Validator COMPRESSION_POLICY_VALIDATOR = new ConfigDef.Validator() {
+        @Override
+        public void ensureValid(String name, Object value) {
+            if (!(value instanceof String)) {
+                throw new ConfigException(name, value, "compression.policy must be a string");
+            }
+            try {
+                CompressionPolicy.parse((String) value);
+            } catch (IllegalArgumentException e) {
+                throw new ConfigException(name, value, e.getMessage());
+            }
+        }
+
+        @Override
+        public String toString() {
+            return "one of " + CompressionPolicy.names()
+                + " or a non-empty comma-separated allow-list of codec names from "
+                + "[gzip, snappy, lz4, zstd]";
+        }
+    };
 
     public static final int DEFAULT_MAX_MESSAGE_BYTES = 1024 * 1024 + Records.LOG_OVERHEAD;
     public static final int DEFAULT_SEGMENT_BYTES = 1024 * 1024 * 1024;
@@ -275,7 +307,7 @@ public class LogConfig extends AbstractConfig {
                 .define(TopicConfig.REMOTE_LOG_COPY_DISABLE_CONFIG, BOOLEAN, false, MEDIUM, TopicConfig.REMOTE_LOG_COPY_DISABLE_DOC)
                 .define(TopicConfig.REMOTE_LOG_DELETE_ON_DISABLE_CONFIG, BOOLEAN, false, MEDIUM, TopicConfig.REMOTE_LOG_DELETE_ON_DISABLE_DOC)
                 .define(COMPRESSION_POLICY_CONFIG, STRING, DEFAULT_COMPRESSION_POLICY,
-                        in(CompressionPolicy.names().toArray(new String[0])), MEDIUM, COMPRESSION_POLICY_DOC);
+                        COMPRESSION_POLICY_VALIDATOR, MEDIUM, COMPRESSION_POLICY_DOC);
     }
 
     public final Set<String> overriddenConfigs;
@@ -355,7 +387,7 @@ public class LogConfig extends AbstractConfig {
         this.minInSyncReplicas = getInt(TopicConfig.MIN_IN_SYNC_REPLICAS_CONFIG);
         this.compressionType = BrokerCompressionType.forName(getString(TopicConfig.COMPRESSION_TYPE_CONFIG));
         this.compression = getCompression();
-        this.compressionPolicy = CompressionPolicy.forName(getString(COMPRESSION_POLICY_CONFIG));
+        this.compressionPolicy = CompressionPolicy.parse(getString(COMPRESSION_POLICY_CONFIG));
         this.preallocate = getBoolean(TopicConfig.PREALLOCATE_CONFIG);
         this.messageTimestampType = TimestampType.forName(getString(TopicConfig.MESSAGE_TIMESTAMP_TYPE_CONFIG));
         this.messageTimestampBeforeMaxMs = getLong(TopicConfig.MESSAGE_TIMESTAMP_BEFORE_MAX_MS_CONFIG);
