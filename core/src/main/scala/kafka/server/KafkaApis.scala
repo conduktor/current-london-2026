@@ -29,6 +29,7 @@ import org.apache.kafka.clients.CommonClientConfigs
 import org.apache.kafka.clients.admin.EndpointType
 import org.apache.kafka.common.acl.AclOperation
 import org.apache.kafka.common.acl.AclOperation._
+import org.apache.kafka.common.config.ConfigResource
 import org.apache.kafka.common.errors._
 import org.apache.kafka.common.internals.Topic.{GROUP_METADATA_TOPIC_NAME, SHARE_GROUP_STATE_TOPIC_NAME, TRANSACTION_STATE_TOPIC_NAME, isInternal}
 import org.apache.kafka.common.internals.{FatalExitError, Topic}
@@ -3660,9 +3661,127 @@ class KafkaApis(val requestChannel: RequestChannel,
   }
 
   def handleDescribeConfigsRequest(request: RequestChannel.Request): Unit = {
+    val describeConfigsRequest = request.body[DescribeConfigsRequest]
+    val tenantCtx = tenantContextFor(request)
+
+    if (!tenantCtx.effectiveTenant.isPresent) {
+      val responseData = configHelper.handleDescribeConfigsRequest(request, authHelper)
+      requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
+        new DescribeConfigsResponse(responseData.setThrottleTimeMs(requestThrottleMs)))
+      return
+    }
+
+    // Phase 3c.1: tenant-aware DescribeConfigs.
+    // The handler refuses cluster-wide resources (BROKER, BROKER_LOGGER,
+    // CLIENT_METRICS) and internal topics, rewrites TOPIC and GROUP resource
+    // names IN (logical → physical) before consulting configHelper, and
+    // rewrites them back OUT (physical → logical) on the response. Resources
+    // that cannot be served are merged in alongside the rewritten ones so
+    // the tenant sees a complete answer keyed on the literal names it sent.
+
+    if (tenantCtx.isUnsafe) {
+      // Privileged-on-tenant-listener, principal/listener mismatch, or untrusted
+      // tenant principal: refuse the WHOLE request. We never consult the cache
+      // so we cannot leak names, and the per-resource error code matches what
+      // an authz-failure would carry for that resource type.
+      val results = describeConfigsRequest.data.resources.asScala.map { r =>
+        val err = ConfigResource.Type.forId(r.resourceType) match {
+          case ConfigResource.Type.TOPIC => Errors.TOPIC_AUTHORIZATION_FAILED
+          case ConfigResource.Type.GROUP => Errors.GROUP_AUTHORIZATION_FAILED
+          case _ => Errors.CLUSTER_AUTHORIZATION_FAILED
+        }
+        refusedDescribeConfigsResult(r, err, null)
+      }.toList
+      requestHelper.sendResponseMaybeThrottle(request, throttleMs =>
+        new DescribeConfigsResponse(new DescribeConfigsResponseData()
+          .setThrottleTimeMs(throttleMs)
+          .setResults(results.asJava)))
+      return
+    }
+
+    val rewriteable = new java.util.ArrayList[DescribeConfigsRequestData.DescribeConfigsResource]()
+    val refused = new ArrayBuffer[DescribeConfigsResponseData.DescribeConfigsResult]()
+    describeConfigsRequest.data.resources.forEach { resource =>
+      val literalName = resource.resourceName
+      ConfigResource.Type.forId(resource.resourceType) match {
+        case ConfigResource.Type.BROKER |
+             ConfigResource.Type.BROKER_LOGGER |
+             ConfigResource.Type.CLIENT_METRICS =>
+          // Cluster-wide configs are not tenant-scoped. A tenant must not be
+          // able to discover broker, broker-logger, or client-metrics state.
+          refused += refusedDescribeConfigsResult(resource, Errors.CLUSTER_AUTHORIZATION_FAILED, null)
+        case ConfigResource.Type.TOPIC =>
+          if (literalName != null && Topic.isInternal(literalName)) {
+            // Internal topic configs (`__consumer_offsets`, `__transaction_state`,
+            // `__share_group_state`) are broker-wide and tenant-opaque. Refuse
+            // before reaching the cache so a misconfigured ACL cannot leak.
+            refused += refusedDescribeConfigsResult(resource, Errors.TOPIC_AUTHORIZATION_FAILED, null)
+          } else if (literalName != null && tenantCtx.isReservedPhysicalForm(literalName)) {
+            // Reserved physical form (e.g. `acme.foo` from tenant acme): refuse
+            // with the LITERAL name echoed back rather than rewriting into
+            // `acme.acme.foo` and silently returning UNKNOWN_TOPIC_OR_PARTITION.
+            refused += refusedDescribeConfigsResult(resource, Errors.INVALID_TOPIC_EXCEPTION,
+              "DescribeConfigs refused: topic name uses reserved tenant-prefix form")
+          } else {
+            try {
+              resource.setResourceName(tenantCtx.toPhysical(literalName))
+              rewriteable.add(resource)
+            } catch {
+              case e: InvalidTopicException =>
+                refused += refusedDescribeConfigsResult(resource, Errors.INVALID_TOPIC_EXCEPTION, e.getMessage)
+            }
+          }
+        case ConfigResource.Type.GROUP =>
+          try {
+            resource.setResourceName(tenantCtx.toPhysicalGroup(literalName))
+            rewriteable.add(resource)
+          } catch {
+            // Cross-tenant group prefix (`__tenant_other.group1`): refuse with
+            // the wire-shape an authz failure would produce.
+            case _: IllegalArgumentException =>
+              refused += refusedDescribeConfigsResult(resource, Errors.GROUP_AUTHORIZATION_FAILED, null)
+          }
+        case _ =>
+          refused += refusedDescribeConfigsResult(resource, Errors.INVALID_REQUEST, null)
+      }
+    }
+
+    describeConfigsRequest.data.setResources(rewriteable)
     val responseData = configHelper.handleDescribeConfigsRequest(request, authHelper)
+
+    // OUT-rewrite: each result echoes back the logical name the tenant submitted.
+    responseData.results.forEach { result =>
+      ConfigResource.Type.forId(result.resourceType) match {
+        case ConfigResource.Type.TOPIC =>
+          result.setResourceName(tenantCtx.toLogical(result.resourceName))
+        case ConfigResource.Type.GROUP =>
+          result.setResourceName(tenantCtx.toLogicalGroup(result.resourceName))
+        case _ =>
+      }
+    }
+
+    if (refused.nonEmpty) {
+      val merged = new java.util.ArrayList[DescribeConfigsResponseData.DescribeConfigsResult]()
+      merged.addAll(responseData.results)
+      refused.foreach(merged.add)
+      responseData.setResults(merged)
+    }
+
     requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
       new DescribeConfigsResponse(responseData.setThrottleTimeMs(requestThrottleMs)))
+  }
+
+  private def refusedDescribeConfigsResult(
+    resource: DescribeConfigsRequestData.DescribeConfigsResource,
+    error: Errors,
+    message: String
+  ): DescribeConfigsResponseData.DescribeConfigsResult = {
+    new DescribeConfigsResponseData.DescribeConfigsResult()
+      .setErrorCode(error.code)
+      .setErrorMessage(if (message != null) message else error.message)
+      .setResourceName(resource.resourceName)
+      .setResourceType(resource.resourceType)
+      .setConfigs(Collections.emptyList[DescribeConfigsResponseData.DescribeConfigsResourceResult])
   }
 
   def handleAlterReplicaLogDirsRequest(request: RequestChannel.Request): Unit = {
@@ -5080,6 +5199,7 @@ object KafkaApis {
     ApiKeys.ADD_OFFSETS_TO_TXN,
     ApiKeys.END_TXN,
     ApiKeys.TXN_OFFSET_COMMIT,
+    ApiKeys.DESCRIBE_CONFIGS,
     ApiKeys.SASL_HANDSHAKE,
     ApiKeys.SASL_AUTHENTICATE,
     ApiKeys.API_VERSIONS

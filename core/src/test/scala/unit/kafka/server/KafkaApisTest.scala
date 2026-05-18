@@ -14326,4 +14326,268 @@ class KafkaApisTest extends Logging {
       anyBoolean())
   }
 
+  // ---- Phase 3c.1: DescribeConfigs tenant rewrite ----
+
+  @Test
+  def testDescribeConfigsTenantRewritesTopicNameToPhysical(): Unit = {
+    // Tenant `acme` describes topic `orders`. configHelper must look up
+    // `acme.orders` in the metadata cache and config repository; the response
+    // must carry the logical name `orders` back to the tenant.
+    metadataCache = mock(classOf[KRaftMetadataCache])
+    when(metadataCache.contains("acme.orders")).thenReturn(true)
+
+    val topicConfigs = new Properties()
+    topicConfigs.put("min.insync.replicas", "3")
+    val configRepository = mock(classOf[ConfigRepository])
+    when(configRepository.topicConfig("acme.orders")).thenReturn(topicConfigs)
+
+    val describeRequest = new DescribeConfigsRequest.Builder(new DescribeConfigsRequestData()
+      .setResources(List(new DescribeConfigsRequestData.DescribeConfigsResource()
+        .setResourceName("orders")
+        .setResourceType(ConfigResource.Type.TOPIC.id)).asJava))
+      .build(ApiKeys.DESCRIBE_CONFIGS.latestVersion)
+    val request = buildRequest(describeRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(
+      configRepository = configRepository,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDescribeConfigsRequest(request)
+
+    val response = verifyNoThrottling[DescribeConfigsResponse](request)
+    val results = response.data.results.asScala
+    assertEquals(1, results.size)
+    val result = results.head
+    assertEquals(Errors.NONE.code, result.errorCode,
+      "topic config lookup must succeed against the physical name")
+    assertEquals("orders", result.resourceName,
+      "response must echo the LOGICAL name back, not the physical form")
+    assertEquals(ConfigResource.Type.TOPIC.id, result.resourceType)
+    assertTrue(result.configs.asScala.exists(_.name == "min.insync.replicas"),
+      "configHelper must have read the topic's physical config row")
+    // Defence in depth: configHelper should NEVER have been asked for the logical name.
+    verify(configRepository, never()).topicConfig("orders")
+  }
+
+  @Test
+  def testDescribeConfigsTenantRefusesReservedPhysicalFormTopic(): Unit = {
+    // Tenant `acme` submits the literal `acme.orders` (the reserved
+    // physical form for its own namespace). Refuse with the LITERAL name
+    // echoed back so the wire shape never round-trips into `acme.acme.orders`
+    // and the tenant cannot infer broker storage conventions from the error.
+    val describeRequest = new DescribeConfigsRequest.Builder(new DescribeConfigsRequestData()
+      .setResources(List(new DescribeConfigsRequestData.DescribeConfigsResource()
+        .setResourceName("acme.orders")
+        .setResourceType(ConfigResource.Type.TOPIC.id)).asJava))
+      .build(ApiKeys.DESCRIBE_CONFIGS.latestVersion)
+    val request = buildRequest(describeRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDescribeConfigsRequest(request)
+
+    val response = verifyNoThrottling[DescribeConfigsResponse](request)
+    val results = response.data.results.asScala
+    assertEquals(1, results.size)
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, results.head.errorCode)
+    assertEquals("acme.orders", results.head.resourceName,
+      "literal name must be echoed back unchanged")
+  }
+
+  @Test
+  def testDescribeConfigsTenantRefusesInternalTopic(): Unit = {
+    // `__consumer_offsets` configs are cluster-wide. A tenant must never see
+    // them through its own listener — the refusal happens before any cache
+    // lookup so a permissive ACL cannot leak.
+    val describeRequest = new DescribeConfigsRequest.Builder(new DescribeConfigsRequestData()
+      .setResources(List(new DescribeConfigsRequestData.DescribeConfigsResource()
+        .setResourceName("__consumer_offsets")
+        .setResourceType(ConfigResource.Type.TOPIC.id)).asJava))
+      .build(ApiKeys.DESCRIBE_CONFIGS.latestVersion)
+    val request = buildRequest(describeRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDescribeConfigsRequest(request)
+
+    val response = verifyNoThrottling[DescribeConfigsResponse](request)
+    val results = response.data.results.asScala
+    assertEquals(1, results.size)
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED.code, results.head.errorCode)
+    assertEquals("__consumer_offsets", results.head.resourceName)
+  }
+
+  @Test
+  def testDescribeConfigsTenantRefusesBrokerResource(): Unit = {
+    // BROKER / BROKER_LOGGER / CLIENT_METRICS describe cluster-wide state.
+    // A tenant must not be able to introspect the broker's dynamic config.
+    val describeRequest = new DescribeConfigsRequest.Builder(new DescribeConfigsRequestData()
+      .setResources(List(
+        new DescribeConfigsRequestData.DescribeConfigsResource()
+          .setResourceName("0")
+          .setResourceType(ConfigResource.Type.BROKER.id),
+        new DescribeConfigsRequestData.DescribeConfigsResource()
+          .setResourceName("0")
+          .setResourceType(ConfigResource.Type.BROKER_LOGGER.id),
+        new DescribeConfigsRequestData.DescribeConfigsResource()
+          .setResourceName("client-metrics-subscription-1")
+          .setResourceType(ConfigResource.Type.CLIENT_METRICS.id)).asJava))
+      .build(ApiKeys.DESCRIBE_CONFIGS.latestVersion)
+    val request = buildRequest(describeRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDescribeConfigsRequest(request)
+
+    val response = verifyNoThrottling[DescribeConfigsResponse](request)
+    val results = response.data.results.asScala
+    assertEquals(3, results.size)
+    assertTrue(results.forall(_.errorCode == Errors.CLUSTER_AUTHORIZATION_FAILED.code),
+      "every cluster-wide resource must be refused with CLUSTER_AUTHORIZATION_FAILED")
+  }
+
+  @Test
+  def testDescribeConfigsTenantRewritesGroupNameToPhysical(): Unit = {
+    // Group configs are stored under the physical group name
+    // `__tenant_acme.<logical>`; the lookup must use that form, while the
+    // response must echo the tenant-visible logical id.
+    val physicalGroup = "__tenant_acme.my-consumer"
+    val groupConfigs = new Properties()
+    groupConfigs.put(CONSUMER_SESSION_TIMEOUT_MS_CONFIG,
+      GroupCoordinatorConfig.CONSUMER_GROUP_SESSION_TIMEOUT_MS_DEFAULT.toString)
+    val configRepository = mock(classOf[ConfigRepository])
+    when(configRepository.groupConfig(physicalGroup)).thenReturn(groupConfigs)
+
+    val describeRequest = new DescribeConfigsRequest.Builder(new DescribeConfigsRequestData()
+      .setResources(List(new DescribeConfigsRequestData.DescribeConfigsResource()
+        .setResourceName("my-consumer")
+        .setResourceType(ConfigResource.Type.GROUP.id)).asJava))
+      .build(ApiKeys.DESCRIBE_CONFIGS.latestVersion)
+    val request = buildRequest(describeRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(
+      configRepository = configRepository,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDescribeConfigsRequest(request)
+
+    val response = verifyNoThrottling[DescribeConfigsResponse](request)
+    val results = response.data.results.asScala
+    assertEquals(1, results.size)
+    val result = results.head
+    assertEquals(Errors.NONE.code, result.errorCode)
+    assertEquals("my-consumer", result.resourceName,
+      "response must echo the LOGICAL group id, not the __tenant_-prefixed form")
+    // The mock would have returned an empty Properties for any other key.
+    verify(configRepository).groupConfig(physicalGroup)
+    verify(configRepository, never()).groupConfig("my-consumer")
+  }
+
+  @Test
+  def testDescribeConfigsTenantRefusesCrossTenantGroup(): Unit = {
+    // Tenant `acme` queries the configs for group `__tenant_other.foo`.
+    // The rewrite refuses with GROUP_AUTHORIZATION_FAILED — same wire shape
+    // the unauthorised-group response carries — so the foreign tenant's
+    // existence is not implied by the error.
+    val describeRequest = new DescribeConfigsRequest.Builder(new DescribeConfigsRequestData()
+      .setResources(List(new DescribeConfigsRequestData.DescribeConfigsResource()
+        .setResourceName("__tenant_other.foo")
+        .setResourceType(ConfigResource.Type.GROUP.id)).asJava))
+      .build(ApiKeys.DESCRIBE_CONFIGS.latestVersion)
+    val request = buildRequest(describeRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDescribeConfigsRequest(request)
+
+    val response = verifyNoThrottling[DescribeConfigsResponse](request)
+    val results = response.data.results.asScala
+    assertEquals(1, results.size)
+    assertEquals(Errors.GROUP_AUTHORIZATION_FAILED.code, results.head.errorCode)
+    assertEquals("__tenant_other.foo", results.head.resourceName,
+      "the literal cross-tenant name is preserved on the wire")
+  }
+
+  @Test
+  def testDescribeConfigsPrivilegedCallerOnTenantBoundListenerIsRefused(): Unit = {
+    // Super-user (no `__tenant_` prefix) on a tenant-bound listener. The
+    // unsafe-context short-circuit refuses the WHOLE request before the
+    // rewrite — otherwise the listener binding alone would silently wrap
+    // `orders` into `acme.orders` and let the privileged caller drive
+    // tenant state.
+    val describeRequest = new DescribeConfigsRequest.Builder(new DescribeConfigsRequestData()
+      .setResources(List(
+        new DescribeConfigsRequestData.DescribeConfigsResource()
+          .setResourceName("orders")
+          .setResourceType(ConfigResource.Type.TOPIC.id),
+        new DescribeConfigsRequestData.DescribeConfigsResource()
+          .setResourceName("my-consumer")
+          .setResourceType(ConfigResource.Type.GROUP.id)).asJava))
+      .build(ApiKeys.DESCRIBE_CONFIGS.latestVersion)
+    val request = buildRequest(describeRequest,
+      listenerName = TENANT_LISTENER,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDescribeConfigsRequest(request)
+
+    val response = verifyNoThrottling[DescribeConfigsResponse](request)
+    val results = response.data.results.asScala
+    assertEquals(2, results.size)
+    val topicResult = results.find(_.resourceType == ConfigResource.Type.TOPIC.id).get
+    val groupResult = results.find(_.resourceType == ConfigResource.Type.GROUP.id).get
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED.code, topicResult.errorCode)
+    assertEquals("orders", topicResult.resourceName)
+    assertEquals(Errors.GROUP_AUTHORIZATION_FAILED.code, groupResult.errorCode)
+    assertEquals("my-consumer", groupResult.resourceName)
+  }
+
+  @Test
+  def testDescribeConfigsTenantMergesRefusedAndSuccessfulResources(): Unit = {
+    // A request mixing a valid topic with a refused cluster-wide resource
+    // must return both — the success keyed on the logical name, the refusal
+    // carrying its literal name. Order doesn't matter; both must be present.
+    metadataCache = mock(classOf[KRaftMetadataCache])
+    when(metadataCache.contains("acme.orders")).thenReturn(true)
+
+    val topicConfigs = new Properties()
+    topicConfigs.put("min.insync.replicas", "3")
+    val configRepository = mock(classOf[ConfigRepository])
+    when(configRepository.topicConfig("acme.orders")).thenReturn(topicConfigs)
+
+    val describeRequest = new DescribeConfigsRequest.Builder(new DescribeConfigsRequestData()
+      .setResources(List(
+        new DescribeConfigsRequestData.DescribeConfigsResource()
+          .setResourceName("orders")
+          .setResourceType(ConfigResource.Type.TOPIC.id),
+        new DescribeConfigsRequestData.DescribeConfigsResource()
+          .setResourceName("0")
+          .setResourceType(ConfigResource.Type.BROKER.id)).asJava))
+      .build(ApiKeys.DESCRIBE_CONFIGS.latestVersion)
+    val request = buildRequest(describeRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(
+      configRepository = configRepository,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDescribeConfigsRequest(request)
+
+    val response = verifyNoThrottling[DescribeConfigsResponse](request)
+    val results = response.data.results.asScala
+    assertEquals(2, results.size)
+    val topicResult = results.find(_.resourceType == ConfigResource.Type.TOPIC.id).get
+    val brokerResult = results.find(_.resourceType == ConfigResource.Type.BROKER.id).get
+    assertEquals(Errors.NONE.code, topicResult.errorCode)
+    assertEquals("orders", topicResult.resourceName)
+    assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED.code, brokerResult.errorCode)
+    assertEquals("0", brokerResult.resourceName)
+  }
+
 }
