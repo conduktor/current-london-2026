@@ -197,19 +197,51 @@ public class RuleEngineTest {
 
     @Test
     public void firstMatchingDenyShortCircuitsAndReturnsItsErrorCode() {
-        // Multiple DENY rules on the same api key. Both match. The first one
-        // wins by declared order — its error code propagates, the second's does not.
+        // Multiple DENY rules on the same api key. The first one matches, and
+        // PROMPT.md requires the engine to short-circuit: the second rule's
+        // CEL must NOT be evaluated. The original form of this test only
+        // checked the propagated errorCode (100 not 200) — a regression that
+        // turned short-circuit into "evaluate all, return first" would still
+        // pass that check. To prove short-circuit *behaviorally*, we route
+        // each rule's CEL through a distinct activation key and count
+        // accesses to the second rule's key: it must be zero.
+        AtomicInteger firstKeyAccess = new AtomicInteger(0);
+        AtomicInteger secondKeyAccess = new AtomicInteger(0);
+        Map<String, Object> counting = new java.util.HashMap<String, Object>() {
+            @Override
+            public Object get(Object key) {
+                if ("probeFirst".equals(key)) firstKeyAccess.incrementAndGet();
+                if ("probeSecond".equals(key)) secondKeyAccess.incrementAndGet();
+                return super.get(key);
+            }
+        };
+        counting.put("probeFirst", 1);
+        counting.put("probeSecond", 1);
+
         RuleEngine engine = new RuleEngine();
         engine.install(new RuleSetBuilder()
-            .put(denyRule("first", ApiKeys.CREATE_TOPICS, "true", 100))
-            .put(denyRule("second", ApiKeys.CREATE_TOPICS, "true", 200))
+            // First rule references probeFirst and matches.
+            .put(denyRule("first", ApiKeys.CREATE_TOPICS, "probeFirst == 1", 100))
+            // Second rule references probeSecond. If it ever runs, it would
+            // also match — so we can detect a missing short-circuit purely
+            // by observing whether its activation key is touched.
+            .put(denyRule("second", ApiKeys.CREATE_TOPICS, "probeSecond == 1", 200))
             .build());
+
         RuleDecision decision = engine.evaluate(
             ApiKeys.CREATE_TOPICS, "external-client", null, false,
-            () -> Collections.singletonMap("request", Collections.emptyMap()));
+            () -> counting);
         assertTrue(decision.denied());
-        assertEquals(100, decision.errorCode());
+        assertEquals(100, decision.errorCode(),
+            "first rule's error code must propagate, not the second's");
         assertEquals("first", decision.denyingRuleId());
+        assertTrue(firstKeyAccess.get() >= 1,
+            "first rule must have been evaluated and consulted its activation key");
+        assertEquals(0, secondKeyAccess.get(),
+            "second rule's CEL MUST NOT be evaluated after the first DENY matches " +
+                "— this is the short-circuit contract from PROMPT.md and the only way " +
+                "to prevent a long deny-rule chain from quadratically blowing up the " +
+                "request hot path");
     }
 
     @Test
