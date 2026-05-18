@@ -224,6 +224,48 @@ public class LogicalOffsetTrackerTest {
     }
 
     @Test
+    public void removePartitionDropsStateAndAllowsFreshStart() {
+        // Pins the unbounded-growth audit fix: removing a partition wipes the state entry so the
+        // tracker map shrinks. After removal, reserving on the same key starts at offset 0 again
+        // (the tracker has no memory of past commits — that is the intended semantics for
+        // partition deletion).
+        LogicalOffsetTracker tracker = new LogicalOffsetTracker();
+        for (int i = 0; i < 5; i++) tracker.commit(tracker.reserve("orders", 0));
+        assertEquals(5L, tracker.nextLogicalOffset("orders", 0));
+        assertTrue(tracker.removePartition("orders", 0));
+        assertEquals(0L, tracker.nextLogicalOffset("orders", 0),
+            "after removal, the partition reads as never-seen");
+        // Second remove on the same key is a no-op (idempotent).
+        assertFalse(tracker.removePartition("orders", 0));
+        // Fresh reservations start at 0.
+        assertEquals(0L, tracker.reserve("orders", 0).logicalOffset());
+    }
+
+    @Test
+    public void removePartitionRefusesWhileReservationOutstanding() {
+        // If a produce is mid-flight, dropping the state would lose the reservation lock and
+        // could let the partition's next-offset regress on the next reserve. Refuse loudly.
+        LogicalOffsetTracker tracker = new LogicalOffsetTracker();
+        Reservation r = tracker.reserve("orders", 0);
+        assertThrows(IllegalStateException.class,
+            () -> tracker.removePartition("orders", 0));
+        // Once committed, removal is allowed again.
+        tracker.commit(r);
+        assertTrue(tracker.removePartition("orders", 0));
+    }
+
+    @Test
+    public void removePartitionDoesNotTouchSiblings() {
+        LogicalOffsetTracker tracker = new LogicalOffsetTracker();
+        for (int i = 0; i < 3; i++) tracker.commit(tracker.reserve("orders", 0));
+        for (int i = 0; i < 7; i++) tracker.commit(tracker.reserve("orders", 1));
+        tracker.removePartition("orders", 0);
+        assertEquals(0L, tracker.nextLogicalOffset("orders", 0));
+        assertEquals(7L, tracker.nextLogicalOffset("orders", 1),
+            "sibling partition state must survive removal of a neighbour");
+    }
+
+    @Test
     public void reservationCarriesItsOwnLogicalTopicAndPartition() {
         // The Reservation will be passed across to the sidecar-index writer; it must carry
         // enough identity to address the right index file.

@@ -110,6 +110,39 @@ public final class LogicalOffsetTracker {
     }
 
     /**
+     * Drop all bookkeeping for one (logicalTopic, logicalPartition). Caller invariant: there must
+     * be no outstanding reservation — that would indicate a teardown racing an in-flight produce,
+     * which is a broker bug. Used when a logical partition is being deleted from the broker;
+     * lets the tracker's state map shrink rather than grow without bound over the broker's
+     * lifetime.
+     *
+     * @return {@code true} if a state entry existed and was removed; {@code false} if there was
+     *     nothing to remove (idempotent).
+     * @throws IllegalStateException if a reservation is currently outstanding on this partition.
+     */
+    public boolean removePartition(String logicalTopic, int logicalPartition) {
+        Objects.requireNonNull(logicalTopic, "logicalTopic");
+        Key key = new Key(logicalTopic, logicalPartition);
+        PartitionState s = states.get(key);
+        if (s == null) return false;
+        // Take the lock so we're synchronised against any in-flight reserve/commit. If the lock
+        // is held by another thread, the reservation it holds is the outstanding one; we will
+        // see it under our lock and refuse rather than silently dropping live state.
+        s.lock.lock();
+        try {
+            if (s.outstanding != null) {
+                throw new IllegalStateException(
+                    "cannot remove (" + logicalTopic + "," + logicalPartition
+                        + "): a reservation is outstanding");
+            }
+            states.remove(key, s);
+            return true;
+        } finally {
+            s.lock.unlock();
+        }
+    }
+
+    /**
      * Direct seeding of partition state, used during recovery from a sidecar or backing-log
      * scan. The reservation lock is not taken because recovery is single-threaded by contract.
      */

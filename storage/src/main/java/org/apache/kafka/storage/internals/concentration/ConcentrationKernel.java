@@ -175,6 +175,60 @@ public final class ConcentrationKernel implements AutoCloseable {
         tracker.advanceStartOffset(logicalTopic, logicalPartition, newStartOffset);
     }
 
+    // ------------------ Partition teardown ------------------
+
+    /**
+     * Drop all kernel state for one (logicalTopic, logicalPartition): close the sidecar handle,
+     * remove the cached handle, remove the tracker state, and delete the on-disk sidecar file.
+     * Used when the broker deletes a logical partition (or the whole logical topic, iterated
+     * partition-by-partition). Without this API the kernel's caches grow linearly with the total
+     * number of partitions ever produced to over the broker's lifetime — the production-readiness
+     * audit flagged that as an unbounded-growth liability.
+     *
+     * <p>Caller invariant: no produce reservation is in flight against this partition. The
+     * tracker raises {@link IllegalStateException} if one is, which the kernel re-throws after
+     * releasing the sidecar handle (file is already closed; map entry already gone — partial
+     * teardown is preferable to a leaked handle).
+     *
+     * @return {@code true} if any state existed and was removed; {@code false} if there was
+     *     nothing to remove.
+     */
+    public synchronized boolean removeLogicalPartition(String logicalTopic, int logicalPartition) throws IOException {
+        ensureOpen();
+        Objects.requireNonNull(logicalTopic, "logicalTopic");
+        LogicalPartition key = new LogicalPartition(logicalTopic, logicalPartition);
+        boolean removedAny = false;
+
+        // Order matters. Drop tracker state first because tracker.removePartition acquires the
+        // partition lock — that's the lock held throughout reserve→commit, so by the time it
+        // returns no in-flight commitProduce can still be using the sidecar handle. If we
+        // closed the sidecar first we'd risk yanking it out from under a concurrent append.
+        //
+        // Caller contract: the broker must have stopped serving this partition before calling
+        // here. tracker.removePartition surfaces a violation as IllegalStateException (an
+        // outstanding reservation indicates a still-live produce) which propagates without
+        // having touched anything yet.
+        if (tracker.removePartition(logicalTopic, logicalPartition)) {
+            removedAny = true;
+        }
+        LogicalSidecarIndex sidecar = sidecars.remove(key);
+        if (sidecar != null) {
+            sidecar.close();
+            removedAny = true;
+        }
+        File sidecarFile = recoverer.sidecarFile(logicalTopic, logicalPartition);
+        if (sidecarFile.exists()) {
+            // Delete is best-effort: if it fails (e.g., a stray open handle the kernel does not
+            // know about), surface as IOException so the caller knows the on-disk state diverged
+            // from the in-memory state.
+            if (!sidecarFile.delete()) {
+                throw new IOException("failed to delete sidecar file " + sidecarFile);
+            }
+            removedAny = true;
+        }
+        return removedAny;
+    }
+
     // ------------------ Recovery ------------------
 
     public void recoverFromSidecars(Collection<LogicalPartition> partitions) throws IOException {

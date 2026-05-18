@@ -302,6 +302,58 @@ public class ConcentrationKernelTest {
     }
 
     @Test
+    public void removeLogicalPartitionClosesSidecarAndDeletesFileAndTrackerState() throws IOException {
+        // Pins the unbounded-growth audit fix at the broker-facing surface: removeLogicalPartition
+        // must close the cached sidecar handle, delete the on-disk file, and drop the tracker
+        // state so a subsequent reserve starts fresh at offset 0.
+        kernel.declare(descriptor("orders", 4, "shared", 1));
+        kernel.commitProduce(kernel.reserveProduce("orders", 0), 100L);
+        kernel.commitProduce(kernel.reserveProduce("orders", 0), 200L);
+        assertEquals(2L, kernel.nextLogicalOffset("orders", 0));
+
+        // The sidecar file lives under <sidecarDir>/<logicalTopic>/<partition>.sidecar.
+        File sidecarFile = new File(new File(sidecarDir, "orders"), "0.sidecar");
+        assertTrue(sidecarFile.exists(), "sidecar file should have been created by produce");
+
+        assertTrue(kernel.removeLogicalPartition("orders", 0));
+        assertFalse(sidecarFile.exists(), "sidecar file must be deleted");
+        assertEquals(0L, kernel.nextLogicalOffset("orders", 0),
+            "tracker state must be wiped — partition reads as never-seen");
+
+        // Second remove is a no-op.
+        assertFalse(kernel.removeLogicalPartition("orders", 0));
+
+        // After removal, the partition can be re-produced to and the on-disk file reappears.
+        kernel.commitProduce(kernel.reserveProduce("orders", 0), 999L);
+        assertEquals(999L, kernel.resolveBackingOffset("orders", 0, 0L));
+        assertTrue(sidecarFile.exists());
+    }
+
+    @Test
+    public void removeLogicalPartitionRefusesWhenReservationInFlight() throws IOException {
+        kernel.declare(descriptor("orders", 4, "shared", 1));
+        Reservation r = kernel.reserveProduce("orders", 0);
+        // Sidecar was opened by reserveProduce indirectly? No — reserveProduce only touches the
+        // tracker. But sidecarFile may or may not exist; what matters is the tracker lock is
+        // held, so the remove must throw.
+        assertThrows(IllegalStateException.class,
+            () -> kernel.removeLogicalPartition("orders", 0));
+        // After committing, removal proceeds normally.
+        kernel.commitProduce(r, 50L);
+        assertTrue(kernel.removeLogicalPartition("orders", 0));
+    }
+
+    @Test
+    public void removeLogicalPartitionRejectsAfterClose() throws IOException {
+        kernel.declare(descriptor("orders", 4, "shared", 1));
+        kernel.commitProduce(kernel.reserveProduce("orders", 0), 0L);
+        kernel.close();
+        assertThrows(IllegalStateException.class,
+            () -> kernel.removeLogicalPartition("orders", 0));
+        kernel = null;
+    }
+
+    @Test
     public void reservationIdentityIsPreservedAcrossCommit() throws IOException {
         kernel.declare(descriptor("orders", 4, "shared", 1));
         Reservation r = kernel.reserveProduce("orders", 0);
