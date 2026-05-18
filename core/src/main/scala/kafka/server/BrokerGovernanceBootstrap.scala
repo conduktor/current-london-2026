@@ -417,17 +417,28 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
    *
    * <p>The loop is bounded by the same deadline as Phases 1 and 2 — total
    * startup-bootstrap wait is one number from the operator's perspective.
-   * Two failure modes both reach [[IllegalStateException]] and abort
-   * startup before any socket opens:
+   * The deadline is checked at the top of every iteration (Codex round-2
+   * audit finding: previously only zero-progress iterations checked it, so
+   * a [[drainOnce]] making slow forward progress could run past the
+   * deadline indefinitely). Three failure modes all reach
+   * [[IllegalStateException]] and abort startup before any socket opens:
    *
    * <ul>
-   *   <li>[[nextOffset]] catches up to a moving target but the cumulative
-   *       wait exceeds the deadline.</li>
-   *   <li>[[nextOffset]] makes <em>no</em> progress across two consecutive
+   *   <li>The cumulative drain wait exceeds the deadline, whether the
+   *       cursor is moving forward or stuck.</li>
+   *   <li>[[nextOffset]] makes <em>no</em> progress across consecutive
    *       [[drainOnce]] invocations — typically a persistent defensive
    *       empty-read, suggesting the local log dir or pager is unhealthy.
    *       Continuing to loop would burn CPU without producing the drain
-   *       the spec promises; fail-closed is the safe answer.</li>
+   *       the spec promises; we sleep and retry, but the deadline above
+   *       eventually trips us closed.</li>
+   *   <li>The local log object disappears while the loop is running. The
+   *       prior implementation treated a missing log as "no HW to drain
+   *       to" and silently returned 0 replayed — fail-open. The bootstrap
+   *       acceptance criterion is "all existing rules drained before
+   *       sockets open"; a vanished log means we cannot even compute the
+   *       HW we need to drain to, so the only safe answer is to refuse
+   *       to proceed. Codex round-2 audit finding.</li>
    * </ul>
    *
    * <p>The local high-watermark may itself advance during the loop (new
@@ -439,41 +450,50 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
    *
    * @return total records replayed across all [[drainOnce]] invocations
    * @throws IllegalStateException when the deadline elapses with the drain
-   *         incomplete
+   *         incomplete, or when the local log object disappears
    */
   private def drainToHighWatermark(deadlineNanos: Long,
                                    pollIntervalMs: Long): Long = {
     val tp = topicPartition
-    // Snapshot HW under the existing log handle. We resolved log via
-    // replicaManager.getLog(tp) immediately before calling here, but it
-    // is safer to re-resolve in case the log object briefly disappeared
-    // (extremely unusual after Phase 1 + Phase 2 succeeded, but the
-    // bootstrap path must not NPE — fall back to "treat as no HW to
-    // drain to" so the loop is a single no-op iteration).
-    val snapshotHw = replicaManager.getLog(tp).map(_.highWatermark).getOrElse(0L)
+    // Snapshot HW under the existing log handle. Phase 1 + Phase 2 already
+    // proved the log was open and this broker was in the replica set; the
+    // log disappearing here means a catastrophic local event (log dir
+    // unmount, dir-failure handler hitting it concurrently). The only
+    // safe answer is fail-closed — we cannot drain to an HW we do not
+    // know, and opening sockets without draining violates the bootstrap
+    // acceptance criterion. Codex round-2 audit P2 finding.
+    val snapshotHw = replicaManager.getLog(tp).map(_.highWatermark).getOrElse {
+      throw new IllegalStateException(
+        s"governance bootstrap: local log for $tp disappeared between Phase 2 " +
+          s"and Phase 3 — cannot determine high-watermark to drain to. Refusing " +
+          s"to open client traffic with an undrained rules log. Investigate " +
+          s"log-dir health / log-dir failure handlers and restart.")
+    }
     var totalReplayed = 0L
     while (nextOffset.get() < snapshotHw) {
+      // Deadline gate on every iteration, not only zero-progress ones. A
+      // drainOnce that advances slowly (eg. 1 record per call against a
+      // pager-thrashed disk) must NOT bypass the deadline by virtue of
+      // making forward progress — startup-bootstrap latency is a single
+      // operator-visible number and we honour it strictly.
+      if (System.nanoTime() >= deadlineNanos) {
+        throw new IllegalStateException(
+          s"governance bootstrap could not fully drain $tp before the " +
+            s"deadline elapsed; cursor at offset ${nextOffset.get()} with HW " +
+            s"$snapshotHw (replayed $totalReplayed records so far). Refusing " +
+            s"to open client traffic with a partial drain — increase the " +
+            s"bootstrap-deadline knob if the log is healthy but large, or " +
+            s"investigate disk / pager performance if drain is stalling.")
+      }
       val before = nextOffset.get()
       val replayed = drainOnce()
       totalReplayed += replayed
       val after = nextOffset.get()
       if (after == before) {
         // No progress this iteration. Either replay defensively bailed on
-        // an empty read, or the log object disappeared. Either way, sleep
-        // and retry — but if the deadline has elapsed, fail-closed: opening
-        // the socket with a partial drain would violate the bootstrap
-        // acceptance criterion. The operator needs to investigate the
-        // log dir / pager / disk state, not have us silently fail-open.
-        if (System.nanoTime() >= deadlineNanos) {
-          throw new IllegalStateException(
-            s"governance bootstrap could not fully drain $tp before the " +
-              s"deadline elapsed; cursor stuck at offset $after with HW " +
-              s"$snapshotHw. A persistent zero-byte read suggests the " +
-              s"local log dir or pager is unhealthy. Refusing to open " +
-              s"client traffic with a partial drain — investigate log4j " +
-              s"for log-loader errors / disk faults / pager pauses, then " +
-              s"restart.")
-        }
+        // an empty read, or the log object briefly hiccuped. Sleep and
+        // retry — the next iteration's deadline check is what eventually
+        // fails us closed if the situation persists.
         Thread.sleep(pollIntervalMs)
       }
     }

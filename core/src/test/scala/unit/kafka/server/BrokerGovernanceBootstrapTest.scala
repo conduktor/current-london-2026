@@ -736,6 +736,92 @@ class BrokerGovernanceBootstrapTest {
   }
 
   @Test
+  def drainStartupFailsClosedWhenDeadlineElapsesDuringForwardProgress(): Unit = {
+    // Codex round-2 audit P2: the prior implementation only checked the
+    // deadline on zero-progress iterations. A drainOnce that makes slow
+    // forward progress (eg. 1 record at a time against a pager-thrashed
+    // disk, or a tiered storage tier-down stall) would loop indefinitely
+    // past the operator-configured deadline because the cursor was
+    // advancing on every call.
+    //
+    // The fix: the deadline is gated at the TOP of every iteration so
+    // forward-progress drains are still bounded by the same single number
+    // operators set.
+    //
+    // Scenario: HW=10, drainOnce takes longer than the entire deadline to
+    // complete one iteration (simulated by sleeping inside log.read). The
+    // first iteration does make forward progress (returns one record) but
+    // the second iteration's top-of-loop deadline check trips closed.
+    val rm = mock(classOf[ReplicaManager])
+    val log = mock(classOf[UnifiedLog])
+    val engine = new RuleEngine()
+    when(rm.getLog(tp)).thenReturn(Some(log))
+    when(log.logStartOffset).thenReturn(0L)
+    when(log.highWatermark).thenReturn(10L)
+
+    when(log.read(0L, 1024 * 1024, FetchIsolation.HIGH_WATERMARK, true))
+      .thenAnswer { _ =>
+        // Burn the deadline inside the first drainOnce.
+        Thread.sleep(120L)
+        recordsAt(0L, new SimpleRecord("r1".getBytes(StandardCharsets.UTF_8),
+          envelope("true", ApiKeys.METADATA, 7)))
+      }
+    // If we ever reach a second drainOnce, this stub catches it.
+    when(log.read(1L, 1024 * 1024, FetchIsolation.HIGH_WATERMARK, true))
+      .thenReturn(new FetchDataInfo(new LogOffsetMetadata(1L), MemoryRecords.EMPTY))
+
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp)
+    val ex = assertThrows(classOf[IllegalStateException],
+      () => boot.drainStartup(deadlineMs = 50L, pollIntervalMs = 1L))
+    val msg = ex.getMessage
+    assertTrue(msg.contains("deadline elapsed") || msg.contains("partial drain"),
+      s"error must signal fail-closed on deadline despite forward progress, got: $msg")
+    // The first drainOnce did advance the cursor by one record, so the engine
+    // legitimately reflects that partial drain — the throw exists to abort
+    // BrokerServer startup BEFORE any client socket opens, not to roll back
+    // the in-engine RuleSet. The acceptance criterion is "no client traffic
+    // sees a partially-drained engine", and the throw delivers exactly that.
+    assertTrue(engine.active().size() < 10,
+      "partial drain expected; the test exists to prove that the deadline " +
+        "fires despite forward progress, not that drained rules are unwound")
+  }
+
+  @Test
+  def drainStartupFailsClosedWhenLocalLogDisappearsBetweenPhase2AndPhase3(): Unit = {
+    // Codex round-2 audit P2: the prior drainToHighWatermark resolved the
+    // log handle with `replicaManager.getLog(tp).map(_.highWatermark).getOrElse(0L)`.
+    // If the log disappeared between Phase 2's check and Phase 3's HW
+    // snapshot (eg. a log-dir failure handler running concurrently), the
+    // loop condition `nextOffset < 0` was false immediately, the method
+    // returned 0 silently, and BrokerServer happily opened sockets with an
+    // empty RuleSet despite real rules potentially existing on the leader.
+    //
+    // The fix: a missing log at Phase 3 is fail-closed. We cannot drain to
+    // an HW we cannot determine, and opening sockets without a drain
+    // violates the bootstrap acceptance criterion.
+    //
+    // Scenario: getLog returns Some(log) for Phase 1 + Phase 2 (proves the
+    // log was open and the broker is in the ISR), then None for the Phase
+    // 3 snapshot. drainStartup must throw, not return 0.
+    val rm = mock(classOf[ReplicaManager])
+    val log = mock(classOf[UnifiedLog])
+    val engine = new RuleEngine()
+    // Phase 1 + Phase 2 see the log; Phase 3 sees it gone.
+    when(rm.getLog(tp)).thenReturn(Some(log)).thenReturn(None)
+    when(log.logStartOffset).thenReturn(0L)
+    when(log.highWatermark).thenReturn(3L)
+
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp)
+    val ex = assertThrows(classOf[IllegalStateException],
+      () => boot.drainStartup(deadlineMs = 5_000L, pollIntervalMs = 1L))
+    val msg = ex.getMessage
+    assertTrue(msg.contains("disappeared") || msg.contains("high-watermark"),
+      s"error must signal log-disappearance fail-closed, got: $msg")
+    assertEquals(0, engine.active().size(),
+      "no rule must be installed when the local log disappears at Phase 3")
+  }
+
+  @Test
   def drainStartupFailsClosedIfDrainMakesNoProgressBeforeDeadline(): Unit = {
     // Codex final-audit P0 fail-closed branch: if drainOnce never advances
     // the cursor (a persistent zero-byte read suggesting log-dir / pager
