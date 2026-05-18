@@ -159,8 +159,18 @@ public class SocketServerConfigs {
     public static final String HTTP_BRIDGE_ENABLED_DOC = "Whether to start the embedded HTTP bridge inside the broker process. When enabled, the broker listens on the configured HTTP host/port and exposes /v1/topics/{topic}/records (POST for produce, GET for fetch), translating HTTP JSON to Kafka ProduceRequest/FetchRequest objects that flow through the same RequestChannel, authorization and quota paths as the binary protocol. Disabled by default so existing deployments are unaffected.";
 
     public static final String HTTP_BRIDGE_HOST_CONFIG = "http.bridge.host";
-    public static final String HTTP_BRIDGE_HOST_DEFAULT = "0.0.0.0";
-    public static final String HTTP_BRIDGE_HOST_DOC = "Host or interface the HTTP bridge listener binds to when " + HTTP_BRIDGE_ENABLED_CONFIG + " is true. Defaults to 0.0.0.0 (all interfaces).";
+    public static final String HTTP_BRIDGE_HOST_DEFAULT = "127.0.0.1";
+    public static final String HTTP_BRIDGE_HOST_DOC = "Host or interface the HTTP bridge listener binds to when " + HTTP_BRIDGE_ENABLED_CONFIG + " is true. " +
+        "Defaults to 127.0.0.1 (loopback) because the bridge has no per-request authentication in v1 and exposes the " +
+        "broker as KafkaPrincipal.ANONYMOUS to anyone who can reach the port. To make the bridge reachable from other " +
+        "hosts, set this to a specific trusted interface address, or to a wildcard (0.0.0.0 / ::) — and only after " +
+        "(a) firewalling the bridge port so direct access from outside the trust boundary is impossible (an auth proxy " +
+        "is not protective if clients can still reach the bridge directly), (b) fronting it with an authenticating " +
+        "reverse proxy or mTLS ingress, and (c) scoping ACLs for User:ANONYMOUS to exactly the topics the bridge is " +
+        "meant to expose. In containers and Kubernetes pods, 127.0.0.1 is shared inside the pod network namespace " +
+        "(a sidecar can reach it, other pods cannot) — set this to 0.0.0.0 or the pod IP when intentionally exposing " +
+        "the bridge through an ingress, never as a network convenience. The broker emits a separate WARN at startup " +
+        "whenever this resolves to a wildcard, so log scrapers can page on accidental exposure.";
 
     public static final String HTTP_BRIDGE_PORT_CONFIG = "http.bridge.port";
     public static final int HTTP_BRIDGE_PORT_DEFAULT = 8082;

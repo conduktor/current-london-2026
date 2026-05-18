@@ -95,7 +95,7 @@ JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 ./gradlew \
 - **`KafkaHttpServerIntegrationTest`** — 15 tests against real embedded Jetty + Jetty `HttpClient`. Covers the PROMPT.md spec scenario (0 OK / 1 offline / 2 OK → 207) verbatim, Retry-After on quota throttle, ACL → 403, malformed JSON / missing records → 400, fetch HATEOAS with a cursor round-trip over the wire, deferred-future correctness, submitter throwable → 500.
 - **`SocketServerConfigs`** — three new config keys:
   - `http.bridge.enabled` (Boolean, default false)
-  - `http.bridge.host` (String, default `0.0.0.0`)
+  - `http.bridge.host` (String, default `127.0.0.1` — loopback only; see Security model)
   - `http.bridge.port` (Int, default 8082 — matches Confluent REST Proxy convention)
 - **`KafkaConfig.scala`** — exposes the three above as `httpBridgeEnabled` / `httpBridgeHost` / `httpBridgePort`.
 - **`BrokerServer.scala`** — `httpBridgeServer` field, started after the SocketServer acceptors are up, stopped before `socketServer.stopProcessingRequests()`. Gated on `config.httpBridgeEnabled`.
@@ -179,4 +179,4 @@ http.bridge.host=127.0.0.1
 http.bridge.port=8082
 ```
 
-Then read the Security model section above before exposing the listener to any network you do not control. The default in the example is `127.0.0.1`, not `0.0.0.0`, because the default a reader copies must not be the dangerous one.
+The example mirrors the config default (`127.0.0.1`, loopback only). To make the bridge reachable from other hosts, change `http.bridge.host` — but read the Security model section above first, and expect a secondary WARN in the broker log whenever the host is set to a wildcard (`0.0.0.0` or `::`).

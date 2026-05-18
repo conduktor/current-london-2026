@@ -24,7 +24,7 @@ import kafka.log.remote.RemoteLogManager
 import com.fasterxml.jackson.databind.ObjectMapper
 import kafka.network.{DataPlaneAcceptor, SocketServer}
 import kafka.network.http.KafkaApiRequestSubmitter
-import org.apache.kafka.network.http.{KafkaHttpBridge, KafkaHttpServer}
+import org.apache.kafka.network.http.{HostBindingValidator, KafkaHttpBridge, KafkaHttpServer}
 import org.apache.kafka.common.security.auth.KafkaPrincipal
 import kafka.raft.KafkaRaftManager
 import kafka.server.metadata._
@@ -658,6 +658,24 @@ class BrokerServer(
           "Before exposing it: (1) bind http.bridge.host to a trusted interface, (2) front it with an " +
           "authenticating reverse proxy or mTLS ingress, (3) scope ACLs so User:ANONYMOUS has only the topic " +
           "operations this bridge is intended to expose. See HTTP_BRIDGE.md \"Security model\".")
+        // Secondary warning specifically for wildcard binds — the v1 default is loopback, so a wildcard means the
+        // operator explicitly chose to publish the listener network-wide. That choice is sometimes correct (behind a
+        // reverse proxy or an inbound firewall) but operators should be paged by their log scraper whenever it
+        // appears, because the combination "ANONYMOUS principal + wildcard host + missing front-end" is the textbook
+        // anonymous-data-plane-takeover misconfiguration.
+        //
+        // Detection is delegated to HostBindingValidator.isWildcardBind so we semantically resolve the host through
+        // InetAddress.getAllByName + isAnyLocalAddress rather than string-matching "0.0.0.0" — that catches every
+        // any-local spelling Java accepts (0, 0.0.0.0, ::, [::], 0:0:0:0:0:0:0:0, blank, etc.) and is unit-tested in
+        // HostBindingValidatorTest.
+        if (HostBindingValidator.isWildcardBind(config.httpBridgeHost)) {
+          warn(s"HTTP bridge is binding to wildcard interface '${config.httpBridgeHost}'. " +
+            "Every host with network reachability to this broker's bridge port can act as User:ANONYMOUS. " +
+            "Direct access to the bridge port MUST be impossible from outside the trust boundary — an auth proxy " +
+            "is not protective if clients can reach the bridge directly. Confirm a firewall / security group / " +
+            "network policy enforces that, and that User:ANONYMOUS ACLs are scoped to exactly the topics the " +
+            "bridge is meant to expose.")
+        }
       }
 
       maybeChangeStatus(STARTING, STARTED)
