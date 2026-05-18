@@ -24,6 +24,7 @@ import org.apache.kafka.common.config.ConfigDef.Type.INT
 import org.apache.kafka.common.config.{ConfigException, SslConfigs, TopicConfig}
 import org.apache.kafka.common.errors.InvalidConfigurationException
 import org.apache.kafka.server.common.MetadataVersion
+import org.apache.kafka.server.views.ViewTopicConfig
 import org.junit.jupiter.api.Assertions._
 import org.junit.jupiter.api.Test
 
@@ -94,6 +95,11 @@ class LogConfigTest {
       case TopicConfig.COMPRESSION_ZSTD_LEVEL_CONFIG => assertPropertyInvalid(name, "not_a_number", "-0.1")
       case TopicConfig.REMOTE_LOG_COPY_DISABLE_CONFIG => assertPropertyInvalid(name, "not_a_number", "remove", "0")
       case TopicConfig.REMOTE_LOG_DELETE_ON_DISABLE_CONFIG => assertPropertyInvalid(name, "not_a_number", "remove", "0")
+
+      // view.backing.topic / view.cel.predicate accept any string at parse time. Their
+      // semantic validation runs in LogConfig.validateValues (covered by ViewLogConfigTest).
+      case ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG => // no invalid construction-time values
+      case ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG => // no invalid construction-time values
 
       case _ => assertPropertyInvalid(name, "not_a_number", "-1")
     })
@@ -445,6 +451,31 @@ class LogConfigTest {
     val logProps = new Properties
     logProps.put(TopicConfig.REMOTE_LOG_DELETE_ON_DISABLE_CONFIG, deleteOnDisable.toString)
     LogConfig.validate(logProps)
+  }
+
+  @Test
+  def testViewConfigsRoundTripWhenAllThreeAreSet(): Unit = {
+    // Sanity check that a fully-configured view passes through both LogConfig.validate and
+    // LogConfig construction without losing the values. Covers the integration of the new
+    // view configs with the existing config plumbing.
+    val props = new Properties()
+    props.put(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, "orders-raw")
+    props.put(ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.color == 'red'")
+    props.put(ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+    LogConfig.validate(props)
+    val cfg = new LogConfig(props)
+    assertTrue(cfg.isView)
+    assertEquals("orders-raw", cfg.viewBackingTopic)
+    assertEquals("body.color == 'red'", cfg.viewCelPredicate)
+    assertEquals(ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE, cfg.viewOffsetMode)
+  }
+
+  @Test
+  def testViewConfigsRejectedWhenPartial(): Unit = {
+    val props = new Properties()
+    props.put(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, "orders-raw")
+    // Missing predicate + mode — must be rejected before the LogConfig is exposed anywhere.
+    assertThrows(classOf[InvalidConfigurationException], () => LogConfig.validate(props))
   }
 
   @Test

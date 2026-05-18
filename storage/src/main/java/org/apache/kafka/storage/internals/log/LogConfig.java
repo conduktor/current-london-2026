@@ -35,6 +35,10 @@ import org.apache.kafka.server.config.QuotaConfig;
 import org.apache.kafka.server.config.ServerLogConfigs;
 import org.apache.kafka.server.config.ServerTopicConfigSynonyms;
 import org.apache.kafka.server.record.BrokerCompressionType;
+import org.apache.kafka.server.views.PredicateCompiler;
+import org.apache.kafka.server.views.PredicateLimits;
+import org.apache.kafka.server.views.PredicateValidationException;
+import org.apache.kafka.server.views.ViewTopicConfig;
 
 import java.util.Collections;
 import java.util.HashMap;
@@ -150,7 +154,12 @@ public class LogConfig extends AbstractConfig {
             TopicConfig.REMOTE_LOG_DELETE_ON_DISABLE_CONFIG,
             TopicConfig.REMOTE_LOG_COPY_DISABLE_CONFIG,
             QuotaConfig.LEADER_REPLICATION_THROTTLED_REPLICAS_CONFIG,
-            QuotaConfig.FOLLOWER_REPLICATION_THROTTLED_REPLICAS_CONFIG
+            QuotaConfig.FOLLOWER_REPLICATION_THROTTLED_REPLICAS_CONFIG,
+            // Topic-view configs are broker-only and have no server-wide default; topics opt in
+            // explicitly. Excluded from the static-init dependency check.
+            ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG,
+            ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG,
+            ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG
     );
 
     public static final ConfigDef SERVER_CONFIG_DEF = new ConfigDef()
@@ -257,7 +266,27 @@ public class LogConfig extends AbstractConfig {
                 .define(TopicConfig.LOCAL_LOG_RETENTION_BYTES_CONFIG, LONG, DEFAULT_LOCAL_RETENTION_BYTES, atLeast(-2), MEDIUM,
                         TopicConfig.LOCAL_LOG_RETENTION_BYTES_DOC)
                 .define(TopicConfig.REMOTE_LOG_COPY_DISABLE_CONFIG, BOOLEAN, false, MEDIUM, TopicConfig.REMOTE_LOG_COPY_DISABLE_DOC)
-                .define(TopicConfig.REMOTE_LOG_DELETE_ON_DISABLE_CONFIG, BOOLEAN, false, MEDIUM, TopicConfig.REMOTE_LOG_DELETE_ON_DISABLE_DOC);
+                .define(TopicConfig.REMOTE_LOG_DELETE_ON_DISABLE_CONFIG, BOOLEAN, false, MEDIUM, TopicConfig.REMOTE_LOG_DELETE_ON_DISABLE_DOC)
+                // ---- topic views ----
+                // The three view configs are read-only at fetch time, ignored when null, and
+                // mutually-required: validateValues rejects partial configurations so the broker
+                // never observes a "half-view" state.
+                .define(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, STRING, null, LOW,
+                        ViewTopicConfig.VIEW_BACKING_TOPIC_DOC)
+                .define(ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, STRING, null, LOW,
+                        ViewTopicConfig.VIEW_CEL_PREDICATE_DOC)
+                .define(ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, STRING, null,
+                        ConfigDef.LambdaValidator.with(
+                                (name, value) -> {
+                                    if (value != null
+                                            && !ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE.equals(value)) {
+                                        throw new ConfigException(name, value,
+                                                "String must be one of: "
+                                                        + ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE);
+                                    }
+                                },
+                                () -> "[" + ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE + "]"),
+                        LOW, ViewTopicConfig.VIEW_OFFSET_MODE_DOC);
     }
 
     public final Set<String> overriddenConfigs;
@@ -297,6 +326,13 @@ public class LogConfig extends AbstractConfig {
 
     private final RemoteLogConfig remoteLogConfig;
     private final int maxMessageSize;
+
+    // ---- topic views ----
+    // All three are null for a regular topic, all three are non-null for a view.
+    // validateValues enforces that invariant at create/alter time.
+    private final String viewBackingTopic;
+    private final String viewCelPredicate;
+    private final String viewOffsetMode;
     private final Map<?, ?> props;
 
     public LogConfig(Map<?, ?> props) {
@@ -344,6 +380,30 @@ public class LogConfig extends AbstractConfig {
         this.followerReplicationThrottledReplicas = Collections.unmodifiableList(getList(QuotaConfig.FOLLOWER_REPLICATION_THROTTLED_REPLICAS_CONFIG));
 
         remoteLogConfig = new RemoteLogConfig(this);
+
+        this.viewBackingTopic = getString(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG);
+        this.viewCelPredicate = getString(ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG);
+        this.viewOffsetMode = getString(ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG);
+    }
+
+    /** @return true iff this topic is configured as a view (all three view configs are set). */
+    public boolean isView() {
+        return viewBackingTopic != null && viewCelPredicate != null && viewOffsetMode != null;
+    }
+
+    /** @return the backing-topic name for a view, or {@code null} when this is a regular topic. */
+    public String viewBackingTopic() {
+        return viewBackingTopic;
+    }
+
+    /** @return the CEL predicate source for a view, or {@code null} when this is a regular topic. */
+    public String viewCelPredicate() {
+        return viewCelPredicate;
+    }
+
+    /** @return the offset-mode for a view, or {@code null} when this is a regular topic. */
+    public String viewOffsetMode() {
+        return viewOffsetMode;
     }
 
     private Optional<Compression> getCompression() {
@@ -482,6 +542,64 @@ public class LogConfig extends AbstractConfig {
                     + TopicConfig.MIN_COMPACTION_LAG_MS_CONFIG + " (" + minCompactionLag + ") > "
                     + TopicConfig.MAX_COMPACTION_LAG_MS_CONFIG + " (" + maxCompactionLag + ")");
         }
+        validateViewConfigs(props);
+    }
+
+    /**
+     * Enforce the "all-or-none" invariant on the three view-topic configs and validate the CEL
+     * predicate at config-set time so consumers never hit a bad predicate on the fetch path.
+     *
+     * Rules:
+     *  - If none of {@link ViewTopicConfig#VIEW_BACKING_TOPIC_CONFIG},
+     *    {@link ViewTopicConfig#VIEW_CEL_PREDICATE_CONFIG},
+     *    {@link ViewTopicConfig#VIEW_OFFSET_MODE_CONFIG} is set, the topic is regular.
+     *  - If all three are set, the predicate must compile under the default sandbox limits and
+     *    the backing-topic name must be a non-blank string.
+     *  - Any strict, non-empty subset is rejected — half-configured views would either fail
+     *    silently or behave inconsistently across brokers, so they are not allowed.
+     *
+     * @throws InvalidConfigurationException when the view configs are inconsistent or the
+     *         predicate fails to compile.
+     */
+    private static void validateViewConfigs(Map<?, ?> props) {
+        String backing = stringOrNull(props.get(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG));
+        String predicate = stringOrNull(props.get(ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG));
+        String mode = stringOrNull(props.get(ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG));
+
+        int present = (backing != null ? 1 : 0)
+                + (predicate != null ? 1 : 0)
+                + (mode != null ? 1 : 0);
+        if (present == 0) {
+            return;
+        }
+        if (present != 3) {
+            throw new InvalidConfigurationException("Topic-view configuration is incomplete: "
+                    + ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG + ", "
+                    + ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG + " and "
+                    + ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG
+                    + " must all be set together, or none of them. Got "
+                    + present + "/3.");
+        }
+
+        if (backing.trim().isEmpty()) {
+            throw new InvalidConfigurationException(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG
+                    + " must be a non-blank topic name.");
+        }
+        if (predicate.trim().isEmpty()) {
+            throw new InvalidConfigurationException(ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG
+                    + " must be a non-blank expression.");
+        }
+        try {
+            new PredicateCompiler(PredicateLimits.defaults()).compile(predicate);
+        } catch (PredicateValidationException badPredicate) {
+            throw new InvalidConfigurationException("Invalid "
+                    + ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG + ": " + badPredicate.getMessage(),
+                    badPredicate);
+        }
+    }
+
+    private static String stringOrNull(Object o) {
+        return (o instanceof String) ? (String) o : null;
     }
 
     /**
@@ -657,6 +775,9 @@ public class LogConfig extends AbstractConfig {
                 ", followerReplicationThrottledReplicas=" + followerReplicationThrottledReplicas +
                 ", remoteLogConfig=" + remoteLogConfig +
                 ", maxMessageSize=" + maxMessageSize +
+                ", viewBackingTopic=" + viewBackingTopic +
+                ", viewCelPredicate=" + viewCelPredicate +
+                ", viewOffsetMode=" + viewOffsetMode +
                 '}';
     }
 
