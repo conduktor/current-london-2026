@@ -100,21 +100,36 @@ object BrokerServer {
 
   /**
    * Fail-closed enforcement of {@code cleanup.policy=compact} on the
-   * {@code __governance} topic. Audit round-5 finding {@code a016e43dc} and
-   * round-12 tombstone/compaction sub-agent HIGH-1.
+   * {@code __governance} topic. Audit round-5 finding {@code a016e43dc},
+   * round-12 tombstone/compaction sub-agent HIGH-1, and round-13
+   * log-compaction race sub-agent HIGH-1 (which tightened the check from
+   * "includes compact" to "equals compact exactly").
    *
    * <p>If {@code __governance} exists in the metadata image and its effective
-   * cleanup policy does NOT include {@code compact}, throw
+   * cleanup policy is NOT exactly {@code compact}, throw
    * [[IllegalStateException]]. Callers in [[BrokerServer.startup]] do not catch
    * — broker startup aborts before [[kafka.network.SocketServer]] opens client
    * traffic, with the offending policy and a one-line remediation command in
    * the exception message.
    *
+   * <p>Why exact-match, not substring: {@code compact,delete} is a valid Kafka
+   * policy that enables BOTH compaction AND retention-based whole-segment
+   * deletion. A PUT rule with no tombstone still gets deleted once
+   * {@code retention.ms} (default 7 days) elapses on its segment — exactly the
+   * fail-stale regression this gate exists to close. Allowing
+   * {@code compact,delete} would re-open the hole the gate is trying to plug.
+   * Operators with a legitimate need to also enforce retention (e.g. to GC
+   * very old tombstones) should accept the fail-stale risk explicitly via a
+   * future opt-in property, not slip through a substring loophole.
+   *
    * <p>"Effective policy" mirrors how the log layer resolves it: topic-level
    * override if present, otherwise the broker-default
    * {@code log.cleanup.policy} list joined by comma. Both are passed in by the
    * caller; this helper only enforces the check and crafts the message, so a
-   * unit test can drive every branch without a live cluster.
+   * unit test can drive every branch without a live cluster. The list is
+   * compared after a trim of each element so that
+   * {@code log.cleanup.policy=compact, delete} (a single broker-default value
+   * with a stray space) is treated the same as {@code [compact, delete]}.
    *
    * <p>When {@code topicExists} is false, the helper returns silently — fresh
    * clusters where the operator has not yet created {@code __governance} are
@@ -135,18 +150,26 @@ object BrokerServer {
       topicLevelCleanupPolicy: String,
       brokerDefaultCleanupPolicy: util.List[String]): Unit = {
     if (!topicExists) return
-    val effectivePolicy = if (topicLevelCleanupPolicy != null) topicLevelCleanupPolicy
+    val raw = if (topicLevelCleanupPolicy != null) topicLevelCleanupPolicy
       else brokerDefaultCleanupPolicy.asScala.mkString(",")
-    if (!effectivePolicy.contains(TopicConfig.CLEANUP_POLICY_COMPACT)) {
+    // Normalise: split on comma, trim whitespace per element, sort + lowercase.
+    // {compact} (single-element set) is the ONLY accepted shape.
+    val components = raw.split(",").iterator
+      .map(_.trim.toLowerCase(java.util.Locale.ROOT))
+      .filter(_.nonEmpty)
+      .toSet
+    if (components != Set(TopicConfig.CLEANUP_POLICY_COMPACT)) {
       throw new IllegalStateException(
-        s"Topic ${GovernanceTopic.NAME} has effective cleanup.policy='$effectivePolicy' " +
-          s"which does NOT include '${TopicConfig.CLEANUP_POLICY_COMPACT}'. Rule records on " +
-          s"this topic would be deleted by retention.ms (default 7 days), causing CEL DENY " +
-          s"rules to silently disappear and the broker to fail OPEN after restart. The broker " +
+        s"Topic ${GovernanceTopic.NAME} has effective cleanup.policy='$raw' " +
+          s"which is not exactly '${TopicConfig.CLEANUP_POLICY_COMPACT}'. " +
+          s"The 'delete' co-policy (i.e. 'compact,delete') is NOT accepted on " +
+          s"this topic because retention.ms (default 7 days) would still delete " +
+          s"rule records whole-segment, causing CEL DENY rules to silently " +
+          s"disappear and the broker to fail OPEN after restart. The broker " +
           s"refuses to start until this is fixed. Run: " +
           s"bin/kafka-configs.sh --bootstrap-server <broker> --alter --entity-type topics " +
           s"--entity-name ${GovernanceTopic.NAME} --add-config cleanup.policy=compact " +
-          s"(audit finding a016e43dc, round-12 HIGH-1).")
+          s"(audit finding a016e43dc, round-12 HIGH-1, round-13 HIGH-1).")
     }
   }
 }

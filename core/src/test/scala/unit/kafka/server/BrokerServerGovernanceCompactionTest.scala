@@ -64,12 +64,68 @@ class BrokerServerGovernanceCompactionTest {
   }
 
   @Test
-  def topicLevelOverrideCompactAndDeleteIsAllowed(): Unit = {
-    // "compact,delete" is a valid mixed policy — Kafka keeps compaction
-    // semantics while also enforcing retention. The check looks for the
-    // substring "compact" in the comma-separated list, so this passes.
+  def topicLevelOverrideCompactAndDeleteFailsClosed(): Unit = {
+    // Round-13 HIGH-1 tightening: "compact,delete" is a valid Kafka policy
+    // (compaction PLUS retention-based whole-segment deletion), but it
+    // defeats the entire purpose of this gate — once retention.ms (default
+    // 7 days) elapses, rule records get deleted by the retention path even
+    // though compaction is also enabled. The previous round-12 substring
+    // check ("contains compact") let this through; the round-13 fix
+    // requires exact-match on the policy set.
+    val ex = assertThrows(classOf[IllegalStateException],
+      () => BrokerServer.requireGovernanceTopicCompactPolicy(
+        topicExists = true, "compact,delete", brokerDefaultList("delete")))
+    val msg = ex.getMessage
+    assertTrue(msg.contains("compact,delete"),
+      s"message must reflect the offending policy verbatim, got: $msg")
+    assertTrue(msg.contains("retention.ms"),
+      s"message must name retention.ms as the failure mode, got: $msg")
+    assertTrue(msg.contains("kafka-configs.sh"),
+      s"message must include the remediation command, got: $msg")
+  }
+
+  @Test
+  def deleteCompactOrderIsNormalisedAndFailsClosed(): Unit = {
+    // Order is normalised — "delete,compact" is semantically the same
+    // mixed policy as "compact,delete" and must fail-closed the same way.
+    val ex = assertThrows(classOf[IllegalStateException],
+      () => BrokerServer.requireGovernanceTopicCompactPolicy(
+        topicExists = true, "delete,compact", brokerDefaultList("delete")))
+    assertTrue(ex.getMessage.contains("delete,compact"),
+      s"message must reflect the policy as authored, got: ${ex.getMessage}")
+  }
+
+  @Test
+  def whitespaceInPolicyListIsTolerated(): Unit = {
+    // "compact, delete" (stray space after the comma) is still the
+    // mixed policy — accept the value as-authored but fail-closed for
+    // the same reason. The trim normalisation must not silently turn
+    // "compact" into "compact" while allowing " compact" to be a different
+    // token; both must split, trim, then compare against {compact}.
+    val ex = assertThrows(classOf[IllegalStateException],
+      () => BrokerServer.requireGovernanceTopicCompactPolicy(
+        topicExists = true, "compact, delete", brokerDefaultList("delete")))
+    assertTrue(ex.getMessage.contains("compact, delete"),
+      s"message must reflect the policy as authored, got: ${ex.getMessage}")
+  }
+
+  @Test
+  def trimmedCompactValueIsAllowed(): Unit = {
+    // " compact " (leading + trailing whitespace) — just compaction with
+    // ergonomic whitespace, must be accepted after trim.
     BrokerServer.requireGovernanceTopicCompactPolicy(
-      topicExists = true, "compact,delete", brokerDefaultList("delete"))
+      topicExists = true, " compact ", brokerDefaultList("delete"))
+  }
+
+  @Test
+  def mixedCaseCompactIsAllowed(): Unit = {
+    // Kafka's TopicConfig parses cleanup.policy via ConfigDef, which
+    // typically lowercases the value, but the @ClusterConfigProperty path
+    // and direct Admin --add-config calls do not always normalise case.
+    // Accept "Compact" the same as "compact" so a case-only typo doesn't
+    // trip the gate and confuse operators.
+    BrokerServer.requireGovernanceTopicCompactPolicy(
+      topicExists = true, "Compact", brokerDefaultList("delete"))
   }
 
   @Test
@@ -112,15 +168,19 @@ class BrokerServerGovernanceCompactionTest {
   }
 
   @Test
-  def brokerDefaultListJoinedWithComma(): Unit = {
-    // log.cleanup.policy is List<String>; the helper joins it with commas
-    // when no topic-level override is present, matching how LogManager
-    // resolves the policy when opening the log. A multi-element default of
-    // [compact, delete] is valid and the join surfaces "compact" in the
-    // substring check.
-    BrokerServer.requireGovernanceTopicCompactPolicy(
-      topicExists = true, topicLevelCleanupPolicy = null,
-      brokerDefaultList("compact", "delete"))
+  def brokerDefaultListJoinedWithCommaFailsClosed(): Unit = {
+    // Round-13 HIGH-1: a multi-element broker-default list of
+    // [compact, delete] is a valid Kafka mixed policy at the log layer but
+    // is rejected here for the same reason as topic-level "compact,delete"
+    // — retention.ms still applies and rule records age out. The helper
+    // joins with commas to match the canonical form of the topic-level
+    // override and the same fail-closed check then trips.
+    val ex = assertThrows(classOf[IllegalStateException],
+      () => BrokerServer.requireGovernanceTopicCompactPolicy(
+        topicExists = true, topicLevelCleanupPolicy = null,
+        brokerDefaultList("compact", "delete")))
+    assertTrue(ex.getMessage.contains("compact,delete"),
+      s"message must reflect the joined broker-default policy, got: ${ex.getMessage}")
   }
 
   @Test
