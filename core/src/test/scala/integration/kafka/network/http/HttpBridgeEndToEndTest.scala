@@ -21,10 +21,16 @@ import kafka.utils.TestUtils
 import org.apache.kafka.clients.admin.{Admin, NewTopic}
 import org.apache.kafka.clients.consumer.{ConsumerConfig, KafkaConsumer}
 import org.apache.kafka.common.TopicPartition
+import org.apache.kafka.common.acl.AclOperation
+import org.apache.kafka.common.resource.ResourceType
+import org.apache.kafka.common.security.auth.KafkaPrincipal
 import org.apache.kafka.common.serialization.StringDeserializer
 import org.apache.kafka.common.test.{KafkaClusterTestKit, TestKitNodes}
 import org.apache.kafka.metadata.BrokerState
+import org.apache.kafka.metadata.authorizer.StandardAuthorizer
 import org.apache.kafka.network.SocketServerConfigs
+import org.apache.kafka.server.authorizer.{Action, AuthorizableRequestContext, AuthorizationResult}
+import org.apache.kafka.server.config.ServerConfigs
 import org.junit.jupiter.api.Assertions._
 import org.junit.jupiter.api.{Tag, Test, Timeout}
 
@@ -32,6 +38,7 @@ import java.net.URI
 import java.net.http.{HttpClient, HttpRequest, HttpResponse}
 import java.nio.charset.StandardCharsets
 import java.time.Duration
+import java.util
 import java.util.Collections
 import java.util.Properties
 
@@ -350,6 +357,87 @@ class HttpBridgeEndToEndTest {
     }
   }
 
+  @Test
+  def aclDeniedTopicReturns403(): Unit = {
+    // PROMPT.md FS4: a POST to a topic the ANONYMOUS principal lacks WRITE on must return 403, and the body must
+    // carry the standard {errorCode, errorMessage} envelope. We boot the cluster with a custom authorizer that
+    // selectively denies WRITE on the test topic for ANONYMOUS — every other operation (CLUSTER bootstrap,
+    // CreateTopics, etc.) is allowed so the cluster still functions and the admin client still works. This is the
+    // smallest setup that exercises the full Kafka authorizer pipeline end-to-end through the HTTP bridge without
+    // needing SASL/SSL plumbing.
+    val deniedTopic = HttpBridgeEndToEndTest.DenyAnonymousAuthorizer.DeniedTopic
+    val allowedTopic = "http-bridge-acl-allow"
+    val cluster = new KafkaClusterTestKit.Builder(
+      new TestKitNodes.Builder()
+        .setNumBrokerNodes(1)
+        .setNumControllerNodes(1)
+        .build())
+      .setConfigProp(SocketServerConfigs.HTTP_BRIDGE_ENABLED_CONFIG, "true")
+      .setConfigProp(SocketServerConfigs.HTTP_BRIDGE_HOST_CONFIG, "127.0.0.1")
+      .setConfigProp(SocketServerConfigs.HTTP_BRIDGE_PORT_CONFIG, "0")
+      .setConfigProp(ServerConfigs.AUTHORIZER_CLASS_NAME_CONFIG,
+        classOf[HttpBridgeEndToEndTest.DenyAnonymousAuthorizer].getName)
+      // ANONYMOUS must still be super on the controller-internal path so the broker can register itself, fetch
+      // metadata, and answer heartbeats — those calls don't go near our deniedTopic guard.
+      .setConfigProp(StandardAuthorizer.SUPER_USERS_CONFIG, "User:ANONYMOUS")
+      .build()
+    try {
+      cluster.format()
+      cluster.startup()
+      cluster.waitForReadyBrokers()
+
+      val broker = cluster.brokers().get(0)
+      TestUtils.waitUntilTrue(() => broker.brokerState == BrokerState.RUNNING, "Broker never reached RUNNING.")
+      TestUtils.waitUntilTrue(() => broker.httpBridgeServer != null && broker.httpBridgeServer.boundPort() > 0,
+        "HTTP bridge never bound its port.")
+      val bridgePort = broker.httpBridgeServer.boundPort()
+
+      // Both topics exist — only the WRITE on deniedTopic should fail. createTopic itself is allowed for ANONYMOUS
+      // because the custom authorizer only denies WRITE on the named topic, not CREATE.
+      createTopic(cluster, deniedTopic, partitions = 1)
+      createTopic(cluster, allowedTopic, partitions = 1)
+
+      // Sanity: the allowed topic still produces successfully, proving the authorizer isn't a blanket deny.
+      val okBody =
+        s"""
+           |{ "records": [ { "partition": 0, "value": { "type": "STRING", "data": "ok" } } ] }
+           |""".stripMargin
+      val okResp = postJson(s"http://127.0.0.1:$bridgePort/v1/topics/$allowedTopic/records", okBody)
+      assertEquals(200, okResp.statusCode(),
+        s"control-group produce on $allowedTopic must succeed under the same authorizer, body=${okResp.body()}")
+
+      // The denied path: uniform TOPIC_AUTHORIZATION_FAILED across all partitions must collapse to a uniform-failure
+      // 403 (the formatter only emits 207 for *mixed* outcomes — a single-partition deny is uniform).
+      val denyBody =
+        s"""
+           |{ "records": [ { "partition": 0, "value": { "type": "STRING", "data": "should-fail" } } ] }
+           |""".stripMargin
+      val denyResp = postJson(s"http://127.0.0.1:$bridgePort/v1/topics/$deniedTopic/records", denyBody)
+      assertEquals(403, denyResp.statusCode(),
+        s"ACL deny on $deniedTopic must surface HTTP 403; got status=${denyResp.statusCode()}, body=${denyResp.body()}")
+      // PROMPT.md AC7: 403 must NOT carry Retry-After — that header is reserved for 503/504/throttle paths.
+      assertNull(denyResp.headers().firstValue("Retry-After").orElse(null),
+        s"403 must not carry Retry-After, headers=${denyResp.headers().map()}")
+      val denyJson = parseJson(denyResp.body())
+      // The body shape is the same as 200 and 207 — {topic, results: [{partition, offset, errorCode, errorMessage}]}.
+      // PROMPT.md AC7 mandates errorCode + errorMessage on every error response; here they live per-partition (the
+      // shape callers also see on 207, so a single parser handles all produce responses). errorCode is the raw Kafka
+      // Errors code (TOPIC_AUTHORIZATION_FAILED = 29).
+      assertEquals(deniedTopic, denyJson.get("topic").asText(),
+        s"body must keep the topic context, body=${denyResp.body()}")
+      val denyEntry = denyJson.get("results").get(0)
+      assertEquals(0, denyEntry.get("partition").asInt())
+      assertTrue(denyEntry.get("offset").isNull,
+        s"failed partition must surface null offset, body=${denyResp.body()}")
+      assertEquals(29, denyEntry.get("errorCode").asInt(),
+        s"errorCode must be the raw Kafka code (29 = TOPIC_AUTHORIZATION_FAILED), body=${denyResp.body()}")
+      assertFalse(denyEntry.get("errorMessage").isNull,
+        s"errorMessage is mandatory on every error response, body=${denyResp.body()}")
+    } finally {
+      cluster.close()
+    }
+  }
+
   // ----- helpers -------------------------------------------------------------------------------------------------
 
   private def createTopic(cluster: KafkaClusterTestKit, name: String, partitions: Int): Unit = {
@@ -418,4 +506,40 @@ class HttpBridgeEndToEndTest {
   }
 
   private def parseJson(body: String): JsonNode = mapper.readTree(body)
+}
+
+object HttpBridgeEndToEndTest {
+  /**
+   * Narrowest possible test authorizer for the FS4 deny case: extends StandardAuthorizer so cluster bootstrap,
+   * topic creation, fetch metadata, etc. all flow through the normal allow path, but selectively returns DENIED for
+   * WRITE on a single named topic when the principal is ANONYMOUS. We avoid configuring deny ACLs through the admin
+   * client because super.users (which we need so the broker can register itself as ANONYMOUS) bypasses ACLs entirely —
+   * subclassing authorize() is the only way to enforce a deny that the super-user path can't dodge.
+   */
+  class DenyAnonymousAuthorizer extends StandardAuthorizer {
+    override def authorize(
+      requestContext: AuthorizableRequestContext,
+      actions: util.List[Action]
+    ): util.List[AuthorizationResult] = {
+      val anonymous = requestContext.principal() == KafkaPrincipal.ANONYMOUS
+      val results = new util.ArrayList[AuthorizationResult](actions.size())
+      val it = actions.iterator()
+      while (it.hasNext) {
+        val a = it.next()
+        if (anonymous
+            && a.resourcePattern().resourceType() == ResourceType.TOPIC
+            && a.resourcePattern().name() == DenyAnonymousAuthorizer.DeniedTopic
+            && a.operation() == AclOperation.WRITE) {
+          results.add(AuthorizationResult.DENIED)
+        } else {
+          results.add(AuthorizationResult.ALLOWED)
+        }
+      }
+      results
+    }
+  }
+
+  object DenyAnonymousAuthorizer {
+    val DeniedTopic = "http-bridge-acl-deny"
+  }
 }
