@@ -11519,6 +11519,60 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testFetchTenantRefusesInternalTopicEvenIfAclWouldAllow(): Unit = {
+    // Defence-in-depth: a tenant principal must never be able to Fetch
+    // __consumer_offsets / __transaction_state / __share_group_state directly.
+    // The legitimate path is via the coordinator APIs (OffsetFetch,
+    // FindCoordinator, AddPartitionsToTxn, ...) which key by tenant-scoped id.
+    // If an operator mistakenly granted READ on __consumer_offsets, a direct
+    // Fetch would expose every tenant's commits. The handler refuses regardless
+    // of ACL — replicaManager is never invoked — and surfaces
+    // UNKNOWN_TOPIC_OR_PARTITION so existence cannot be probed.
+    //
+    // The internal TIP is filtered into `foreignFetchTips` BEFORE
+    // `fetchManager.newContext`, so the resulting session map is empty — we
+    // model that by handing newContext an empty FullFetchContext and asserting
+    // (via the captor) that no TIP entered the session. The wire-level
+    // UNKNOWN_TOPIC_OR_PARTITION is merged in via `appendForeignErroneousRows`.
+    val topicId = Uuid.randomUuid()
+    val internalTp = new TopicPartition(Topic.GROUP_METADATA_TOPIC_NAME, 0)
+    addTopicToMetadataCache(internalTp.topic, numPartitions = 1, numBrokers = 1, topicId)
+
+    val emptyFetchData = new util.LinkedHashMap[TopicIdPartition, FetchRequest.PartitionData]()
+    val fetchMetadata = new JFetchMetadata(0, 0)
+    val fetchContext = new FullFetchContext(time, new FetchSessionCacheShard(1000, 100),
+      fetchMetadata, emptyFetchData, true, false)
+    val newContextFetchDataCaptor = ArgumentCaptor.forClass(classOf[util.Map[TopicIdPartition, FetchRequest.PartitionData]])
+    when(fetchManager.newContext(
+      any[Short], any[JFetchMetadata], any[Boolean],
+      newContextFetchDataCaptor.capture(),
+      any[util.List[TopicIdPartition]],
+      any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val fetchRequest = buildSingleTopicFetchRequest(topicId, internalTp)
+    val request = buildRequest(
+      fetchRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(
+      authorizer = None,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleFetchRequest(request)
+
+    assertTrue(newContextFetchDataCaptor.getValue.isEmpty,
+      s"internal-topic TIPs must not enter fetchManager.newContext; saw ${newContextFetchDataCaptor.getValue.keySet}")
+    val response = verifyNoThrottling[FetchResponse](request)
+    val partitionData = response.data.responses.asScala.head.partitions.asScala.head
+    assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION.code, partitionData.errorCode,
+      "tenant must not be able to Fetch __consumer_offsets directly")
+
+    verify(replicaManager, never()).fetchMessages(any(), any(), any(), any())
+  }
+
+  @Test
   def testFetchTenantForgottenUnresolvableIdIsPassedThroughForSessionRemoval(): Unit = {
     // When a tenant deletes a topic and then issues an incremental fetch
     // forgetting it, the topic id no longer resolves via

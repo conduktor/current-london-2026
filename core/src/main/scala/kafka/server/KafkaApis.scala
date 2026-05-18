@@ -193,7 +193,19 @@ class KafkaApis(val requestChannel: RequestChannel,
                                            ctx: TenantContext,
                                            versionId: Int): Option[TopicIdPartition] = {
     if (tip.topic == null) return None
-    if (Topic.isInternal(tip.topic)) return Some(tip)
+    if (Topic.isInternal(tip.topic)) {
+      // Defence-in-depth: a tenant principal must never Fetch a Kafka-internal
+      // topic directly. The legitimate path is via the coordinator APIs
+      // (OffsetFetch, FindCoordinator, AddPartitionsToTxn, ...) which key by
+      // tenant-scoped id and only return that tenant's records. A direct Fetch
+      // on `__consumer_offsets` (or friends), if any operator ever grants READ
+      // by mistake, would otherwise expose every tenant's commits / txn state.
+      // The follower-fetch path is unaffected: an inter-broker listener has no
+      // tenant binding, so ctx.effectiveTenant is empty and we keep returning
+      // the tip unchanged. Surface as UNKNOWN_TOPIC_OR_PARTITION (via the
+      // foreignFetchTips path) so existence cannot be probed.
+      return if (ctx.effectiveTenant.isPresent) None else Some(tip)
+    }
     if (versionId >= 13) {
       if (ctx.belongsToTenant(tip.topic)) Some(tip) else None
     } else {
