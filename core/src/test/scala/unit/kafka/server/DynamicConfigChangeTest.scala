@@ -18,8 +18,10 @@ package kafka.server
 
 import kafka.cluster.Partition
 import kafka.integration.KafkaServerTestHarness
+import kafka.log.LogManager
 import kafka.log.UnifiedLog
 import kafka.log.remote.RemoteLogManager
+import kafka.server.QuotaFactory.QuotaManagers
 import kafka.utils.TestUtils.random
 import kafka.utils._
 import org.apache.kafka.clients.CommonClientConfigs
@@ -42,7 +44,7 @@ import org.junit.jupiter.api.{Test, Timeout}
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.ValueSource
 import org.mockito.ArgumentCaptor
-import org.mockito.ArgumentMatchers.any
+import org.mockito.ArgumentMatchers.{any, eq => mockitoEq}
 import org.mockito.Mockito._
 
 import java.net.InetAddress
@@ -606,5 +608,121 @@ class DynamicConfigChangeUnitTest {
     val configHandler: TopicConfigHandler = new TopicConfigHandler(replicaManager, null, null)
     configHandler.maybeUpdateRemoteLogComponents(topic, Seq(log0), isRemoteLogEnabledBeforeUpdate, false)
     verify(rlm, never()).onLeadershipChange(any(), any(), any())
+  }
+
+  /**
+   * The TopicConfigHandler invokes its onTopicConfigChange hook for every successful config
+   * update. The view subsystem uses it to drop the ViewRegistry's cached compiled spec; without
+   * this hook a fetch against a view whose predicate has been edited would keep evaluating the
+   * old predicate. We assert the hook fires exactly once per call AND that it fires AFTER
+   * updateLogConfig — invalidating a stale spec while the new LogConfig hasn't landed yet
+   * would only invite a recompile against the old text.
+   */
+  @Test
+  def testProcessConfigChangesInvokesOnTopicConfigChangeHookAfterLogConfig(): Unit = {
+    val hookMock: java.util.function.Consumer[String] = mock(classOf[java.util.function.Consumer[String]])
+    val (handler, logManager) = newTopicConfigHandlerForHookTest((topic: String) => hookMock.accept(topic))
+
+    handler.processConfigChanges("orders", new Properties())
+
+    // Mockito InOrder pins the ordering: log-update first, hook last. A future refactor that
+    // moves the hook before updateLogConfig would fail HERE rather than slip through silently.
+    val inOrder = org.mockito.Mockito.inOrder(logManager, hookMock)
+    inOrder.verify(logManager).updateTopicConfig(mockitoEq("orders"),
+      any(classOf[Properties]),
+      mockitoEq(false),
+      mockitoEq(false))
+    inOrder.verify(hookMock).accept("orders")
+
+    handler.processConfigChanges("payments", new Properties())
+    inOrder.verify(logManager).updateTopicConfig(mockitoEq("payments"),
+      any(classOf[Properties]),
+      mockitoEq(false),
+      mockitoEq(false))
+    inOrder.verify(hookMock).accept("payments")
+    inOrder.verifyNoMoreInteractions()
+  }
+
+  /**
+   * A misbehaving onTopicConfigChange hook must not break the rest of the config-change pipeline
+   * — config updates are control-plane events the broker can't skip just because a view-cache
+   * listener threw. We verify by passing a hook that always throws and asserting that
+   * processConfigChanges still returns normally and still drives the log-update path.
+   */
+  @Test
+  def testProcessConfigChangesSwallowsOnTopicConfigChangeFailure(): Unit = {
+    val (handler, logManager) = newTopicConfigHandlerForHookTest((_: String) =>
+      throw new RuntimeException("boom from view registry"))
+
+    handler.processConfigChanges("orders", new Properties())
+
+    // updateTopicConfig was called before the hook threw — so its side effects are durable
+    // and the broker did not lose the config update because of a misbehaving listener.
+    verify(logManager).updateTopicConfig(mockitoEq("orders"),
+      any(classOf[Properties]),
+      mockitoEq(false),
+      mockitoEq(false))
+  }
+
+  /**
+   * If `updateLogConfig` itself throws (e.g. an internal log-manager failure), the hook must
+   * NOT fire — invalidating the view cache against a config that didn't actually land would
+   * make the next fetch recompile from an inconsistent snapshot. We assert the hook stays
+   * silent on the failure path; the exception is allowed to propagate so the outer publisher's
+   * fault handler can record it.
+   */
+  @Test
+  def testProcessConfigChangesDoesNotInvokeHookWhenLogConfigUpdateThrows(): Unit = {
+    val hookCalls = scala.collection.mutable.ArrayBuffer.empty[String]
+    val replicaManager = mock(classOf[ReplicaManager])
+    val logManager = mock(classOf[LogManager])
+    val kafkaConfig = mock(classOf[KafkaConfig])
+    val remoteLogManagerConfig =
+      mock(classOf[org.apache.kafka.server.log.remote.storage.RemoteLogManagerConfig])
+    val quotas = mock(classOf[QuotaManagers])
+    when(replicaManager.logManager).thenReturn(logManager)
+    when(logManager.logsByTopic(any(classOf[String]))).thenReturn(Seq.empty)
+    when(kafkaConfig.remoteLogManagerConfig).thenReturn(remoteLogManagerConfig)
+    when(remoteLogManagerConfig.isRemoteStorageSystemEnabled()).thenReturn(false)
+    when(logManager.updateTopicConfig(any(classOf[String]), any(classOf[Properties]),
+      any(classOf[Boolean]), any(classOf[Boolean])))
+      .thenThrow(new RuntimeException("log-manager down"))
+
+    val handler = new TopicConfigHandler(replicaManager, kafkaConfig, quotas,
+      onTopicConfigChange = (topic: String) => { hookCalls += topic; () })
+
+    assertThrows(classOf[RuntimeException],
+      () => handler.processConfigChanges("orders", new Properties()))
+    assertEquals(Seq.empty[String], hookCalls.toSeq,
+      "hook must not fire when the log-config update failed — cache invalidation against an " +
+        "unlanded config would only invite a stale recompile")
+  }
+
+  /**
+   * Build a TopicConfigHandler with the minimum mocks needed to drive processConfigChanges
+   * without running real log / quota code. Returns the handler and its LogManager mock so tests
+   * can verify ordering of the hook relative to the log-update path.
+   */
+  private def newTopicConfigHandlerForHookTest(hook: String => Unit): (TopicConfigHandler, LogManager) = {
+    val replicaManager = mock(classOf[ReplicaManager])
+    val logManager = mock(classOf[LogManager])
+    val kafkaConfig = mock(classOf[KafkaConfig])
+    val remoteLogManagerConfig =
+      mock(classOf[org.apache.kafka.server.log.remote.storage.RemoteLogManagerConfig])
+    val quotas = mock(classOf[QuotaManagers])
+    val leaderQuota = mock(classOf[ReplicationQuotaManager])
+    val followerQuota = mock(classOf[ReplicationQuotaManager])
+
+    when(replicaManager.logManager).thenReturn(logManager)
+    when(logManager.logsByTopic(any(classOf[String]))).thenReturn(Seq.empty)
+    when(kafkaConfig.remoteLogManagerConfig).thenReturn(remoteLogManagerConfig)
+    when(remoteLogManagerConfig.isRemoteStorageSystemEnabled()).thenReturn(false)
+    when(kafkaConfig.brokerId).thenReturn(0)
+    when(quotas.leader).thenReturn(leaderQuota)
+    when(quotas.follower).thenReturn(followerQuota)
+
+    val handler = new TopicConfigHandler(replicaManager, kafkaConfig, quotas,
+      onTopicConfigChange = hook)
+    (handler, logManager)
   }
 }

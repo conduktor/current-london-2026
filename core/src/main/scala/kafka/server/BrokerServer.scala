@@ -390,12 +390,6 @@ class BrokerServer(
         config, clientToControllerChannelManager, groupCoordinator,
         transactionCoordinator, shareCoordinator)
 
-      dynamicConfigHandlers = Map[String, ConfigHandler](
-        ConfigType.TOPIC -> new TopicConfigHandler(replicaManager, config, quotaManagers),
-        ConfigType.BROKER -> new BrokerConfigHandler(config, quotaManagers),
-        ConfigType.CLIENT_METRICS -> new ClientMetricsConfigHandler(clientMetricsManager),
-        ConfigType.GROUP -> new GroupConfigHandler(groupCoordinator))
-
       val featuresRemapped = BrokerFeatures.createDefaultFeatureMap(brokerFeatures)
 
       val brokerLifecycleChannelManager = new NodeToControllerChannelManagerImpl(
@@ -473,6 +467,19 @@ class BrokerServer(
         socketServer.dataPlaneRequestChannel, dataPlaneRequestProcessor, time,
         config.numIoThreads, s"${DataPlaneAcceptor.MetricPrefix}RequestHandlerAvgIdlePercent",
         DataPlaneAcceptor.ThreadPrefix)
+
+      // Built after dataPlaneRequestProcessor so the TopicConfigHandler can call
+      // KafkaApis.viewRegistry.invalidate(topic) when a topic's view configs change.
+      // The registry must drop its cached compiled spec, otherwise the next fetch would keep
+      // applying the old predicate. dynamicConfigHandlers is only consumed below by the
+      // DynamicConfigPublisher inside brokerMetadataPublisher, so moving the construction
+      // here keeps the existing wiring intact.
+      dynamicConfigHandlers = Map[String, ConfigHandler](
+        ConfigType.TOPIC -> new TopicConfigHandler(replicaManager, config, quotaManagers,
+          onTopicConfigChange = (topic: String) => dataPlaneRequestProcessor.viewRegistry.invalidate(topic)),
+        ConfigType.BROKER -> new BrokerConfigHandler(config, quotaManagers),
+        ConfigType.CLIENT_METRICS -> new ClientMetricsConfigHandler(clientMetricsManager),
+        ConfigType.GROUP -> new GroupConfigHandler(groupCoordinator))
 
       // Start RemoteLogManager before initializing broker metadata publishers.
       remoteLogManagerOpt.foreach { rlm =>

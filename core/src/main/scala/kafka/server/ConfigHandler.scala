@@ -30,6 +30,7 @@ import org.apache.kafka.storage.internals.log.{LogStartOffsetIncrementReason, Th
 
 import scala.jdk.CollectionConverters._
 import scala.collection.Seq
+import scala.util.control.NonFatal
 
 /**
   * The ConfigHandler is used to process broker configuration change notifications.
@@ -41,10 +42,16 @@ trait ConfigHandler {
 /**
   * The TopicConfigHandler will process topic config changes from the metadata log.
   * The callback provides the topic name and the full properties set.
+  *
+  * @param onTopicConfigChange invoked with the topic name after every successful config update.
+  *                            Used by the view subsystem to drop cached compiled predicates so the
+  *                            next fetch recompiles from the new config snapshot. Defaults to a
+  *                            no-op so tests and non-view code paths don't need to wire it.
   */
 class TopicConfigHandler(private val replicaManager: ReplicaManager,
                          kafkaConfig: KafkaConfig,
-                         val quotas: QuotaManagers) extends ConfigHandler with Logging  {
+                         val quotas: QuotaManagers,
+                         onTopicConfigChange: String => Unit = _ => ()) extends ConfigHandler with Logging  {
 
   private def updateLogConfig(topic: String,
                               topicConfig: Properties): Unit = {
@@ -121,6 +128,19 @@ class TopicConfigHandler(private val replicaManager: ReplicaManager,
     }
     updateThrottledList(QuotaConfig.LEADER_REPLICATION_THROTTLED_REPLICAS_CONFIG, quotas.leader)
     updateThrottledList(QuotaConfig.FOLLOWER_REPLICATION_THROTTLED_REPLICAS_CONFIG, quotas.follower)
+
+    // Notify the view subsystem last. If the new config promotes/demotes/edits a view, the
+    // registry must drop its cached ViewSpec so the next fetch recompiles from the new config.
+    // Correctness note: the ViewRegistry pulls the new configs via `MetadataCache`/`ConfigRepository`,
+    // which `KRaftMetadataCachePublisher` swaps to the new `MetadataImage` earlier in the same
+    // publish cycle — so by the time this hook fires, `configRepository.topicConfig(name)`
+    // already returns the new value. We invoke the hook *last* (after `updateLogConfig` and the
+    // throttle updates) so a hook failure can't break log-config application; the hook's
+    // side-effect is cache invalidation, which the next fetch can tolerate retrying.
+    try onTopicConfigChange(topic) catch {
+      case NonFatal(t) =>
+        warn(s"onTopicConfigChange hook threw for topic $topic; continuing.", t)
+    }
   }
 
   def parseThrottledPartitions(topicConfig: Properties, brokerId: Int, prop: String): Seq[Int] = {

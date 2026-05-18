@@ -90,8 +90,18 @@ public final class ViewRegistry {
      * Drop the cached entry for {@code viewTopic}. The next call to {@link #viewFor} will
      * re-fetch the configs and recompile.
      *
-     * Called by the broker when a topic's config changes (create, alter, delete). Safe to call
-     * for non-view topics; the registry tracks miss entries too.
+     * Called by the broker when a topic's config changes (create, alter, delete). Topic deletion
+     * also enters this path: KRaft replays {@code RemoveTopicRecord} as an empty-config delta,
+     * which the {@code TopicConfigHandler} surfaces to us — so a recreate-with-different-shape
+     * cannot leak a stale spec or miss entry. Safe to call for non-view topics; the registry
+     * tracks miss entries too.
+     *
+     * Caller contract: the {@code configSource} threaded into this registry must already reflect
+     * the new configs by the time this method is called. The broker satisfies this because the
+     * metadata-cache publisher swaps to the new {@code MetadataImage} earlier in the same publish
+     * cycle than the dynamic-config publisher that calls this hook. Calling {@code invalidate}
+     * before the source is updated would leave a fetch racing with us free to recompile against
+     * the *old* configs and re-cache them.
      */
     public void invalidate(String viewTopic) {
         cache.remove(viewTopic);
