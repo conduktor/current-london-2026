@@ -470,7 +470,7 @@ public final class RecordContexts {
             case VALUE_NUMBER_INT:
                 return extractLongOrNull(p);
             case VALUE_NUMBER_FLOAT:
-                return p.getDoubleValue();
+                return extractDoubleOrUnusable(p);
             case VALUE_TRUE:
                 return Boolean.TRUE;
             case VALUE_FALSE:
@@ -493,6 +493,20 @@ public final class RecordContexts {
             // silently skip those records" requires record-skip, so we surface BODY_UNUSABLE.
             return RecordContext.BODY_UNUSABLE;
         }
+    }
+
+    private static Object extractDoubleOrUnusable(JsonParser p) throws IOException {
+        double d = p.getDoubleValue();
+        // JSON floats beyond IEEE-754 finite range parse to NaN/+Infinity/-Infinity. A predicate
+        // like `body.limit >= body.spent` would otherwise admit a record with limit=1e9998 and
+        // spent=1e9999 — both round to +Infinity, and Infinity >= Infinity is TRUE under IEEE
+        // semantics, even though the exact JSON numbers should reject. NaN is unreachable from
+        // valid JSON (Jackson rejects it by default unless ALLOW_NON_NUMERIC_NUMBERS is enabled,
+        // which we don't enable), but guard it for completeness — defense-in-depth.
+        if (!Double.isFinite(d)) {
+            return RecordContext.BODY_UNUSABLE;
+        }
+        return d;
     }
 
     private static Optional<String> decodeUtf8Strict(byte[] bytes) {

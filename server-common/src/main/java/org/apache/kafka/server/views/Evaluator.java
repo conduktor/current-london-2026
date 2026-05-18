@@ -153,10 +153,19 @@ final class Evaluator {
 
     private Object applyBinaryOp(Ast.Binary.Op op, Object lv, Object rv) {
         switch (op) {
-            case EQ:
-                return Boolean.valueOf(equalsValues(lv, rv));
-            case NEQ:
-                return Boolean.valueOf(!equalsValues(lv, rv));
+            case EQ: {
+                // Tri-state: null means "unknown" (e.g. unsafe Long/Double precision-loss).
+                // null propagates as falsy in boolean context so the record is skipped — the
+                // safe outcome at an access-control boundary. Returning Boolean.FALSE here
+                // instead would let NEQ negate it to TRUE and admit a record whose equality
+                // we couldn't actually decide.
+                Boolean eq = equalsValuesOrNull(lv, rv);
+                return eq;
+            }
+            case NEQ: {
+                Boolean eq = equalsValuesOrNull(lv, rv);
+                return eq == null ? null : Boolean.valueOf(!eq.booleanValue());
+            }
             case LT:
                 return compare(lv, rv, -1, false);
             case LTE:
@@ -194,46 +203,52 @@ final class Evaluator {
      * because consumers reasonably expect equality to be total. JSON-null / missing operand
      * compares unequal to any non-null value, equal to itself.
      *
-     * <p>For mixed Long/Double equality the operands are only compared in {@code double} space
-     * when the Long is inside the IEEE-safe-integer range ({@code |L| <= 2^53}). Outside that
-     * range the equality returns {@code false}: predicates are an access-control boundary, and
-     * naïve {@code (double) L == D} comparison would let an adversary craft Long values that
-     * "equal" the rounded double representation of a different literal (e.g. body Long
-     * {@code 2^53 + 1} matching predicate Double {@code 2^53.0}).
+     * <p>Returns a nullable {@link Boolean}: {@code null} means "unknown" (today only the unsafe
+     * mixed Long/Double path produces it). The caller propagates {@code null} to both EQ and NEQ
+     * so an undecidable equality cannot be negated into a confident TRUE. Without tri-state, the
+     * round-4 IEEE_SAFE_INTEGER guard that encoded the unsafe case as FALSE would let
+     * {@code body.x != 9007199254740992.0} admit a Long body {@code 9007199254740993} (precision
+     * round-trips to {@code 9007199254740992.0} as a double), bypassing the predicate writer's
+     * intent.
+     *
+     * <p>For mixed Long/Double equality the operands are compared in {@code double} space only
+     * when the Long is inside the IEEE-safe-integer range ({@code |L| <= 2^53}); outside that
+     * range we return {@code null}.
      */
-    private static boolean equalsValues(Object l, Object r) {
-        if (l == null && r == null) return true;
-        if (l == null || r == null) return false;
+    private static Boolean equalsValuesOrNull(Object l, Object r) {
+        if (l == null && r == null) return Boolean.TRUE;
+        if (l == null || r == null) return Boolean.FALSE;
         if (l instanceof Number && r instanceof Number) {
-            return equalsNumeric((Number) l, (Number) r);
+            return equalsNumericOrNull((Number) l, (Number) r);
         }
-        if (l instanceof Boolean && r instanceof Boolean) return l.equals(r);
-        if (l instanceof String && r instanceof String) return l.equals(r);
-        return false;
+        if (l instanceof Boolean && r instanceof Boolean) return Boolean.valueOf(l.equals(r));
+        if (l instanceof String && r instanceof String) return Boolean.valueOf(l.equals(r));
+        return Boolean.FALSE;
     }
 
-    private static boolean equalsNumeric(Number l, Number r) {
+    private static Boolean equalsNumericOrNull(Number l, Number r) {
         if (l instanceof Long && r instanceof Long) {
-            return ((Long) l).longValue() == ((Long) r).longValue();
+            return Boolean.valueOf(((Long) l).longValue() == ((Long) r).longValue());
         }
         if (l instanceof Long) {
-            return numericEqLongDouble((Long) l, r.doubleValue());
+            return numericEqLongDoubleOrNull((Long) l, r.doubleValue());
         }
         if (r instanceof Long) {
-            return numericEqLongDouble((Long) r, l.doubleValue());
+            return numericEqLongDoubleOrNull((Long) r, l.doubleValue());
         }
         // Both Double.
-        return l.doubleValue() == r.doubleValue();
+        return Boolean.valueOf(l.doubleValue() == r.doubleValue());
     }
 
-    private static boolean numericEqLongDouble(long longSide, double doubleSide) {
-        if (Double.isNaN(doubleSide) || Double.isInfinite(doubleSide)) return false;
+    private static Boolean numericEqLongDoubleOrNull(long longSide, double doubleSide) {
+        if (Double.isNaN(doubleSide) || Double.isInfinite(doubleSide)) return Boolean.FALSE;
         if (longSide > IEEE_SAFE_INTEGER || longSide < -IEEE_SAFE_INTEGER) {
-            // Long is outside the range where (double) longSide is exact. Refuse to match
-            // rather than silently equate to a rounded value.
-            return false;
+            // Long is outside the range where (double) longSide is exact. Tri-state UNKNOWN so
+            // both EQ and NEQ refuse to commit — a confident FALSE here would let NEQ flip
+            // to TRUE and admit a record whose Long value rounds to the predicate's double.
+            return null;
         }
-        return (double) longSide == doubleSide;
+        return Boolean.valueOf((double) longSide == doubleSide);
     }
 
     /**

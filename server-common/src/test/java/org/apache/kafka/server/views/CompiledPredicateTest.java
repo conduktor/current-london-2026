@@ -251,10 +251,13 @@ class CompiledPredicateTest {
         // bypassing a predicate. Refuse the equality outside the IEEE-safe range.
         CompiledPredicate p = compiler.compile("body.x == 9007199254740992.0");
         // Body has 9007199254740993 (one above 2^53). Without the safe-range check this would
-        // promote to (double) 9007199254740992 and compare equal — wrong.
+        // promote to (double) 9007199254740992 and compare equal — wrong. With tri-state semantics
+        // the equality returns UNKNOWN (Optional.empty), which the filter treats as falsy → record
+        // skipped. Round-4 returned a confident FALSE here; round-5 changed to UNKNOWN so that NEQ
+        // cannot negate FALSE to TRUE.
         Optional<Boolean> r = p.evaluate(jsonRecord("{\"x\":9007199254740993}"));
-        assertFalse(r.orElse(true),
-                () -> "expected false (no precision-loss match) for Long beyond 2^53, got " + r);
+        assertTrue(r.isEmpty() || !r.get(),
+                () -> "expected no precision-loss match for Long beyond 2^53, got " + r);
     }
 
     @Test
@@ -353,6 +356,52 @@ class CompiledPredicateTest {
         // Sanity: when the Long IS inside the safe range, mixed arithmetic still works.
         CompiledPredicate ok = compiler.compile("body.id + 0.0 == 42.0");
         assertTrue(ok.evaluate(jsonRecord("{\"id\":42}")).orElse(false));
+    }
+
+    @Test
+    void unsafeMixedLongDoubleInequalityIsUnknownNotConfidentTrue() {
+        // Round-4's IEEE_SAFE_INTEGER guard for mixed Long/Double equality returned FALSE
+        // when the Long was outside [-2^53, 2^53]. NEQ then negated FALSE to TRUE — admitting a
+        // record whose equality we could not actually decide. A predicate written as
+        // `body.x != 9007199254740992.0` (intent: exclude the specific high-value record) would
+        // ADMIT a body with x = 9007199254740993 because the Long rounds to that exact double.
+        // The fix is tri-state: unsafe mixed equality returns null/unknown so both EQ and NEQ
+        // refuse to commit. Record is skipped — the safe outcome at an access-control boundary.
+        CompiledPredicate p = compiler.compile("body.x != 9007199254740992.0");
+        Optional<Boolean> r = p.evaluate(jsonRecord("{\"x\":9007199254740993}"));
+        assertTrue(r.isEmpty() || !r.get(),
+                () -> "unsafe Long != Double must be unknown/false, not confident true, got " + r);
+        // Symmetric: equality with the same operands must not be confident TRUE either (it
+        // returns null/unknown, which orElse(false) renders as false).
+        CompiledPredicate q = compiler.compile("body.x == 9007199254740992.0");
+        Optional<Boolean> rq = q.evaluate(jsonRecord("{\"x\":9007199254740993}"));
+        assertTrue(rq.isEmpty() || !rq.get(),
+                () -> "unsafe Long == Double must be unknown/false, not confident true, got " + rq);
+        // Sanity: inside the safe range, NEQ still works.
+        CompiledPredicate ok = compiler.compile("body.x != 42.0");
+        assertTrue(ok.evaluate(jsonRecord("{\"x\":7}")).orElse(false));
+        assertFalse(ok.evaluate(jsonRecord("{\"x\":42}")).orElse(true));
+    }
+
+    @Test
+    void jsonFloatInfinityIsTreatedAsUnusable() {
+        // 1e9999 parses to Double.POSITIVE_INFINITY (Jackson does not throw for out-of-range
+        // floats by default). Without an explicit Infinity check in RecordContexts, a predicate
+        // like `body.limit >= body.spent` would admit a record with both at 1e9999/1e9998:
+        // both round to +Infinity, and Infinity >= Infinity is TRUE under IEEE. The fix marks
+        // any non-finite double from JSON as BODY_UNUSABLE → record skipped.
+        CompiledPredicate p = compiler.compile("body.limit >= body.spent");
+        Optional<Boolean> r = p.evaluate(jsonRecord("{\"limit\":1e9998,\"spent\":1e9999}"));
+        assertTrue(r.isEmpty() || !r.get(),
+                () -> "infinite JSON float must be unusable, not admit the record, got " + r);
+        // Symmetric for negative infinity.
+        Optional<Boolean> r2 = p.evaluate(jsonRecord("{\"limit\":-1e9999,\"spent\":-1e9998}"));
+        assertTrue(r2.isEmpty() || !r2.get(),
+                () -> "negative infinite JSON float must be unusable, got " + r2);
+        // Sanity: ordinary finite doubles still work.
+        CompiledPredicate q = compiler.compile("body.limit >= body.spent");
+        assertTrue(q.evaluate(jsonRecord("{\"limit\":100.0,\"spent\":50.0}")).orElse(false));
+        assertFalse(q.evaluate(jsonRecord("{\"limit\":50.0,\"spent\":100.0}")).orElse(true));
     }
 
     @Test
