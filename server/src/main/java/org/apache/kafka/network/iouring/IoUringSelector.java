@@ -187,8 +187,7 @@ public final class IoUringSelector implements BrokerSelector {
      * enforce {@link #maxPendingAccepts}; with a high accept rate the O(n) walk would itself
      * become the bottleneck (and would race the producer/consumer pointers).
      */
-    private final java.util.concurrent.atomic.AtomicInteger pendingAcceptCount =
-        new java.util.concurrent.atomic.AtomicInteger();
+    private final AtomicInteger pendingAcceptCount = new AtomicInteger();
     /**
      * Bound for {@link #pendingAccepts}. Mirrors NIO's per-Processor
      * {@code ArrayBlockingQueue(connectionQueueSize)} in {@code SocketServer.Acceptor}:
@@ -259,7 +258,13 @@ public final class IoUringSelector implements BrokerSelector {
     private final AtomicInteger idGen = new AtomicInteger();
     private volatile boolean closed;
 
-    /** Test-only constructor: uses processor id 0 and an empty configs map (default principal builder). */
+    /**
+     * Test-only constructor: uses processor id 0 and an empty configs map (default principal builder).
+     * Production code must use the 7-arg constructor so a user-configured {@code principal.builder.class}
+     * is honored — empty configs silently falls back to {@code DefaultKafkaPrincipalBuilder} and diverges
+     * from the NIO PLAINTEXT path on the same broker. Kept {@code public} because the throughput benchmark
+     * lives in a sibling sub-package ({@code .bench}) and cannot reach a package-private constructor.
+     */
     public IoUringSelector(ListenerName listenerName,
                            int maxReceiveSize,
                            MemoryPool memoryPool,
@@ -268,7 +273,10 @@ public final class IoUringSelector implements BrokerSelector {
         this(listenerName, maxReceiveSize, memoryPool, connectionsMaxIdleNanos, time, 0, java.util.Collections.emptyMap());
     }
 
-    /** Test-only constructor: empty configs map (default principal builder). */
+    /**
+     * Test-only constructor: empty configs map (default principal builder). Same {@code public}
+     * visibility caveat as the no-processor-id variant above.
+     */
     public IoUringSelector(ListenerName listenerName,
                            int maxReceiveSize,
                            MemoryPool memoryPool,
@@ -902,6 +910,22 @@ public final class IoUringSelector implements BrokerSelector {
     @Override
     public KafkaChannel closingChannel(String id) {
         return closingChannels.get(id);
+    }
+
+    /**
+     * Package-private accessor used by integration tests that need to inspect the broker-side
+     * Netty channel of an accepted connection (e.g. to verify that {@code childOption(TCP_NODELAY)}
+     * and {@code childOption(SO_KEEPALIVE)} were actually applied by {@link IoUringServerListener}).
+     * The standard {@link org.apache.kafka.common.network.Selectable} surface intentionally does
+     * not expose the underlying transport's Netty channel, so a test-only accessor here is the
+     * narrowest possible hook — it does not enlarge any public API and is unreachable from
+     * production callers in other packages.
+     *
+     * @return the Netty channel for the given connection id, or {@code null} if no such channel
+     *         exists on this selector
+     */
+    Channel nettyChannelFor(String id) {
+        return nettyChannels.get(id);
     }
 
     @Override

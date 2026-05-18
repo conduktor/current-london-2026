@@ -31,6 +31,9 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.util.concurrent.TimeUnit;
 
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelOption;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
@@ -155,9 +158,10 @@ class IoUringServerListenerIT {
         // listener must match — otherwise the broker silently regresses on request/response
         // latency (Nagle adds hundreds of microseconds per flush) and silently fails to
         // detect half-open peer connections (which keeps a dead peer slot indefinitely).
-        // We verify from the client side because the broker-side Netty channel does not
-        // expose the underlying file descriptor to user code; the client's view of its peer
-        // is the only host-portable observation we can make for this test.
+        // We verify against the broker-side Netty channel via the selector's package-private
+        // {@code nettyChannelFor} accessor: the channel's ChannelConfig is the authoritative
+        // source for what {@code childOption(TCP_NODELAY)} / {@code childOption(SO_KEEPALIVE)}
+        // actually applied to the accepted child.
         assumeTrue(IoUringSupport.isAvailable(),
             "io_uring not available (" + IoUringSupport.unavailabilityReason() + "); skipping");
 
@@ -170,20 +174,17 @@ class IoUringServerListenerIT {
             int port = listener.boundPort();
             try (Socket client = new Socket()) {
                 client.connect(new InetSocketAddress("127.0.0.1", port), (int) DEADLINE_MS);
-                pollForFirstConnected(selector);
+                String channelId = pollForFirstConnected(selector);
 
-                // Round-trip a frame so the connection is fully established and the kernel
-                // commits the inherited options.
-                writeFrame(client, "ping".getBytes());
-                pollForFirstReceive(selector);
-
-                // The client-side observations don't directly read the broker's options,
-                // but a successful TCP_NODELAY+KEEPALIVE handshake leaves no client-visible
-                // artifact. The strongest portable check is that no SocketException is
-                // raised by the configured options round-trip. Verify against the listener's
-                // public configuration surface (the constructor parameters are immutable
-                // after bind) by reading back via the dedicated buffer-size IT below.
-                assertTrue(client.isConnected(), "client connection must remain established");
+                Channel brokerChannel = selector.nettyChannelFor(channelId);
+                assertTrue(brokerChannel != null,
+                    "broker-side Netty channel must be reachable from the selector for " + channelId);
+                assertEquals(Boolean.TRUE, brokerChannel.config().getOption(ChannelOption.TCP_NODELAY),
+                    "accepted child must inherit TCP_NODELAY=true (Nagle off); else request/response "
+                        + "latency silently regresses by hundreds of microseconds per flush");
+                assertEquals(Boolean.TRUE, brokerChannel.config().getOption(ChannelOption.SO_KEEPALIVE),
+                    "accepted child must inherit SO_KEEPALIVE=true; else half-open peer connections "
+                        + "are never detected and the broker leaks dead peer slots indefinitely");
             }
         }
     }
