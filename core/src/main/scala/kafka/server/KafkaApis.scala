@@ -156,6 +156,26 @@ class KafkaApis(val requestChannel: RequestChannel,
     false
   }
 
+  // Outside-in guard for coordinator-keyed namespaces (consumer-group ids and
+  // transactional ids). The physical wire form is `__tenant_<id>.<logical>`; a
+  // privileged caller on a non-tenant listener naming `__tenant_acme.foo`
+  // directly addresses acme's slot in `__consumer_offsets` /
+  // `__transaction_state` and could fence the tenant or read their commits.
+  // Mirrors isReservedTenantNamespace: refuse only when the prefix encodes a
+  // KNOWN tenant id (an unknown `__tenant_*` is opaque to the broker and the
+  // coordinator's own validation will land the rejection).
+  private def isReservedTenantPrincipalNamespace(name: String): Boolean = {
+    if (name == null) return false
+    if (!name.startsWith(org.apache.kafka.server.tenant.TenantNamespace.PRINCIPAL_PREFIX)) return false
+    val knownTenants = tenantConfig.allTenants
+    if (knownTenants.isEmpty) return false
+    val it = knownTenants.iterator
+    while (it.hasNext) {
+      if (name.startsWith(org.apache.kafka.server.tenant.TenantNamespace.PRINCIPAL_PREFIX + it.next + ".")) return true
+    }
+    false
+  }
+
   // Return the PHYSICAL TopicIdPartition the tenant is allowed to fetch, or
   // None if the topic falls outside the tenant's namespace.
   //
@@ -2239,6 +2259,20 @@ class KafkaApis(val requestChannel: RequestChannel,
     keyType: Byte,
     logicalKey: String
   ): Either[Errors, String] = {
+    // Outside-in: non-tenant caller naming `__tenant_<known>.foo` would resolve
+    // the tenant's GROUP or TRANSACTION coordinator and learn the broker that
+    // hosts the partition — and, with cluster-admin ACLs, fence the slot. Refuse
+    // with the auth-failed wire shape so the response is indistinguishable from
+    // an ACL refusal on the same key.
+    if (!tenantCtx.effectiveTenant.isPresent
+        && isReservedTenantPrincipalNamespace(logicalKey)) {
+      val err = keyType match {
+        case t if t == CoordinatorType.GROUP.id => Errors.GROUP_AUTHORIZATION_FAILED
+        case t if t == CoordinatorType.TRANSACTION.id => Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED
+        case _ => Errors.INVALID_REQUEST
+      }
+      return Left(err)
+    }
     keyType match {
       case t if t == CoordinatorType.GROUP.id =>
         try Right(tenantCtx.toPhysicalGroup(logicalKey))
@@ -2485,6 +2519,13 @@ class KafkaApis(val requestChannel: RequestChannel,
   ): Either[Errors, String] = {
     if (tenantCtx.isUnsafe) {
       Left(Errors.GROUP_AUTHORIZATION_FAILED)
+    } else if (!tenantCtx.effectiveTenant.isPresent
+               && isReservedTenantPrincipalNamespace(logicalGroupId)) {
+      // Outside-in: non-tenant caller naming `__tenant_<known>.foo` directly
+      // addresses a tenant's coordinator slot. Refuse with the auth-failed
+      // wire shape the coordinator would emit for an unauthorised access so
+      // the response cannot be used to confirm tenant existence.
+      Left(Errors.GROUP_AUTHORIZATION_FAILED)
     } else {
       try Right(tenantCtx.toPhysicalGroup(logicalGroupId))
       catch {
@@ -2505,6 +2546,13 @@ class KafkaApis(val requestChannel: RequestChannel,
     // so callers cannot distinguish "you can't see this tenant" from
     // "rewrite failed" from "auth failed".
     if (tenantCtx.isUnsafe) {
+      Left(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED)
+    } else if (!tenantCtx.effectiveTenant.isPresent
+               && isReservedTenantPrincipalNamespace(logicalTxnId)) {
+      // Outside-in: non-tenant caller naming `__tenant_<known>.foo` fences the
+      // tenant's producer slot in `__transaction_state`. The CreateTopics
+      // pollution guard refuses naming the storage topic; this refuses naming
+      // its keys.
       Left(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED)
     } else {
       try Right(tenantCtx.toPhysicalTxnId(logicalTxnId))
@@ -2865,6 +2913,15 @@ class KafkaApis(val requestChannel: RequestChannel,
         if (logicalTransactionalId != null) Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED
         else Errors.CLUSTER_AUTHORIZATION_FAILED
       requestHelper.sendErrorResponseMaybeThrottle(request, err.exception)
+      return
+    }
+    // Outside-in: a non-tenant caller naming `__tenant_<known>.foo` would
+    // allocate (and fence) a known tenant's producer slot. Refuse with the
+    // auth-failed wire shape so the response cannot be used as a probe for
+    // whether the tenant exists or has an outstanding producer.
+    if (!tenantCtx.effectiveTenant.isPresent
+        && isReservedTenantPrincipalNamespace(logicalTransactionalId)) {
+      requestHelper.sendErrorResponseMaybeThrottle(request, Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.exception)
       return
     }
     // Phase 3b: rewrite the tenant's logical transactional id to its physical
@@ -3229,9 +3286,20 @@ class KafkaApis(val requestChannel: RequestChannel,
       // so the same call covers both code paths. A cross-tenant prefix from a
       // tenant client (`__tenant_other.x`) raises IllegalArgumentException →
       // refuse this transaction with TRANSACTIONAL_ID_AUTHORIZATION_FAILED.
+      // Outside-in: a non-tenant client naming `__tenant_<known>.x` directly
+      // would fence the tenant's coordinator slot; refuse per-transaction
+      // with the same wire shape so the response cannot be used to probe
+      // for tenant existence. v >= 4 callers are inter-broker (gated by
+      // authorizeClusterOperation above) so the guard is a no-op for them
+      // but harmless — the prefix on inter-broker AddPartitions only ever
+      // arrives from the broker's own outgoing rewrite, which we minted.
       val maybePhysicalTransactionalId: Either[Errors, String] =
-        try Right(tenantCtx.toPhysicalTxnId(logicalTransactionalId))
-        catch { case _: IllegalArgumentException => Left(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED) }
+        if (!tenantCtx.effectiveTenant.isPresent && version < 4
+            && isReservedTenantPrincipalNamespace(logicalTransactionalId))
+          Left(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED)
+        else
+          try Right(tenantCtx.toPhysicalTxnId(logicalTransactionalId))
+          catch { case _: IllegalArgumentException => Left(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED) }
 
       val logicalPartitionsToAdd = partitionsByTransaction.get(logicalTransactionalId).asScala
 
@@ -3345,6 +3413,27 @@ class KafkaApis(val requestChannel: RequestChannel,
     val tenantCtx = tenantContextFor(request)
     if (tenantCtx.isUnsafe) {
       requestHelper.sendErrorResponseMaybeThrottle(request, Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.exception)
+      return
+    }
+
+    // Outside-in: non-tenant caller naming `__tenant_<known>.foo` for either
+    // the transactional id or the group id is fencing tenant coordinator
+    // state. Refuse with the same auth-failed wire shape an unauthorised call
+    // would already produce.
+    if (!tenantCtx.effectiveTenant.isPresent
+        && isReservedTenantPrincipalNamespace(logicalTransactionalId)) {
+      requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
+        new AddOffsetsToTxnResponse(new AddOffsetsToTxnResponseData()
+          .setErrorCode(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.code)
+          .setThrottleTimeMs(requestThrottleMs)))
+      return
+    }
+    if (!tenantCtx.effectiveTenant.isPresent
+        && isReservedTenantPrincipalNamespace(logicalGroupId)) {
+      requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
+        new AddOffsetsToTxnResponse(new AddOffsetsToTxnResponseData()
+          .setErrorCode(Errors.GROUP_AUTHORIZATION_FAILED.code)
+          .setThrottleTimeMs(requestThrottleMs)))
       return
     }
 

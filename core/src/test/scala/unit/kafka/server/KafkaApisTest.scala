@@ -14646,4 +14646,230 @@ class KafkaApisTest extends Logging {
       "errorMessage must not echo the physical prefix")
   }
 
+  @Test
+  def testInitProducerIdOutsideInRefusesTenantPrincipalNamespace(): Unit = {
+    // Outside-in coordinator-namespace pollution: a privileged caller on a
+    // cluster-wide (non-tenant) listener submits `__tenant_acme.tx` as the
+    // transactional id. Without the guard, toPhysicalTxnId is identity for
+    // non-tenant contexts, the auth check would pass for the super-user, and
+    // the InitProducerId would fence acme's producer slot in
+    // __transaction_state. Refuse with TRANSACTIONAL_ID_AUTHORIZATION_FAILED
+    // before reaching the coordinator.
+    val initRequest = new InitProducerIdRequest.Builder(new InitProducerIdRequestData()
+      .setTransactionalId("__tenant_acme.tx")
+      .setTransactionTimeoutMs(TimeUnit.MINUTES.toMillis(1).toInt)
+      .setProducerId(RecordBatch.NO_PRODUCER_ID)
+      .setProducerEpoch(RecordBatch.NO_PRODUCER_EPOCH))
+      .build()
+    val request = buildRequest(initRequest) // default: cluster-wide listener, "Alice" principal
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleInitProducerIdRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[InitProducerIdResponse](request)
+    assertEquals(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.code, response.data.errorCode,
+      "non-tenant caller naming `__tenant_<known>.X` must be refused — coordinator slot is tenant-owned")
+    verify(txnCoordinator, never()).handleInitProducerId(
+      any[String](), anyInt(), any[Option[ProducerIdAndEpoch]](),
+      any[InitProducerIdResult => Unit](), any[RequestLocal]())
+  }
+
+  @Test
+  def testInitProducerIdOutsideInPassesThroughForUnknownTenant(): Unit = {
+    // Mirror of isReservedTenantNamespace semantics: only KNOWN tenant prefixes
+    // are reserved at the broker boundary. An unknown `__tenant_*` prefix is
+    // opaque — the coordinator's own validation lands the rejection. This is
+    // what keeps the guard from blocking unrelated id schemes that happen to
+    // share the prefix shape in installations not running this fork.
+    val initRequest = new InitProducerIdRequest.Builder(new InitProducerIdRequestData()
+      .setTransactionalId("__tenant_unknown.tx")
+      .setTransactionTimeoutMs(TimeUnit.MINUTES.toMillis(1).toInt)
+      .setProducerId(RecordBatch.NO_PRODUCER_ID)
+      .setProducerEpoch(RecordBatch.NO_PRODUCER_EPOCH))
+      .build()
+    val request = buildRequest(initRequest)
+
+    val responseCallback: ArgumentCaptor[InitProducerIdResult => Unit] =
+      ArgumentCaptor.forClass(classOf[InitProducerIdResult => Unit])
+    val requestLocal = RequestLocal.withThreadConfinedCaching
+    when(txnCoordinator.handleInitProducerId(
+      ArgumentMatchers.eq("__tenant_unknown.tx"),
+      anyInt(),
+      ArgumentMatchers.eq(Option.empty),
+      responseCallback.capture(),
+      ArgumentMatchers.eq(requestLocal)
+    )).thenAnswer(_ => responseCallback.getValue.apply(InitProducerIdResult(7L, 0.toShort, Errors.NONE)))
+
+    kafkaApis = createKafkaApis(
+      authorizer = None,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleInitProducerIdRequest(request, requestLocal)
+
+    val response = verifyNoThrottling[InitProducerIdResponse](request)
+    assertEquals(Errors.NONE.code, response.data.errorCode,
+      "an unknown `__tenant_*` prefix is not reserved — the coordinator owns its own validation")
+  }
+
+  @Test
+  def testEndTxnOutsideInRefusesTenantPrincipalNamespace(): Unit = {
+    // EndTxn routes through rewriteTenantTxnId — the centralized fix covers it.
+    // A non-tenant super-user naming `__tenant_acme.tx` would otherwise drive
+    // acme's coordinator to abort/commit a transaction it doesn't own.
+    val endTxnRequest = new EndTxnRequest.Builder(new EndTxnRequestData()
+      .setTransactionalId("__tenant_acme.tx")
+      .setProducerId(42L)
+      .setProducerEpoch(0.toShort)
+      .setCommitted(true), true).build()
+    val request = buildRequest(endTxnRequest)
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleEndTxnRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[EndTxnResponse](request)
+    assertEquals(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.code, response.data.errorCode)
+    verify(txnCoordinator, never()).handleEndTransaction(
+      anyString(), anyLong(), anyShort(), any(), any(),
+      any[(Errors, Long, Short) => Unit](), any[RequestLocal]())
+  }
+
+  @Test
+  def testJoinGroupOutsideInRefusesTenantPrincipalNamespace(): Unit = {
+    // JoinGroup routes through rewriteTenantGroupId — centralized fix covers it.
+    val joinGroupRequest = new JoinGroupRequest.Builder(new JoinGroupRequestData()
+      .setGroupId("__tenant_acme.consumer")
+      .setSessionTimeoutMs(10000)
+      .setRebalanceTimeoutMs(60000)
+      .setProtocolType("consumer")
+      .setMemberId("")
+      .setProtocols(new JoinGroupRequestData.JoinGroupRequestProtocolCollection())).build()
+    val request = buildRequest(joinGroupRequest)
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleJoinGroupRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[JoinGroupResponse](request)
+    assertEquals(Errors.GROUP_AUTHORIZATION_FAILED.code, response.data.errorCode)
+    verify(groupCoordinator, never()).joinGroup(any(), any(), any())
+  }
+
+  @Test
+  def testAddOffsetsToTxnOutsideInRefusesTenantPrincipalNamespaceTxnId(): Unit = {
+    val req = new AddOffsetsToTxnRequest.Builder(new AddOffsetsToTxnRequestData()
+      .setGroupId("orders-consumer")
+      .setTransactionalId("__tenant_acme.tx")
+      .setProducerId(42L)
+      .setProducerEpoch(0.toShort)).build(ApiKeys.ADD_OFFSETS_TO_TXN.latestVersion)
+    val request = buildRequest(req)
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleAddOffsetsToTxnRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[AddOffsetsToTxnResponse](request)
+    assertEquals(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.code, response.data.errorCode)
+    verify(groupCoordinator, never()).partitionFor(anyString())
+    verify(txnCoordinator, never()).handleAddPartitionsToTransaction(
+      anyString(), anyLong(), anyShort(), any[Set[TopicPartition]](),
+      any[Errors => Unit](), any[TransactionVersion](), any[RequestLocal]())
+  }
+
+  @Test
+  def testAddOffsetsToTxnOutsideInRefusesTenantPrincipalNamespaceGroupId(): Unit = {
+    val req = new AddOffsetsToTxnRequest.Builder(new AddOffsetsToTxnRequestData()
+      .setGroupId("__tenant_acme.consumer")
+      .setTransactionalId("my-tx")
+      .setProducerId(42L)
+      .setProducerEpoch(0.toShort)).build(ApiKeys.ADD_OFFSETS_TO_TXN.latestVersion)
+    val request = buildRequest(req)
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleAddOffsetsToTxnRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[AddOffsetsToTxnResponse](request)
+    assertEquals(Errors.GROUP_AUTHORIZATION_FAILED.code, response.data.errorCode)
+    verify(groupCoordinator, never()).partitionFor(anyString())
+  }
+
+  @Test
+  def testAddPartitionsToTxnOutsideInRefusesTenantPrincipalNamespaceV3(): Unit = {
+    // v3 = client path; v >= 4 is inter-broker and gated by CLUSTER_ACTION
+    // separately. The outside-in guard fires per-transaction on v < 4.
+    val tp = new TopicPartition("topic", 0)
+    val req = AddPartitionsToTxnRequest.Builder.forClient(
+      "__tenant_acme.tx", 42L, 0.toShort, Collections.singletonList(tp)
+    ).build(3.toShort)
+    val request = buildRequest(req)
+
+    kafkaApis = createKafkaApis(
+      authorizer = None,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleAddPartitionsToTxnRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[AddPartitionsToTxnResponse](request)
+    val txnErrors = response.errors().get(AddPartitionsToTxnResponse.V3_AND_BELOW_TXN_ID)
+    assertEquals(Collections.singletonMap(tp, Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED), txnErrors)
+    verify(txnCoordinator, never()).handleAddPartitionsToTransaction(
+      anyString(), anyLong(), anyShort(), any[Set[TopicPartition]](),
+      any[Errors => Unit](), any[TransactionVersion](), any[RequestLocal]())
+  }
+
+  @Test
+  def testFindCoordinatorOutsideInRefusesTenantPrincipalNamespaceGroupV4(): Unit = {
+    val findCoord = new FindCoordinatorRequest.Builder(new FindCoordinatorRequestData()
+      .setKeyType(CoordinatorType.GROUP.id)
+      .setCoordinatorKeys(util.Arrays.asList("__tenant_acme.consumer"))).build()
+    val request = buildRequest(findCoord)
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleFindCoordinatorRequest(request)
+
+    val response = verifyNoThrottling[FindCoordinatorResponse](request)
+    val coords = response.data.coordinators.asScala
+    assertEquals(1, coords.size)
+    assertEquals("__tenant_acme.consumer", coords.head.key,
+      "echo key verbatim so the response cannot probe whether the rewrite happened")
+    assertEquals(Errors.GROUP_AUTHORIZATION_FAILED.code, coords.head.errorCode)
+    verify(groupCoordinator, never()).partitionFor(anyString())
+  }
+
+  @Test
+  def testFindCoordinatorOutsideInRefusesTenantPrincipalNamespaceTxnV4(): Unit = {
+    val findCoord = new FindCoordinatorRequest.Builder(new FindCoordinatorRequestData()
+      .setKeyType(CoordinatorType.TRANSACTION.id)
+      .setCoordinatorKeys(util.Arrays.asList("__tenant_acme.tx"))).build()
+    val request = buildRequest(findCoord)
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleFindCoordinatorRequest(request)
+
+    val response = verifyNoThrottling[FindCoordinatorResponse](request)
+    val coords = response.data.coordinators.asScala
+    assertEquals(1, coords.size)
+    assertEquals("__tenant_acme.tx", coords.head.key)
+    assertEquals(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.code, coords.head.errorCode)
+    verify(txnCoordinator, never()).partitionFor(anyString())
+  }
+
+  @Test
+  def testOffsetFetchOutsideInRefusesTenantPrincipalNamespace(): Unit = {
+    // OffsetFetch routes through rewriteTenantGroupId — the centralized fix
+    // covers it. A non-tenant super-user fetching `__tenant_acme.consumer`'s
+    // committed offsets would learn the tenant's progress without an ACL on
+    // the tenant. Refuse with GROUP_AUTHORIZATION_FAILED.
+    val groups = Map[String, java.util.List[TopicPartition]](
+      "__tenant_acme.consumer" -> List(new TopicPartition("topic", 0)).asJava
+    ).asJava
+    val req = new OffsetFetchRequest.Builder(groups, false, false)
+      .build(ApiKeys.OFFSET_FETCH.latestVersion)
+    val request = buildRequest(req)
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleOffsetFetchRequest(request)
+
+    val response = verifyNoThrottling[OffsetFetchResponse](request)
+    val groupResult = response.data.groups.asScala.head
+    assertEquals("__tenant_acme.consumer", groupResult.groupId,
+      "echo groupId verbatim — wire form is what the caller sent")
+    assertEquals(Errors.GROUP_AUTHORIZATION_FAILED.code, groupResult.errorCode)
+  }
+
 }
