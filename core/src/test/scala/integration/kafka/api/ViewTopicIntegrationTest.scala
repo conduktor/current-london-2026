@@ -224,6 +224,64 @@ class ViewTopicIntegrationTest extends IntegrationTestHarness {
   }
 
   @Test
+  def testTwoViewsOverSameBackingInOneFetchRejectsSecondView(): Unit = {
+    // The replica fetch API is keyed by TopicIdPartition, so two views over the same backing
+    // partition in a single FetchRequest cannot both be dispatched. The previous implementation
+    // would have silently overwritten one view in `viewRewrites`, mis-attributing the response.
+    // The current implementation rejects the second view with INVALID_REQUEST so operators see
+    // the collision instead of debugging "why did consumer for viewB receive records that match
+    // viewA's predicate?" months later. This is a hard rejection — not a silent merge.
+    val viewA = "view-red"
+    val viewB = "view-blue"
+    createTopic(backingTopic)
+    createViewTopic(viewA, backingTopic, "body.color == 'red'")
+    createViewTopic(viewB, backingTopic, "body.color == 'blue'")
+
+    val producer = createProducer()
+    produceColors(producer, Seq("red", "blue", "red", "blue"))
+
+    val consumer = createConsumer(configOverrides = newGroupConfig("multi-view-collision"))
+    try {
+      val pA = new TopicPartition(viewA, 0)
+      val pB = new TopicPartition(viewB, 0)
+      consumer.assign(java.util.Arrays.asList(pA, pB))
+      consumer.seekToBeginning(java.util.Arrays.asList(pA, pB))
+
+      // Drive poll cycles for a bounded window. The broker must fail this fetch — either by
+      // throwing an InvalidRequestException up out of poll() or by surfacing an error code at
+      // the consumer's partition that translates to one. The exact surface depends on the
+      // consumer's retry policy, but the IMPORTANT property is that the response is NOT a
+      // silent half-correct merge of viewA's data delivered against viewB's topic. If this
+      // assertion ever fails by "no exception, returns records", that is the regression
+      // Codex flagged: a silent collision in a single FetchRequest.
+      val deadline = System.currentTimeMillis() + 10_000
+      var caught: Option[Throwable] = None
+      while (caught.isEmpty && System.currentTimeMillis() < deadline) {
+        try {
+          consumer.poll(Duration.ofMillis(500))
+        } catch {
+          case t: Throwable => caught = Some(t)
+        }
+      }
+      assertTrue(caught.isDefined,
+        "expected the consumer to surface the multi-view collision (no exception within budget — broker may be " +
+          "silently mis-attributing records)")
+      // The classic consumer surfaces a per-partition INVALID_REQUEST (error code 42) either as
+      // InvalidRequestException directly OR wrapped as IllegalStateException("Unexpected error code
+      // 42 ..."). Either is fine — what matters is that the broker rejected loudly rather than
+      // silently merging two views over one backing partition.
+      val chain = causeChain(caught.get)
+      val directlyInvalidRequest = chain.exists(_.isInstanceOf[InvalidRequestException])
+      val wrappedInvalidRequest = chain.exists(t =>
+        Option(t.getMessage).exists(m => m.contains("error code 42") || m.contains("INVALID_REQUEST")))
+      assertTrue(directlyInvalidRequest || wrappedInvalidRequest,
+        s"expected INVALID_REQUEST signal from broker collision-reject, got: ${chain.map(_.toString).mkString(" -> ")}")
+    } finally {
+      consumer.close(Duration.ofSeconds(5))
+    }
+  }
+
+  @Test
   def testViewFilterHandlesCompressedBatches(): Unit = {
     createTopic(backingTopic)
     createViewTopic(viewTopic, backingTopic, "body.color == 'red'")
@@ -304,6 +362,17 @@ class ViewTopicIntegrationTest extends IntegrationTestHarness {
     assertEquals(expectedCount, collected.size,
       s"expected $expectedCount matching records within ${timeout.toMillis}ms, got ${collected.size}")
     collected.toIndexedSeq
+  }
+
+  /** Flatten the exception cause chain into a Seq for easy scanning. */
+  private def causeChain(t: Throwable): Seq[Throwable] = {
+    val out = scala.collection.mutable.ArrayBuffer.empty[Throwable]
+    var cur: Throwable = t
+    while (cur != null && !out.contains(cur)) {
+      out += cur
+      cur = cur.getCause
+    }
+    out.toIndexedSeq
   }
 
   private def newGroupConfig(groupId: String): Properties = {
