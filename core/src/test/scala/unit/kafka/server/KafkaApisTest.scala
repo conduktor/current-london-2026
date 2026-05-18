@@ -95,7 +95,7 @@ import org.apache.kafka.server.share.context.{FinalContext, ShareSessionContext}
 import org.apache.kafka.server.share.session.{ShareSession, ShareSessionKey}
 import org.apache.kafka.server.storage.log.{FetchParams, FetchPartitionData}
 import org.apache.kafka.server.util.{FutureUtils, MockTime}
-import org.apache.kafka.storage.internals.concentration.ConcentrationKernel
+import org.apache.kafka.storage.internals.concentration.{ConcentrationKernel, LogicalTopicDescriptor}
 import org.apache.kafka.storage.internals.log.{AppendOrigin, LogConfig}
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats
 import org.junit.jupiter.api.Assertions._
@@ -2119,6 +2119,8 @@ class KafkaApisTest extends Logging {
     val logicalTopic = "logical-topic"
     val targetOffset = 50L
     when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
+    when(concentrationKernel.describe(logicalTopic))
+      .thenReturn(Optional.of(new LogicalTopicDescriptor(logicalTopic, 4, "backing-topic", 1)))
     when(concentrationKernel.startLogicalOffset(logicalTopic, 0)).thenReturn(targetOffset)
 
     val deleteRecordsRequest = new DeleteRecordsRequest.Builder(new DeleteRecordsRequestData()
@@ -2158,6 +2160,8 @@ class KafkaApisTest extends Logging {
     val logicalTopic = "logical-topic"
     val highWaterMark = 100L
     when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
+    when(concentrationKernel.describe(logicalTopic))
+      .thenReturn(Optional.of(new LogicalTopicDescriptor(logicalTopic, 4, "backing-topic", 1)))
     when(concentrationKernel.nextLogicalOffset(logicalTopic, 0)).thenReturn(highWaterMark)
     when(concentrationKernel.startLogicalOffset(logicalTopic, 0)).thenReturn(highWaterMark)
 
@@ -2191,6 +2195,8 @@ class KafkaApisTest extends Logging {
     // OFFSET_OUT_OF_RANGE — the same error stock DeleteRecords returns for the same condition.
     val logicalTopic = "logical-topic"
     when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
+    when(concentrationKernel.describe(logicalTopic))
+      .thenReturn(Optional.of(new LogicalTopicDescriptor(logicalTopic, 4, "backing-topic", 1)))
     doThrow(new IllegalArgumentException("offset past HW"))
       .when(concentrationKernel).advanceStartOffset(logicalTopic, 0, 9999L)
 
@@ -2212,6 +2218,80 @@ class KafkaApisTest extends Logging {
     val response = verifyNoThrottling[DeleteRecordsResponse](request)
     val partitionResult = response.data.topics.asScala.head.partitions.asScala.head
     assertEquals(Errors.OFFSET_OUT_OF_RANGE, Errors.forCode(partitionResult.errorCode))
+    assertEquals(DeleteRecordsResponse.INVALID_LOW_WATERMARK, partitionResult.lowWatermark)
+    verify(replicaManager, never()).deleteRecords(anyLong, any(), any(), anyBoolean)
+  }
+
+  @Test
+  def testDeleteRecordsOnLogicalTopicWithOutOfRangePartitionReturnsUnknownTopicOrPartition(): Unit = {
+    // Audit-fix follow-up: the kernel facade's advanceStartOffset lazily creates tracker state
+    // for any (topic, partition) key, so without an explicit bounds check the broker would
+    // silently return NONE with lowWatermark=0 for partition 9999 of a 4-partition logical
+    // topic. The hook resolves this by validating partition < descriptor.numLogicalPartitions
+    // first and surfacing the failure as UNKNOWN_TOPIC_OR_PARTITION — the same error stock
+    // Kafka returns for a partition index that doesn't exist.
+    val logicalTopic = "logical-topic"
+    when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
+    when(concentrationKernel.describe(logicalTopic))
+      .thenReturn(Optional.of(new LogicalTopicDescriptor(logicalTopic, 4, "backing-topic", 1)))
+
+    val deleteRecordsRequest = new DeleteRecordsRequest.Builder(new DeleteRecordsRequestData()
+      .setTopics(Collections.singletonList(new DeleteRecordsTopic()
+        .setName(logicalTopic)
+        .setPartitions(Collections.singletonList(new DeleteRecordsPartition()
+          .setOffset(0L)
+          .setPartitionIndex(9999)))))
+      .setTimeoutMs(5000)).build()
+    val request = buildRequest(deleteRecordsRequest)
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleDeleteRecordsRequest(request)
+
+    val response = verifyNoThrottling[DeleteRecordsResponse](request)
+    val partitionResult = response.data.topics.asScala.head.partitions.asScala.head
+    assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION, Errors.forCode(partitionResult.errorCode))
+    assertEquals(DeleteRecordsResponse.INVALID_LOW_WATERMARK, partitionResult.lowWatermark)
+    // The kernel must NOT have been asked to advance — bounds rejection happens before that call.
+    verify(concentrationKernel, never()).advanceStartOffset(any[String], anyInt, anyLong)
+    verify(replicaManager, never()).deleteRecords(anyLong, any(), any(), anyBoolean)
+  }
+
+  @Test
+  def testDeleteRecordsOnLogicalTopicMapsIllegalStateToKafkaStorageError(): Unit = {
+    // Audit-fix follow-up: the kernel facade's ensureOpen() throws IllegalStateException if a
+    // DeleteRecords request arrives after kernel.close() has run (broker shutdown raced the
+    // request). Without an explicit catch the exception would propagate into the request
+    // handler and crash the data-plane thread. The hook maps it to KAFKA_STORAGE_ERROR — a
+    // retriable storage-layer failure — so the client retries against the next live broker
+    // rather than seeing a generic error.
+    val logicalTopic = "logical-topic"
+    when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
+    when(concentrationKernel.describe(logicalTopic))
+      .thenReturn(Optional.of(new LogicalTopicDescriptor(logicalTopic, 4, "backing-topic", 1)))
+    doThrow(new IllegalStateException("ConcentrationKernel is closed"))
+      .when(concentrationKernel).advanceStartOffset(logicalTopic, 0, 42L)
+
+    val deleteRecordsRequest = new DeleteRecordsRequest.Builder(new DeleteRecordsRequestData()
+      .setTopics(Collections.singletonList(new DeleteRecordsTopic()
+        .setName(logicalTopic)
+        .setPartitions(Collections.singletonList(new DeleteRecordsPartition()
+          .setOffset(42L)
+          .setPartitionIndex(0)))))
+      .setTimeoutMs(5000)).build()
+    val request = buildRequest(deleteRecordsRequest)
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleDeleteRecordsRequest(request)
+
+    val response = verifyNoThrottling[DeleteRecordsResponse](request)
+    val partitionResult = response.data.topics.asScala.head.partitions.asScala.head
+    assertEquals(Errors.KAFKA_STORAGE_ERROR, Errors.forCode(partitionResult.errorCode))
     assertEquals(DeleteRecordsResponse.INVALID_LOW_WATERMARK, partitionResult.lowWatermark)
     verify(replicaManager, never()).deleteRecords(anyLong, any(), any(), anyBoolean)
   }

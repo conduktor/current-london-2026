@@ -110,6 +110,11 @@ class KafkaApis(val requestChannel: RequestChannel,
 ) extends ApiRequestHandler with Logging {
 
   type FetchResponseStats = Map[TopicPartition, RecordValidationStats]
+  // Fail fast at construction rather than NPE on the first request that touches the concentration
+  // hot paths (isBackingTopic / isLogicalTopic). Production-audit defence-in-depth: BrokerServer
+  // initialises this lazily inside startup(), so any code path that builds a KafkaApis without
+  // wiring the kernel surfaces here, not deep in handleProduceRequest.
+  java.util.Objects.requireNonNull(concentrationKernel, "concentrationKernel")
   this.logIdent = "[KafkaApi-%d] ".format(brokerId)
   val configHelper = new ConfigHelper(metadataCache, config, configRepository)
   val authHelper = new AuthHelper(authorizer)
@@ -1497,27 +1502,48 @@ class KafkaApis(val requestChannel: RequestChannel,
         // start offset; the backing log is not truncated and sibling logical topics on the same
         // backing partition retain their full readable ranges. PROMPT.md acceptance criterion 3.
         //
-        // Sentinel -1 (DeleteRecordsRequest.HIGH_WATERMARK) means "delete up to the high
-        // watermark" — for a logical topic that is the kernel's nextLogicalOffset.
-        val targetOffset =
-          if (offset == DeleteRecordsRequest.HIGH_WATERMARK)
-            concentrationKernel.nextLogicalOffset(topicPartition.topic, topicPartition.partition)
-          else offset
-        try {
-          concentrationKernel.advanceStartOffset(topicPartition.topic, topicPartition.partition, targetOffset)
-          val newLowWatermark =
-            concentrationKernel.startLogicalOffset(topicPartition.topic, topicPartition.partition)
+        // The kernel facade does not validate partition bounds on advanceStartOffset (because
+        // tracker.stateFor lazily creates state for any (topic, partition) key, with startOffset
+        // and nextOffset both zero). Without an explicit bounds check here, a DeleteRecords on
+        // partition 9999 of a 4-partition logical topic would silently return NONE with a
+        // lowWatermark of 0 — wrong. Validate the partition index against the descriptor first.
+        val descriptor = concentrationKernel.describe(topicPartition.topic).get
+        if (topicPartition.partition < 0 || topicPartition.partition >= descriptor.numLogicalPartitions) {
           logicalTopicResponses += topicPartition -> new DeleteRecordsPartitionResult()
-            .setLowWatermark(newLowWatermark)
-            .setErrorCode(Errors.NONE.code)
-        } catch {
-          case _: IllegalArgumentException =>
-            // newStart < current startOffset, or newStart > nextLogicalOffset (past HW). Both
-            // are client-visible as OFFSET_OUT_OF_RANGE — the same error stock DeleteRecords
-            // returns when the requested low-water is outside the readable range.
+            .setLowWatermark(DeleteRecordsResponse.INVALID_LOW_WATERMARK)
+            .setErrorCode(Errors.UNKNOWN_TOPIC_OR_PARTITION.code)
+        } else {
+          // Sentinel -1 (DeleteRecordsRequest.HIGH_WATERMARK) means "delete up to the high
+          // watermark" — for a logical topic that is the kernel's nextLogicalOffset.
+          val targetOffset =
+            if (offset == DeleteRecordsRequest.HIGH_WATERMARK)
+              concentrationKernel.nextLogicalOffset(topicPartition.topic, topicPartition.partition)
+            else offset
+          try {
+            concentrationKernel.advanceStartOffset(topicPartition.topic, topicPartition.partition, targetOffset)
+            val newLowWatermark =
+              concentrationKernel.startLogicalOffset(topicPartition.topic, topicPartition.partition)
             logicalTopicResponses += topicPartition -> new DeleteRecordsPartitionResult()
-              .setLowWatermark(DeleteRecordsResponse.INVALID_LOW_WATERMARK)
-              .setErrorCode(Errors.OFFSET_OUT_OF_RANGE.code)
+              .setLowWatermark(newLowWatermark)
+              .setErrorCode(Errors.NONE.code)
+          } catch {
+            case _: IllegalArgumentException =>
+              // newStart < current startOffset, or newStart > nextLogicalOffset (past HW). Both
+              // are client-visible as OFFSET_OUT_OF_RANGE — the same error stock DeleteRecords
+              // returns when the requested low-water is outside the readable range.
+              logicalTopicResponses += topicPartition -> new DeleteRecordsPartitionResult()
+                .setLowWatermark(DeleteRecordsResponse.INVALID_LOW_WATERMARK)
+                .setErrorCode(Errors.OFFSET_OUT_OF_RANGE.code)
+            case _: IllegalStateException =>
+              // The kernel facade's ensureOpen() throws IllegalStateException when the kernel
+              // is closed (broker shutdown raced this request). Surface as KAFKA_STORAGE_ERROR —
+              // a retriable storage-layer failure rather than a client-data error. Without this
+              // catch the exception would propagate to the request handler and crash the request
+              // thread, exactly the kind of failure mode the production-audit flagged.
+              logicalTopicResponses += topicPartition -> new DeleteRecordsPartitionResult()
+                .setLowWatermark(DeleteRecordsResponse.INVALID_LOW_WATERMARK)
+                .setErrorCode(Errors.KAFKA_STORAGE_ERROR.code)
+          }
         }
       }
       else if (!metadataCache.contains(topicPartition))
