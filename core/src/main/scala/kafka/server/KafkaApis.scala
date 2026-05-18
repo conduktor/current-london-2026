@@ -992,6 +992,15 @@ class KafkaApis(val requestChannel: RequestChannel,
       partitionDatas.foreach { case (topicIdPartition, data) =>
         if (!authorizedTopics.contains(topicIdPartition.topic))
           erroneous += topicIdPartition -> FetchResponse.partitionResponse(topicIdPartition, Errors.TOPIC_AUTHORIZATION_FAILED)
+        else if (concentrationKernel.isBackingTopic(topicIdPartition.topic))
+          // Concentration v1: a backing topic's records carry headers for the multiplexed logical
+          // topics (LOGICAL_TOPIC, LOGICAL_PARTITION, LOGICAL_OFFSETS) and otherwise interleave
+          // payloads from all of them. A direct client fetch on the backing name would expose
+          // raw records belonging to other logical-topic tenants — cross-tenant leak. Reject at
+          // the same level as the Produce/DeleteRecords guards (KafkaApis.scala:423, :2040),
+          // surfacing INVALID_TOPIC_EXCEPTION. Internal backing fetches issued by
+          // routeLogicalFetch land in `interesting` directly (line 948) and are unaffected.
+          erroneous += topicIdPartition -> FetchResponse.partitionResponse(topicIdPartition, Errors.INVALID_TOPIC_EXCEPTION)
         else if (concentrationKernel.isLogicalTopic(topicIdPartition.topic))
           routeLogicalFetch(topicIdPartition, data)
         else if (!metadataCache.contains(topicIdPartition.topicPartition))

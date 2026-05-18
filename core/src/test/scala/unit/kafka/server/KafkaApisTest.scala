@@ -3267,6 +3267,52 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testFetchOnBackingTopicIsRejectedWithInvalidTopic(): Unit = {
+    // Codex HIGH 1. Direct client fetch against a backing topic name would expose raw
+    // interleaved records belonging to every logical-topic tenant multiplexed onto the
+    // backing partition — both their payloads and their concentration headers. The fetch
+    // path must reject with INVALID_TOPIC_EXCEPTION at the same level as the Produce and
+    // DeleteRecords guards. Internal backing fetches (issued by routeLogicalFetch) bypass
+    // this classification loop, so this guard does not affect legitimate logical fetches.
+    val backingTopic = "backing-topic"
+    val backingTopicId = Uuid.randomUuid()
+    addTopicToMetadataCache(backingTopic, numPartitions = 1, topicId = backingTopicId)
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+
+    val backingTip = new TopicIdPartition(backingTopicId, new TopicPartition(backingTopic, 0))
+    val fetchDataBuilder = Map(backingTip.topicPartition ->
+      new FetchRequest.PartitionData(backingTip.topicId, 0L, 0L, 1_000_000, Optional.empty())).asJava
+    val fetchData = Map(backingTip ->
+      new FetchRequest.PartitionData(backingTip.topicId, 0L, 0L, 1_000_000, Optional.empty())).asJava
+    val fetchMetadata = new JFetchMetadata(0, 0)
+    val fetchContext = new FullFetchContext(time, new FetchSessionCacheShard(1000, 100),
+      fetchMetadata, fetchData, false, false)
+    when(fetchManager.newContext(
+      any[Short], any[JFetchMetadata], any[Boolean],
+      any[util.Map[TopicIdPartition, FetchRequest.PartitionData]],
+      any[util.List[TopicIdPartition]], any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val fetchRequest = new FetchRequest.Builder(ApiKeys.FETCH.latestVersion,
+      ApiKeys.FETCH.latestVersion, -1, -1, 100, 0, fetchDataBuilder).build()
+    val request = buildRequest(fetchRequest)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleFetchRequest(request)
+
+    val response = verifyNoThrottling[FetchResponse](request)
+    val responseData = response.responseData(metadataCache.topicIdsToNames(), ApiKeys.FETCH.latestVersion)
+    val partitionData = responseData.get(backingTip.topicPartition)
+    assertNotNull(partitionData, "response must contain an entry for the rejected backing TIP")
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, partitionData.errorCode,
+      "direct fetch on a backing topic must be rejected with INVALID_TOPIC_EXCEPTION")
+    // ReplicaManager must never see the backing-topic fetch — the guard short-circuits it.
+    verify(replicaManager, never()).fetchMessages(
+      any[FetchParams], any[Seq[(TopicIdPartition, FetchRequest.PartitionData)]],
+      any[ReplicaQuota], any[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]())
+  }
+
+  @Test
   def testFetchOnLogicalTopicRoutesToBackingAndTranslatesResponse(): Unit = {
     // Concentration hook #3.B happy path. A stock consumer fetches logical topic "orders"
     // partition 0 at offset 100. The hook must:
