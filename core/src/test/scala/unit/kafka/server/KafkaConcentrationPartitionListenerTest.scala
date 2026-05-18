@@ -95,18 +95,24 @@ class KafkaConcentrationPartitionListenerTest {
   }
 
   @Test
-  def equalsAndHashCodeAreScopedByTopicPartitionAndKernelIdentity(): Unit = {
+  def equalsAndHashCodeAreScopedByTopicPartition(): Unit = {
+    // Per convergent Codex+Gemini Q2 feedback: a broker holds a single ConcentrationKernel
+    // for its entire lifetime, so a Partition cannot meaningfully see two distinct kernels.
+    // Equality is therefore scoped to TopicPartition only — same backing TP collapses to a
+    // single listener registration in Partition.listeners regardless of kernel reference.
     val kernel1 = mock(classOf[ConcentrationKernel])
     val kernel2 = mock(classOf[ConcentrationKernel])
     val a = new KafkaConcentrationPartitionListener(backingTp, kernel1)
     val aDup = new KafkaConcentrationPartitionListener(backingTp, kernel1)
     val otherPartition = new KafkaConcentrationPartitionListener(new TopicPartition(backingTp.topic, 9), kernel1)
-    val otherKernel = new KafkaConcentrationPartitionListener(backingTp, kernel2)
+    val sameTpDifferentKernel = new KafkaConcentrationPartitionListener(backingTp, kernel2)
 
-    assertEquals(a, aDup, "Same (tp, kernel-identity) must be equal — required for CopyOnWriteArraySet idempotence")
+    assertEquals(a, aDup, "Same TopicPartition must be equal — required for CopyOnWriteArraySet idempotence")
     assertEquals(a.hashCode, aDup.hashCode)
     assertNotEquals(a, otherPartition, "Different TopicPartition must not be equal")
-    assertNotEquals(a, otherKernel, "Different kernel identity must not be equal")
+    assertEquals(a, sameTpDifferentKernel,
+      "Equality is intentionally scoped to TopicPartition only — broker-singleton kernel makes identity-folding pointless")
+    assertEquals(a.hashCode, sameTpDifferentKernel.hashCode)
   }
 
   @Test

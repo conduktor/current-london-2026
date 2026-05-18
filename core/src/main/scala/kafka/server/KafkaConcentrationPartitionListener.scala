@@ -43,10 +43,12 @@ import org.slf4j.LoggerFactory
  * rehydrate is intentionally deferred to a follow-up commit (the listener will gain a
  * companion {@code onBecomingLeader}-equivalent path).
  *
- * Concurrency / idempotence: this listener is hashed/equated by (topicPartition, kernel),
- * so {@code Partition.maybeAddListener} (a CopyOnWriteArraySet add) is idempotent under
- * repeated {@code makeLeader} calls across leader-epoch bumps. Without this, every epoch
- * bump would leak an additional listener instance.
+ * Concurrency / idempotence: this listener is hashed/equated by {@code TopicPartition}
+ * only, so {@code Partition.maybeAddListener} (a CopyOnWriteArraySet add) is idempotent
+ * under repeated {@code makeLeader} calls across leader-epoch bumps. Without this, every
+ * epoch bump would leak an additional listener instance. The broker has a single
+ * concentration kernel per process; folding kernel identity into equality is unnecessary
+ * (both Codex and Gemini called this out in the Commit A review).
  */
 final class KafkaConcentrationPartitionListener(
   private val backingTopicPartition: TopicPartition,
@@ -77,12 +79,11 @@ final class KafkaConcentrationPartitionListener(
 
   override def equals(other: Any): Boolean = other match {
     case that: KafkaConcentrationPartitionListener =>
-      this.backingTopicPartition == that.backingTopicPartition && (this.kernel eq that.kernel)
+      this.backingTopicPartition == that.backingTopicPartition
     case _ => false
   }
 
-  override def hashCode(): Int =
-    31 * backingTopicPartition.hashCode + System.identityHashCode(kernel)
+  override def hashCode(): Int = backingTopicPartition.hashCode
 }
 
 object KafkaConcentrationPartitionListener {
