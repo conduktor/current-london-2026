@@ -18,6 +18,7 @@ package org.apache.kafka.storage.internals.concentration;
 
 import java.io.File;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Iterator;
 import java.util.List;
@@ -299,6 +300,52 @@ public final class ConcentrationKernel implements AutoCloseable {
     public void recoverFromBackingScan(Iterator<RecoveryRecord> stream) throws IOException {
         ensureOpen();
         recoverer.recoverFromScan(stream, tracker);
+    }
+
+    /**
+     * Cheap-path startup recovery. For every declared logical topic, enumerate the sidecar files
+     * already on disk under {@code sidecarDir/<topic>/<partition>.sidecar} and seed the tracker
+     * with their {@code (logicalStart=0, nextLogical=size)}.
+     *
+     * <p>This is the PROMPT's "restart with index → sub-second offset-tracker rebuild" path. The
+     * broker calls this at startup after declaring every logical topic. Partitions that have
+     * never been produced to have no sidecar file on disk and are left at the tracker's default
+     * {@code (0, 0)} — they will be created on first produce.
+     *
+     * <p>Sidecar files whose {@code openSidecar} throws {@code CorruptIndexException} (tail-torn
+     * write detected at open time) are NOT swallowed here: the exception propagates, surfacing
+     * the corruption to the operator so the backing-log scan fallback can be triggered.
+     *
+     * <p>Idempotent: re-calling overwrites the tracker state for every partition with a sidecar,
+     * which is correct because the on-disk sidecar is the source of truth in this path.
+     */
+    public void recoverFromDisk() throws IOException {
+        ensureOpen();
+        List<LogicalPartition> present = new ArrayList<>();
+        for (LogicalTopicDescriptor d : registry.all()) {
+            File topicDir = new File(recoverer.sidecarFile(d.logicalName(), 0).getParentFile().getPath());
+            File[] files = topicDir.listFiles((dir, name) -> name.endsWith(".sidecar"));
+            if (files == null) continue;
+            for (File f : files) {
+                String name = f.getName();
+                int dot = name.lastIndexOf('.');
+                if (dot <= 0) continue;
+                int partition;
+                try {
+                    partition = Integer.parseInt(name.substring(0, dot));
+                } catch (NumberFormatException nfe) {
+                    continue; // not a numeric partition file — leave alone
+                }
+                if (partition < 0 || partition >= d.numLogicalPartitions()) {
+                    // A sidecar file outside the declared partition range is a stale artefact
+                    // (e.g., a topic that was previously declared with a larger N). Skip silently
+                    // — the operator can clean it up; recovery should not abort because of it.
+                    continue;
+                }
+                present.add(new LogicalPartition(d.logicalName(), partition));
+            }
+        }
+        recoverer.recoverFromSidecars(present, tracker);
     }
 
     // ------------------ Lifecycle ------------------

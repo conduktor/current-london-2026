@@ -95,4 +95,13 @@ public final class LogicalTopicRegistry {
             return List.copyOf(list);
         }
     }
+
+    /**
+     * Immutable snapshot of every declared logical topic. Used at broker startup so the recovery
+     * pass can enumerate the registry-known partitions and seed their sidecars from disk. Safe to
+     * iterate without holding any lock — the returned list is a copy.
+     */
+    public Collection<LogicalTopicDescriptor> all() {
+        return List.copyOf(byLogicalName.values());
+    }
 }

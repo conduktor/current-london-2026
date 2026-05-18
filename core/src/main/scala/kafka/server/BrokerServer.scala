@@ -466,6 +466,20 @@ class BrokerServer(
         config.getString(ServerConfigs.CONCENTRATION_LOGICAL_TOPICS_CONFIG)
       ).forEach(concentrationKernel.declare(_))
 
+      // Hook #5 (cheap path): PROMPT acceptance criterion — "Broker restart with intact durable
+      // index → sub-second offset-tracker rebuild from the sidecar file." Sidecars on disk are
+      // the source of truth here; recoverFromDisk() walks the per-topic sidecar directory and
+      // seeds the tracker for every (logicalTopic, partition) with a file present. Partitions
+      // never produced to have no sidecar and are left at the default (0, 0) — they will be
+      // created at first produce.
+      //
+      // The expensive "restart without index → full log scan" recovery uses a different kernel
+      // entry point (recoverFromBackingScan), which requires reading the backing UnifiedLog —
+      // not available until logManager.startup() runs later in the metadata-publishing path.
+      // That wiring is intentionally NOT part of this hook; see PROMPT.md for the contract and
+      // the kernel's recoverFromBackingScan for the operator-driven recovery API.
+      concentrationKernel.recoverFromDisk()
+
       dataPlaneRequestProcessor = new KafkaApis(
         requestChannel = socketServer.dataPlaneRequestChannel,
         forwardingManager = forwardingManager,

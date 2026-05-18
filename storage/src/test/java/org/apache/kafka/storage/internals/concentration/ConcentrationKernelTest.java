@@ -315,6 +315,86 @@ public class ConcentrationKernelTest {
     }
 
     @Test
+    public void recoverFromDiskSeedsTrackerForEveryPartitionWithASidecar() throws IOException {
+        // PROMPT acceptance criterion: "Broker restart with intact durable index → sub-second
+        // offset-tracker rebuild from the sidecar file." This pins the broker-startup wiring:
+        // after declarations are made, a single recoverFromDisk() call seeds the tracker for
+        // every partition whose sidecar file is intact on disk, with no further input from the
+        // broker. Mirrors what BrokerServer.startup() will invoke.
+        kernel.declare(descriptor("orders", 4, "shared", 1));
+        kernel.declare(descriptor("events", 4, "shared", 1));
+        // Produce a few records to "orders" partitions 0 and 2, and one to "events" partition 1.
+        for (long b = 0; b < 5; b++) kernel.commitProduce(kernel.reserveProduce("orders", 0), b);
+        for (long b = 5; b < 8; b++) kernel.commitProduce(kernel.reserveProduce("orders", 2), b);
+        kernel.commitProduce(kernel.reserveProduce("events", 1), 100L);
+        kernel.close();
+
+        // Rebuild from disk: declarations are made again (mirrors broker startup re-reading
+        // config), then a single recoverFromDisk() seeds every partition whose sidecar exists.
+        ConcentrationKernel rebuilt = new ConcentrationKernel(sidecarDir);
+        try {
+            rebuilt.declare(descriptor("orders", 4, "shared", 1));
+            rebuilt.declare(descriptor("events", 4, "shared", 1));
+            rebuilt.recoverFromDisk();
+            assertEquals(5L, rebuilt.nextLogicalOffset("orders", 0));
+            assertEquals(0L, rebuilt.nextLogicalOffset("orders", 1), "no sidecar — stays at zero");
+            assertEquals(3L, rebuilt.nextLogicalOffset("orders", 2));
+            assertEquals(0L, rebuilt.nextLogicalOffset("orders", 3), "no sidecar — stays at zero");
+            assertEquals(1L, rebuilt.nextLogicalOffset("events", 1));
+            // Next reserve on a recovered partition continues contiguously from its end.
+            assertEquals(5L, rebuilt.reserveProduce("orders", 0).logicalOffset());
+            assertEquals(3L, rebuilt.reserveProduce("orders", 2).logicalOffset());
+        } finally {
+            rebuilt.close();
+        }
+        kernel = null;
+    }
+
+    @Test
+    public void recoverFromDiskSkipsSidecarsForStalePartitionsOutsideDeclaredRange() throws IOException {
+        // Defensive: if a previous incarnation of the topic was declared with a larger N (say
+        // 100) and partition 80 had a sidecar, but the topic is now redeclared with N=4, the
+        // stale partition-80 sidecar must NOT be loaded — it would be invalid against the
+        // current descriptor's partition-range and would surprise the tracker. Skip silently
+        // so recovery succeeds; the operator can clean the stale file up later.
+        kernel.declare(descriptor("orders", 100, "shared", 1));
+        kernel.commitProduce(kernel.reserveProduce("orders", 80), 0L);
+        kernel.close();
+
+        ConcentrationKernel rebuilt = new ConcentrationKernel(sidecarDir);
+        try {
+            rebuilt.declare(descriptor("orders", 4, "shared", 1)); // smaller N — partition 80 stale
+            rebuilt.recoverFromDisk(); // must NOT throw
+            for (int p = 0; p < 4; p++) {
+                assertEquals(0L, rebuilt.nextLogicalOffset("orders", p),
+                    "no in-range partition had a sidecar; all stay at zero");
+            }
+        } finally {
+            rebuilt.close();
+        }
+        kernel = null;
+    }
+
+    @Test
+    public void recoverFromDiskOnEmptyDirIsANoOp() throws IOException {
+        // First-boot scenario: no sidecars on disk yet. recoverFromDisk() must succeed without
+        // touching the tracker.
+        kernel.declare(descriptor("orders", 4, "shared", 1));
+        kernel.recoverFromDisk(); // no sidecars, no state change
+        assertEquals(0L, kernel.nextLogicalOffset("orders", 0));
+        assertEquals(0L, kernel.reserveProduce("orders", 0).logicalOffset(),
+            "no recovery state — next reserve starts at 0");
+    }
+
+    @Test
+    public void recoverFromDiskRejectsAfterClose() throws IOException {
+        kernel.declare(descriptor("orders", 4, "shared", 1));
+        kernel.close();
+        assertThrows(IllegalStateException.class, kernel::recoverFromDisk);
+        kernel = null;
+    }
+
+    @Test
     public void removeLogicalPartitionClosesSidecarAndDeletesFileAndTrackerState() throws IOException {
         // Pins the unbounded-growth audit fix at the broker-facing surface: removeLogicalPartition
         // must close the cached sidecar handle, delete the on-disk file, and drop the tracker
