@@ -231,11 +231,14 @@ public class RuleEngineTest {
     }
 
     @Test
-    public void privilegedListenerWithLegacyEmptyTrustedSetAllowsAllPrincipals() {
-        // Legacy construction (no trusted-bypass principals): falls back to
-        // listener-only bypass. Preserved for deployments that haven't
-        // configured super.users yet; a WARN is logged at engine construction
-        // time so the operator notices the gap.
+    public void privilegedListenerWithEmptyTrustedSetDeniesEveryone() {
+        // Codex round-2 P1#1 fix: empty governance.bypass.principals means
+        // NO principal can ride the privileged-listener bypass — every
+        // request, even one arriving from a privileged (inter-broker)
+        // listener, is subject to CEL rule evaluation. The previous
+        // "empty = listener-only fallback" semantics silently re-introduced
+        // the gap the dedicated config exists to close: any client reaching
+        // a shared listener would have ridden the bypass.
         RuleEngine engine = new RuleEngine();
         engine.install(new RuleSetBuilder()
             .put(denyRule("deny-all-create-topics", ApiKeys.CREATE_TOPICS, "true", 1))
@@ -243,14 +246,14 @@ public class RuleEngineTest {
             .put(denyRule("deny-all-metadata", ApiKeys.METADATA, "true", 3))
             .build());
         for (ApiKeys k : new ApiKeys[]{ApiKeys.CREATE_TOPICS, ApiKeys.FETCH, ApiKeys.METADATA}) {
-            assertSame(RuleDecision.ALLOW,
+            assertTrue(
                 engine.evaluate(k, "any-client-id-here", "User:anyone", true,
-                    () -> Collections.emptyMap()),
-                "legacy listener-only bypass must accept any principal on api key " + k);
+                    () -> Collections.singletonMap("request", Collections.emptyMap())).denied(),
+                "empty trusted set must deny the bypass even on a privileged listener: " + k);
         }
         assertTrue(engine.evaluate(ApiKeys.FETCH, "regular-client", "User:client", false,
-            () -> Collections.emptyMap()).denied(),
-            "non-privileged client still subject to rules");
+            () -> Collections.singletonMap("request", Collections.emptyMap())).denied(),
+            "non-privileged client also subject to rules");
     }
 
     @Test
@@ -499,5 +502,73 @@ public class RuleEngineTest {
         assertTrue(d.denied());
         assertEquals(99, d.errorCode());
         assertEquals("after", d.denyingRuleId());
+    }
+
+    // ----- parseBypassPrincipals (governance.bypass.principals parser) -----
+
+    @Test
+    public void parseBypassPrincipalsAcceptsValidSemicolonSeparatedList() {
+        java.util.Set<String> out = RuleEngine.parseBypassPrincipals(
+            "User:broker;User:kafka-controller");
+        assertEquals(2, out.size());
+        assertTrue(out.contains("User:broker"));
+        assertTrue(out.contains("User:kafka-controller"));
+    }
+
+    @Test
+    public void parseBypassPrincipalsNullOrEmptyYieldsEmptySet() {
+        assertTrue(RuleEngine.parseBypassPrincipals(null).isEmpty());
+        assertTrue(RuleEngine.parseBypassPrincipals("").isEmpty());
+        assertTrue(RuleEngine.parseBypassPrincipals("   ").isEmpty());
+        assertTrue(RuleEngine.parseBypassPrincipals(";;;").isEmpty());
+    }
+
+    @Test
+    public void parseBypassPrincipalsTrimsWhitespaceAndDropsBlankSegments() {
+        java.util.Set<String> out = RuleEngine.parseBypassPrincipals(
+            "  User:broker  ; ; User:other ;");
+        assertEquals(2, out.size());
+        assertTrue(out.contains("User:broker"));
+        assertTrue(out.contains("User:other"));
+    }
+
+    @Test
+    public void parseBypassPrincipalsThrowsOnMalformedEntry() {
+        // Codex round-2 P1#1: malformed entries fail broker startup loudly
+        // — never silently dropped. A trailing typo like 'Userbroker' (no
+        // colon) is the exact mistake a hurried operator would make.
+        IllegalArgumentException ex = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals(
+                    "User:broker;Userbroker;User:other"));
+        // Surface enough of the offending entry that the operator can grep
+        // for it in their startup logs.
+        assertTrue(ex.getMessage() != null,
+            "parseBypassPrincipals must report which entry was malformed");
+    }
+
+    @Test
+    public void parseBypassPrincipalsCanonicalizesParsedForm() {
+        // SecurityUtils.parseKafkaPrincipal returns a KafkaPrincipal whose
+        // toString() is the canonical "type:name" form. We rely on the
+        // canonical form for the verbatim string match at evaluate() time,
+        // so a parser-round-trip of a canonical entry must produce that
+        // same canonical string.
+        java.util.Set<String> out = RuleEngine.parseBypassPrincipals("User:broker");
+        assertTrue(out.contains("User:broker"));
+    }
+
+    @Test
+    public void parseBypassPrincipalsThrowsOnEntryWithoutSeparator() {
+        // SecurityUtils.parseKafkaPrincipal requires "type:name" and throws
+        // when no ':' separator is present. We propagate that behaviour so
+        // a typo like 'Userbroker' (the most likely operator slip) is caught
+        // at broker startup, not at first inter-broker request.
+        org.junit.jupiter.api.Assertions.assertThrows(
+            IllegalArgumentException.class,
+            () -> RuleEngine.parseBypassPrincipals("Userbroker"));
+        org.junit.jupiter.api.Assertions.assertThrows(
+            IllegalArgumentException.class,
+            () -> RuleEngine.parseBypassPrincipals("User:ok;noseparator"));
     }
 }

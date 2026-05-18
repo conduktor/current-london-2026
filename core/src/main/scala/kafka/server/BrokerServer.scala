@@ -45,7 +45,7 @@ import org.apache.kafka.metadata.{BrokerState, ListenerInfo}
 import org.apache.kafka.security.CredentialProvider
 import org.apache.kafka.server.authorizer.Authorizer
 import org.apache.kafka.server.common.{ApiMessageAndVersion, DirectoryEventHandler, NodeToControllerChannelManager, TopicIdPartition}
-import org.apache.kafka.server.config.ConfigType
+import org.apache.kafka.server.config.{ConfigType, ServerConfigs}
 import org.apache.kafka.server.log.remote.storage.RemoteLogManagerConfig
 import org.apache.kafka.server.metrics.{ClientMetricsReceiverPlugin, KafkaYammerMetrics}
 import org.apache.kafka.server.network.{EndpointReadyFutures, KafkaAuthorizerServerInfo}
@@ -492,48 +492,33 @@ class BrokerServer(
       // The actual drain from the __governance log happens below, before
       // SocketServer.enableRequestProcessing — see governanceBootstrap.
       //
-      // Pass super.users as the trusted-bypass principal allow-list. The
-      // privileged-listener bypass for inter-broker traffic is necessary
-      // but not sufficient on its own: an operator who mis-configures the
-      // inter-broker listener to share traffic with a client listener would
-      // otherwise let every client on that listener evade rule evaluation.
-      // Requiring the peer principal to also match super.users closes that
-      // gap. Empty super.users means legacy behaviour (listener-only) and a
-      // WARN at construction time — see RuleEngine constructor for details.
-      // Parse super.users with the same validation Kafka's own authorizer
-      // uses (semicolon-separated, each entry SecurityUtils.parseKafkaPrincipal
-      // for type:name validation). Codex final-audit P1#3: the prior raw split
-      // accepted any non-empty string, so malformed entries silently never
-      // matched any canonical principal — leaving the operator's intent
-      // partially unenforced with no log signal. The new path stores entries
-      // in canonical form (type:name as produced by KafkaPrincipal) and
-      // surfaces each unparseable entry with a single WARN at startup so the
-      // operator notices the typo before relying on the bypass.
-      val superUserSet: java.util.Set[String] = {
-        val raw = config.originals().get("super.users")
-        val out = new java.util.HashSet[String]()
-        if (raw != null) {
-          raw.toString.split(";").foreach { v =>
-            val trimmed = v.trim
-            if (trimmed.nonEmpty) {
-              try {
-                val principal = org.apache.kafka.common.utils.SecurityUtils
-                  .parseKafkaPrincipal(trimmed)
-                out.add(principal.getPrincipalType + ":" + principal.getName)
-              } catch {
-                case _: IllegalArgumentException =>
-                  warn(s"ignoring malformed super.users entry '$trimmed' — " +
-                    s"expected 'type:name' (e.g. 'User:broker'); this entry " +
-                    s"will not be granted the privileged-listener rule-engine " +
-                    s"bypass. Fix the super.users config and restart to " +
-                    s"include it.")
-              }
-            }
-          }
-        }
-        out
-      }
-      ruleEngine = new RuleEngine(superUserSet)
+      // Codex deep-audit P1#1 (round-2): the trusted-bypass set is sourced
+      // from the dedicated `governance.bypass.principals` config, NOT from
+      // `super.users`. The two were coupled in an earlier iteration; that
+      // coupling was wrong on three independent axes:
+      //   1. It over-granted the bypass to non-broker super-users that
+      //      happened to reach the inter-broker listener.
+      //   2. It under-granted when the broker principal was ACL-authorized
+      //      but not enrolled in super.users.
+      //   3. An empty super.users (a valid config) silently re-introduced
+      //      the listener-only fallback the dedicated config was meant to
+      //      close.
+      // The new path uses a narrow identity concept (which principals may
+      // ride the broker-internal traffic bypass) decoupled from the broad
+      // authorization concept that super.users represents. Malformed entries
+      // fail broker startup loudly inside parseBypassPrincipals — no silent
+      // drop, no fail-open. An empty list means NO principal can ride the
+      // bypass; ALL traffic — including inter-broker — is then subject to
+      // CEL rule evaluation. Operators are documented in ServerConfigs as
+      // required to enroll the broker's own principal for steady-state
+      // safety.
+      val bypassPrincipals: java.util.Set[String] =
+        RuleEngine.parseBypassPrincipals(
+          config.originals().get(ServerConfigs.GOVERNANCE_BYPASS_PRINCIPALS_CONFIG) match {
+            case null => null
+            case v    => v.toString
+          })
+      ruleEngine = new RuleEngine(bypassPrincipals)
 
       // Authoritative probe for "is this broker a replica of __governance-0?".
       // The legacy bootstrap conflated "topic absent" with "broker not a

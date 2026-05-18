@@ -17,11 +17,13 @@
 package org.apache.kafka.server.rules;
 
 import org.apache.kafka.common.protocol.ApiKeys;
+import org.apache.kafka.common.utils.SecurityUtils;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.Collections;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -91,9 +93,26 @@ public final class RuleEngine {
 
     /**
      * Allow-list of principal strings (e.g. {@code "User:broker"}) that may
-     * exercise the privileged-listener bypass. When empty, the bypass falls
-     * back to listener-only — preserving legacy behaviour for deployments
-     * that haven't yet configured the broker principal.
+     * exercise the privileged-listener bypass. Sourced from the dedicated
+     * {@code governance.bypass.principals} broker config — independent of
+     * {@code super.users} by design (Codex P1#1 deep-audit finding):
+     *
+     * <ul>
+     *   <li>{@code super.users} is a broad authorization concept tied to the
+     *       authorizer. Coupling the bypass to it over-grants the bypass to
+     *       non-broker super-users that happen to reach the inter-broker
+     *       listener, and under-grants when the broker is ACL-authorized but
+     *       not enrolled in super.users.</li>
+     *   <li>{@code governance.bypass.principals} is a narrow identity concept
+     *       used only to protect broker-internal traffic (replica fetchers,
+     *       __governance log consumer, KRaft metadata fetches) from being
+     *       blocked by a misconfigured DENY rule.</li>
+     * </ul>
+     *
+     * <p>An empty set means <strong>no principal</strong> can exercise the
+     * bypass; ALL traffic — including inter-broker — is subject to rule
+     * evaluation. This is the strict, fail-closed posture. Operators MUST
+     * enroll the broker's own principal explicitly for steady-state safety.
      *
      * <p>The set is constructor-immutable. Operators rotate broker
      * credentials by restarting brokers, so a hot-reload knob would buy
@@ -106,10 +125,9 @@ public final class RuleEngine {
      * Backwards-compatible constructor for tests and old callers that don't
      * configure a trusted-principal allow-list. Equivalent to
      * {@code new RuleEngine(Collections.emptySet())}: the privileged-listener
-     * bypass falls back to listener-only semantics. New code should pass
-     * the broker's configured {@code super.users} principal set so that a
-     * client connecting on a mis-configured shared listener cannot ride the
-     * bypass.
+     * bypass is denied for every principal. New production code must pass
+     * the operator's parsed {@code governance.bypass.principals} set so the
+     * broker's own principal can ride the bypass.
      */
     public RuleEngine() {
         this(Collections.emptySet());
@@ -118,27 +136,74 @@ public final class RuleEngine {
     /**
      * Construct an engine that requires {@code principalName ∈ trustedBypassPrincipals}
      * in addition to {@code fromPrivilegedListener=true} to grant the bypass.
-     * Pass {@code Collections.emptySet()} to preserve listener-only behaviour.
+     * Pass {@code Collections.emptySet()} to refuse the bypass for every
+     * principal — every request, even from a privileged listener, is then
+     * subject to rule evaluation.
      *
-     * <p>The recommended source for {@code trustedBypassPrincipals} is the
-     * broker's {@code super.users} config: by Kafka convention, the broker's
-     * own principal is enrolled there. Passing the parsed super-user set
-     * narrows the bypass to "privileged listener AND principal is broker /
-     * super-user", which is the production-safe posture.
+     * <p>The required source for {@code trustedBypassPrincipals} is the
+     * dedicated {@code governance.bypass.principals} broker config, parsed
+     * via {@link #parseBypassPrincipals(String)} so that a malformed entry
+     * fails broker startup rather than silently dropping.
      */
     public RuleEngine(Set<String> trustedBypassPrincipals) {
         this.trustedBypassPrincipals = Set.copyOf(trustedBypassPrincipals);
         if (this.trustedBypassPrincipals.isEmpty()) {
-            LOG.warn("RuleEngine constructed with no trusted-bypass principals; "
-                + "privileged-listener bypass will rely on listener flag alone. "
-                + "If the inter-broker listener is shared with client traffic this "
-                + "lets any client on that listener evade rule evaluation. Configure "
-                + "super.users (and ensure the broker principal is in it) to close "
-                + "this gap.");
+            LOG.warn("RuleEngine constructed with empty governance.bypass.principals — "
+                + "no principal can ride the privileged-listener bypass. "
+                + "ALL traffic, including inter-broker (replica fetchers, "
+                + "__governance log consumer, KRaft metadata fetches), is subject "
+                + "to CEL rule evaluation. Enroll the broker's own principal in "
+                + "governance.bypass.principals for steady-state safety.");
         } else {
             LOG.info("RuleEngine privileged-listener bypass narrowed to principals: {}",
                 this.trustedBypassPrincipals);
         }
+    }
+
+    /**
+     * Parse the value of the {@code governance.bypass.principals} config.
+     *
+     * <p>Format: semicolon-separated list of Kafka principals, each parseable
+     * by {@link SecurityUtils#parseKafkaPrincipal(String)} (e.g.
+     * {@code "User:broker;User:kafka-controller"}). Whitespace around
+     * separators is tolerated; empty segments between separators are
+     * tolerated and skipped (so {@code "User:a; ;User:b"} is equivalent to
+     * {@code "User:a;User:b"}).
+     *
+     * <p><strong>Fails fast on any malformed entry</strong> — throws
+     * {@link IllegalArgumentException} so the broker refuses to start rather
+     * than silently dropping the entry and producing an under-protected
+     * runtime. This matches upstream {@code StandardAuthorizer}'s
+     * super.users parsing, which also throws on malformed entries.
+     *
+     * <p>Returns the canonical string form of each parsed principal
+     * (mirroring how the network layer reports the authenticated peer
+     * principal at request time) so that {@link #bypassIsAuthorisedFor(String)}
+     * can do a verbatim string-equals match.
+     *
+     * @param raw the config value (may be {@code null} or empty — both
+     *            return an empty set, granting no bypass)
+     * @return canonical principal strings; never {@code null}
+     * @throws IllegalArgumentException if any non-empty segment fails to
+     *         parse as a Kafka principal
+     */
+    public static Set<String> parseBypassPrincipals(String raw) {
+        if (raw == null) {
+            return Collections.emptySet();
+        }
+        Set<String> out = new LinkedHashSet<>();
+        for (String segment : raw.split(";")) {
+            String trimmed = segment.trim();
+            if (trimmed.isEmpty()) {
+                continue;
+            }
+            // SecurityUtils.parseKafkaPrincipal throws IllegalArgumentException
+            // on a malformed entry (no ':' separator, empty type, etc.). We let
+            // that propagate so broker startup fails loudly.
+            String canonical = SecurityUtils.parseKafkaPrincipal(trimmed).toString();
+            out.add(canonical);
+        }
+        return Collections.unmodifiableSet(out);
     }
 
     /**
@@ -282,15 +347,20 @@ public final class RuleEngine {
 
     /**
      * Returns true when the privileged-listener bypass is authorised for the
-     * given peer principal. When no allow-list is configured, falls back to
-     * legacy listener-only behaviour (already logged at construction time).
-     * When an allow-list IS configured, the principal must appear in it —
-     * matched as a verbatim string against the principal's
-     * {@code toString()} representation (e.g. {@code "User:broker"}).
+     * given peer principal. Strict, fail-closed semantics: an empty allow-list
+     * grants the bypass to nobody (so every request, including inter-broker,
+     * is subject to rule evaluation). When an allow-list IS configured, the
+     * principal must appear in it — matched as a verbatim string against the
+     * principal's {@code toString()} representation (e.g. {@code "User:broker"}).
+     *
+     * <p>Codex P1#1 fix: previous behaviour fell back to listener-only when
+     * the allow-list was empty, which silently re-introduced the very gap the
+     * dedicated config exists to close (any client reaching a shared listener
+     * would ride the bypass). Empty now means no bypass.
      */
     private boolean bypassIsAuthorisedFor(String principalName) {
         if (trustedBypassPrincipals.isEmpty()) {
-            return true;
+            return false;
         }
         return principalName != null && trustedBypassPrincipals.contains(principalName);
     }

@@ -120,6 +120,32 @@ public class ServerConfigs {
             "initialization. This is useful when the authorizer is dependent on the cluster itself for bootstrapping, as is the case for " +
             "the StandardAuthorizer (which stores ACLs in the metadata log.) By default, all listeners included in controller.listener.names " +
             "will also be early start listeners. A listener should not appear in this list if it accepts external traffic.";
+
+    /************ Governance (CEL rule engine) Configuration ************/
+    public static final String GOVERNANCE_BYPASS_PRINCIPALS_CONFIG = "governance.bypass.principals";
+    public static final String GOVERNANCE_BYPASS_PRINCIPALS_DEFAULT = "";
+    public static final String GOVERNANCE_BYPASS_PRINCIPALS_DOC =
+            "Semicolon-separated list of Kafka principals (e.g. " +
+            "<code>User:broker;User:kafka-controller</code>) that are granted " +
+            "the broker-side CEL rule-engine bypass when they connect on a " +
+            "privileged listener (the broker's inter-broker listener). The " +
+            "bypass requires BOTH conditions to hold: the request must arrive " +
+            "on a listener the network layer treats as inter-broker AND the " +
+            "authenticated peer principal must appear in this list. This " +
+            "config is INDEPENDENT of <code>super.users</code> by design: " +
+            "<code>super.users</code> is a broad authorization concept used by " +
+            "the authorizer, while the governance bypass is a narrow identity " +
+            "concept used only to protect broker-internal traffic (replica " +
+            "fetchers, __governance log consumer, KRaft metadata fetches) from " +
+            "being blocked by a misconfigured DENY rule. Coupling the two " +
+            "would (a) break deployments where the broker is ACL-authorized " +
+            "but not in <code>super.users</code> and (b) over-grant the " +
+            "bypass to non-broker super-users that can reach a privileged " +
+            "listener.<br/>Operators MUST enroll the broker's own principal " +
+            "here for steady-state safety; an empty list means no principal " +
+            "can exercise the bypass and ALL traffic — including inter-broker " +
+            "— is subject to rule evaluation. Malformed entries fail broker " +
+            "startup at config load (no silent drop).";
     public static final ConfigDef CONFIG_DEF =  new ConfigDef()
             .define(BROKER_ID_CONFIG, INT, BROKER_ID_DEFAULT, HIGH, BROKER_ID_DOC)
             .define(MESSAGE_MAX_BYTES_CONFIG, INT, LogConfig.DEFAULT_MAX_MESSAGE_BYTES, atLeast(0), HIGH, MESSAGE_MAX_BYTES_DOC)
@@ -132,6 +158,8 @@ public class ServerConfigs {
             /************* Authorizer Configuration ***********/
             .define(AUTHORIZER_CLASS_NAME_CONFIG, STRING, AUTHORIZER_CLASS_NAME_DEFAULT, new ConfigDef.NonNullValidator(), LOW, AUTHORIZER_CLASS_NAME_DOC)
             .define(EARLY_START_LISTENERS_CONFIG, STRING, null,  HIGH, EARLY_START_LISTENERS_DOC)
+            /************ Governance (CEL rule engine) Configuration ************/
+            .define(GOVERNANCE_BYPASS_PRINCIPALS_CONFIG, STRING, GOVERNANCE_BYPASS_PRINCIPALS_DEFAULT, MEDIUM, GOVERNANCE_BYPASS_PRINCIPALS_DOC)
             /************ Rack Configuration ******************/
             .define(BROKER_RACK_CONFIG, STRING, null, MEDIUM, BROKER_RACK_DOC)
             /** ********* Controlled shutdown configuration ***********/
