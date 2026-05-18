@@ -952,4 +952,54 @@ class ConnectionQuotasTest {
       )
     }
   }
+
+  @Test
+  def testTryIncReturnsFalseWhenBrokerMaxReachedInsteadOfBlocking(): Unit = {
+    // Contract: tryInc is the non-blocking variant used by the io_uring Processor accept
+    // path. Under broker-max overload, inc() would counts.wait() — fine for the dedicated
+    // NIO Acceptor thread but disastrous on a Processor poll loop. tryInc must refuse
+    // promptly and never block. This test is the inverse of
+    // testMaxBrokerWideConnectionLimit's "future.get(100ms) throws TimeoutException"
+    // assertion against inc().
+    val maxConnections = 4
+    val props = brokerPropsWithDefaultConnectionLimits
+    props.put(SocketServerConfigs.MAX_CONNECTIONS_CONFIG, maxConnections.toString)
+    val config = KafkaConfig.fromProps(props)
+    connectionQuotas = new ConnectionQuotas(config, time, metrics)
+    addListenersAndVerify(config, connectionQuotas)
+
+    val external = listeners("EXTERNAL")
+    // Saturate the broker-wide limit on EXTERNAL via the regular inc() path.
+    for (_ <- 0 until maxConnections)
+      connectionQuotas.inc(external.listenerName, external.defaultIp, blockedPercentMeters("EXTERNAL"))
+
+    // tryInc on EXTERNAL beyond the limit must return false, never block. We run it on
+    // the same thread (no executor) to prove there is no wait.
+    val startNs = System.nanoTime()
+    val accepted = connectionQuotas.tryInc(external.listenerName, external.defaultIp)
+    val elapsedMs = (System.nanoTime() - startNs) / 1000000
+    assertFalse(accepted, "tryInc must refuse when broker-wide max is reached, not block")
+    assertTrue(elapsedMs < 200,
+      s"tryInc must not block — completed in ${elapsedMs}ms. inc() would have blocked indefinitely here.")
+    assertEquals(maxConnections, connectionQuotas.get(external.defaultIp),
+      "refused connection must not bump the per-IP count")
+
+    // Inter-broker (protected) listener still works via tryInc because it bypasses the broker-wide cap.
+    val replication = listeners("REPLICATION")
+    assertTrue(connectionQuotas.tryInc(replication.listenerName, replication.defaultIp),
+      "protected (inter-broker) listener must still accept via tryInc above broker max")
+  }
+
+  @Test
+  def testTryIncReturnsTrueAndIncrementsCountInTheHappyPath(): Unit = {
+    // Plain success case: well within all quotas, tryInc must accept and bump the
+    // per-IP/listener counters identically to inc().
+    val config = KafkaConfig.fromProps(brokerPropsWithDefaultConnectionLimits)
+    connectionQuotas = new ConnectionQuotas(config, time, metrics)
+    addListenersAndVerify(config, connectionQuotas)
+
+    val external = listeners("EXTERNAL")
+    assertTrue(connectionQuotas.tryInc(external.listenerName, external.defaultIp))
+    assertEquals(1, connectionQuotas.get(external.defaultIp))
+  }
 }

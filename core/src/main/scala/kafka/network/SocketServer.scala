@@ -1226,7 +1226,16 @@ private[kafka] class Processor(
         val address = channel.socketAddress
         if (address != null) {
           try {
-            connectionQuotas.inc(listenerName, address, acceptorBlockedPercentMeter)
+            // tryInc — never blocks. On NIO the dedicated Acceptor thread can wait for a
+            // slot via inc(); here the caller is the Processor's poll loop, so a wait
+            // would stall every other channel on this Processor. Refusal here closes the
+            // channel; the next disconnect tick runs the normal dec()/disconnect-listener
+            // path. See ConnectionQuotas.tryInc for the un-record accounting.
+            if (!connectionQuotas.tryInc(listenerName, address)) {
+              info(s"Closing io_uring connection $connectionId from $address: broker- or " +
+                s"listener-level connection slot unavailable or rate-limited.")
+              selector.close(connectionId)
+            }
           } catch {
             case e: TooManyConnectionsException =>
               info(s"Closing io_uring connection $connectionId from ${e.ip}: " +
@@ -1461,6 +1470,51 @@ class ConnectionQuotas(config: KafkaConfig, time: Time, metrics: Metrics) extend
       val max = maxConnectionsPerIpOverrides.getOrElse(address, defaultMaxConnectionsPerIp)
       if (count >= max)
         throw new TooManyConnectionsException(address, max)
+    }
+  }
+
+  /**
+   * Non-blocking variant of [[inc]] used by the io_uring Processor accept path.
+   *
+   * On the NIO path [[inc]] blocks the dedicated Acceptor thread when the broker is at
+   * max.connections or when the listener connection-rate quota requires a throttle.
+   * On the io_uring path the caller is the Processor's poll loop — blocking it would
+   * stall every other channel on that Processor, including in-flight requests. This
+   * method instead refuses (returns false) when the slot is unavailable or a throttle
+   * applies, after un-recording the rate-sensor sample so accounting stays correct.
+   *
+   * Like [[inc]], may throw [[TooManyConnectionsException]] (per-IP max) or
+   * [[ConnectionThrottledException]] (per-IP rate); callers MUST close the channel on
+   * either return-false or exception.
+   */
+  def tryInc(listenerName: ListenerName, address: InetAddress): Boolean = {
+    counts.synchronized {
+      val timeMs = time.milliseconds
+      val throttleTimeMs = math.max(recordConnectionAndGetThrottleTimeMs(listenerName, timeMs), 0)
+      if (throttleTimeMs > 0 || !connectionSlotAvailable(listenerName)) {
+        // Un-record the speculative +1 from recordConnectionAndGetThrottleTimeMs so the
+        // rate sensor doesn't drift when we refuse the connection. Mirrors the un-record
+        // path used by recordIpConnectionMaybeThrottle for IP throttle refusal.
+        if (!protectedListener(listenerName)) {
+          brokerConnectionRateSensor.record(-1.0, timeMs, false)
+        }
+        maxConnectionsPerListener
+          .get(listenerName)
+          .foreach(_.connectionRateSensor.record(-1.0, timeMs, false))
+        return false
+      }
+
+      recordIpConnectionMaybeThrottle(listenerName, address)
+      val count = counts.getOrElseUpdate(address, 0)
+      counts.put(address, count + 1)
+      totalCount += 1
+      if (listenerCounts.contains(listenerName)) {
+        listenerCounts.put(listenerName, listenerCounts(listenerName) + 1)
+      }
+      val max = maxConnectionsPerIpOverrides.getOrElse(address, defaultMaxConnectionsPerIp)
+      if (count >= max)
+        throw new TooManyConnectionsException(address, max)
+      true
     }
   }
 
