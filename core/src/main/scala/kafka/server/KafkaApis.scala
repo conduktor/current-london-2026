@@ -820,7 +820,12 @@ class KafkaApis(val requestChannel: RequestChannel,
     val fetchRequest = request.body[FetchRequest]
     val topicNames =
       if (fetchRequest.version() >= 13)
-        metadataCache.topicIdsToNames()
+        // Overlay logical topic IDs so a v13+ FETCH(topicIds=…) from a stock client that has
+        // already cached the deterministic UUIDs from METADATA can resolve back to the logical
+        // name. Without this the topicId arrives unrecognised and the partition surfaces as
+        // UNKNOWN_TOPIC_ID — breaking the stock consumer's refresh-by-id optimisation
+        // (Codex r11 BLOCKER #96).
+        overlayLogicalTopicIdsToNames(metadataCache.topicIdsToNames())
       else
         Collections.emptyMap[Uuid, String]()
 
@@ -1409,6 +1414,32 @@ class KafkaApis(val requestChannel: RequestChannel,
       }
 
       topicResponses ++ nonExistingTopicResponses
+    }
+  }
+
+  /**
+   * Overlay logical-topic (id → name) entries on top of the KRaft metadata cache's
+   * {@code topicIdsToNames()} map. Stock clients cache the (name, uuid) pair returned by
+   * METADATA and refresh by uuid on later RPCs (FETCH v13+, ShareFetch, ShareAcknowledge).
+   * Logical topics have deterministic UUIDs computed by the kernel, never seen by the KRaft
+   * cache, so without this overlay every cached-by-id request from a stock client would resolve
+   * to a null topic name and surface as {@code UNKNOWN_TOPIC_ID}.
+   *
+   * <p>Physical wins on UUID collision (vanishingly unlikely with MD5-based deterministic IDs;
+   * if it ever happens the user-named topic stays visible and the logical declaration becomes
+   * effectively shadowed — a declare-time validation can be added if collisions surface in
+   * practice).
+   */
+  private def overlayLogicalTopicIdsToNames(physical: util.Map[Uuid, String]): util.Map[Uuid, String] = {
+    val logicalNames = concentrationKernel.allLogicalTopicNames()
+    if (logicalNames.isEmpty) physical
+    else {
+      val merged = new util.HashMap[Uuid, String](physical.size + logicalNames.size)
+      merged.putAll(physical)
+      logicalNames.forEach { name =>
+        merged.putIfAbsent(concentrationKernel.logicalTopicId(name), name)
+      }
+      util.Collections.unmodifiableMap(merged)
     }
   }
 
@@ -3592,7 +3623,10 @@ class KafkaApis(val requestChannel: RequestChannel,
     }
 
     val isAcknowledgeDataPresent = isAcknowledgeDataPresentInFetchRequest
-    val topicIdNames = metadataCache.topicIdsToNames()
+    // Same logical-id overlay as the regular fetch path — share-fetch is always topic-id based,
+    // so without this every share-consumer talking to a logical topic gets UNKNOWN_TOPIC_ID
+    // (Codex r11 BLOCKER #97).
+    val topicIdNames = overlayLogicalTopicIdsToNames(metadataCache.topicIdsToNames())
 
     val shareFetchData = shareFetchRequest.shareFetchData(topicIdNames)
     val forgottenTopics = shareFetchRequest.forgottenTopics(topicIdNames)
@@ -3910,7 +3944,9 @@ class KafkaApis(val requestChannel: RequestChannel,
     val topicIdPartitionSeq: mutable.Set[TopicIdPartition] = mutable.Set()
     val shareAcknowledgeData = shareAcknowledgeRequest.data
 
-    val topicIdNames = metadataCache.topicIdsToNames()
+    // Same logical-id overlay as the regular fetch path — share-acknowledge keys partitions by
+    // topic-id and would otherwise see null names for cached logical UUIDs (Codex r11 BLOCKER).
+    val topicIdNames = overlayLogicalTopicIdsToNames(metadataCache.topicIdsToNames())
 
     shareAcknowledgeData.topics.forEach{ topic =>
       topic.partitions.forEach{ partition =>
