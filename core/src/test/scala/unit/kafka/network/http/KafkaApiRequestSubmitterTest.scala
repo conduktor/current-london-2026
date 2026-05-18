@@ -40,7 +40,7 @@ import org.junit.jupiter.api.{AfterEach, BeforeEach, Test}
 import java.nio.charset.StandardCharsets
 import java.util
 import java.util.OptionalInt
-import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 import java.util.concurrent.{CountDownLatch, TimeUnit}
 
 import scala.collection.mutable
@@ -362,6 +362,89 @@ class KafkaApiRequestSubmitterTest {
     assertEquals(Errors.NONE, fetch.error())
     assertEquals(1, fetch.records().size())
     assertEquals("v", new String(fetch.records().get(0).value(), StandardCharsets.UTF_8))
+  }
+
+  @Test
+  def submitFetchWithFromEarliestRetriesAtLogStartOffsetOnOutOfRange(): Unit = {
+    // from=earliest is a hint: the parser hands the submitter offset=0 because it can't afford a ListOffsets per
+    // request. On a retained or compacted partition logStartOffset may be far past 0 — the first fetch returns OOR
+    // with logStartOffset filled in. The submitter must retry once at that broker-reported offset so the client sees
+    // the actual earliest retained record, not an error envelope.
+    val attempts = new AtomicInteger(0)
+    val fetchOffsets = new java.util.concurrent.ConcurrentLinkedQueue[java.lang.Long]()
+    val recordsAtLogStart = MemoryRecords.withRecords(Compression.NONE,
+      new SimpleRecord(time.milliseconds(), "k".getBytes, "v".getBytes))
+
+    fakeHandler = new FakeApiHandler(channel, request => {
+      val fetchReq = request.asInstanceOf[org.apache.kafka.common.requests.FetchRequest]
+      val pd = fetchReq.fetchData(util.Map.of(topicId, topic))
+      pd.values().forEach(p => fetchOffsets.add(p.fetchOffset))
+      attempts.incrementAndGet() match {
+        case 1 =>
+          // First attempt: OOR with the broker's logStartOffset hinting where the partition actually starts.
+          val partitionData = new FetchPartitionData()
+            .setPartitionIndex(0)
+            .setErrorCode(Errors.OFFSET_OUT_OF_RANGE.code())
+            .setLogStartOffset(100L)
+            .setHighWatermark(150L)
+          val topicResp = new FetchableTopicResponse().setTopicId(topicId)
+            .setPartitions(util.List.of(partitionData))
+          new FetchResponse(new FetchResponseData().setResponses(util.List.of(topicResp)))
+        case _ =>
+          // Second attempt at logStartOffset=100: the records are there now.
+          val partitionData = new FetchPartitionData()
+            .setPartitionIndex(0)
+            .setHighWatermark(150L)
+            .setLogStartOffset(100L)
+            .setRecords(recordsAtLogStart)
+          val topicResp = new FetchableTopicResponse().setTopicId(topicId)
+            .setPartitions(util.List.of(partitionData))
+          new FetchResponse(new FetchResponseData().setResponses(util.List.of(topicResp)))
+      }
+    })
+    fakeHandler.start()
+
+    val submitter = newSubmitter()
+    val cmd = new FetchRequestParser.FetchCommand(topic, 0, 0L, OptionalInt.empty(), true)
+    val result = submitter.submitFetch(cmd).get(5, TimeUnit.SECONDS)
+
+    assertEquals(Errors.NONE, result.partition().error(),
+      "fromEarliest retry must surface the second-attempt success, not the first-attempt OOR")
+    assertEquals(1, result.partition().records().size(),
+      "records from the retry attempt at logStartOffset must reach the caller")
+    assertEquals(2, attempts.get(),
+      "fromEarliest with OOR must trigger exactly one retry — never zero (no auto-resolve) and never two (no loop)")
+    val offsets = fetchOffsets.toArray(new Array[java.lang.Long](0)).toSeq.map(_.longValue())
+    assertEquals(Seq(0L, 100L), offsets,
+      "the retry must target the broker-reported logStartOffset, not loop back at offset 0")
+  }
+
+  @Test
+  def submitFetchWithoutFromEarliestDoesNotRetryOutOfRange(): Unit = {
+    // An explicit offset (or a cursor-derived one) is a deliberate caller choice. If the broker says OOR, the caller
+    // wants to know — silently snapping to logStartOffset would replay records the caller already saw.
+    val attempts = new AtomicInteger(0)
+    fakeHandler = new FakeApiHandler(channel, _ => {
+      attempts.incrementAndGet()
+      val partitionData = new FetchPartitionData()
+        .setPartitionIndex(0)
+        .setErrorCode(Errors.OFFSET_OUT_OF_RANGE.code())
+        .setLogStartOffset(100L)
+        .setHighWatermark(150L)
+      val topicResp = new FetchableTopicResponse().setTopicId(topicId)
+        .setPartitions(util.List.of(partitionData))
+      new FetchResponse(new FetchResponseData().setResponses(util.List.of(topicResp)))
+    })
+    fakeHandler.start()
+
+    val submitter = newSubmitter()
+    val cmd = new FetchRequestParser.FetchCommand(topic, 0, 5L, OptionalInt.empty(), false)
+    val result = submitter.submitFetch(cmd).get(5, TimeUnit.SECONDS)
+
+    assertEquals(Errors.OFFSET_OUT_OF_RANGE, result.partition().error(),
+      "explicit-offset OOR must surface — only fromEarliest enables the silent retry")
+    assertEquals(1, attempts.get(),
+      "without fromEarliest the submitter must not retry on OOR")
   }
 
   // ----- helpers ---------------------------------------------------------------------------------------------------

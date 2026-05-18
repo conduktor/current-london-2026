@@ -50,6 +50,7 @@ public final class FetchRequestParser {
 
         int partitionValue;
         long offsetValue;
+        boolean fromEarliest = false;
         if (cursor.isPresent()) {
             if (partition.isPresent() || offset.isPresent() || from.isPresent()) {
                 throw new ProduceRequestParser.BadRequestException(
@@ -65,10 +66,11 @@ public final class FetchRequestParser {
         } else {
             partitionValue = readPartition(partition);
             offsetValue = readStartOffset(offset, from);
+            fromEarliest = from.isPresent() && "earliest".equalsIgnoreCase(from.get());
         }
 
         OptionalInt maxBytes = readMaxBytes(query.get("max_bytes"));
-        return new FetchCommand(topic, partitionValue, offsetValue, maxBytes);
+        return new FetchCommand(topic, partitionValue, offsetValue, maxBytes, fromEarliest);
     }
 
     /**
@@ -156,12 +158,23 @@ public final class FetchRequestParser {
         private final int partition;
         private final long offset;
         private final OptionalInt maxBytes;
+        // True when the caller asked for from=earliest. The parser cannot pre-resolve the actual earliest
+        // retained offset (that would cost a ListOffsets round-trip per request), so the submitter detects
+        // OFFSET_OUT_OF_RANGE on a fromEarliest fetch and retries once at the broker-reported logStartOffset.
+        // Streamers constructing follow-up FetchCommands always default this to false — the retry only
+        // matters for the very first fetch on a stream.
+        private final boolean fromEarliest;
 
         public FetchCommand(String topic, int partition, long offset, OptionalInt maxBytes) {
+            this(topic, partition, offset, maxBytes, false);
+        }
+
+        public FetchCommand(String topic, int partition, long offset, OptionalInt maxBytes, boolean fromEarliest) {
             this.topic = Objects.requireNonNull(topic, "topic must not be null");
             this.partition = partition;
             this.offset = offset;
             this.maxBytes = Objects.requireNonNull(maxBytes, "maxBytes must not be null");
+            this.fromEarliest = fromEarliest;
         }
 
         public String topic() {
@@ -178,6 +191,10 @@ public final class FetchRequestParser {
 
         public OptionalInt maxBytes() {
             return maxBytes;
+        }
+
+        public boolean fromEarliest() {
+            return fromEarliest;
         }
     }
 }

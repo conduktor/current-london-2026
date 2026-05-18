@@ -110,6 +110,29 @@ class KafkaApiRequestSubmitter(
   }
 
   override def submitFetch(command: FetchCommand): CompletableFuture[FetchResult] = {
+    val firstAttempt = submitFetchOnce(command)
+    if (!command.fromEarliest) {
+      return firstAttempt
+    }
+    // from=earliest is a hint, not an offset. The parser hands us offset=0 because the parser can't afford
+    // a ListOffsets round-trip per HTTP request — but on a retained or compacted topic logStartOffset may
+    // be far past 0, so the first fetch returns OFFSET_OUT_OF_RANGE. Retry once at the broker-reported
+    // logStartOffset so the client sees the actual earliest retained record, not an error frame. The retry
+    // submits with fromEarliest=false to bound recursion and to make any second OOR (e.g. logStartOffset
+    // changed under us between attempts due to retention sweep) surface as a real error.
+    firstAttempt.thenCompose { result =>
+      if (result.partition().error() == Errors.OFFSET_OUT_OF_RANGE) {
+        val retryOffset = result.partition().logStartOffset()
+        val retryCommand = new FetchCommand(
+          command.topic(), command.partition(), retryOffset, command.maxBytes(), false)
+        submitFetchOnce(retryCommand)
+      } else {
+        CompletableFuture.completedFuture(result)
+      }
+    }
+  }
+
+  private def submitFetchOnce(command: FetchCommand): CompletableFuture[FetchResult] = {
     val future = new CompletableFuture[FetchResult]()
     try {
       val request = buildFetchRequest(command)

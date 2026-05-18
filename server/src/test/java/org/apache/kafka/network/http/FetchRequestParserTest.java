@@ -150,6 +150,29 @@ class FetchRequestParserTest {
 
         assertEquals(1, cmd.partition());
         assertEquals(0L, cmd.offset());
+        assertTrue(cmd.fromEarliest(),
+            "fromEarliest must surface to the submitter so it can retry at logStartOffset on a truncated topic "
+                + "(otherwise from=earliest on a retained partition returns OFFSET_OUT_OF_RANGE)");
+    }
+
+    @Test
+    void parsesExplicitOffsetWithoutFromEarliestFlag() {
+        FetchRequestParser.FetchCommand cmd = FetchRequestParser.parse(
+            "orders", QueryParams.of("partition", "1", "offset", "0"));
+
+        assertEquals(0L, cmd.offset());
+        assertFalse(cmd.fromEarliest(),
+            "explicit offset=0 is a deliberate choice — must not trigger the earliest-retry path");
+    }
+
+    @Test
+    void parsesCursorWithoutFromEarliestFlag() {
+        String cursor = CursorCodec.encode("orders", 0, 0);
+        FetchRequestParser.FetchCommand cmd = FetchRequestParser.parse(
+            "orders", QueryParams.of("cursor", cursor));
+
+        assertFalse(cmd.fromEarliest(),
+            "cursor offsets are explicit; the streamer's follow-up fetches must not chase OOR back to logStartOffset");
     }
 
     @Test
