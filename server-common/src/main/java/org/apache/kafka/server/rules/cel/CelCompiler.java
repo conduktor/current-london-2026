@@ -37,6 +37,19 @@ public final class CelCompiler {
         if (source == null || source.trim().isEmpty()) {
             throw new CelCompilationException("empty expression");
         }
+        // Codex final-audit P1#5: reject pathologically long sources BEFORE
+        // tokenising. The lexer allocates one Token per character span; a
+        // multi-megabyte source — typically a giant string or regex literal —
+        // would otherwise pin tens of megabytes of token objects in the
+        // rule-load thread before MAX_NODES kicks in. See CelLimits.MAX_EXPR_LEN.
+        if (source.length() > CelLimits.MAX_EXPR_LEN) {
+            throw new CelCompilationException(
+                "CEL source length " + source.length()
+                    + " exceeds MAX_EXPR_LEN of " + CelLimits.MAX_EXPR_LEN
+                    + "; rules approaching this cap are almost certainly "
+                    + "smuggling a giant string or regex literal — rewrite as "
+                    + "a coarser filter or split into multiple rules");
+        }
         try {
             Parser p = new Parser(new Lexer(source).tokenize());
             CelNode root = p.parseExpr();

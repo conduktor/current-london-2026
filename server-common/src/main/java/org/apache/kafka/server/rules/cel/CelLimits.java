@@ -54,6 +54,25 @@ package org.apache.kafka.server.rules.cel;
 final class CelLimits {
 
     /**
+     * Maximum source length (in {@code char} units) of a CEL rule expression.
+     * Checked before lexing in {@link CelCompiler#compile(String)} so a giant
+     * source — typically a multi-megabyte string or regex literal — never
+     * even reaches the tokenizer's allocation path. Without this cap the
+     * lexer happily walks the entire {@code char[]} producing one
+     * {@link CelCompiler.Token} per character span; a single rule could
+     * pin tens of megabytes of token objects before the {@link #MAX_NODES}
+     * cap kicks in at parse time. Codex final-audit P1#5.
+     *
+     * <p>A typical production rule is &lt; 200 characters
+     * ({@code request.topics.exists(t, t.name.startsWith("audit-"))} is 49).
+     * 8192 chars is two orders of magnitude over typical and well above any
+     * defensible legitimate use; rules approaching this cap are almost
+     * certainly trying to bypass the engine's other bounds via a giant
+     * string/regex literal and should be rewritten as a coarser filter.
+     */
+    static final int MAX_EXPR_LEN = 8192;
+
+    /**
      * Maximum recursive-descent call depth. Each entry into
      * {@code parseExpr}, {@code parseNot}, or {@code parseUnary} consumes one
      * unit. 64 covers every legitimate rule (nesting is bounded by

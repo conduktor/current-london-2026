@@ -217,6 +217,26 @@ public class CelProgramTest {
     }
 
     @Test
+    public void sourceLengthIsBoundedBeforeLex() {
+        // Codex final-audit P1#5: a multi-megabyte source — typically a
+        // giant string or regex literal — must be rejected BEFORE tokenising,
+        // not after. Without the MAX_EXPR_LEN gate the lexer allocates one
+        // Token per character span, which can pin tens of megabytes of token
+        // objects in the rule-load thread before MAX_NODES catches up at
+        // parse time.
+        StringBuilder sb = new StringBuilder("\"");
+        for (int n = 0; n < CelLimits.MAX_EXPR_LEN + 16; n++) {
+            sb.append('x');
+        }
+        sb.append("\"");
+        CelCompilationException ex = assertThrows(
+            CelCompilationException.class,
+            () -> CelCompiler.compile(sb.toString()));
+        assertTrue(ex.getMessage().contains("MAX_EXPR_LEN"),
+            "expected MAX_EXPR_LEN error, got: " + ex.getMessage());
+    }
+
+    @Test
     public void parseDepthIsBoundedAgainstChainedNotOperators() {
         // A hand-rolled recursive descent compiler will overflow the JVM
         // stack on a deeply-chained unary `!`. The parser must refuse the
