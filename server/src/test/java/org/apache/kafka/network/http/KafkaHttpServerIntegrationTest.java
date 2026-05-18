@@ -55,6 +55,7 @@ class KafkaHttpServerIntegrationTest {
     private static final int DEFAULT_TEST_MAX_BODY_BYTES = 1024 * 1024;
     // 100 matches the production default. Tests that need to exercise the cap pass an explicit smaller value.
     private static final int DEFAULT_TEST_MAX_SSE_STREAMS = 100;
+    private static final int DEFAULT_TEST_MAX_WS_SUBSCRIPTIONS = 100;
 
     private final ObjectMapper mapper = new ObjectMapper();
     private final ControllableSubmitter submitter = new ControllableSubmitter();
@@ -63,12 +64,13 @@ class KafkaHttpServerIntegrationTest {
 
     @BeforeEach
     void setUp() throws Exception {
-        startServer(DEFAULT_TEST_MAX_BODY_BYTES, DEFAULT_TEST_MAX_SSE_STREAMS);
+        startServer(DEFAULT_TEST_MAX_BODY_BYTES, DEFAULT_TEST_MAX_SSE_STREAMS, DEFAULT_TEST_MAX_WS_SUBSCRIPTIONS);
     }
 
-    private void startServer(int maxRequestBodyBytes, int maxConcurrentSseStreams) throws Exception {
+    private void startServer(int maxRequestBodyBytes, int maxConcurrentSseStreams,
+                             int maxConcurrentWsSubscriptions) throws Exception {
         server = new KafkaHttpServer("127.0.0.1", 0, new KafkaHttpBridge(mapper, submitter), submitter, mapper,
-            maxRequestBodyBytes, maxConcurrentSseStreams);
+            maxRequestBodyBytes, maxConcurrentSseStreams, maxConcurrentWsSubscriptions);
         server.start();
         client = new HttpClient();
         client.start();
@@ -193,7 +195,7 @@ class KafkaHttpServerIntegrationTest {
         // broker JVM from an unbounded inbound POST: Jackson's readTree() consumes the whole stream into memory before
         // it parses, so without this cap a multi-GiB upload can OOM the broker before Kafka admission control runs.
         tearDown();
-        startServer(64, DEFAULT_TEST_MAX_SSE_STREAMS);
+        startServer(64, DEFAULT_TEST_MAX_SSE_STREAMS, DEFAULT_TEST_MAX_WS_SUBSCRIPTIONS);
 
         // The body below is 100+ bytes — well past the 64-byte cap. The exact body shape doesn't matter; the cap
         // trips before Jackson finishes building the JsonNode tree.
@@ -398,7 +400,7 @@ class KafkaHttpServerIntegrationTest {
         // While we're here, also assert the SseStreamsOpened + RejectedAtSseCap meters increment as expected —
         // this is the end-to-end wiring proof for the SSE-specific metrics (which never land in ResponseCount).
         tearDown();
-        startServer(DEFAULT_TEST_MAX_BODY_BYTES, 1);
+        startServer(DEFAULT_TEST_MAX_BODY_BYTES, 1, DEFAULT_TEST_MAX_WS_SUBSCRIPTIONS);
 
         com.yammer.metrics.core.Meter streamsOpened = (com.yammer.metrics.core.Meter)
             org.apache.kafka.server.metrics.KafkaYammerMetrics.defaultRegistry().allMetrics()
@@ -652,7 +654,7 @@ class KafkaHttpServerIntegrationTest {
         // boundary (rather than the broker boundary) must land on their dedicated counter so operators can alert
         // on bridge-side admission control without first having to read access logs.
         tearDown();
-        startServer(64, DEFAULT_TEST_MAX_SSE_STREAMS);
+        startServer(64, DEFAULT_TEST_MAX_SSE_STREAMS, DEFAULT_TEST_MAX_WS_SUBSCRIPTIONS);
         com.yammer.metrics.core.MetricName oversizedName = bridgeMetricName("RejectedOversizedBody");
         com.yammer.metrics.core.MetricName fourXxName = bridgeMetricName("ResponseCount", "operation", "Produce", "statusClass", "4xx");
         com.yammer.metrics.core.Meter oversized = (com.yammer.metrics.core.Meter)
@@ -688,7 +690,7 @@ class KafkaHttpServerIntegrationTest {
         tearDown();
         KafkaHttpServer neverStarted = new KafkaHttpServer("127.0.0.1", 0,
             new KafkaHttpBridge(mapper, submitter), submitter, mapper,
-            DEFAULT_TEST_MAX_BODY_BYTES, DEFAULT_TEST_MAX_SSE_STREAMS);
+            DEFAULT_TEST_MAX_BODY_BYTES, DEFAULT_TEST_MAX_SSE_STREAMS, DEFAULT_TEST_MAX_WS_SUBSCRIPTIONS);
         try {
             com.yammer.metrics.core.MetricName gauge = bridgeMetricName("ActiveSseStreams");
             assertNotNull(
@@ -705,11 +707,11 @@ class KafkaHttpServerIntegrationTest {
         // registry refused a duplicate.
         KafkaHttpServer second = new KafkaHttpServer("127.0.0.1", 0,
             new KafkaHttpBridge(mapper, submitter), submitter, mapper,
-            DEFAULT_TEST_MAX_BODY_BYTES, DEFAULT_TEST_MAX_SSE_STREAMS);
+            DEFAULT_TEST_MAX_BODY_BYTES, DEFAULT_TEST_MAX_SSE_STREAMS, DEFAULT_TEST_MAX_WS_SUBSCRIPTIONS);
         second.stop();
         // Restore the @BeforeEach-style state for any later tests that follow the alphabetical execution order;
         // tearDown() in @AfterEach handles whatever this method leaves behind.
-        startServer(DEFAULT_TEST_MAX_BODY_BYTES, DEFAULT_TEST_MAX_SSE_STREAMS);
+        startServer(DEFAULT_TEST_MAX_BODY_BYTES, DEFAULT_TEST_MAX_SSE_STREAMS, DEFAULT_TEST_MAX_WS_SUBSCRIPTIONS);
     }
 
     @Test
@@ -720,13 +722,13 @@ class KafkaHttpServerIntegrationTest {
         tearDown();
         KafkaHttpServer oneShot = new KafkaHttpServer("127.0.0.1", 0,
             new KafkaHttpBridge(mapper, submitter), submitter, mapper,
-            DEFAULT_TEST_MAX_BODY_BYTES, DEFAULT_TEST_MAX_SSE_STREAMS);
+            DEFAULT_TEST_MAX_BODY_BYTES, DEFAULT_TEST_MAX_SSE_STREAMS, DEFAULT_TEST_MAX_WS_SUBSCRIPTIONS);
         oneShot.start();
         oneShot.stop();
         IllegalStateException ex = org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class, oneShot::start);
         org.junit.jupiter.api.Assertions.assertTrue(ex.getMessage().contains("stopped"),
             "error message should make the one-shot constraint obvious: " + ex.getMessage());
-        startServer(DEFAULT_TEST_MAX_BODY_BYTES, DEFAULT_TEST_MAX_SSE_STREAMS);
+        startServer(DEFAULT_TEST_MAX_BODY_BYTES, DEFAULT_TEST_MAX_SSE_STREAMS, DEFAULT_TEST_MAX_WS_SUBSCRIPTIONS);
     }
 
     private static com.yammer.metrics.core.MetricName bridgeMetricName(String name, String... tagPairs) {

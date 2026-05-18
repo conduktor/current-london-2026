@@ -59,13 +59,15 @@ public final class KafkaHttpServer {
     private final ObjectMapper mapper;
     private final int maxRequestBodyBytes;
     private final SseStreamLimiter sseLimiter;
+    private final WsStreamLimiter wsLimiter;
     private final HttpBridgeMetrics metrics;
 
     private Server server;
     private int boundPort = -1;
 
     public KafkaHttpServer(String host, int port, KafkaHttpBridge bridge, RequestSubmitter submitter,
-                           ObjectMapper mapper, int maxRequestBodyBytes, int maxConcurrentSseStreams) {
+                           ObjectMapper mapper, int maxRequestBodyBytes, int maxConcurrentSseStreams,
+                           int maxConcurrentWsSubscriptions) {
         this.host = Objects.requireNonNull(host, "host must not be null");
         this.port = port;
         this.bridge = Objects.requireNonNull(bridge, "bridge must not be null");
@@ -76,12 +78,13 @@ public final class KafkaHttpServer {
         }
         this.maxRequestBodyBytes = maxRequestBodyBytes;
         this.sseLimiter = new SseStreamLimiter(maxConcurrentSseStreams);
-        // Construct metrics here (not in start()) so the gauge for ActiveSseStreams is registered as soon as the
-        // server object exists and a JMX scrape against a stopped broker doesn't briefly show "metric missing".
-        // The Yammer registry is global; stop() must call metrics.close() so the next KafkaHttpServer constructed
-        // in the same JVM does not trip "duplicate metric name". (This instance itself is one-shot — see class
-        // javadoc — so a same-instance start() after stop() is rejected, not re-registered.)
-        this.metrics = new HttpBridgeMetrics(sseLimiter);
+        this.wsLimiter = new WsStreamLimiter(maxConcurrentWsSubscriptions);
+        // Construct metrics here (not in start()) so the gauges for ActiveSseStreams / ActiveWsSubscriptions are
+        // registered as soon as the server object exists and a JMX scrape against a stopped broker doesn't briefly
+        // show "metric missing". The Yammer registry is global; stop() must call metrics.close() so the next
+        // KafkaHttpServer constructed in the same JVM does not trip "duplicate metric name". (This instance itself
+        // is one-shot — see class javadoc — so a same-instance start() after stop() is rejected, not re-registered.)
+        this.metrics = new HttpBridgeMetrics(sseLimiter, wsLimiter);
     }
 
     public synchronized void start() throws Exception {

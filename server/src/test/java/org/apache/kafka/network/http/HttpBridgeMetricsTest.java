@@ -38,12 +38,14 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 class HttpBridgeMetricsTest {
 
     private SseStreamLimiter limiter;
+    private WsStreamLimiter wsLimiter;
     private HttpBridgeMetrics metrics;
 
     @BeforeEach
     void setUp() {
         limiter = new SseStreamLimiter(4);
-        metrics = new HttpBridgeMetrics(limiter);
+        wsLimiter = new WsStreamLimiter(4);
+        metrics = new HttpBridgeMetrics(limiter, wsLimiter);
     }
 
     @AfterEach
@@ -137,6 +139,49 @@ class HttpBridgeMetricsTest {
     }
 
     @Test
+    void wsSubscriptionsOpenedMeterCountsAcceptedSeparatelyFromRejections() {
+        // Same rationale as the SSE-side meter: a WebSocket subscription has no terminal response status, so the
+        // ResponseCount family never sees it. An operator debugging a WS incident needs open-rate, point-in-time
+        // active count, and reject-rate independently.
+        metrics.recordWsSubscriptionOpened();
+        metrics.recordWsSubscriptionOpened();
+        metrics.recordWsCapRejection();
+
+        assertEquals(2L, lookupMeter("WsSubscriptionsOpened").count());
+        assertEquals(1L, lookupMeter("RejectedAtWsCap").count());
+    }
+
+    @Test
+    void wsAndSseRejectionCountersAreIndependentMeters() {
+        // The two streaming paths each get their own cap and their own rejection meter. Alerting on bridge-side
+        // refusals must be able to distinguish "SSE cap hit" from "WS cap hit" — different operator action.
+        metrics.recordSseCapRejection();
+        metrics.recordSseCapRejection();
+        metrics.recordWsCapRejection();
+        metrics.recordWsCapRejection();
+        metrics.recordWsCapRejection();
+
+        assertEquals(2L, lookupMeter("RejectedAtSseCap").count());
+        assertEquals(3L, lookupMeter("RejectedAtWsCap").count());
+    }
+
+    @Test
+    void activeWsSubscriptionsGaugeReflectsLimiterState() {
+        // Mirror the ActiveSseStreams test: the gauge reads live from the WsStreamLimiter, with no cached snapshot.
+        Gauge<?> gauge = lookupGauge("ActiveWsSubscriptions");
+        assertEquals(0, gauge.value());
+
+        WsStreamLimiter.Token a = wsLimiter.tryAcquire();
+        WsStreamLimiter.Token b = wsLimiter.tryAcquire();
+        assertEquals(2, gauge.value(), "gauge must observe newly-acquired WS slots");
+
+        a.close();
+        assertEquals(1, gauge.value(), "gauge must observe the released slot");
+        b.close();
+        assertEquals(0, gauge.value());
+    }
+
+    @Test
     void activeSseStreamsGaugeReflectsLimiterState() {
         // The gauge must read live from the limiter — not a cached snapshot. Acquiring two tokens must change the
         // observed value immediately.
@@ -164,6 +209,8 @@ class HttpBridgeMetricsTest {
         metrics.recordOversizedBodyRejection();
         metrics.recordSseCapRejection();
         metrics.recordSseStreamOpened();
+        metrics.recordWsCapRejection();
+        metrics.recordWsSubscriptionOpened();
     }
 
     @Test
@@ -189,6 +236,8 @@ class HttpBridgeMetricsTest {
                             metrics.recordOversizedBodyRejection();
                             metrics.recordSseCapRejection();
                             metrics.recordSseStreamOpened();
+                            metrics.recordWsCapRejection();
+                            metrics.recordWsSubscriptionOpened();
                         }
                     } catch (Throwable th) {
                         error.compareAndSet(null, th);
@@ -224,7 +273,7 @@ class HttpBridgeMetricsTest {
         metrics.close();
         HttpBridgeMetrics fresh = null;
         try {
-            fresh = new HttpBridgeMetrics(limiter);
+            fresh = new HttpBridgeMetrics(limiter, wsLimiter);
             // If construction succeeded, every name was cleared. Sanity-check one of the histograms exists again.
             assertNotNull(lookupHistogram("RequestLatencyMs", "Produce"));
         } finally {
@@ -235,10 +284,11 @@ class HttpBridgeMetricsTest {
     }
 
     @Test
-    void rejectsNullSseLimiter() {
+    void rejectsNullLimiters() {
         // A null limiter would NPE on the first gauge read. Fail fast at construction so the wiring layer can't
-        // accidentally hand in null.
-        assertThrows(NullPointerException.class, () -> new HttpBridgeMetrics(null));
+        // accidentally hand in null for either streaming path.
+        assertThrows(NullPointerException.class, () -> new HttpBridgeMetrics(null, wsLimiter));
+        assertThrows(NullPointerException.class, () -> new HttpBridgeMetrics(limiter, null));
     }
 
     @Test

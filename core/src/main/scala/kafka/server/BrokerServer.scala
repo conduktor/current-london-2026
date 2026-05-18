@@ -651,7 +651,8 @@ class BrokerServer(
         val bridge = new KafkaHttpBridge(new ObjectMapper(), submitter, config.httpBridgeRequestTimeoutMs.toLong)
         httpBridgeServer = new KafkaHttpServer(
           config.httpBridgeHost, config.httpBridgePort, bridge, submitter, new ObjectMapper(),
-          config.httpBridgeMaxRequestBodyBytes, config.httpBridgeMaxConcurrentSseStreams)
+          config.httpBridgeMaxRequestBodyBytes, config.httpBridgeMaxConcurrentSseStreams,
+          config.httpBridgeMaxConcurrentWsSubscriptions)
         httpBridgeServer.start()
         info(s"HTTP bridge listening on ${config.httpBridgeHost}:${httpBridgeServer.boundPort()}")
         warn("HTTP bridge: every request runs as KafkaPrincipal.ANONYMOUS (no per-request authentication in v1). " +

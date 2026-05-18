@@ -61,6 +61,9 @@ public final class HttpBridgeMetrics implements AutoCloseable {
     private static final String NAME_REJECTED_OVERSIZED_BODY = "RejectedOversizedBody";
     private static final String NAME_REJECTED_AT_SSE_CAP = "RejectedAtSseCap";
     private static final String NAME_SSE_STREAMS_OPENED = "SseStreamsOpened";
+    private static final String NAME_ACTIVE_WS_SUBSCRIPTIONS = "ActiveWsSubscriptions";
+    private static final String NAME_REJECTED_AT_WS_CAP = "RejectedAtWsCap";
+    private static final String NAME_WS_SUBSCRIPTIONS_OPENED = "WsSubscriptionsOpened";
 
     /** Operation identifier for {@link #recordRequest}. Lower-case in tags, capitalised here for readability. */
     public enum Operation {
@@ -80,12 +83,15 @@ public final class HttpBridgeMetrics implements AutoCloseable {
     private final Meter rejectedOversizedBody;
     private final Meter rejectedAtSseCap;
     private final Meter sseStreamsOpened;
+    private final Meter rejectedAtWsCap;
+    private final Meter wsSubscriptionsOpened;
 
     /** {@code true} if {@link #close()} has run; we then refuse {@code record*} calls so a late callback doesn't blow up. */
     private volatile boolean closed = false;
 
-    public HttpBridgeMetrics(SseStreamLimiter sseLimiter) {
+    public HttpBridgeMetrics(SseStreamLimiter sseLimiter, WsStreamLimiter wsLimiter) {
         Objects.requireNonNull(sseLimiter, "sseLimiter must not be null");
+        Objects.requireNonNull(wsLimiter, "wsLimiter must not be null");
         this.group = new KafkaMetricsGroup(METRICS_GROUP, METRICS_TYPE);
 
         // Pre-create the per-operation latency histograms and per-(operation, status-class) response meters. The set
@@ -101,6 +107,8 @@ public final class HttpBridgeMetrics implements AutoCloseable {
         Meter oversized = null;
         Meter sseCap = null;
         Meter streamsOpened = null;
+        Meter wsCap = null;
+        Meter wsOpened = null;
         try {
             for (Operation op : Operation.values()) {
                 histograms.put(op, group.newHistogram(NAME_REQUEST_LATENCY_MS, true,
@@ -130,6 +138,14 @@ public final class HttpBridgeMetrics implements AutoCloseable {
             // Live gauge for the SSE concurrent-stream count. Reading the limiter is lock-free (one AtomicInteger.get()
             // per JMX poll) so exposing it as a gauge has no observable cost.
             group.newGauge(NAME_ACTIVE_SSE_STREAMS, sseLimiter::inUse);
+
+            // WebSocket counterparts. Separate from the SSE meters because the two paths have different per-connection
+            // cost profiles (SSE is a pure server-push stream; WebSocket is bidirectional with client-driven credit
+            // accounting) — alerting on one path should not mask traffic on the other. Naming matches the SSE family:
+            // ActiveWsSubscriptions (live), WsSubscriptionsOpened (rate of accepted), RejectedAtWsCap (rate of refused).
+            wsCap = group.newMeter(NAME_REJECTED_AT_WS_CAP, "rejections", TimeUnit.SECONDS);
+            wsOpened = group.newMeter(NAME_WS_SUBSCRIPTIONS_OPENED, "subscriptions", TimeUnit.SECONDS);
+            group.newGauge(NAME_ACTIVE_WS_SUBSCRIPTIONS, wsLimiter::inUse);
         } catch (RuntimeException constructionFailure) {
             // Best-effort rollback of every singleton name we might have registered. removeMetric() is no-op-on-absent
             // so it is safe to call unconditionally — and we MUST call it unconditionally rather than gating on the
@@ -146,6 +162,9 @@ public final class HttpBridgeMetrics implements AutoCloseable {
             tryRemove(constructionFailure, NAME_REJECTED_AT_SSE_CAP, Collections.emptyMap());
             tryRemove(constructionFailure, NAME_SSE_STREAMS_OPENED, Collections.emptyMap());
             tryRemove(constructionFailure, NAME_ACTIVE_SSE_STREAMS, Collections.emptyMap());
+            tryRemove(constructionFailure, NAME_REJECTED_AT_WS_CAP, Collections.emptyMap());
+            tryRemove(constructionFailure, NAME_WS_SUBSCRIPTIONS_OPENED, Collections.emptyMap());
+            tryRemove(constructionFailure, NAME_ACTIVE_WS_SUBSCRIPTIONS, Collections.emptyMap());
             throw constructionFailure;
         }
         this.latencyHistograms = Collections.unmodifiableMap(histograms);
@@ -153,6 +172,8 @@ public final class HttpBridgeMetrics implements AutoCloseable {
         this.rejectedOversizedBody = oversized;
         this.rejectedAtSseCap = sseCap;
         this.sseStreamsOpened = streamsOpened;
+        this.rejectedAtWsCap = wsCap;
+        this.wsSubscriptionsOpened = wsOpened;
     }
 
     private void tryRemove(RuntimeException primary, String metric, Map<String, String> tags) {
@@ -209,6 +230,14 @@ public final class HttpBridgeMetrics implements AutoCloseable {
         if (!closed) sseStreamsOpened.mark();
     }
 
+    public void recordWsCapRejection() {
+        if (!closed) rejectedAtWsCap.mark();
+    }
+
+    public void recordWsSubscriptionOpened() {
+        if (!closed) wsSubscriptionsOpened.mark();
+    }
+
     /**
      * Map an HTTP status code to a 2xx / 4xx / 5xx family label. Out-of-range codes (1xx, 3xx, or anything {@code < 100}
      * or {@code > 599}) fall through to {@code "other"} — these are not states the bridge emits today, but a Meter for
@@ -252,5 +281,8 @@ public final class HttpBridgeMetrics implements AutoCloseable {
         group.removeMetric(NAME_REJECTED_AT_SSE_CAP);
         group.removeMetric(NAME_SSE_STREAMS_OPENED);
         group.removeMetric(NAME_ACTIVE_SSE_STREAMS);
+        group.removeMetric(NAME_REJECTED_AT_WS_CAP);
+        group.removeMetric(NAME_WS_SUBSCRIPTIONS_OPENED);
+        group.removeMetric(NAME_ACTIVE_WS_SUBSCRIPTIONS);
     }
 }
