@@ -836,4 +836,47 @@ class IoUringSelectorTest {
         }
         return merged;
     }
+
+    @Test
+    void onAcceptDropsConnectionWhenPendingQueueIsFull() throws Exception {
+        // Regression for the unbounded-pre-quota-accept blow-up: if the Processor stalls
+        // (e.g. blocked on request-handler backpressure), Netty's event loop must not
+        // accumulate KafkaChannel state indefinitely in pendingAccepts. After the cap
+        // (DEFAULT_MAX_PENDING_ACCEPTS = 20) is reached, further onAccept calls must close
+        // the freshly accepted netty channel immediately rather than enqueueing it.
+        //
+        // The cap is the io_uring analog of NIO's ArrayBlockingQueue(connectionQueueSize)
+        // in SocketServer.Acceptor — NIO blocks the Acceptor on put() to apply kernel-level
+        // backpressure, we close because the Netty event loop is shared across this
+        // listener's child channels and blocking it would stall the world.
+        IoUringSelector s = newSelector(IDLE_NANOS_NEVER);
+        int cap = 20; // mirrors DEFAULT_MAX_PENDING_ACCEPTS in IoUringSelector
+
+        // Saturate the queue: 20 accepts with NO intervening poll, so nothing drains.
+        List<EmbeddedChannel> queued = new ArrayList<>();
+        for (int i = 0; i < cap; i++) {
+            queued.add(acceptNew(s, new InetSocketAddress("198.51.100.9", 40000 + i)));
+        }
+        for (EmbeddedChannel ch : queued) {
+            assertTrue(ch.isOpen(), "channels up to the cap must stay open");
+        }
+
+        // 21st accept: queue is at the cap. Selector must close this one without queuing.
+        EmbeddedChannel overflow = acceptNew(s, new InetSocketAddress("198.51.100.9", 40020));
+        assertFalse(overflow.isOpen(),
+            "accept past the cap must be refused (netty channel closed) — otherwise " +
+            "a stalled Processor leaks KafkaChannel + direct-memory state per accept");
+
+        // Poll drains the queued accepts so the next batch of accepts is admissible. This
+        // also verifies the counter is properly decremented on drain: without that, the
+        // cap would be permanently saturated after a single high-water event.
+        s.poll(0);
+        assertEquals(cap, s.connected().size(), "all queued accepts must surface this poll");
+
+        // Verify the counter actually recovered: a fresh accept right after the drain
+        // must be admitted.
+        EmbeddedChannel freshAfterDrain = acceptNew(s, new InetSocketAddress("198.51.100.9", 41000));
+        assertTrue(freshAfterDrain.isOpen(),
+            "after draining the queue, the counter must reset so new accepts are admitted");
+    }
 }

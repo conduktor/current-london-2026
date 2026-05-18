@@ -154,6 +154,30 @@ public final class IoUringSelector implements BrokerSelector {
 
     // Cross-thread queues (event loop pushes, Processor pulls).
     private final Queue<KafkaChannel> pendingAccepts = new ConcurrentLinkedQueue<>();
+    /**
+     * Cheap O(1) view of {@link #pendingAccepts}'s depth — ConcurrentLinkedQueue.size() walks
+     * the chain, so we maintain a counter alongside it. The size is read on every accept to
+     * enforce {@link #maxPendingAccepts}; with a high accept rate the O(n) walk would itself
+     * become the bottleneck (and would race the producer/consumer pointers).
+     */
+    private final java.util.concurrent.atomic.AtomicInteger pendingAcceptCount =
+        new java.util.concurrent.atomic.AtomicInteger();
+    /**
+     * Bound for {@link #pendingAccepts}. Mirrors NIO's per-Processor
+     * {@code ArrayBlockingQueue(connectionQueueSize)} in {@code SocketServer.Acceptor}:
+     * NIO blocks the Acceptor thread on {@code put()} when full, providing kernel-level
+     * backpressure via the SYN/ACCEPT backlog. We can't block — the Netty event loop is
+     * shared across all child channels for this listener and freezing it would stall every
+     * accepted connection — so when the cap is hit, {@link #onAccept(Channel, InetSocketAddress, InetSocketAddress)}
+     * closes the freshly accepted netty channel instead. The client sees a RST and the OS
+     * backlog drains.
+     *
+     * <p>The value matches the default for {@code socket.server.listen.backlog.size}'s
+     * downstream queue (NIO uses 20 hardcoded per processor). Under sustained pressure the
+     * total cap is N * 20 across N selectors, same as NIO.
+     */
+    private static final int DEFAULT_MAX_PENDING_ACCEPTS = 20;
+    private final int maxPendingAccepts;
     private final Queue<String> pendingDisconnects = new ConcurrentLinkedQueue<>();
 
     // Wakeup signalling. Permits are drained on acquisition; see acquireWithTimeout below.
@@ -235,6 +259,7 @@ public final class IoUringSelector implements BrokerSelector {
         this.time = Objects.requireNonNull(time, "time");
         this.processorId = processorId;
         this.configs = Objects.requireNonNull(configs, "configs");
+        this.maxPendingAccepts = DEFAULT_MAX_PENDING_ACCEPTS;
     }
 
     // -------------------------------------------------------------------------
@@ -247,6 +272,24 @@ public final class IoUringSelector implements BrokerSelector {
      */
     void onAccept(Channel nettyChannel, InetSocketAddress remote, InetSocketAddress local) {
         if (closed) {
+            nettyChannel.close();
+            return;
+        }
+        // Bound the accept queue depth: if the Processor is slow to drain pendingAccepts,
+        // close the freshly accepted netty channel immediately rather than building the
+        // full KafkaChannel stack (TransportLayer, Authenticator, MetadataRegistry, plus
+        // a slot in nettyChannels) and stranding it in an unbounded queue. This mirrors
+        // NIO's per-Processor bounded queue (ArrayBlockingQueue(connectionQueueSize) in
+        // SocketServer.Acceptor) — NIO blocks on put() when full so the OS backlog
+        // absorbs the pressure; we close because blocking the Netty event loop would
+        // freeze every child channel served by this listener.
+        //
+        // Closing here sends a TCP RST (or FIN) to the client. Without the cap, a stuck
+        // Processor would let the queue grow until the JVM OOMs — every entry pins a
+        // Netty Channel with its own direct-memory recvByteBufAllocator state.
+        if (pendingAcceptCount.get() >= maxPendingAccepts) {
+            log.info("io_uring: dropping accept from {} — pending-accept queue at cap ({}); " +
+                     "Processor likely overloaded", remote, maxPendingAccepts);
             nettyChannel.close();
             return;
         }
@@ -268,6 +311,7 @@ public final class IoUringSelector implements BrokerSelector {
         // references through the KafkaChannel's selectionKey.
         nettyChannels.put(id, nettyChannel);
         pendingAccepts.offer(channel);
+        pendingAcceptCount.incrementAndGet();
         wakeup.release();
     }
 
@@ -337,6 +381,7 @@ public final class IoUringSelector implements BrokerSelector {
         // 1. Drain accepts.
         KafkaChannel acceptedChannel;
         while ((acceptedChannel = pendingAccepts.poll()) != null) {
+            pendingAcceptCount.decrementAndGet();
             channels.put(acceptedChannel.id(), acceptedChannel);
             lastActiveNanos.put(acceptedChannel.id(), nowNanos);
             // PLAINTEXT auth completes synchronously; one prepare() call drives the channel to READY.
@@ -825,6 +870,7 @@ public final class IoUringSelector implements BrokerSelector {
         // Drain queues so any in-flight ByteBufs are released.
         KafkaChannel pending;
         while ((pending = pendingAccepts.poll()) != null) {
+            pendingAcceptCount.decrementAndGet();
             Utils.closeQuietly(pending, "pending-accept on close");
         }
         pendingDisconnects.clear();
