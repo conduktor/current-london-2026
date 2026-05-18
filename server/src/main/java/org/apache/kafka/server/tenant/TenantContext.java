@@ -137,6 +137,19 @@ public final class TenantContext {
             .orElse(false);
     }
 
+    /**
+     * True if the combined {@code <tenantId>.<logicalTopic>} would exceed
+     * Kafka's MAX_NAME_LENGTH. Handlers consult this BEFORE calling
+     * {@link #toPhysical} so the broker can refuse the entry with the LOGICAL
+     * name in the error message — letting the controller reject would surface
+     * the physical form in the rejection string, leaking the tenant prefix.
+     */
+    public boolean isOverlongLogicalForm(String logicalTopic) {
+        return effectiveTenant()
+            .map(t -> TenantNamespace.isOverlongLogicalForm(t, logicalTopic))
+            .orElse(false);
+    }
+
     public String toLogical(String physicalTopic) {
         return effectiveTenant()
             .map(t -> TenantNamespace.toLogical(t, physicalTopic))

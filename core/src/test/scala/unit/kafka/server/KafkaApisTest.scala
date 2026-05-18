@@ -11945,6 +11945,42 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testCreateTopicsTenantRejectsOverlongLogicalNameWithoutLeakingPhysicalForm(): Unit = {
+    // Kafka caps topic names at 249 chars. A 245-char logical name for tenant
+    // acme would inflate to "acme." + 245 = 250 chars on the wire to the
+    // controller, which would reject it — but the controller's rejection
+    // string would embed the physical name, leaking the tenant prefix. The
+    // broker must refuse the entry up front with INVALID_TOPIC_EXCEPTION and
+    // the LOGICAL name in the error message, and not forward.
+    val tooLongLogical = "a" * 245
+    val createRequest = new CreateTopicsRequest.Builder(new CreateTopicsRequestData()
+      .setTopics(new CreateTopicsRequestData.CreatableTopicCollection(
+        Collections.singleton(new CreateTopicsRequestData.CreatableTopic()
+          .setName(tooLongLogical).setNumPartitions(1).setReplicationFactor(1.toShort)).iterator)))
+      .build()
+    val request = buildRequest(
+      createRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleCreateTopicsRequest(request)
+
+    val response = verifyNoThrottling[CreateTopicsResponse](request)
+    val result = response.data.topics.asScala.head
+    assertEquals(tooLongLogical, result.name,
+      "rejection must echo the LOGICAL name the client sent, never the physical form")
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, result.errorCode)
+    assertNotNull(result.errorMessage)
+    assertTrue(result.errorMessage.contains(tooLongLogical),
+      "error message must quote the logical name back to the tenant")
+    assertFalse(result.errorMessage.contains("acme." + tooLongLogical),
+      "error message must not embed the physical form: " + result.errorMessage)
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[AbstractRequest](), any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
   def testCreateTopicsClusterWideListenerRejectsTenantPrefixedNames(): Unit = {
     // Outside-in pollution: a super-user on the cluster-wide (non-tenant)
     // listener could otherwise CreateTopics("acme.foo") literally; tenant acme

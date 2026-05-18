@@ -156,6 +156,37 @@ class TenantNamespaceTest {
     }
 
     @Test
+    void isOverlongLogicalFormFlagsNamesThatBlowPastKafkaMaxLengthAfterPrefixing() {
+        // Kafka caps topic names at 249 characters. Handlers must reject
+        // logical names whose combined `<tenantId>.<name>` form would exceed
+        // that bound BEFORE forwarding — otherwise the controller's rejection
+        // would carry the physical form back in the error message.
+        String tooLongLogical = "a".repeat(245); // "acme." + 245 = 250 → over the cap
+        assertTrue(TenantNamespace.isOverlongLogicalForm("acme", tooLongLogical));
+    }
+
+    @Test
+    void isOverlongLogicalFormBoundaryCaseAcceptsExactly249Chars() {
+        // "acme." + 244-char logical = 249-char physical → exactly at the limit
+        String boundaryLogical = "a".repeat(244);
+        assertFalse(TenantNamespace.isOverlongLogicalForm("acme", boundaryLogical));
+        assertEquals("acme." + boundaryLogical,
+            TenantNamespace.toPhysical("acme", boundaryLogical));
+    }
+
+    @Test
+    void isOverlongLogicalFormIgnoresInternalTopics() {
+        // Internal topics aren't prefixed at all, so length validation does
+        // not apply.
+        assertFalse(TenantNamespace.isOverlongLogicalForm("acme", "__consumer_offsets"));
+    }
+
+    @Test
+    void isOverlongLogicalFormIsFalseForNullName() {
+        assertFalse(TenantNamespace.isOverlongLogicalForm("acme", null));
+    }
+
+    @Test
     void toPhysicalAllowsLogicalNameStartingWithUnrelatedTenantPrefix() {
         // "beta.orders" is a perfectly valid logical name for tenant acme — it
         // just contains a dot. The contract is per-tenant: acme's reserved

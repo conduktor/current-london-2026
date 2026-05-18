@@ -40,6 +40,10 @@ public final class TenantNamespace {
 
     public static final String PRINCIPAL_PREFIX = "__tenant_";
     static final char SEPARATOR = '.';
+    // Mirrors Topic.MAX_NAME_LENGTH (which is private). Kept as a duplicated
+    // constant so the rewrite can refuse over-long names BEFORE forwarding to
+    // the controller (where the rejection would carry the physical name).
+    private static final int MAX_TOPIC_NAME_LENGTH = 249;
 
     private TenantNamespace() { }
 
@@ -75,6 +79,22 @@ public final class TenantNamespace {
                     + tenantId + SEPARATOR + "' and is therefore reserved");
         }
         return tenantId + SEPARATOR + logicalTopic;
+    }
+
+    /**
+     * True if {@code logicalTopic}, when rewritten to the physical form
+     * {@code <tenantId>.<logicalTopic>}, would exceed Kafka's MAX_NAME_LENGTH
+     * (249 chars). Handlers consult this BEFORE calling {@link #toPhysical} so a
+     * single over-long entry can be refused per-batch entry without aborting the
+     * whole request — and so the error message quotes the LOGICAL name the
+     * tenant sent rather than letting the controller reject with a message
+     * containing the physical form.
+     */
+    public static boolean isOverlongLogicalForm(String tenantId, String logicalTopic) {
+        if (logicalTopic == null || isInternalTopic(logicalTopic)) {
+            return false;
+        }
+        return tenantId.length() + 1 + logicalTopic.length() > MAX_TOPIC_NAME_LENGTH;
     }
 
     /**

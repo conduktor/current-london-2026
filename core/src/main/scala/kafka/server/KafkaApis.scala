@@ -160,8 +160,10 @@ class KafkaApis(val requestChannel: RequestChannel,
       // asking for `acme.orders`) is treated as foreign — surfaces as
       // UNKNOWN_TOPIC_OR_PARTITION, identical to any other out-of-namespace
       // probe so it cannot be used to test for the existence of the physical
-      // form.
-      if (ctx.isReservedPhysicalForm(tip.topic)) return None
+      // form. An over-long logical name is treated the same way: prefixing it
+      // would produce a name the cluster cannot carry, and we want a probe to
+      // be indistinguishable from any other miss.
+      if (ctx.isReservedPhysicalForm(tip.topic) || ctx.isOverlongLogicalForm(tip.topic)) return None
       val physical = ctx.toPhysical(tip.topic)
       if (ctx.belongsToTenant(physical)) {
         if (physical == tip.topic) Some(tip)
@@ -297,6 +299,14 @@ class KafkaApis(val requestChannel: RequestChannel,
           .setName(logical)
           .setErrorCode(Errors.INVALID_TOPIC_EXCEPTION.code)
           .setErrorMessage("Topic name '" + logical + "' is reserved (tenant namespace prefix)"))
+      } else if (ctx.isOverlongLogicalForm(logical)) {
+        // Refuse here so the rejection message quotes the LOGICAL name. Forwarding
+        // would have the controller respond with the physical form in its error
+        // string, leaking the tenant prefix.
+        preRejected.add(new CreateTopicsResponseData.CreatableTopicResult()
+          .setName(logical)
+          .setErrorCode(Errors.INVALID_TOPIC_EXCEPTION.code)
+          .setErrorMessage("Topic name '" + logical + "' is too long for the tenant namespace"))
       } else {
         val physical = ctx.toPhysical(logical)
         physicalToLogical(physical) = logical
@@ -389,6 +399,11 @@ class KafkaApis(val requestChannel: RequestChannel,
               .setName(logical)
               .setErrorCode(Errors.INVALID_TOPIC_EXCEPTION.code)
               .setErrorMessage("Topic name '" + logical + "' is reserved (tenant namespace prefix)"))
+          } else if (ctx.isOverlongLogicalForm(logical)) {
+            preRejected.add(new DeleteTopicsResponseData.DeletableTopicResult()
+              .setName(logical)
+              .setErrorCode(Errors.INVALID_TOPIC_EXCEPTION.code)
+              .setErrorMessage("Topic name '" + logical + "' is too long for the tenant namespace"))
           } else {
             val physical = ctx.toPhysical(logical)
             physicalToLogical(physical) = logical
@@ -428,6 +443,11 @@ class KafkaApis(val requestChannel: RequestChannel,
             .setName(name)
             .setErrorCode(Errors.INVALID_TOPIC_EXCEPTION.code)
             .setErrorMessage("Topic name '" + name + "' is reserved (tenant namespace prefix)"))
+        } else if (ctx.isOverlongLogicalForm(name)) {
+          preRejected.add(new DeleteTopicsResponseData.DeletableTopicResult()
+            .setName(name)
+            .setErrorCode(Errors.INVALID_TOPIC_EXCEPTION.code)
+            .setErrorMessage("Topic name '" + name + "' is too long for the tenant namespace"))
         } else {
           val physical = ctx.toPhysical(name)
           physicalToLogical(physical) = name
@@ -772,7 +792,12 @@ class KafkaApis(val requestChannel: RequestChannel,
     if (tenantScoped) {
       val rejected = new util.ArrayList[ProduceRequestData.TopicProduceData]()
       produceRequest.data.topicData.forEach { t =>
-        if (tenantCtx.isReservedPhysicalForm(t.name)) {
+        // Two upstream-rejectable conditions:
+        //   (a) reserved-physical-form (`acme.X` from tenant acme) → double-prefix
+        //   (b) over-long logical form whose `<tenant>.<name>` exceeds 249 chars
+        // Both share INVALID_TOPIC_EXCEPTION and bypass replicaManager; per-entry
+        // pre-rejection keeps the rest of the batch alive.
+        if (tenantCtx.isReservedPhysicalForm(t.name) || tenantCtx.isOverlongLogicalForm(t.name)) {
           rejected.add(t)
           t.partitionData.forEach { p =>
             invalidLogicalTopicResponses +=
@@ -1406,15 +1431,24 @@ class KafkaApis(val requestChannel: RequestChannel,
     val unknownTopicIdsTopicMetadata = unknownTopicIds.map(topicId =>
         metadataResponseTopic(Errors.UNKNOWN_TOPIC_ID, null, topicId, isInternal = false, util.Collections.emptyList())).toSeq
 
-    // Reserved-physical-form guard for explicit-name lookups: a tenant asking
-    // for metadata about `acme.orders` would otherwise have it rewritten to
-    // `acme.acme.orders`; that physical topic doesn't exist (assuming the
-    // CreateTopics guard is intact) and the response would falsely report it
-    // unknown. Refuse the lookup with INVALID_TOPIC_EXCEPTION, name preserved.
+    // Pre-rejection guard for explicit-name lookups:
+    //   - Reserved physical form: a tenant asking for metadata about
+    //     `acme.orders` would otherwise have it rewritten to `acme.acme.orders`;
+    //     that physical topic doesn't exist (assuming the CreateTopics guard is
+    //     intact) and the response would falsely report it unknown.
+    //   - Over-long logical name: prefixing `<tenantId>.` would push the
+    //     physical form past Kafka's 249-char cap; we'd then either request
+    //     a name the cluster can't carry or surface a controller-side error
+    //     containing the physical form. Refuse here, carrying the logical
+    //     name back unchanged.
+    // Both cases surface as INVALID_TOPIC_EXCEPTION with the name preserved.
+    def isInvalidTenantLookup(name: String): Boolean =
+      tenantCtx.isReservedPhysicalForm(name) || tenantCtx.isOverlongLogicalForm(name)
+
     val reservedPhysicalForm: Seq[MetadataResponseTopic] =
       if (tenantScoped && !metadataRequest.isAllTopics && !useTopicId) {
         metadataRequest.topics.asScala.toSeq
-          .filter(tenantCtx.isReservedPhysicalForm)
+          .filter(isInvalidTenantLookup)
           .map(name => metadataResponseTopic(
             Errors.INVALID_TOPIC_EXCEPTION,
             name,
@@ -1430,7 +1464,7 @@ class KafkaApis(val requestChannel: RequestChannel,
       knownTopicNames
     } else if (tenantScoped) {
       metadataRequest.topics.asScala.toSet
-        .filterNot(tenantCtx.isReservedPhysicalForm)
+        .filterNot(isInvalidTenantLookup)
         .map(tenantCtx.toPhysical)
     } else {
       metadataRequest.topics.asScala.toSet.map(tenantCtx.toPhysical)
@@ -1519,9 +1553,10 @@ class KafkaApis(val requestChannel: RequestChannel,
         if (t.name != null) t.setName(tenantCtx.toLogical(t.name))
       }
     }
-    // reservedPhysicalForm entries already carry the logical name the client
-    // sent (e.g. "acme.orders"); appending after the OUT rewrite avoids
-    // toLogical stripping the prefix they intentionally included.
+    // reservedPhysicalForm entries (reserved + over-long) already carry the
+    // logical name the client sent (e.g. "acme.orders"); appending after the
+    // OUT rewrite avoids toLogical stripping the prefix they intentionally
+    // included, and avoids any attempt to rewrite an over-long name.
     val finalTopicMetadata = completeTopicMetadata ++ reservedPhysicalForm
 
     val brokers = metadataCache.getAliveBrokerNodes(request.context.listenerName)
