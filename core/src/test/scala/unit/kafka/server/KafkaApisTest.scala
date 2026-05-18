@@ -3937,6 +3937,118 @@ class KafkaApisTest extends Logging {
     assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION.code, partitionData.errorCode)
   }
 
+  @Test
+  def testFetchOnLogicalTopicErrorResponseRemapsOffsetsToLogicalSpace(): Unit = {
+    // r19 #131 BLOCKER. When ReplicaManager.fetchMessages returns a FetchPartitionData with a
+    // non-NONE error (NOT_LEADER_OR_FOLLOWER, KAFKA_STORAGE_ERROR, OFFSET_OUT_OF_RANGE on the
+    // backing partition, etc.), the offset fields on that data are in the BACKING offset
+    // space. The pre-fix code passed the whole FetchPartitionData through verbatim to the
+    // logical participant — leaking backing HW / logStartOffset to the consumer. Concretely:
+    //   * backing retention can leave the backing log's logStartOffset thousands of records
+    //     above zero while the logical topic's true start is 0 (no DeleteRecords issued);
+    //   * the backing HW is the sum across all logical partitions coalesced onto it, easily
+    //     orders of magnitude beyond any single logical partition's nextLogicalOffset.
+    // A stock consumer that receives a transient NOT_LEADER_OR_FOLLOWER for "orders" partition
+    // 0 would read those numbers as logical offsets, observe its committed offset (say 25) is
+    // BELOW the leaked logStartOffset (say 88888), and on the next successful fetch trigger
+    // OFFSET_OUT_OF_RANGE reset behaviour — skipping past the actual data to a meaningless
+    // backing position. The fix remaps HW / logStartOffset / LSO to the LOGICAL offset space
+    // even on error so the consumer's view of the partition's offset bounds remains coherent.
+    val logicalTopic = "orders"
+    val backingTopic = "concentrated"
+    val backingTopicId = Uuid.randomUuid()
+    val logicalTopicId = Uuid.randomUuid()
+    val descriptor = new LogicalTopicDescriptor(logicalTopic, 1024, backingTopic, 4)
+    addTopicToMetadataCache(backingTopic, numPartitions = 4, topicId = backingTopicId)
+    addTopicToMetadataCache(logicalTopic, numPartitions = 1024, topicId = logicalTopicId)
+
+    when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
+    when(concentrationKernel.describe(logicalTopic)).thenReturn(Optional.of(descriptor))
+    when(concentrationKernel.backingPartitionFor(logicalTopic, 0)).thenReturn(2)
+    when(concentrationKernel.isBackingReady(any[TopicPartition])).thenReturn(true)
+    stubBackingPartitionAsLeader()
+    // The logical offset space the consumer expects to see.
+    when(concentrationKernel.nextLogicalOffset(logicalTopic, 0)).thenReturn(50L)
+    when(concentrationKernel.startLogicalOffset(logicalTopic, 0)).thenReturn(0L)
+    when(concentrationKernel.resolveBackingOffset(logicalTopic, 0, 25L)).thenReturn(7777L)
+
+    // BACKING-space offsets the (pre-fix) code would have leaked. The 88888L logStartOffset
+    // is the BLOCKER-defining condition: backing retention well above zero while the logical
+    // topic's true start is zero. The 99999L HW is the sum of HWs across all logical
+    // partitions concentrated onto this backing.
+    val leakedBackingHw = 99999L
+    val leakedBackingLogStart = 88888L
+    val backingTip = new TopicIdPartition(backingTopicId, new TopicPartition(backingTopic, 2))
+    when(replicaManager.fetchMessages(
+      any[FetchParams],
+      any[Seq[(TopicIdPartition, FetchRequest.PartitionData)]],
+      any[ReplicaQuota],
+      any[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]()
+    )).thenAnswer { invocation =>
+      val callback = invocation.getArgument(3).asInstanceOf[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]
+      // KAFKA_STORAGE_ERROR rather than NOT_LEADER_OR_FOLLOWER: at FETCH v16+ the
+      // response path resolves a new leader for the NOT_LEADER / FENCED_EPOCH cases,
+      // pulling in extra wiring (replicaManager.getPartitionOrError, alive-broker
+      // lookup) that's irrelevant to the offset-leak invariant under test. Any
+      // non-NONE error reproduces the leak, so pick the cleanest one.
+      callback(Seq(backingTip -> new FetchPartitionData(
+        Errors.KAFKA_STORAGE_ERROR,
+        leakedBackingHw,
+        leakedBackingLogStart,
+        MemoryRecords.EMPTY,
+        Optional.empty(),
+        OptionalLong.of(leakedBackingHw),
+        Optional.empty(),
+        OptionalInt.empty(),
+        false)))
+    }
+
+    val logicalTip = new TopicIdPartition(logicalTopicId, new TopicPartition(logicalTopic, 0))
+    val fetchData = Map(logicalTip ->
+      new FetchRequest.PartitionData(logicalTip.topicId, 25L, 0L, 1_000_000, Optional.empty())).asJava
+    val fetchDataBuilder = Map(logicalTip.topicPartition ->
+      new FetchRequest.PartitionData(logicalTip.topicId, 25L, 0L, 1_000_000, Optional.empty())).asJava
+    val fetchContext = new FullFetchContext(time, new FetchSessionCacheShard(1000, 100),
+      new JFetchMetadata(0, 0), fetchData, false, false)
+    when(fetchManager.newContext(
+      any[Short], any[JFetchMetadata], any[Boolean],
+      any[util.Map[TopicIdPartition, FetchRequest.PartitionData]],
+      any[util.List[TopicIdPartition]], any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val fetchRequest = new FetchRequest.Builder(ApiKeys.FETCH.latestVersion,
+      ApiKeys.FETCH.latestVersion, -1, -1, 100, 0, fetchDataBuilder).build()
+    val request = buildRequest(fetchRequest)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleFetchRequest(request)
+
+    val response = verifyNoThrottling[FetchResponse](request)
+    val responseData = response.responseData(metadataCache.topicIdsToNames(), ApiKeys.FETCH.latestVersion)
+    val partitionData = responseData.get(logicalTip.topicPartition)
+    assertNotNull(partitionData, "expected the logical TP to appear in the fetch response")
+
+    // The error propagates to the logical participant — same fault as the backing fetch.
+    assertEquals(Errors.KAFKA_STORAGE_ERROR.code, partitionData.errorCode,
+      "the replication-level error against the backing must propagate to the logical TP")
+
+    // CRUCIAL invariant: backing-space offsets MUST NOT leak through to the consumer.
+    assertNotEquals(leakedBackingHw, partitionData.highWatermark,
+      s"backing HW $leakedBackingHw must not leak to the logical consumer")
+    assertNotEquals(leakedBackingLogStart, partitionData.logStartOffset,
+      s"backing logStartOffset $leakedBackingLogStart must not leak to the logical consumer")
+    assertNotEquals(leakedBackingHw, partitionData.lastStableOffset,
+      s"backing LSO $leakedBackingHw must not leak to the logical consumer")
+
+    // Positive invariant: offsets must be in the LOGICAL space.
+    assertEquals(50L, partitionData.highWatermark,
+      "highWatermark must be kernel.nextLogicalOffset for the logical partition")
+    assertEquals(0L, partitionData.logStartOffset,
+      "logStartOffset must be kernel.startLogicalOffset for the logical partition")
+    assertEquals(50L, partitionData.lastStableOffset,
+      "v1 non-transactional: LSO == logical HW")
+  }
+
   // Helper for fetch-hook tests: build a MemoryRecords as if it had been produced through the
   // logical-topic stamper, with each record carrying ConcentrationHeaders for `logicalTopic`,
   // `logicalPartition`, and `logicalOffset`. Mirrors the wire shape the fetch hook sees coming

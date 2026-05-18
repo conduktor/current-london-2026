@@ -1215,12 +1215,36 @@ class KafkaApis(val requestChannel: RequestChannel,
               // KAFKA_STORAGE_ERROR, etc.) propagates to every participant — they all asked for
               // the same backing partition, so they share the same fault.
               participants.iterator.map { case (logicalTp, logicalTopic, logicalPartition) =>
+                // r19 #131 BLOCKER: even on an error response, remap HW/logStartOffset/LSO into
+                // the LOGICAL offset space. The old code passed `data` straight through on
+                // error, which leaked backing-side values: backing retention can leave the
+                // backing log's logStartOffset far above 0 while the logical topic's true start
+                // is something else, and the backing HW can be orders of magnitude beyond the
+                // logical HW. A consumer that receives a transient NOT_LEADER_OR_FOLLOWER for a
+                // logical partition would interpret those numbers as logical offsets, mis-seek
+                // out of its valid range, and trigger OFFSET_OUT_OF_RANGE-driven reset
+                // behaviour on the NEXT successful fetch. The on-the-wire shape must match the
+                // NONE-branch shape (same HW/start/LSO meaning) regardless of error code —
+                // FetchResponse fields are not optional on error and clients read them
+                // unconditionally. Records pass through as-is: error responses normally carry
+                // MemoryRecords.EMPTY, and substituting would break any error code that
+                // legitimately carries records (none today, but the contract is the safer
+                // default than silently dropping bytes).
+                val logicalHW = concentrationKernel.nextLogicalOffset(logicalTopic, logicalPartition)
+                val logicalStart = concentrationKernel.startLogicalOffset(logicalTopic, logicalPartition)
                 if (data.error != Errors.NONE) {
-                  logicalTp -> data
+                  logicalTp -> new FetchPartitionData(
+                    data.error,
+                    logicalHW,
+                    logicalStart,
+                    data.records,
+                    data.divergingEpoch,
+                    OptionalLong.of(logicalHW),
+                    data.abortedTransactions,
+                    data.preferredReadReplica,
+                    data.isReassignmentFetch)
                 } else {
                   val translated = LogicalFetchTranslator.translate(data.records, logicalTopic, logicalPartition)
-                  val logicalHW = concentrationKernel.nextLogicalOffset(logicalTopic, logicalPartition)
-                  val logicalStart = concentrationKernel.startLogicalOffset(logicalTopic, logicalPartition)
                   // v1 is non-transactional: LSO equals HW (no aborted writes outstanding).
                   val newData = new FetchPartitionData(
                     data.error,
