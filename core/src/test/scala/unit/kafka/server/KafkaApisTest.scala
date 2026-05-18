@@ -13260,6 +13260,119 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testReadShareGroupStateRejectsBackingTopic(): Unit = {
+    // r19 ADV-A BLOCKER #144 — share-state RPCs key on TopicId; a misbehaving share-broker (or a
+    // future bug in the share-fetch path that bypasses #136 via topic-ID) could send a backing
+    // topic's UUID here, and the share-coordinator would happily store/retrieve state under
+    // (groupId, backingTopicId, partition) — fan-out across every logical tenant on that backing.
+    // Defense-in-depth at the share-coord entry: resolve UUID → name and reject backing topics.
+    val backingTopic = "backing-topic"
+    val backingTopicId = Uuid.randomUuid()
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
+    addTopicToMetadataCache(backingTopic, numPartitions = 4, topicId = backingTopicId)
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+
+    val readRequestData = new ReadShareGroupStateRequestData()
+      .setGroupId("group1")
+      .setTopics(List(
+        new ReadShareGroupStateRequestData.ReadStateData()
+          .setTopicId(backingTopicId)
+          .setPartitions(List(
+            new ReadShareGroupStateRequestData.PartitionData()
+              .setPartition(1)
+              .setLeaderEpoch(1),
+            new ReadShareGroupStateRequestData.PartitionData()
+              .setPartition(2)
+              .setLeaderEpoch(1)
+          ).asJava)
+      ).asJava)
+
+    val requestChannelRequest = buildRequest(new ReadShareGroupStateRequest.Builder(readRequestData, true).build())
+    kafkaApis = createKafkaApis(
+      overrideProperties = Map(ShareGroupConfig.SHARE_GROUP_ENABLE_CONFIG -> "true") ++
+        ShareCoordinatorTestConfig.testConfigMap().asScala
+    )
+    kafkaApis.handle(requestChannelRequest, RequestLocal.noCaching())
+
+    val response = verifyNoThrottling[ReadShareGroupStateResponse](requestChannelRequest)
+    assertEquals(1, response.data.results.size)
+    val topicResult = response.data.results.get(0)
+    assertEquals(backingTopicId, topicResult.topicId)
+    assertEquals(2, topicResult.partitions.size)
+    topicResult.partitions.forEach { partResult =>
+      assertEquals(Errors.INVALID_REQUEST.code(), partResult.errorCode(),
+        s"partition ${partResult.partition} should be rejected")
+    }
+    // The share coordinator must never see this backing-topic key.
+    verify(shareCoordinator, never()).readState(any[RequestContext], any[ReadShareGroupStateRequestData])
+  }
+
+  @Test
+  def testReadShareGroupStatePartitionsBackingFromLegitimate(): Unit = {
+    // Mixed request: one backing topic (rejected) + one legitimate topic (forwarded).
+    // Verifies the rejected topic does not poison the legitimate one and that the share
+    // coordinator is called with only the legitimate topic.
+    val backingTopic = "backing-topic"
+    val backingTopicId = Uuid.randomUuid()
+    val legitTopic = "legit-topic"
+    val legitTopicId = Uuid.randomUuid()
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
+    addTopicToMetadataCache(backingTopic, numPartitions = 4, topicId = backingTopicId)
+    addTopicToMetadataCache(legitTopic, numPartitions = 2, topicId = legitTopicId)
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+    when(concentrationKernel.isBackingTopic(legitTopic)).thenReturn(false)
+
+    val readRequestData = new ReadShareGroupStateRequestData()
+      .setGroupId("group1")
+      .setTopics(List(
+        new ReadShareGroupStateRequestData.ReadStateData()
+          .setTopicId(backingTopicId)
+          .setPartitions(List(
+            new ReadShareGroupStateRequestData.PartitionData().setPartition(0).setLeaderEpoch(1)
+          ).asJava),
+        new ReadShareGroupStateRequestData.ReadStateData()
+          .setTopicId(legitTopicId)
+          .setPartitions(List(
+            new ReadShareGroupStateRequestData.PartitionData().setPartition(0).setLeaderEpoch(1)
+          ).asJava)
+      ).asJava)
+
+    val future = new CompletableFuture[ReadShareGroupStateResponseData]()
+    when(shareCoordinator.readState(any[RequestContext], any[ReadShareGroupStateRequestData])).thenReturn(future)
+    val requestChannelRequest = buildRequest(new ReadShareGroupStateRequest.Builder(readRequestData, true).build())
+    kafkaApis = createKafkaApis(
+      overrideProperties = Map(ShareGroupConfig.SHARE_GROUP_ENABLE_CONFIG -> "true") ++
+        ShareCoordinatorTestConfig.testConfigMap().asScala
+    )
+    kafkaApis.handle(requestChannelRequest, RequestLocal.noCaching())
+
+    // Share coordinator handles ONLY the legitimate topic; complete its future to release the response.
+    future.complete(new ReadShareGroupStateResponseData()
+      .setResults(List(
+        new ReadShareGroupStateResponseData.ReadStateResult()
+          .setTopicId(legitTopicId)
+          .setPartitions(List(new ReadShareGroupStateResponseData.PartitionResult()
+            .setPartition(0)
+            .setErrorCode(Errors.NONE.code())
+            .setStateEpoch(1)
+            .setStartOffset(0)).asJava)
+      ).asJava))
+
+    val response = verifyNoThrottling[ReadShareGroupStateResponse](requestChannelRequest)
+    val byTopic = response.data.results.asScala.map(r => r.topicId -> r).toMap
+    assertEquals(2, byTopic.size)
+    assertEquals(Errors.INVALID_REQUEST.code(), byTopic(backingTopicId).partitions.get(0).errorCode())
+    assertEquals(Errors.NONE.code(), byTopic(legitTopicId).partitions.get(0).errorCode())
+
+    // Verify the request forwarded to the coordinator excluded the backing topic.
+    val forwarded = ArgumentCaptor.forClass(classOf[ReadShareGroupStateRequestData])
+    verify(shareCoordinator).readState(any[RequestContext], forwarded.capture())
+    val forwardedTopics = forwarded.getValue.topics.asScala.map(_.topicId).toSet
+    assertFalse(forwardedTopics.contains(backingTopicId), "backing topic must not reach share-coordinator")
+    assertEquals(Set(legitTopicId), forwardedTopics)
+  }
+
+  @Test
   def testWriteShareGroupStateSuccess(): Unit = {
     val topicId = Uuid.randomUuid();
     val writeRequestData = new WriteShareGroupStateRequestData()
@@ -13367,6 +13480,56 @@ class KafkaApisTest extends Logging {
       assertEquals(1, writeResult.partitions.size)
       assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED.code(), writeResult.partitions.get(0).errorCode())
     })
+  }
+
+  @Test
+  def testWriteShareGroupStateRejectsBackingTopic(): Unit = {
+    // r19 ADV-A BLOCKER #144 — symmetric with the read path: a backing-topic UUID slipping into
+    // WriteShareGroupState would scribble share-group state under (groupId, backingTopicId,
+    // partition), corrupting acquisition tracking for every logical tenant on that backing.
+    val backingTopic = "backing-topic"
+    val backingTopicId = Uuid.randomUuid()
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
+    addTopicToMetadataCache(backingTopic, numPartitions = 4, topicId = backingTopicId)
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+
+    val writeRequestData = new WriteShareGroupStateRequestData()
+      .setGroupId("group1")
+      .setTopics(List(
+        new WriteShareGroupStateRequestData.WriteStateData()
+          .setTopicId(backingTopicId)
+          .setPartitions(List(
+            new WriteShareGroupStateRequestData.PartitionData()
+              .setPartition(1)
+              .setLeaderEpoch(1)
+              .setStateEpoch(2)
+              .setStartOffset(10)
+              .setStateBatches(List(
+                new WriteShareGroupStateRequestData.StateBatch()
+                  .setFirstOffset(11)
+                  .setLastOffset(15)
+                  .setDeliveryCount(1)
+                  .setDeliveryState(0)
+              ).asJava)
+          ).asJava)
+      ).asJava)
+
+    val requestChannelRequest = buildRequest(new WriteShareGroupStateRequest.Builder(writeRequestData, true).build())
+    kafkaApis = createKafkaApis(
+      overrideProperties = Map(ShareGroupConfig.SHARE_GROUP_ENABLE_CONFIG -> "true") ++
+        ShareCoordinatorTestConfig.testConfigMap().asScala
+    )
+    kafkaApis.handle(requestChannelRequest, RequestLocal.noCaching())
+
+    val response = verifyNoThrottling[WriteShareGroupStateResponse](requestChannelRequest)
+    assertEquals(1, response.data.results.size)
+    val topicResult = response.data.results.get(0)
+    assertEquals(backingTopicId, topicResult.topicId)
+    assertEquals(1, topicResult.partitions.size)
+    assertEquals(Errors.INVALID_REQUEST.code(), topicResult.partitions.get(0).errorCode())
+    // The share coordinator must never see this backing-topic key — even one corrupt
+    // write would persist cross-tenant state in __share_group_state.
+    verify(shareCoordinator, never()).writeState(any[RequestContext], any[WriteShareGroupStateRequestData])
   }
 
   def getShareGroupDescribeResponse(groupIds: util.List[String], configOverrides: Map[String, String] = Map.empty,

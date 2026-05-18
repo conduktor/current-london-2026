@@ -4362,12 +4362,54 @@ class KafkaApis(val requestChannel: RequestChannel,
         readShareGroupStateRequest.getErrorResponse(requestThrottleMs,
           new ApiException("Share coordinator is not enabled.")))
         CompletableFuture.completedFuture[Unit](())
-      case Some(coordinator) => coordinator.readState(request.context, readShareGroupStateRequest.data)
-        .handle[Unit] { (response, exception) =>
-          if (exception != null) {
-            requestHelper.sendMaybeThrottle(request, readShareGroupStateRequest.getErrorResponse(exception))
+      case Some(coordinator) =>
+        // r19 ADV-A BLOCKER #144 — defense in depth at the share-coord entry. Share-state RPCs
+        // key on TopicId (UUID), not name; if a backing-topic UUID reaches this handler (a
+        // misbehaving share-broker, or a future bug in the share-fetch path that bypasses
+        // ADV-A #136 via topic-ID), the share-coordinator would happily persist state under
+        // (groupId, backingTopicId, partition) — corrupting acquisition tracking for every
+        // logical tenant on that backing. CLUSTER_ACTION authz alone is not enough: any broker
+        // principal in the cluster can send this RPC.
+        val (rejectedRead, forwardedRead) = partitionShareStateTopicsForBackingTopic(
+          readShareGroupStateRequest.data.topics.asScala.toSeq,
+          (t: ReadShareGroupStateRequestData.ReadStateData) => t.topicId)
+        if (rejectedRead.isEmpty) {
+          coordinator.readState(request.context, readShareGroupStateRequest.data)
+            .handle[Unit] { (response, exception) =>
+              if (exception != null) {
+                requestHelper.sendMaybeThrottle(request, readShareGroupStateRequest.getErrorResponse(exception))
+              } else {
+                requestHelper.sendMaybeThrottle(request, new ReadShareGroupStateResponse(response))
+              }
+            }
+        } else {
+          val rejectedResults = rejectedRead.map { td =>
+            new ReadShareGroupStateResponseData.ReadStateResult()
+              .setTopicId(td.topicId)
+              .setPartitions(td.partitions.asScala.map { p =>
+                ReadShareGroupStateResponse.toErrorResponsePartitionResult(
+                  p.partition, Errors.INVALID_REQUEST,
+                  "Backing topic for concentrated logical topics is not addressable as a share-partition.")
+              }.asJava)
+          }
+          if (forwardedRead.isEmpty) {
+            requestHelper.sendMaybeThrottle(request,
+              new ReadShareGroupStateResponse(new ReadShareGroupStateResponseData().setResults(rejectedResults.asJava)))
+            CompletableFuture.completedFuture[Unit](())
           } else {
-            requestHelper.sendMaybeThrottle(request, new ReadShareGroupStateResponse(response))
+            val filteredData = new ReadShareGroupStateRequestData()
+              .setGroupId(readShareGroupStateRequest.data.groupId)
+              .setTopics(forwardedRead.asJava)
+            coordinator.readState(request.context, filteredData)
+              .handle[Unit] { (response, exception) =>
+                if (exception != null) {
+                  requestHelper.sendMaybeThrottle(request, readShareGroupStateRequest.getErrorResponse(exception))
+                } else {
+                  val merged = new ReadShareGroupStateResponseData()
+                    .setResults((response.results.asScala ++ rejectedResults).asJava)
+                  requestHelper.sendMaybeThrottle(request, new ReadShareGroupStateResponse(merged))
+                }
+              }
           }
         }
     }
@@ -4383,14 +4425,70 @@ class KafkaApis(val requestChannel: RequestChannel,
         writeShareRequest.getErrorResponse(requestThrottleMs,
           new ApiException("Share coordinator is not enabled.")))
         CompletableFuture.completedFuture[Unit](())
-      case Some(coordinator) => coordinator.writeState(request.context, writeShareRequest.data)
-        .handle[Unit] { (response, exception) =>
-          if (exception != null) {
-            requestHelper.sendMaybeThrottle(request, writeShareRequest.getErrorResponse(exception))
+      case Some(coordinator) =>
+        // r19 ADV-A BLOCKER #144 — symmetric with handleReadShareGroupStateRequest. A backing
+        // topic UUID reaching writeState would persist (groupId, backingTopicId, partition)
+        // entries into __share_group_state — cross-tenant state pollution, unrecoverable
+        // without manual coordinator-log surgery.
+        val (rejectedWrite, forwardedWrite) = partitionShareStateTopicsForBackingTopic(
+          writeShareRequest.data.topics.asScala.toSeq,
+          (t: WriteShareGroupStateRequestData.WriteStateData) => t.topicId)
+        if (rejectedWrite.isEmpty) {
+          coordinator.writeState(request.context, writeShareRequest.data)
+            .handle[Unit] { (response, exception) =>
+              if (exception != null) {
+                requestHelper.sendMaybeThrottle(request, writeShareRequest.getErrorResponse(exception))
+              } else {
+                requestHelper.sendMaybeThrottle(request, new WriteShareGroupStateResponse(response))
+              }
+            }
+        } else {
+          val rejectedResults = rejectedWrite.map { td =>
+            new WriteShareGroupStateResponseData.WriteStateResult()
+              .setTopicId(td.topicId)
+              .setPartitions(td.partitions.asScala.map { p =>
+                WriteShareGroupStateResponse.toErrorResponsePartitionResult(
+                  p.partition, Errors.INVALID_REQUEST,
+                  "Backing topic for concentrated logical topics is not addressable as a share-partition.")
+              }.asJava)
+          }
+          if (forwardedWrite.isEmpty) {
+            requestHelper.sendMaybeThrottle(request,
+              new WriteShareGroupStateResponse(new WriteShareGroupStateResponseData().setResults(rejectedResults.asJava)))
+            CompletableFuture.completedFuture[Unit](())
           } else {
-            requestHelper.sendMaybeThrottle(request, new WriteShareGroupStateResponse(response))
+            val filteredData = new WriteShareGroupStateRequestData()
+              .setGroupId(writeShareRequest.data.groupId)
+              .setTopics(forwardedWrite.asJava)
+            coordinator.writeState(request.context, filteredData)
+              .handle[Unit] { (response, exception) =>
+                if (exception != null) {
+                  requestHelper.sendMaybeThrottle(request, writeShareRequest.getErrorResponse(exception))
+                } else {
+                  val merged = new WriteShareGroupStateResponseData()
+                    .setResults((response.results.asScala ++ rejectedResults).asJava)
+                  requestHelper.sendMaybeThrottle(request, new WriteShareGroupStateResponse(merged))
+                }
+              }
           }
         }
+    }
+  }
+
+  /**
+   * r19 ADV-A BLOCKER #144 helper. Partition share-state request topics into a rejected set
+   * (those whose TopicId resolves via the metadata cache to a backing-topic name registered
+   * in the concentration kernel) and a forwarded set (everything else). The resolution can
+   * miss in two ways: (a) the UUID is unknown — let the share-coord handle UNKNOWN_TOPIC_ID
+   * downstream; (b) the name resolves but isn't a backing topic — forward normally. Only when
+   * BOTH the resolution succeeds AND the kernel agrees it's a backing topic do we reject.
+   */
+  private def partitionShareStateTopicsForBackingTopic[T](
+      topics: Seq[T],
+      topicIdOf: T => Uuid): (Seq[T], Seq[T]) = {
+    topics.partition { t =>
+      val id = topicIdOf(t)
+      metadataCache.getTopicName(id).exists(concentrationKernel.isBackingTopic)
     }
   }
 
