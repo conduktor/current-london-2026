@@ -506,6 +506,108 @@ class CompressionPolicyIntegrationTest extends QuorumTestHarness {
     }
   }
 
+  /**
+   * Pins the operator retry story: an application that sends to a `required` topic with
+   * `compression.type=none` is rejected on the first send, then succeeds on a second send
+   * once it has been reconfigured to use a compressed codec. This is the realistic remediation
+   * flow — the application learns about the policy via the rejected send, fixes its own
+   * `compression.type` config, and retries.
+   *
+   * We model this with two producer instances against the same topic and the same broker:
+   * a stock `KafkaProducer` does not let you flip `compression.type` after construction, so
+   * the "reconfigure" step is necessarily a new producer. The contract pinned here is the
+   * broker-side one: the same topic accepts the same logical record once the wire-format
+   * compression header on the batch changes from NONE to LZ4.
+   */
+  @Test
+  def testRetryWithCompressionAfterRequiredRejection(): Unit = {
+    val topic = "retry-after-reject"
+    val admin = TestUtils.createAdminClient(Seq(broker),
+      ListenerName.forSecurityProtocol(SecurityProtocol.PLAINTEXT))
+    try {
+      val cfg = new Properties()
+      cfg.put(LogConfig.COMPRESSION_POLICY_CONFIG, "required")
+      TestUtils.createTopicWithAdmin(admin, topic, Seq(broker), controllerServers, topicConfig = cfg)
+    } finally {
+      admin.close()
+    }
+
+    val bootstrap = TestUtils.plaintextBootstrapServers(Seq(broker))
+    val payload = "v".getBytes
+
+    val uncompressed = newProducer(bootstrap, "none")
+    try {
+      val ee = assertThrows(classOf[ExecutionException],
+        () => uncompressed.send(new ProducerRecord(topic, payload)).get())
+      assertTrue(ee.getCause.isInstanceOf[InvalidRecordException],
+        s"first send must be rejected with InvalidRecordException, got " +
+          s"${ee.getCause.getClass.getName}: ${ee.getCause.getMessage}")
+    } finally {
+      uncompressed.close()
+    }
+
+    // The application reconfigures itself with a compressed codec and retries the same logical
+    // record. The broker must accept it — this is the documented escape hatch for callers who
+    // discover `compression.policy=required` at runtime.
+    val retried = newProducer(bootstrap, "lz4")
+    try {
+      val meta = retried.send(new ProducerRecord(topic, payload)).get()
+      assertEquals(0L, meta.offset(),
+        "retry with compression.type=lz4 must satisfy compression.policy=required and append at offset 0")
+    } finally {
+      retried.close()
+    }
+  }
+
+  /**
+   * Pins the `validateOnly=true` silent-success semantics: a syntactically valid AlterConfig
+   * call is reported as successful but must NOT mutate the live config. Operators rely on
+   * this dry-run shape to confirm a planned change is acceptable before committing it; if
+   * `validateOnly` silently committed a "good" value, every dry-run would become a live
+   * change and the API would be broken.
+   *
+   * The sibling test `testValidateOnlyAlterConfigRejectsBadValueAndPreservesState` covers the
+   * bad-value rejection path; this test covers the good-value-but-not-committed path that
+   * the bad-value test cannot exercise (since rejection short-circuits the commit anyway).
+   */
+  @Test
+  def testValidateOnlyAlterConfigDoesNotCommitGoodValue(): Unit = {
+    val topic = "validate-only-good"
+    val admin = TestUtils.createAdminClient(Seq(broker),
+      ListenerName.forSecurityProtocol(SecurityProtocol.PLAINTEXT))
+    try {
+      TestUtils.createTopicWithAdmin(admin, topic, Seq(broker), controllerServers)
+
+      val topicResource = new ConfigResource(ConfigResource.Type.TOPIC, topic)
+      val alterOps = Collections.singletonList(
+        new AlterConfigOp(new ConfigEntry(LogConfig.COMPRESSION_POLICY_CONFIG, "required"), OpType.SET))
+
+      // validateOnly must succeed (the value is valid) but must not mutate the broker view.
+      admin.incrementalAlterConfigs(
+        Collections.singletonMap(topicResource, alterOps),
+        new AlterConfigsOptions().validateOnly(true)
+      ).all().get()
+
+      val described = admin.describeConfigs(Collections.singletonList(topicResource)).all().get()
+      val entry = described.get(topicResource).get(LogConfig.COMPRESSION_POLICY_CONFIG)
+      assertEquals(LogConfig.DEFAULT_COMPRESSION_POLICY, entry.value(),
+        "validateOnly with a syntactically valid value must report success without committing the change")
+
+      // Behavioural confirmation: an uncompressed producer must still succeed (the topic is
+      // still at the default `none` policy, not the dry-run `required` value).
+      val producer = newProducer(TestUtils.plaintextBootstrapServers(Seq(broker)), "none")
+      try {
+        val meta = producer.send(new ProducerRecord(topic, "v".getBytes)).get()
+        assertEquals(0L, meta.offset(),
+          "uncompressed producer must succeed: validateOnly must not have committed compression.policy=required")
+      } finally {
+        producer.close()
+      }
+    } finally {
+      admin.close()
+    }
+  }
+
   private def newProducer(bootstrap: String, compression: String): KafkaProducer[Array[Byte], Array[Byte]] = {
     val props = new Properties()
     props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrap)
