@@ -154,6 +154,18 @@ public class SocketServerConfigs {
     public static final int NUM_NETWORK_THREADS_DEFAULT = 3;
     public static final String NUM_NETWORK_THREADS_DOC = "The number of threads that the server uses for receiving requests from the network and sending responses to the network. Noted: each listener (except for controller listener) creates its own thread pool.";
 
+    public static final String HTTP_BRIDGE_ENABLED_CONFIG = "http.bridge.enabled";
+    public static final boolean HTTP_BRIDGE_ENABLED_DEFAULT = false;
+    public static final String HTTP_BRIDGE_ENABLED_DOC = "Whether to start the embedded HTTP bridge inside the broker process. When enabled, the broker listens on the configured HTTP host/port and exposes /v1/topics/{topic}/records (POST for produce, GET for fetch), translating HTTP JSON to Kafka ProduceRequest/FetchRequest objects that flow through the same RequestChannel, authorization and quota paths as the binary protocol. Disabled by default so existing deployments are unaffected.";
+
+    public static final String HTTP_BRIDGE_HOST_CONFIG = "http.bridge.host";
+    public static final String HTTP_BRIDGE_HOST_DEFAULT = "0.0.0.0";
+    public static final String HTTP_BRIDGE_HOST_DOC = "Host or interface the HTTP bridge listener binds to when " + HTTP_BRIDGE_ENABLED_CONFIG + " is true. Defaults to 0.0.0.0 (all interfaces).";
+
+    public static final String HTTP_BRIDGE_PORT_CONFIG = "http.bridge.port";
+    public static final int HTTP_BRIDGE_PORT_DEFAULT = 8082;
+    public static final String HTTP_BRIDGE_PORT_DOC = "TCP port the HTTP bridge listener binds to when " + HTTP_BRIDGE_ENABLED_CONFIG + " is true. Defaults to 8082, the same port used by Confluent's REST Proxy so existing tooling can point at the broker directly without reconfiguration.";
+
     public static final ConfigDef CONFIG_DEF =  new ConfigDef()
             .define(LISTENERS_CONFIG, STRING, LISTENERS_DEFAULT, HIGH, LISTENERS_DOC)
             .define(ADVERTISED_LISTENERS_CONFIG, STRING, null, HIGH, ADVERTISED_LISTENERS_DOC)
@@ -170,7 +182,10 @@ public class SocketServerConfigs {
             .define(FAILED_AUTHENTICATION_DELAY_MS_CONFIG, INT, FAILED_AUTHENTICATION_DELAY_MS_DEFAULT, atLeast(0), LOW, FAILED_AUTHENTICATION_DELAY_MS_DOC)
             .define(QUEUED_MAX_REQUESTS_CONFIG, INT, QUEUED_MAX_REQUESTS_DEFAULT, atLeast(1), HIGH, QUEUED_MAX_REQUESTS_DOC)
             .define(QUEUED_MAX_BYTES_CONFIG, LONG, QUEUED_MAX_REQUEST_BYTES_DEFAULT, MEDIUM, QUEUED_MAX_REQUEST_BYTES_DOC)
-            .define(NUM_NETWORK_THREADS_CONFIG, INT, NUM_NETWORK_THREADS_DEFAULT, atLeast(1), HIGH, NUM_NETWORK_THREADS_DOC);
+            .define(NUM_NETWORK_THREADS_CONFIG, INT, NUM_NETWORK_THREADS_DEFAULT, atLeast(1), HIGH, NUM_NETWORK_THREADS_DOC)
+            .define(HTTP_BRIDGE_ENABLED_CONFIG, ConfigDef.Type.BOOLEAN, HTTP_BRIDGE_ENABLED_DEFAULT, LOW, HTTP_BRIDGE_ENABLED_DOC)
+            .define(HTTP_BRIDGE_HOST_CONFIG, STRING, HTTP_BRIDGE_HOST_DEFAULT, LOW, HTTP_BRIDGE_HOST_DOC)
+            .define(HTTP_BRIDGE_PORT_CONFIG, INT, HTTP_BRIDGE_PORT_DEFAULT, atLeast(1), LOW, HTTP_BRIDGE_PORT_DOC);
 
     private static final Pattern URI_PARSE_REGEXP = Pattern.compile(
         "^(.*)://\\[?([0-9a-zA-Z\\-%._:]*)\\]?:(-?[0-9]+)");

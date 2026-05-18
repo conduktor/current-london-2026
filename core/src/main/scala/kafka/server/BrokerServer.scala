@@ -21,7 +21,9 @@ import kafka.coordinator.group.{CoordinatorLoaderImpl, CoordinatorPartitionWrite
 import kafka.coordinator.transaction.TransactionCoordinator
 import kafka.log.LogManager
 import kafka.log.remote.RemoteLogManager
+import com.fasterxml.jackson.databind.ObjectMapper
 import kafka.network.{DataPlaneAcceptor, SocketServer}
+import org.apache.kafka.network.http.{KafkaHttpBridge, KafkaHttpServer, NotImplementedRequestSubmitter}
 import kafka.raft.KafkaRaftManager
 import kafka.server.metadata._
 import kafka.server.share.SharePartitionManager
@@ -105,6 +107,9 @@ class BrokerServer(
   var authorizer: Option[Authorizer] = None
   @volatile var socketServer: SocketServer = _
   var dataPlaneRequestHandlerPool: KafkaRequestHandlerPool = _
+  // Embedded HTTP bridge (off by default). Lifecycle is colocated with the SocketServer so the bridge starts after
+  // the broker is ready to take requests and is stopped before logs/cores tear down. See KafkaHttpServer.
+  @volatile var httpBridgeServer: KafkaHttpServer = _
 
   var logDirFailureChannel: LogDirFailureChannel = _
   var logManager: LogManager = _
@@ -609,6 +614,16 @@ class BrokerServer(
         "all of the SocketServer Acceptors to be started",
         enableRequestProcessingFuture, startupDeadline, time)
 
+      // Embedded HTTP bridge (off by default). Started after SocketServer so the binary protocol is ready before the
+      // bridge starts accepting work; the current submitter wiring is a placeholder that returns 504 for everything.
+      // The bridge owns its own Jetty thread pool; it does not borrow KafkaRequestHandler threads.
+      if (config.httpBridgeEnabled) {
+        val bridge = new KafkaHttpBridge(new ObjectMapper(), new NotImplementedRequestSubmitter())
+        httpBridgeServer = new KafkaHttpServer(config.httpBridgeHost, config.httpBridgePort, bridge, new ObjectMapper())
+        httpBridgeServer.start()
+        info(s"HTTP bridge listening on ${config.httpBridgeHost}:${httpBridgeServer.boundPort()}")
+      }
+
       maybeChangeStatus(STARTING, STARTED)
     } catch {
       case e: Throwable =>
@@ -766,6 +781,13 @@ class BrokerServer(
       }
       if (lifecycleManager != null)
         lifecycleManager.beginShutdown()
+
+      // Stop the HTTP bridge first so in-flight HTTP requests fail cleanly instead of seeing the broker tear down
+      // mid-call. The bridge is dependent on RequestChannel/KafkaApis once the production submitter lands, so it
+      // must be stopped before those go.
+      if (httpBridgeServer != null) {
+        CoreUtils.swallow(httpBridgeServer.stop(), this)
+      }
 
       // Stop socket server to stop accepting any more connections and requests.
       // Socket server will be shutdown towards the end of the sequence.

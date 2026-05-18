@@ -322,6 +322,13 @@ class KafkaConfig private(doLog: Boolean, val props: util.Map[_, _])
   val queuedMaxBytes = getLong(SocketServerConfigs.QUEUED_MAX_BYTES_CONFIG)
   def numNetworkThreads = getInt(SocketServerConfigs.NUM_NETWORK_THREADS_CONFIG)
 
+  /** ********* HTTP bridge ***********
+   * Embedded HTTP listener inside the broker process; off by default.
+   * See SocketServerConfigs for documentation on each property. */
+  val httpBridgeEnabled: Boolean = getBoolean(SocketServerConfigs.HTTP_BRIDGE_ENABLED_CONFIG)
+  val httpBridgeHost: String = getString(SocketServerConfigs.HTTP_BRIDGE_HOST_CONFIG)
+  val httpBridgePort: Int = getInt(SocketServerConfigs.HTTP_BRIDGE_PORT_CONFIG)
+
   /***************** rack configuration **************/
   val rack = Option(getString(ServerConfigs.BROKER_RACK_CONFIG))
   val replicaSelectorClassName = Option(getString(ReplicationConfigs.REPLICA_SELECTOR_CLASS_CONFIG))
