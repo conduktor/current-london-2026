@@ -82,6 +82,27 @@ public final class KafkaHttpServlet extends HttpServlet {
     }
 
     @Override
+    protected void doTrace(HttpServletRequest req, HttpServletResponse resp) throws IOException {
+        // HttpServlet.doTrace echoes the request line + every header back as `message/http`. That's the
+        // classic XST surface: an attacker that can run script in the origin uses TRACE to read cookies and
+        // auth headers that are marked HttpOnly on the JS side. The bridge accepts POST/GET/HEAD/OPTIONS
+        // only — closing TRACE here keeps the wire surface to what PROMPT.md actually documents.
+        writeMethodNotAllowed(resp);
+    }
+
+    @Override
+    protected void doOptions(HttpServletRequest req, HttpServletResponse resp) throws IOException {
+        // The default doOptions reflects every doXxx defined on the class hierarchy into an Allow header — that
+        // still listed TRACE before we overrode it, and would re-introduce the leak the moment HttpServlet adds
+        // a new default verb. Curate the Allow set explicitly: the bridge documents POST (produce on /records),
+        // GET (SSE on /records?stream=true and fetch elsewhere), HEAD (default servlet behaviour for GET), and
+        // OPTIONS (this method). Anything else is 405.
+        resp.setStatus(HttpStatusMapper.OK);
+        resp.setHeader("Allow", "GET, HEAD, OPTIONS, POST");
+        resp.setContentLength(0);
+    }
+
+    @Override
     protected void doPost(HttpServletRequest req, HttpServletResponse resp) throws IOException {
         long startNanos = System.nanoTime();
         String topic = extractTopic(req.getPathInfo());
@@ -386,6 +407,14 @@ public final class KafkaHttpServlet extends HttpServlet {
 
     private void writeNotFound(HttpServletResponse resp) throws IOException {
         writeEnvelope(resp, HttpStatusMapper.NOT_FOUND, "no such endpoint");
+    }
+
+    private void writeMethodNotAllowed(HttpServletResponse resp) throws IOException {
+        // RFC 9110: a 405 response MUST generate an Allow header listing the methods that are allowed. We pin
+        // the curated list here so the envelope path and the OPTIONS path agree on what the bridge actually
+        // supports.
+        resp.setHeader("Allow", "GET, HEAD, OPTIONS, POST");
+        writeEnvelope(resp, HttpStatusMapper.METHOD_NOT_ALLOWED, "method not allowed");
     }
 
     private void writeInternalError(HttpServletResponse resp, String message) throws IOException {

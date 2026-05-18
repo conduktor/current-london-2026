@@ -1152,6 +1152,58 @@ class KafkaHttpServerIntegrationTest {
         assertTrue(resp.getStatus() == 404 || resp.getStatus() == 400);
     }
 
+    @Test
+    void traceMethodReturns405AndDoesNotEchoRequest() throws Exception {
+        // XST defense: HttpServlet.doTrace echoes the request line + every header as `message/http`. An attacker
+        // that can run script in the origin uses that to read HttpOnly cookies and auth headers. The bridge's
+        // override must return 405 + the canonical {errorCode, errorMessage} envelope, and the body must NOT
+        // contain the secret header we injected.
+        Request req = client.newRequest(url("/v1/topics/orders/records"))
+            .method("TRACE")
+            .headers(h -> h.put("X-Secret-Probe", "trace-leak-canary-9821"));
+        ContentResponse resp = req.send();
+
+        assertEquals(405, resp.getStatus());
+        String allow = resp.getHeaders().get("Allow");
+        assertNotNull(allow, "405 response must include Allow header per RFC 9110");
+        assertFalse(allow.contains("TRACE"), "Allow header must not advertise TRACE, got: " + allow);
+        String bodyText = new String(resp.getContent(), StandardCharsets.UTF_8);
+        assertFalse(bodyText.contains("trace-leak-canary-9821"),
+            "TRACE response body must not echo request headers (XST defense), got: " + bodyText);
+        JsonNode envelope = asJson(resp.getContent());
+        assertEquals("method not allowed", envelope.get("errorMessage").asText());
+    }
+
+    @Test
+    void optionsAllowHeaderDoesNotAdvertiseTrace() throws Exception {
+        // The default HttpServlet.doOptions reflects every doXxx method into the Allow header. Even with doTrace
+        // overridden to 405, the reflective discovery still listed it. Override doOptions to curate the set
+        // explicitly so the wire surface matches PROMPT.md (POST/GET/HEAD/OPTIONS only).
+        ContentResponse resp = client.newRequest(url("/v1/topics/orders/records"))
+            .method(HttpMethod.OPTIONS)
+            .send();
+
+        assertEquals(200, resp.getStatus());
+        String allow = resp.getHeaders().get("Allow");
+        assertNotNull(allow);
+        assertFalse(allow.contains("TRACE"), "Allow header must not advertise TRACE, got: " + allow);
+        assertTrue(allow.contains("GET"), "Allow header must advertise GET, got: " + allow);
+        assertTrue(allow.contains("POST"), "Allow header must advertise POST, got: " + allow);
+    }
+
+    @Test
+    void putMethodReturns405() throws Exception {
+        // PUT/DELETE/PATCH have no override on HttpServlet, so the default already returns 405 + a stock HTML
+        // body. Pin the contract: the bridge must answer with the {errorCode, errorMessage} envelope so clients
+        // see a consistent error shape across every refused method.
+        ContentResponse resp = client.newRequest(url("/v1/topics/orders/records"))
+            .method(HttpMethod.PUT)
+            .body(new StringRequestContent("application/json", "{}"))
+            .send();
+
+        assertEquals(405, resp.getStatus());
+    }
+
     // ----- async correctness -----
 
     @Test
