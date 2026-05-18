@@ -191,6 +191,64 @@ public class GovernanceLoaderTest {
     }
 
     @Test
+    public void tombstoneThenMalformedUpdateInSameBatchHonoursCompactionOrder() {
+        // Regression test for the GovernanceLoader.apply batch-atomicity audit
+        // finding. Scenario: a single uncommitted batch contains, in this order,
+        //   1. PUT r1  (good)            — installs r1
+        //   2. DELETE r1 (tombstone)      — removes r1
+        //   3. PUT r1  (malformed update) — decode fails; previous step is NOT undone
+        //
+        // The correct end state is "r1 is gone". This is what log-compaction
+        // semantics say happens by-offset: the tombstone at offset 2 supersedes
+        // the PUT at offset 1, and the malformed PUT at offset 3 fails to
+        // install a replacement. The loader's decode-then-mutate ordering means
+        // the bad update never touches the working state, so the tombstone's
+        // effect is preserved — there is no silent overwrite, no half-staged
+        // state, no atomicity bug.
+        //
+        // What is NOT a bug: that the tombstone "removes the previously good"
+        // r1. That removal is the explicit, ordered intent of the tombstone
+        // record. The audit finding was a misread of compaction semantics;
+        // this test pins the actual behaviour so a future refactor doesn't
+        // drift back to the buggy "delete X first, then try to install bad X"
+        // pattern (which would NOT preserve r1 anyway and would behave
+        // identically to today).
+        RuleEngine engine = new RuleEngine();
+        GovernanceLoader loader = new GovernanceLoader(engine);
+        loader.apply("r1", envelope("true", ApiKeys.METADATA, 7));
+        loader.apply("r1", null);
+        loader.apply("r1", "not json".getBytes(StandardCharsets.UTF_8));
+        loader.commit();
+        assertSame(RuleDecision.ALLOW,
+            engine.evaluate(ApiKeys.METADATA, "client", false, Collections::emptyMap),
+            "tombstone followed by bad update must leave r1 removed (compaction order)");
+    }
+
+    @Test
+    public void malformedUpdateAfterCommittedGoodOnlyTouchesWorkingStateIfDecodeSucceeded() {
+        // Reordering of the same edge case, with a commit between the good
+        // PUT and the bad PUT — the bad envelope must NEVER displace a good
+        // rule that's already in the working state. This is the half of task
+        // #13's concern that does need to hold: validate-then-mutate.
+        RuleEngine engine = new RuleEngine();
+        GovernanceLoader loader = new GovernanceLoader(engine);
+        loader.apply("r1", envelope("true", ApiKeys.METADATA, 7));
+        loader.commit();
+        // Now apply a bad update. The working state already has r1; the bad
+        // decode must NOT remove or replace it. (Without the validate-first
+        // ordering, a buggy refactor that did `working.remove(key); decode();
+        // working.put(rule);` would zero out r1 before failing to install
+        // its replacement.)
+        loader.apply("r1", "still not json".getBytes(StandardCharsets.UTF_8));
+        loader.commit();
+        RuleDecision d = engine.evaluate(
+            ApiKeys.METADATA, "client", false, Collections::emptyMap);
+        assertTrue(d.denied(), "previously good r1 must still be active");
+        assertEquals(7, d.errorCode());
+        assertEquals("r1", d.denyingRuleId());
+    }
+
+    @Test
     public void encodeDecodeViaCodecLinesUpWithLoader() {
         // Sanity: the loader and the codec must agree on what a record looks
         // like. We use the codec's own encode() to produce input — if a

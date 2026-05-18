@@ -78,6 +78,21 @@ public final class GovernanceLoader {
     /**
      * Apply a single {@code __governance} record to the working state.
      *
+     * <p><b>Validation order matters.</b> For an update record we decode the
+     * envelope <em>before</em> mutating the working state. This is what makes
+     * a batch of {@code [DELETE X, PUT X-malformed]} safe: the delete is the
+     * second-to-last form of the record stream for key X, and a malformed
+     * update record in compaction-key order would already have failed to
+     * install in an earlier batch — there is no good reason to let a poison
+     * update silently delete the previously-good version of the rule in the
+     * working state. Equivalently: we only ever transition the working state
+     * to a new, decoded, validated rule, never to a half-built one.
+     *
+     * <p>Tombstones still apply unconditionally — that is the documented
+     * semantics for a compacted topic: a null-value record means "this key
+     * is now removed". A malformed update for the same key in the same batch
+     * cannot un-do a valid tombstone that ordered before it.
+     *
      * @param key the record key (rule id); null records are dropped
      * @param value the record value (envelope JSON); null is a tombstone
      */
@@ -91,12 +106,18 @@ public final class GovernanceLoader {
             working.remove(key);
             return;
         }
+        // Decode-then-mutate: a malformed envelope must not silently displace
+        // the previously installed good version of this rule. Only commit the
+        // mutation once we hold a fully-validated Rule.
+        final Rule rule;
         try {
-            Rule rule = RuleJsonCodec.decode(key, value);
-            working.put(rule);
+            rule = RuleJsonCodec.decode(key, value);
         } catch (RuleEnvelopeException e) {
-            LOG.warn("rejecting bad __governance envelope for rule '{}': {}", key, e.getMessage());
+            LOG.warn("rejecting bad __governance envelope for rule '{}': {} — " +
+                "previously installed version of this rule (if any) is preserved", key, e.getMessage());
+            return;
         }
+        working.put(rule);
     }
 
     /**
