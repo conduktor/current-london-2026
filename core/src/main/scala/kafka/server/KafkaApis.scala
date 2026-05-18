@@ -182,6 +182,138 @@ class KafkaApis(val requestChannel: RequestChannel,
     requestChannel.closeConnection(request, Collections.emptyMap())
   }
 
+  // CREATE_TOPICS — Forwarded to the controller. We translate the topic names
+  // in the request body to physical before forwarding, and translate them back
+  // in the response. A privileged caller on a tenant-bound listener is refused
+  // here rather than forwarded — the controller has no knowledge of listener
+  // tenancy and would happily let the caller create topics in any namespace.
+  def handleCreateTopicsRequest(request: RequestChannel.Request): Unit = {
+    val ctx = tenantContextFor(request)
+    if (ctx.isPrivilegedOnTenantListener) {
+      val createReq = request.body[CreateTopicsRequest]
+      val results = new CreateTopicsResponseData.CreatableTopicResultCollection()
+      createReq.data.topics.forEach(t =>
+        results.add(new CreateTopicsResponseData.CreatableTopicResult()
+          .setName(t.name)
+          .setErrorCode(Errors.TOPIC_AUTHORIZATION_FAILED.code)
+          .setErrorMessage(Errors.TOPIC_AUTHORIZATION_FAILED.message)))
+      requestChannel.sendResponse(request,
+        new CreateTopicsResponse(new CreateTopicsResponseData().setTopics(results)), None)
+      return
+    }
+    if (!ctx.effectiveTenant.isPresent) {
+      forwardToController(request)
+      return
+    }
+    val createReq = request.body[CreateTopicsRequest]
+    // Map physical → logical so we can rewrite the response, even when an
+    // error path returns the physical name (e.g. INVALID_TOPIC_EXCEPTION).
+    val physicalToLogical = mutable.Map[String, String]()
+    val rewrittenTopics = new CreateTopicsRequestData.CreatableTopicCollection(createReq.data.topics.size)
+    createReq.data.topics.forEach { t =>
+      val logical = t.name
+      val physical = ctx.toPhysical(logical)
+      physicalToLogical(physical) = logical
+      rewrittenTopics.add(t.duplicate().setName(physical))
+    }
+    createReq.data.setTopics(rewrittenTopics)
+    forwardingManager.forwardRequest(request, createReq, {
+      case Some(resp: CreateTopicsResponse) =>
+        val rewritten = new CreateTopicsResponseData.CreatableTopicResultCollection(resp.data.topics.size)
+        resp.data.topics.forEach { r =>
+          val logical = Option(r.name).map(p => physicalToLogical.getOrElse(p, ctx.toLogical(p))).orNull
+          rewritten.add(r.duplicate().setName(logical))
+        }
+        resp.data.setTopics(rewritten)
+        requestHelper.sendForwardedResponse(request, resp)
+      case Some(other) =>
+        requestHelper.sendForwardedResponse(request, other)
+      case None => handleInvalidVersionsDuringForwarding(request)
+    })
+  }
+
+  // DELETE_TOPICS — Forwarded to the controller. v0-5 carries a list of topic
+  // names; v6+ carries DeleteTopicState entries that may name OR id the topic.
+  // For each entry with a name we translate logical → physical; for delete-by-id
+  // we forward the id as-is and post-validate the controller's response — if the
+  // returned physical name does not belong to the tenant, the response is
+  // redacted to UNKNOWN_TOPIC_ID rather than leaking the foreign name.
+  // Privileged caller on a tenant-bound listener is refused outright.
+  def handleDeleteTopicsRequest(request: RequestChannel.Request): Unit = {
+    val ctx = tenantContextFor(request)
+    val delReq = request.body[DeleteTopicsRequest]
+    val version = delReq.version
+    if (ctx.isPrivilegedOnTenantListener) {
+      val results = new DeleteTopicsResponseData.DeletableTopicResultCollection()
+      delReq.topics.forEach { t =>
+        val result = new DeleteTopicsResponseData.DeletableTopicResult()
+          .setErrorCode(Errors.TOPIC_AUTHORIZATION_FAILED.code)
+        if (t.name != null) result.setName(t.name)
+        if (t.topicId != null && !t.topicId.equals(Uuid.ZERO_UUID)) result.setTopicId(t.topicId)
+        results.add(result)
+      }
+      requestChannel.sendResponse(request,
+        new DeleteTopicsResponse(new DeleteTopicsResponseData().setResponses(results)), None)
+      return
+    }
+    if (!ctx.effectiveTenant.isPresent) {
+      forwardToController(request)
+      return
+    }
+    val physicalToLogical = mutable.Map[String, String]()
+    if (version >= 6) {
+      val rewritten = new util.ArrayList[DeleteTopicsRequestData.DeleteTopicState](delReq.data.topics.size)
+      delReq.data.topics.forEach { t =>
+        if (t.name != null) {
+          val logical = t.name
+          val physical = ctx.toPhysical(logical)
+          physicalToLogical(physical) = logical
+          rewritten.add(t.duplicate().setName(physical))
+        } else {
+          // delete-by-id: pass through; response phase will validate the
+          // resolved name belongs to the tenant before exposing it.
+          rewritten.add(t.duplicate())
+        }
+      }
+      delReq.data.setTopics(rewritten)
+    } else {
+      val rewritten = new util.ArrayList[String](delReq.data.topicNames.size)
+      delReq.data.topicNames.forEach { name =>
+        val physical = ctx.toPhysical(name)
+        physicalToLogical(physical) = name
+        rewritten.add(physical)
+      }
+      delReq.data.setTopicNames(rewritten)
+    }
+    forwardingManager.forwardRequest(request, delReq, {
+      case Some(resp: DeleteTopicsResponse) =>
+        val rewritten = new DeleteTopicsResponseData.DeletableTopicResultCollection(resp.data.responses.size)
+        resp.data.responses.forEach { r =>
+          val physical = r.name
+          val rebuilt = if (physical == null) {
+            // controller could not resolve the id (UNKNOWN_TOPIC_ID etc); pass through.
+            r.duplicate()
+          } else if (ctx.belongsToTenant(physical) || Topic.isInternal(physical)) {
+            val logical = physicalToLogical.getOrElse(physical, ctx.toLogical(physical))
+            r.duplicate().setName(logical)
+          } else {
+            // id-based delete that resolved to a topic outside the tenant's
+            // namespace — redact the name and surface UNKNOWN_TOPIC_ID.
+            new DeleteTopicsResponseData.DeletableTopicResult()
+              .setName(null)
+              .setTopicId(r.topicId)
+              .setErrorCode(Errors.UNKNOWN_TOPIC_ID.code)
+          }
+          rewritten.add(rebuilt)
+        }
+        resp.data.setResponses(rewritten)
+        requestHelper.sendForwardedResponse(request, resp)
+      case Some(other) =>
+        requestHelper.sendForwardedResponse(request, other)
+      case None => handleInvalidVersionsDuringForwarding(request)
+    })
+  }
+
   /**
    * Top-level method that handles all requests and multiplexes to the right api
    */
@@ -218,8 +350,8 @@ class KafkaApis(val requestChannel: RequestChannel,
         case ApiKeys.LIST_GROUPS => handleListGroupsRequest(request).exceptionally(handleError)
         case ApiKeys.SASL_HANDSHAKE => handleSaslHandshakeRequest(request)
         case ApiKeys.API_VERSIONS => handleApiVersionsRequest(request)
-        case ApiKeys.CREATE_TOPICS => forwardToController(request)
-        case ApiKeys.DELETE_TOPICS => forwardToController(request)
+        case ApiKeys.CREATE_TOPICS => handleCreateTopicsRequest(request)
+        case ApiKeys.DELETE_TOPICS => handleDeleteTopicsRequest(request)
         case ApiKeys.DELETE_RECORDS => handleDeleteRecordsRequest(request)
         case ApiKeys.INIT_PRODUCER_ID => handleInitProducerIdRequest(request, requestLocal)
         case ApiKeys.OFFSET_FOR_LEADER_EPOCH => handleOffsetForLeaderEpochRequest(request)

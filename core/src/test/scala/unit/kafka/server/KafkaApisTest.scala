@@ -11201,4 +11201,309 @@ class KafkaApisTest extends Logging {
 
     verify(replicaManager, never()).fetchMessages(any(), any(), any(), any())
   }
+
+  // ---------------------------------------------------------------------------
+  // CreateTopics — multi-tenancy
+  //
+  // CreateTopics is forwarded to the controller. The broker rewrites the
+  // request body from logical → physical names BEFORE forwarding so the
+  // controller stores the topic under the tenant-prefixed name. The response
+  // is rewritten the other way so the client sees only the logical name —
+  // including in error responses (e.g. TOPIC_ALREADY_EXISTS). A privileged
+  // caller on a tenant-bound listener is refused before forwarding.
+  // ---------------------------------------------------------------------------
+
+  private def captureForwardedCreateTopics(request: RequestChannel.Request)
+      : (CreateTopicsRequest, Option[AbstractResponse] => Unit) = {
+    val bodyCaptor: ArgumentCaptor[AbstractRequest] = ArgumentCaptor.forClass(classOf[AbstractRequest])
+    val callbackCaptor: ArgumentCaptor[Option[AbstractResponse] => Unit] =
+      ArgumentCaptor.forClass(classOf[Option[AbstractResponse] => Unit])
+    verify(forwardingManager).forwardRequest(
+      ArgumentMatchers.eq(request),
+      bodyCaptor.capture(),
+      callbackCaptor.capture())
+    (bodyCaptor.getValue.asInstanceOf[CreateTopicsRequest], callbackCaptor.getValue)
+  }
+
+  @Test
+  def testCreateTopicsTenantRewritesLogicalNameToPhysicalBeforeForwarding(): Unit = {
+    // The tenant submits CreateTopics for "orders"; the broker must forward
+    // the request to the controller with the physical name "acme.orders".
+    // The controller's response (also physical) must come back to the client
+    // stripped to "orders".
+    val createRequest = new CreateTopicsRequest.Builder(new CreateTopicsRequestData()
+      .setTopics(new CreateTopicsRequestData.CreatableTopicCollection(
+        Collections.singleton(new CreateTopicsRequestData.CreatableTopic()
+          .setName("orders").setNumPartitions(1).setReplicationFactor(1.toShort)).iterator)))
+      .build()
+    val request = buildRequest(
+      createRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleCreateTopicsRequest(request)
+
+    val (forwarded, callback) = captureForwardedCreateTopics(request)
+    assertEquals(Set("acme.orders"), forwarded.data.topics.asScala.map(_.name).toSet,
+      "controller must see the physical topic name")
+
+    // Simulate the controller's response (physical name + topic id).
+    val topicId = Uuid.randomUuid()
+    val controllerResponse = new CreateTopicsResponse(new CreateTopicsResponseData()
+      .setTopics(new CreateTopicsResponseData.CreatableTopicResultCollection(
+        Collections.singleton(new CreateTopicsResponseData.CreatableTopicResult()
+          .setName("acme.orders").setTopicId(topicId).setErrorCode(Errors.NONE.code)).iterator)))
+    callback(Some(controllerResponse))
+
+    val response = verifyNoThrottling[CreateTopicsResponse](request)
+    assertEquals(1, response.data.topics.size)
+    val result = response.data.topics.asScala.head
+    assertEquals("orders", result.name, "client must see the logical topic name")
+    assertEquals(topicId, result.topicId, "topic id must be preserved through the rewrite")
+    assertEquals(Errors.NONE.code, result.errorCode)
+  }
+
+  @Test
+  def testCreateTopicsTenantResponseStripsPhysicalPrefixFromErrorResponses(): Unit = {
+    // Topic already exists at the physical layer; the controller returns
+    // TOPIC_ALREADY_EXISTS keyed on "acme.orders". The client must see the
+    // error against "orders" — the physical prefix must never leak.
+    val createRequest = new CreateTopicsRequest.Builder(new CreateTopicsRequestData()
+      .setTopics(new CreateTopicsRequestData.CreatableTopicCollection(
+        Collections.singleton(new CreateTopicsRequestData.CreatableTopic()
+          .setName("orders").setNumPartitions(1).setReplicationFactor(1.toShort)).iterator)))
+      .build()
+    val request = buildRequest(
+      createRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleCreateTopicsRequest(request)
+
+    val (_, callback) = captureForwardedCreateTopics(request)
+    val controllerResponse = new CreateTopicsResponse(new CreateTopicsResponseData()
+      .setTopics(new CreateTopicsResponseData.CreatableTopicResultCollection(
+        Collections.singleton(new CreateTopicsResponseData.CreatableTopicResult()
+          .setName("acme.orders")
+          .setErrorCode(Errors.TOPIC_ALREADY_EXISTS.code)
+          .setErrorMessage("Topic 'acme.orders' already exists.")).iterator)))
+    callback(Some(controllerResponse))
+
+    val response = verifyNoThrottling[CreateTopicsResponse](request)
+    val result = response.data.topics.asScala.head
+    assertEquals("orders", result.name, "error response must carry the logical name")
+    assertEquals(Errors.TOPIC_ALREADY_EXISTS.code, result.errorCode)
+  }
+
+  @Test
+  def testCreateTopicsPrivilegedCallerOnTenantBoundListenerIsRejected(): Unit = {
+    // Super-user without `__tenant_` prefix on a tenant-bound listener:
+    // refuse rather than rewrite the create into the tenant namespace
+    // (silent rewrite would let a privileged caller pollute the tenant).
+    val createRequest = new CreateTopicsRequest.Builder(new CreateTopicsRequestData()
+      .setTopics(new CreateTopicsRequestData.CreatableTopicCollection(
+        Collections.singleton(new CreateTopicsRequestData.CreatableTopic()
+          .setName("orders").setNumPartitions(1).setReplicationFactor(1.toShort)).iterator)))
+      .build()
+    val request = buildRequest(
+      createRequest,
+      listenerName = TENANT_LISTENER,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "Alice"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleCreateTopicsRequest(request)
+
+    val response = verifyNoThrottling[CreateTopicsResponse](request)
+    val result = response.data.topics.asScala.head
+    assertEquals("orders", result.name, "rejection response must carry the logical name")
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED.code, result.errorCode,
+      "privileged caller on tenant listener without tenant prefix must be refused")
+
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[AbstractRequest](), any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
+  def testCreateTopicsNonTenantRequestUnchangedWhenNoBinding(): Unit = {
+    // Single-tenant behaviour unchanged: no listener binding, no principal
+    // prefix, request forwarded verbatim via the original 2-arg path.
+    val createRequest = new CreateTopicsRequest.Builder(new CreateTopicsRequestData()
+      .setTopics(new CreateTopicsRequestData.CreatableTopicCollection(
+        Collections.singleton(new CreateTopicsRequestData.CreatableTopic()
+          .setName("plain-topic").setNumPartitions(1).setReplicationFactor(1.toShort)).iterator)))
+      .build()
+    val request = buildRequest(createRequest)
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleCreateTopicsRequest(request)
+
+    verify(forwardingManager).forwardRequest(
+      ArgumentMatchers.eq(request),
+      any[Option[AbstractResponse] => Unit]())
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[AbstractRequest](), any[Option[AbstractResponse] => Unit]())
+  }
+
+  // ---------------------------------------------------------------------------
+  // DeleteTopics — multi-tenancy
+  //
+  // The same shape as CreateTopics: rewrite request IN, forward, rewrite
+  // response OUT, refuse privileged-on-tenant-listener. v6+ supports delete
+  // by topic id; if the controller resolves the id to a foreign physical
+  // name we redact the response to UNKNOWN_TOPIC_ID rather than leaking it.
+  // ---------------------------------------------------------------------------
+
+  private def captureForwardedDeleteTopics(request: RequestChannel.Request)
+      : (DeleteTopicsRequest, Option[AbstractResponse] => Unit) = {
+    val bodyCaptor: ArgumentCaptor[AbstractRequest] = ArgumentCaptor.forClass(classOf[AbstractRequest])
+    val callbackCaptor: ArgumentCaptor[Option[AbstractResponse] => Unit] =
+      ArgumentCaptor.forClass(classOf[Option[AbstractResponse] => Unit])
+    verify(forwardingManager).forwardRequest(
+      ArgumentMatchers.eq(request),
+      bodyCaptor.capture(),
+      callbackCaptor.capture())
+    (bodyCaptor.getValue.asInstanceOf[DeleteTopicsRequest], callbackCaptor.getValue)
+  }
+
+  @Test
+  def testDeleteTopicsTenantRewritesLogicalNameToPhysicalBeforeForwarding(): Unit = {
+    // Tenant submits DeleteTopics for "orders"; controller must see "acme.orders"
+    // on the wire and the client must see "orders" on the way back.
+    val deleteRequest = new DeleteTopicsRequest.Builder(new DeleteTopicsRequestData()
+      .setTopics(util.Arrays.asList(new DeleteTopicsRequestData.DeleteTopicState().setName("orders")))
+      .setTimeoutMs(5000)).build()
+    val request = buildRequest(
+      deleteRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDeleteTopicsRequest(request)
+
+    val (forwarded, callback) = captureForwardedDeleteTopics(request)
+    assertEquals(Set("acme.orders"),
+      forwarded.data.topics.asScala.map(_.name).toSet,
+      "controller must see the physical topic name")
+
+    val topicId = Uuid.randomUuid()
+    val controllerResponse = new DeleteTopicsResponse(new DeleteTopicsResponseData()
+      .setResponses(new DeleteTopicsResponseData.DeletableTopicResultCollection(
+        Collections.singleton(new DeleteTopicsResponseData.DeletableTopicResult()
+          .setName("acme.orders").setTopicId(topicId).setErrorCode(Errors.NONE.code)).iterator)))
+    callback(Some(controllerResponse))
+
+    val response = verifyNoThrottling[DeleteTopicsResponse](request)
+    val result = response.data.responses.asScala.head
+    assertEquals("orders", result.name, "client must see the logical topic name")
+    assertEquals(topicId, result.topicId)
+    assertEquals(Errors.NONE.code, result.errorCode)
+  }
+
+  @Test
+  def testDeleteTopicsTenantResponseStripsPhysicalPrefixFromErrorResponses(): Unit = {
+    // Topic doesn't exist; controller returns UNKNOWN_TOPIC_OR_PARTITION
+    // keyed on "acme.orders". Client must see the error against "orders".
+    val deleteRequest = new DeleteTopicsRequest.Builder(new DeleteTopicsRequestData()
+      .setTopics(util.Arrays.asList(new DeleteTopicsRequestData.DeleteTopicState().setName("orders")))
+      .setTimeoutMs(5000)).build()
+    val request = buildRequest(
+      deleteRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDeleteTopicsRequest(request)
+
+    val (_, callback) = captureForwardedDeleteTopics(request)
+    val controllerResponse = new DeleteTopicsResponse(new DeleteTopicsResponseData()
+      .setResponses(new DeleteTopicsResponseData.DeletableTopicResultCollection(
+        Collections.singleton(new DeleteTopicsResponseData.DeletableTopicResult()
+          .setName("acme.orders").setErrorCode(Errors.UNKNOWN_TOPIC_OR_PARTITION.code)
+          .setErrorMessage("This server does not host this topic-partition.")).iterator)))
+    callback(Some(controllerResponse))
+
+    val response = verifyNoThrottling[DeleteTopicsResponse](request)
+    val result = response.data.responses.asScala.head
+    assertEquals("orders", result.name, "error response must carry the logical name")
+    assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION.code, result.errorCode)
+  }
+
+  @Test
+  def testDeleteTopicsTenantBoundaryViolationByIdReturnsUnknownTopicId(): Unit = {
+    // Tenant submits a delete-by-id whose id resolves to a foreign tenant's
+    // physical topic ("beta.orders"). The broker must redact the foreign name
+    // and surface UNKNOWN_TOPIC_ID rather than leak the physical prefix.
+    val foreignId = Uuid.randomUuid()
+    val deleteRequest = new DeleteTopicsRequest.Builder(new DeleteTopicsRequestData()
+      .setTopics(util.Arrays.asList(new DeleteTopicsRequestData.DeleteTopicState().setTopicId(foreignId)))
+      .setTimeoutMs(5000)).build()
+    val request = buildRequest(
+      deleteRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDeleteTopicsRequest(request)
+
+    val (forwarded, callback) = captureForwardedDeleteTopics(request)
+    val forwardedEntry = forwarded.data.topics.asScala.head
+    assertNull(forwardedEntry.name, "delete-by-id must not synthesize a name when none was provided")
+    assertEquals(foreignId, forwardedEntry.topicId)
+
+    // Simulate controller successfully resolving the id but to a foreign tenant's topic.
+    val controllerResponse = new DeleteTopicsResponse(new DeleteTopicsResponseData()
+      .setResponses(new DeleteTopicsResponseData.DeletableTopicResultCollection(
+        Collections.singleton(new DeleteTopicsResponseData.DeletableTopicResult()
+          .setName("beta.orders").setTopicId(foreignId).setErrorCode(Errors.NONE.code)).iterator)))
+    callback(Some(controllerResponse))
+
+    val response = verifyNoThrottling[DeleteTopicsResponse](request)
+    val result = response.data.responses.asScala.head
+    assertNull(result.name, "foreign tenant topic name must be redacted from the response")
+    assertEquals(foreignId, result.topicId)
+    assertEquals(Errors.UNKNOWN_TOPIC_ID.code, result.errorCode,
+      "cross-tenant delete-by-id must surface UNKNOWN_TOPIC_ID")
+  }
+
+  @Test
+  def testDeleteTopicsPrivilegedCallerOnTenantBoundListenerIsRejected(): Unit = {
+    val deleteRequest = new DeleteTopicsRequest.Builder(new DeleteTopicsRequestData()
+      .setTopics(util.Arrays.asList(new DeleteTopicsRequestData.DeleteTopicState().setName("orders")))
+      .setTimeoutMs(5000)).build()
+    val request = buildRequest(
+      deleteRequest,
+      listenerName = TENANT_LISTENER,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "Alice"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDeleteTopicsRequest(request)
+
+    val response = verifyNoThrottling[DeleteTopicsResponse](request)
+    val result = response.data.responses.asScala.head
+    assertEquals("orders", result.name, "rejection response must carry the logical name")
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED.code, result.errorCode,
+      "privileged caller on tenant listener without tenant prefix must be refused")
+
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[AbstractRequest](), any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
+  def testDeleteTopicsNonTenantRequestUnchangedWhenNoBinding(): Unit = {
+    val deleteRequest = new DeleteTopicsRequest.Builder(new DeleteTopicsRequestData()
+      .setTopics(util.Arrays.asList(new DeleteTopicsRequestData.DeleteTopicState().setName("plain-topic")))
+      .setTimeoutMs(5000)).build()
+    val request = buildRequest(deleteRequest)
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleDeleteTopicsRequest(request)
+
+    verify(forwardingManager).forwardRequest(
+      ArgumentMatchers.eq(request),
+      any[Option[AbstractResponse] => Unit]())
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[AbstractRequest](), any[Option[AbstractResponse] => Unit]())
+  }
 }
