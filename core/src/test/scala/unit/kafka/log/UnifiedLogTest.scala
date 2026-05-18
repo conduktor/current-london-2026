@@ -42,7 +42,7 @@ import org.apache.kafka.server.storage.log.{FetchIsolation, UnexpectedAppendOffs
 import org.apache.kafka.server.util.{KafkaScheduler, MockTime, Scheduler}
 import org.apache.kafka.storage.internals.checkpoint.{LeaderEpochCheckpointFile, PartitionMetadataFile}
 import org.apache.kafka.storage.internals.epoch.LeaderEpochFileCache
-import org.apache.kafka.storage.internals.log.{AbortedTxn, AppendOrigin, EpochEntry, LogConfig, LogFileUtils, LogOffsetMetadata, LogOffsetSnapshot, LogOffsetsListener, LogSegment, LogSegments, LogStartOffsetIncrementReason, OffsetResultHolder, OffsetsOutOfOrderException, ProducerStateManager, ProducerStateManagerConfig, RecordValidationException, VerificationGuard}
+import org.apache.kafka.storage.internals.log.{AbortedTxn, AppendOrigin, CompressionPolicy, EpochEntry, LogConfig, LogFileUtils, LogOffsetMetadata, LogOffsetSnapshot, LogOffsetsListener, LogSegment, LogSegments, LogStartOffsetIncrementReason, OffsetResultHolder, OffsetsOutOfOrderException, ProducerStateManager, ProducerStateManagerConfig, RecordValidationException, VerificationGuard}
 import org.apache.kafka.storage.internals.utils.Throttler
 import org.apache.kafka.storage.log.metrics.{BrokerTopicMetrics, BrokerTopicStats}
 import org.junit.jupiter.api.Assertions._
@@ -4749,6 +4749,64 @@ class UnifiedLogTest {
     assertTrue(exception.getMessage.contains("smaller than the last seen epoch"))
     assertTrue(exception.getMessage.contains(s"$originalEpoch"))
     assertTrue(exception.getMessage.contains(s"$bumpedEpoch"))
+  }
+
+  @Test
+  def testCompressionPolicyRequiredRejectsUncompressedClientAppend(): Unit = {
+    val logConfig = LogTestUtils.createLogConfig(compressionPolicy = CompressionPolicy.REQUIRED.name)
+    val log = createLog(logDir, logConfig)
+    val uncompressed = MemoryRecords.withRecords(Compression.NONE,
+      new SimpleRecord(mockTime.milliseconds, "k".getBytes, "v".getBytes))
+
+    val e = assertThrows(classOf[InvalidRecordException],
+      () => log.appendAsLeader(uncompressed, leaderEpoch = 0))
+    assertTrue(e.getMessage.contains("compression.policy"),
+      s"Error message should mention the violated config, was: ${e.getMessage}")
+    assertEquals(0L, log.logEndOffset, "Rejected batch must not be appended to the log")
+  }
+
+  @Test
+  def testCompressionPolicyRequiredAcceptsCompressedClientAppend(): Unit = {
+    val logConfig = LogTestUtils.createLogConfig(compressionPolicy = CompressionPolicy.REQUIRED.name)
+    val log = createLog(logDir, logConfig)
+    val compressed = MemoryRecords.withRecords(Compression.lz4().build(),
+      new SimpleRecord(mockTime.milliseconds, "k".getBytes, "v".getBytes),
+      new SimpleRecord(mockTime.milliseconds, "k2".getBytes, "v2".getBytes))
+
+    val info = log.appendAsLeader(compressed, leaderEpoch = 0)
+    assertEquals(0L, info.firstOffset)
+    assertEquals(1L, info.lastOffset)
+    assertEquals(2L, log.logEndOffset)
+  }
+
+  @Test
+  def testCompressionPolicyDefaultAcceptsUncompressedClientAppend(): Unit = {
+    // Default policy is NONE — behaviour must be identical to vanilla Kafka.
+    val logConfig = LogTestUtils.createLogConfig()
+    val log = createLog(logDir, logConfig)
+    val uncompressed = MemoryRecords.withRecords(Compression.NONE,
+      new SimpleRecord(mockTime.milliseconds, "k".getBytes, "v".getBytes))
+
+    val info = log.appendAsLeader(uncompressed, leaderEpoch = 0)
+    assertEquals(0L, info.firstOffset)
+    assertEquals(1L, log.logEndOffset)
+  }
+
+  @Test
+  def testCompressionPolicyRequiredDoesNotAffectFollowerAppend(): Unit = {
+    // Replication must keep working: a follower receives whatever the leader stored,
+    // including NONE-compressed batches written before the policy was set.
+    val logConfig = LogTestUtils.createLogConfig(compressionPolicy = CompressionPolicy.REQUIRED.name)
+    val log = createLog(logDir, logConfig)
+    val partitionLeaderEpoch = 0
+    val records = TestUtils.records(
+      List(new SimpleRecord(mockTime.milliseconds, "k".getBytes, "v".getBytes)),
+      baseOffset = 0L,
+      partitionLeaderEpoch = partitionLeaderEpoch)
+
+    val info = log.appendAsFollower(records, partitionLeaderEpoch)
+    assertEquals(0L, info.firstOffset)
+    assertEquals(1L, log.logEndOffset)
   }
 
   private def appendTransactionalToBuffer(buffer: ByteBuffer,
