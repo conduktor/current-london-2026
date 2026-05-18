@@ -76,9 +76,27 @@ A single new topic-level config is added. There are **no** new broker configs,
 | Dynamic | yes (settable via `incrementalAlterConfigs`) |
 | Doc | "Server-side policy for the compression of producer batches. `none` (default) preserves vanilla behaviour. `required` rejects produce requests whose batches carry `compression.type=none` with INVALID_RECORD on a per-partition basis. Enforced in the produce request handler, so replication, transaction-state, and group-coordinator appends bypass the check by construction." |
 
-This config is exposed under the same name on the public `TopicConfig`
-Java surface (`org.apache.kafka.common.config.TopicConfig`) as
-`COMPRESSION_POLICY_CONFIG`, matching every other dynamic topic config.
+The config key is the bare string `"compression.policy"` — the same string an
+operator passes to `kafka-configs.sh --add-config` or a programmatic client
+passes to `NewTopic.configs(Map.of("compression.policy", "required"))`. The
+public Java constant `COMPRESSION_POLICY_CONFIG` lives in
+`org.apache.kafka.storage.internals.log.LogConfig` (server-side, storage
+module).
+
+This MVP deliberately does **not** mirror the constant onto the public
+`org.apache.kafka.common.config.TopicConfig` surface, even though every
+other dynamic topic config (`cleanup.policy`, `compression.type`,
+`remote.storage.enable`, …) is exposed there. That mirroring requires
+modifying `clients/`, which this KIP's non-goals forbid (see Non-goals
+above). The operational consequence is that programmatic clients that want a
+compile-time-checked constant must reference `LogConfig.COMPRESSION_POLICY_CONFIG`
+(which pulls in the `storage` module) instead of `TopicConfig.COMPRESSION_POLICY_CONFIG`.
+For the string-based admin tooling path (`kafka-configs.sh`, AdminClient
+`NewTopic.configs(...)`, AlterConfig with `ConfigEntry(name, value)`) this is
+a no-op — no constant is required. Adding a one-line
+`TopicConfig.COMPRESSION_POLICY_CONFIG = "compression.policy"` once the
+non-goal is lifted is listed in Future Work as a strictly additive,
+backwards-compatible change.
 
 ### Error code
 
@@ -339,6 +357,12 @@ Coverage gaps deliberately left for future work, not blockers for the MVP:
 
 Strictly orthogonal extensions, each of which would be its own KIP:
 
+0. **Mirror the constant onto `TopicConfig`.** Add
+   `public static final String COMPRESSION_POLICY_CONFIG = "compression.policy"`
+   plus its `_DOC` companion to `org.apache.kafka.common.config.TopicConfig`,
+   matching the convention every other dynamic topic config follows. The MVP
+   omits this only because the spec forbids `clients/` modifications; the
+   change itself is a one-line additive constant with no behavioural impact.
 1. **Codec allow-list** (`compression.policy=gzip,zstd`). Use the same
    `LogConfigDef` validator with a parsed list; have `CompressionPolicy`
    resolve at config-load time into a `Set<CompressionType>`. The
