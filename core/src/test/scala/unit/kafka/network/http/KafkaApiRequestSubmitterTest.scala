@@ -219,6 +219,56 @@ class KafkaApiRequestSubmitterTest {
   }
 
   @Test
+  def translateFetchPreservesNullRecordValues(): Unit = {
+    // Compacted-topic tombstones and HTTP-produced {"type":"NULL"} records reach the bridge as Kafka records with
+    // record.hasValue() == false. The translation MUST surface those as Java null (not Array.emptyByteArray) so the
+    // downstream ValueSerializer emits {"type":"NULL"} instead of misclassifying as {"type":"STRING","data":""}.
+    val submitter = newSubmitter()
+    val records = MemoryRecords.withRecords(Compression.NONE,
+      new SimpleRecord(1700_000_000L, "k".getBytes, null: Array[Byte]))
+
+    val partitionData = new FetchPartitionData()
+      .setPartitionIndex(0)
+      .setHighWatermark(1L)
+      .setLogStartOffset(0L)
+      .setRecords(records)
+    val topicResp = new FetchableTopicResponse().setTopicId(topicId)
+      .setPartitions(util.List.of(partitionData))
+    val response = new FetchResponse(new FetchResponseData().setResponses(util.List.of(topicResp)))
+
+    val cmd = new FetchRequestParser.FetchCommand(topic, 0, 0L, OptionalInt.empty())
+    val result = submitter.translateFetch(response, cmd)
+
+    assertEquals(1, result.partition().records().size())
+    val record = result.partition().records().get(0)
+    assertNull(record.value(),
+      "null Kafka record values must surface as Java null so ValueSerializer can emit {type:NULL}; " +
+        "Array.emptyByteArray would collapse to {type:STRING,data:''} and lose the tombstone signal")
+  }
+
+  @Test
+  def translateFetchTreatsThrottledEmptyResponseAsSuccessfulEmptyPage(): Unit = {
+    // KafkaApis.handleFetchRequest returns an empty FetchResponse (no partition data) with throttleTimeMs > 0 when the
+    // consumer's fetch quota is exceeded. The bridge MUST NOT fabricate UNKNOWN_TOPIC_OR_PARTITION here — that collapses
+    // to HTTP 404 and drops Retry-After per PROMPT.md AC3. Surface as an empty NONE page so the formatter emits
+    // 200 + Retry-After.
+    val submitter = newSubmitter()
+    val response = new FetchResponse(new FetchResponseData()
+      .setThrottleTimeMs(750))
+
+    val cmd = new FetchRequestParser.FetchCommand(topic, 0, 42L, OptionalInt.empty())
+    val result = submitter.translateFetch(response, cmd)
+
+    assertEquals(Errors.NONE, result.partition().error(),
+      "throttled empty fetch must not be reported as UNKNOWN_TOPIC_OR_PARTITION (would drop Retry-After on 404)")
+    assertEquals(0, result.partition().records().size())
+    assertEquals(42L, result.partition().requestedOffset(),
+      "requested offset must round-trip so the formatter's _links cursors remain accurate")
+    assertEquals(750L, result.throttleTimeMs(),
+      "throttle hint must flow through so the formatter can emit Retry-After")
+  }
+
+  @Test
   def translateFetchSurfacesPartitionErrors(): Unit = {
     val submitter = newSubmitter()
 

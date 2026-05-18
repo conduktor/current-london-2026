@@ -204,10 +204,18 @@ class KafkaApiRequestSubmitter(
   }
 
   private[http] def translateFetch(response: FetchResponse, command: FetchCommand): FetchResult = {
+    val throttleTimeMs = response.data().throttleTimeMs()
     val partitionDataOpt = response.data().responses().asScala.flatMap(_.partitions().asScala)
       .find(_.partitionIndex() == command.partition())
 
     val partitionFetch = partitionDataOpt match {
+      case None if throttleTimeMs > 0 =>
+        // Consumer fetch quota throttle: KafkaApis returns an empty response with throttleTimeMs > 0 and no partition
+        // data (see KafkaApis.handleFetchRequest → fetchContext.getThrottledResponse). The throttle is not a fetch
+        // error; surface it as an empty successful page so the formatter emits 200 + Retry-After per PROMPT.md AC3
+        // instead of fabricating UNKNOWN_TOPIC_OR_PARTITION (which collapses to 404 and drops Retry-After).
+        new PartitionFetch(command.partition(), Errors.NONE, null,
+          command.offset(), 0L, 0L, util.List.of[FetchedRecord]())
       case None =>
         new PartitionFetch(command.partition(), Errors.UNKNOWN_TOPIC_OR_PARTITION,
           "Broker returned no partition data for the requested partition",
@@ -230,7 +238,7 @@ class KafkaApiRequestSubmitter(
             records)
         }
     }
-    new FetchResult(partitionFetch, response.data().throttleTimeMs().toLong)
+    new FetchResult(partitionFetch, throttleTimeMs.toLong)
   }
 
   private def extractRecords(partition: FetchResponseData.PartitionData): util.List[FetchedRecord] = {
@@ -246,7 +254,10 @@ class KafkaApiRequestSubmitter(
           val offset = record.offset()
           val timestamp = record.timestamp()
           val key: Array[Byte] = if (record.hasKey) bytesOf(record.key()) else null
-          val value: Array[Byte] = if (record.hasValue) bytesOf(record.value()) else Array.emptyByteArray
+          // Preserve null-value semantics for compacted-topic tombstones and HTTP-produced {"type":"NULL"} records.
+          // Returning Array.emptyByteArray here would let ValueSerializer.encode emit {"type":"STRING","data":""} —
+          // an incorrect downgrade that loses the tombstone signal. Match the key handling on the line above.
+          val value: Array[Byte] = if (record.hasValue) bytesOf(record.value()) else null
           val contentType: String = record.headers().toSeq.find(_.key() == "content-type") match {
             case Some(h) if h.value() != null => new String(h.value(), StandardCharsets.UTF_8)
             case _ => null
