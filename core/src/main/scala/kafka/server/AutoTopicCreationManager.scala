@@ -135,6 +135,12 @@ class DefaultAutoTopicCreationManager(
         createTopicsRequest.build(requestVersion).serializeWithHeader(requestHeader))
     }.getOrElse(createTopicsRequest)
 
+    // CEL rule-engine bypass: this dispatch reaches the active controller via
+    // NodeToControllerChannelManager and is handled by ControllerApis — it does
+    // NOT traverse the broker's KafkaApis.handle() and is therefore outside
+    // the scope of broker-side DENY rules targeting CREATE_TOPICS. Operators
+    // who need CREATE_TOPICS rules to bind universally must set
+    // auto.create.topics.enable=false (see PROMPT.md MVP step #3, path (b)).
     channelManager.sendRequest(request, requestCompletionHandler)
 
     val creatableTopicResponses = creatableTopics.keySet.toSeq.map { topic =>
