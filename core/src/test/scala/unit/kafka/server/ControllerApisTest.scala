@@ -1639,6 +1639,179 @@ class ControllerApisTest {
       any(classOf[AlterUserScramCredentialsRequestData]))
   }
 
+  // ---------------------------------------------------------------------------
+  // Envelope re-dispatch tenant trust boundary (#110)
+  //
+  // EnvelopeUtils.handleEnvelopeRequest deserialises the inner forwardedPrincipal
+  // via KafkaPrincipalSerde without any signature/MAC check. In a default KRaft
+  // deployment every broker holds CLUSTER_ACTION via super.users — so without
+  // a guard at the envelope layer, any broker could forge a `__tenant_<id>.<u>`
+  // principal in an envelope, re-dispatch it into the controller, and reach
+  // handlers that grant tenant capability (mint delegation token, alter SCRAM,
+  // attach quotas …) — fully bypassing every controller-side tenant guard.
+  //
+  // The fix mirrors the broker's TENANT_ALLOWED_APIS dispatch gate onto the
+  // envelope path: a forwarded tenant-namespaced principal is only allowed to
+  // re-enter for APIs the tenant dispatch boundary would itself admit.
+  // ---------------------------------------------------------------------------
+
+  private val envelopePrincipalSerde = new org.apache.kafka.common.security.auth.KafkaPrincipalSerde {
+    override def serialize(principal: KafkaPrincipal): Array[Byte] =
+      org.apache.kafka.common.utils.Utils.utf8(principal.toString)
+    override def deserialize(bytes: Array[Byte]): KafkaPrincipal =
+      org.apache.kafka.common.utils.SecurityUtils.parseKafkaPrincipal(
+        org.apache.kafka.common.utils.Utils.utf8(bytes))
+  }
+
+  private def captureEnvelopeResponse(request: RequestChannel.Request): EnvelopeResponse = {
+    val captor: ArgumentCaptor[AbstractResponse] = ArgumentCaptor.forClass(classOf[AbstractResponse])
+    verify(requestChannel).sendResponse(
+      ArgumentMatchers.eq(request),
+      captor.capture(),
+      any())
+    captor.getValue.asInstanceOf[EnvelopeResponse]
+  }
+
+  @Test
+  def testEnvelopeRefusesForgedTenantPrincipalOnCreateDelegationToken(): Unit = {
+    val tokenRequest = new CreateDelegationTokenRequest.Builder(
+      new CreateDelegationTokenRequestData()
+        .setOwnerPrincipalType(KafkaPrincipal.USER_TYPE)
+        .setOwnerPrincipalName("victim")).build()
+    val forged = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_acme.alice")
+    val envelopeRequest = kafka.utils.TestUtils.buildEnvelopeRequest(
+      tokenRequest, envelopePrincipalSerde, requestChannelMetrics, time.nanoseconds(),
+      forwardedPrincipal = forged,
+      outerPrincipal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = new MockController.Builder().build(),
+      tenantConfig = tenantConfigBinding("acme", "CONTROLLER"))
+    controllerApis.handle(envelopeRequest, RequestLocal.noCaching())
+
+    val response = captureEnvelopeResponse(envelopeRequest)
+    assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED, response.error,
+      "envelope gate must refuse forged tenant principal for CREATE_DELEGATION_TOKEN")
+  }
+
+  @Test
+  def testEnvelopeRefusesForgedTenantPrincipalOnAlterUserScramCredentials(): Unit = {
+    val upsertions = new util.ArrayList[AlterUserScramCredentialsRequestData.ScramCredentialUpsertion]()
+    upsertions.add(new AlterUserScramCredentialsRequestData.ScramCredentialUpsertion()
+      .setName("victim")
+      .setMechanism(1.toByte)
+      .setIterations(8192)
+      .setSalt(Array.emptyByteArray)
+      .setSaltedPassword(Array.emptyByteArray))
+    val alterRequest = new AlterUserScramCredentialsRequest.Builder(
+      new AlterUserScramCredentialsRequestData().setUpsertions(upsertions)).build()
+    val forged = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_acme.alice")
+    val envelopeRequest = kafka.utils.TestUtils.buildEnvelopeRequest(
+      alterRequest, envelopePrincipalSerde, requestChannelMetrics, time.nanoseconds(),
+      forwardedPrincipal = forged,
+      outerPrincipal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = new MockController.Builder().build(),
+      tenantConfig = tenantConfigBinding("acme", "CONTROLLER"))
+    controllerApis.handle(envelopeRequest, RequestLocal.noCaching())
+
+    val response = captureEnvelopeResponse(envelopeRequest)
+    assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED, response.error,
+      "envelope gate must refuse forged tenant principal for ALTER_USER_SCRAM_CREDENTIALS")
+  }
+
+  @Test
+  def testEnvelopeRefusesForgedTenantPrincipalOnAlterClientQuotas(): Unit = {
+    val quotaRequest = new AlterClientQuotasRequest(
+      new AlterClientQuotasRequestData()
+        .setEntries(new util.ArrayList[AlterClientQuotasRequestData.EntryData]())
+        .setValidateOnly(false),
+      0.toShort)
+    val forged = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_acme.alice")
+    val envelopeRequest = kafka.utils.TestUtils.buildEnvelopeRequest(
+      quotaRequest, envelopePrincipalSerde, requestChannelMetrics, time.nanoseconds(),
+      forwardedPrincipal = forged,
+      outerPrincipal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = new MockController.Builder().build(),
+      tenantConfig = tenantConfigBinding("acme", "CONTROLLER"))
+    controllerApis.handle(envelopeRequest, RequestLocal.noCaching())
+
+    val response = captureEnvelopeResponse(envelopeRequest)
+    assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED, response.error,
+      "envelope gate must refuse forged tenant principal for ALTER_CLIENT_QUOTAS")
+  }
+
+  @Test
+  def testEnvelopeRefusesEmptyTenantIdForgedPrincipal(): Unit = {
+    // `__tenant_.alice` matches the PRINCIPAL_PREFIX startsWith — the gate
+    // must not require a well-formed tenant id; it must refuse on prefix
+    // alone. parseTenantId may treat this as malformed elsewhere, but the
+    // envelope gate cannot rely on that.
+    val tokenRequest = new CreateDelegationTokenRequest.Builder(
+      new CreateDelegationTokenRequestData()
+        .setOwnerPrincipalType(KafkaPrincipal.USER_TYPE)
+        .setOwnerPrincipalName("victim")).build()
+    val forged = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_.alice")
+    val envelopeRequest = kafka.utils.TestUtils.buildEnvelopeRequest(
+      tokenRequest, envelopePrincipalSerde, requestChannelMetrics, time.nanoseconds(),
+      forwardedPrincipal = forged,
+      outerPrincipal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = new MockController.Builder().build(),
+      tenantConfig = tenantConfigBinding("acme", "CONTROLLER"))
+    controllerApis.handle(envelopeRequest, RequestLocal.noCaching())
+
+    val response = captureEnvelopeResponse(envelopeRequest)
+    assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED, response.error,
+      "envelope gate must refuse `__tenant_.<u>` (empty tenant id) for non-tenant-allowed API")
+  }
+
+  @Test
+  def testEnvelopeAllowsTenantPrincipalOnCreateTopics(): Unit = {
+    // Legitimate forwarded tenant flow: a broker receives CreateTopics from a
+    // tenant client, envelopes it to the controller with the (authentic)
+    // tenant principal as forwardedPrincipal. CREATE_TOPICS is in
+    // TENANT_ALLOWED_APIS — the gate must let this through and the controller
+    // must perform the create. Load-bearing must-not-regress case: prove the
+    // gate is scoped to non-tenant-allowed APIs and does not refuse the only
+    // controller-routed legitimate tenant flow.
+    val topics = new CreatableTopicCollection()
+    topics.add(new CreatableTopic().setName("__tenant_acme.foo").setNumPartitions(1).setReplicationFactor(1.toShort))
+    val createTopicsRequest = new CreateTopicsRequest.Builder(
+      new CreateTopicsRequestData().setTopics(topics)).build()
+    val tenantPrincipal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_acme.alice")
+    val envelopeRequest = kafka.utils.TestUtils.buildEnvelopeRequest(
+      createTopicsRequest, envelopePrincipalSerde, requestChannelMetrics, time.nanoseconds(),
+      forwardedPrincipal = tenantPrincipal,
+      outerPrincipal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    val controller = mock(classOf[Controller])
+    when(controller.createTopics(
+      any(classOf[ControllerRequestContext]),
+      any(classOf[CreateTopicsRequestData]),
+      any(classOf[java.util.Set[String]])))
+      .thenReturn(CompletableFuture.completedFuture(new CreateTopicsResponseData()))
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = tenantConfigBinding("acme", "CONTROLLER"))
+    controllerApis.handle(envelopeRequest, RequestLocal.noCaching())
+
+    // The gate did NOT refuse — the forwarded request reached the controller.
+    verify(controller).createTopics(
+      any(classOf[ControllerRequestContext]),
+      any(classOf[CreateTopicsRequestData]),
+      any(classOf[java.util.Set[String]]))
+  }
+
   @AfterEach
   def tearDown(): Unit = {
     quotasNeverThrottleControllerMutations.shutdown()

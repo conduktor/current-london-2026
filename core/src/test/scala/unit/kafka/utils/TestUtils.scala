@@ -1469,7 +1469,9 @@ object TestUtils extends Logging {
     requestChannelMetrics: RequestChannelMetrics,
     startTimeNanos: Long,
     dequeueTimeNanos: Long = -1,
-    fromPrivilegedListener: Boolean = true
+    fromPrivilegedListener: Boolean = true,
+    forwardedPrincipal: KafkaPrincipal = KafkaPrincipal.ANONYMOUS,
+    outerPrincipal: KafkaPrincipal = KafkaPrincipal.ANONYMOUS
   ): RequestChannel.Request = {
     val clientId = "id"
     val listenerName = ListenerName.forSecurityProtocol(SecurityProtocol.PLAINTEXT)
@@ -1480,14 +1482,14 @@ object TestUtils extends Logging {
     val envelopeHeader = new RequestHeader(ApiKeys.ENVELOPE, ApiKeys.ENVELOPE.latestVersion(), clientId, 0)
     val envelopeBuffer = new EnvelopeRequest.Builder(
       requestBuffer,
-      principalSerde.serialize(KafkaPrincipal.ANONYMOUS),
+      principalSerde.serialize(forwardedPrincipal),
       InetAddress.getLocalHost.getAddress
     ).build().serializeWithHeader(envelopeHeader)
 
     RequestHeader.parse(envelopeBuffer)
 
     val envelopeContext = new RequestContext(envelopeHeader, "1", InetAddress.getLocalHost, Optional.empty(),
-      KafkaPrincipal.ANONYMOUS, listenerName, SecurityProtocol.PLAINTEXT, ClientInformation.EMPTY,
+      outerPrincipal, listenerName, SecurityProtocol.PLAINTEXT, ClientInformation.EMPTY,
       fromPrivilegedListener, Optional.of(principalSerde))
 
     val envelopRequest = new RequestChannel.Request(

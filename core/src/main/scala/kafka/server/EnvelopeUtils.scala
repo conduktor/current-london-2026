@@ -20,11 +20,12 @@ package kafka.server
 import java.net.{InetAddress, UnknownHostException}
 import java.nio.ByteBuffer
 import kafka.network.RequestChannel
-import org.apache.kafka.common.errors.{InvalidRequestException, PrincipalDeserializationException, UnsupportedVersionException}
+import org.apache.kafka.common.errors.{ClusterAuthorizationException, InvalidRequestException, PrincipalDeserializationException, UnsupportedVersionException}
 import org.apache.kafka.common.network.ClientInformation
 import org.apache.kafka.common.requests.{EnvelopeRequest, RequestContext, RequestHeader}
 import org.apache.kafka.common.security.auth.KafkaPrincipal
 import org.apache.kafka.network.metrics.RequestChannelMetrics
+import org.apache.kafka.server.tenant.TenantNamespace
 
 import scala.jdk.OptionConverters.RichOptional
 
@@ -45,6 +46,22 @@ object EnvelopeUtils {
     val forwardedApi = forwardedRequestHeader.apiKey
     if (!forwardedApi.forwardable) {
       throw new InvalidRequestException(s"API $forwardedApi is not enabled or is not eligible for forwarding")
+    }
+
+    // Tenant trust boundary on the envelope re-dispatch path. The outer CLUSTER_ACTION
+    // check on the controller envelope handler does not authenticate the inner
+    // forwardedPrincipal — KafkaPrincipalSerde.deserialize has no signature/MAC.
+    // In a default KRaft deployment every broker holds CLUSTER_ACTION via super.users,
+    // so any broker could otherwise forge `__tenant_<id>.<user>` as the forwarded
+    // identity and re-dispatch into any controller handler — bypassing both the
+    // broker-side TENANT_ALLOWED_APIS dispatch gate and every controller-side
+    // tenant-namespace guard (mint delegation token, alter SCRAM credentials, …).
+    // Refuse forwarded tenant identities for APIs outside the tenant-allowed surface.
+    if (forwardedPrincipal.getName.startsWith(TenantNamespace.PRINCIPAL_PREFIX)
+        && !KafkaApis.TENANT_ALLOWED_APIS.contains(forwardedApi)) {
+      throw new ClusterAuthorizationException(
+        s"Envelope carries tenant-namespaced principal ${forwardedPrincipal.getName} " +
+          s"for API $forwardedApi outside the tenant-allowed surface")
     }
 
     val forwardedContext = new RequestContext(
