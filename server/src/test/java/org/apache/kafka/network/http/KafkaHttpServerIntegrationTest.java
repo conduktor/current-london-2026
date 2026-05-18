@@ -1293,6 +1293,165 @@ class KafkaHttpServerIntegrationTest {
             mbean.toString());
     }
 
+    @Test
+    void gracefulShutdownLetsInFlightSseStreamSettleBeforeForceClose() throws Exception {
+        // PROMPT.md production-readiness regression: server.stop() with shutdownGraceMs=0 forcibly closes
+        // every open connector socket, so SSE/WS clients see a TCP reset mid-stream instead of a clean FIN.
+        // With shutdownGraceMs > 0 Jetty's Server.doStop calls Graceful.shutdown on the connectors and
+        // ServletContextHandler — connectors stop accepting new connections, in-flight requests get up to
+        // shutdownGraceMs to drain, and only then are sockets closed. We pin this by:
+        //   1. starting a server configured with a 1500ms grace,
+        //   2. opening a real SSE stream that long-polls forever,
+        //   3. calling stop() on the test thread and timing how long it takes,
+        //   4. confirming the close happened within the grace window (so the connector did get to close
+        //      cleanly) but did NOT return instantly (so the grace path was actually exercised).
+        tearDown();
+        ControllableSubmitter localSubmitter = new ControllableSubmitter();
+        KafkaHttpServer gracefulServer = new KafkaHttpServer("127.0.0.1", 0,
+            new KafkaHttpBridge(mapper, localSubmitter), localSubmitter, mapper,
+            DEFAULT_TEST_MAX_BODY_BYTES, DEFAULT_TEST_MAX_SSE_STREAMS, DEFAULT_TEST_MAX_WS_SUBSCRIPTIONS,
+            1500L);
+        try {
+            gracefulServer.start();
+            HttpClient localClient = new HttpClient();
+            localClient.start();
+            try {
+                // First fetch yields one record; subsequent fetches block (never-completing future). That
+                // keeps the SSE stream in the long-poll across the entire grace window, which is the case
+                // we care about: a stream that has nothing to do on its own when shutdown begins.
+                ConcurrentLinkedQueue<RequestSubmitter.FetchResult> queue = new ConcurrentLinkedQueue<>();
+                queue.add(new RequestSubmitter.FetchResult(
+                    new FetchResponseFormatter.PartitionFetch(
+                        0, Errors.NONE, null, 0, 0, 1,
+                        List.of(new FetchResponseFormatter.FetchedRecord(
+                            0, null, "x".getBytes(StandardCharsets.UTF_8), null, 1L))),
+                    0L));
+                localSubmitter.fetchResultQueue = queue;
+
+                InputStreamResponseListener listener = new InputStreamResponseListener();
+                String streamUrl = "http://127.0.0.1:" + gracefulServer.boundPort()
+                    + "/v1/topics/orders/records?partition=0&from=earliest";
+                localClient.newRequest(streamUrl)
+                    .method(HttpMethod.GET)
+                    .headers(h -> h.put("Accept", "text/event-stream"))
+                    .send(listener);
+                Response response = listener.get(5, TimeUnit.SECONDS);
+                assertEquals(200, response.getStatus());
+
+                // Drain past the first data event so we know the streamer is firmly in its long-poll loop
+                // before we trigger shutdown — otherwise the test races initial setup against stop().
+                try (InputStream body = listener.getInputStream();
+                     BufferedReader reader = new BufferedReader(new InputStreamReader(body, StandardCharsets.UTF_8))) {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        if (line.startsWith("data: ")) {
+                            break;
+                        }
+                    }
+
+                    long start = System.nanoTime();
+                    gracefulServer.stop();
+                    long elapsedMs = (System.nanoTime() - start) / 1_000_000L;
+                    // The Graceful.shutdown future for a still-pending async request only completes when
+                    // the grace timeout itself elapses, so stop() must block at least ~1.5s. Allow a small
+                    // floor (1000ms) to absorb timing jitter on slow CI hardware. The ceiling (4000ms)
+                    // catches the legacy zero-grace bug — that took <200ms in practice. An unconditional
+                    // 30s servlet timeout would also bust this ceiling.
+                    assertTrue(elapsedMs >= 1000L,
+                        "graceful stop should have waited at least ~1s for in-flight SSE stream; got " + elapsedMs + "ms");
+                    assertTrue(elapsedMs <= 4000L,
+                        "graceful stop should not exceed ~4x the configured 1500ms grace; got " + elapsedMs + "ms");
+                }
+            } finally {
+                localClient.stop();
+            }
+        } finally {
+            // Idempotent: if the assertions above blew up before the explicit stop, this still cleans up.
+            try {
+                gracefulServer.stop();
+            } catch (Exception ignored) {
+                // already stopped
+            }
+            // Restore the @BeforeEach state for the next test in the class.
+            startServer(DEFAULT_TEST_MAX_BODY_BYTES, DEFAULT_TEST_MAX_SSE_STREAMS, DEFAULT_TEST_MAX_WS_SUBSCRIPTIONS);
+        }
+    }
+
+    @Test
+    void zeroGraceStopsImmediatelyForLegacyTestHarness() throws Exception {
+        // Counterpart to gracefulShutdownLetsInFlightSseStreamSettleBeforeForceClose: confirm that the
+        // 8-arg legacy constructor still produces a server that tears down without waiting, so the
+        // existing test harness's @AfterEach stop() does not slow the suite to a crawl. Same setup —
+        // SSE stream stuck in long-poll — but the grace must be 0 (the legacy default), and stop must
+        // return within a small bounded window.
+        tearDown();
+        ControllableSubmitter localSubmitter = new ControllableSubmitter();
+        KafkaHttpServer immediateStop = new KafkaHttpServer("127.0.0.1", 0,
+            new KafkaHttpBridge(mapper, localSubmitter), localSubmitter, mapper,
+            DEFAULT_TEST_MAX_BODY_BYTES, DEFAULT_TEST_MAX_SSE_STREAMS, DEFAULT_TEST_MAX_WS_SUBSCRIPTIONS);
+        try {
+            immediateStop.start();
+            HttpClient localClient = new HttpClient();
+            localClient.start();
+            try {
+                ConcurrentLinkedQueue<RequestSubmitter.FetchResult> queue = new ConcurrentLinkedQueue<>();
+                queue.add(new RequestSubmitter.FetchResult(
+                    new FetchResponseFormatter.PartitionFetch(
+                        0, Errors.NONE, null, 0, 0, 1,
+                        List.of(new FetchResponseFormatter.FetchedRecord(
+                            0, null, "x".getBytes(StandardCharsets.UTF_8), null, 1L))),
+                    0L));
+                localSubmitter.fetchResultQueue = queue;
+
+                InputStreamResponseListener listener = new InputStreamResponseListener();
+                String streamUrl = "http://127.0.0.1:" + immediateStop.boundPort()
+                    + "/v1/topics/orders/records?partition=0&from=earliest";
+                localClient.newRequest(streamUrl)
+                    .method(HttpMethod.GET)
+                    .headers(h -> h.put("Accept", "text/event-stream"))
+                    .send(listener);
+                Response response = listener.get(5, TimeUnit.SECONDS);
+                assertEquals(200, response.getStatus());
+
+                try (InputStream body = listener.getInputStream();
+                     BufferedReader reader = new BufferedReader(new InputStreamReader(body, StandardCharsets.UTF_8))) {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        if (line.startsWith("data: ")) {
+                            break;
+                        }
+                    }
+                    long start = System.nanoTime();
+                    immediateStop.stop();
+                    long elapsedMs = (System.nanoTime() - start) / 1_000_000L;
+                    assertTrue(elapsedMs < 1000L,
+                        "legacy zero-grace stop must return promptly even with in-flight SSE; got " + elapsedMs + "ms");
+                }
+            } finally {
+                localClient.stop();
+            }
+        } finally {
+            try {
+                immediateStop.stop();
+            } catch (Exception ignored) {
+                // already stopped
+            }
+            startServer(DEFAULT_TEST_MAX_BODY_BYTES, DEFAULT_TEST_MAX_SSE_STREAMS, DEFAULT_TEST_MAX_WS_SUBSCRIPTIONS);
+        }
+    }
+
+    @Test
+    void constructorRejectsNegativeShutdownGrace() {
+        IllegalArgumentException ex = org.junit.jupiter.api.Assertions.assertThrows(
+            IllegalArgumentException.class,
+            () -> new KafkaHttpServer("127.0.0.1", 0,
+                new KafkaHttpBridge(mapper, submitter), submitter, mapper,
+                DEFAULT_TEST_MAX_BODY_BYTES, DEFAULT_TEST_MAX_SSE_STREAMS, DEFAULT_TEST_MAX_WS_SUBSCRIPTIONS,
+                -1L));
+        assertTrue(ex.getMessage().contains("shutdownGraceMs"),
+            "error message must name the offending parameter: " + ex.getMessage());
+    }
+
     // ----- extractTopic unit -----
 
     @Test

@@ -30,6 +30,7 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.Objects;
+import java.util.concurrent.TimeoutException;
 
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
@@ -75,13 +76,30 @@ public final class KafkaHttpServer {
     private final SseStreamLimiter sseLimiter;
     private final WsStreamLimiter wsLimiter;
     private final HttpBridgeMetrics metrics;
+    // Jetty stop timeout. >0 enables Graceful.shutdown — connectors stop accepting new connections, in-flight
+    // requests get this long to drain, and only then are sockets forcibly closed. With 0 (the legacy behaviour
+    // and the test-harness default) stop() returns near-instantly and SSE/WS clients see a TCP reset mid-stream
+    // instead of an orderly close. Production wiring (BrokerServer) passes the configured value.
+    private final long shutdownGraceMs;
 
     private Server server;
     private int boundPort = -1;
 
+    /**
+     * Legacy 8-arg constructor preserved for tests that explicitly want a fast, ungraceful teardown
+     * (no in-flight drain). New production call sites should pass {@code shutdownGraceMs} via the
+     * 9-arg overload below.
+     */
     public KafkaHttpServer(String host, int port, KafkaHttpBridge bridge, RequestSubmitter submitter,
                            ObjectMapper mapper, int maxRequestBodyBytes, int maxConcurrentSseStreams,
                            int maxConcurrentWsSubscriptions) {
+        this(host, port, bridge, submitter, mapper, maxRequestBodyBytes,
+            maxConcurrentSseStreams, maxConcurrentWsSubscriptions, 0L);
+    }
+
+    public KafkaHttpServer(String host, int port, KafkaHttpBridge bridge, RequestSubmitter submitter,
+                           ObjectMapper mapper, int maxRequestBodyBytes, int maxConcurrentSseStreams,
+                           int maxConcurrentWsSubscriptions, long shutdownGraceMs) {
         this.host = Objects.requireNonNull(host, "host must not be null");
         this.port = port;
         this.bridge = Objects.requireNonNull(bridge, "bridge must not be null");
@@ -90,7 +108,11 @@ public final class KafkaHttpServer {
         if (maxRequestBodyBytes < 0) {
             throw new IllegalArgumentException("maxRequestBodyBytes must be non-negative, got " + maxRequestBodyBytes);
         }
+        if (shutdownGraceMs < 0L) {
+            throw new IllegalArgumentException("shutdownGraceMs must be non-negative, got " + shutdownGraceMs);
+        }
         this.maxRequestBodyBytes = maxRequestBodyBytes;
+        this.shutdownGraceMs = shutdownGraceMs;
         this.sseLimiter = new SseStreamLimiter(maxConcurrentSseStreams);
         this.wsLimiter = new WsStreamLimiter(maxConcurrentWsSubscriptions);
         // Construct metrics here (not in start()) so the gauges for ActiveSseStreams / ActiveWsSubscriptions are
@@ -112,6 +134,14 @@ public final class KafkaHttpServer {
         }
 
         Server jetty = new Server();
+        // Set BEFORE jetty.start() so Server.doStop() picks it up. With shutdownGraceMs > 0, Server.doStop
+        // calls Graceful.shutdown(this) on every Graceful bean (the ServerConnector stops accepting new
+        // connections, the ServletContextHandler refuses new requests) and waits up to this timeout for the
+        // returned future to complete before forcing connectors closed. SSE/WS clients with no other escape
+        // from the long-poll thereby observe an orderly TCP close (FIN) rather than a reset (RST) when the
+        // broker restarts. shutdownGraceMs == 0 keeps the legacy ungraceful behaviour, which the test harness
+        // relies on for fast teardown.
+        jetty.setStopTimeout(shutdownGraceMs);
         ServerConnector connector = new ServerConnector(jetty);
         connector.setHost(host);
         connector.setPort(port);
@@ -200,7 +230,19 @@ public final class KafkaHttpServer {
     public synchronized void stop() throws Exception {
         try {
             if (server != null) {
-                server.stop();
+                try {
+                    server.stop();
+                } catch (TimeoutException e) {
+                    // Jetty 12's Server.doStop runs Graceful.shutdown(this).get(stopTimeout, MS) BEFORE
+                    // it forcibly stops connectors and the handler tree. The throwable from get() is
+                    // accumulated and rethrown at the end of doStop — but by then connectors are already
+                    // down. A TimeoutException here therefore means "a stream did not drain inside the
+                    // configured graceMs window and was force-closed", which is the documented contract
+                    // of http.bridge.shutdown.grace.ms, not a shutdown failure. Downgrade to a warning so
+                    // the broker's stop sequence can continue past the bridge.
+                    LOG.warn("HTTP bridge did not drain all in-flight streams within {}ms; force-closed",
+                        shutdownGraceMs);
+                }
             }
         } finally {
             server = null;

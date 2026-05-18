@@ -192,6 +192,10 @@ public class SocketServerConfigs {
     public static final int HTTP_BRIDGE_MAX_CONCURRENT_WS_SUBSCRIPTIONS_DEFAULT = 100;
     public static final String HTTP_BRIDGE_MAX_CONCURRENT_WS_SUBSCRIPTIONS_DOC = "Upper bound on the number of WebSocket subscriptions the HTTP bridge will serve concurrently (the WebSocket upgrade on /v1/topics/{topic}/subscribe). Each subscription holds a Jetty thread for the lifetime of the connection, recursively long-polls the broker via the fetch pipeline, and is gated on a client-granted credit budget. Without this cap a hostile or runaway client can open arbitrarily many simultaneous subscriptions until the Jetty thread pool is exhausted — at which point even one-shot produce/fetch requests stall behind it. New WebSocket upgrade attempts past the cap are refused at the handshake with HTTP 503 Service Unavailable so the client never enters the subscribe protocol against a connection that would immediately close. This cap is independent of the SSE cap because the two paths have different per-connection cost profiles. The default of 100 mirrors the SSE default and is conservative for a single-broker deployment. Set to 0 to disable WebSocket subscribe entirely while leaving produce/fetch/SSE open.";
 
+    public static final String HTTP_BRIDGE_SHUTDOWN_GRACE_MS_CONFIG = "http.bridge.shutdown.grace.ms";
+    public static final int HTTP_BRIDGE_SHUTDOWN_GRACE_MS_DEFAULT = 5_000;
+    public static final String HTTP_BRIDGE_SHUTDOWN_GRACE_MS_DOC = "Upper bound in milliseconds the HTTP bridge waits for in-flight requests, SSE streams, and WebSocket subscriptions to drain when the broker shuts down. With a positive value, Jetty stops accepting new connections immediately and lets pending async produce/fetch responses complete, gives streamers a chance to send a final error frame or close-with-code, and only then forcibly closes any connections that have not finished. With a value of 0 the broker calls server.stop() with no grace and connections are terminated abruptly — the client sees a TCP reset mid-stream instead of an orderly close. Tune to the larger of: the highest expected end-to-end produce/fetch latency, and the longest acceptable broker-restart hang. The default of 5s gives a streaming client plenty of room to observe the close without delaying an operator-initiated restart noticeably.";
+
     public static final ConfigDef CONFIG_DEF =  new ConfigDef()
             .define(LISTENERS_CONFIG, STRING, LISTENERS_DEFAULT, HIGH, LISTENERS_DOC)
             .define(ADVERTISED_LISTENERS_CONFIG, STRING, null, HIGH, ADVERTISED_LISTENERS_DOC)
@@ -215,7 +219,8 @@ public class SocketServerConfigs {
             .define(HTTP_BRIDGE_MAX_REQUEST_BODY_BYTES_CONFIG, INT, HTTP_BRIDGE_MAX_REQUEST_BODY_BYTES_DEFAULT, atLeast(0), LOW, HTTP_BRIDGE_MAX_REQUEST_BODY_BYTES_DOC)
             .define(HTTP_BRIDGE_REQUEST_TIMEOUT_MS_CONFIG, INT, HTTP_BRIDGE_REQUEST_TIMEOUT_MS_DEFAULT, atLeast(1), LOW, HTTP_BRIDGE_REQUEST_TIMEOUT_MS_DOC)
             .define(HTTP_BRIDGE_MAX_CONCURRENT_SSE_STREAMS_CONFIG, INT, HTTP_BRIDGE_MAX_CONCURRENT_SSE_STREAMS_DEFAULT, atLeast(0), LOW, HTTP_BRIDGE_MAX_CONCURRENT_SSE_STREAMS_DOC)
-            .define(HTTP_BRIDGE_MAX_CONCURRENT_WS_SUBSCRIPTIONS_CONFIG, INT, HTTP_BRIDGE_MAX_CONCURRENT_WS_SUBSCRIPTIONS_DEFAULT, atLeast(0), LOW, HTTP_BRIDGE_MAX_CONCURRENT_WS_SUBSCRIPTIONS_DOC);
+            .define(HTTP_BRIDGE_MAX_CONCURRENT_WS_SUBSCRIPTIONS_CONFIG, INT, HTTP_BRIDGE_MAX_CONCURRENT_WS_SUBSCRIPTIONS_DEFAULT, atLeast(0), LOW, HTTP_BRIDGE_MAX_CONCURRENT_WS_SUBSCRIPTIONS_DOC)
+            .define(HTTP_BRIDGE_SHUTDOWN_GRACE_MS_CONFIG, INT, HTTP_BRIDGE_SHUTDOWN_GRACE_MS_DEFAULT, atLeast(0), LOW, HTTP_BRIDGE_SHUTDOWN_GRACE_MS_DOC);
 
     private static final Pattern URI_PARSE_REGEXP = Pattern.compile(
         "^(.*)://\\[?([0-9a-zA-Z\\-%._:]*)\\]?:(-?[0-9]+)");
