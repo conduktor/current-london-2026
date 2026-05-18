@@ -404,9 +404,12 @@ public class ApiMessageActivationTest {
         // nodes, where each one would recurse MAX_DEPTH levels — can still
         // perform millions of accessor invocations before the depth cap kicks
         // in at each branch. The total-invocation budget bounds the aggregate
-        // work and raises IllegalStateException long before the request
-        // thread is starved. The engine catches Throwable from the supplier
-        // and fails open.
+        // work and raises ActivationBudgetExceededException long before the
+        // request thread is starved. The engine catches that specific type
+        // ahead of the generic Throwable branch and fails the request CLOSED
+        // (synthetic POLICY_VIOLATION DENY), since budget overflow is
+        // attacker-shaped and the cap is what makes worst-case walk cost
+        // bounded — see ActivationBudgetExceededException javadoc.
         WideNode root = new WideNode();
         // 1000 children, each recursing MAX_DEPTH levels of self-reference,
         // is well above MAX_ACCESSOR_INVOCATIONS=10_000. The walk must abort.
@@ -415,8 +418,8 @@ public class ApiMessageActivationTest {
             kids.add(new SelfReferencingNode());
         }
         root.children = kids;
-        IllegalStateException ex = assertThrows(
-            IllegalStateException.class,
+        ActivationBudgetExceededException ex = assertThrows(
+            ActivationBudgetExceededException.class,
             () -> ApiMessageActivation.from(root));
         assertTrue(ex.getMessage().contains("accessor budget"),
             "expected accessor-budget error, got: " + ex.getMessage());
@@ -484,8 +487,8 @@ public class ApiMessageActivationTest {
             ids.add(i);
         }
         root.ids = ids;
-        IllegalStateException ex = assertThrows(
-            IllegalStateException.class,
+        ActivationBudgetExceededException ex = assertThrows(
+            ActivationBudgetExceededException.class,
             () -> ApiMessageActivation.from(root));
         assertTrue(ex.getMessage().contains("accessor budget"),
             "expected accessor-budget error, got: " + ex.getMessage());

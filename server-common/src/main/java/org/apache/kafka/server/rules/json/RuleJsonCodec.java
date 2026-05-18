@@ -103,6 +103,20 @@ public final class RuleJsonCodec {
         if (id == null || id.isEmpty()) {
             throw new RuleEnvelopeException("rule id (record key) must be non-empty");
         }
+        // Reserve the "__name__" id shape for engine-internal sentinels.
+        // RuleEngine.ACTIVATION_BUDGET_RULE_ID is the only one today (used as
+        // RuleDecision.denyingRuleId on synthetic fail-closed DENYs from
+        // ApiMessageActivation budget overflow), but the convention exists
+        // independently so audit consumers can attribute any future internal
+        // posture without a collision. Operator rules that respect the
+        // convention are blocked here at intake.
+        if (id.startsWith("__") && id.endsWith("__")) {
+            throw new RuleEnvelopeException(
+                "rule id '" + id + "' uses the reserved \"__name__\" shape "
+                    + "(double-underscore prefix and suffix); these ids are reserved "
+                    + "for engine-internal synthetic decisions and may not be authored "
+                    + "by operators");
+        }
         if (value == null) {
             throw new RuleEnvelopeException("rule envelope is null (tombstones must be handled by the loader, not the codec)");
         }

@@ -17,8 +17,10 @@
 package org.apache.kafka.server.rules;
 
 import org.apache.kafka.common.protocol.ApiKeys;
+import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.security.auth.KafkaPrincipal;
 import org.apache.kafka.common.utils.SecurityUtils;
+import org.apache.kafka.server.rules.extract.ActivationBudgetExceededException;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -89,6 +91,20 @@ public final class RuleEngine {
      * when constructing the broker-internal consumer.
      */
     public static final String INTERNAL_CLIENT_ID_PREFIX = "__kafka-governance-";
+
+    /**
+     * Synthetic rule id surfaced in audit logs (and {@link RuleDecision#denyingRuleId()})
+     * when the engine fails a request closed because the activation walker
+     * exhausted its accessor budget — see
+     * {@link ActivationBudgetExceededException} for the policy rationale. The
+     * matching {@code "__name__"} shape is rejected by
+     * {@link org.apache.kafka.server.rules.json.RuleJsonCodec#decode} as a
+     * reserved engine-internal sentinel shape, so this id cannot collide with
+     * any rule an operator publishes to the {@code __governance} topic — an
+     * audit consumer that sees this denying-rule-id can attribute the DENY
+     * unambiguously to engine posture.
+     */
+    public static final String ACTIVATION_BUDGET_RULE_ID = "__activation-budget-exceeded__";
 
     private final AtomicReference<RuleSet> active = new AtomicReference<>(RuleSet.EMPTY);
 
@@ -379,6 +395,28 @@ public final class RuleEngine {
         Map<String, Object> activation;
         try {
             activation = activationSupplier.get();
+        } catch (ActivationBudgetExceededException budget) {
+            // Attacker-shaped wide request: the walker exhausted its
+            // MAX_ACCESSOR_INVOCATIONS budget (e.g. an OffsetFetch with 10000+
+            // partition indexes, a CreateTopics with 10000+ topic descriptors,
+            // a JoinGroup with 5000+ protocols). Falling through to the generic
+            // Throwable branch below would fail OPEN, which is the right answer
+            // for a buggy extractor (broker bug should not 503 every request)
+            // but the wrong answer here: any external client could then evade
+            // every DENY rule on the targeted API simply by inflating a single
+            // repeated field past the budget, since the budget cap is exactly
+            // what makes worst-case walk cost bounded.
+            //
+            // Fail CLOSED with a synthetic DENY whose error code is
+            // POLICY_VIOLATION (44) and whose denyingRuleId is the reserved
+            // sentinel ACTIVATION_BUDGET_RULE_ID — codec rules forbid operator
+            // rule ids that start or end with "__", so an audit consumer can
+            // attribute this DENY to the engine's defensive posture without
+            // ambiguity. See ActivationBudgetExceededException javadoc for the
+            // full broker-bug-vs-attacker-shape policy distinction.
+            LOG.warn("activation budget exceeded on apiKey {} — failing closed (POLICY_VIOLATION): {}",
+                apiKey, budget.getMessage());
+            return RuleDecision.deny(Errors.POLICY_VIOLATION.code(), ACTIVATION_BUDGET_RULE_ID);
         } catch (Throwable t) {
             // Codex deep-audit P0 fix: a throwing activation supplier MUST NOT
             // propagate into the request thread. The most realistic failure mode
@@ -399,6 +437,10 @@ public final class RuleEngine {
             // crash the request path") and is the only outcome consistent
             // with that policy — no rule can be evaluated without an
             // activation map, so ALLOW is the only available safe answer.
+            //
+            // The attacker-shape exception above is caught FIRST so it never
+            // falls through this generic branch; see that catch's comment for
+            // why budget overflow needs the opposite posture.
             LOG.warn("activation supplier failed for apiKey {} — failing open: {}",
                 apiKey, t.toString());
             return RuleDecision.ALLOW;

@@ -168,6 +168,28 @@ public class RuleJsonCodecTest {
     }
 
     @Test
+    public void doubleUnderscoreIdShapeReserved() {
+        // The "__name__" rule id shape is reserved for engine-internal
+        // synthetic decisions (today: ACTIVATION_BUDGET_RULE_ID, surfaced as
+        // RuleDecision.denyingRuleId when ApiMessageActivation overflows its
+        // accessor budget and the engine fails closed). Operator rules using
+        // this shape must be rejected at intake so audit consumers can
+        // attribute a `__…__` denying-rule-id unambiguously to an engine
+        // posture, not to an operator-authored rule that picked a colliding id.
+        RuleEnvelopeException prefixAndSuffix = assertThrows(RuleEnvelopeException.class,
+            () -> RuleJsonCodec.decode("__activation-budget-exceeded__",
+                SAMPLE.getBytes(StandardCharsets.UTF_8)));
+        assertTrue(prefixAndSuffix.getMessage().contains("reserved"),
+            "rejection message must explain the reservation: " + prefixAndSuffix.getMessage());
+        // A single-underscore prefix or a `__` only on one side is fine — only
+        // the matching `__…__` shape is reserved. Operators routinely use a
+        // leading underscore for "internal" naming and we don't want to over-
+        // reach.
+        RuleJsonCodec.decode("__only-prefix", SAMPLE.getBytes(StandardCharsets.UTF_8));
+        RuleJsonCodec.decode("only-suffix__", SAMPLE.getBytes(StandardCharsets.UTF_8));
+    }
+
+    @Test
     public void encodeRoundTrip() {
         Rule r = RuleJsonCodec.decode("round", SAMPLE.getBytes(StandardCharsets.UTF_8));
         byte[] enc = RuleJsonCodec.encode(r);

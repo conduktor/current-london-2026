@@ -20,7 +20,9 @@ import org.apache.kafka.common.message.CreateTopicsRequestData;
 import org.apache.kafka.common.message.CreateTopicsRequestData.CreatableTopic;
 import org.apache.kafka.common.message.CreateTopicsRequestData.CreatableTopicCollection;
 import org.apache.kafka.common.protocol.ApiKeys;
+import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.server.rules.cel.CelCompiler;
+import org.apache.kafka.server.rules.extract.ActivationBudgetExceededException;
 import org.apache.kafka.server.rules.extract.ApiMessageActivation;
 
 import org.junit.jupiter.api.Test;
@@ -165,6 +167,70 @@ public class RuleEngineTest {
             });
         assertSame(RuleDecision.ALLOW, d,
             "Errors from the activation supplier must fail open, same as RuntimeExceptions");
+    }
+
+    @Test
+    public void activationBudgetExceededFailsClosedWithPolicyViolation() {
+        // Adversarial DoS-P0 fix: an attacker-shaped wide request (e.g.
+        // OffsetFetch with 10000+ partition indexes, CreateTopics with 10000+
+        // topic descriptors, JoinGroup with 5000+ supported protocols) trips
+        // ApiMessageActivation's MAX_ACCESSOR_INVOCATIONS=10_000 budget and
+        // raises ActivationBudgetExceededException. Falling through to the
+        // generic-Throwable catch above (fail-open) would let any external
+        // client evade every DENY rule on the targeted API simply by
+        // inflating one repeated field past the budget — the cap is exactly
+        // what makes worst-case walk cost bounded, so the only consistent
+        // answer is to fail CLOSED.
+        //
+        // The synthetic DENY carries Errors.POLICY_VIOLATION (44) and the
+        // reserved rule id RuleEngine.ACTIVATION_BUDGET_RULE_ID. Operator
+        // rule ids cannot start or end with "__" (codec rejects them), so
+        // the sentinel is unambiguous in audit logs.
+        RuleEngine engine = new RuleEngine();
+        // Install a real DENY rule so we exercise the path past the bitset
+        // fast-path; without it, evaluate() returns ALLOW before ever
+        // touching the activation supplier and we'd be testing the wrong
+        // codepath.
+        engine.install(new RuleSetBuilder()
+            .put(denyRule("deny-all", ApiKeys.METADATA, "true", 99))
+            .build());
+        RuleDecision d = engine.evaluate(
+            ApiKeys.METADATA, "client", null, false,
+            () -> {
+                throw new ActivationBudgetExceededException(
+                    "activation walk exceeded accessor budget of 10000 on FakeWideRequest");
+            });
+        assertTrue(d.denied(), "budget overflow MUST fail closed, not open");
+        assertEquals(Errors.POLICY_VIOLATION.code(), d.errorCode(),
+            "budget-overflow DENY must surface POLICY_VIOLATION (44) so clients see " +
+                "a clear governance-rejection error code, not the rule author's choice");
+        assertEquals(RuleEngine.ACTIVATION_BUDGET_RULE_ID, d.denyingRuleId(),
+            "denyingRuleId must be the reserved sentinel so audit consumers can " +
+                "distinguish defensive engine posture from any operator-authored rule");
+    }
+
+    @Test
+    public void activationBudgetCatchSitsAheadOfGenericThrowableFailOpen() {
+        // Pinning test: the two catches must be co-located in the right
+        // ORDER. If a future refactor reorders them (or makes
+        // ActivationBudgetExceededException extend something the generic
+        // branch swallows first), the DoS-P0 fail-closed posture quietly
+        // regresses to fail-open — and the only test that would notice is
+        // this one. The previous test already covers the budget-overflow
+        // outcome; this one proves a RuntimeException that is NOT a budget
+        // overflow still fails OPEN, so the ordering matters because both
+        // catches are reachable from the same supplier.get() call.
+        RuleEngine engine = new RuleEngine();
+        engine.install(new RuleSetBuilder()
+            .put(denyRule("deny-all", ApiKeys.METADATA, "true", 99))
+            .build());
+        RuleDecision d = engine.evaluate(
+            ApiKeys.METADATA, "client", null, false,
+            () -> {
+                throw new RuntimeException("buggy walker, not an attacker");
+            });
+        assertSame(RuleDecision.ALLOW, d,
+            "generic exceptions must still fail open — only ActivationBudget closes");
     }
 
     @Test

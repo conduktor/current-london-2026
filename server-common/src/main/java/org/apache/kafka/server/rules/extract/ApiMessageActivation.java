@@ -188,9 +188,11 @@ public final class ApiMessageActivation {
      * descriptors. 10k accessor invocations leaves three orders of magnitude
      * of headroom for normal traffic while killing pathological extraction in
      * single-digit milliseconds. A request that exceeds this raises
-     * {@link IllegalStateException}, which {@link RuleEngine#evaluate} catches
-     * and treats as fail-open (one buggy extraction does not crash the
-     * request thread).
+     * {@link ActivationBudgetExceededException}, which {@link RuleEngine#evaluate}
+     * catches and fails the request <em>closed</em> — see that exception's
+     * class javadoc for the fail-closed-vs-open policy distinction (attacker-
+     * shaped wide requests must NOT fall through the generic {@code Throwable}
+     * branch that protects against buggy extractors).
      */
     static final int MAX_ACCESSOR_INVOCATIONS = 10_000;
 
@@ -242,9 +244,12 @@ public final class ApiMessageActivation {
      * truncated. {@code invocations} is a one-element array used as a shared
      * mutable counter across the whole walk; each {@link Accessor#invoke}
      * call bumps it, and overflowing {@link #MAX_ACCESSOR_INVOCATIONS}
-     * raises {@link IllegalStateException}. A one-element {@code int[]} is
-     * the smallest reliable way to share an integer counter across recursive
-     * calls without boxing or a dedicated holder class.
+     * raises {@link ActivationBudgetExceededException} — a typed signal
+     * {@link RuleEngine#evaluate} catches separately from the generic
+     * {@code Throwable} branch so attacker-shaped wide requests fail closed.
+     * A one-element {@code int[]} is the smallest reliable way to share an
+     * integer counter across recursive calls without boxing or a dedicated
+     * holder class.
      */
     private static Map<String, Object> toMap(Object o, int depth, int[] invocations) {
         if (depth >= MAX_DEPTH) {
@@ -253,7 +258,7 @@ public final class ApiMessageActivation {
         Map<String, Object> out = new LinkedHashMap<>();
         for (Accessor a : accessorsFor(o.getClass())) {
             if (++invocations[0] > MAX_ACCESSOR_INVOCATIONS) {
-                throw new IllegalStateException(
+                throw new ActivationBudgetExceededException(
                     "activation walk exceeded accessor budget of "
                         + MAX_ACCESSOR_INVOCATIONS + " on " + o.getClass().getName());
             }
@@ -464,7 +469,7 @@ public final class ApiMessageActivation {
         List<Object> list = new ArrayList<>();
         for (Object item : it) {
             if (++invocations[0] > MAX_ACCESSOR_INVOCATIONS) {
-                throw new IllegalStateException(
+                throw new ActivationBudgetExceededException(
                     "activation walk exceeded accessor budget of "
                         + MAX_ACCESSOR_INVOCATIONS
                         + " while walking iterable of "
