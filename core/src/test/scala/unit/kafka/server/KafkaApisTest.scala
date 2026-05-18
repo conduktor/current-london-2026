@@ -32,7 +32,7 @@ import org.apache.kafka.common.acl.AclOperation
 import org.apache.kafka.common.compress.Compression
 import org.apache.kafka.common.config.ConfigResource
 import org.apache.kafka.common.config.ConfigResource.Type.{BROKER, BROKER_LOGGER}
-import org.apache.kafka.common.errors.{ClusterAuthorizationException, FencedLeaderEpochException, UnknownLeaderEpochException, UnsupportedVersionException}
+import org.apache.kafka.common.errors.{ClusterAuthorizationException, FencedLeaderEpochException, NotLeaderOrFollowerException, UnknownLeaderEpochException, UnsupportedVersionException}
 import org.apache.kafka.common.internals.Topic
 import org.apache.kafka.common.memory.MemoryPool
 import org.apache.kafka.common.message.AddPartitionsToTxnRequestData.{AddPartitionsToTxnTopic, AddPartitionsToTxnTopicCollection, AddPartitionsToTxnTransaction, AddPartitionsToTxnTransactionCollection}
@@ -5333,6 +5333,154 @@ class KafkaApisTest extends Logging {
       "partition 0 must surface its FencedLeaderEpoch")
     assertEquals(Errors.NONE.code, byPart(1).errorCode)
     assertEquals(99L, byPart(1).offset, "partition 1 must surface its replica-layer offset")
+  }
+
+  @Test
+  def testListOffsetsFromViewWithUnknownEpochStillValidatesViewLeadership(): Unit = {
+    // Even when the client supplies no currentLeaderEpoch (UNKNOWN_EPOCH = -1, the common case
+    // for fresh consumers), the broker must verify it is the view's leader before redirecting
+    // to the backing topic. Otherwise a non-leader view replica that happens to host the
+    // backing topic would serve ListOffsets from the backing's local log, masking stale client
+    // metadata and (when the view-leader has actually moved elsewhere) returning data that does
+    // not reflect the view's current authoritative offsets. Validating with
+    // localLogWithEpochOrThrow(Optional.empty(), requireLeader=true) enforces is-leader without
+    // any epoch comparison.
+    val viewTopic = "list-noepoch-view"
+    val backingTopic = "list-noepoch-backing"
+    val viewTopicId = Uuid.randomUuid()
+    val backingTopicId = Uuid.randomUuid()
+
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, backingTopic)
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.x == 1")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+    addTopicToMetadataCache(viewTopic, numPartitions = 1, topicId = viewTopicId)
+    addTopicToMetadataCache(backingTopic, numPartitions = 1, topicId = backingTopicId)
+
+    // Simulate: we are NOT the view leader. localLogWithEpochOrThrow rejects with
+    // NOT_LEADER_OR_FOLLOWER regardless of whether an epoch is supplied.
+    val viewPartition = mock(classOf[Partition])
+    when(viewPartition.localLogWithEpochOrThrow(any[Optional[Integer]], anyBoolean))
+      .thenThrow(new NotLeaderOrFollowerException("not the view leader"))
+    when(replicaManager.getPartitionOrError(new TopicPartition(viewTopic, 0)))
+      .thenReturn(Right(viewPartition))
+    when(replicaManager.getPartitionOrError(new TopicPartition(backingTopic, 0)))
+      .thenReturn(Right(mock(classOf[Partition])))
+
+    val targetTimes = List(new ListOffsetsTopic()
+      .setName(viewTopic)
+      .setPartitions(List(new ListOffsetsPartition()
+        .setPartitionIndex(0)
+        // Explicit UNKNOWN_EPOCH (-1) — the path the bug was hiding behind.
+        .setCurrentLeaderEpoch(ListOffsetsResponse.UNKNOWN_EPOCH)
+        .setTimestamp(ListOffsetsRequest.LATEST_TIMESTAMP)).asJava)).asJava
+    val listOffsetRequest = ListOffsetsRequest.Builder.forConsumer(true, IsolationLevel.READ_UNCOMMITTED)
+      .setTargetTimes(targetTimes).build()
+    val request = buildRequest(listOffsetRequest)
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+    kafkaApis = createKafkaApis(configRepository = configRepository)
+    kafkaApis.handleListOffsetRequest(request)
+
+    // The replica fetchOffset must NEVER be reached — the gate stops at the view layer.
+    verify(replicaManager, never).fetchOffset(
+      any[Seq[ListOffsetsTopic]],
+      any[Set[TopicPartition]],
+      any[IsolationLevel],
+      anyInt(),
+      any[String],
+      anyInt(),
+      anyShort(),
+      any[(Errors, ListOffsetsPartition) => ListOffsetsPartitionResponse],
+      any[List[ListOffsetsTopicResponse] => Unit],
+      anyInt())
+
+    val response = verifyNoThrottling[ListOffsetsResponse](request)
+    val viewEntries = response.topics.asScala.filter(_.name == viewTopic)
+    assertEquals(1, viewEntries.size)
+    val partResp = viewEntries.head.partitions.asScala.head
+    assertEquals(0, partResp.partitionIndex)
+    assertEquals(Errors.NOT_LEADER_OR_FOLLOWER.code, partResp.errorCode,
+      "an empty epoch must still go through view-leader validation; a non-leader view broker " +
+        "must reject with NOT_LEADER_OR_FOLLOWER under the view's name so the client refreshes " +
+        "VIEW metadata, not be silently redirected to the backing")
+  }
+
+  @Test
+  def testListOffsetsFromViewWithDuplicatePartitionReturnsInvalidRequestOnce(): Unit = {
+    // The ListOffsets request protocol allows the same partition index to appear multiple
+    // times within a topic; upstream replicaManager.fetchOffset surfaces this as
+    // INVALID_REQUEST per the canonical duplicate handling. The view rewrite must match that
+    // shape — and, critically, must NOT splice a duplicate partition-index entry into the
+    // response (the protocol expects one ListOffsetsPartitionResponse per partition index per
+    // ListOffsetsTopicResponse). The risk is the splice path: if one duplicate fails epoch
+    // validation and another succeeds, naive code would emit two response entries for the
+    // same partition index. The fix collapses duplicates at the view layer before per-epoch
+    // dispatch.
+    val viewTopic = "list-dup-view"
+    val backingTopic = "list-dup-backing"
+    val viewTopicId = Uuid.randomUuid()
+    val backingTopicId = Uuid.randomUuid()
+
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, backingTopic)
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.x == 1")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+    addTopicToMetadataCache(viewTopic, numPartitions = 1, topicId = viewTopicId)
+    addTopicToMetadataCache(backingTopic, numPartitions = 1, topicId = backingTopicId)
+
+    // The view partition mock would accept any epoch — but it should NEVER be consulted for
+    // duplicates: dup detection must short-circuit before epoch validation. Set the mock to
+    // fail loudly if called, so a regression that bypasses the dup gate would also blow up.
+    val viewPartition = mock(classOf[Partition])
+    when(viewPartition.localLogWithEpochOrThrow(any[Optional[Integer]], anyBoolean))
+      .thenThrow(new IllegalStateException("view partition must not be touched for duplicate-index requests"))
+    when(replicaManager.getPartitionOrError(new TopicPartition(viewTopic, 0)))
+      .thenReturn(Right(viewPartition))
+    when(replicaManager.getPartitionOrError(new TopicPartition(backingTopic, 0)))
+      .thenReturn(Right(mock(classOf[Partition])))
+
+    // Two ListOffsetsPartition entries with the same partitionIndex inside one topic — the
+    // canonical "duplicate" shape that ListOffsetsRequest's constructor records in
+    // `duplicatePartitions`.
+    val targetTimes = List(new ListOffsetsTopic()
+      .setName(viewTopic)
+      .setPartitions(List(
+        new ListOffsetsPartition().setPartitionIndex(0).setCurrentLeaderEpoch(3)
+          .setTimestamp(ListOffsetsRequest.LATEST_TIMESTAMP),
+        new ListOffsetsPartition().setPartitionIndex(0).setCurrentLeaderEpoch(7)
+          .setTimestamp(ListOffsetsRequest.EARLIEST_TIMESTAMP)).asJava)).asJava
+    val listOffsetRequest = ListOffsetsRequest.Builder.forConsumer(true, IsolationLevel.READ_UNCOMMITTED)
+      .setTargetTimes(targetTimes).build()
+    val request = buildRequest(listOffsetRequest)
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+    kafkaApis = createKafkaApis(configRepository = configRepository)
+    kafkaApis.handleListOffsetRequest(request)
+
+    // The replica fetchOffset must NEVER be reached: both copies fail at the dup gate.
+    verify(replicaManager, never).fetchOffset(
+      any[Seq[ListOffsetsTopic]],
+      any[Set[TopicPartition]],
+      any[IsolationLevel],
+      anyInt(),
+      any[String],
+      anyInt(),
+      anyShort(),
+      any[(Errors, ListOffsetsPartition) => ListOffsetsPartitionResponse],
+      any[List[ListOffsetsTopicResponse] => Unit],
+      anyInt())
+
+    val response = verifyNoThrottling[ListOffsetsResponse](request)
+    val viewEntries = response.topics.asScala.filter(_.name == viewTopic)
+    assertEquals(1, viewEntries.size, "exactly one TopicResponse for the view name")
+    val partResps = viewEntries.head.partitions.asScala
+    assertEquals(1, partResps.size,
+      "duplicate partition indexes must collapse to a single response entry; " +
+        s"got ${partResps.size} entries: $partResps")
+    assertEquals(0, partResps.head.partitionIndex)
+    assertEquals(Errors.INVALID_REQUEST.code, partResps.head.errorCode,
+      "duplicates must surface as INVALID_REQUEST, matching upstream replicaManager.fetchOffset")
   }
 
   @Test

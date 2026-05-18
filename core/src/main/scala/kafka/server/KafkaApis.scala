@@ -1229,36 +1229,61 @@ class KafkaApis(val requestChannel: RequestChannel,
             // UNKNOWN_LEADER_EPOCH / NOT_LEADER_OR_FOLLOWER) via viewPartialPartitionErrors;
             // the surviving partitions go through the storage layer normally.
             //
-            // `fetchOnlyFromLeader = true` mirrors `ReplicaManager.fetchOffset`'s decision
-            // (replicaId != DEBUGGING_REPLICA_ID) for consumer and inter-broker ListOffsets.
+            // The view-leader check runs even when the client omits the epoch
+            // (UNKNOWN_EPOCH = -1): otherwise a non-view-leader replica could still
+            // serve ListOffsets via the backing redirect, hiding stale client metadata.
+            // `localLogWithEpochOrThrow(Optional.empty(), requireLeader=true)` enforces the
+            // is-leader predicate without epoch validation.
+            //
+            // `fetchOnlyFromLeader` mirrors `ReplicaManager.fetchOffset`'s own decision
+            // (`replicaId != DEBUGGING_REPLICA_ID`); debug-replica requests bypass leader
+            // enforcement so they can poke at follower replicas, matching upstream.
+            //
+            // Duplicate view partitions are emitted to the client as INVALID_REQUEST,
+            // matching upstream's `replicaManager.fetchOffset` behaviour for duplicates,
+            // and we collapse the duplicate to a single response entry to keep the
+            // protocol-mandated "one partition-response per partition-index" invariant
+            // through the splice path.
+            val viewDuplicatePartitionIndexes: Set[Int] =
+              offsetRequest.duplicatePartitions().asScala
+                .iterator
+                .filter(_.topic == topic.name)
+                .map(_.partition)
+                .toSet
+            val processedPartitionIndexes = mutable.Set[Int]()
+            val fetchOnlyFromLeader = offsetRequest.replicaId != ListOffsetsRequest.DEBUGGING_REPLICA_ID
             val validatedPartitions = new util.ArrayList[ListOffsetsPartition]()
             val perPartitionErrors = mutable.ArrayBuffer[ListOffsetsPartitionResponse]()
             topic.partitions.asScala.foreach { p =>
-              val epochOpt: Optional[Integer] =
-                if (p.currentLeaderEpoch == ListOffsetsResponse.UNKNOWN_EPOCH) Optional.empty()
-                else Optional.of(Integer.valueOf(p.currentLeaderEpoch))
-              val epochError: Errors =
-                if (!epochOpt.isPresent) {
-                  Errors.NONE
-                } else {
+              if (!processedPartitionIndexes.add(p.partitionIndex)) {
+                // Already handled (first occurrence won). Drop this copy on the floor so the
+                // response carries exactly one entry for this partition index — same shape as
+                // the replica-manager's duplicate handling for ordinary topics.
+              } else if (viewDuplicatePartitionIndexes.contains(p.partitionIndex)) {
+                perPartitionErrors += buildErrorResponse(Errors.INVALID_REQUEST, p)
+              } else {
+                val epochOpt: Optional[Integer] =
+                  if (p.currentLeaderEpoch == ListOffsetsResponse.UNKNOWN_EPOCH) Optional.empty()
+                  else Optional.of(Integer.valueOf(p.currentLeaderEpoch))
+                val epochError: Errors =
                   replicaManager.getPartitionOrError(new TopicPartition(topic.name, p.partitionIndex)) match {
                     case Left(error) => error
                     case Right(viewPartition) =>
                       try {
-                        viewPartition.localLogWithEpochOrThrow(epochOpt, true)
+                        viewPartition.localLogWithEpochOrThrow(epochOpt, fetchOnlyFromLeader)
                         Errors.NONE
                       } catch {
                         case e: ApiException => Errors.forException(e)
                       }
                   }
+                if (epochError != Errors.NONE) {
+                  perPartitionErrors += buildErrorResponse(epochError, p)
+                } else {
+                  validatedPartitions.add(new ListOffsetsPartition()
+                    .setPartitionIndex(p.partitionIndex)
+                    .setCurrentLeaderEpoch(ListOffsetsResponse.UNKNOWN_EPOCH)
+                    .setTimestamp(p.timestamp))
                 }
-              if (epochError != Errors.NONE) {
-                perPartitionErrors += buildErrorResponse(epochError, p)
-              } else {
-                validatedPartitions.add(new ListOffsetsPartition()
-                  .setPartitionIndex(p.partitionIndex)
-                  .setCurrentLeaderEpoch(ListOffsetsResponse.UNKNOWN_EPOCH)
-                  .setTimestamp(p.timestamp))
               }
             }
             if (perPartitionErrors.nonEmpty && validatedPartitions.isEmpty) {
