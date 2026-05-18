@@ -143,7 +143,7 @@ public final class KafkaHttpServer {
         // servlet's extractTopic enforces /topics/{topic}/records — /subscribe does not match).
         JettyWebSocketServletContainerInitializer.configure(context, (servletContext, container) -> {
             // Upgrade-time admission gate: extract the topic, acquire a limiter slot, and either return a
-            // freshly-constructed endpoint (counts as one accepted subscription) or send a 503 (counts as
+            // freshly-constructed endpoint (counts as one accepted subscription) or send a 429 (counts as
             // a cap rejection). The endpoint owns the token from that point onward; cleanup in onClose/onError
             // is idempotent.
             container.addMapping(WS_PATH_SPEC, (req, resp) -> {
@@ -160,13 +160,15 @@ public final class KafkaHttpServer {
                 WsStreamLimiter.Token token = wsLimiter.tryAcquire();
                 if (token == null) {
                     metrics.recordWsCapRejection();
-                    // 503 + Retry-After is the right shape for a transient-capacity error at upgrade time;
-                    // distinct from the SSE 429 because 429 means "you are rate-limited" while 503 means
-                    // "this listener is full right now". Operator alerting reads them differently.
+                    // PROMPT.md AC: "429 is reserved for the WebSocket pre-flight throttle, not the HTTP
+                    // produce path." Refusing the upgrade at the concurrency cap is exactly that pre-flight
+                    // throttle, so the contract is 429 + Retry-After — matching the SSE limiter's shape so
+                    // both streaming admission gates report the same surface to clients and dashboards.
                     // Retry-After must be set BEFORE sendError — sendError commits the response headers when
                     // the configured ErrorHandler runs, and headers added after commit are dropped.
                     resp.setHeader("Retry-After", "5");
-                    resp.sendError(503, "WebSocket subscription cap reached; try again shortly");
+                    resp.sendError(HttpStatusMapper.TOO_MANY_REQUESTS,
+                        "WebSocket subscription cap reached; try again shortly");
                     return null;
                 }
                 // Wrap endpoint construction so a throw between tryAcquire() and the returned endpoint does not

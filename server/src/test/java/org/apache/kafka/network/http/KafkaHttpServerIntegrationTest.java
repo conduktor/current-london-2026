@@ -691,11 +691,13 @@ class KafkaHttpServerIntegrationTest {
     }
 
     @Test
-    void wsReturns503WhenSubscriptionCapReached() throws Exception {
+    void wsReturns429WhenSubscriptionCapReached() throws Exception {
         // Restart with a WS cap of 1 so the first subscription consumes all capacity. The second upgrade attempt must
-        // be refused with HTTP 503 + Retry-After at the upgrade gate, NOT a half-opened WS that immediately errors —
-        // a runaway client otherwise pins a Jetty I/O slot per attempt. Also asserts RejectedAtWsCap increments, which
-        // is the metric operators alert on for "WS bridge is saturated".
+        // be refused with HTTP 429 + Retry-After at the upgrade gate, NOT a half-opened WS that immediately errors —
+        // a runaway client otherwise pins a Jetty I/O slot per attempt. PROMPT.md AC reserves 429 for the WebSocket
+        // pre-flight throttle (the concurrency cap is exactly that), distinguishing it from the HTTP produce path
+        // which uses 200+Retry-After for quota throttling. Also asserts RejectedAtWsCap increments, which is the
+        // metric operators alert on for "WS bridge is saturated".
         tearDown();
         startServer(DEFAULT_TEST_MAX_BODY_BYTES, DEFAULT_TEST_MAX_SSE_STREAMS, 1);
         com.yammer.metrics.core.Meter opened = (com.yammer.metrics.core.Meter)
@@ -734,7 +736,7 @@ class KafkaHttpServerIntegrationTest {
                     Callback.NOOP);
                 firstListener.awaitMessages(1, 5, TimeUnit.SECONDS);
 
-                // Second upgrade attempt — limiter is at capacity, must fail with 503.
+                // Second upgrade attempt — limiter is at capacity, must fail with 429.
                 CapturingWsListener secondListener = new CapturingWsListener();
                 ExecutionException ex = org.junit.jupiter.api.Assertions.assertThrows(
                     ExecutionException.class,
@@ -743,13 +745,13 @@ class KafkaHttpServerIntegrationTest {
                 Throwable cause = ex.getCause();
                 assertTrue(cause instanceof UpgradeException,
                     "second connect must surface as UpgradeException, got: " + cause);
-                assertEquals(503, ((UpgradeException) cause).getResponseStatusCode(),
-                    "second connect must fail with HTTP 503 — the upgrade-time admission gate fired");
+                assertEquals(429, ((UpgradeException) cause).getResponseStatusCode(),
+                    "second connect must fail with HTTP 429 — the upgrade-time admission gate fired");
 
                 // UpgradeException exposes only the status; to verify the rejection body and Retry-After header we
                 // issue a third upgrade-shaped request through the plain HttpClient — the WS filter still invokes the
-                // creator (which still returns null with sendError 503), but HttpClient surfaces the full response
-                // instead of throwing UpgradeException. Both 503s land while cap=1 is still held by `first`.
+                // creator (which still returns null with sendError 429), but HttpClient surfaces the full response
+                // instead of throwing UpgradeException. Both 429s land while cap=1 is still held by `first`.
                 ContentResponse rawResp = client.newRequest(URI.create(url("/v1/topics/orders/subscribe")))
                     .method(HttpMethod.GET)
                     .headers(headers -> {
@@ -762,14 +764,14 @@ class KafkaHttpServerIntegrationTest {
                         headers.put("Sec-WebSocket-Version", "13");
                     })
                     .send();
-                assertEquals(503, rawResp.getStatus(),
-                    "raw upgrade request at-cap must also surface 503");
+                assertEquals(429, rawResp.getStatus(),
+                    "raw upgrade request at-cap must also surface 429");
                 assertEquals("5", rawResp.getHeaders().get("Retry-After"),
                     "Retry-After must survive sendError → JsonErrorHandler — clients rely on it to back off");
                 assertTrue(rawResp.getHeaders().get("Content-Type").startsWith("application/json"),
-                    "503 body must be JSON, not the default Jetty HTML error page");
+                    "429 body must be JSON, not the default Jetty HTML error page");
                 JsonNode envelope = mapper.readTree(rawResp.getContent());
-                assertEquals(503, envelope.get("errorCode").asInt(),
+                assertEquals(429, envelope.get("errorCode").asInt(),
                     "cap-rejection envelope must match the bridge's {errorCode, errorMessage} contract");
                 assertTrue(envelope.get("errorMessage").asText().toLowerCase(java.util.Locale.ROOT).contains("cap"),
                     "errorMessage must explain why the upgrade was refused, got: " + envelope.get("errorMessage"));
