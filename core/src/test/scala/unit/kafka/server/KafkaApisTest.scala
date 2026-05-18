@@ -28,7 +28,7 @@ import kafka.utils.{CoreUtils, Log4jController, Logging, TestUtils}
 import org.apache.kafka.clients.admin.AlterConfigOp.OpType
 import org.apache.kafka.clients.admin.{AlterConfigOp, ConfigEntry}
 import org.apache.kafka.common._
-import org.apache.kafka.common.acl.{AclOperation, AclPermissionType}
+import org.apache.kafka.common.acl.{AccessControlEntry, AccessControlEntryFilter, AclBinding, AclBindingFilter, AclOperation, AclPermissionType}
 import org.apache.kafka.common.compress.Compression
 import org.apache.kafka.common.config.ConfigResource
 import org.apache.kafka.common.config.ConfigResource.Type.{BROKER, BROKER_LOGGER}
@@ -70,7 +70,7 @@ import org.apache.kafka.common.requests.MetadataResponse.TopicMetadata
 import org.apache.kafka.common.requests.ProduceResponse.PartitionResponse
 import org.apache.kafka.common.requests.WriteTxnMarkersRequest.TxnMarkerEntry
 import org.apache.kafka.common.requests.{FetchMetadata => JFetchMetadata, _}
-import org.apache.kafka.common.resource.{PatternType, Resource, ResourcePattern, ResourceType}
+import org.apache.kafka.common.resource.{PatternType, Resource, ResourcePattern, ResourcePatternFilter, ResourceType}
 import org.apache.kafka.common.security.auth.{KafkaPrincipal, KafkaPrincipalSerde, SecurityProtocol}
 import org.apache.kafka.common.security.token.delegation.{DelegationToken, TokenInformation}
 import org.apache.kafka.common.utils.annotation.ApiKeyVersionsSource
@@ -13298,6 +13298,247 @@ class KafkaApisTest extends Logging {
     val response = verifyNoThrottling[DeleteAclsResponse](request)
     assertEquals(1, response.data.filterResults.get(0).matchingAcls.size,
       "non-tenant matching ACL must not be scrubbed")
+  }
+
+  // ------------------------------------------------------------------
+  // DescribeAcls — tenant existence-oracle + namespace-enumeration leak
+  // (KafkaApis.handleDescribeAcls L1 filter validation + L2 response scrub).
+  // ------------------------------------------------------------------
+
+  private def describeAclsRequest(rt: ResourceType,
+                                  name: String,
+                                  patternType: PatternType,
+                                  principal: String): DescribeAclsRequest = {
+    val patternFilter = new ResourcePatternFilter(rt, name, patternType)
+    val entryFilter = new AccessControlEntryFilter(principal, null,
+      AclOperation.ANY, AclPermissionType.ANY)
+    new DescribeAclsRequest.Builder(new AclBindingFilter(patternFilter, entryFilter)).build()
+  }
+
+  private def aclBinding(rt: ResourceType,
+                         resourceName: String,
+                         patternType: PatternType,
+                         principal: String): AclBinding = {
+    new AclBinding(
+      new ResourcePattern(rt, resourceName, patternType),
+      new AccessControlEntry(principal, "*", AclOperation.READ, AclPermissionType.ALLOW))
+  }
+
+  private def authorizerAllowingClusterDescribe(): Authorizer = {
+    val auth: Authorizer = mock(classOf[Authorizer])
+    // authorizeClusterOperation(DESCRIBE) under the hood issues a single
+    // Action(CLUSTER, kafka-cluster, DESCRIBE) authorize() — return ALLOWED.
+    when(auth.authorize(any[RequestContext], any[util.List[Action]]()))
+      .thenAnswer(inv => {
+        val actions = inv.getArgument[util.List[Action]](1)
+        val out = new util.ArrayList[AuthorizationResult](actions.size)
+        actions.forEach(_ => out.add(AuthorizationResult.ALLOWED))
+        out
+      })
+    auth
+  }
+
+  @Test
+  def testDescribeAclsClusterWideListenerRefusesLiteralTenantTopicFilter(): Unit = {
+    // L1: a LITERAL filter naming `Topic:acme.orders` is an existence oracle —
+    // the response (NONE vs SECURITY_DISABLED vs binding count) reveals whether
+    // acme owns that topic and which principals hold ACLs on it. The guard
+    // refuses with CLUSTER_AUTHORIZATION_FAILED before the Authorizer is asked.
+    val req = describeAclsRequest(ResourceType.TOPIC, "acme.orders", PatternType.LITERAL, null)
+    val request = buildRequest(req)
+    val auth = authorizerAllowingClusterDescribe()
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(
+      authorizer = Some(auth),
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDescribeAcls(request)
+
+    val response = verifyNoThrottling[DescribeAclsResponse](request)
+    assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED.code, response.data.errorCode)
+    assertEquals(0, response.data.resources.size, "L1 refusal must not leak any ACL bindings")
+    // L1 short-circuits before AclApis is invoked — Authorizer is never asked
+    // about cluster DESCRIBE and never asked for acls().
+    verify(auth, never()).acls(any[AclBindingFilter]())
+  }
+
+  @Test
+  def testDescribeAclsClusterWideListenerRefusesPrefixedTenantTopicFilter(): Unit = {
+    // L1: PREFIXED filter naming `Topic:acme.` dumps every binding under
+    // acme's topic namespace. Refuse outright.
+    val req = describeAclsRequest(ResourceType.TOPIC, "acme.", PatternType.PREFIXED, null)
+    val request = buildRequest(req)
+    val auth = authorizerAllowingClusterDescribe()
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(
+      authorizer = Some(auth),
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDescribeAcls(request)
+
+    val response = verifyNoThrottling[DescribeAclsResponse](request)
+    assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED.code, response.data.errorCode)
+    verify(auth, never()).acls(any[AclBindingFilter]())
+  }
+
+  @Test
+  def testDescribeAclsClusterWideListenerRefusesTenantPrincipalFilter(): Unit = {
+    // L1: entryFilter principal `User:__tenant_acme.alice` is an existence
+    // oracle for the tenant principal — the response telegraphs whether alice
+    // exists in acme's namespace via the binding count.
+    val req = describeAclsRequest(ResourceType.ANY, null, PatternType.ANY,
+      "User:__tenant_acme.alice")
+    val request = buildRequest(req)
+    val auth = authorizerAllowingClusterDescribe()
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(
+      authorizer = Some(auth),
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDescribeAcls(request)
+
+    val response = verifyNoThrottling[DescribeAclsResponse](request)
+    assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED.code, response.data.errorCode)
+    verify(auth, never()).acls(any[AclBindingFilter]())
+  }
+
+  @Test
+  def testDescribeAclsClusterWideListenerRefusesTenantPrincipalGroupFilter(): Unit = {
+    // L1: GROUP resourceType + name `__tenant_acme.cg-1` reveals whether the
+    // tenant has a consumer group with that id.
+    val req = describeAclsRequest(ResourceType.GROUP, "__tenant_acme.cg-1",
+      PatternType.LITERAL, null)
+    val request = buildRequest(req)
+    val auth = authorizerAllowingClusterDescribe()
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(
+      authorizer = Some(auth),
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDescribeAcls(request)
+
+    val response = verifyNoThrottling[DescribeAclsResponse](request)
+    assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED.code, response.data.errorCode)
+    verify(auth, never()).acls(any[AclBindingFilter]())
+  }
+
+  @Test
+  def testDescribeAclsClusterWideListenerScrubsTenantBindingsFromWildcard(): Unit = {
+    // L2: a legitimate wildcard / ResourceType.ANY filter is allowed through
+    // (this is the inherent reach of cluster admin), but the response is
+    // scrubbed of any AclBinding whose pattern name or principal lives in a
+    // tenant namespace. Mix tenant + neutral bindings; only the neutral entry
+    // appears in the response.
+    val req = describeAclsRequest(ResourceType.ANY, null, PatternType.ANY, null)
+    val request = buildRequest(req)
+    val auth = authorizerAllowingClusterDescribe()
+
+    val bindings = util.Arrays.asList(
+      aclBinding(ResourceType.TOPIC, "acme.orders", PatternType.LITERAL, "User:bob"),
+      aclBinding(ResourceType.TOPIC, "plain-topic", PatternType.LITERAL, "User:bob"),
+      aclBinding(ResourceType.GROUP, "__tenant_acme.cg-1", PatternType.LITERAL, "User:bob"),
+      aclBinding(ResourceType.TOPIC, "neutral-2", PatternType.LITERAL, "User:__tenant_acme.alice"))
+    when(auth.acls(any[AclBindingFilter]())).thenReturn(bindings)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(
+      authorizer = Some(auth),
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDescribeAcls(request)
+
+    val response = verifyNoThrottling[DescribeAclsResponse](request)
+    assertEquals(Errors.NONE.code, response.data.errorCode)
+    // 4 bindings in → 1 binding out (plain-topic with User:bob). The tenant
+    // topic, tenant group, and tenant-principal-targeted entries are scrubbed.
+    val flattened = response.data.resources.asScala.flatMap { r =>
+      r.acls.asScala.map(a => (r.resourceType, r.resourceName, a.principal))
+    }.toSet
+    assertEquals(Set((ResourceType.TOPIC.code, "plain-topic", "User:bob")), flattened,
+      "wildcard response must scrub every tenant-namespaced binding")
+  }
+
+  @Test
+  def testDescribeAclsClusterWideListenerNeutralFilterPassesThrough(): Unit = {
+    // A neutral LITERAL filter (no tenant namespace in either pattern name or
+    // principal) passes L1 and returns its bindings unscrubbed.
+    val req = describeAclsRequest(ResourceType.TOPIC, "plain-topic",
+      PatternType.LITERAL, "User:bob")
+    val request = buildRequest(req)
+    val auth = authorizerAllowingClusterDescribe()
+    val bindings = util.Arrays.asList(
+      aclBinding(ResourceType.TOPIC, "plain-topic", PatternType.LITERAL, "User:bob"))
+    when(auth.acls(any[AclBindingFilter]())).thenReturn(bindings)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(
+      authorizer = Some(auth),
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDescribeAcls(request)
+
+    val response = verifyNoThrottling[DescribeAclsResponse](request)
+    assertEquals(Errors.NONE.code, response.data.errorCode)
+    assertEquals(1, response.data.resources.size)
+    assertEquals("plain-topic", response.data.resources.get(0).resourceName)
+  }
+
+  @Test
+  def testDescribeAclsClusterWideListenerUnknownTenantPrincipalOpaque(): Unit = {
+    // `__tenant_unknown.bob` doesn't match any KNOWN tenant id, so the
+    // reserved-namespace helpers short-circuit to false. The filter is treated
+    // as a regular principal probe — passes L1, response unscrubbed. Mirrors
+    // CreateAcls behaviour for unknown tenant ids and keeps cluster admin
+    // tooling working when a stale tenant id is queried.
+    val req = describeAclsRequest(ResourceType.ANY, null, PatternType.ANY,
+      "User:__tenant_unknown.bob")
+    val request = buildRequest(req)
+    val auth = authorizerAllowingClusterDescribe()
+    val bindings = util.Arrays.asList(
+      aclBinding(ResourceType.TOPIC, "plain-topic", PatternType.LITERAL,
+        "User:__tenant_unknown.bob"))
+    when(auth.acls(any[AclBindingFilter]())).thenReturn(bindings)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(
+      authorizer = Some(auth),
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDescribeAcls(request)
+
+    val response = verifyNoThrottling[DescribeAclsResponse](request)
+    assertEquals(Errors.NONE.code, response.data.errorCode)
+    assertEquals(1, response.data.resources.size,
+      "unknown-tenant principal must be opaque (not scrubbed, not refused)")
+  }
+
+  @Test
+  def testDescribeAclsTenantListenerBypassesGuardAndReturnsBindings(): Unit = {
+    // A tenant principal on the tenant listener: handleDescribeAcls bypasses
+    // the L1/L2 guards (their own namespace is not foreign to them) and
+    // delegates straight to AclApis. authorizeClusterOperation(DESCRIBE) still
+    // applies inside AclApis, so the Authorizer is consulted; we ALLOW it for
+    // the test to ensure delegation works end-to-end without the guard
+    // erroneously firing on a tenant caller.
+    val req = describeAclsRequest(ResourceType.TOPIC, "acme.orders",
+      PatternType.LITERAL, null)
+    val request = buildRequest(
+      req,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+    val auth = authorizerAllowingClusterDescribe()
+    val bindings = util.Arrays.asList(
+      aclBinding(ResourceType.TOPIC, "acme.orders", PatternType.LITERAL, "User:bob"))
+    when(auth.acls(any[AclBindingFilter]())).thenReturn(bindings)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(
+      authorizer = Some(auth),
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDescribeAcls(request)
+
+    val response = verifyNoThrottling[DescribeAclsResponse](request)
+    assertEquals(Errors.NONE.code, response.data.errorCode,
+      "tenant caller must not be refused on its own namespace")
+    assertEquals(1, response.data.resources.size,
+      "tenant caller must see bindings for its own namespace")
   }
 
   @Test

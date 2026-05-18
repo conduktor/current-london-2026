@@ -55,7 +55,13 @@ class AclApis(authHelper: AuthHelper,
 
   def close(): Unit = alterAclsPurgatory.shutdown()
 
-  def handleDescribeAcls(request: RequestChannel.Request): CompletableFuture[Unit] = {
+  // postFilter is the tenant-leak scrub: KafkaApis passes a predicate that
+  // returns false for AclBindings naming a reserved tenant namespace, so a
+  // cluster-wide caller running a wildcard / ResourceType.ANY filter does not
+  // receive a free dump of tenant ACLs. The default is `_ => true` (no scrub)
+  // so non-tenant deployments and tests calling AclApis directly are unchanged.
+  def handleDescribeAcls(request: RequestChannel.Request,
+                         postFilter: AclBinding => Boolean = _ => true): CompletableFuture[Unit] = {
     authHelper.authorizeClusterOperation(request, DESCRIBE)
     val describeAclsRequest = request.body[DescribeAclsRequest]
     authorizer match {
@@ -68,10 +74,12 @@ class AclApis(authHelper: AuthHelper,
           describeAclsRequest.version))
       case Some(auth) =>
         val filter = describeAclsRequest.filter
+        val scrubbed = new util.ArrayList[AclBinding]()
+        auth.acls(filter).forEach { b => if (postFilter(b)) scrubbed.add(b) }
         requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
           new DescribeAclsResponse(new DescribeAclsResponseData()
             .setThrottleTimeMs(requestThrottleMs)
-            .setResources(DescribeAclsResponse.aclsResources(auth.acls(filter))),
+            .setResources(DescribeAclsResponse.aclsResources(scrubbed)),
           describeAclsRequest.version))
     }
     CompletableFuture.completedFuture[Unit](())

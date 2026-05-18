@@ -27,7 +27,7 @@ import kafka.utils.Logging
 import org.apache.kafka.admin.AdminUtils
 import org.apache.kafka.clients.CommonClientConfigs
 import org.apache.kafka.clients.admin.EndpointType
-import org.apache.kafka.common.acl.AclOperation
+import org.apache.kafka.common.acl.{AclBinding, AclOperation}
 import org.apache.kafka.common.acl.AclOperation._
 import org.apache.kafka.common.config.ConfigResource
 import org.apache.kafka.common.errors._
@@ -3839,8 +3839,107 @@ class KafkaApis(val requestChannel: RequestChannel,
     }
   }
 
+  // DESCRIBE_ACLS — tenant existence-oracle + namespace-enumeration guard.
+  //
+  // The stock handler accepts any AclBindingFilter and returns every matching
+  // binding. With multi-tenancy that is a triple leak for a cluster-wide caller:
+  //
+  //  1. EXISTENCE ORACLE: a LITERAL filter on `Topic:acme.orders` returns the
+  //     ACL bindings if the topic exists — telling the caller which tenants
+  //     own which logical topic names. The same probe on a USER/GROUP/TXN
+  //     resource of form `__tenant_acme.alice` enumerates tenant principals,
+  //     consumer groups, and transactional ids.
+  //  2. PREFIX ENUMERATION: a PREFIXED filter on `acme.` (TOPIC) or
+  //     `__tenant_acme.` (GROUP/TXN/USER) dumps every binding under the
+  //     tenant's namespace.
+  //  3. WILDCARD DUMP: a ResourceType.ANY / null-name filter — the caller's
+  //     legitimate cluster admin reach — returns every binding in the cluster
+  //     unscrubbed, including every tenant binding.
+  //
+  // Two-layer defense, matching the pattern used by handleCreateAclsRequest /
+  // handleDeleteAclsRequest:
+  //
+  //  L1 (filter validation): refuse with CLUSTER_AUTHORIZATION_FAILED if the
+  //     filter EXPLICITLY NAMES a known tenant namespace via the patternFilter
+  //     (TOPIC + reserved-topic name; GROUP/TXN/USER + reserved-principal
+  //     name) or via the entryFilter principal (`User:__tenant_<known>.*`).
+  //     This closes the existence-oracle and prefix-enumeration vectors.
+  //  L2 (response scrub): for wildcard / ResourceType.ANY queries (which we
+  //     intentionally let through — they are the inherent reach of cluster
+  //     admin), pass a scrub predicate down to AclApis that drops every
+  //     binding whose pattern name or ACE principal lives in a tenant
+  //     namespace before the response is serialized.
+  //
+  // Tenant callers (effectiveTenant.isPresent) bypass this guard: their
+  // authorizeClusterOperation(DESCRIBE) inside AclApis already gates the API,
+  // and any LITERAL name a tenant queries is part of their own namespace —
+  // no cross-tenant leak is possible from a tenant principal.
+  //
+  // When no tenants are configured (tenantConfig.allTenants is empty) the
+  // guards are no-ops (isReservedTenantNamespace / isReservedTenantPrincipalNamespace
+  // both short-circuit on empty knownTenants) and behaviour matches stock Kafka.
   def handleDescribeAcls(request: RequestChannel.Request): Unit = {
-    aclApis.handleDescribeAcls(request)
+    val tenantCtx = tenantContextFor(request)
+    if (tenantCtx.effectiveTenant.isPresent) {
+      aclApis.handleDescribeAcls(request)
+      return
+    }
+
+    val describeReq = request.body[DescribeAclsRequest]
+    val filter = describeReq.filter
+    val patternFilter = filter.patternFilter
+    val entryFilter = filter.entryFilter
+    val filterName = patternFilter.name
+    val filterRT = patternFilter.resourceType
+    val filterPrincipal = entryFilter.principal
+
+    // L1: a non-null name on a tenant-scoped resource type that lands in a
+    // reserved tenant namespace is refused outright. ResourceType.ANY with a
+    // tenant-looking name is also refused (the caller is asking the server
+    // to test the name against every resource type — which is itself an
+    // oracle).
+    val topicFilterNamesForeignTenant =
+      filterName != null &&
+        (filterRT == ResourceType.TOPIC || filterRT == ResourceType.ANY) &&
+        isReservedTenantNamespace(filterName)
+    val principalScopedFilterNamesForeignTenant =
+      filterName != null &&
+        (filterRT == ResourceType.GROUP ||
+          filterRT == ResourceType.TRANSACTIONAL_ID ||
+          filterRT == ResourceType.USER ||
+          filterRT == ResourceType.ANY) &&
+        isReservedTenantPrincipalNamespace(filterName)
+    val entryFilterTargetsForeignTenantPrincipal =
+      isReservedUserPrincipalLiteral(filterPrincipal)
+
+    if (topicFilterNamesForeignTenant ||
+        principalScopedFilterNamesForeignTenant ||
+        entryFilterTargetsForeignTenantPrincipal) {
+      requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
+        new DescribeAclsResponse(new DescribeAclsResponseData()
+          .setErrorCode(Errors.CLUSTER_AUTHORIZATION_FAILED.code)
+          .setErrorMessage("Filter names a reserved tenant namespace")
+          .setThrottleTimeMs(requestThrottleMs),
+          describeReq.version))
+      return
+    }
+
+    // L2: defense-in-depth scrub of any tenant-owned binding from the
+    // serialized response. Reuses the same reserved-namespace helpers so the
+    // L1 filter check and L2 binding check stay in lock-step.
+    def isForeignTenantBinding(b: AclBinding): Boolean = {
+      val pattern = b.pattern
+      val name = pattern.name
+      val rt = pattern.resourceType
+      val byPatternName =
+        (rt == ResourceType.TOPIC && isReservedTenantNamespace(name)) ||
+          ((rt == ResourceType.GROUP ||
+            rt == ResourceType.TRANSACTIONAL_ID ||
+            rt == ResourceType.USER) && isReservedTenantPrincipalNamespace(name))
+      val byPrincipal = isReservedUserPrincipalLiteral(b.entry.principal)
+      byPatternName || byPrincipal
+    }
+    aclApis.handleDescribeAcls(request, b => !isForeignTenantBinding(b))
   }
 
   def handleOffsetForLeaderEpochRequest(request: RequestChannel.Request): Unit = {
