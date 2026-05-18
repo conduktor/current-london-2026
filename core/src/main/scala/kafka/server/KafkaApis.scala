@@ -1335,6 +1335,18 @@ class KafkaApis(val requestChannel: RequestChannel,
     // erroneous bucket after context creation, so the session is built only on
     // tenant-owned partitions.
     val foreignFetchTips = new util.LinkedHashMap[TopicIdPartition, FetchRequest.PartitionData]()
+    // Outside-in pollution guard for non-tenant callers on cluster-wide listeners
+    // (mirror of the Produce/DeleteTopics guards). Without it, a `User:* READ
+    // Topic:*` cluster admin could drain tenant logs by naming `acme.orders`
+    // directly: tenantScoped is false (non-tenant principal), the normalise
+    // step is skipped, and rawFetchData flows straight into the authz/metadata
+    // check — which a permissive ACL passes. Surface reserved-prefix entries
+    // as UNKNOWN_TOPIC_OR_PARTITION (via foreignFetchTips → foreignErroneous
+    // below) so the response is indistinguishable from a real miss; this
+    // closes both the data leak and the existence oracle. Follower fetches
+    // are skipped (inter-broker traffic legitimately addresses physical names
+    // and is already gated on CLUSTER_ACTION).
+    val outsideInGuardActive = !tenantScoped && !fetchRequest.isFromFollower && !tenantConfig.allTenants.isEmpty
     val fetchData = if (tenantScoped) {
       val rewritten = new util.LinkedHashMap[TopicIdPartition, FetchRequest.PartitionData](rawFetchData.size)
       rawFetchData.forEach { (tip, data) =>
@@ -1344,6 +1356,13 @@ class KafkaApis(val requestChannel: RequestChannel,
         }
       }
       rewritten
+    } else if (outsideInGuardActive) {
+      val kept = new util.LinkedHashMap[TopicIdPartition, FetchRequest.PartitionData](rawFetchData.size)
+      rawFetchData.forEach { (tip, data) =>
+        if (tip.topic != null && isReservedTenantNamespace(tip.topic)) foreignFetchTips.put(tip, data)
+        else kept.put(tip, data)
+      }
+      kept
     } else rawFetchData
     val forgottenTopics = if (tenantScoped) {
       val rewritten = new util.ArrayList[TopicIdPartition](rawForgottenTopics.size)

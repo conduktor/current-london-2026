@@ -3712,7 +3712,8 @@ class KafkaApisTest extends Logging {
       any[Boolean],
       any[util.Map[TopicIdPartition, FetchRequest.PartitionData]],
       any[util.List[TopicIdPartition]],
-      any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+      any[util.Map[Uuid, String]],
+      any[Option[String]])).thenReturn(fetchContext)
 
     when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
       any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
@@ -3760,13 +3761,14 @@ class KafkaApisTest extends Logging {
       fetchMetadata, fetchData, true, replicaId >= 0)
     // We expect to have the resolved partition, but we will simulate an unknown one with the fetchContext we return.
     when(fetchManager.newContext(
-      ApiKeys.FETCH.latestVersion,
-      fetchMetadata,
-      replicaId >= 0,
-      Collections.singletonMap(foo, new FetchRequest.PartitionData(foo.topicId, 0, 0, 1000, Optional.empty())),
-      Collections.emptyList[TopicIdPartition],
-      metadataCache.topicIdsToNames())
-    ).thenReturn(fetchContext)
+      ArgumentMatchers.eq[Short](ApiKeys.FETCH.latestVersion),
+      ArgumentMatchers.eq(fetchMetadata),
+      ArgumentMatchers.eq(replicaId >= 0),
+      ArgumentMatchers.eq(Collections.singletonMap(foo, new FetchRequest.PartitionData(foo.topicId, 0, 0, 1000, Optional.empty()))),
+      ArgumentMatchers.eq(Collections.emptyList[TopicIdPartition]),
+      ArgumentMatchers.eq(metadataCache.topicIdsToNames()),
+      any[Option[String]]
+    )).thenReturn(fetchContext)
 
     when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
       any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
@@ -3835,7 +3837,8 @@ class KafkaApisTest extends Logging {
       any[Boolean],
       any[util.Map[TopicIdPartition, FetchRequest.PartitionData]],
       any[util.List[TopicIdPartition]],
-      any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+      any[util.Map[Uuid, String]],
+      any[Option[String]])).thenReturn(fetchContext)
 
     when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
       any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
@@ -8799,7 +8802,8 @@ class KafkaApisTest extends Logging {
       any[Boolean],
       any[util.Map[TopicIdPartition, FetchRequest.PartitionData]],
       any[util.List[TopicIdPartition]],
-      any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+      any[util.Map[Uuid, String]],
+      any[Option[String]])).thenReturn(fetchContext)
 
     when(replicaManager.getLogConfig(ArgumentMatchers.eq(tp0))).thenReturn(None)
     when(replicaManager.isAddingReplica(any(), anyInt)).thenReturn(isReassigning)
@@ -11405,7 +11409,8 @@ class KafkaApisTest extends Logging {
       any[Short], any[JFetchMetadata], any[Boolean],
       any[util.Map[TopicIdPartition, FetchRequest.PartitionData]],
       any[util.List[TopicIdPartition]],
-      any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+      any[util.Map[Uuid, String]],
+      any[Option[String]])).thenReturn(fetchContext)
     when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
       any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
 
@@ -11449,7 +11454,8 @@ class KafkaApisTest extends Logging {
       any[Short], any[JFetchMetadata], any[Boolean],
       any[util.Map[TopicIdPartition, FetchRequest.PartitionData]],
       any[util.List[TopicIdPartition]],
-      any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+      any[util.Map[Uuid, String]],
+      any[Option[String]])).thenReturn(fetchContext)
     when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
       any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
 
@@ -11496,7 +11502,8 @@ class KafkaApisTest extends Logging {
       any[Short], any[JFetchMetadata], any[Boolean],
       newContextFetchDataCaptor.capture(),
       any[util.List[TopicIdPartition]],
-      any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+      any[util.Map[Uuid, String]],
+      any[Option[String]])).thenReturn(fetchContext)
     when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
       any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
 
@@ -11548,7 +11555,8 @@ class KafkaApisTest extends Logging {
       any[Short], any[JFetchMetadata], any[Boolean],
       newContextFetchDataCaptor.capture(),
       any[util.List[TopicIdPartition]],
-      any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+      any[util.Map[Uuid, String]],
+      any[Option[String]])).thenReturn(fetchContext)
     when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
       any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
 
@@ -11594,7 +11602,8 @@ class KafkaApisTest extends Logging {
       any[Short], any[JFetchMetadata], any[Boolean],
       any[util.Map[TopicIdPartition, FetchRequest.PartitionData]],
       forgottenCaptor.capture(),
-      any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+      any[util.Map[Uuid, String]],
+      any[Option[String]])).thenReturn(fetchContext)
     when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
       any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
 
@@ -11649,6 +11658,93 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testFetchClusterWideCallerRefusesTenantReservedPhysicalForm(): Unit = {
+    // Outside-in pollution guard for Fetch (mirror of the Produce / DeleteTopics
+    // guards). A non-tenant principal on the cluster-wide listener naming
+    // `acme.orders` directly would otherwise reach the authz/metadata stage —
+    // and a typical `User:* READ Topic:*` cluster-admin ACL passes that. With
+    // the guard, the reserved TIP is bucketed into foreignFetchTips before
+    // fetchManager.newContext, surfaces as UNKNOWN_TOPIC_OR_PARTITION (the same
+    // shape as a real miss → no existence oracle), and is never fetched. The
+    // TIP must also be kept out of the session map: otherwise an incremental
+    // fetch on the same session would later iterate it via foreachPartition
+    // with no per-request foreign marker, recreating the leak.
+    val topicId = Uuid.randomUuid()
+    val physicalTp = new TopicPartition("acme.orders", 0)
+    addTopicToMetadataCache(physicalTp.topic, numPartitions = 1, numBrokers = 1, topicId)
+
+    val emptyFetchData = new util.LinkedHashMap[TopicIdPartition, FetchRequest.PartitionData]()
+    val fetchMetadata = new JFetchMetadata(0, 0)
+    val fetchContext = new FullFetchContext(time, new FetchSessionCacheShard(1000, 100),
+      fetchMetadata, emptyFetchData, true, false)
+    val newContextFetchDataCaptor = ArgumentCaptor.forClass(classOf[util.Map[TopicIdPartition, FetchRequest.PartitionData]])
+    when(fetchManager.newContext(
+      any[Short], any[JFetchMetadata], any[Boolean],
+      newContextFetchDataCaptor.capture(),
+      any[util.List[TopicIdPartition]],
+      any[util.Map[Uuid, String]],
+      any[Option[String]])).thenReturn(fetchContext)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val fetchRequest = buildSingleTopicFetchRequest(topicId, physicalTp)
+    val request = buildRequest(fetchRequest)
+
+    kafkaApis = createKafkaApis(
+      authorizer = None,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleFetchRequest(request)
+
+    assertTrue(newContextFetchDataCaptor.getValue.isEmpty,
+      s"reserved-physical-form TIPs must not enter fetchManager.newContext on the cluster-wide listener; saw ${newContextFetchDataCaptor.getValue.keySet}")
+
+    val response = verifyNoThrottling[FetchResponse](request)
+    val partitionData = response.data.responses.asScala.head.partitions.asScala.head
+    assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION.code, partitionData.errorCode,
+      "non-tenant caller naming a tenant physical topic must see UNKNOWN_TOPIC_OR_PARTITION, identical to a real miss")
+
+    verify(replicaManager, never()).fetchMessages(any(), any(), any(), any())
+  }
+
+  @Test
+  def testFetchClusterWideCallerKeepsDottedNameWhenNoTenantsConfigured(): Unit = {
+    // Without configured tenants, `acme.orders` is just a topic name with a
+    // dot. The outside-in guard must short-circuit so legitimate non-tenant
+    // clusters keep their ability to fetch from any topic. Verified by capturing
+    // the fetchData passed into fetchManager.newContext and asserting the TIP
+    // survived — replicaManager mocking is unnecessary because we stop at the
+    // session boundary.
+    val topicId = Uuid.randomUuid()
+    val tp = new TopicPartition("acme.orders", 0)
+    val tidp = new TopicIdPartition(topicId, tp)
+    addTopicToMetadataCache(tp.topic, numPartitions = 1, numBrokers = 1, topicId)
+
+    val emptyFetchData = new util.LinkedHashMap[TopicIdPartition, FetchRequest.PartitionData]()
+    val fetchMetadata = new JFetchMetadata(0, 0)
+    val fetchContext = new FullFetchContext(time, new FetchSessionCacheShard(1000, 100),
+      fetchMetadata, emptyFetchData, true, false)
+    val newContextFetchDataCaptor = ArgumentCaptor.forClass(classOf[util.Map[TopicIdPartition, FetchRequest.PartitionData]])
+    when(fetchManager.newContext(
+      any[Short], any[JFetchMetadata], any[Boolean],
+      newContextFetchDataCaptor.capture(),
+      any[util.List[TopicIdPartition]],
+      any[util.Map[Uuid, String]],
+      any[Option[String]])).thenReturn(fetchContext)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val fetchRequest = buildSingleTopicFetchRequest(topicId, tp)
+    val request = buildRequest(fetchRequest)
+
+    kafkaApis = createKafkaApis() // no tenantConfig → allTenants is empty
+    kafkaApis.handleFetchRequest(request)
+
+    val capturedFetchData = newContextFetchDataCaptor.getValue
+    assertTrue(capturedFetchData.containsKey(tidp),
+      s"with no tenants configured the dotted TIP must reach fetchManager.newContext; saw ${capturedFetchData.keySet}")
+  }
+
+  @Test
   def testFetchV12TenantResponseTopicFieldIsLogical(): Unit = {
     // Pre-id-fetch (v0-12) carries the Topic string on the wire. The broker
     // must rewrite logical -> physical end-to-end (so sessions, replicaManager
@@ -11691,7 +11787,8 @@ class KafkaApisTest extends Logging {
       any[Short], any[JFetchMetadata], any[Boolean],
       newContextFetchDataCaptor.capture(),
       any[util.List[TopicIdPartition]],
-      any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+      any[util.Map[Uuid, String]],
+      any[Option[String]])).thenReturn(fetchContext)
     when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
       any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
 
