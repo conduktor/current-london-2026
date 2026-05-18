@@ -144,6 +144,45 @@ class FetchRequestParserTest {
     }
 
     @Test
+    void parsesFromEarliestAsOffsetZero() {
+        FetchRequestParser.FetchCommand cmd = FetchRequestParser.parse(
+            "orders", QueryParams.of("partition", "1", "from", "earliest"));
+
+        assertEquals(1, cmd.partition());
+        assertEquals(0L, cmd.offset());
+    }
+
+    @Test
+    void fromAndOffsetAreMutuallyExclusive() {
+        assertThrows(
+            ProduceRequestParser.BadRequestException.class,
+            () -> FetchRequestParser.parse("orders",
+                QueryParams.of("partition", "0", "from", "earliest", "offset", "5")));
+    }
+
+    @Test
+    void fromOnlyAcceptsEarliestForNow() {
+        // from=latest would require a broker round-trip to discover the high watermark before the first fetch; the
+        // v1 single-shot fetch path doesn't carry that machinery. Reject explicitly so it isn't silently treated as
+        // a typo for "earliest" or the default.
+        assertThrows(
+            ProduceRequestParser.BadRequestException.class,
+            () -> FetchRequestParser.parse("orders", QueryParams.of("partition", "0", "from", "latest")));
+        assertThrows(
+            ProduceRequestParser.BadRequestException.class,
+            () -> FetchRequestParser.parse("orders", QueryParams.of("partition", "0", "from", "gibberish")));
+    }
+
+    @Test
+    void cursorAndFromAreMutuallyExclusive() {
+        String cursor = CursorCodec.encode("orders", 0, 0);
+        assertThrows(
+            ProduceRequestParser.BadRequestException.class,
+            () -> FetchRequestParser.parse("orders",
+                QueryParams.of("cursor", cursor, "from", "earliest")));
+    }
+
+    @Test
     void blankParamsBehaveAsMissing() {
         // Empty string is what some clients send when an input is absent — treat as "not present".
         assertFalse(QueryParams.of("partition", "").get("partition").isPresent());

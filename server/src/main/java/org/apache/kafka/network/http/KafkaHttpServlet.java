@@ -56,10 +56,12 @@ public final class KafkaHttpServlet extends HttpServlet {
     private static final String HEADER_RETRY_AFTER = "Retry-After";
 
     private final KafkaHttpBridge bridge;
+    private final RequestSubmitter submitter;
     private final ObjectMapper mapper;
 
-    public KafkaHttpServlet(KafkaHttpBridge bridge, ObjectMapper mapper) {
+    public KafkaHttpServlet(KafkaHttpBridge bridge, RequestSubmitter submitter, ObjectMapper mapper) {
         this.bridge = Objects.requireNonNull(bridge, "bridge must not be null");
+        this.submitter = Objects.requireNonNull(submitter, "submitter must not be null");
         this.mapper = Objects.requireNonNull(mapper, "mapper must not be null");
     }
 
@@ -99,8 +101,24 @@ public final class KafkaHttpServlet extends HttpServlet {
         }
 
         QueryParams params = QueryParams.from(req.getParameterMap());
-
         String contentType = ContentTypeNegotiator.resolve(req.getHeader(HEADER_ACCEPT));
+
+        // SSE branches before startAsync: we parse the same fetch command up-front so a malformed query string falls
+        // out as a one-shot 400, not a half-opened event-stream that then immediately errors. After this point the
+        // streamer owns the AsyncContext and the response lifetime.
+        if (ContentTypeNegotiator.TEXT_EVENT_STREAM.equals(contentType)) {
+            FetchRequestParser.FetchCommand command;
+            try {
+                command = FetchRequestParser.parse(topic, params);
+            } catch (ProduceRequestParser.BadRequestException e) {
+                writeBadRequest(resp, e.getMessage());
+                return;
+            }
+            AsyncContext async = req.startAsync();
+            SseStreamer.start(async, submitter, mapper, command);
+            return;
+        }
+
         AsyncContext async = req.startAsync();
         bridge.fetch(topic, params).whenComplete((response, throwable) ->
             writeResponseAndComplete(async, response, throwable, contentType));

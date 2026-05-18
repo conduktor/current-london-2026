@@ -635,7 +635,8 @@ class BrokerServer(
           topicIdLookup = name => metadataCache.getTopicId(name)
         )
         val bridge = new KafkaHttpBridge(new ObjectMapper(), submitter)
-        httpBridgeServer = new KafkaHttpServer(config.httpBridgeHost, config.httpBridgePort, bridge, new ObjectMapper())
+        httpBridgeServer = new KafkaHttpServer(
+          config.httpBridgeHost, config.httpBridgePort, bridge, submitter, new ObjectMapper())
         httpBridgeServer.start()
         info(s"HTTP bridge listening on ${config.httpBridgeHost}:${httpBridgeServer.boundPort()}")
         warn("HTTP bridge is running every request as KafkaPrincipal.ANONYMOUS. There is no per-request " +

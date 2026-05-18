@@ -46,13 +46,14 @@ public final class FetchRequestParser {
         Optional<String> cursor = query.get("cursor");
         Optional<String> partition = query.get("partition");
         Optional<String> offset = query.get("offset");
+        Optional<String> from = query.get("from");
 
         int partitionValue;
         long offsetValue;
         if (cursor.isPresent()) {
-            if (partition.isPresent() || offset.isPresent()) {
+            if (partition.isPresent() || offset.isPresent() || from.isPresent()) {
                 throw new ProduceRequestParser.BadRequestException(
-                    "cursor is mutually exclusive with partition / offset");
+                    "cursor is mutually exclusive with partition / offset / from");
             }
             CursorCodec.Cursor c = decodeCursor(cursor.get());
             if (!c.topic().equals(topic)) {
@@ -63,11 +64,34 @@ public final class FetchRequestParser {
             offsetValue = c.offset();
         } else {
             partitionValue = readPartition(partition);
-            offsetValue = readOffset(offset);
+            offsetValue = readStartOffset(offset, from);
         }
 
         OptionalInt maxBytes = readMaxBytes(query.get("max_bytes"));
         return new FetchCommand(topic, partitionValue, offsetValue, maxBytes);
+    }
+
+    /**
+     * Resolves the starting offset. Either an explicit numeric {@code offset}, or {@code from=earliest} (offset 0).
+     * The two are mutually exclusive: a client that asks for both is being ambiguous, not redundant.
+     *
+     * <p>{@code from=latest} is intentionally not supported yet — it requires a round-trip to discover the current
+     * high watermark before the first fetch, which the v1 single-shot fetch path doesn't need. SSE-mode clients that
+     * want "only new records" can omit historic catch-up by passing the high watermark as an explicit offset.
+     */
+    private static long readStartOffset(Optional<String> offset, Optional<String> from) {
+        if (offset.isPresent() && from.isPresent()) {
+            throw new ProduceRequestParser.BadRequestException("offset and from are mutually exclusive");
+        }
+        if (from.isPresent()) {
+            String value = from.get();
+            if ("earliest".equalsIgnoreCase(value)) {
+                return 0L;
+            }
+            throw new ProduceRequestParser.BadRequestException(
+                "from must be 'earliest' (got '" + value + "')");
+        }
+        return readOffset(offset);
     }
 
     private static CursorCodec.Cursor decodeCursor(String cursor) {

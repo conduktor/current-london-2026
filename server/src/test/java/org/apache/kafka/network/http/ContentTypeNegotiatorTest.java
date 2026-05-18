@@ -67,4 +67,19 @@ class ContentTypeNegotiatorTest {
         assertEquals("application/json", ContentTypeNegotiator.resolve("application/*"));
         assertEquals("application/json", ContentTypeNegotiator.resolve("text/html"));
     }
+
+    @Test
+    void eventStreamWinsOverHalAndJson() {
+        // SSE is a different wire protocol on the same URL; if the client asks for it, that's what they get even when
+        // they also list JSON / HAL+JSON as fallbacks.
+        assertEquals("text/event-stream", ContentTypeNegotiator.resolve("text/event-stream"));
+        assertEquals("text/event-stream",
+            ContentTypeNegotiator.resolve("text/event-stream, application/json"));
+        assertEquals("text/event-stream",
+            ContentTypeNegotiator.resolve("application/hal+json, text/event-stream"));
+        assertEquals("text/event-stream",
+            ContentTypeNegotiator.resolve("text/event-stream;q=0.9"));
+        assertEquals("text/event-stream",
+            ContentTypeNegotiator.resolve("Text/Event-Stream"));
+    }
 }

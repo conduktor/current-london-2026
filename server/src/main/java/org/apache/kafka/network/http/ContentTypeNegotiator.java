@@ -19,38 +19,52 @@ package org.apache.kafka.network.http;
 /**
  * Picks the {@code Content-Type} for a successful HTTP bridge response from the client's {@code Accept} header.
  *
- * <p>The fetch response body carries HAL-style {@code _links}, so a client may legitimately ask for
- * {@code application/hal+json} (HAL is JSON, but the more specific type signals the body shape contract). When the
- * client explicitly accepts {@code application/hal+json}, we honour it; otherwise we default to
- * {@code application/json} — including for {@code &#42;/&#42;} and absent headers, so existing clients see no change.
+ * <p>Three outputs:
+ * <ul>
+ *   <li>{@link #TEXT_EVENT_STREAM} when the client wants Server-Sent Events — a different wire protocol on the same
+ *       URL. This wins outright: a client asking for {@code text/event-stream} is asking for a streaming response,
+ *       not a one-shot JSON page, so HAL+JSON / JSON preferences don't apply.</li>
+ *   <li>{@link #APPLICATION_HAL_JSON} when the client explicitly lists HAL+JSON anywhere in the Accept list. HAL is
+ *       still JSON, but the more specific media type signals the body-shape contract clients build against.</li>
+ *   <li>{@link #APPLICATION_JSON} for everything else, including absent or wildcard Accept — keeps existing clients
+ *       on the byte-identical response they already see.</li>
+ * </ul>
  *
  * <p>Parsing is deliberately minimal: split on comma, strip parameters after {@code ;}, match the bare media type.
  * Q-values are ignored — a client that lists {@code application/hal+json;q=0.1, application/json;q=0.9} is still given
  * HAL+JSON because the body remains valid JSON either way. We are not building a generic RFC 7231 conneg engine; we are
- * answering one yes/no question about one specific media type.
+ * answering yes/no questions about specific media types.
  */
 final class ContentTypeNegotiator {
 
     static final String APPLICATION_JSON = "application/json";
     static final String APPLICATION_HAL_JSON = "application/hal+json";
+    static final String TEXT_EVENT_STREAM = "text/event-stream";
 
     private ContentTypeNegotiator() { }
 
-    /** Returns {@link #APPLICATION_HAL_JSON} if the client explicitly listed it, otherwise {@link #APPLICATION_JSON}. */
+    /**
+     * Returns {@link #TEXT_EVENT_STREAM} if the client asked for SSE, otherwise {@link #APPLICATION_HAL_JSON} if HAL was
+     * listed, otherwise {@link #APPLICATION_JSON}.
+     */
     static String resolve(String acceptHeader) {
         if (acceptHeader == null || acceptHeader.isEmpty()) {
             return APPLICATION_JSON;
         }
+        boolean sawHal = false;
         for (String range : acceptHeader.split(",")) {
             String mediaType = range.trim();
             int semicolon = mediaType.indexOf(';');
             if (semicolon >= 0) {
                 mediaType = mediaType.substring(0, semicolon).trim();
             }
+            if (TEXT_EVENT_STREAM.equalsIgnoreCase(mediaType)) {
+                return TEXT_EVENT_STREAM;
+            }
             if (APPLICATION_HAL_JSON.equalsIgnoreCase(mediaType)) {
-                return APPLICATION_HAL_JSON;
+                sawHal = true;
             }
         }
-        return APPLICATION_JSON;
+        return sawHal ? APPLICATION_HAL_JSON : APPLICATION_JSON;
     }
 }

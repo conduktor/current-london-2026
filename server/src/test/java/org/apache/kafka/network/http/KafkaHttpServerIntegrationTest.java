@@ -23,18 +23,25 @@ import org.apache.kafka.common.protocol.Errors;
 
 import org.eclipse.jetty.client.ContentResponse;
 import org.eclipse.jetty.client.HttpClient;
+import org.eclipse.jetty.client.InputStreamResponseListener;
 import org.eclipse.jetty.client.Request;
+import org.eclipse.jetty.client.Response;
 import org.eclipse.jetty.client.StringRequestContent;
 import org.eclipse.jetty.http.HttpMethod;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.io.BufferedReader;
+import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -50,7 +57,7 @@ class KafkaHttpServerIntegrationTest {
 
     @BeforeEach
     void setUp() throws Exception {
-        server = new KafkaHttpServer("127.0.0.1", 0, new KafkaHttpBridge(mapper, submitter), mapper);
+        server = new KafkaHttpServer("127.0.0.1", 0, new KafkaHttpBridge(mapper, submitter), submitter, mapper);
         server.start();
         client = new HttpClient();
         client.start();
@@ -265,6 +272,139 @@ class KafkaHttpServerIntegrationTest {
         assertEquals(400, resp.getStatus());
     }
 
+    // ----- SSE -----
+
+    @Test
+    void sseStreamsRecordsAsDataFrames() throws Exception {
+        // PROMPT.md AC6/FS6: GET ?from=earliest with Accept: text/event-stream streams the records as SSE events.
+        // We seed the submitter with two batches: a non-empty first fetch, then an empty page so the streamer loops
+        // into "live tail" mode. The test reads the first two events off the wire and asserts the framing, content,
+        // and id-line; then closes the connection to terminate the streamer.
+        ConcurrentLinkedQueue<RequestSubmitter.FetchResult> queue = new ConcurrentLinkedQueue<>();
+        queue.add(new RequestSubmitter.FetchResult(
+            new FetchResponseFormatter.PartitionFetch(
+                0, Errors.NONE, null, 0, 0, 2,
+                List.of(
+                    new FetchResponseFormatter.FetchedRecord(
+                        0, null, "alpha".getBytes(StandardCharsets.UTF_8), null, 1111L),
+                    new FetchResponseFormatter.FetchedRecord(
+                        1, "k".getBytes(StandardCharsets.UTF_8), "beta".getBytes(StandardCharsets.UTF_8), null, 2222L))),
+            0L));
+        // Second response is empty — streamer should then re-poll and the queue is exhausted, which holds the next
+        // fetch open. That keeps the connection alive long enough for us to assert and then disconnect.
+        queue.add(new RequestSubmitter.FetchResult(
+            new FetchResponseFormatter.PartitionFetch(
+                0, Errors.NONE, null, 2, 0, 2, Collections.emptyList()),
+            0L));
+        submitter.fetchResultQueue = queue;
+
+        InputStreamResponseListener listener = new InputStreamResponseListener();
+        Request request = client.newRequest(url("/v1/topics/orders/records?partition=0&from=earliest"))
+            .method(HttpMethod.GET)
+            .headers(h -> h.put("Accept", "text/event-stream"));
+        request.send(listener);
+        Response response = listener.get(5, TimeUnit.SECONDS);
+        assertEquals(200, response.getStatus());
+        // Jetty appends charset on text/* responses — accept either bare or charset-suffixed.
+        assertTrue(response.getHeaders().get("Content-Type").startsWith("text/event-stream"),
+            "expected text/event-stream content-type, got: " + response.getHeaders().get("Content-Type"));
+
+        try (InputStream body = listener.getInputStream();
+             BufferedReader reader = new BufferedReader(new InputStreamReader(body, StandardCharsets.UTF_8))) {
+            String firstId = null;
+            String firstData = null;
+            String secondId = null;
+            String secondData = null;
+            // Skip past the ": connected" comment and pick out the two data events.
+            String line;
+            int eventsRead = 0;
+            String pendingId = null;
+            while ((line = reader.readLine()) != null && eventsRead < 2) {
+                if (line.startsWith(": ")) {
+                    continue; // comment
+                }
+                if (line.startsWith("id: ")) {
+                    pendingId = line.substring(4);
+                    continue;
+                }
+                if (line.startsWith("data: ")) {
+                    if (eventsRead == 0) {
+                        firstId = pendingId;
+                        firstData = line.substring(6);
+                    } else {
+                        secondId = pendingId;
+                        secondData = line.substring(6);
+                    }
+                    eventsRead++;
+                }
+            }
+            assertEquals("0", firstId, "first event must carry id: 0");
+            assertEquals("1", secondId, "second event must carry id: 1");
+            JsonNode first = asJson(firstData.getBytes(StandardCharsets.UTF_8));
+            assertEquals(0L, first.get("offset").asLong());
+            assertEquals("STRING", first.get("value").get("type").asText());
+            assertEquals("alpha", first.get("value").get("data").asText());
+            JsonNode second = asJson(secondData.getBytes(StandardCharsets.UTF_8));
+            assertEquals(1L, second.get("offset").asLong());
+            assertEquals("k", second.get("key").get("data").asText());
+            assertEquals("beta", second.get("value").get("data").asText());
+        }
+        // Closing the response stream above causes the next servlet write to fail; the streamer detects the
+        // disconnect and completes the AsyncContext. We don't need an explicit teardown here.
+    }
+
+    @Test
+    void sseRejectsMissingPartitionWithBadRequest() throws Exception {
+        // The SSE branch parses the fetch command up-front so a malformed query string falls out as a one-shot 400,
+        // not a half-opened event-stream. Without partition= the parser refuses.
+        ContentResponse resp = client.newRequest(url("/v1/topics/orders/records?from=earliest"))
+            .method(HttpMethod.GET)
+            .headers(h -> h.put("Accept", "text/event-stream"))
+            .send();
+        assertEquals(400, resp.getStatus());
+    }
+
+    @Test
+    void sseSurfacesPartitionErrorAsErrorFrame() throws Exception {
+        // If the first fetch reports a partition-level error, the streamer emits one `event: error` SSE frame and
+        // closes the stream rather than retrying — a streaming consumer that lost its source partition should be
+        // told, not silently spun on.
+        ConcurrentLinkedQueue<RequestSubmitter.FetchResult> queue = new ConcurrentLinkedQueue<>();
+        queue.add(new RequestSubmitter.FetchResult(
+            new FetchResponseFormatter.PartitionFetch(
+                0, Errors.NOT_LEADER_OR_FOLLOWER, "moved", 0, 0, 0, Collections.emptyList()),
+            0L));
+        submitter.fetchResultQueue = queue;
+
+        InputStreamResponseListener listener = new InputStreamResponseListener();
+        client.newRequest(url("/v1/topics/orders/records?partition=0&from=earliest"))
+            .method(HttpMethod.GET)
+            .headers(h -> h.put("Accept", "text/event-stream"))
+            .send(listener);
+        Response response = listener.get(5, TimeUnit.SECONDS);
+        assertEquals(200, response.getStatus());
+
+        try (InputStream body = listener.getInputStream();
+             BufferedReader reader = new BufferedReader(new InputStreamReader(body, StandardCharsets.UTF_8))) {
+            boolean sawErrorEvent = false;
+            String errorData = null;
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if ("event: error".equals(line)) {
+                    sawErrorEvent = true;
+                } else if (sawErrorEvent && line.startsWith("data: ")) {
+                    errorData = line.substring(6);
+                    break;
+                }
+            }
+            assertTrue(sawErrorEvent, "stream must emit `event: error` on a partition-level fetch failure");
+            assertNotNull(errorData);
+            JsonNode payload = asJson(errorData.getBytes(StandardCharsets.UTF_8));
+            assertEquals("NOT_LEADER_OR_FOLLOWER", payload.get("errorCode").asText());
+            assertEquals("moved", payload.get("errorMessage").asText());
+        }
+    }
+
     // ----- routing edge cases -----
 
     @Test
@@ -351,6 +491,10 @@ class KafkaHttpServerIntegrationTest {
         RuntimeException produceFailure;
         CompletableFuture<RequestSubmitter.ProduceResult> produceFutureOverride;
         FetchRequestParser.FetchCommand lastFetch;
+        // SSE flow: each submitFetch returns the next item in this queue. After the queue is exhausted, we return a
+        // never-completing future so the SSE loop blocks waiting — the test then closes the connection to tear it down.
+        java.util.Queue<RequestSubmitter.FetchResult> fetchResultQueue;
+        java.util.List<FetchRequestParser.FetchCommand> fetchCommandLog = new java.util.concurrent.CopyOnWriteArrayList<>();
 
         @Override
         public CompletableFuture<ProduceResult> submitProduce(ProduceRequestParser.ProduceCommand command) {
@@ -368,6 +512,15 @@ class KafkaHttpServerIntegrationTest {
         @Override
         public CompletableFuture<FetchResult> submitFetch(FetchRequestParser.FetchCommand command) {
             this.lastFetch = command;
+            fetchCommandLog.add(command);
+            if (fetchResultQueue != null) {
+                RequestSubmitter.FetchResult next = fetchResultQueue.poll();
+                if (next != null) {
+                    return CompletableFuture.completedFuture(next);
+                }
+                // Queue drained — block the loop. The test closes the response stream to terminate the streamer.
+                return new CompletableFuture<>();
+            }
             return CompletableFuture.completedFuture(fetchResult);
         }
     }
