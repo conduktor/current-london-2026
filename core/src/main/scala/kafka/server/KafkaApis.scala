@@ -659,58 +659,93 @@ class KafkaApis(val requestChannel: RequestChannel,
     // silently mis-attributing records. Lift this restriction (and add proper backing-fetch
     // fan-out) only if operational demand emerges; today no consumer subscribes to two views over
     // one backing partition in one FetchRequest.
+    //
+    // The same invariant must also hold for the asymmetric case where ONE view AND its backing
+    // are requested in a single FetchRequest. Otherwise `rewritten` would contain duplicate
+    // backingTpId entries (one from the view's redirect, one from the direct backing fetch),
+    // which would either be deduped by the replica layer (silently dropping data) or read twice,
+    // and the response callback would apply the view filter to the consumer's direct backing
+    // fetch — leaking the view's identity into a fetch the consumer never asked to be filtered.
+    // We pre-classify entries into "direct" vs "view" in one pass, then route in a second pass
+    // so the order in which the view and its backing appear in the FetchRequest doesn't matter.
     val viewRewrites = mutable.Map[TopicIdPartition, (TopicIdPartition, ViewSpec)]()
     if (!fetchRequest.isFromFollower && interesting.nonEmpty) {
-      val rewritten = new mutable.ArrayBuffer[(TopicIdPartition, FetchRequest.PartitionData)](interesting.size)
-      interesting.foreach { case (viewTpId, data) =>
-        // `routed` tracks whether we already placed viewTpId in either `rewritten` (as itself or
-        // its backing) or `erroneous`. Bookkeeping it locally keeps the outer loop O(n) — an
-        // earlier version scanned `erroneous` with `exists`, which made the whole block O(n²).
-        var routed = false
-        val maybeSpec = try {
-          viewRegistry.viewFor(viewTpId.topic)
+      // First pass: classify each interesting entry. Outcomes per entry:
+      //   - Right(Some(spec))    — entry is a view; route via redirect
+      //   - Right(None)          — entry is a direct (non-view) fetch
+      //   - Left(exception)      — viewFor blew up; reject with INVALID_REQUEST
+      // We materialize the classification map so the second pass can detect collisions between
+      // views' backing TpIds and other entries' direct TpIds regardless of request order.
+      val classified = new mutable.ArrayBuffer[(TopicIdPartition, FetchRequest.PartitionData, Either[Exception, Optional[ViewSpec]])](interesting.size)
+      val directTpIds = mutable.Set[TopicIdPartition]()
+      interesting.foreach { case (tpId, data) =>
+        val result: Either[Exception, Optional[ViewSpec]] = try {
+          Right(viewRegistry.viewFor(tpId.topic))
         } catch {
-          case e: Exception =>
+          case e: Exception => Left(e)
+        }
+        classified += ((tpId, data, result))
+        result match {
+          case Right(opt) if !opt.isPresent => directTpIds.add(tpId)
+          case _ => // view, or threw — not a direct fetch
+        }
+      }
+
+      // Second pass: route. Reuses `viewRewrites` for the multi-view-same-backing detection (unchanged
+      // semantics) and adds a directTpIds membership check for the view-and-backing-same-request case.
+      val rewritten = new mutable.ArrayBuffer[(TopicIdPartition, FetchRequest.PartitionData)](interesting.size)
+      classified.foreach { case (viewTpId, data, classification) =>
+        classification match {
+          case Left(e) =>
             // A malformed view config (predicate compile failure, self-loop) reaching this point
             // means LogConfig validation was bypassed somehow. Fail the fetch cleanly instead of
             // letting the exception escape. WARN (not ERROR) because broker liveness is fine —
             // only this one view is broken, and operators get the same actionable signal.
             warn(s"Failed to load view spec for topic ${viewTpId.topic}; rejecting fetch with INVALID_REQUEST", e)
             erroneous += viewTpId -> FetchResponse.partitionResponse(viewTpId, Errors.INVALID_REQUEST)
-            routed = true
-            Optional.empty[ViewSpec]()
-        }
-        if (maybeSpec.isPresent) {
-          val spec = maybeSpec.get()
-          val backingName = spec.backingTopic()
-          val backingTp = new TopicPartition(backingName, viewTpId.partition)
-          if (!metadataCache.contains(backingTp)) {
-            // The view points at a non-existent (or non-existent-on-this-broker) backing topic.
-            // Surface that as UNKNOWN_TOPIC_OR_PARTITION keyed at the *view* so the consumer
-            // does not learn about the backing topic name.
-            erroneous += viewTpId -> FetchResponse.partitionResponse(viewTpId, Errors.UNKNOWN_TOPIC_OR_PARTITION)
-          } else {
-            val backingTpId = new TopicIdPartition(metadataCache.getTopicId(backingName), backingTp)
-            if (viewRewrites.contains(backingTpId)) {
-              // Collision: another view over the same backing partition is already in this request.
-              // Don't append a duplicate entry to `rewritten` (that would either be deduped by the
-              // replica layer, silently dropping the first fetch's data, or read the backing twice
-              // — both wrong). Reject the colliding view keyed at the *view*'s topic so the consumer
-              // sees a clean error against the name it asked for.
-              val firstViewTpId = viewRewrites(backingTpId)._1
-              warn(s"Fetch rejected: view ${viewTpId.topic} and view ${firstViewTpId.topic} both target backing " +
-                s"partition $backingTp in one FetchRequest. The replica fetch API cannot dispatch this; " +
-                s"failing the second view with INVALID_REQUEST. Issue the views in separate fetch sessions.")
-              erroneous += viewTpId -> FetchResponse.partitionResponse(viewTpId, Errors.INVALID_REQUEST)
+          case Right(maybeSpec) if maybeSpec.isPresent =>
+            val spec = maybeSpec.get()
+            val backingName = spec.backingTopic()
+            val backingTp = new TopicPartition(backingName, viewTpId.partition)
+            if (!metadataCache.contains(backingTp)) {
+              // The view points at a non-existent (or non-existent-on-this-broker) backing topic.
+              // Surface that as UNKNOWN_TOPIC_OR_PARTITION keyed at the *view* so the consumer
+              // does not learn about the backing topic name.
+              erroneous += viewTpId -> FetchResponse.partitionResponse(viewTpId, Errors.UNKNOWN_TOPIC_OR_PARTITION)
             } else {
-              rewritten += backingTpId -> data
-              viewRewrites.put(backingTpId, (viewTpId, spec))
+              val backingTpId = new TopicIdPartition(metadataCache.getTopicId(backingName), backingTp)
+              if (directTpIds.contains(backingTpId)) {
+                // The view redirects to a backing TpId that is ALSO requested directly in this same
+                // FetchRequest. Routing both would produce duplicate backingTpId entries in `rewritten`
+                // (the replica layer is keyed by TopicIdPartition) and the response callback would apply
+                // the view filter to the direct fetch's data — silently filtering bytes the consumer
+                // explicitly asked for unfiltered. Reject the VIEW side (not the direct backing fetch:
+                // the consumer holds READ on the backing topic and is entitled to raw bytes), keyed at
+                // the view's topic so the consumer sees the rejection against the name it asked for.
+                warn(s"Fetch rejected: view ${viewTpId.topic} redirects to backing partition $backingTp " +
+                  s"which is also a direct fetch target in the same FetchRequest. The replica fetch API " +
+                  s"cannot route both; failing the view with INVALID_REQUEST. Issue the view in a separate " +
+                  s"fetch session.")
+                erroneous += viewTpId -> FetchResponse.partitionResponse(viewTpId, Errors.INVALID_REQUEST)
+              } else if (viewRewrites.contains(backingTpId)) {
+                // Collision: another view over the same backing partition is already in this request.
+                // Don't append a duplicate entry to `rewritten` (that would either be deduped by the
+                // replica layer, silently dropping the first fetch's data, or read the backing twice
+                // — both wrong). Reject the colliding view keyed at the *view*'s topic so the consumer
+                // sees a clean error against the name it asked for.
+                val firstViewTpId = viewRewrites(backingTpId)._1
+                warn(s"Fetch rejected: view ${viewTpId.topic} and view ${firstViewTpId.topic} both target backing " +
+                  s"partition $backingTp in one FetchRequest. The replica fetch API cannot dispatch this; " +
+                  s"failing the second view with INVALID_REQUEST. Issue the views in separate fetch sessions.")
+                erroneous += viewTpId -> FetchResponse.partitionResponse(viewTpId, Errors.INVALID_REQUEST)
+              } else {
+                rewritten += backingTpId -> data
+                viewRewrites.put(backingTpId, (viewTpId, spec))
+              }
             }
-          }
-          routed = true
-        }
-        if (!routed) {
-          rewritten += viewTpId -> data
+          case Right(_) =>
+            // Not a view — pass through as a direct fetch.
+            rewritten += viewTpId -> data
         }
       }
       interesting.clear()

@@ -282,6 +282,55 @@ class ViewTopicIntegrationTest extends IntegrationTestHarness {
   }
 
   @Test
+  def testViewAndBackingInSameFetchRejectsView(): Unit = {
+    // A single FetchRequest containing BOTH the view and its backing topic must not produce
+    // duplicate backingTpId entries in the broker's fetch dispatch — otherwise either the
+    // replica layer silently drops one of them or the response callback applies the view
+    // filter to the consumer's direct (READ-on-backing) fetch, leaking the view's identity
+    // into bytes the consumer asked for raw. The broker must reject the VIEW side with
+    // INVALID_REQUEST (preserving the consumer's entitlement to raw backing-topic bytes via
+    // their existing READ ACL on the backing topic).
+    createTopic(backingTopic)
+    createViewTopic(viewTopic, backingTopic, "body.color == 'red'")
+
+    val producer = createProducer()
+    produceColors(producer, Seq("red", "blue", "red", "blue"))
+
+    val consumer = createConsumer(configOverrides = newGroupConfig("view-and-backing-collision"))
+    try {
+      val pView = new TopicPartition(viewTopic, 0)
+      val pBacking = new TopicPartition(backingTopic, 0)
+      consumer.assign(java.util.Arrays.asList(pView, pBacking))
+      consumer.seekToBeginning(java.util.Arrays.asList(pView, pBacking))
+
+      // Drive poll cycles for a bounded window. The broker must reject the fetch on the view
+      // side — surfaced either as an exception out of poll() or as an error code translated to
+      // InvalidRequestException by the consumer. What MUST NOT happen is a silent merge that
+      // returns the view's filtered output keyed at the consumer's direct backing-topic fetch.
+      val deadline = System.currentTimeMillis() + 10_000
+      var caught: Option[Throwable] = None
+      while (caught.isEmpty && System.currentTimeMillis() < deadline) {
+        try {
+          consumer.poll(Duration.ofMillis(500))
+        } catch {
+          case t: Throwable => caught = Some(t)
+        }
+      }
+      assertTrue(caught.isDefined,
+        "expected the consumer to surface the view-and-backing collision (no exception within budget — broker " +
+          "may be silently mis-attributing records or merging fetches)")
+      val chain = causeChain(caught.get)
+      val directlyInvalidRequest = chain.exists(_.isInstanceOf[InvalidRequestException])
+      val wrappedInvalidRequest = chain.exists(t =>
+        Option(t.getMessage).exists(m => m.contains("error code 42") || m.contains("INVALID_REQUEST")))
+      assertTrue(directlyInvalidRequest || wrappedInvalidRequest,
+        s"expected INVALID_REQUEST signal from broker collision-reject, got: ${chain.map(_.toString).mkString(" -> ")}")
+    } finally {
+      consumer.close(Duration.ofSeconds(5))
+    }
+  }
+
+  @Test
   def testViewOverMultiPartitionBacking(): Unit = {
     // Multi-partition: most pre-existing tests are single-partition so the partition mapping
     // (viewTpId.partition -> backingTpId.partition) is never exercised. This test produces with
