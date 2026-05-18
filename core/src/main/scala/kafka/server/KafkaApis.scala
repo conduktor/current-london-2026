@@ -786,28 +786,27 @@ class KafkaApis(val requestChannel: RequestChannel,
           CompletableFuture.completedFuture[Unit](())
         } else {
           offsetCommitRequest.data.setGroupId(physicalGroupId)
-          // Pre-rejected entries (reserved-physical-form topics from this
-          // tenant) bypass auth + coordinator entirely and surface as
-          // UNKNOWN_TOPIC_OR_PARTITION; their topic.name on the response
-          // must stay the LITERAL form the caller sent. We hold them in a
-          // side list AND track their names so the out-rewrite below skips
-          // them — otherwise toLogical("acme", "acme.foo") would strip the
-          // prefix and silently rewrite the caller's literal request.
-          val rejectedLogical = new mutable.ArrayBuffer[OffsetCommitRequestData.OffsetCommitRequestTopic]()
-          val rejectedNames = new util.HashSet[String]()
+          // A tenant submitting a reserved-physical-form topic name (e.g. the
+          // literal "acme.foo" for tenant acme) cannot be satisfied: the name
+          // would round-trip to a physical-physical form, and merging the
+          // per-topic rejection back into a response that may also carry a
+          // legitimate "foo"→"acme.foo" commit would collide on the response
+          // builder's by-name map. Refuse the WHOLE request rather than
+          // partially satisfy and partially reject — the request itself is
+          // malformed. The error response is built before in-rewrite so the
+          // tenant sees the LITERAL names they submitted, not their physical
+          // forms.
+          if (tenantCtx.effectiveTenant.isPresent &&
+              offsetCommitRequest.data.topics.asScala.exists(t => tenantCtx.isReservedPhysicalForm(t.name))) {
+            requestHelper.sendMaybeThrottle(request,
+              offsetCommitRequest.getErrorResponse(new InvalidTopicException(
+                "OffsetCommit refused: one or more topic names use the reserved tenant-prefix form")))
+            return CompletableFuture.completedFuture[Unit](())
+          }
           if (tenantCtx.effectiveTenant.isPresent) {
-            val accepted = new util.ArrayList[OffsetCommitRequestData.OffsetCommitRequestTopic]()
             offsetCommitRequest.data.topics.forEach { topic =>
-              try {
-                topic.setName(tenantCtx.toPhysical(topic.name))
-                accepted.add(topic)
-              } catch {
-                case _: org.apache.kafka.common.errors.InvalidTopicException =>
-                  rejectedLogical += topic
-                  rejectedNames.add(topic.name)
-              }
+              topic.setName(tenantCtx.toPhysical(topic.name))
             }
-            offsetCommitRequest.data.setTopics(accepted)
           }
 
           val authorizedTopics = authHelper.filterByAuthorized(
@@ -848,18 +847,9 @@ class KafkaApis(val requestChannel: RequestChannel,
             }
           }
 
-          // Reserved-form topic names the tenant submitted: per-topic
-          // UNKNOWN_TOPIC_OR_PARTITION, keyed by the LOGICAL name (already
-          // unmodified in rejectedLogical), so the rejection wire form
-          // matches what the client sent.
-          rejectedLogical.foreach { topic =>
-            responseBuilder.addPartitions[OffsetCommitRequestData.OffsetCommitRequestPartition](
-              topic.name, topic.partitions, _.partitionIndex, Errors.UNKNOWN_TOPIC_OR_PARTITION)
-          }
-
           if (authorizedTopicsRequest.isEmpty) {
             val response = responseBuilder.build()
-            rewriteOffsetCommitResponseToLogical(response, tenantCtx, rejectedNames)
+            rewriteOffsetCommitResponseToLogical(response, tenantCtx)
             requestHelper.sendMaybeThrottle(request, response)
             CompletableFuture.completedFuture(())
           } else {
@@ -870,8 +860,7 @@ class KafkaApis(val requestChannel: RequestChannel,
               authorizedTopicsRequest,
               responseBuilder,
               requestLocal,
-              tenantCtx,
-              rejectedNames
+              tenantCtx
             )
           }
         }
@@ -881,20 +870,15 @@ class KafkaApis(val requestChannel: RequestChannel,
   // Rewrite physical topic names back to the LOGICAL form the tenant sent,
   // and drop the tenant prefix from anything still wearing it (including
   // partial coordinator failures that may quote the physical name).
-  // {@code skipNames} carries the LITERAL names the caller already echoed
-  // back unchanged (reserved-physical-form rejections); we must not run
-  // toLogical on them or "acme.foo" would silently become "foo".
+  // Reserved-form requests are refused upfront (see handleOffsetCommitRequest)
+  // so every name reaching here is either a real physical topic in this
+  // tenant's namespace or an internal topic that toLogical leaves untouched.
   private def rewriteOffsetCommitResponseToLogical(
     response: OffsetCommitResponse,
-    tenantCtx: TenantContext,
-    skipNames: util.Set[String]
+    tenantCtx: TenantContext
   ): Unit = {
     if (!tenantCtx.effectiveTenant.isPresent) return
-    response.data().topics().forEach { t =>
-      if (!skipNames.contains(t.name)) {
-        t.setName(tenantCtx.toLogical(t.name))
-      }
-    }
+    response.data().topics().forEach(t => t.setName(tenantCtx.toLogical(t.name)))
   }
 
   private def commitOffsetsToCoordinator(
@@ -903,8 +887,7 @@ class KafkaApis(val requestChannel: RequestChannel,
     authorizedTopicsRequest: mutable.ArrayBuffer[OffsetCommitRequestData.OffsetCommitRequestTopic],
     responseBuilder: OffsetCommitResponse.Builder,
     requestLocal: RequestLocal,
-    tenantCtx: TenantContext,
-    rejectedNames: util.Set[String]
+    tenantCtx: TenantContext
   ): CompletableFuture[Unit] = {
     val offsetCommitRequestData = new OffsetCommitRequestData()
       .setGroupId(offsetCommitRequest.data.groupId)
@@ -924,11 +907,11 @@ class KafkaApis(val requestChannel: RequestChannel,
         // only carries shape — no topic names from coordinator state. Still
         // run the out-rewrite for symmetry with the success path.
         val errResponse = offsetCommitRequest.getErrorResponse(exception)
-        rewriteOffsetCommitResponseToLogical(errResponse, tenantCtx, rejectedNames)
+        rewriteOffsetCommitResponseToLogical(errResponse, tenantCtx)
         requestHelper.sendMaybeThrottle(request, errResponse)
       } else {
         val response = responseBuilder.merge(results).build()
-        rewriteOffsetCommitResponseToLogical(response, tenantCtx, rejectedNames)
+        rewriteOffsetCommitResponseToLogical(response, tenantCtx)
         requestHelper.sendMaybeThrottle(request, response)
       }
     }
@@ -2149,6 +2132,25 @@ class KafkaApis(val requestChannel: RequestChannel,
     }
   }
 
+  // Per-key rewrite for FindCoordinator. Identity for non-GROUP key types and
+  // for non-tenant callers. For a tenant GROUP key, returns Left(error) if
+  // the logical key carries a cross-tenant `__tenant_<other>.` prefix or any
+  // reserved-prefix-without-separator shape (the same defensive rejection
+  // `rewriteTenantGroupId` applies in the other handlers). Without this guard
+  // a single bad key in a multi-key v4+ request would surface as a request-
+  // level exception instead of per-key GROUP_AUTHORIZATION_FAILED.
+  private def rewriteFindCoordinatorKey(
+    tenantCtx: TenantContext,
+    keyType: Byte,
+    logicalKey: String
+  ): Either[Errors, String] = {
+    if (keyType != CoordinatorType.GROUP.id) return Right(logicalKey)
+    try Right(tenantCtx.toPhysicalGroup(logicalKey))
+    catch {
+      case _: IllegalArgumentException => Left(Errors.GROUP_AUTHORIZATION_FAILED)
+    }
+  }
+
   private def handleFindCoordinatorRequestV4AndAbove(request: RequestChannel.Request): Unit = {
     val findCoordinatorRequest = request.body[FindCoordinatorRequest]
     val tenantCtx = tenantContextFor(request)
@@ -2165,17 +2167,27 @@ class KafkaApis(val requestChannel: RequestChannel,
             .setNodeId(Node.noNode.id)
             .setPort(Node.noNode.port)
         case None =>
-          val physicalKey =
-            if (keyType == CoordinatorType.GROUP.id) tenantCtx.toPhysicalGroup(logicalKey)
-            else logicalKey
-          val (error, node) = getCoordinator(request, keyType, physicalKey)
-          new FindCoordinatorResponseData.Coordinator()
-            // Echo the LOGICAL key back — the tenant never sees the physical form.
-            .setKey(logicalKey)
-            .setErrorCode(error.code)
-            .setHost(node.host)
-            .setNodeId(node.id)
-            .setPort(node.port)
+          rewriteFindCoordinatorKey(tenantCtx, keyType, logicalKey) match {
+            case Left(keyErr) =>
+              // Cross-tenant prefix attempt — refuse with the auth-shape error
+              // for this key, never letting toPhysicalGroup's exception bubble
+              // out and fail the whole multi-key request.
+              new FindCoordinatorResponseData.Coordinator()
+                .setKey(logicalKey)
+                .setErrorCode(keyErr.code)
+                .setHost(Node.noNode.host)
+                .setNodeId(Node.noNode.id)
+                .setPort(Node.noNode.port)
+            case Right(physicalKey) =>
+              val (error, node) = getCoordinator(request, keyType, physicalKey)
+              new FindCoordinatorResponseData.Coordinator()
+                // Echo the LOGICAL key back — the tenant never sees the physical form.
+                .setKey(logicalKey)
+                .setErrorCode(error.code)
+                .setHost(node.host)
+                .setNodeId(node.id)
+                .setPort(node.port)
+          }
       }
     }
     def createResponse(requestThrottleMs: Int): AbstractResponse = {
@@ -2199,10 +2211,10 @@ class KafkaApis(val requestChannel: RequestChannel,
     val (error, node) = tenantReject match {
       case Some(err) => (err, Node.noNode)
       case None =>
-        val physicalKey =
-          if (keyType == CoordinatorType.GROUP.id) tenantCtx.toPhysicalGroup(findCoordinatorRequest.data.key)
-          else findCoordinatorRequest.data.key
-        getCoordinator(request, keyType, physicalKey)
+        rewriteFindCoordinatorKey(tenantCtx, keyType, findCoordinatorRequest.data.key) match {
+          case Left(keyErr) => (keyErr, Node.noNode)
+          case Right(physicalKey) => getCoordinator(request, keyType, physicalKey)
+        }
     }
     def createResponse(requestThrottleMs: Int): AbstractResponse = {
       val responseBody = new FindCoordinatorResponse(

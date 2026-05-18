@@ -13100,16 +13100,24 @@ class KafkaApisTest extends Logging {
 
   @Test
   def testOffsetCommitTenantRefusesReservedPhysicalFormTopic(): Unit = {
-    // A tenant submits a literal "acme.foo" as a logical topic name. The broker
-    // rejects it as reserved (it would round-trip to the physical form) with
-    // UNKNOWN_TOPIC_OR_PARTITION per-topic, never touches the coordinator, and
-    // echoes back the LITERAL name the tenant sent — stripping the prefix in
-    // the response would substitute "foo" for "acme.foo" and confuse the user
-    // about what they actually submitted.
+    // A tenant submitting a literal "acme.foo" topic name is malformed: the
+    // name would round-trip to a physical-physical form, and (per Codex
+    // round-7 finding) merging the rejection back into a response that may
+    // also carry a legitimate "foo"→"acme.foo" commit collides on the
+    // OffsetCommitResponse.Builder's by-name HashMap. Rather than partially
+    // satisfy and partially reject, the WHOLE request is refused with
+    // INVALID_TOPIC_EXCEPTION, with all literal names echoed back unchanged
+    // so the tenant can correlate the error to what they submitted.
     val data = new OffsetCommitRequestData()
       .setGroupId("orders-consumer")
       .setMemberId("member-1")
       .setTopics(List(
+        new OffsetCommitRequestData.OffsetCommitRequestTopic()
+          .setName("foo")
+          .setPartitions(List(
+            new OffsetCommitRequestData.OffsetCommitRequestPartition()
+              .setPartitionIndex(0)
+              .setCommittedOffset(1)).asJava),
         new OffsetCommitRequestData.OffsetCommitRequestTopic()
           .setName("acme.foo")
           .setPartitions(List(
@@ -13125,15 +13133,62 @@ class KafkaApisTest extends Logging {
 
     val response = verifyNoThrottling[OffsetCommitResponse](request)
     val topics = response.data.topics.asScala
-    assertEquals(1, topics.size)
-    assertEquals("acme.foo", topics.head.name,
-      "rejected-form topic must echo back the LITERAL logical name the tenant sent")
-    assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION.code,
-      topics.head.partitions.asScala.head.errorCode)
+    // Whole-request rejection: every submitted topic carries INVALID_TOPIC_EXCEPTION
+    // with its LITERAL name unchanged. Even the legitimate "foo" entry is
+    // refused — the request itself is malformed, and partial satisfaction
+    // would collide on the response builder.
+    assertEquals(2, topics.size)
+    val byName = topics.map(t => t.name -> t).toMap
+    assertTrue(byName.contains("foo"),
+      "legit-form topic must echo back unchanged in the rejection response")
+    assertTrue(byName.contains("acme.foo"),
+      "reserved-form topic must echo back the LITERAL logical name the tenant sent")
+    topics.foreach { t =>
+      assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code,
+        t.partitions.asScala.head.errorCode,
+        s"every topic in the rejection response must carry INVALID_TOPIC_EXCEPTION, got ${t.name}")
+    }
     verify(groupCoordinator, never()).commitOffsets(
       any[RequestContext](),
       any[OffsetCommitRequestData](),
       any[org.apache.kafka.common.utils.BufferSupplier]())
+  }
+
+  @Test
+  def testFindCoordinatorV4TenantRefusesCrossTenantPrefixedKey(): Unit = {
+    // PROMPT.md scenario 49 — a tenant on its listener addressing
+    // "__tenant_other.foo" must be refused at the per-key level without
+    // letting TenantNamespace.groupToPhysical's IllegalArgumentException
+    // bubble out and fail the whole multi-key request. The wire form
+    // never hints at the foreign tenant's existence.
+    val keys = List("orders-consumer", "__tenant_other.foo", "another-group").asJava
+    val data = new FindCoordinatorRequestData()
+      .setKeyType(CoordinatorType.GROUP.id)
+      .setCoordinatorKeys(keys)
+    val request = buildRequest(new FindCoordinatorRequest.Builder(data).build(ApiKeys.FIND_COORDINATOR.latestVersion),
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    addTopicToMetadataCache(Topic.GROUP_METADATA_TOPIC_NAME, numPartitions = 1)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleFindCoordinatorRequest(request)
+
+    val response = verifyNoThrottling[FindCoordinatorResponse](request)
+    val byKey = response.data.coordinators.asScala.map(c => c.key -> c).toMap
+    assertEquals(3, byKey.size)
+    // Legit keys proceed (their per-key error is whatever the coordinator
+    // path produces — what matters here is they are NOT short-circuited
+    // with GROUP_AUTHORIZATION_FAILED).
+    assertNotEquals(Errors.GROUP_AUTHORIZATION_FAILED.code,
+      byKey("orders-consumer").errorCode,
+      "valid logical key must reach the coordinator lookup, not be auth-refused")
+    assertNotEquals(Errors.GROUP_AUTHORIZATION_FAILED.code,
+      byKey("another-group").errorCode,
+      "valid logical key must reach the coordinator lookup, not be auth-refused")
+    // Cross-tenant key is refused per-key with the auth-shape error.
+    assertEquals(Errors.GROUP_AUTHORIZATION_FAILED.code,
+      byKey("__tenant_other.foo").errorCode,
+      "cross-tenant prefixed key must be refused at the per-key level")
   }
 
   @Test
