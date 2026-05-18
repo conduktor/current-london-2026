@@ -85,8 +85,12 @@ public final class KafkaHttpServer {
 
         ServletContextHandler context = new ServletContextHandler();
         context.setContextPath(CONTEXT_PATH);
+        // jetty.getThreadPool() returns the bound ThreadPool (Executor) — pass it to the servlet so async-completion
+        // writes happen on Jetty I/O threads rather than the broker request-handler thread that completes the
+        // submitter future. Without this, a slow HTTP client can pin a broker handler thread on a socket write.
+        java.util.concurrent.Executor httpExecutor = jetty.getThreadPool();
         ServletHolder holder = new ServletHolder(
-            new KafkaHttpServlet(bridge, submitter, mapper, maxRequestBodyBytes, sseLimiter));
+            new KafkaHttpServlet(bridge, submitter, mapper, maxRequestBodyBytes, sseLimiter, httpExecutor));
         holder.setAsyncSupported(true);
         context.addServlet(holder, SERVLET_PATTERN);
 

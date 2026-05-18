@@ -26,6 +26,7 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 
 import jakarta.servlet.AsyncContext;
 import jakarta.servlet.http.HttpServlet;
@@ -60,9 +61,10 @@ public final class KafkaHttpServlet extends HttpServlet {
     private final ObjectMapper mapper;
     private final int maxRequestBodyBytes;
     private final SseStreamLimiter sseLimiter;
+    private final Executor httpExecutor;
 
     public KafkaHttpServlet(KafkaHttpBridge bridge, RequestSubmitter submitter, ObjectMapper mapper,
-                            int maxRequestBodyBytes, SseStreamLimiter sseLimiter) {
+                            int maxRequestBodyBytes, SseStreamLimiter sseLimiter, Executor httpExecutor) {
         this.bridge = Objects.requireNonNull(bridge, "bridge must not be null");
         this.submitter = Objects.requireNonNull(submitter, "submitter must not be null");
         this.mapper = Objects.requireNonNull(mapper, "mapper must not be null");
@@ -71,6 +73,7 @@ public final class KafkaHttpServlet extends HttpServlet {
         }
         this.maxRequestBodyBytes = maxRequestBodyBytes;
         this.sseLimiter = Objects.requireNonNull(sseLimiter, "sseLimiter must not be null");
+        this.httpExecutor = Objects.requireNonNull(httpExecutor, "httpExecutor must not be null");
     }
 
     @Override
@@ -108,8 +111,12 @@ public final class KafkaHttpServlet extends HttpServlet {
         // async dispatch hands the response off to the callback thread.
         String contentType = ContentTypeNegotiator.resolve(req.getHeader(HEADER_ACCEPT));
         AsyncContext async = req.startAsync();
-        bridge.produce(topic, body).whenComplete((response, throwable) ->
-            writeResponseAndComplete(async, response, throwable, contentType));
+        // whenCompleteAsync(..., httpExecutor) dispatches the response write off the thread that completes the
+        // submitter future. That thread is the broker's request-handler thread (RequestChannel callback) — running
+        // a socket write there pins a Kafka API handler on slow-client I/O, which can starve the binary protocol.
+        // Move the write onto Jetty's server thread pool instead.
+        bridge.produce(topic, body).whenCompleteAsync((response, throwable) ->
+            writeResponseAndComplete(async, response, throwable, contentType), httpExecutor);
     }
 
     @Override
@@ -149,13 +156,15 @@ public final class KafkaHttpServlet extends HttpServlet {
                 token.close();
                 throw e;
             }
-            SseStreamer.start(async, submitter, mapper, command, token);
+            SseStreamer.start(async, submitter, mapper, command, token, httpExecutor);
             return;
         }
 
         AsyncContext async = req.startAsync();
-        bridge.fetch(topic, params).whenComplete((response, throwable) ->
-            writeResponseAndComplete(async, response, throwable, contentType));
+        // See doPost for why this is whenCompleteAsync: the broker handler thread that completes the future must
+        // not be the thread that performs the HTTP socket write — dispatch to Jetty's server thread pool.
+        bridge.fetch(topic, params).whenCompleteAsync((response, throwable) ->
+            writeResponseAndComplete(async, response, throwable, contentType), httpExecutor);
     }
 
     /**

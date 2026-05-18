@@ -27,6 +27,7 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.util.Objects;
 import java.util.OptionalInt;
+import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import jakarta.servlet.AsyncContext;
@@ -75,13 +76,14 @@ final class SseStreamer {
     private final int partition;
     private final OptionalInt maxBytes;
     private final SseStreamLimiter.Token limiterToken;
+    private final Executor httpExecutor;
 
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private volatile long currentOffset;
 
     private SseStreamer(AsyncContext async, RequestSubmitter submitter, ObjectMapper mapper,
                         String topic, int partition, long startOffset, OptionalInt maxBytes,
-                        SseStreamLimiter.Token limiterToken) throws IOException {
+                        SseStreamLimiter.Token limiterToken, Executor httpExecutor) throws IOException {
         this.async = Objects.requireNonNull(async);
         this.resp = (HttpServletResponse) async.getResponse();
         this.out = resp.getOutputStream();
@@ -92,6 +94,7 @@ final class SseStreamer {
         this.currentOffset = startOffset;
         this.maxBytes = Objects.requireNonNull(maxBytes);
         this.limiterToken = Objects.requireNonNull(limiterToken);
+        this.httpExecutor = Objects.requireNonNull(httpExecutor);
     }
 
     /**
@@ -100,8 +103,10 @@ final class SseStreamer {
      * disconnect, partition-level error, or unrecoverable submitter failure).
      */
     static void start(AsyncContext async, RequestSubmitter submitter, ObjectMapper mapper,
-                      FetchRequestParser.FetchCommand command, SseStreamLimiter.Token limiterToken) {
+                      FetchRequestParser.FetchCommand command, SseStreamLimiter.Token limiterToken,
+                      Executor httpExecutor) {
         Objects.requireNonNull(limiterToken, "limiterToken must not be null — caller must acquire before start()");
+        Objects.requireNonNull(httpExecutor, "httpExecutor must not be null");
         SseStreamer streamer;
         try {
             HttpServletResponse resp = (HttpServletResponse) async.getResponse();
@@ -117,7 +122,7 @@ final class SseStreamer {
             async.setTimeout(0L); // no servlet-side timeout — the broker's fetch max-wait is the only pacing
 
             streamer = new SseStreamer(async, submitter, mapper, command.topic(), command.partition(),
-                command.offset(), command.maxBytes(), limiterToken);
+                command.offset(), command.maxBytes(), limiterToken, httpExecutor);
             // Write the framing comment so connection-buffering proxies flush the headers before any record arrives.
             streamer.out.write(CONNECTED_COMMENT);
             streamer.out.flush();
@@ -143,7 +148,11 @@ final class SseStreamer {
         }
         FetchRequestParser.FetchCommand command =
             new FetchRequestParser.FetchCommand(topic, partition, currentOffset, maxBytes);
-        submitter.submitFetch(command).whenComplete(this::handleFetchResult);
+        // whenCompleteAsync(..., httpExecutor) dispatches the next iteration off the thread that completed the
+        // submitter future. That thread is the broker's request-handler thread (RequestChannel callback) — running
+        // the SSE write loop there pins a Kafka API handler on a slow streaming client and can starve the binary
+        // protocol. Move the write + scheduleNextFetch chain onto Jetty's server thread pool instead.
+        submitter.submitFetch(command).whenCompleteAsync(this::handleFetchResult, httpExecutor);
     }
 
     private void handleFetchResult(RequestSubmitter.FetchResult result, Throwable throwable) {
