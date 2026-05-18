@@ -130,6 +130,20 @@
         <subpackage name="config">
             <allow pkg="org.apache.kafka.server"/>
         </subpackage>
+
+        <subpackage name="rules">
+            <!-- CEL rules engine: needs Jackson for JSON envelopes, Kafka protocol
+                 message types for generic field extraction, and the clients
+                 Consumer API for the internal __governance topic reader. -->
+            <allow pkg="com.fasterxml.jackson" />
+            <allow pkg="org.apache.kafka.common.protocol" />
+            <allow pkg="org.apache.kafka.common.requests" />
+            <allow pkg="org.apache.kafka.common.message" />
+            <allow pkg="org.apache.kafka.clients" />
+            <allow pkg="org.apache.kafka.clients.consumer" />
+            <allow pkg="org.apache.kafka.common.serialization" />
+            <allow pkg="org.apache.kafka.server.rules" />
+        </subpackage>
     </subpackage>
 
     <subpackage name="admin">
