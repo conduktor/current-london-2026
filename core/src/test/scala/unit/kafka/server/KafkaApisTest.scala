@@ -12025,8 +12025,10 @@ class KafkaApisTest extends Logging {
     val response = verifyNoThrottling[DescribeGroupsResponse](request)
     val errorCodes = response.data.groups.asScala.map(_.errorCode)
     assertTrue(errorCodes.nonEmpty, "expected at least one group in the synthesized error response")
-    assertTrue(errorCodes.forall(_ == Errors.TOPIC_AUTHORIZATION_FAILED.code),
-      "tenant principal calling a non-v1 API must be refused at dispatch with TOPIC_AUTHORIZATION_FAILED")
+    assertTrue(errorCodes.forall(_ == Errors.CLUSTER_AUTHORIZATION_FAILED.code),
+      "tenant principal calling a non-v1 API must be refused at dispatch with CLUSTER_AUTHORIZATION_FAILED " +
+      "(not TOPIC_AUTHORIZATION_FAILED — the refusal is a capability decision, not a topic-resource decision; " +
+      "see KafkaApis dispatch comment)")
     verify(groupCoordinator, never()).describeGroups(any[RequestContext](), any[util.List[String]]())
   }
 
@@ -12820,9 +12822,51 @@ class KafkaApisTest extends Logging {
     val response = verifyNoThrottling[DescribeGroupsResponse](request)
     val errorCodes = response.data.groups.asScala.map(_.errorCode)
     assertTrue(errorCodes.nonEmpty, "expected at least one group in the synthesized error response")
-    assertTrue(errorCodes.forall(_ == Errors.TOPIC_AUTHORIZATION_FAILED.code),
-      "privileged caller on tenant listener must be refused with TOPIC_AUTHORIZATION_FAILED on disallowed APIs")
+    assertTrue(errorCodes.forall(_ == Errors.CLUSTER_AUTHORIZATION_FAILED.code),
+      "privileged caller on tenant listener must be refused with CLUSTER_AUTHORIZATION_FAILED on disallowed APIs " +
+      "— uniform error code across all API shapes, removes the topic-flavoured probe vector")
     verify(groupCoordinator, never()).describeGroups(any[RequestContext](), any[util.List[String]]())
+  }
+
+  @Test
+  def testDispatchRefusalErrorCodeIsUniformAcrossApiCategories(): Unit = {
+    // Probe-vector regression guard: the dispatch refusal must produce the
+    // SAME error code regardless of the API's natural category (topic-,
+    // group-, txn-, cluster-flavoured). Before this change, the refusal
+    // returned TOPIC_AUTHORIZATION_FAILED for every API — which on a
+    // non-topic API like LIST_TRANSACTIONS revealed that the broker was
+    // forcing a topic-flavoured error, telling the attacker the principal
+    // is being treated as tenant-scoped. After the fix, both refusals
+    // must surface CLUSTER_AUTHORIZATION_FAILED.
+    def refuse(req: AbstractRequest): Short = {
+      val request = buildRequest(req,
+        listenerName = TENANT_LISTENER,
+        principal = tenantPrincipal("acme", "alice"))
+      when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(
+        any[RequestChannel.Request](), any[Long])).thenReturn(0)
+      kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+      kafkaApis.handle(request, RequestLocal.withThreadConfinedCaching)
+      val resp = verifyNoThrottling[AbstractResponse](request)
+      // Extract the top-level (or first-element) error code from each shape.
+      resp match {
+        case dgr: DescribeGroupsResponse =>
+          dgr.data.groups.asScala.head.errorCode
+        case ltr: ListTransactionsResponse =>
+          ltr.data.errorCode
+        case _ => fail(s"unexpected response type: ${resp.getClass}").asInstanceOf[Short]
+      }
+    }
+
+    val groupCode = refuse(new DescribeGroupsRequest.Builder(
+      new DescribeGroupsRequestData().setGroups(util.Arrays.asList("any"))).build())
+    val txnCode = refuse(new ListTransactionsRequest.Builder(
+      new ListTransactionsRequestData()).build())
+    assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED.code, groupCode,
+      "group-shaped API refusal must surface CLUSTER_AUTHORIZATION_FAILED, not its natural GROUP_AUTHORIZATION_FAILED")
+    assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED.code, txnCode,
+      "txn-shaped API refusal must surface CLUSTER_AUTHORIZATION_FAILED, not its natural TRANSACTIONAL_ID_AUTHORIZATION_FAILED")
+    assertEquals(groupCode, txnCode,
+      "refusal error code must NOT co-vary with API category — that co-variance is the probe vector")
   }
 
   @Test

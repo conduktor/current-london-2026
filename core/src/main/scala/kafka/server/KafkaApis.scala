@@ -689,13 +689,24 @@ class KafkaApis(val requestChannel: RequestChannel,
       // KafkaApis.TENANT_ALLOWED_APIS — the allow-list also covers connection
       // setup (SASL/API_VERSIONS) so a tenant-bound listener stays reachable
       // for auth.
+      //
+      // Wire shape: CLUSTER_AUTHORIZATION_FAILED. The refusal is a connection-
+      // level capability decision, not a topic-resource decision; using
+      // TOPIC_AUTHORIZATION_FAILED here is a probe vector — a non-topic API
+      // (e.g. ListTransactions, DescribeCluster) returning a topic-flavoured
+      // error tells the attacker the broker is treating their principal as
+      // tenant-scoped (a per-API ACL denial would mirror the API's natural
+      // error category, not always force TOPIC_AUTHORIZATION_FAILED).
+      // CLUSTER_AUTHORIZATION_FAILED is uniform across API shapes and reveals
+      // only that the caller lacks ClusterAction — a generic denial that
+      // could equally describe any cluster-wide ACL.
       if (!KafkaApis.TENANT_ALLOWED_APIS.contains(request.header.apiKey)) {
         val tenantCtx = tenantContextFor(request)
         if (tenantCtx.effectiveTenant.isPresent) {
           info(s"Refusing ${request.header.apiKey} from tenant-scoped context " +
             s"(principal=${request.context.principal}, listener=${request.context.listenerName}, " +
             s"correlation id ${request.header.correlationId}, client id ${request.header.clientId})")
-          requestHelper.sendErrorResponseMaybeThrottle(request, Errors.TOPIC_AUTHORIZATION_FAILED.exception)
+          requestHelper.sendErrorResponseMaybeThrottle(request, Errors.CLUSTER_AUTHORIZATION_FAILED.exception)
           return
         }
       }
