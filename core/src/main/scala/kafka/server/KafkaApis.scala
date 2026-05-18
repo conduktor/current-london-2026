@@ -123,7 +123,7 @@ class KafkaApis(val requestChannel: RequestChannel,
   val configManager = new ConfigAdminManager(brokerId, config, configRepository)
   val describeTopicPartitionsRequestHandler : Option[DescribeTopicPartitionsRequestHandler] = metadataCache match {
     case kRaftMetadataCache: KRaftMetadataCache =>
-      Some(new DescribeTopicPartitionsRequestHandler(kRaftMetadataCache, authHelper, config))
+      Some(new DescribeTopicPartitionsRequestHandler(kRaftMetadataCache, authHelper, config, concentrationKernel))
     case _ => None
   }
 
