@@ -23,6 +23,7 @@ import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class TenantContextTest {
@@ -127,6 +128,24 @@ class TenantContextTest {
     void rewriteInDelegatesToNamespace() {
         TenantContext ctx = TenantContext.of(ACME, Optional.empty());
         assertEquals("acme.orders", ctx.toPhysical("orders"));
+    }
+
+    @Test
+    void rewriteInRefusesReservedPhysicalForm() {
+        // The handler is expected to consult isReservedPhysicalForm before
+        // calling toPhysical; the throw here is a defence-in-depth signal that
+        // a caller forgot to.
+        TenantContext ctx = TenantContext.of(ACME, Optional.empty());
+        assertTrue(ctx.isReservedPhysicalForm("acme.orders"));
+        assertThrows(org.apache.kafka.common.errors.InvalidTopicException.class,
+            () -> ctx.toPhysical("acme.orders"));
+    }
+
+    @Test
+    void isReservedPhysicalFormFalseWhenNoTenantInContext() {
+        // A non-tenant context has no reserved prefix at all.
+        TenantContext ctx = TenantContext.of(SUPER, Optional.empty());
+        assertFalse(ctx.isReservedPhysicalForm("acme.orders"));
     }
 
     @Test

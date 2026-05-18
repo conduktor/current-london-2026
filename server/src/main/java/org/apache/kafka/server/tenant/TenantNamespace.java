@@ -16,6 +16,7 @@
  */
 package org.apache.kafka.server.tenant;
 
+import org.apache.kafka.common.errors.InvalidTopicException;
 import org.apache.kafka.common.internals.Topic;
 import org.apache.kafka.common.security.auth.KafkaPrincipal;
 
@@ -63,7 +64,30 @@ public final class TenantNamespace {
         if (isInternalTopic(logicalTopic)) {
             return logicalTopic;
         }
+        if (isReservedPhysicalForm(tenantId, logicalTopic)) {
+            // A logical name that already begins with `<tenantId>.` is the
+            // round-trip of a physical name; rewriting it would double-prefix
+            // and silently materialise a topic like `acme.acme.orders`. The
+            // namespace contract is that tenants only ever name logical topics,
+            // so refuse this upstream rather than create the surprise on disk.
+            throw new InvalidTopicException(
+                "Logical topic name '" + logicalTopic + "' begins with the tenant prefix '"
+                    + tenantId + SEPARATOR + "' and is therefore reserved");
+        }
         return tenantId + SEPARATOR + logicalTopic;
+    }
+
+    /**
+     * True if {@code logicalTopic} begins with {@code <tenantId>.} and is not an
+     * internal topic. Such a name is what {@link #toLogical} would produce for
+     * a physical topic in this tenant's namespace; accepting it on the inbound
+     * side would double-prefix.
+     */
+    public static boolean isReservedPhysicalForm(String tenantId, String logicalTopic) {
+        if (logicalTopic == null || isInternalTopic(logicalTopic)) {
+            return false;
+        }
+        return logicalTopic.startsWith(tenantId + SEPARATOR);
     }
 
     public static String toLogical(String tenantId, String physicalTopic) {

@@ -156,6 +156,12 @@ class KafkaApis(val requestChannel: RequestChannel,
     if (versionId >= 13) {
       if (ctx.belongsToTenant(tip.topic)) Some(tip) else None
     } else {
+      // A v0-12 fetch carrying a reserved-physical-form name (e.g. tenant acme
+      // asking for `acme.orders`) is treated as foreign — surfaces as
+      // UNKNOWN_TOPIC_OR_PARTITION, identical to any other out-of-namespace
+      // probe so it cannot be used to test for the existence of the physical
+      // form.
+      if (ctx.isReservedPhysicalForm(tip.topic)) return None
       val physical = ctx.toPhysical(tip.topic)
       if (ctx.belongsToTenant(physical)) {
         if (physical == tip.topic) Some(tip)
@@ -224,20 +230,42 @@ class KafkaApis(val requestChannel: RequestChannel,
       return
     }
     val createReq = request.body[CreateTopicsRequest]
+    // Reserved-physical-form guard: refuse to forward `acme.orders` from
+    // tenant acme — rewriting would double-prefix into `acme.acme.orders`.
+    // Such entries get INVALID_TOPIC_EXCEPTION carrying the logical name the
+    // client sent; the rest of the batch is rewritten and forwarded normally.
+    val preRejected = new util.ArrayList[CreateTopicsResponseData.CreatableTopicResult]()
     // Map physical → logical so we can rewrite the response, even when an
     // error path returns the physical name (e.g. INVALID_TOPIC_EXCEPTION).
     val physicalToLogical = mutable.Map[String, String]()
     val rewrittenTopics = new CreateTopicsRequestData.CreatableTopicCollection(createReq.data.topics.size)
     createReq.data.topics.forEach { t =>
       val logical = t.name
-      val physical = ctx.toPhysical(logical)
-      physicalToLogical(physical) = logical
-      rewrittenTopics.add(t.duplicate().setName(physical))
+      if (ctx.isReservedPhysicalForm(logical)) {
+        preRejected.add(new CreateTopicsResponseData.CreatableTopicResult()
+          .setName(logical)
+          .setErrorCode(Errors.INVALID_TOPIC_EXCEPTION.code)
+          .setErrorMessage("Topic name '" + logical + "' is reserved (tenant namespace prefix)"))
+      } else {
+        val physical = ctx.toPhysical(logical)
+        physicalToLogical(physical) = logical
+        rewrittenTopics.add(t.duplicate().setName(physical))
+      }
+    }
+    if (rewrittenTopics.isEmpty) {
+      // Every entry was rejected upstream; don't forward an empty CreateTopics.
+      val responses = new CreateTopicsResponseData.CreatableTopicResultCollection(preRejected.size)
+      preRejected.forEach(r => responses.add(r))
+      requestChannel.sendResponse(request,
+        new CreateTopicsResponse(new CreateTopicsResponseData().setTopics(responses)), None)
+      return
     }
     createReq.data.setTopics(rewrittenTopics)
     forwardingManager.forwardRequest(request, createReq, {
       case Some(resp: CreateTopicsResponse) =>
-        val rewritten = new CreateTopicsResponseData.CreatableTopicResultCollection(resp.data.topics.size)
+        val rewritten = new CreateTopicsResponseData.CreatableTopicResultCollection(
+          resp.data.topics.size + preRejected.size)
+        preRejected.forEach(r => rewritten.add(r))
         resp.data.topics.forEach { r =>
           val logical = Option(r.name).map(p => physicalToLogical.getOrElse(p, ctx.toLogical(p))).orNull
           rewritten.add(r.duplicate()
@@ -300,9 +328,21 @@ class KafkaApis(val requestChannel: RequestChannel,
       delReq.data.topics.forEach { t =>
         if (t.name != null) {
           val logical = t.name
-          val physical = ctx.toPhysical(logical)
-          physicalToLogical(physical) = logical
-          forwardable.add(t.duplicate().setName(physical))
+          if (ctx.isReservedPhysicalForm(logical)) {
+            // Tenant supplied `acme.orders` for tenant acme — rewriting would
+            // hit `acme.acme.orders`, which (a) doesn't exist and would
+            // surface as UNKNOWN_TOPIC_OR_PARTITION at the controller, and
+            // (b) leaks the namespace contract. Surface INVALID_TOPIC with the
+            // logical name preserved.
+            preRejected.add(new DeleteTopicsResponseData.DeletableTopicResult()
+              .setName(logical)
+              .setErrorCode(Errors.INVALID_TOPIC_EXCEPTION.code)
+              .setErrorMessage("Topic name '" + logical + "' is reserved (tenant namespace prefix)"))
+          } else {
+            val physical = ctx.toPhysical(logical)
+            physicalToLogical(physical) = logical
+            forwardable.add(t.duplicate().setName(physical))
+          }
         } else {
           // delete-by-id: pre-resolve and authorise BEFORE forwarding so a
           // foreign UUID cannot cause a foreign topic to be deleted. Unknown
@@ -329,13 +369,28 @@ class KafkaApis(val requestChannel: RequestChannel,
         return
       }
     } else {
+      // v0-5 only carries names (no UUID path).
       val rewritten = new util.ArrayList[String](delReq.data.topicNames.size)
       delReq.data.topicNames.forEach { name =>
-        val physical = ctx.toPhysical(name)
-        physicalToLogical(physical) = name
-        rewritten.add(physical)
+        if (ctx.isReservedPhysicalForm(name)) {
+          preRejected.add(new DeleteTopicsResponseData.DeletableTopicResult()
+            .setName(name)
+            .setErrorCode(Errors.INVALID_TOPIC_EXCEPTION.code)
+            .setErrorMessage("Topic name '" + name + "' is reserved (tenant namespace prefix)"))
+        } else {
+          val physical = ctx.toPhysical(name)
+          physicalToLogical(physical) = name
+          rewritten.add(physical)
+        }
       }
       delReq.data.setTopicNames(rewritten)
+      if (rewritten.isEmpty) {
+        val responses = new DeleteTopicsResponseData.DeletableTopicResultCollection(preRejected.size)
+        preRejected.forEach(r => responses.add(r))
+        requestChannel.sendResponse(request,
+          new DeleteTopicsResponse(new DeleteTopicsResponseData().setResponses(responses)), None)
+        return
+      }
     }
     forwardingManager.forwardRequest(request, delReq, {
       case Some(resp: DeleteTopicsResponse) =>
@@ -657,6 +712,26 @@ class KafkaApis(val requestChannel: RequestChannel,
       return
     }
 
+    // Reserved-physical-form guard. A tenant submitting `acme.orders` is
+    // either confused or trying to address the storage namespace directly;
+    // either way, rewriting would double-prefix into `acme.acme.orders` and
+    // silently create the topic (auto-create on Produce). Refuse such topics
+    // up front, keyed by the LOGICAL name the client sent.
+    val invalidLogicalTopicResponses = mutable.Map[TopicPartition, PartitionResponse]()
+    if (tenantScoped) {
+      val rejected = new util.ArrayList[ProduceRequestData.TopicProduceData]()
+      produceRequest.data.topicData.forEach { t =>
+        if (tenantCtx.isReservedPhysicalForm(t.name)) {
+          rejected.add(t)
+          t.partitionData.forEach { p =>
+            invalidLogicalTopicResponses +=
+              new TopicPartition(t.name, p.index) -> new PartitionResponse(Errors.INVALID_TOPIC_EXCEPTION)
+          }
+        }
+      }
+      rejected.forEach(t => produceRequest.data.topicData.remove(t))
+    }
+
     // IN rewrite — topic names in the request are logical; authorization,
     // metadataCache.contains() and replicaManager.handleProduceAppend() below
     // all key on physical names. Mutate the request's TopicProduceData names
@@ -735,10 +810,16 @@ class KafkaApis(val requestChannel: RequestChannel,
       // names; the PartitionResponse values are shared by reference, so the
       // currentLeader info set above is preserved on the rekeyed entries.
       // The client sees logical topic names in all paths including errors.
-      val mergedResponseStatus: Map[TopicPartition, PartitionResponse] =
-        if (tenantScoped) physicalResponseStatus.map { case (tp, pr) =>
-          new TopicPartition(tenantCtx.toLogical(tp.topic), tp.partition) -> pr
-        } else physicalResponseStatus
+      // invalidLogicalTopicResponses is already keyed by the LOGICAL name the
+      // client sent; merge after the toLogical pass so it doesn't strip the
+      // tenant-prefix portion the caller intentionally included.
+      val mergedResponseStatus: Map[TopicPartition, PartitionResponse] = {
+        val rewritten: Map[TopicPartition, PartitionResponse] =
+          if (tenantScoped) physicalResponseStatus.map { case (tp, pr) =>
+            new TopicPartition(tenantCtx.toLogical(tp.topic), tp.partition) -> pr
+          } else physicalResponseStatus
+        rewritten ++ invalidLogicalTopicResponses
+      }
 
       // Record both bandwidth and request quota-specific values and throttle by muting the channel if any of the quotas
       // have been violated. If both quotas have been violated, use the max throttle time between the two quotas. Note
@@ -1263,11 +1344,32 @@ class KafkaApis(val requestChannel: RequestChannel,
     val unknownTopicIdsTopicMetadata = unknownTopicIds.map(topicId =>
         metadataResponseTopic(Errors.UNKNOWN_TOPIC_ID, null, topicId, isInternal = false, util.Collections.emptyList())).toSeq
 
+    // Reserved-physical-form guard for explicit-name lookups: a tenant asking
+    // for metadata about `acme.orders` would otherwise have it rewritten to
+    // `acme.acme.orders`; that physical topic doesn't exist (assuming the
+    // CreateTopics guard is intact) and the response would falsely report it
+    // unknown. Refuse the lookup with INVALID_TOPIC_EXCEPTION, name preserved.
+    val reservedPhysicalForm: Seq[MetadataResponseTopic] =
+      if (tenantScoped && !metadataRequest.isAllTopics && !useTopicId) {
+        metadataRequest.topics.asScala.toSeq
+          .filter(tenantCtx.isReservedPhysicalForm)
+          .map(name => metadataResponseTopic(
+            Errors.INVALID_TOPIC_EXCEPTION,
+            name,
+            Uuid.ZERO_UUID,
+            isInternal(name),
+            util.Collections.emptyList()))
+      } else Seq.empty
+
     val topics = if (metadataRequest.isAllTopics) {
       val all = metadataCache.getAllTopics()
       if (tenantScoped) all.filter(t => tenantCtx.belongsToTenant(t) || isInternal(t)) else all
     } else if (useTopicId) {
       knownTopicNames
+    } else if (tenantScoped) {
+      metadataRequest.topics.asScala.toSet
+        .filterNot(tenantCtx.isReservedPhysicalForm)
+        .map(tenantCtx.toPhysical)
     } else {
       metadataRequest.topics.asScala.toSet.map(tenantCtx.toPhysical)
     }
@@ -1355,10 +1457,14 @@ class KafkaApis(val requestChannel: RequestChannel,
         if (t.name != null) t.setName(tenantCtx.toLogical(t.name))
       }
     }
+    // reservedPhysicalForm entries already carry the logical name the client
+    // sent (e.g. "acme.orders"); appending after the OUT rewrite avoids
+    // toLogical stripping the prefix they intentionally included.
+    val finalTopicMetadata = completeTopicMetadata ++ reservedPhysicalForm
 
     val brokers = metadataCache.getAliveBrokerNodes(request.context.listenerName)
 
-    trace("Sending topic metadata %s and brokers %s for correlation id %d to client %s".format(completeTopicMetadata.mkString(","),
+    trace("Sending topic metadata %s and brokers %s for correlation id %d to client %s".format(finalTopicMetadata.mkString(","),
       brokers.mkString(","), request.header.correlationId, request.header.clientId))
     val controllerId = {
       metadataCache.getControllerId.flatMap {
@@ -1374,7 +1480,7 @@ class KafkaApis(val requestChannel: RequestChannel,
          brokers.toList.asJava,
          clusterId,
          controllerId.getOrElse(MetadataResponse.NO_CONTROLLER_ID),
-         completeTopicMetadata.asJava,
+         finalTopicMetadata.asJava,
          clusterAuthorizedOperations
       ))
   }

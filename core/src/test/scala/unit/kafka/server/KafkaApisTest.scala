@@ -11785,6 +11785,131 @@ class KafkaApisTest extends Logging {
       "tenant principal calling a non-v1 API must be refused with TOPIC_AUTHORIZATION_FAILED")
   }
 
+  // ---------------------------------------------------------------------------
+  // Reserved-physical-form guard — applies to every v1 surface
+  //
+  // A tenant submitting a logical name that already begins with its own
+  // physical prefix (e.g. tenant acme asking for "acme.orders") is either
+  // confused or trying to break out of its namespace. Rewriting would
+  // double-prefix into "acme.acme.orders" — auto-created on Produce/Metadata
+  // and silently materialised by CreateTopics. Each handler refuses such
+  // entries up front with the wire name preserved.
+  // ---------------------------------------------------------------------------
+
+  @Test
+  def testProduceTenantRejectsReservedPhysicalFormLogicalName(): Unit = {
+    // Tenant acme produces to "acme.orders" — a name that would double-prefix
+    // to physical "acme.acme.orders". The broker must refuse with
+    // INVALID_TOPIC_EXCEPTION carrying the wire name; replicaManager must not
+    // be invoked for this topic.
+    val produceRequest = buildSingleTopicProduceRequest("acme.orders")
+    val request = buildRequest(
+      produceRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), any[Long])).thenReturn(0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    kafkaApis = createKafkaApis(
+      authorizer = None,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[ProduceResponse](request)
+    assertEquals(1, response.data.responses.size)
+    val topicResp = response.data.responses.asScala.head
+    assertEquals("acme.orders", topicResp.name,
+      "rejection must keep the wire name; toLogical would have silently stripped the prefix")
+    val partitionResp = topicResp.partitionResponses.asScala.head
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION,
+      Errors.forCode(partitionResp.errorCode),
+      "double-prefix produce must be refused with INVALID_TOPIC_EXCEPTION")
+    verify(replicaManager, never()).handleProduceAppend(
+      anyLong, anyShort, anyBoolean, any(), any(), any(), any(), any(), any(), any())
+  }
+
+  @Test
+  def testCreateTopicsTenantRejectsReservedPhysicalFormLogicalName(): Unit = {
+    // CreateTopics is the loudest auto-pollution vector — the controller would
+    // happily materialise "acme.acme.orders" for tenant acme. The broker must
+    // refuse the entry, never forward, and leave the rest of the batch intact.
+    val createRequest = new CreateTopicsRequest.Builder(new CreateTopicsRequestData()
+      .setTopics(new CreateTopicsRequestData.CreatableTopicCollection(
+        Collections.singleton(new CreateTopicsRequestData.CreatableTopic()
+          .setName("acme.orders").setNumPartitions(1).setReplicationFactor(1.toShort)).iterator)))
+      .build()
+    val request = buildRequest(
+      createRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleCreateTopicsRequest(request)
+
+    val response = verifyNoThrottling[CreateTopicsResponse](request)
+    val result = response.data.topics.asScala.head
+    assertEquals("acme.orders", result.name,
+      "rejection must keep the wire name the client sent")
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, result.errorCode,
+      "double-prefix create must be refused with INVALID_TOPIC_EXCEPTION")
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[AbstractRequest](), any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
+  def testDeleteTopicsTenantRejectsReservedPhysicalFormLogicalName(): Unit = {
+    // DeleteTopics by-name with `acme.orders` would rewrite to `acme.acme.orders`,
+    // which (if it exists at all) is a phantom artefact rather than the topic the
+    // tenant means. Refuse with INVALID_TOPIC_EXCEPTION and don't forward.
+    val deleteRequest = new DeleteTopicsRequest.Builder(new DeleteTopicsRequestData()
+      .setTopics(util.Arrays.asList(new DeleteTopicsRequestData.DeleteTopicState().setName("acme.orders")))
+      .setTimeoutMs(5000)).build()
+    val request = buildRequest(
+      deleteRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDeleteTopicsRequest(request)
+
+    val response = verifyNoThrottling[DeleteTopicsResponse](request)
+    val result = response.data.responses.asScala.head
+    assertEquals("acme.orders", result.name,
+      "rejection must keep the wire name the client sent")
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, result.errorCode,
+      "double-prefix delete-by-name must be refused with INVALID_TOPIC_EXCEPTION")
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[AbstractRequest](), any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
+  def testMetadataTenantRejectsReservedPhysicalFormLogicalName(): Unit = {
+    // A Metadata lookup for `acme.orders` from tenant acme would rewrite to
+    // `acme.acme.orders` — a phantom topic the tenant cannot reason about. The
+    // broker surfaces INVALID_TOPIC_EXCEPTION with the wire name preserved
+    // rather than silently returning UNKNOWN_TOPIC_OR_PARTITION for the phantom.
+    val metadataRequest = new MetadataRequest.Builder(List("acme.orders").asJava, false).build()
+    val request = buildRequest(
+      metadataRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleTopicMetadataRequest(request)
+
+    val response = verifyNoThrottling[MetadataResponse](request)
+    val errored = response.topicMetadata().asScala.toSeq
+    assertEquals(1, errored.size)
+    assertEquals("acme.orders", errored.head.topic,
+      "rejection must keep the wire name; toLogical would have silently stripped the prefix")
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION, errored.head.error,
+      "double-prefix metadata must be refused with INVALID_TOPIC_EXCEPTION")
+  }
+
   @Test
   def testNonV1ApiFromPrivilegedCallerOnTenantBoundListenerIsRefusedAtDispatch(): Unit = {
     // The silent-pollution trap extends to every non-v1 API: a super-user on a

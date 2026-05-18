@@ -123,6 +123,20 @@ public final class TenantContext {
             .orElse(logicalTopic);
     }
 
+    /**
+     * True if {@code logicalTopic} would round-trip to a physical-looking name
+     * for the effective tenant — i.e. starts with {@code <tenantId>.} and is
+     * not internal. Handlers consult this BEFORE calling {@link #toPhysical} to
+     * choose the per-API error shape (INVALID_TOPIC for create/produce,
+     * UNKNOWN_TOPIC_OR_PARTITION for fetch, etc.) rather than catch the
+     * exception across iteration boundaries.
+     */
+    public boolean isReservedPhysicalForm(String logicalTopic) {
+        return effectiveTenant()
+            .map(t -> TenantNamespace.isReservedPhysicalForm(t, logicalTopic))
+            .orElse(false);
+    }
+
     public String toLogical(String physicalTopic) {
         return effectiveTenant()
             .map(t -> TenantNamespace.toLogical(t, physicalTopic))

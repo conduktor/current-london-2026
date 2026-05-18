@@ -16,6 +16,7 @@
  */
 package org.apache.kafka.server.tenant;
 
+import org.apache.kafka.common.errors.InvalidTopicException;
 import org.apache.kafka.common.security.auth.KafkaPrincipal;
 import org.junit.jupiter.api.Test;
 
@@ -142,6 +143,42 @@ class TenantNamespaceTest {
         TenantNamespace.validateTenantId("acme-1");
         TenantNamespace.validateTenantId("acme_1");
         TenantNamespace.validateTenantId("Acme1");
+    }
+
+    @Test
+    void toPhysicalRefusesLogicalNameThatAlreadyHasTenantPrefix() {
+        // A logical name starting with `<tenantId>.` is the round-trip of a
+        // physical name. Rewriting it would silently produce `acme.acme.orders`.
+        InvalidTopicException ex = assertThrows(InvalidTopicException.class,
+            () -> TenantNamespace.toPhysical("acme", "acme.orders"));
+        assertTrue(ex.getMessage().contains("acme.orders"));
+        assertTrue(ex.getMessage().contains("reserved"));
+    }
+
+    @Test
+    void toPhysicalAllowsLogicalNameStartingWithUnrelatedTenantPrefix() {
+        // "beta.orders" is a perfectly valid logical name for tenant acme — it
+        // just contains a dot. The contract is per-tenant: acme's reserved
+        // prefix is "acme.", not "beta.".
+        assertEquals("acme.beta.orders", TenantNamespace.toPhysical("acme", "beta.orders"));
+    }
+
+    @Test
+    void toPhysicalAcceptsLogicalNameEqualToTenantIdWithoutSeparator() {
+        // "acme" (no trailing dot) is not the reserved form; rewriting to
+        // "acme.acme" is the standard single prefix.
+        assertEquals("acme.acme", TenantNamespace.toPhysical("acme", "acme"));
+    }
+
+    @Test
+    void isReservedPhysicalFormFlagsTenantPrefixedNames() {
+        assertTrue(TenantNamespace.isReservedPhysicalForm("acme", "acme.orders"));
+        assertTrue(TenantNamespace.isReservedPhysicalForm("acme", "acme.legacy.event"));
+        assertFalse(TenantNamespace.isReservedPhysicalForm("acme", "orders"));
+        assertFalse(TenantNamespace.isReservedPhysicalForm("acme", "beta.orders"));
+        assertFalse(TenantNamespace.isReservedPhysicalForm("acme", "acme"));
+        // Internal topics are never tenant-namespaced.
+        assertFalse(TenantNamespace.isReservedPhysicalForm("acme", "__consumer_offsets"));
     }
 
     @Test
