@@ -245,4 +245,14 @@ class TenantContextTest {
         TenantContext ctx = TenantContext.of(SUPER, Optional.empty());
         assertFalse(ctx.txnIdBelongsToTenant("__tenant_acme.foo"));
     }
+
+    @Test
+    void rewriteInRefusesNullLogicalTopic() {
+        // Defence-in-depth: a null topic name slipping past the handler-side
+        // isInvalidLogicalForm gate would otherwise concatenate to the literal
+        // string "acme.null". The helper refuses upstream.
+        TenantContext ctx = TenantContext.of(ACME, Optional.empty());
+        assertThrows(org.apache.kafka.common.errors.InvalidTopicException.class,
+            () -> ctx.toPhysical(null));
+    }
 }

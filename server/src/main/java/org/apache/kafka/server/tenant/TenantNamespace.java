@@ -65,6 +65,13 @@ public final class TenantNamespace {
     }
 
     public static String toPhysical(String tenantId, String logicalTopic) {
+        if (logicalTopic == null) {
+            // Defence-in-depth: callers are expected to consult
+            // {@link #isInvalidLogicalForm} first, but a null slipping through
+            // would otherwise concatenate to the literal string "<id>.null".
+            throw new InvalidTopicException(
+                "Logical topic name must not be null for tenant '" + tenantId + "'");
+        }
         if (isInternalTopic(logicalTopic)) {
             return logicalTopic;
         }
