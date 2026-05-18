@@ -547,6 +547,72 @@ class KafkaHttpServerIntegrationTest {
         }
     }
 
+    @Test
+    void sseReleasesSlotWhenIdleClientDisconnects() throws Exception {
+        // Regression for the idle-disconnect SSE leak: a client that opens SSE on a perpetually-quiet topic
+        // (broker keeps returning empty fetch pages) and then drops its connection must not leak the
+        // SseStreamLimiter slot. Without the empty-fetch heartbeat the streamer has no write attempt that
+        // could surface the TCP close — it would spin on broker fetches forever. With the heartbeat, the
+        // next iteration's `: \n\n` write throws IOException once the kernel observes the peer close, and
+        // closeStream() releases the slot. We assert via the ActiveSseStreams gauge dropping back to zero
+        // AND a second SSE attempt succeeding under a cap of 1 (the strongest end-to-end proof of release).
+        tearDown();
+        startServer(DEFAULT_TEST_MAX_BODY_BYTES, 1, DEFAULT_TEST_MAX_WS_SUBSCRIPTIONS);
+        submitter.fetchAlwaysEmpty = true;
+
+        com.yammer.metrics.core.Gauge<?> active = (com.yammer.metrics.core.Gauge<?>)
+            org.apache.kafka.server.metrics.KafkaYammerMetrics.defaultRegistry().allMetrics()
+                .get(bridgeMetricName("ActiveSseStreams"));
+        assertNotNull(active, "ActiveSseStreams gauge must be registered after a fresh server start");
+
+        InputStreamResponseListener listener = new InputStreamResponseListener();
+        client.newRequest(url("/v1/topics/orders/records?partition=0&from=earliest"))
+            .method(HttpMethod.GET)
+            .headers(h -> h.put("Accept", "text/event-stream"))
+            .send(listener);
+        Response response = listener.get(5, TimeUnit.SECONDS);
+        assertEquals(200, response.getStatus());
+        // Read the priming `: connected` comment so we know the streamer is fully wired before we disconnect.
+        InputStream body = listener.getInputStream();
+        BufferedReader reader = new BufferedReader(new InputStreamReader(body, StandardCharsets.UTF_8));
+        String connectedLine = reader.readLine();
+        assertNotNull(connectedLine, "stream must emit at least the `: connected` comment line");
+        assertTrue(connectedLine.startsWith(":"), "first SSE line must be a comment, got: " + connectedLine);
+        // Wait until the streamer has counted the slot — the gauge update happens before the priming bytes
+        // are written, so this should already be true.
+        assertEquals(1, ((Number) active.value()).intValue(),
+            "ActiveSseStreams must report 1 while the SSE stream is in flight");
+
+        // Abrupt client-side disconnect. The streamer's next heartbeat write must fail with IOException
+        // once the kernel observes the peer close, regardless of timing of the next fetch result.
+        reader.close();
+        body.close();
+
+        // Poll the gauge with a generous timeout — broker fetch max-wait in production is 500ms; here
+        // empty fetches return immediately, so the heartbeat-write-fails path should kick in within a few
+        // hundred ms of the disconnect. 10s is enough headroom that a slow CI host won't flake.
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (((Number) active.value()).intValue() != 0 && System.nanoTime() < deadline) {
+            Thread.sleep(50);
+        }
+        assertEquals(0, ((Number) active.value()).intValue(),
+            "ActiveSseStreams must return to 0 within 10s of client disconnect — otherwise the idle "
+                + "stream leaked its limiter slot (the fix is the empty-fetch heartbeat write in SseStreamer)");
+
+        // Strongest end-to-end proof: under maxSseStreams=1, a fresh SSE attempt must now succeed. If the
+        // slot had leaked we'd get 429 here instead of 200.
+        InputStreamResponseListener secondListener = new InputStreamResponseListener();
+        client.newRequest(url("/v1/topics/orders/records?partition=0&from=earliest"))
+            .method(HttpMethod.GET)
+            .headers(h -> h.put("Accept", "text/event-stream"))
+            .send(secondListener);
+        Response secondResponse = secondListener.get(5, TimeUnit.SECONDS);
+        assertEquals(200, secondResponse.getStatus(),
+            "after the first stream's slot is released, a second SSE attempt must be admitted (200), not 429");
+        // Close the second connection so @AfterEach can shut the server down cleanly.
+        secondListener.getInputStream().close();
+    }
+
     // ----- WebSocket -----
 
     @Test
@@ -1023,6 +1089,11 @@ class KafkaHttpServerIntegrationTest {
         // SSE flow: each submitFetch returns the next item in this queue. After the queue is exhausted, we return a
         // never-completing future so the SSE loop blocks waiting — the test then closes the connection to tear it down.
         java.util.Queue<RequestSubmitter.FetchResult> fetchResultQueue;
+        // When true, submitFetch returns an immediately-completed empty fetch result on every call. Models a
+        // perpetually-quiet topic where the broker's purgatory returns empty pages back-to-back — used by the
+        // idle-disconnect regression test to ensure the SSE streamer keeps writing heartbeats (and thus
+        // surfaces a client disconnect) even when no records ever arrive.
+        volatile boolean fetchAlwaysEmpty;
         java.util.List<FetchRequestParser.FetchCommand> fetchCommandLog = new java.util.concurrent.CopyOnWriteArrayList<>();
 
         @Override
@@ -1042,6 +1113,12 @@ class KafkaHttpServerIntegrationTest {
         public CompletableFuture<FetchResult> submitFetch(FetchRequestParser.FetchCommand command) {
             this.lastFetch = command;
             fetchCommandLog.add(command);
+            if (fetchAlwaysEmpty) {
+                return CompletableFuture.completedFuture(new RequestSubmitter.FetchResult(
+                    new FetchResponseFormatter.PartitionFetch(
+                        0, Errors.NONE, null, command.offset(), 0, command.offset(), Collections.emptyList()),
+                    0L));
+            }
             if (fetchResultQueue != null) {
                 RequestSubmitter.FetchResult next = fetchResultQueue.poll();
                 if (next != null) {

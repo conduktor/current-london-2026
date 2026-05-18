@@ -65,6 +65,9 @@ final class SseStreamer {
     private static final byte[] EVENT_ERROR = "event: error\n".getBytes(java.nio.charset.StandardCharsets.UTF_8);
     private static final byte[] CONNECTED_COMMENT =
         ": connected\n\n".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    // SSE comment line: clients ignore it, but the write itself is our liveness probe — see handleFetchResult.
+    private static final byte[] HEARTBEAT_COMMENT =
+        ":\n\n".getBytes(java.nio.charset.StandardCharsets.UTF_8);
     private static final byte LF = (byte) '\n';
 
     private final AsyncContext async;
@@ -187,6 +190,24 @@ final class SseStreamer {
         if (!clientStillThere) {
             closeStream();
             return;
+        }
+        // Liveness probe for the empty-fetch path. When the broker has no new records the for-loop above
+        // never attempts a write — and a Servlet streaming response has no other client-disconnect signal
+        // until the next write fails. Without this heartbeat, a client that opens SSE on a quiet topic and
+        // then drops its connection (TCP FIN) is undetectable: we would loop forever, holding an SSE
+        // limiter slot and resubmitting broker fetches indefinitely. Writing a comment line on every empty
+        // fetch bounds the leak window to one broker fetch max-wait (~500ms): the next iteration's write
+        // throws IOException on a dead socket and we tear the stream down. Cost is 4 bytes per quiet-topic
+        // poll, which is also the standard SSE keep-alive pattern that prevents NAT/proxy idle timeouts.
+        if (view.records().isEmpty()) {
+            try {
+                out.write(HEARTBEAT_COMMENT);
+                out.flush();
+            } catch (IOException e) {
+                LOG.debug("SSE client disconnected on heartbeat for {}/{}: {}", topic, partition, e.toString());
+                closeStream();
+                return;
+            }
         }
         // If the broker returned nothing, the fetch purgatory already held us up to its max-wait. Re-submitting
         // immediately is the correct behaviour — that's how SSE transitions from "replay" to "live tail" without a
