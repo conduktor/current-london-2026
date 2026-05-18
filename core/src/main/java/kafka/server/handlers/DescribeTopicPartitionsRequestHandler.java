@@ -82,25 +82,14 @@ public class DescribeTopicPartitionsRequestHandler {
         }
 
         Set<DescribeTopicPartitionsResponseTopic> unauthorizedForDescribeTopicMetadata = new HashSet<>();
-        List<String> physicalTopics = new ArrayList<>();
-        List<String> logicalTopics = new ArrayList<>();
-        partitionAuthorizedTopics(abstractRequest, topics, fetchAllTopics,
-            unauthorizedForDescribeTopicMetadata, physicalTopics, logicalTopics);
+        List<String> authorizedSorted = collectAuthorizedSorted(
+            abstractRequest, topics, fetchAllTopics, unauthorizedForDescribeTopicMetadata);
 
         ListenerName listenerName = abstractRequest.context().listenerName;
         int maxPartitions = Math.max(Math.min(config.maxRequestPartitionSizeLimit(), request.responsePartitionLimit()), 1);
 
-        DescribeTopicPartitionsResponseData response = describePhysicalTopics(
-            physicalTopics, listenerName, cursor, cursorTopicName, maxPartitions, fetchAllTopics);
-
-        if (response.nextCursor() == null) {
-            int used = 0;
-            for (DescribeTopicPartitionsResponseTopic t : response.topics()) {
-                used += t.partitions().size();
-            }
-            appendLogicalTopics(response, logicalTopics, listenerName, cursor, cursorTopicName,
-                maxPartitions - used, fetchAllTopics);
-        }
+        DescribeTopicPartitionsResponseData response = buildResponse(
+            authorizedSorted, listenerName, cursor, cursorTopicName, maxPartitions, fetchAllTopics);
 
         // get topic authorized operations
         response.topics().forEach(topicData ->
@@ -150,18 +139,19 @@ public class DescribeTopicPartitionsRequestHandler {
 
     /**
      * Filter by DESCRIBE authorization, append authorization-failure stubs for explicitly named
-     * topics that fail authorization (matches stock semantics), and split the authorized topics
-     * into physical vs logical buckets. The physical bucket is the normal metadata-cache flow;
-     * the logical bucket is synthesized from backing-partition leadership.
+     * topics that fail authorization (matches stock semantics), and return the authorized topics
+     * as a single alphabetically-sorted list (physical and logical interleaved). The interleaving
+     * is critical: DescribeTopicPartitions cursor pagination relies on the response being in
+     * topic-name order — bucketing physical-then-logical would silently drop logical topics that
+     * sort between two physical topics on a paged request.
      */
-    private void partitionAuthorizedTopics(
+    private List<String> collectAuthorizedSorted(
         RequestChannel.Request abstractRequest,
         Set<String> topics,
         boolean fetchAllTopics,
-        Set<DescribeTopicPartitionsResponseTopic> unauthorizedForDescribeTopicMetadata,
-        List<String> physicalTopics,
-        List<String> logicalTopics
+        Set<DescribeTopicPartitionsResponseTopic> unauthorizedForDescribeTopicMetadata
     ) {
+        List<String> authorized = new ArrayList<>();
         topics.stream().sorted().forEach(topicName -> {
             boolean isAuthorized = authHelper.authorize(
                 abstractRequest.context(), DESCRIBE, TOPIC, topicName, true, true, 1);
@@ -174,86 +164,118 @@ public class DescribeTopicPartitionsRequestHandler {
                 }
                 return;
             }
-            if (concentrationKernel != null && concentrationKernel.isLogicalTopic(topicName)) {
-                logicalTopics.add(topicName);
-            } else {
-                physicalTopics.add(topicName);
-            }
+            authorized.add(topicName);
         });
+        return authorized;
     }
 
     /**
-     * Delegate the physical bucket to the unchanged metadata-cache path. If the cursor points
-     * into the logical phase, the physical phase is skipped entirely so the response resumes
-     * exactly where the previous call stopped.
+     * Walk the authorized topics in alphabetical order, dispatching per topic to either the
+     * KRaft metadata cache (physical) or the kernel-based synthesizer (logical), sharing a
+     * single partition budget. Per-topic dispatch is functionally equivalent to a batched
+     * cache call for physical-only workloads (the cache iterates topics in the input order and
+     * applies the same budget arithmetic), but it lets us interleave logical synthesis without
+     * disturbing the cursor contract.
      */
-    private DescribeTopicPartitionsResponseData describePhysicalTopics(
-        List<String> physicalTopics,
+    private DescribeTopicPartitionsResponseData buildResponse(
+        List<String> authorizedSorted,
         ListenerName listenerName,
         DescribeTopicPartitionsRequestData.Cursor cursor,
         String cursorTopicName,
         int maxPartitions,
         boolean fetchAllTopics
     ) {
-        boolean cursorIsLogical = cursor != null && concentrationKernel != null
-            && concentrationKernel.isLogicalTopic(cursorTopicName);
-        if (cursorIsLogical) {
-            return new DescribeTopicPartitionsResponseData();
+        DescribeTopicPartitionsResponseData response = new DescribeTopicPartitionsResponseData();
+        int remaining = maxPartitions;
+        for (String topicName : authorizedSorted) {
+            if (remaining <= 0) {
+                response.setNextCursor(new Cursor()
+                    .setTopicName(topicName)
+                    .setPartitionIndex(0));
+                return response;
+            }
+            boolean isLogical = concentrationKernel != null && concentrationKernel.isLogicalTopic(topicName);
+            int delta = isLogical
+                ? appendLogicalTopic(response, topicName, listenerName, cursor, cursorTopicName, remaining, fetchAllTopics)
+                : appendPhysicalTopic(response, topicName, listenerName, cursor, cursorTopicName, remaining, fetchAllTopics);
+            if (delta < 0) {
+                // Topic emitted a nextCursor — pagination stops here.
+                return response;
+            }
+            remaining -= delta;
         }
-        return metadataCache.getTopicMetadataForDescribeTopicResponse(
-            CollectionConverters.asScala(physicalTopics.iterator()),
-            listenerName,
-            (String topicName) -> topicName.equals(cursorTopicName) ? cursor.partitionIndex() : 0,
-            maxPartitions,
-            fetchAllTopics
-        );
+        return response;
     }
 
     /**
-     * Synthesize {@link DescribeTopicPartitionsResponseTopic} entries for logical topics that
-     * appear after the physical phase finished without hitting the partition budget. Mirrors
-     * {@code KafkaApis.synthesizeLogicalTopicMetadata} but for the
-     * {@code DescribeTopicPartitions} response shape and with per-partition pagination so
-     * large logical topics don't have to come back in one response.
+     * Dispatch a single physical topic to the KRaft metadata cache using a single-element list.
+     * Returns the number of partitions added on success, or -1 if the cache emitted a nextCursor
+     * (mid-topic break), signalling the caller to stop the walk.
      */
-    private void appendLogicalTopics(
+    private int appendPhysicalTopic(
         DescribeTopicPartitionsResponseData response,
-        List<String> logicalTopics,
+        String topicName,
         ListenerName listenerName,
         DescribeTopicPartitionsRequestData.Cursor cursor,
         String cursorTopicName,
         int remainingBudget,
-        boolean ignoreTopicsWithExceptions
+        boolean fetchAllTopics
     ) {
-        int remaining = remainingBudget;
-        for (String logicalTopic : logicalTopics) {
-            if (remaining <= 0) {
-                response.setNextCursor(new Cursor()
-                    .setTopicName(logicalTopic)
-                    .setPartitionIndex(0));
-                return;
-            }
-            int startPartition = logicalTopic.equals(cursorTopicName) && cursor != null
-                ? cursor.partitionIndex() : 0;
-            SynthesisResult synth = synthesizeLogicalDescribe(
-                logicalTopic, listenerName, startPartition, remaining);
-            if (synth == null) {
-                if (!ignoreTopicsWithExceptions) {
-                    response.topics().add(describeTopicPartitionsResponseTopic(
-                        Errors.UNKNOWN_TOPIC_OR_PARTITION, logicalTopic, Uuid.ZERO_UUID, false,
-                        Collections.emptyList()));
-                }
-                continue;
-            }
-            response.topics().add(synth.topic);
-            remaining -= synth.topic.partitions().size();
-            if (synth.nextPartitionIndex >= 0) {
-                response.setNextCursor(new Cursor()
-                    .setTopicName(logicalTopic)
-                    .setPartitionIndex(synth.nextPartitionIndex));
-                return;
-            }
+        DescribeTopicPartitionsResponseData oneTopic = metadataCache.getTopicMetadataForDescribeTopicResponse(
+            CollectionConverters.asScala(Collections.singletonList(topicName).iterator()),
+            listenerName,
+            (String t) -> t.equals(cursorTopicName) && cursor != null ? cursor.partitionIndex() : 0,
+            remainingBudget,
+            fetchAllTopics
+        );
+        int added = 0;
+        for (DescribeTopicPartitionsResponseTopic t : oneTopic.topics()) {
+            // DescribeTopicPartitionsResponseTopic is an ImplicitLinkedHashMultiCollection.Element
+            // and carries intrusive prev/next pointers, so an element still linked in oneTopic.topics()
+            // silently fails to insert into response.topics(). Duplicate to get an unlinked copy.
+            response.topics().add(t.duplicate());
+            added += t.partitions().size();
         }
+        if (oneTopic.nextCursor() != null) {
+            response.setNextCursor(oneTopic.nextCursor());
+            return -1;
+        }
+        return added;
+    }
+
+    /**
+     * Synthesize a single logical topic and append it. Returns the number of partitions added,
+     * or -1 if the topic emitted a nextCursor (mid-topic break).
+     */
+    private int appendLogicalTopic(
+        DescribeTopicPartitionsResponseData response,
+        String topicName,
+        ListenerName listenerName,
+        DescribeTopicPartitionsRequestData.Cursor cursor,
+        String cursorTopicName,
+        int remainingBudget,
+        boolean fetchAllTopics
+    ) {
+        int startPartition = topicName.equals(cursorTopicName) && cursor != null
+            ? cursor.partitionIndex() : 0;
+        SynthesisResult synth = synthesizeLogicalDescribe(
+            topicName, listenerName, startPartition, remainingBudget);
+        if (synth == null) {
+            if (!fetchAllTopics) {
+                response.topics().add(describeTopicPartitionsResponseTopic(
+                    Errors.UNKNOWN_TOPIC_OR_PARTITION, topicName, Uuid.ZERO_UUID, false,
+                    Collections.emptyList()));
+            }
+            return 0;
+        }
+        response.topics().add(synth.topic);
+        if (synth.nextPartitionIndex >= 0) {
+            response.setNextCursor(new Cursor()
+                .setTopicName(topicName)
+                .setPartitionIndex(synth.nextPartitionIndex));
+            return -1;
+        }
+        return synth.topic.partitions().size();
     }
 
     /**
