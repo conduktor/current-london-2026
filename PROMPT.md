@@ -10,7 +10,7 @@ Reject `compression.type=none` produces to topics configured with `compression.p
 
 ## Minimum viable outcome
 1. Register `compression.policy` as a recognised topic config server-side (in `storage`/`core`, not `clients`).
-2. In the produce handler, after the existing `validateRecords()` step, inspect each batch's `CompressionType` and reject with `INVALID_RECORD` per offending partition.
+2. In the **produce request handler — `KafkaApis.handleProduceRequest`** — right next to the existing `ProduceRequest.validateRecords(...)` call, inspect each batch's `CompressionType` and reject with `INVALID_RECORD` per offending partition. The check happens in the request handler, *before* the records reach the replication / log-append layers.
 3. Produce with `compression.type=lz4` (or any non-NONE) → succeeds.
 
 ## Stretch (only after the minimum lands)
@@ -18,7 +18,14 @@ Reject `compression.type=none` produces to topics configured with `compression.p
 - Metric for rejected batches.
 
 ## Careful
-- `validateRecords()` only checks API version + record format today. Extend it with a topic-config parameter, or add the check directly after — both are fine.
+- **The check belongs in the produce request handler — `KafkaApis.handleProduceRequest` — adjacent to the existing `ProduceRequest.validateRecords(...)` call.** That site already converts `ApiException` into a per-partition `PartitionResponse` via `Errors.forException(e)`, which is exactly the per-partition error shape this feature requires.
+- **Do NOT put the check in any of the following — those are too deep and bypass the existing per-partition error shaping in the handler:**
+  - `UnifiedLog.analyzeAndValidateRecords` (or anywhere else in `UnifiedLog`)
+  - `Partition.appendRecordsToLeader`
+  - `ReplicaManager.appendRecords` / `handleProduceAppend` / `appendToLocalLog`
+  - `LogValidator` or any storage-layer validator
+- `ProduceRequest.validateRecords()` lives in `clients/` and only checks API version + record format. **You may not modify it** (clients/ is off-limits). Add the new check **immediately after** the call to `ProduceRequest.validateRecords(...)` in `KafkaApis`, inside the same per-partition `try { ... } catch { case e: ApiException => ... }` block. Throwing an `InvalidRecordException` from there flows naturally into the existing `invalidRequestResponses` map.
+- Topic config is reached via the replica/log manager in `KafkaApis` (`replicaManager.getLogConfig(tp)` or equivalent). If no `LogConfig` is available for a partition at that point (topic just created, race), the existing path proceeds unchanged — do not invent a synchronous lookup.
 - The LLM's first instinct is to fail the whole request. That's wrong: produce responses are per-partition and clients depend on partial success.
 
 ## Lessons already known (don't rediscover)
@@ -29,7 +36,7 @@ Reject `compression.type=none` produces to topics configured with `compression.p
 - The config is registered server-side only; no client recompilation is required to consume topics with the config set or unset.
 - A single produce request targeting multiple partitions across multiple topics is evaluated per-partition: only batches that violate their topic's policy are rejected; the rest succeed in the same response.
 - The error returned for an offending partition is `INVALID_RECORD` (or the standard partition-scoped record-validation error code).
-- Validation runs after the existing API-version and record-format checks, on the same path, with no allocation on the fast path when the config is unset.
+- Validation runs in `KafkaApis.handleProduceRequest`, immediately after the existing `ProduceRequest.validateRecords(...)` call, with no allocation on the fast path when the config is unset (default = `none`). The storage layer (`UnifiedLog`, `Partition`, `ReplicaManager`) is **not** modified for this check.
 - The config accepts a small, validated value set (e.g., `none` (default), `required`); unknown values are rejected at CreateTopic / AlterConfig time with a clear error.
 
 ## Functional test scenarios
