@@ -2198,8 +2198,9 @@ class KafkaApis(val requestChannel: RequestChannel,
 
   // Tenant gate for FindCoordinator. Returns a non-empty Errors when the tenant
   // context forbids the lookup for the given key type (unsafe context, or a
-  // non-GROUP key from a tenant — v1 excludes transactions and share groups).
-  // None means the call may proceed to getCoordinator with the rewritten key.
+  // SHARE key from a tenant — share groups remain out of scope). None means
+  // the call may proceed to getCoordinator with the rewritten key. GROUP and
+  // TRANSACTION are both admitted for tenants in Phase 3b.
   private def rejectTenantFindCoordinator(
     tenantCtx: TenantContext,
     keyType: Byte
@@ -2215,30 +2216,40 @@ class KafkaApis(val requestChannel: RequestChannel,
         case _ => Errors.INVALID_REQUEST
       })
     }
-    // Tenant principal: only GROUP keys are admitted in this phase.
+    // Tenant principal: GROUP and TRANSACTION are admitted (rewritten to
+    // their respective physical forms); SHARE and any unknown key type
+    // remain refused at this gate.
     keyType match {
       case t if t == CoordinatorType.GROUP.id => None
-      case t if t == CoordinatorType.TRANSACTION.id => Some(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED)
+      case t if t == CoordinatorType.TRANSACTION.id => None
       case _ => Some(Errors.INVALID_REQUEST)
     }
   }
 
-  // Per-key rewrite for FindCoordinator. Identity for non-GROUP key types and
-  // for non-tenant callers. For a tenant GROUP key, returns Left(error) if
-  // the logical key carries a cross-tenant `__tenant_<other>.` prefix or any
-  // reserved-prefix-without-separator shape (the same defensive rejection
-  // `rewriteTenantGroupId` applies in the other handlers). Without this guard
-  // a single bad key in a multi-key v4+ request would surface as a request-
-  // level exception instead of per-key GROUP_AUTHORIZATION_FAILED.
+  // Per-key rewrite for FindCoordinator. Identity for non-tenant callers and
+  // for key types we don't rewrite (SHARE — share-group coordination is out
+  // of scope). For tenant GROUP / TRANSACTION keys, returns Left(error) if
+  // the logical key carries a cross-tenant `__tenant_<other>.` prefix or
+  // any reserved-prefix-without-separator shape. Without this guard a single
+  // bad key in a multi-key v4+ request would surface as a request-level
+  // exception instead of per-key {GROUP,TRANSACTIONAL_ID}_AUTHORIZATION_FAILED.
   private def rewriteFindCoordinatorKey(
     tenantCtx: TenantContext,
     keyType: Byte,
     logicalKey: String
   ): Either[Errors, String] = {
-    if (keyType != CoordinatorType.GROUP.id) return Right(logicalKey)
-    try Right(tenantCtx.toPhysicalGroup(logicalKey))
-    catch {
-      case _: IllegalArgumentException => Left(Errors.GROUP_AUTHORIZATION_FAILED)
+    keyType match {
+      case t if t == CoordinatorType.GROUP.id =>
+        try Right(tenantCtx.toPhysicalGroup(logicalKey))
+        catch {
+          case _: IllegalArgumentException => Left(Errors.GROUP_AUTHORIZATION_FAILED)
+        }
+      case t if t == CoordinatorType.TRANSACTION.id =>
+        try Right(tenantCtx.toPhysicalTxnId(logicalKey))
+        catch {
+          case _: IllegalArgumentException => Left(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED)
+        }
+      case _ => Right(logicalKey)
     }
   }
 
@@ -2823,27 +2834,36 @@ class KafkaApis(val requestChannel: RequestChannel,
 
   def handleInitProducerIdRequest(request: RequestChannel.Request, requestLocal: RequestLocal): Unit = {
     val initProducerIdRequest = request.body[InitProducerIdRequest]
-    val transactionalId = initProducerIdRequest.data.transactionalId
+    val logicalTransactionalId = initProducerIdRequest.data.transactionalId
 
-    // Tenant-scope guard. INIT_PRODUCER_ID is admitted into TENANT_ALLOWED_APIS
-    // so that the default idempotent producer (transactionalId == null) can
-    // bootstrap, but transactions are explicitly out of v1 scope. Refuse the
-    // transactional path early — before the request reaches the txn
-    // coordinator, which would otherwise persist a tenant-scoped txn record
-    // into the shared __transaction_state log under a logical id chosen by
-    // the tenant.
+    // Tenant-scope guard. The unsafe-context refusal (privileged-on-tenant /
+    // mismatch / spoof) must short-circuit before we touch the coordinator
+    // because the listener binding alone cannot disambiguate which tenant
+    // a producer id should be allocated under.
     val tenantCtx = tenantContextFor(request)
     if (tenantCtx.isUnsafe) {
       val err =
-        if (transactionalId != null) Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED
+        if (logicalTransactionalId != null) Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED
         else Errors.CLUSTER_AUTHORIZATION_FAILED
       requestHelper.sendErrorResponseMaybeThrottle(request, err.exception)
       return
     }
-    if (tenantCtx.effectiveTenant.isPresent && transactionalId != null) {
-      requestHelper.sendErrorResponseMaybeThrottle(request, Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.exception)
-      return
-    }
+    // Phase 3b: rewrite the tenant's logical transactional id to its physical
+    // form (__tenant_<id>.<name>) before authorisation and before reaching
+    // the transaction coordinator. The shared __transaction_state log is
+    // keyed by hash(transactionalId), so two tenants colliding on the same
+    // external id MUST resolve to distinct coordinator records — that
+    // separation is what the prefix buys us. Null passes through (idempotent
+    // producers). Cross-tenant `__tenant_<other>.foo` is refused defensively;
+    // without this the tenant would be able to write into another tenant's
+    // coordinator state simply by spelling their prefix.
+    val transactionalId =
+      try tenantCtx.toPhysicalTxnId(logicalTransactionalId)
+      catch {
+        case _: IllegalArgumentException =>
+          requestHelper.sendErrorResponseMaybeThrottle(request, Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.exception)
+          return
+      }
 
     if (transactionalId != null) {
       if (!authHelper.authorize(request.context, WRITE, TRANSACTIONAL_ID, transactionalId)) {
@@ -2872,7 +2892,9 @@ class KafkaApis(val requestChannel: RequestChannel,
           .setThrottleTimeMs(requestThrottleMs)
           .setErrorCode(finalError.code)
         val responseBody = new InitProducerIdResponse(responseData)
-        trace(s"Completed $transactionalId's InitProducerIdRequest with result $result from client ${request.header.clientId}.")
+        // Trace LOGICAL — operators on the tenant listener should see the
+        // id the client sent, not the physical bookkeeping name.
+        trace(s"Completed $logicalTransactionalId's InitProducerIdRequest with result $result from client ${request.header.clientId}.")
         responseBody
       }
       requestHelper.sendResponseMaybeThrottle(request, createResponse)

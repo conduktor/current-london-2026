@@ -12723,15 +12723,62 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
-  def testInitProducerIdTenantRejectsTransactionalProducer(): Unit = {
-    // Transactions are deliberately out of v1 scope: the __transaction_state
-    // log is shared across tenants, so accepting a tenant-scoped
-    // transactionalId would let acme and beta name-collide on the same
-    // coordinator record. Refuse the transactional path with the standard
-    // TRANSACTIONAL_ID_AUTHORIZATION_FAILED so clients fall back cleanly,
-    // and never reach the txn coordinator.
+  def testInitProducerIdTenantRewritesTransactionalIdToPhysicalForm(): Unit = {
+    // Phase 3b: tenants may now use transactional producers. The broker
+    // rewrites the logical transactional id ("my-txn") to its physical form
+    // (__tenant_acme.my-txn) before authorisation and before reaching the
+    // txn coordinator. __transaction_state is keyed by hash(transactional_id)
+    // — two tenants both naming a transaction "my-txn" must resolve to
+    // distinct coordinator records, otherwise they would share producer-id
+    // / epoch state and silently fence each other.
     val initRequest = new InitProducerIdRequest.Builder(new InitProducerIdRequestData()
       .setTransactionalId("my-txn")
+      .setTransactionTimeoutMs(TimeUnit.MINUTES.toMillis(1).toInt)
+      .setProducerId(RecordBatch.NO_PRODUCER_ID)
+      .setProducerEpoch(RecordBatch.NO_PRODUCER_EPOCH))
+      .build()
+    val request = buildRequest(initRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    val responseCallback: ArgumentCaptor[InitProducerIdResult => Unit] =
+      ArgumentCaptor.forClass(classOf[InitProducerIdResult => Unit])
+    val requestLocal = RequestLocal.withThreadConfinedCaching
+    when(txnCoordinator.handleInitProducerId(
+      ArgumentMatchers.eq("__tenant_acme.my-txn"),
+      anyInt(),
+      ArgumentMatchers.eq(Option.empty),
+      responseCallback.capture(),
+      ArgumentMatchers.eq(requestLocal)
+    )).thenAnswer(_ => responseCallback.getValue.apply(InitProducerIdResult(99L, 0.toShort, Errors.NONE)))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleInitProducerIdRequest(request, requestLocal)
+
+    val response = verifyNoThrottling[InitProducerIdResponse](request)
+    assertEquals(Errors.NONE.code, response.data.errorCode,
+      "transactional InitProducerId from a tenant must succeed after physical rewrite")
+    assertEquals(99L, response.data.producerId)
+    // The physical id is what the coordinator actually saw — proving the
+    // tenant namespace isolation, not just a happy-path response shape.
+    verify(txnCoordinator).handleInitProducerId(
+      ArgumentMatchers.eq("__tenant_acme.my-txn"),
+      anyInt(),
+      ArgumentMatchers.eq(Option.empty),
+      any[InitProducerIdResult => Unit](),
+      ArgumentMatchers.eq(requestLocal))
+  }
+
+  @Test
+  def testInitProducerIdTenantRefusesCrossTenantPrefixedTransactionalId(): Unit = {
+    // A tenant addressing `__tenant_other.foo` is either hostile or
+    // confused. toPhysicalTxnId refuses to rewrap it into
+    // `__tenant_acme.__tenant_other.foo` and throws; the handler must
+    // catch that and respond with TRANSACTIONAL_ID_AUTHORIZATION_FAILED
+    // — never letting the request reach the coordinator with a foreign
+    // prefix in scope.
+    val initRequest = new InitProducerIdRequest.Builder(new InitProducerIdRequestData()
+      .setTransactionalId("__tenant_other.foo")
       .setTransactionTimeoutMs(TimeUnit.MINUTES.toMillis(1).toInt)
       .setProducerId(RecordBatch.NO_PRODUCER_ID)
       .setProducerEpoch(RecordBatch.NO_PRODUCER_EPOCH))
@@ -12745,10 +12792,49 @@ class KafkaApisTest extends Logging {
 
     val response = verifyNoThrottling[InitProducerIdResponse](request)
     assertEquals(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.code, response.data.errorCode,
-      "transactional InitProducerId from a tenant must be refused before reaching the coordinator")
+      "cross-tenant prefixed transactional id must be refused before reaching the coordinator")
     verify(txnCoordinator, never()).handleInitProducerId(
       any[String](), anyInt(), any[Option[ProducerIdAndEpoch]](),
       any[InitProducerIdResult => Unit](), any[RequestLocal]())
+  }
+
+  @Test
+  def testInitProducerIdTenantAdminToolPassthroughForAlreadyPhysicalTransactionalId(): Unit = {
+    // PROMPT.md scenario 49 generalised to txn ids: an admin tool that
+    // explicitly addresses the physical form (`__tenant_acme.foo`) must
+    // succeed without double-prefixing into `__tenant_acme.__tenant_acme.foo`.
+    val initRequest = new InitProducerIdRequest.Builder(new InitProducerIdRequestData()
+      .setTransactionalId("__tenant_acme.foo")
+      .setTransactionTimeoutMs(TimeUnit.MINUTES.toMillis(1).toInt)
+      .setProducerId(RecordBatch.NO_PRODUCER_ID)
+      .setProducerEpoch(RecordBatch.NO_PRODUCER_EPOCH))
+      .build()
+    val request = buildRequest(initRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    val responseCallback: ArgumentCaptor[InitProducerIdResult => Unit] =
+      ArgumentCaptor.forClass(classOf[InitProducerIdResult => Unit])
+    val requestLocal = RequestLocal.withThreadConfinedCaching
+    when(txnCoordinator.handleInitProducerId(
+      ArgumentMatchers.eq("__tenant_acme.foo"),
+      anyInt(),
+      ArgumentMatchers.eq(Option.empty),
+      responseCallback.capture(),
+      ArgumentMatchers.eq(requestLocal)
+    )).thenAnswer(_ => responseCallback.getValue.apply(InitProducerIdResult(7L, 0.toShort, Errors.NONE)))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleInitProducerIdRequest(request, requestLocal)
+
+    val response = verifyNoThrottling[InitProducerIdResponse](request)
+    assertEquals(Errors.NONE.code, response.data.errorCode)
+    verify(txnCoordinator).handleInitProducerId(
+      ArgumentMatchers.eq("__tenant_acme.foo"),
+      anyInt(),
+      ArgumentMatchers.eq(Option.empty),
+      any[InitProducerIdResult => Unit](),
+      ArgumentMatchers.eq(requestLocal))
   }
 
   @Test
@@ -12812,11 +12898,14 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
-  def testFindCoordinatorV4TenantRefusesTransactionalKey(): Unit = {
-    // Transactional coordinator lookups are explicitly out of v1 scope; the
-    // broker must refuse them with TRANSACTIONAL_ID_AUTHORIZATION_FAILED
-    // before touching the txn coordinator, and echo the LOGICAL key so the
-    // tenant doesn't see a physical form leak through the error response.
+  def testFindCoordinatorV4TenantRewritesTransactionalKeyInAndEchoesLogicalOut(): Unit = {
+    // Phase 3b: TRANSACTION keys are now admitted for tenants. The logical
+    // key the client sent ("txn-1") is rewritten to the physical form
+    // (__tenant_acme.txn-1) before partitionFor and authorisation, then the
+    // LOGICAL key is echoed back so the tenant never sees the physical
+    // bookkeeping form in the response. partitionFor(physical) is what
+    // proves the tenant namespace is actually in play — equal-named
+    // transactions across tenants land on distinct coordinator partitions.
     val findCoord = new FindCoordinatorRequest.Builder(new FindCoordinatorRequestData()
       .setKeyType(CoordinatorType.TRANSACTION.id)
       .setCoordinatorKeys(asList("txn-1"))).build(ApiKeys.FIND_COORDINATOR.latestVersion)
@@ -12827,12 +12916,58 @@ class KafkaApisTest extends Logging {
     kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
     kafkaApis.handleFindCoordinatorRequest(request)
 
+    verify(txnCoordinator).partitionFor("__tenant_acme.txn-1")
+    val response = verifyNoThrottling[FindCoordinatorResponse](request)
+    val coord = response.data.coordinators.get(0)
+    assertEquals("txn-1", coord.key,
+      "tenant must see the LOGICAL transactional id, never the physical form")
+  }
+
+  @Test
+  def testFindCoordinatorV4TenantRefusesCrossTenantPrefixedTransactionalKey(): Unit = {
+    // Defensive: a tenant submitting `__tenant_other.foo` as a TRANSACTION
+    // key must be refused with TRANSACTIONAL_ID_AUTHORIZATION_FAILED before
+    // partitionFor is ever called — the foreign prefix would otherwise be
+    // double-wrapped or leaked to the coordinator. Echoes the LOGICAL key
+    // back unchanged.
+    val findCoord = new FindCoordinatorRequest.Builder(new FindCoordinatorRequestData()
+      .setKeyType(CoordinatorType.TRANSACTION.id)
+      .setCoordinatorKeys(asList("__tenant_other.foo"))).build(ApiKeys.FIND_COORDINATOR.latestVersion)
+    val request = buildRequest(findCoord,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleFindCoordinatorRequest(request)
+
     val response = verifyNoThrottling[FindCoordinatorResponse](request)
     val coord = response.data.coordinators.get(0)
     assertEquals(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.code, coord.errorCode)
-    assertEquals("txn-1", coord.key, "logical key must be echoed back unchanged")
+    assertEquals("__tenant_other.foo", coord.key,
+      "logical key (including the bad foreign prefix) must be echoed back unchanged")
     verify(txnCoordinator, never()).partitionFor(anyString())
-    verify(groupCoordinator, never()).partitionFor(anyString())
+  }
+
+  @Test
+  def testFindCoordinatorV4PrivilegedCallerOnTenantListenerRefusedForTransactionalKey(): Unit = {
+    // The same unsafe-context refusal pattern as the GROUP case, but the
+    // error surfaces as TRANSACTIONAL_ID_AUTHORIZATION_FAILED so the client
+    // sees the shape it would for a regular unauthorised txn request.
+    val findCoord = new FindCoordinatorRequest.Builder(new FindCoordinatorRequestData()
+      .setKeyType(CoordinatorType.TRANSACTION.id)
+      .setCoordinatorKeys(asList("txn-1"))).build(ApiKeys.FIND_COORDINATOR.latestVersion)
+    val request = buildRequest(findCoord,
+      listenerName = TENANT_LISTENER,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleFindCoordinatorRequest(request)
+
+    val response = verifyNoThrottling[FindCoordinatorResponse](request)
+    val coord = response.data.coordinators.get(0)
+    assertEquals(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.code, coord.errorCode)
+    assertEquals("txn-1", coord.key)
+    verify(txnCoordinator, never()).partitionFor(anyString())
   }
 
   @Test
