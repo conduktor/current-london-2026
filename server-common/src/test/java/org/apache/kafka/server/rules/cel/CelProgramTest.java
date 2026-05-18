@@ -715,6 +715,114 @@ public class CelProgramTest {
     }
 
     @Test
+    public void sizeOfNullThrowsRatherThanReturningZero() {
+        // Round-10 audit: returning 0 for null is a rule-author trap.
+        // `size(request.missing) > 100` silently false; `size(...) == 0`
+        // conflates empty and missing. Throw so the rule fails-open
+        // (logged at WARN by RuleEngine) and the author sees the bug.
+        Map<String, Object> env = new HashMap<>();
+        Map<String, Object> req = new LinkedHashMap<>();
+        env.put("request", req);
+        CelEvaluationException ex = assertThrows(
+            CelEvaluationException.class,
+            () -> evalBool("size(request.missing) > 100", env));
+        assertTrue(ex.getMessage().toLowerCase().contains("null"),
+            "expected 'null' in: " + ex.getMessage());
+    }
+
+    @Test
+    public void listMapEqualityChargesElementCostAgainstBudget() {
+        // Round-10 audit: AbstractList/AbstractMap.equals walks every
+        // element via Objects.equals. Before the fix, only string ==
+        // string was charged proportionally; List == List and Map == Map
+        // could amortise O(N) element compares per CEL step inside a
+        // comprehension. A list of ~200 strings × 600 iterations =
+        // 120k element-bumps, over the 100k budget.
+        java.util.List<Object> needle = new java.util.ArrayList<>();
+        for (int n = 0; n < 200; n++) {
+            needle.add("needle-" + n);
+        }
+        // Every candidate is a fresh 200-element copy of the needle. So
+        // `x == needle` is TRUE for every iteration: `all()` does not
+        // short-circuit on TRUE — it walks every element. Each iteration
+        // pays for 200 element compares plus the bumpSteps(200) charge
+        // on Compare.eval. 600 iters × 200 = 120k step bumps, over the
+        // 100k budget. Without the per-element bump, only 600 iteration
+        // steps are charged and the predicate evaluates to true.
+        java.util.List<Object> iters = new java.util.ArrayList<>();
+        for (int k = 0; k < 600; k++) {
+            iters.add(new java.util.ArrayList<>(needle));
+        }
+        Map<String, Object> env = new HashMap<>();
+        env.put("xs", iters);
+        env.put("needle", needle);
+        assertThrows(CelEvaluationException.class,
+            () -> evalBool("xs.all(x, x == needle)", env));
+    }
+
+    @Test
+    public void listLiteralConstructionChargesPerElementAgainstBudget() {
+        // Round-10 audit: ListLiteral.eval charged zero per element. A
+        // literal allocated inside a comprehension paid for its
+        // construction every iteration but only at one step apiece.
+        // 200-element literal × 600 iters = 120k bumps with the fix,
+        // over the 100k budget.
+        java.util.List<Object> iters = new java.util.ArrayList<>();
+        // Iterate over values that do NOT appear in the literal, so the
+        // comprehension does not short-circuit and pays for the literal
+        // construction every iteration.
+        for (int n = 0; n < 600; n++) {
+            iters.add(Long.valueOf(n + 10_000));
+        }
+        Map<String, Object> env = new HashMap<>();
+        env.put("xs", iters);
+        // Build a 200-element list literal in source — short enough to
+        // stay under MAX_NODES (=1024) but long enough that 600 iters
+        // exceed MAX_EVAL_STEPS.
+        StringBuilder lit = new StringBuilder("[");
+        for (int n = 0; n < 200; n++) {
+            if (n > 0) {
+                lit.append(',');
+            }
+            lit.append(n);
+        }
+        lit.append(']');
+        // Use all() so the entire iteration sequence runs (no
+        // early-exit on a match). For a candidate not in the literal,
+        // x in [literal] is false, so all(...) returns false eventually
+        // — but only after every per-iter literal allocation has been
+        // charged.
+        String expr = "xs.all(x, !(x in " + lit + "))";
+        assertThrows(CelEvaluationException.class,
+            () -> evalBool(expr, env));
+    }
+
+    @Test
+    public void integerOverflowSurfacesAsCelException() {
+        // Round-10 audit: silent overflow flipped predicate truth values.
+        // Math.addExact / multiplyExact / negateExact surface overflow
+        // as ArithmeticException → CelEvaluationException → fail-open
+        // at the RuleEngine boundary, instead of silently mismatching.
+        Map<String, Object> env = new HashMap<>();
+        env.put("x", Long.MAX_VALUE);
+        assertThrows(CelEvaluationException.class,
+            () -> evalBool("x + 1 > 0", env));
+        // Negate of MIN_VALUE: parse '-9223372036854775808' as
+        // Negate(Literal(9223372036854775808L)); but the literal itself
+        // overflows at parse time. Use an evaluation-time path instead:
+        Map<String, Object> env2 = new HashMap<>();
+        env2.put("y", Long.MIN_VALUE);
+        assertThrows(CelEvaluationException.class,
+            () -> evalBool("-y > 0", env2));
+        // DIV-overflow: MIN_VALUE / -1.
+        Map<String, Object> env3 = new HashMap<>();
+        env3.put("z", Long.MIN_VALUE);
+        env3.put("w", -1L);
+        assertThrows(CelEvaluationException.class,
+            () -> evalBool("z / w > 0", env3));
+    }
+
+    @Test
     public void stringConcatChargesResultLengthAgainstBudget() {
         // Audit HIGH-2: Arith.ADD on strings now charges (l.length() +
         // r.length()) per call. A comprehension that builds long strings

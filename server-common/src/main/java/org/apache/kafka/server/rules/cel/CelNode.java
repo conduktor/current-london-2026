@@ -318,8 +318,16 @@ abstract class CelNode {
         @Override
         Object eval(Function<String, Object> a) {
             Object v = arg.eval(a);
+            // Round-10 audit: returning 0 for null is a rule-author trap.
+            // `size(request.missing) > 100` silently evaluates false, and
+            // `size(request.field) == 0` conflates "empty" with "missing"
+            // with no way to distinguish. Throw → CelEvaluationException
+            // → fail-open at the RuleEngine boundary, matching the posture
+            // of Not/Negate on type mismatch and avoiding the silent
+            // discrepancy. Rule authors who want to tolerate missing
+            // fields can write `request.field != null && size(request.field) > 100`.
             if (v == null) {
-                return 0L;
+                throw new CelEvaluationException("size() applied to null");
             }
             if (v instanceof String) {
                 return (long) ((String) v).length();
@@ -364,11 +372,20 @@ abstract class CelNode {
         @Override
         Object eval(Function<String, Object> a) {
             Object v = inner.eval(a);
-            if (v instanceof Long) {
-                return -(Long) v;
-            }
-            if (v instanceof Integer) {
-                return -(long) (Integer) v;
+            // Round-10 audit: negate of Long.MIN_VALUE silently wraps to
+            // MIN_VALUE again, which is the soundness footgun the spec
+            // already warns about for Arith. Use negateExact so the
+            // overflow surfaces as CelEvaluationException → fail-open at
+            // RuleEngine boundary, rather than silently mis-matching.
+            try {
+                if (v instanceof Long) {
+                    return Math.negateExact((Long) v);
+                }
+                if (v instanceof Integer) {
+                    return Math.negateExact((long) (Integer) v);
+                }
+            } catch (ArithmeticException e) {
+                throw new CelEvaluationException("integer overflow in unary -");
             }
             throw new CelEvaluationException("unary - requires number");
         }
@@ -440,6 +457,22 @@ abstract class CelNode {
             if (l instanceof String && r instanceof String) {
                 int len = Math.min(((String) l).length(), ((String) r).length());
                 CelLimits.bumpSteps(Math.max(1, len));
+            } else if (l instanceof List && r instanceof List) {
+                // Round-10 audit: List equality walks every element via
+                // AbstractList.equals → recursive Objects.equals. A rule like
+                // request.giantList == request.otherGiantList in an
+                // attacker-iterated comprehension could amortise N element
+                // compares per CEL step. Charge proportionally; size mismatch
+                // short-circuits inside Objects.equals so this overcharges
+                // only in the (cheap) early-bail case.
+                CelLimits.bumpSteps(Math.min(((List<?>) l).size(), ((List<?>) r).size()));
+            } else if (l instanceof Map && r instanceof Map) {
+                // Same motivation for Map equality: AbstractMap.equals walks
+                // every entry; for ApiMessageActivation-shaped data both sides
+                // can be deep nested maps. Charge proportional to the smaller
+                // side (size-mismatch short-circuit) so the step budget kills
+                // the runaway at the iteration limit, not after the walk.
+                CelLimits.bumpSteps(Math.min(((Map<?, ?>) l).size(), ((Map<?, ?>) r).size()));
             }
             if (op == Op.EQ) {
                 return valueEquals(l, r);
@@ -551,21 +584,35 @@ abstract class CelNode {
         }
 
         private long applyArith(long li, long ri) {
-            switch (op) {
-                case ADD: return li + ri;
-                case SUB: return li - ri;
-                case MUL: return li * ri;
-                case DIV:
-                    if (ri == 0) {
-                        throw new CelEvaluationException("divide by zero");
-                    }
-                    return li / ri;
-                case MOD:
-                    if (ri == 0) {
-                        throw new CelEvaluationException("modulo by zero");
-                    }
-                    return li % ri;
-                default: throw new CelEvaluationException("unhandled arith op " + op);
+            // Round-10 audit: silent overflow flips predicate truth values
+            // (e.g. `request.size + 1 > 0` becomes false at Long.MAX_VALUE).
+            // Use *Exact so overflow surfaces as CelEvaluationException
+            // → fail-open at the RuleEngine boundary, not a soundness bug.
+            try {
+                switch (op) {
+                    case ADD: return Math.addExact(li, ri);
+                    case SUB: return Math.subtractExact(li, ri);
+                    case MUL: return Math.multiplyExact(li, ri);
+                    case DIV:
+                        if (ri == 0) {
+                            throw new CelEvaluationException("divide by zero");
+                        }
+                        // Long.MIN_VALUE / -1 overflows; floorDiv preserves
+                        // the sign convention but still throws on overflow.
+                        if (li == Long.MIN_VALUE && ri == -1L) {
+                            throw new CelEvaluationException(
+                                "integer overflow in division (MIN_VALUE / -1)");
+                        }
+                        return li / ri;
+                    case MOD:
+                        if (ri == 0) {
+                            throw new CelEvaluationException("modulo by zero");
+                        }
+                        return li % ri;
+                    default: throw new CelEvaluationException("unhandled arith op " + op);
+                }
+            } catch (ArithmeticException e) {
+                throw new CelEvaluationException("integer overflow in " + op + " (" + e.getMessage() + ")");
             }
         }
     }
@@ -579,6 +626,14 @@ abstract class CelNode {
 
         @Override
         Object eval(Function<String, Object> a) {
+            // Round-10 audit: charge one step per element so a literal
+            // {@code [a,b,c,…]} re-allocated inside a comprehension
+            // (e.g. {@code xs.exists(a, a in [k1,…,kN])}) accounts for its
+            // per-iteration construction cost. MAX_NODES indirectly bounds N
+            // at ~1024, but charging here keeps the "every per-element
+            // runtime cost is charged" invariant clean for future
+            // activation-shape extensions.
+            CelLimits.bumpSteps(Math.max(1, items.size()));
             List<Object> out = new ArrayList<>(items.size());
             for (CelNode n : items) {
                 out.add(n.eval(a));
@@ -598,6 +653,11 @@ abstract class CelNode {
 
         @Override
         Object eval(Function<String, Object> a) {
+            // Round-10 audit: same per-element charge as ListLiteral. A
+            // {@code {k1:v1,…,kN:vN}} built inside an exists/all loop
+            // re-pays HashMap.put cost each iteration; the step budget must
+            // see that work to terminate runaway predicates at the limit.
+            CelLimits.bumpSteps(Math.max(1, keys.size()));
             Map<Object, Object> out = new HashMap<>();
             for (int i = 0; i < keys.size(); i++) {
                 out.put(keys.get(i).eval(a), vals.get(i).eval(a));
