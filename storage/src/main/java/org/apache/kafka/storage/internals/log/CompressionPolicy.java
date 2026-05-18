@@ -31,8 +31,10 @@ import java.util.stream.Stream;
  * path. Setting it to {@link #REQUIRED} causes the broker to reject batches whose
  * {@link CompressionType} is {@code NONE}, per-partition, with {@code INVALID_RECORD}.
  *
- * Enforcement is intentionally limited to client appends; replication and internal
- * origins bypass the check so that already-stored batches remain replicable.
+ * Enforcement runs in the produce request handler, ahead of the replication and log
+ * layers. Replication, transaction state, and group-coordinator appends therefore
+ * bypass the check by construction: already-stored batches remain replicable even
+ * if the policy is enabled after the fact.
  */
 public enum CompressionPolicy {
     NONE("none") {

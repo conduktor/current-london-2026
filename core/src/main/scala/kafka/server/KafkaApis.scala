@@ -56,7 +56,7 @@ import org.apache.kafka.common.resource.{Resource, ResourceType}
 import org.apache.kafka.common.security.auth.{KafkaPrincipal, SecurityProtocol}
 import org.apache.kafka.common.security.token.delegation.{DelegationToken, TokenInformation}
 import org.apache.kafka.common.utils.{ProducerIdAndEpoch, Time}
-import org.apache.kafka.common.{Node, TopicIdPartition, TopicPartition, Uuid}
+import org.apache.kafka.common.{InvalidRecordException, Node, TopicIdPartition, TopicPartition, Uuid}
 import org.apache.kafka.coordinator.group.{Group, GroupCoordinator}
 import org.apache.kafka.coordinator.share.ShareCoordinator
 import org.apache.kafka.server.ClientMetricsManager
@@ -66,7 +66,7 @@ import org.apache.kafka.server.share.context.ShareFetchContext
 import org.apache.kafka.server.share.{ErroneousAndValidPartitionData, SharePartitionKey}
 import org.apache.kafka.server.share.acknowledge.ShareAcknowledgementBatch
 import org.apache.kafka.server.storage.log.{FetchIsolation, FetchParams, FetchPartitionData}
-import org.apache.kafka.storage.internals.log.AppendOrigin
+import org.apache.kafka.storage.internals.log.{AppendOrigin, CompressionPolicy}
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats
 
 import java.time.Duration
@@ -408,6 +408,7 @@ class KafkaApis(val requestChannel: RequestChannel,
       else
         try {
           ProduceRequest.validateRecords(request.header.apiVersion, memoryRecords)
+          enforceCompressionPolicy(topicPartition, memoryRecords)
           authorizedRequestInfo += (topicPartition -> memoryRecords)
         } catch {
           case e: ApiException =>
@@ -520,6 +521,32 @@ class KafkaApis(val requestChannel: RequestChannel,
       // if the request is put into the purgatory, it will have a held reference and hence cannot be garbage collected;
       // hence we clear its data here in order to let GC reclaim its memory since it is already appended to log
       produceRequest.clearPartitionRecords()
+    }
+  }
+
+  /**
+   * Reject the partition if its records violate the topic-level `compression.policy`.
+   *
+   * Runs adjacent to `ProduceRequest.validateRecords(...)` inside the same per-partition
+   * try/catch in `handleProduceRequest`, so an `InvalidRecordException` thrown here flows
+   * directly into `invalidRequestResponses` as a per-partition `INVALID_RECORD` response.
+   *
+   * Fast path (the topic's policy is `none` or no `LogConfig` is yet visible for the
+   * partition) returns immediately without walking the batches.
+   */
+  private def enforceCompressionPolicy(topicPartition: TopicPartition, records: MemoryRecords): Unit = {
+    val policy = replicaManager.getLogConfig(topicPartition)
+      .map(_.compressionPolicy)
+      .getOrElse(CompressionPolicy.NONE)
+    if (policy eq CompressionPolicy.NONE) return
+    val batchIter = records.batches.iterator
+    while (batchIter.hasNext) {
+      val batch = batchIter.next()
+      if (policy.isViolatedBy(batch.compressionType)) {
+        throw new InvalidRecordException(
+          s"Produce to $topicPartition was rejected by compression.policy=${policy.name}: " +
+          s"batch has compression.type=${batch.compressionType.name} but the topic requires compressed batches.")
+      }
     }
   }
 

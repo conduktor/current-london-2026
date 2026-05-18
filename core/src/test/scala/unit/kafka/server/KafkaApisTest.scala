@@ -93,7 +93,7 @@ import org.apache.kafka.server.share.context.{FinalContext, ShareSessionContext}
 import org.apache.kafka.server.share.session.{ShareSession, ShareSessionKey}
 import org.apache.kafka.server.storage.log.{FetchParams, FetchPartitionData}
 import org.apache.kafka.server.util.{FutureUtils, MockTime}
-import org.apache.kafka.storage.internals.log.{AppendOrigin, LogConfig}
+import org.apache.kafka.storage.internals.log.{AppendOrigin, CompressionPolicy, LogConfig}
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats
 import org.junit.jupiter.api.Assertions._
 import org.junit.jupiter.api.{AfterEach, Test}
@@ -2299,6 +2299,180 @@ class KafkaApisTest extends Logging {
         kafkaApis.close()
       }
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // compression.policy enforcement in KafkaApis.handleProduceRequest
+  //
+  // These tests pin the design to the request-handler layer: the check runs
+  // adjacent to ProduceRequest.validateRecords(...), an offending partition is
+  // turned into a per-partition INVALID_RECORD response without going down to
+  // ReplicaManager.handleProduceAppend, and the rest of the request keeps
+  // flowing through the existing path.
+  // ---------------------------------------------------------------------------
+
+  private def compressionPolicyLogConfig(policy: CompressionPolicy): LogConfig = {
+    val props = new Properties()
+    props.put(LogConfig.COMPRESSION_POLICY_CONFIG, policy.name)
+    new LogConfig(props)
+  }
+
+  private def buildSingleTopicProduceRequest(tp: TopicPartition, records: MemoryRecords, version: Short): ProduceRequest = {
+    ProduceRequest.builder(new ProduceRequestData()
+      .setTopicData(new ProduceRequestData.TopicProduceDataCollection(
+        Collections.singletonList(new ProduceRequestData.TopicProduceData()
+          .setName(tp.topic).setPartitionData(Collections.singletonList(
+            new ProduceRequestData.PartitionProduceData()
+              .setIndex(tp.partition)
+              .setRecords(records))))
+          .iterator))
+      .setAcks(1.toShort)
+      .setTimeoutMs(5000))
+      .build(version)
+  }
+
+  @Test
+  def testCompressionPolicyDefaultLetsUncompressedBatchThrough(): Unit = {
+    // Acceptance criterion: topic without the policy set behaves exactly like vanilla Kafka.
+    val topic = "topic"
+    addTopicToMetadataCache(topic, numPartitions = 1)
+    val tp = new TopicPartition(topic, 0)
+
+    // Default LogConfig — compression.policy defaults to "none".
+    when(replicaManager.getLogConfig(ArgumentMatchers.eq(tp))).thenReturn(Some(new LogConfig(new Properties())))
+
+    val responseCallback: ArgumentCaptor[Map[TopicPartition, PartitionResponse] => Unit] =
+      ArgumentCaptor.forClass(classOf[Map[TopicPartition, PartitionResponse] => Unit])
+    when(replicaManager.handleProduceAppend(anyLong, anyShort, ArgumentMatchers.eq(false), any(), any(),
+      responseCallback.capture(), any(), any(), any(), any())
+    ).thenAnswer(_ => responseCallback.getValue.apply(Map(tp -> new PartitionResponse(Errors.NONE))))
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](), any[Long])).thenReturn(0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val produceRequest = buildSingleTopicProduceRequest(tp,
+      MemoryRecords.withRecords(Compression.NONE, new SimpleRecord("v".getBytes)),
+      ApiKeys.PRODUCE.latestVersion)
+    val request = buildRequest(produceRequest)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[ProduceResponse](request)
+    val partitionResponse = response.data.responses.asScala.head.partitionResponses.asScala.head
+    assertEquals(Errors.NONE, Errors.forCode(partitionResponse.errorCode))
+  }
+
+  @Test
+  def testCompressionPolicyRequiredRejectsUncompressedBatchAsInvalidRecord(): Unit = {
+    // Acceptance criterion: a NONE-compressed batch on a `required` topic is rejected with
+    // INVALID_RECORD, the producer can retry with compression enabled, and ReplicaManager
+    // never sees the offending append.
+    val topic = "topic"
+    addTopicToMetadataCache(topic, numPartitions = 1)
+    val tp = new TopicPartition(topic, 0)
+
+    when(replicaManager.getLogConfig(ArgumentMatchers.eq(tp)))
+      .thenReturn(Some(compressionPolicyLogConfig(CompressionPolicy.REQUIRED)))
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](), any[Long])).thenReturn(0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val produceRequest = buildSingleTopicProduceRequest(tp,
+      MemoryRecords.withRecords(Compression.NONE, new SimpleRecord("v".getBytes)),
+      ApiKeys.PRODUCE.latestVersion)
+    val request = buildRequest(produceRequest)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[ProduceResponse](request)
+    val partitionResponse = response.data.responses.asScala.head.partitionResponses.asScala.head
+    assertEquals(Errors.INVALID_RECORD, Errors.forCode(partitionResponse.errorCode))
+    // Rejected partitions must not reach the replica/log layer.
+    verify(replicaManager, never()).handleProduceAppend(anyLong, anyShort, anyBoolean, any(), any(), any(), any(), any(), any(), any())
+  }
+
+  @Test
+  def testCompressionPolicyRequiredAcceptsCompressedBatch(): Unit = {
+    val topic = "topic"
+    addTopicToMetadataCache(topic, numPartitions = 1)
+    val tp = new TopicPartition(topic, 0)
+
+    when(replicaManager.getLogConfig(ArgumentMatchers.eq(tp)))
+      .thenReturn(Some(compressionPolicyLogConfig(CompressionPolicy.REQUIRED)))
+
+    val responseCallback: ArgumentCaptor[Map[TopicPartition, PartitionResponse] => Unit] =
+      ArgumentCaptor.forClass(classOf[Map[TopicPartition, PartitionResponse] => Unit])
+    when(replicaManager.handleProduceAppend(anyLong, anyShort, ArgumentMatchers.eq(false), any(), any(),
+      responseCallback.capture(), any(), any(), any(), any())
+    ).thenAnswer(_ => responseCallback.getValue.apply(Map(tp -> new PartitionResponse(Errors.NONE))))
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](), any[Long])).thenReturn(0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val produceRequest = buildSingleTopicProduceRequest(tp,
+      MemoryRecords.withRecords(Compression.lz4().build(), new SimpleRecord("v".getBytes)),
+      ApiKeys.PRODUCE.latestVersion)
+    val request = buildRequest(produceRequest)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[ProduceResponse](request)
+    val partitionResponse = response.data.responses.asScala.head.partitionResponses.asScala.head
+    assertEquals(Errors.NONE, Errors.forCode(partitionResponse.errorCode))
+  }
+
+  @Test
+  def testCompressionPolicyAppliesPerPartitionAcrossMixedTopics(): Unit = {
+    // Acceptance criterion: a single produce request targeting partitions on two topics —
+    // one with policy=required, one without — succeeds for the unconfigured topic's
+    // partition and returns INVALID_RECORD only for the configured topic's partition,
+    // in a single response.
+    val configuredTopic = "configured"
+    val openTopic = "open"
+    addTopicToMetadataCache(configuredTopic, numPartitions = 1)
+    addTopicToMetadataCache(openTopic, numPartitions = 1)
+    val tpConfigured = new TopicPartition(configuredTopic, 0)
+    val tpOpen = new TopicPartition(openTopic, 0)
+
+    when(replicaManager.getLogConfig(ArgumentMatchers.eq(tpConfigured)))
+      .thenReturn(Some(compressionPolicyLogConfig(CompressionPolicy.REQUIRED)))
+    when(replicaManager.getLogConfig(ArgumentMatchers.eq(tpOpen)))
+      .thenReturn(Some(new LogConfig(new Properties()))) // policy = none
+
+    val responseCallback: ArgumentCaptor[Map[TopicPartition, PartitionResponse] => Unit] =
+      ArgumentCaptor.forClass(classOf[Map[TopicPartition, PartitionResponse] => Unit])
+    // Only the open topic's partition reaches handleProduceAppend; mock it to succeed.
+    when(replicaManager.handleProduceAppend(anyLong, anyShort, ArgumentMatchers.eq(false), any(), any(),
+      responseCallback.capture(), any(), any(), any(), any())
+    ).thenAnswer(_ => responseCallback.getValue.apply(Map(tpOpen -> new PartitionResponse(Errors.NONE))))
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](), any[Long])).thenReturn(0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    // Build a two-topic produce request, both with NONE-compressed batches.
+    val produceRequest = ProduceRequest.builder(new ProduceRequestData()
+      .setTopicData(new ProduceRequestData.TopicProduceDataCollection(java.util.List.of(
+        new ProduceRequestData.TopicProduceData()
+          .setName(configuredTopic).setPartitionData(Collections.singletonList(
+            new ProduceRequestData.PartitionProduceData()
+              .setIndex(0)
+              .setRecords(MemoryRecords.withRecords(Compression.NONE, new SimpleRecord("v".getBytes))))),
+        new ProduceRequestData.TopicProduceData()
+          .setName(openTopic).setPartitionData(Collections.singletonList(
+            new ProduceRequestData.PartitionProduceData()
+              .setIndex(0)
+              .setRecords(MemoryRecords.withRecords(Compression.NONE, new SimpleRecord("v".getBytes)))))
+      ).iterator))
+      .setAcks(1.toShort)
+      .setTimeoutMs(5000))
+      .build(ApiKeys.PRODUCE.latestVersion)
+    val request = buildRequest(produceRequest)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[ProduceResponse](request)
+    val byTopic = response.data.responses.asScala.map(t => t.name -> t.partitionResponses.asScala.head).toMap
+    assertEquals(Errors.INVALID_RECORD, Errors.forCode(byTopic(configuredTopic).errorCode),
+      "configured topic partition must be rejected with INVALID_RECORD")
+    assertEquals(Errors.NONE, Errors.forCode(byTopic(openTopic).errorCode),
+      "unconfigured topic partition must succeed in the same response")
   }
 
   @Test
