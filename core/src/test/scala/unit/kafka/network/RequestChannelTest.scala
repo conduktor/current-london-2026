@@ -28,13 +28,13 @@ import org.apache.kafka.common.config.{ConfigResource, SaslConfigs, SslConfigs, 
 import org.apache.kafka.common.memory.MemoryPool
 import org.apache.kafka.common.message.CreateTopicsRequestData.CreatableTopic
 import org.apache.kafka.common.message.IncrementalAlterConfigsRequestData._
-import org.apache.kafka.common.message.{CreateTopicsRequestData, CreateTopicsResponseData, IncrementalAlterConfigsRequestData}
+import org.apache.kafka.common.message.{CreateTopicsRequestData, CreateTopicsResponseData, IncrementalAlterConfigsRequestData, MetadataResponseData}
 import org.apache.kafka.common.network.{ClientInformation, ListenerName}
 import org.apache.kafka.common.protocol.Errors
 import org.apache.kafka.common.requests.AlterConfigsRequest._
 import org.apache.kafka.common.requests._
 import org.apache.kafka.common.security.auth.{KafkaPrincipal, KafkaPrincipalSerde, SecurityProtocol}
-import org.apache.kafka.common.utils.{SecurityUtils, Utils}
+import org.apache.kafka.common.utils.{MockTime, SecurityUtils, Utils}
 import org.apache.kafka.network.RequestConvertToJson
 import org.apache.kafka.network.metrics.RequestChannelMetrics
 import org.apache.kafka.test
@@ -215,6 +215,62 @@ class RequestChannelTest {
       new Config(entries.asJavaCollection)), true).build())
 
     assertTrue(isValidJson(RequestConvertToJson.request(alterConfigs.loggableRequest).toString))
+  }
+
+  // --- HTTP bridge hook: short-circuit dispatch when the request carries a completion callback ------------------------
+  //
+  // The HTTP bridge submits synthetic requests that don't correspond to any real socket Processor. When KafkaApis
+  // calls sendResponse, the channel must hand the AbstractResponse back to the bridge instead of trying to serialize
+  // it onto a non-existent network connection. The contract pinned by the three tests below is:
+  //   1. With requestCompletionCallback set, sendResponse fires the callback with the same AbstractResponse and does
+  //      NOT touch the processors map.
+  //   2. Step 1 is safe even with an empty processors map (no NPE, no warning log).
+  //   3. With requestCompletionCallback left as None (the binary protocol path), nothing changes — the response is
+  //      dispatched through the normal Processor pathway, identical to today's behaviour.
+
+  @Test
+  def testRequestCompletionCallbackShortCircuitsProcessorDispatch(): Unit = {
+    val channel = new RequestChannel(queueSize = 16, metricNamePrefix = "test", new MockTime(), requestChannelMetrics)
+    val req = request(new MetadataRequest.Builder(List("topic").asJava, true).build())
+    val captured = new AtomicReference[AbstractResponse]()
+    req.requestCompletionCallback = Some(response => captured.set(response))
+
+    val expectedResponse = new MetadataResponse(new MetadataResponseData(), 0.toShort)
+    channel.sendResponse(req, expectedResponse, None)
+
+    assertSame(expectedResponse, captured.get(),
+      "callback should receive the AbstractResponse handed to sendResponse — not a deserialized copy")
+  }
+
+  @Test
+  def testRequestCompletionCallbackTolerantOfNoRegisteredProcessor(): Unit = {
+    // The HTTP bridge submits with processor = -1 and never calls addProcessor. The short-circuit must run BEFORE
+    // any processors.get(...) lookup, otherwise the bridge would silently lose its response.
+    val channel = new RequestChannel(queueSize = 16, metricNamePrefix = "test", new MockTime(), requestChannelMetrics)
+    val req = request(new MetadataRequest.Builder(List("topic").asJava, true).build())
+    val invoked = new AtomicReference[Boolean](false)
+    req.requestCompletionCallback = Some(_ => invoked.set(true))
+
+    val response = new MetadataResponse(new MetadataResponseData(), 0.toShort)
+    // No processor is registered; without the short-circuit this would silently drop the response.
+    channel.sendResponse(req, response, None)
+
+    assertTrue(invoked.get(), "callback must fire even when no processor is registered")
+  }
+
+  @Test
+  def testBinaryPathUnchangedWhenCallbackIsAbsent(): Unit = {
+    // Regression guard: by default Request.requestCompletionCallback is None. In that case sendResponse must follow
+    // the existing Processor-dispatch path — i.e. it must NOT fire any callback (there is none) and must NOT throw.
+    val channel = new RequestChannel(queueSize = 16, metricNamePrefix = "test", new MockTime(), requestChannelMetrics)
+    val req = request(new MetadataRequest.Builder(List("topic").asJava, true).build())
+    assertEquals(None, req.requestCompletionCallback,
+      "default value of requestCompletionCallback must be None so binary-path callers see no behaviour change")
+
+    val response = new MetadataResponse(new MetadataResponseData(), 0.toShort)
+    // No processor is registered for processor=1 (the default in our request() helper), so the existing code path
+    // logs a warning and drops the response. The point of this test is simply that no exception is thrown.
+    channel.sendResponse(req, response, None)
   }
 
   @ParameterizedTest

@@ -82,6 +82,13 @@ object RequestChannel extends Logging {
     @volatile var callbackRequestDequeueTimeNanos: Option[Long] = None
     @volatile var callbackRequestCompleteTimeNanos: Option[Long] = None
 
+    // HTTP-bridge hook. When a request is submitted by an in-process listener (e.g. the HTTP/WS/SSE bridge) it has no
+    // backing socket Processor: setting this callback redirects the AbstractResponse from sendResponse back to the
+    // submitter instead of dispatching it down the binary network pipeline. Left as None on the binary protocol path
+    // so existing callers see no behaviour change. Reader runs on a request handler thread; writer is the submitter
+    // before the request is enqueued — hence @volatile.
+    @volatile var requestCompletionCallback: Option[AbstractResponse => Unit] = None
+
     val session: Session = new Session(context.principal, context.clientAddress)
 
     private val bodyAndSize: RequestAndSize = context.parseRequest(buffer)
@@ -395,12 +402,23 @@ class RequestChannel(val queueSize: Int,
     onComplete: Option[Send => Unit]
   ): Unit = {
     updateErrorMetrics(request.header.apiKey, response.errorCounts.asScala)
-    sendResponse(new RequestChannel.SendResponse(
-      request,
-      request.buildResponseSend(response),
-      request.responseNode(response),
-      onComplete
-    ))
+    // HTTP-bridge short-circuit: an in-process submitter (e.g. the HTTP listener) sets
+    // `requestCompletionCallback` to receive the AbstractResponse directly. There is no socket Processor to write
+    // the response back to, so we must NOT call `buildResponseSend` (wasteful serialization) and we must NOT look up
+    // a Processor (none was ever registered). The callback is invoked synchronously on the request handler thread;
+    // any further fan-out is the submitter's responsibility. Binary protocol callers leave the field as None and
+    // continue down the existing Processor-dispatch path below.
+    request.requestCompletionCallback match {
+      case Some(callback) =>
+        callback(response)
+      case None =>
+        sendResponse(new RequestChannel.SendResponse(
+          request,
+          request.buildResponseSend(response),
+          request.responseNode(response),
+          onComplete
+        ))
+    }
   }
 
   def sendNoOpResponse(request: RequestChannel.Request): Unit = {
