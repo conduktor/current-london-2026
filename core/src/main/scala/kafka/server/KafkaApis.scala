@@ -431,7 +431,25 @@ class KafkaApis(val requestChannel: RequestChannel,
         // protocol violations are caught BEFORE we reserve logical offsets — a reservation we
         // can't fulfil means we have to rollback, which is more expensive than refusing up front.
         val descriptor = concentrationKernel.describe(topicPartition.topic).get
-        if (topicPartition.partition < 0 || topicPartition.partition >= descriptor.numLogicalPartitions) {
+        // Concentration v1: refuse to serve a logical topic whose backing has cleanup.policy
+        // containing "compact". Compaction would let two logical topics tombstone each other on
+        // shared keys (silent data loss) because the compactor sees only the record key, not the
+        // LOGICAL_TOPIC header. The kernel caches the validation per backing so this is a hash
+        // lookup after the first call per broker process — the configRepository read is also
+        // cheap (in-memory) and Kafka already calls it on the produce path for its own validation.
+        val backingCleanupPolicy = configRepository.topicConfig(descriptor.backingTopic)
+          .getProperty(org.apache.kafka.common.config.TopicConfig.CLEANUP_POLICY_CONFIG, "delete")
+        val backingCompactionError: Option[String] =
+          try {
+            concentrationKernel.assertBackingTopicNotCompacted(descriptor.backingTopic, backingCleanupPolicy)
+            None
+          } catch {
+            case e: IllegalStateException => Some(e.getMessage)
+          }
+        if (backingCompactionError.isDefined) {
+          invalidRequestResponses += topicPartition -> new PartitionResponse(
+            Errors.INVALID_TOPIC_EXCEPTION, backingCompactionError.get)
+        } else if (topicPartition.partition < 0 || topicPartition.partition >= descriptor.numLogicalPartitions) {
           // Out-of-range partition is a client routing bug, not a transient error.
           nonExistingTopicResponses += topicPartition -> new PartitionResponse(Errors.UNKNOWN_TOPIC_OR_PARTITION)
         } else {

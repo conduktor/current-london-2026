@@ -684,4 +684,71 @@ public class ConcentrationKernelTest {
                 new IdempotentBatchResult(0L, 0L, 0L, 1L)));
         kernel = null;
     }
+
+    // ------------------ assertBackingTopicNotCompacted ------------------
+
+    @Test
+    public void assertBackingTopicNotCompactedAcceptsDeletePolicy() {
+        // The common case: a backing topic created with default or explicit cleanup.policy=delete.
+        // The first call validates and caches; we don't observe behaviour directly here beyond
+        // "does not throw", but the cache-hit test below relies on this completing successfully.
+        kernel.assertBackingTopicNotCompacted("shared", "delete");
+    }
+
+    @Test
+    public void assertBackingTopicNotCompactedAcceptsNullPolicyAsDelete() {
+        // A broker that has not loaded any topic-level override for cleanup.policy may pass null
+        // here; the kernel must treat that as the broker default ("delete") rather than NPE'ing
+        // out and stalling the produce path.
+        kernel.assertBackingTopicNotCompacted("shared", null);
+    }
+
+    @Test
+    public void assertBackingTopicNotCompactedRejectsCompactPolicy() {
+        // PROMPT.md v1: non-compacted backings only. Compaction on a shared backing would let
+        // logical topic A's tombstone for key K silently delete logical topic B's record with the
+        // same key. Surface this loudly so the operator fixes the topic config.
+        IllegalStateException ex = assertThrows(IllegalStateException.class,
+            () -> kernel.assertBackingTopicNotCompacted("shared", "compact"));
+        assertTrue(ex.getMessage().contains("shared"),
+            "error must name the offending backing topic so the operator can fix it");
+        assertTrue(ex.getMessage().contains("compact"),
+            "error must surface the offending cleanup.policy value");
+    }
+
+    @Test
+    public void assertBackingTopicNotCompactedRejectsCompositeCompactDeletePolicy() {
+        // "compact,delete" is a legitimate cleanup.policy value in stock Kafka, but for
+        // concentration v1 it is still unsafe — the compactor runs and the cross-logical-topic
+        // key collision applies just the same. Reject anything containing "compact".
+        assertThrows(IllegalStateException.class,
+            () -> kernel.assertBackingTopicNotCompacted("shared", "compact,delete"));
+    }
+
+    @Test
+    public void assertBackingTopicNotCompactedCachesValidatedBackingsForHotPath() {
+        // After the first successful check, subsequent calls must NOT re-evaluate the policy
+        // argument — the broker passes whatever it has resolved on the hot path, and a cached
+        // backing must short-circuit before reaching the "compact" string check. We assert this by
+        // calling first with "delete" (validates + caches), then with "compact" (would normally
+        // throw) and confirming no exception: the cache hit short-circuits the check.
+        kernel.assertBackingTopicNotCompacted("shared", "delete");
+        kernel.assertBackingTopicNotCompacted("shared", "compact");
+    }
+
+    @Test
+    public void assertBackingTopicNotCompactedIsolatesBackingTopics() {
+        // Each backing topic has its own validation slot — caching "shared-A" must not mask a
+        // mis-configured "shared-B". Otherwise a single declare of a safe backing would unlock all
+        // backings broker-wide.
+        kernel.assertBackingTopicNotCompacted("shared-A", "delete");
+        assertThrows(IllegalStateException.class,
+            () -> kernel.assertBackingTopicNotCompacted("shared-B", "compact"));
+    }
+
+    @Test
+    public void assertBackingTopicNotCompactedRejectsNullBackingTopic() {
+        assertThrows(NullPointerException.class,
+            () -> kernel.assertBackingTopicNotCompacted(null, "delete"));
+    }
 }

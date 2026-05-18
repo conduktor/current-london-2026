@@ -84,6 +84,14 @@ public final class ConcentrationKernel implements AutoCloseable {
     private final BackingScanRecoverer recoverer;
     private final ConcurrentHashMap<LogicalPartition, LogicalSidecarIndex> sidecars = new ConcurrentHashMap<>();
     /**
+     * Set of backing topic names whose cleanup.policy has already been confirmed non-compacted in
+     * this broker process. v1 cannot serve concentration on a compacted backing — see
+     * {@link #assertBackingTopicNotCompacted(String, String)} for the rationale. Once confirmed,
+     * subsequent checks short-circuit to a single hash lookup so the produce/fetch hot path pays
+     * essentially nothing.
+     */
+    private final ConcurrentHashMap<String, Boolean> validatedBackingTopics = new ConcurrentHashMap<>();
+    /**
      * Outer key: logical partition. Inner key: producerId. Value: bounded deque (FIFO, max
      * {@link #MAX_BATCHES_PER_PRODUCER}) of recent batches. Access is serialised on the inner
      * deque — concurrent produces against the same producerId already serialise at the tracker
@@ -131,6 +139,45 @@ public final class ConcentrationKernel implements AutoCloseable {
      */
     public List<LogicalTopicDescriptor> descriptorsFor(String backingTopic) {
         return List.copyOf(registry.descriptorsFor(backingTopic));
+    }
+
+    /**
+     * Validate that {@code backingTopic}'s {@code cleanup.policy} is non-compacted, caching the
+     * result so subsequent calls in this broker process pay only a hash lookup.
+     *
+     * <p>Concentration v1 cannot serve a compacted backing topic: log compaction keys on the
+     * record key alone, and records from different logical topics (or different logical partitions
+     * of the same logical topic) can collide on the same key. The compactor would then tombstone
+     * one logical topic's record because another logical topic wrote a tombstone on the same key
+     * — straight data loss, undetectable from the producer side. Key-prefixing the backing record
+     * to disambiguate is explicitly out of scope for v1 (PROMPT.md "non-transactional,
+     * non-compacted backings only").
+     *
+     * <p>The broker is expected to call this on the produce hot path (and symmetrically on fetch
+     * for defence in depth), passing the {@code cleanup.policy} resolved from the broker's
+     * {@code ConfigRepository}. We accept the policy as an argument rather than reaching into a
+     * config-repo dependency here because (a) the kernel lives in {@code :storage} which must not
+     * pull in broker-side config plumbing, and (b) the broker already resolves topic configs on
+     * the hot path so passing it through costs nothing.
+     *
+     * <p>Throws {@link IllegalStateException} on a compacted backing. The broker catches this and
+     * surfaces {@link org.apache.kafka.common.protocol.Errors#INVALID_TOPIC_EXCEPTION} to the
+     * client — non-retriable, signals a topic-misconfig that requires operator intervention.
+     */
+    public void assertBackingTopicNotCompacted(String backingTopic, String cleanupPolicy) {
+        Objects.requireNonNull(backingTopic, "backingTopic");
+        if (validatedBackingTopics.containsKey(backingTopic)) {
+            return;
+        }
+        String resolved = cleanupPolicy == null ? "delete" : cleanupPolicy;
+        if (resolved.contains("compact")) {
+            throw new IllegalStateException(
+                "Backing topic '" + backingTopic + "' has cleanup.policy='" + resolved
+                + "'; concentration v1 requires a non-compacted backing — compaction would let "
+                + "different logical topics tombstone each other on shared keys (silent data loss). "
+                + "Set cleanup.policy=delete on the backing topic before declaring logical topics on it.");
+        }
+        validatedBackingTopics.put(backingTopic, Boolean.TRUE);
     }
 
     // ------------------ Routing ------------------

@@ -2111,6 +2111,70 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testProduceToLogicalTopicWithCompactedBackingReturnsInvalidTopicException(): Unit = {
+    // Concentration v1 cannot serve a compacted backing topic: compaction is keyed on the record
+    // key alone, so logical topic A's tombstone on key K would silently delete logical topic B's
+    // record with the same key (PROMPT.md "non-compacted backings only"). Codex CRIT #4: the
+    // produce hook must reject this loudly with INVALID_TOPIC_EXCEPTION — non-retriable, signals
+    // a topic-misconfig that requires operator action, not a transient broker condition.
+    val logicalTopic = "orders"
+    val backingTopic = "concentrated-compacted"
+    val descriptor = new LogicalTopicDescriptor(logicalTopic, 1024, backingTopic, 4)
+    addTopicToMetadataCache(backingTopic, numPartitions = 4)
+
+    val compactedConfigRepo = new kafka.server.metadata.MockConfigRepository()
+    compactedConfigRepo.setTopicConfig(backingTopic,
+      org.apache.kafka.common.config.TopicConfig.CLEANUP_POLICY_CONFIG, "compact")
+
+    when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
+    when(concentrationKernel.describe(logicalTopic)).thenReturn(Optional.of(descriptor))
+    when(concentrationKernel.assertBackingTopicNotCompacted(
+      ArgumentMatchers.eq(backingTopic), ArgumentMatchers.eq("compact"))
+    ).thenThrow(new IllegalStateException(
+      s"Backing topic '$backingTopic' has cleanup.policy='compact'; concentration v1 requires a non-compacted backing"))
+
+    val tp = new TopicPartition(logicalTopic, 0)
+    val produceRequest = ProduceRequest.builder(new ProduceRequestData()
+      .setTopicData(new ProduceRequestData.TopicProduceDataCollection(
+        Collections.singletonList(new ProduceRequestData.TopicProduceData()
+          .setName(tp.topic).setPartitionData(Collections.singletonList(
+            new ProduceRequestData.PartitionProduceData()
+              .setIndex(tp.partition)
+              .setRecords(MemoryRecords.withRecords(Compression.NONE, new SimpleRecord("k".getBytes, "v".getBytes))))))
+          .iterator))
+      .setAcks(1.toShort)
+      .setTimeoutMs(5000))
+      .build(ApiKeys.PRODUCE.latestVersion)
+    val request = buildRequest(produceRequest)
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    kafkaApis = createKafkaApis(configRepository = compactedConfigRepo)
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[ProduceResponse](request)
+    assertEquals(1, response.data.responses.size)
+    val topicProduceResponse = response.data.responses.asScala.head
+    assertEquals(logicalTopic, topicProduceResponse.name)
+    val partitionProduceResponse = topicProduceResponse.partitionResponses.asScala.head
+    assertEquals(0, partitionProduceResponse.index)
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION,
+      Errors.forCode(partitionProduceResponse.errorCode),
+      "compacted backing must surface as a non-retriable INVALID_TOPIC_EXCEPTION so the operator " +
+      "fixes cleanup.policy rather than the client retrying forever")
+
+    // The append path must never have been reached — the rejection must short-circuit BEFORE we
+    // reserve logical offsets, otherwise a doomed produce would still consume a logical offset
+    // and create a non-contiguous gap.
+    verify(replicaManager, never()).handleProduceAppend(anyLong, anyShort, ArgumentMatchers.eq(false),
+      any(), any(), any(), any(), any(), any(), any())
+    verify(concentrationKernel, never()).reserveProduceBatch(any(), anyInt, anyInt)
+  }
+
+  @Test
   def testProduceToLogicalTopicStampsHeadersAndCommitsLogicalOffsets(): Unit = {
     // Concentration hook #2 happy path. A stock producer sends a 3-record batch to logical
     // topic "orders" partition 0. The hook must:
