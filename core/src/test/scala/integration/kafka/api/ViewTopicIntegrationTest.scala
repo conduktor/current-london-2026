@@ -434,6 +434,93 @@ class ViewTopicIntegrationTest extends IntegrationTestHarness {
   }
 
   @Test
+  def testListOffsetsOnViewReturnsBackingOffsets(): Unit = {
+    // Consumers call ListOffsets to find beginning/end offsets and timestamps. For a view, those
+    // queries must return the BACKING topic's offsets — that is what the view exposes through
+    // fetch (sparse, never renumbered). If the broker queried the view's placeholder log instead
+    // (which is empty), endOffsets(view) would be 0 and the consumer would never poll any records
+    // even though backing data exists; beginningOffsets(view) would also be 0, so seekToBeginning
+    // would land at 0 regardless of the backing topic's log-start. Either pathology would silently
+    // break every consumer that relies on the standard offset-discovery flow.
+    createTopic(backingTopic)
+    createViewTopic(viewTopic, backingTopic, "body.color == 'red'")
+
+    val producer = createProducer()
+    // 5 records on the backing — high-water mark is 5 regardless of how many match the predicate.
+    // (View offsets are sparse SOURCE offsets, not renumbered match offsets.)
+    val sentOffsets = produceColors(producer, Seq("red", "blue", "red", "green", "red"))
+    assertEquals(Seq(0L, 1L, 2L, 3L, 4L), sentOffsets,
+      "sanity: backing topic must have been written densely so we can assert the HWM below")
+
+    val consumer = createConsumer(configOverrides = newGroupConfig("list-offsets-on-view"))
+    try {
+      val viewTp = new TopicPartition(viewTopic, 0)
+      val backingTp = new TopicPartition(backingTopic, 0)
+
+      val endOnView = consumer.endOffsets(java.util.Collections.singletonList(viewTp))
+      val endOnBacking = consumer.endOffsets(java.util.Collections.singletonList(backingTp))
+      assertEquals(endOnBacking.get(backingTp), endOnView.get(viewTp),
+        "endOffsets(view) must equal endOffsets(backing) — the view sees the backing log; querying " +
+          "the view's empty placeholder log would return 0 and break consumer discovery")
+      assertEquals(5L, endOnView.get(viewTp).longValue(),
+        "high-water mark must reflect the 5 produced records on the backing topic")
+
+      val beginOnView = consumer.beginningOffsets(java.util.Collections.singletonList(viewTp))
+      val beginOnBacking = consumer.beginningOffsets(java.util.Collections.singletonList(backingTp))
+      assertEquals(beginOnBacking.get(backingTp), beginOnView.get(viewTp),
+        "beginningOffsets(view) must equal beginningOffsets(backing) — log-start belongs to the backing")
+    } finally {
+      consumer.close(Duration.ofSeconds(5))
+    }
+  }
+
+  @Test
+  def testListOffsetsRejectsViewAndBackingInSameRequest(): Unit = {
+    // Mirrors testViewAndBackingInSameFetchRejectsView for the ListOffsets path. If both the view
+    // and its backing appear in one ListOffsetsRequest, rewriting the view to its backing name
+    // would create a duplicate topic entry in the request — replica manager would either ignore
+    // one or our response-callback translation would route the backing's response back to the
+    // view name, silently leaking raw backing identity into the view discovery flow. The broker
+    // must reject the view side with INVALID_REQUEST while letting the direct backing entry
+    // (which the user already has READ-ACL on) succeed.
+    //
+    // Use AdminClient.listOffsets — it returns a per-partition KafkaFuture so we can inspect
+    // both outcomes synchronously. KafkaConsumer.endOffsets retries indefinitely on per-partition
+    // errors which would mask the rejection as a TimeoutException.
+    createTopic(backingTopic)
+    createViewTopic(viewTopic, backingTopic, "body.color == 'red'")
+
+    val producer = createProducer()
+    produceColors(producer, Seq("red", "blue", "red"))
+
+    val admin = createAdminClient()
+    try {
+      val viewTp = new TopicPartition(viewTopic, 0)
+      val backingTp = new TopicPartition(backingTopic, 0)
+      val request = new java.util.HashMap[TopicPartition, org.apache.kafka.clients.admin.OffsetSpec]()
+      request.put(viewTp, org.apache.kafka.clients.admin.OffsetSpec.latest())
+      request.put(backingTp, org.apache.kafka.clients.admin.OffsetSpec.latest())
+
+      val result = admin.listOffsets(request)
+
+      val ex = assertThrows(classOf[ExecutionException], () => result.partitionResult(viewTp).get())
+      val chain = causeChain(ex)
+      assertTrue(chain.exists(_.isInstanceOf[InvalidRequestException]),
+        s"view side must be rejected with INVALID_REQUEST when paired with its backing in one " +
+          s"ListOffsets, got: ${chain.map(_.toString).mkString(" -> ")}")
+
+      // Backing side must succeed — the consumer's READ-ACL on the backing topic still entitles
+      // them to the raw offsets.
+      val backingResult = result.partitionResult(backingTp).get()
+      assertEquals(3L, backingResult.offset(),
+        "backing-side ListOffsets must succeed (the user holds READ on the backing; only the " +
+          "colliding view is rejected). 3 records were produced.")
+    } finally {
+      admin.close(Duration.ofSeconds(5))
+    }
+  }
+
+  @Test
   def testViewFilterHandlesCompressedBatches(): Unit = {
     createTopic(backingTopic)
     createViewTopic(viewTopic, backingTopic, "body.color == 'red'")

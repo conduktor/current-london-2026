@@ -35,7 +35,7 @@ import org.apache.kafka.common.internals.{FatalExitError, Topic}
 import org.apache.kafka.common.message.AddPartitionsToTxnResponseData.{AddPartitionsToTxnResult, AddPartitionsToTxnResultCollection}
 import org.apache.kafka.common.message.DeleteRecordsResponseData.{DeleteRecordsPartitionResult, DeleteRecordsTopicResult}
 import org.apache.kafka.common.message.ListClientMetricsResourcesResponseData.ClientMetricsResource
-import org.apache.kafka.common.message.ListOffsetsRequestData.ListOffsetsPartition
+import org.apache.kafka.common.message.ListOffsetsRequestData.{ListOffsetsPartition, ListOffsetsTopic}
 import org.apache.kafka.common.message.ListOffsetsResponseData.{ListOffsetsPartitionResponse, ListOffsetsTopicResponse}
 import org.apache.kafka.common.message.MetadataResponseData.{MetadataResponsePartition, MetadataResponseTopic}
 import org.apache.kafka.common.message.OffsetForLeaderEpochRequestData.OffsetForLeaderTopic
@@ -1032,12 +1032,120 @@ class KafkaApis(val requestChannel: RequestChannel,
           .setTopics(mergedResponses.asJava)))
     }
 
-    if (authorizedRequestInfo.isEmpty) {
-      sendResponseCallback(Seq.empty)
+    // View-rewrite pass for ListOffsets. After authorization, each view topic in the request is
+    // rewritten to its backing topic so replicaManager.fetchOffset queries the actual on-disk
+    // log (the view's placeholder log is empty). The response is translated back to view names
+    // before being returned to the consumer, so the view name never leaks the backing name.
+    //
+    // Mirrors the rewrite logic in handleFetchRequest (collision detection on view+backing in
+    // one request, on two views sharing one backing, and on malformed view configs). Keyed by
+    // topic NAME rather than TopicIdPartition because ListOffsetsRequest is name-keyed and the
+    // partition count of a view always matches its backing (enforced at view-creation time).
+    val backingToView = mutable.LinkedHashMap[String, String]() // backingName → viewName, response translation
+    val viewRewriteResponses = mutable.ArrayBuffer[ListOffsetsTopicResponse]()
+    val rewrittenAuthorizedInfo = mutable.ArrayBuffer[ListOffsetsTopic]()
+
+    if (authorizedRequestInfo.nonEmpty) {
+      // First pass: classify each authorized topic — view (with spec) / direct / malformed view.
+      val classified = authorizedRequestInfo.map { topic =>
+        val result: Either[Exception, Optional[ViewSpec]] = try {
+          Right(viewRegistry.viewFor(topic.name))
+        } catch {
+          case e: Exception => Left(e)
+        }
+        (topic, result)
+      }
+
+      val directNames: Set[String] = classified.collect {
+        case (topic, Right(opt)) if !opt.isPresent => topic.name
+      }.toSet
+
+      def rejectAllPartitions(topic: ListOffsetsTopic, err: Errors): Unit = {
+        viewRewriteResponses += new ListOffsetsTopicResponse()
+          .setName(topic.name)
+          .setPartitions(topic.partitions.asScala.map(p => buildErrorResponse(err, p)).asJava)
+      }
+
+      classified.foreach {
+        case (topic, Left(e)) =>
+          // A malformed view config (predicate compile failure, self-loop) reaching this point
+          // means LogConfig validation was bypassed somehow. Mirrors handleFetchRequest.
+          warn(s"Failed to load view spec for topic ${topic.name}; rejecting ListOffsets with INVALID_REQUEST", e)
+          rejectAllPartitions(topic, Errors.INVALID_REQUEST)
+
+        case (topic, Right(maybeSpec)) if maybeSpec.isPresent =>
+          val spec = maybeSpec.get()
+          val backingName = spec.backingTopic()
+          // Backing must exist for every requested partition.
+          val anyMissing = topic.partitions.asScala.exists { p =>
+            !metadataCache.contains(new TopicPartition(backingName, p.partitionIndex))
+          }
+          if (anyMissing) {
+            // Mirror handleFetchRequest: surface UNKNOWN_TOPIC_OR_PARTITION keyed at the view
+            // so the consumer never learns the backing topic name.
+            rejectAllPartitions(topic, Errors.UNKNOWN_TOPIC_OR_PARTITION)
+          } else if (directNames.contains(backingName)) {
+            warn(s"ListOffsets rejected: view ${topic.name} redirects to backing topic $backingName " +
+              s"which is also a direct entry in the same ListOffsetsRequest; failing the view with " +
+              s"INVALID_REQUEST. Issue the view in a separate ListOffsets request.")
+            rejectAllPartitions(topic, Errors.INVALID_REQUEST)
+          } else if (backingToView.contains(backingName)) {
+            val firstView = backingToView(backingName)
+            warn(s"ListOffsets rejected: view ${topic.name} and view $firstView both target backing topic " +
+              s"$backingName in one ListOffsetsRequest; failing the second view with INVALID_REQUEST.")
+            rejectAllPartitions(topic, Errors.INVALID_REQUEST)
+          } else {
+            rewrittenAuthorizedInfo += new ListOffsetsTopic()
+              .setName(backingName)
+              .setPartitions(topic.partitions)
+            backingToView.put(backingName, topic.name)
+          }
+
+        case (topic, Right(_)) =>
+          // Non-view — pass through unchanged.
+          rewrittenAuthorizedInfo += topic
+      }
+    }
+
+    // The duplicate-partitions set is keyed by the names the client sent. Rewrite any (view, p)
+    // entries to (backing, p) so replicaManager's duplicate check finds them under the rewritten
+    // request shape.
+    val rewrittenDuplicates: collection.Set[TopicPartition] = if (backingToView.isEmpty) {
+      offsetRequest.duplicatePartitions().asScala
     } else {
-      replicaManager.fetchOffset(authorizedRequestInfo, offsetRequest.duplicatePartitions().asScala,
+      val viewToBacking: Map[String, String] = backingToView.map { case (k, v) => v -> k }.toMap
+      offsetRequest.duplicatePartitions().asScala.map { tp =>
+        viewToBacking.get(tp.topic) match {
+          case Some(backing) => new TopicPartition(backing, tp.partition)
+          case None => tp
+        }
+      }
+    }
+
+    // Wrap the original sendResponseCallback so we (a) translate backing names back to view names
+    // and (b) append any view-rewrite rejection responses we built above. The original callback
+    // also tacks on the topic-authorization-failure responses.
+    def viewAwareSendResponseCallback(response: Seq[ListOffsetsTopicResponse]): Unit = {
+      val translated: Seq[ListOffsetsTopicResponse] =
+        if (backingToView.isEmpty) response
+        else response.map { topicResp =>
+          backingToView.get(topicResp.name) match {
+            case Some(viewName) =>
+              new ListOffsetsTopicResponse().setName(viewName).setPartitions(topicResp.partitions)
+            case None => topicResp
+          }
+        }
+      sendResponseCallback(translated ++ viewRewriteResponses)
+    }
+
+    if (rewrittenAuthorizedInfo.isEmpty) {
+      // Either no authorized topics at all, or every authorized topic was a view that we rejected.
+      // Either way we have nothing live to ask the replica manager.
+      viewAwareSendResponseCallback(Seq.empty)
+    } else {
+      replicaManager.fetchOffset(rewrittenAuthorizedInfo.toSeq, rewrittenDuplicates.toSet,
         offsetRequest.isolationLevel(), offsetRequest.replicaId(), clientId, correlationId, version,
-        buildErrorResponse, sendResponseCallback, offsetRequest.timeoutMs())
+        buildErrorResponse, viewAwareSendResponseCallback, offsetRequest.timeoutMs())
     }
   }
 
