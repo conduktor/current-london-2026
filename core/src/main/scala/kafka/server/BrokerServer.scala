@@ -455,7 +455,7 @@ class BrokerServer(
       // The kernel does NOT take a reference to LogManager — it only needs a place to write
       // its sidecar files. See storage/.../concentration/ConcentrationKernel for the API.
       concentrationKernel = new ConcentrationKernel(
-        new File(logManager.liveLogDirs.head, "_concentration_sidecars"))
+        new File(logManager.liveLogDirs.head, ConcentrationKernel.SIDECAR_DIR_NAME))
 
       // Hook #6 (minimal): broker-config shortcut for declaring logical topics. The long-term
       // path is a KRaft metadata record; until then, operators put their declarations in
@@ -570,7 +570,8 @@ class BrokerServer(
           authorizer
         ),
         sharedServer.initialBrokerMetadataLoadFaultHandler,
-        sharedServer.metadataPublishingFaultHandler
+        sharedServer.metadataPublishingFaultHandler,
+        concentrationKernel
       )
       // If the BrokerLifecycleManager's initial catch-up future fails, it means we timed out
       // or are shutting down before we could catch up. Therefore, also fail the firstPublishFuture.

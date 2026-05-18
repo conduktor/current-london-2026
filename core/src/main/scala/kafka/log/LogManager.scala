@@ -41,6 +41,7 @@ import org.apache.kafka.metadata.properties.{MetaProperties, MetaPropertiesEnsem
 import java.util.{Collections, OptionalLong, Properties}
 import org.apache.kafka.server.metrics.KafkaMetricsGroup
 import org.apache.kafka.server.util.{FileLock, Scheduler}
+import org.apache.kafka.storage.internals.concentration.ConcentrationKernel
 import org.apache.kafka.storage.internals.log.{CleanerConfig, LogConfig, LogDirFailureChannel, ProducerStateManagerConfig, RemoteIndexCache}
 import org.apache.kafka.storage.internals.checkpoint.{CleanShutdownFileHandler, OffsetCheckpointFile}
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats
@@ -463,6 +464,9 @@ class LogManager(logDirs: Seq[File],
             // Ignore remote-log-index-cache directory as that is index cache maintained by tiered storage subsystem
             // but not any topic-partition dir.
             !logDir.getName.equals(RemoteIndexCache.DIR_NAME) &&
+            // Ignore the concentration sidecar directory; it holds the logical-offset index files
+            // for "infinite partitions" and shares the log dir with topic-partition directories.
+            !logDir.getName.equals(ConcentrationKernel.SIDECAR_DIR_NAME) &&
             UnifiedLog.parseTopicPartitionName(logDir).topic != KafkaRaftServer.MetadataTopic)
         numTotalLogs += logsToLoad.length
         numRemainingLogs.put(logDirAbsolutePath, logsToLoad.length)

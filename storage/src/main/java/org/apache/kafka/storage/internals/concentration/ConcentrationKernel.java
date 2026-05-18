@@ -58,6 +58,15 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 public final class ConcentrationKernel implements AutoCloseable {
 
+    /**
+     * Directory name used by the broker wiring when nesting the sidecar directory inside a log
+     * dir. Exposed here so {@code LogManager.loadLogs} can filter it from its topic-partition
+     * scan, mirroring how {@code RemoteIndexCache.DIR_NAME} is filtered. Without this exclusion
+     * LogManager rejects the directory because it does not match the {@code topic-partition}
+     * naming convention, failing broker startup.
+     */
+    public static final String SIDECAR_DIR_NAME = "_concentration_sidecars";
+
     private final LogicalTopicRegistry registry = new LogicalTopicRegistry();
     private final LogicalOffsetTracker tracker = new LogicalOffsetTracker();
     private final BackingScanRecoverer recoverer;
