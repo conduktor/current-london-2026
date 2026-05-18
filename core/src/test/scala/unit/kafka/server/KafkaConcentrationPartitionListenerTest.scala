@@ -21,7 +21,7 @@ import org.apache.kafka.storage.internals.concentration.ConcentrationKernel
 import org.junit.jupiter.api.Assertions._
 import org.junit.jupiter.api.Test
 import org.mockito.ArgumentMatchers.any
-import org.mockito.Mockito._
+import org.mockito.Mockito.{inOrder, _}
 
 import java.io.File
 import java.nio.file.Files
@@ -31,36 +31,57 @@ class KafkaConcentrationPartitionListenerTest {
   private val backingTp = new TopicPartition("orders-backing", 7)
 
   @Test
-  def onFailedInvalidatesIdempotentCacheForBackingTopic(): Unit = {
+  def onFailedClosesGateAndInvalidatesIdempotentCacheForBackingTopic(): Unit = {
     val kernel = mock(classOf[ConcentrationKernel])
     val listener = new KafkaConcentrationPartitionListener(backingTp, kernel)
 
     listener.onFailed(backingTp)
 
-    verify(kernel).invalidateIdempotentCacheForBacking(backingTp.topic)
+    val order = inOrder(kernel)
+    order.verify(kernel).markBackingUnready(backingTp)
+    order.verify(kernel).invalidateIdempotentCacheForBacking(backingTp.topic)
     verifyNoMoreInteractions(kernel)
   }
 
   @Test
-  def onDeletedInvalidatesIdempotentCacheForBackingTopic(): Unit = {
+  def onDeletedClosesGateAndInvalidatesIdempotentCacheForBackingTopic(): Unit = {
     val kernel = mock(classOf[ConcentrationKernel])
     val listener = new KafkaConcentrationPartitionListener(backingTp, kernel)
 
     listener.onDeleted(backingTp)
 
-    verify(kernel).invalidateIdempotentCacheForBacking(backingTp.topic)
+    val order = inOrder(kernel)
+    order.verify(kernel).markBackingUnready(backingTp)
+    order.verify(kernel).invalidateIdempotentCacheForBacking(backingTp.topic)
     verifyNoMoreInteractions(kernel)
   }
 
   @Test
-  def onBecomingFollowerInvalidatesIdempotentCacheForBackingTopic(): Unit = {
+  def onBecomingFollowerClosesGateAndInvalidatesIdempotentCacheForBackingTopic(): Unit = {
     val kernel = mock(classOf[ConcentrationKernel])
     val listener = new KafkaConcentrationPartitionListener(backingTp, kernel)
 
     listener.onBecomingFollower(backingTp)
 
-    verify(kernel).invalidateIdempotentCacheForBacking(backingTp.topic)
+    val order = inOrder(kernel)
+    order.verify(kernel).markBackingUnready(backingTp)
+    order.verify(kernel).invalidateIdempotentCacheForBacking(backingTp.topic)
     verifyNoMoreInteractions(kernel)
+  }
+
+  @Test
+  def gateCloseFailureDoesNotPreventCacheInvalidation(): Unit = {
+    // Defence-in-depth: if markBackingUnready throws for any reason, the cache eviction must
+    // still run — they're independent corrective actions and one must not block the other.
+    val kernel = mock(classOf[ConcentrationKernel])
+    doThrow(new RuntimeException("simulated gate fault"))
+      .when(kernel).markBackingUnready(any[TopicPartition])
+    val listener = new KafkaConcentrationPartitionListener(backingTp, kernel)
+
+    listener.onFailed(backingTp)
+
+    verify(kernel).markBackingUnready(backingTp)
+    verify(kernel).invalidateIdempotentCacheForBacking(backingTp.topic)
   }
 
   @Test
@@ -80,9 +101,12 @@ class KafkaConcentrationPartitionListenerTest {
   def kernelExceptionIsSwallowedSoReplicationStateIsNotCorrupted(): Unit = {
     // The PartitionListener contract states callbacks run on the thread that triggers
     // the transition AND that locks may be held during execution. A kernel-side fault
-    // must not propagate up into Partition.markOffline / delete / makeFollower.
+    // on EITHER the gate-close path OR the cache-eviction path must not propagate up
+    // into Partition.markOffline / delete / makeFollower.
     val kernel = mock(classOf[ConcentrationKernel])
-    doThrow(new RuntimeException("simulated kernel fault"))
+    doThrow(new RuntimeException("simulated gate fault"))
+      .when(kernel).markBackingUnready(any[TopicPartition])
+    doThrow(new RuntimeException("simulated cache fault"))
       .when(kernel).invalidateIdempotentCacheForBacking(any[String])
     val listener = new KafkaConcentrationPartitionListener(backingTp, kernel)
 
@@ -91,6 +115,7 @@ class KafkaConcentrationPartitionListenerTest {
     listener.onDeleted(backingTp)
     listener.onBecomingFollower(backingTp)
 
+    verify(kernel, times(3)).markBackingUnready(backingTp)
     verify(kernel, times(3)).invalidateIdempotentCacheForBacking(backingTp.topic)
   }
 

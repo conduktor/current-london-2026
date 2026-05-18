@@ -36,12 +36,26 @@ import org.slf4j.LoggerFactory
  * practice. It is therefore safe to omit (kernel still correct) but expected to be wired
  * for production: see PROMPT.md / Codex GAP 2.
  *
- * Scope of v1 (this listener): only the idempotent cache is invalidated. The offset
- * tracker is NOT dropped here, because dropping it without a coordinated rehydrate on
- * the next leader-acquisition would cause the new leader to re-assign logical offsets
- * from zero on a partition that already has produced data. Tracker drop + epoch-fenced
- * rehydrate is intentionally deferred to a follow-up commit (the listener will gain a
- * companion {@code onBecomingLeader}-equivalent path).
+ * Scope of v1 (this listener): two effects on a leader-loss transition.
+ *
+ * 1. The kernel's idempotent-batch cache for this backing is invalidated — see Commit A
+ *    rationale above.
+ *
+ * 2. The kernel's per-backing readiness gate is closed via
+ *    {@code kernel.markBackingUnready(backingTopicPartition)}. After this point the
+ *    produce hot path in {@code KafkaApis} sees the gate closed and rejects every
+ *    logical-topic produce routed onto this backing with {@code NOT_LEADER_OR_FOLLOWER},
+ *    which stock idempotent producers handle by refreshing metadata and retrying.
+ *
+ *    The tracker itself is deliberately NOT dropped here. Dropping it without a
+ *    coordinated rehydrate on the next leader-acquisition would race in-flight
+ *    {@code commitProduceBatch} callbacks (the reservation lock is held until the
+ *    backing append's response callback fires, which can be many milliseconds after the
+ *    listener runs). Instead, the upcoming {@code KafkaConcentrationLeaderRecoverer}
+ *    (Commit B.3) will REPLACE the tracker state atomically from sidecars on leader
+ *    re-acquisition, under an epoch fence so any state rebuilt against a stale epoch is
+ *    discarded. The gate stays closed in the meantime, so the stale-in-memory tracker
+ *    cannot be observed.
  *
  * Concurrency / idempotence: this listener is hashed/equated by {@code TopicPartition}
  * only, so {@code Partition.maybeAddListener} (a CopyOnWriteArraySet add) is idempotent
@@ -65,6 +79,19 @@ final class KafkaConcentrationPartitionListener(
     invalidate(partition, "onBecomingFollower")
 
   private def invalidate(partition: TopicPartition, reason: String): Unit = {
+    // Close the produce-gate FIRST, then evict the idempotent cache. The gate closure is
+    // what prevents fresh produces from observing the now-untrusted tracker; doing it before
+    // the cache eviction means a producer racing with the leader-loss event can at worst see
+    // NOT_LEADER_OR_FOLLOWER from the gate (retriable) or a cache-miss-then-NLOF from a race
+    // with the eviction — both correct. The reverse order would briefly leave the gate open
+    // while the cache was already wiped, which is mostly equivalent but feels wrong.
+    try {
+      kernel.markBackingUnready(backingTopicPartition)
+    } catch {
+      case t: Throwable =>
+        KafkaConcentrationPartitionListener.log.warn(
+          s"Concentration kernel markBackingUnready failed for ${backingTopicPartition} on $reason: ${t.getMessage}", t)
+    }
     try {
       kernel.invalidateIdempotentCacheForBacking(partition.topic)
     } catch {

@@ -459,6 +459,17 @@ class KafkaApis(val requestChannel: RequestChannel,
           val backingTp = new TopicPartition(descriptor.backingTopic, backingPartition)
           if (!metadataCache.contains(backingTp))
             nonExistingTopicResponses += topicPartition -> new PartitionResponse(Errors.UNKNOWN_TOPIC_OR_PARTITION)
+          else if (!concentrationKernel.isBackingReady(backingTp))
+            // Concentration GAP 2 (Commit B.2): the kernel's tracker for this backing is in an
+            // untrusted state right now — a leader-loss transition closed the readiness gate and
+            // a rehydrate has not yet completed under the current leader epoch. Reserving
+            // logical offsets against the stale tracker would risk handing out offsets that
+            // collide with what the previous leader already acknowledged. Reject the produce
+            // with NOT_LEADER_OR_FOLLOWER, which stock idempotent producers treat as retriable
+            // (metadata refresh + retry). Convergent Codex+Gemini recommendation: this is the
+            // closest stock error to "broker cannot currently accept produces for this
+            // partition," and it requires no client-side wire-protocol change.
+            invalidRequestResponses += topicPartition -> new PartitionResponse(Errors.NOT_LEADER_OR_FOLLOWER)
           else if (logicalByBacking.contains(backingTp))
             // v1 limitation: two logical topics in the SAME ProduceRequest that both route to
             // the same backing partition would collide in authorizedRequestInfo's TP key. Rather

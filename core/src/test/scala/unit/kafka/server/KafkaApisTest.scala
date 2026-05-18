@@ -2128,6 +2128,7 @@ class KafkaApisTest extends Logging {
 
     when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
     when(concentrationKernel.describe(logicalTopic)).thenReturn(Optional.of(descriptor))
+    when(concentrationKernel.isBackingReady(any[TopicPartition])).thenReturn(true)
     when(concentrationKernel.assertBackingTopicNotCompacted(
       ArgumentMatchers.eq(backingTopic), ArgumentMatchers.eq("compact"))
     ).thenThrow(new IllegalStateException(
@@ -2194,6 +2195,7 @@ class KafkaApisTest extends Logging {
     when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
     when(concentrationKernel.describe(logicalTopic)).thenReturn(Optional.of(descriptor))
     when(concentrationKernel.backingPartitionFor(logicalTopic, 0)).thenReturn(2)
+    when(concentrationKernel.isBackingReady(any[TopicPartition])).thenReturn(true)
     // The kernel's logical start offset (advanced by past DeleteRecords) is decoupled from the
     // backing partition's start offset: a sibling logical topic deleting records on the same
     // backing must NOT make this producer's logStartOffset jump. Pin it to a recognisable value
@@ -2317,6 +2319,7 @@ class KafkaApisTest extends Logging {
     when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
     when(concentrationKernel.describe(logicalTopic)).thenReturn(Optional.of(descriptor))
     when(concentrationKernel.backingPartitionFor(logicalTopic, 0)).thenReturn(2)
+    when(concentrationKernel.isBackingReady(any[TopicPartition])).thenReturn(true)
 
     val res0 = mock(classOf[Reservation]); when(res0.logicalOffset).thenReturn(7L)
     val reservations = Array(res0)
@@ -2412,6 +2415,67 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testProduceToLogicalTopicWhenBackingReadinessGateClosedReturnsNotLeaderOrFollower(): Unit = {
+    // Concentration GAP 2 (Commit B.2): when the backing-partition's per-broker readiness gate is
+    // CLOSED — typically because this broker just lost leadership for the backing and the
+    // KafkaConcentrationLeaderRecoverer has not yet rehydrated the tracker under the new
+    // leader-epoch — every produce to a logical topic mapped onto that backing must be rejected
+    // BEFORE we reserve logical offsets. Reserving against a stale tracker would risk handing out
+    // offsets that collide with what the previous leader already acknowledged on the wire.
+    //
+    // NOT_LEADER_OR_FOLLOWER is the convergent Codex+Gemini recommendation: it's retriable on the
+    // stock producer side (metadata refresh + retry) and requires no client-side wire-protocol
+    // change. This pins that the gate short-circuits BEFORE reservation, stamping, and append.
+    val logicalTopic = "orders"
+    val backingTopic = "concentrated"
+    val descriptor = new LogicalTopicDescriptor(logicalTopic, 1024, backingTopic, 4)
+    addTopicToMetadataCache(backingTopic, numPartitions = 4)
+    when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
+    when(concentrationKernel.describe(logicalTopic)).thenReturn(Optional.of(descriptor))
+    when(concentrationKernel.backingPartitionFor(logicalTopic, 0)).thenReturn(2)
+    // Gate explicitly closed for the backing partition this produce routes to.
+    when(concentrationKernel.isBackingReady(new TopicPartition(backingTopic, 2))).thenReturn(false)
+
+    val tp = new TopicPartition(logicalTopic, 0)
+    val produceRequest = ProduceRequest.builder(new ProduceRequestData()
+      .setTopicData(new ProduceRequestData.TopicProduceDataCollection(
+        Collections.singletonList(new ProduceRequestData.TopicProduceData()
+          .setName(tp.topic).setPartitionData(Collections.singletonList(
+            new ProduceRequestData.PartitionProduceData()
+              .setIndex(tp.partition)
+              .setRecords(MemoryRecords.withRecords(Compression.NONE,
+                new SimpleRecord("payload".getBytes))))))
+          .iterator))
+      .setAcks(1.toShort).setTimeoutMs(5000))
+      .build(ApiKeys.PRODUCE.latestVersion)
+    val request = buildRequest(produceRequest)
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+    // The NLOF response path queries replicaManager.getPartitionOrError. We don't care which
+    // branch it takes for the assertion below — return a benign Left so the response carries
+    // leaderId=-1 / leaderEpoch=-1 (matches the "broker has no current leader info" fallback).
+    when(replicaManager.getPartitionOrError(any[TopicPartition]))
+      .thenReturn(Left(Errors.NOT_LEADER_OR_FOLLOWER))
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[ProduceResponse](request)
+    val partitionProduceResponse = response.data.responses.asScala.head.partitionResponses.asScala.head
+    assertEquals(Errors.NOT_LEADER_OR_FOLLOWER, Errors.forCode(partitionProduceResponse.errorCode),
+      "gate-closed backing must surface as NOT_LEADER_OR_FOLLOWER so stock idempotent producers " +
+        "treat it as a retriable transient condition and refresh metadata")
+
+    // Critical: the gate must short-circuit BEFORE reservation. Burning a logical offset against
+    // a stale tracker is exactly the silent-corruption case Commit B.2 exists to prevent.
+    verify(concentrationKernel, never()).reserveProduceBatch(any[String], anyInt, anyInt)
+    verify(replicaManager, never()).handleProduceAppend(anyLong, anyShort, ArgumentMatchers.eq(false),
+      any(), any(), any(), any(), any(), any(), any())
+  }
+
+  @Test
   def testProduceToLogicalTopicCollidingOnBackingPartitionFailsSecondEntry(): Unit = {
     // v1 limitation: two logical topics in the SAME ProduceRequest routing to the same backing
     // partition would collide in authorizedRequestInfo's TP key, silently dropping or
@@ -2427,6 +2491,7 @@ class KafkaApisTest extends Logging {
     when(concentrationKernel.isLogicalTopic(logicalB)).thenReturn(true)
     when(concentrationKernel.describe(logicalA)).thenReturn(Optional.of(descriptorA))
     when(concentrationKernel.describe(logicalB)).thenReturn(Optional.of(descriptorB))
+    when(concentrationKernel.isBackingReady(any[TopicPartition])).thenReturn(true)
     // Both logical topics route to backing partition 2 — engineered collision.
     when(concentrationKernel.backingPartitionFor(logicalA, 0)).thenReturn(2)
     when(concentrationKernel.backingPartitionFor(logicalB, 0)).thenReturn(2)
@@ -2503,6 +2568,7 @@ class KafkaApisTest extends Logging {
     when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
     when(concentrationKernel.describe(logicalTopic)).thenReturn(Optional.of(descriptor))
     when(concentrationKernel.backingPartitionFor(logicalTopic, 0)).thenReturn(2)
+    when(concentrationKernel.isBackingReady(any[TopicPartition])).thenReturn(true)
 
     val tp = new TopicPartition(logicalTopic, 0)
     val txnRecords = MemoryRecords.withTransactionalRecords(Compression.NONE,
@@ -2570,6 +2636,7 @@ class KafkaApisTest extends Logging {
     when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
     when(concentrationKernel.describe(logicalTopic)).thenReturn(Optional.of(descriptor))
     when(concentrationKernel.backingPartitionFor(logicalTopic, 0)).thenReturn(2)
+    when(concentrationKernel.isBackingReady(any[TopicPartition])).thenReturn(true)
 
     // Mock a cache HIT: the kernel claims it already committed this exact (producerId, epoch,
     // baseSeq, lastSeq) tuple at logical offsets [500..502], with logStartOffset=42 and a
