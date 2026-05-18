@@ -206,30 +206,6 @@ public final class BackingScanRecoverer {
     }
 
     /**
-     * Filter-aware rebuild for the leader-acquisition path.
-     *
-     * <p>The leader-acquisition recovery contract is stricter than the boot-time one: when a
-     * broker becomes leader for a backing partition, ALL logical partitions hosted on that
-     * backing must be reset to a known state derived from the on-disk log, even if their old
-     * sidecar+tracker entries from a previous incarnation suggest otherwise. Trusting only the
-     * stream (as the 2-arg form does) would leave stale local state intact for any logical
-     * partition that is in the filter but has zero records in the current scan window — and
-     * that stale state becomes visible the instant the readiness gate opens.
-     *
-     * <p>Behavior:
-     * <ul>
-     *   <li>Every partition in {@code filter} has its sidecar opened and truncated to 0 before
-     *       record consumption begins.</li>
-     *   <li>The stream is consumed normally; records for partitions already in {@code filter}
-     *       reuse the truncated handle. Records for partitions not in {@code filter} (defensive
-     *       case if the iterator yields beyond its declared scope) open+truncate as before.</li>
-     *   <li>At the end, every open sidecar — filter ∪ defensive — is restored into the tracker
-     *       at {@code (persistedStart, sidecar.size())}. Partitions absent from the stream end
-     *       up at {@code (persistedStart, 0)}, which is the correct "no records on the new
-     *       leader" state.</li>
-     * </ul>
-     */
-    /**
      * Open + truncate the sidecar for every partition in {@code filter}. Returns a map of
      * still-open handles ready for the per-record append loop to reuse. If any open or
      * truncate fails partway through, every handle already collected is closed (best-effort)
@@ -266,6 +242,30 @@ public final class BackingScanRecoverer {
         }
     }
 
+    /**
+     * Filter-aware rebuild for the leader-acquisition path.
+     *
+     * <p>The leader-acquisition recovery contract is stricter than the boot-time one: when a
+     * broker becomes leader for a backing partition, ALL logical partitions hosted on that
+     * backing must be reset to a known state derived from the on-disk log, even if their old
+     * sidecar+tracker entries from a previous incarnation suggest otherwise. Trusting only the
+     * stream (as the 2-arg form does) would leave stale local state intact for any logical
+     * partition that is in the filter but has zero records in the current scan window — and
+     * that stale state becomes visible the instant the readiness gate opens.
+     *
+     * <p>Behavior:
+     * <ul>
+     *   <li>Every partition in {@code filter} has its sidecar opened and truncated to 0 before
+     *       record consumption begins.</li>
+     *   <li>The stream is consumed normally; records for partitions already in {@code filter}
+     *       reuse the truncated handle. Records for partitions not in {@code filter} (defensive
+     *       case if the iterator yields beyond its declared scope) open+truncate as before.</li>
+     *   <li>At the end, every open sidecar — filter ∪ defensive — is restored into the tracker
+     *       at {@code (persistedStart, sidecar.size())}. Partitions absent from the stream end
+     *       up at {@code (persistedStart, 0)}, which is the correct "no records on the new
+     *       leader" state.</li>
+     * </ul>
+     */
     public void recoverFromScan(Iterator<RecoveryRecord> stream, LogicalOffsetTracker tracker,
                                  Set<LogicalPartition> filter) throws IOException {
         Objects.requireNonNull(stream, "stream");
