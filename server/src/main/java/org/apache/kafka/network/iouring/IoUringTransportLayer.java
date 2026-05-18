@@ -28,9 +28,9 @@ import java.nio.channels.SocketChannel;
 import java.security.Principal;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicLong;
 
 import io.netty.buffer.ByteBuf;
-import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
 
 /**
@@ -70,6 +70,13 @@ final class IoUringTransportLayer implements TransportLayer {
     private final Queue<ByteBuf> inbound = new ConcurrentLinkedQueue<>();
     private volatile boolean eofSeen;
     private volatile boolean closed;
+    /**
+     * Bytes still riding inside Netty's outbound buffer for this channel — incremented on
+     * write(), decremented on writeAndFlush completion. {@link #hasPendingWrites()} reads
+     * this so {@code KafkaChannel.maybeCompleteSend} only reports "send done" once the
+     * bytes have actually been handed off to the kernel by Netty, not just queued.
+     */
+    private final AtomicLong pendingWriteBytes = new AtomicLong(0);
 
     IoUringTransportLayer(Channel nettyChannel, InetSocketAddress remote, InetSocketAddress local) {
         this.nettyChannel = nettyChannel;
@@ -213,9 +220,13 @@ final class IoUringTransportLayer implements TransportLayer {
         if (closed) throw new IOException("transport layer is closed");
         int remaining = src.remaining();
         if (remaining == 0) return 0;
-        byte[] copy = new byte[remaining];
-        src.get(copy);
-        nettyChannel.writeAndFlush(Unpooled.wrappedBuffer(copy));
+        // Use a pooled direct buffer so io_uring can submit the bytes without a heap-to-
+        // direct intermediate copy. The buffer is released by Netty after the channel has
+        // flushed it; we only own the writeAndFlush completion listener.
+        ByteBuf buf = nettyChannel.alloc().directBuffer(remaining);
+        buf.writeBytes(src);
+        pendingWriteBytes.addAndGet(remaining);
+        nettyChannel.writeAndFlush(buf).addListener(f -> pendingWriteBytes.addAndGet(-remaining));
         return remaining;
     }
 
@@ -237,7 +248,11 @@ final class IoUringTransportLayer implements TransportLayer {
 
     @Override
     public boolean hasPendingWrites() {
-        return !nettyChannel.isWritable();
+        // Use our own counter, not nettyChannel.isWritable(): the latter only flips when
+        // the outbound queue crosses Netty's high water mark, so any send below the mark
+        // would otherwise report "fully drained" the instant write() returned — even though
+        // the bytes are still sitting in Netty's queue waiting for the event loop to flush.
+        return pendingWriteBytes.get() > 0;
     }
 
     @Override

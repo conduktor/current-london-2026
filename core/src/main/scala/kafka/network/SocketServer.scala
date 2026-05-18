@@ -938,7 +938,8 @@ private[kafka] class Processor(
         maxRequestSize,
         memoryPool,
         java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(connectionsMaxIdleMs),
-        time)
+        time,
+        id)
       val bindAddress = new java.net.InetSocketAddress(endPoint.host, endPoint.port)
       val listener = new org.apache.kafka.network.iouring.IoUringServerListener(
         bindAddress, ioUringSelector, config.socketListenBacklogSize)

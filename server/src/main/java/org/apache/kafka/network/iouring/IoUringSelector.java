@@ -120,9 +120,25 @@ public final class IoUringSelector implements BrokerSelector {
     private final MemoryPool memoryPool;
     private final long connectionsMaxIdleNanos;
     private final Time time;
+    /**
+     * Processor id baked into every connection id we mint. The Kafka request-handling path
+     * decrements connection quotas by parsing the connection id with {@link
+     * org.apache.kafka.common.network.ServerConnectionId}, so the id must follow the
+     * {@code localHost:localPort-remoteHost:remotePort-processorId-index} format — otherwise
+     * {@code Processor.processDisconnected} would silently fail to release the quota.
+     */
+    private final int processorId;
 
     // Processor-owned state.
     private final Map<String, KafkaChannel> channels = new LinkedHashMap<>();
+    /**
+     * Channels that finished serving on this poll but whose final {@code completedReceives}
+     * still need a {@code channel(id)} or {@code closingChannel(id)} resolution from the
+     * Processor. NIO's {@code KSelector} keeps closing channels alive for one extra poll for
+     * exactly this reason — we evict the previous poll's entries at the start of the next
+     * poll, after the Processor has had its chance to drain them.
+     */
+    private final Map<String, KafkaChannel> closingChannels = new HashMap<>();
     /** Crossed by both threads: event loop puts on accept, Processor reads on mute/unmute/close. */
     private final Map<String, Channel> nettyChannels = new ConcurrentHashMap<>();
     private final Map<String, Long> lastActiveNanos = new HashMap<>();
@@ -150,16 +166,27 @@ public final class IoUringSelector implements BrokerSelector {
     private final AtomicLong idGen = new AtomicLong();
     private volatile boolean closed;
 
+    /** Test-only constructor: uses processor id 0 (kept so existing unit tests don't churn). */
     public IoUringSelector(ListenerName listenerName,
                            int maxReceiveSize,
                            MemoryPool memoryPool,
                            long connectionsMaxIdleNanos,
                            Time time) {
+        this(listenerName, maxReceiveSize, memoryPool, connectionsMaxIdleNanos, time, 0);
+    }
+
+    public IoUringSelector(ListenerName listenerName,
+                           int maxReceiveSize,
+                           MemoryPool memoryPool,
+                           long connectionsMaxIdleNanos,
+                           Time time,
+                           int processorId) {
         this.listenerName = Objects.requireNonNull(listenerName, "listenerName");
         this.maxReceiveSize = maxReceiveSize;
         this.memoryPool = Objects.requireNonNull(memoryPool, "memoryPool");
         this.connectionsMaxIdleNanos = connectionsMaxIdleNanos;
         this.time = Objects.requireNonNull(time, "time");
+        this.processorId = processorId;
     }
 
     // -------------------------------------------------------------------------
@@ -175,7 +202,12 @@ public final class IoUringSelector implements BrokerSelector {
             nettyChannel.close();
             return;
         }
-        String id = "iouring-" + idGen.incrementAndGet();
+        // Format must match ServerConnectionId so Processor.processDisconnected can parse it
+        // and decrement ConnectionQuotas correctly. Using the synthetic "iouring-N" form
+        // would silently break quota release.
+        String id = local.getAddress().getHostAddress() + ":" + local.getPort() + "-"
+                  + remote.getAddress().getHostAddress() + ":" + remote.getPort() + "-"
+                  + processorId + "-" + idGen.incrementAndGet();
         IoUringTransportLayer transport = new IoUringTransportLayer(nettyChannel, remote, local);
         Authenticator authenticator = new IoUringPlaintextAuthenticator(transport, listenerName);
         IoUringChannelMetadataRegistry metadata = new IoUringChannelMetadataRegistry();
@@ -226,6 +258,16 @@ public final class IoUringSelector implements BrokerSelector {
     @Override
     public void poll(long timeoutMs) throws IOException {
         if (closed) throw new IOException("selector is closed");
+
+        // Evict the previous poll's closing channels. The Processor has had its chance to
+        // resolve any final completedReceives via closingChannel(id); now we can release
+        // the KafkaChannel for real. This mirrors NIO's KSelector.closingChannels lifecycle.
+        if (!closingChannels.isEmpty()) {
+            for (KafkaChannel c : closingChannels.values()) {
+                Utils.closeQuietly(c, "closing channel after Processor drained");
+            }
+            closingChannels.clear();
+        }
 
         // Reset per-poll outputs.
         completedReceives.clear();
@@ -304,7 +346,10 @@ public final class IoUringSelector implements BrokerSelector {
         }
 
         // 3. Drain disconnects — but give buffered bytes one last delivery pass first,
-        //    mirroring NIO's closingChannels semantics.
+        //    mirroring NIO's closingChannels semantics. The channel goes into
+        //    closingChannels so this poll's completedReceives still resolve via
+        //    closingChannel(id) on the Processor side; we close the channel for real at the
+        //    start of the next poll.
         String disconnectId;
         while ((disconnectId = pendingDisconnects.poll()) != null) {
             KafkaChannel channel = channels.remove(disconnectId);
@@ -313,20 +358,24 @@ public final class IoUringSelector implements BrokerSelector {
             mutedChannelIds.remove(disconnectId);
             if (channel == null) continue;
             try {
-                while (channel.ready() && !mutedChannelIds.contains(disconnectId)) {
+                while (channel.ready()) {
                     long read = channel.read();
                     NetworkReceive completed = channel.maybeCompleteReceive();
                     if (completed != null) {
                         completedReceives.add(completed);
                         madeProgress = true;
+                        // KSelector emits at most one completedReceive per channel per poll —
+                        // matching that invariant keeps Processor.processCompletedReceives
+                        // accounting (per-IP throttling, request-channel queue) consistent.
+                        break;
                     }
-                    if (read <= 0 && completed == null) break;
+                    if (read <= 0) break;
                 }
             } catch (IOException e) {
                 log.debug("Final read on disconnecting channel {} failed", disconnectId, e);
             }
+            closingChannels.put(disconnectId, channel);
             disconnected.put(disconnectId, ChannelState.LOCAL_CLOSE);
-            Utils.closeQuietly(channel, "disconnected channel");
             madeProgress = true;
         }
 
@@ -482,9 +531,7 @@ public final class IoUringSelector implements BrokerSelector {
 
     @Override
     public KafkaChannel closingChannel(String id) {
-        // v1: closures are processed within a single poll, so there is no closing-channel
-        // limbo. Callers that ask for one always get null.
-        return null;
+        return closingChannels.get(id);
     }
 
     @Override
@@ -519,6 +566,10 @@ public final class IoUringSelector implements BrokerSelector {
             Utils.closeQuietly(channel, "channel on selector close");
         }
         channels.clear();
+        for (KafkaChannel channel : closingChannels.values()) {
+            Utils.closeQuietly(channel, "closing channel on selector close");
+        }
+        closingChannels.clear();
         nettyChannels.clear();
         lastActiveNanos.clear();
         mutedChannelIds.clear();

@@ -253,6 +253,34 @@ class IoUringSelectorTest {
             "buffered bytes must be delivered before the disconnect is reported");
         assertTrue(s.disconnected().containsKey(id), "disconnect surfaces on the same poll");
         assertNull(s.channel(id), "channel is gone from the active map");
+        // Processor.processCompletedReceives resolves the receive's source via either
+        // channel(id) or closingChannel(id). channel(id) is null after disconnect, so
+        // closingChannel(id) MUST keep the channel reachable for one extra poll — otherwise
+        // the final completedReceive lands on a null KafkaChannel and gets silently dropped.
+        assertNotNull(s.closingChannel(id),
+            "closingChannel must surface the disconnected channel so the Processor can resolve the final receive");
+
+        // The next poll evicts the closing channel for real.
+        s.poll(0);
+        assertNull(s.closingChannel(id),
+            "closingChannel must be evicted on the next poll; only one extra poll of grace");
+    }
+
+    @Test
+    void connectionIdsParseAsServerConnectionIdSoQuotasCanBeReleased() throws Exception {
+        // Processor.processDisconnected feeds the connection id back into
+        // ServerConnectionId.fromString to decrement ConnectionQuotas. If the format
+        // doesn't match, the quota leaks for every disconnect.
+        IoUringSelector s = newSelector(IDLE_NANOS_NEVER);
+        acceptNew(s, REMOTE_A);
+        s.poll(0);
+        String id = s.connected().get(0);
+
+        org.apache.kafka.common.network.ServerConnectionId parsed =
+            org.apache.kafka.common.network.ServerConnectionId.fromString(id)
+                .orElseThrow(() -> new AssertionError("id " + id + " is not a valid ServerConnectionId"));
+        assertEquals(0, parsed.processorId(),
+            "id minted via the test-only ctor uses processorId=0; the production ctor takes the real id");
     }
 
     @Test
