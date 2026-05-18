@@ -574,10 +574,37 @@ public final class IoUringSelector implements BrokerSelector {
 
     @Override
     public KafkaChannel lowestPriorityChannel() {
-        // v1: not used by the io_uring code path (the broker's quota-eviction logic targets
-        // the listener pool, and the io_uring listener handles its own backpressure via
-        // SO_BACKLOG / accept-rate). Return the first channel as a sensible default if any
-        // caller wires this up later.
+        // Mirrors org.apache.kafka.common.network.Selector.lowestPriorityChannel():
+        //   1. A channel already in teardown — evicting one of those is "free" and never
+        //      sacrifices a healthy connection.
+        //   2. The least-recently-active channel — its peer hasn't done anything for the
+        //      longest, so closing it loses the least useful state. Important so that
+        //      the controller and replication peers (constantly active) survive eviction
+        //      under broker-wide max.connections pressure on a PLAINTEXT listener.
+        //   3. Any channel — degenerate fallback if neither table has an entry.
+        // Previously this returned `channels.values().iterator().next()` which, given
+        // the LinkedHashMap insertion order, would target the OLDEST connection (most
+        // likely the inter-broker controller/replication peer that connected at boot).
+        if (!closingChannels.isEmpty()) {
+            return closingChannels.values().iterator().next();
+        }
+        if (!lastActiveNanos.isEmpty()) {
+            // Find the channel with the smallest lastActiveNanos. The map is updated on
+            // every read/write step in poll() so it tracks per-channel liveness accurately.
+            String oldestId = null;
+            long oldestNanos = Long.MAX_VALUE;
+            for (Map.Entry<String, Long> entry : lastActiveNanos.entrySet()) {
+                long nanos = entry.getValue();
+                if (nanos < oldestNanos) {
+                    oldestNanos = nanos;
+                    oldestId = entry.getKey();
+                }
+            }
+            if (oldestId != null) {
+                KafkaChannel channel = channels.get(oldestId);
+                if (channel != null) return channel;
+            }
+        }
         return channels.isEmpty() ? null : channels.values().iterator().next();
     }
 

@@ -156,6 +156,53 @@ class IoUringSelectorTest {
     }
 
     @Test
+    void lowestPriorityChannelMatchesNioContract() throws Exception {
+        // Contract: SocketServer.Processor.closeExcessConnections uses lowestPriorityChannel
+        // to pick a victim under broker-wide max.connections pressure. It must, in order:
+        //   1. prefer a channel already in teardown (closingChannels), and otherwise
+        //   2. evict the least-recently-active channel so long-lived hot peers
+        //      (controller, replication) survive eviction.
+        // NIO does this — io_uring must agree, otherwise on a busy mixed-listener broker
+        // the io_uring listener happily evicts the boot-time inter-broker connection.
+        IoUringSelector s = newSelector(IDLE_NANOS_NEVER);
+        assertNull(s.lowestPriorityChannel(), "empty selector -> null");
+
+        EmbeddedChannel firstNetty = acceptNew(s, REMOTE_A);
+        s.poll(0); // step 1 stamps lastActiveNanos for first channel
+        String firstId = s.connected().get(0);
+
+        time.sleep(10); // advance clock so second accept has a later timestamp
+        EmbeddedChannel secondNetty = acceptNew(s, REMOTE_B);
+        s.poll(0);
+        String secondId = s.connected().get(0);
+
+        // First channel is older -> lowest priority.
+        assertEquals(firstId, s.lowestPriorityChannel().id(),
+            "least-recently-active channel must be the eviction victim — older lastActiveNanos wins");
+
+        // Drive a read on the first channel to refresh its timestamp; now the second is older.
+        time.sleep(10);
+        s.onRead(firstNetty, framed("ping"));
+        s.poll(0);
+        assertEquals(secondId, s.lowestPriorityChannel().id(),
+            "after activity on first, second becomes the oldest -> next eviction victim");
+
+        // Initiate disconnect on the second channel with buffered bytes still to drain —
+        // the standard NIO closingChannels lifecycle path. Step 3 of poll() routes the
+        // channel into closingChannels for one extra poll of grace so the Processor can
+        // resolve the final completedReceive via closingChannel(id).
+        s.onRead(secondNetty, framed("last"));
+        s.onDisconnect(secondNetty);
+        s.poll(0);
+        assertNotNull(s.closingChannel(secondId),
+            "test setup: a peer-closed channel with buffered bytes lands in closingChannels");
+        KafkaChannel victim = s.lowestPriorityChannel();
+        assertNotNull(victim);
+        assertEquals(secondId, victim.id(),
+            "a channel already in teardown must outrank any healthy channel for eviction");
+    }
+
+    @Test
     void newlyAcceptedChannelDoesNotSurfaceReceiveInSamePoll() throws Exception {
         // Regression: a freshly-accepted channel that receives bytes in the same poll
         // window as the accept must not produce a completedReceive on that poll. The
