@@ -272,7 +272,8 @@ class ControllerServer(
         clusterId,
         registrationsPublisher,
         apiVersionManager,
-        metadataCache)
+        metadataCache,
+        org.apache.kafka.server.tenant.TenantConfig.from(config.originals))
       controllerApisHandlerPool = new KafkaRequestHandlerPool(config.nodeId,
         socketServer.dataPlaneRequestChannel,
         controllerApis,

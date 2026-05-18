@@ -58,6 +58,7 @@ import org.apache.kafka.common.security.auth.KafkaPrincipal
 import org.apache.kafka.common.security.auth.SecurityProtocol
 import org.apache.kafka.server.authorizer.Authorizer
 import org.apache.kafka.server.common.{ApiMessageAndVersion, RequestLocal}
+import org.apache.kafka.server.tenant.{TenantConfig, TenantNamespace}
 
 import scala.jdk.CollectionConverters._
 
@@ -76,7 +77,8 @@ class ControllerApis(
   val clusterId: String,
   val registrationsPublisher: ControllerRegistrationsPublisher,
   val apiVersionManager: ApiVersionManager,
-  val metadataCache: KRaftMetadataCache
+  val metadataCache: KRaftMetadataCache,
+  val tenantConfig: TenantConfig = TenantConfig.empty()
 ) extends ApiRequestHandler with Logging {
 
   this.logIdent = s"[ControllerApis nodeId=${config.nodeId}] "
@@ -914,7 +916,36 @@ class ControllerApis(
       true
   }
 
-  private def handleCreateDelegationTokenRequest(request: RequestChannel.Request): CompletableFuture[Unit] = {
+  // Defence-in-depth helpers for the identity-laundering guard on the
+  // controller listener. The controller has no per-listener tenant binding —
+  // the only way a caller's identity can carry a tenant is through the
+  // KafkaPrincipal name itself (`__tenant_<id>.<user>`), already validated
+  // by TenantPrincipalBuilder on the originating broker/edge listener.
+  private def isReservedTenantPrincipalNamespace(name: String): Boolean = {
+    if (name == null) return false
+    if (!name.startsWith(TenantNamespace.PRINCIPAL_PREFIX)) return false
+    val knownTenants = tenantConfig.allTenants
+    if (knownTenants.isEmpty) return false
+    val it = knownTenants.iterator
+    while (it.hasNext) {
+      if (name.startsWith(TenantNamespace.PRINCIPAL_PREFIX + it.next + ".")) return true
+    }
+    false
+  }
+
+  // Derive the caller's tenant from their principal name when the principal
+  // sits in a KNOWN tenant namespace. Unknown `__tenant_*` prefixes return
+  // None — the controller treats them as foreign to every known tenant.
+  private def callerTenantFromPrincipal(principalName: String): Option[String] = {
+    if (principalName == null || !principalName.startsWith(TenantNamespace.PRINCIPAL_PREFIX)) return None
+    val afterPrefix = principalName.substring(TenantNamespace.PRINCIPAL_PREFIX.length)
+    val dot = afterPrefix.indexOf('.')
+    if (dot <= 0) return None
+    val tenant = afterPrefix.substring(0, dot)
+    if (tenantConfig.allTenants.contains(tenant)) Some(tenant) else None
+  }
+
+  private[server] def handleCreateDelegationTokenRequest(request: RequestChannel.Request): CompletableFuture[Unit] = {
     val createTokenRequest = request.body[CreateDelegationTokenRequest]
 
     val requester = request.context.principal
@@ -926,10 +957,36 @@ class ControllerApis(
       new KafkaPrincipal(ownerPrincipalType, ownerPrincipalName)
     }
 
+    // Defence in depth for the identity-laundering guard the broker applies
+    // in KafkaApis.handleCreateTokenRequest. The controller is reachable
+    // directly (the schema declares listeners=[broker,controller]) and via
+    // Envelope re-dispatch from any CLUSTER_ACTION holder — both routes
+    // bypass the broker-side check. Tenant identity on the controller is
+    // canonical-from-principal: a caller's principal name `__tenant_<id>.X`
+    // is the only way to claim tenant T (TenantPrincipalBuilder rejects
+    // cross-listener wrapping). So: if the owner or any renewer is in a
+    // KNOWN tenant principal namespace and the caller's own principal is
+    // not in that same namespace, refuse the mint.
+    val callerTenant = callerTenantFromPrincipal(requester.getName)
+    def belongsToCallerTenant(name: String): Boolean =
+      name != null && callerTenant.isDefined &&
+        name.startsWith(TenantNamespace.PRINCIPAL_PREFIX + callerTenant.get + ".")
+    def isForeignTenantPrincipal(name: String): Boolean =
+      isReservedTenantPrincipalNamespace(name) && !belongsToCallerTenant(name)
+    val renewerNames = createTokenRequest.data.renewers.asScala.map(_.principalName)
+    val foreignTenantPrincipal =
+      isForeignTenantPrincipal(ownerPrincipalName) ||
+      renewerNames.exists(isForeignTenantPrincipal)
+
     if (!allowTokenRequests(request)) {
       requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
         CreateDelegationTokenResponse.prepareResponse(request.context.requestVersion, requestThrottleMs,
           Errors.DELEGATION_TOKEN_REQUEST_NOT_ALLOWED, owner, requester))
+      CompletableFuture.completedFuture[Unit](())
+    } else if (foreignTenantPrincipal) {
+      requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
+        CreateDelegationTokenResponse.prepareResponse(request.context.requestVersion, requestThrottleMs,
+          Errors.DELEGATION_TOKEN_AUTHORIZATION_FAILED, owner, requester))
       CompletableFuture.completedFuture[Unit](())
     } else if (!owner.equals(requester) &&
       !authHelper.authorize(request.context, CREATE_TOKENS, USER, owner.toString)) {

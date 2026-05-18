@@ -153,7 +153,9 @@ class ControllerApisTest {
   private def createControllerApis(authorizer: Option[Authorizer],
                                    controller: Controller,
                                    props: Properties = new Properties(),
-                                   throttle: Boolean = false): ControllerApis = {
+                                   throttle: Boolean = false,
+                                   tenantConfig: org.apache.kafka.server.tenant.TenantConfig =
+                                     org.apache.kafka.server.tenant.TenantConfig.empty()): ControllerApis = {
     props.put(KRaftConfigs.NODE_ID_CONFIG, nodeId: java.lang.Integer)
     props.put(KRaftConfigs.PROCESS_ROLES_CONFIG, "controller")
     props.put(KRaftConfigs.CONTROLLER_LISTENER_NAMES_CONFIG, "CONTROLLER")
@@ -173,7 +175,8 @@ class ControllerApisTest {
         ListenerType.CONTROLLER,
         true,
         () => FinalizedFeatures.fromKRaftVersion(MetadataVersion.latestTesting())),
-      metadataCache
+      metadataCache,
+      tenantConfig
     )
   }
 
@@ -1300,6 +1303,177 @@ class ControllerApisTest {
       controllerApis.handleDescribeCluster(buildRequest(
         new DescribeClusterRequest(new DescribeClusterRequestData(), 1.toShort)))
     })
+  }
+
+  // ---------------------------------------------------------------------------
+  // CreateDelegationToken — controller-side defence-in-depth.
+  //
+  // The broker-side guard in KafkaApis.handleCreateTokenRequest refuses tenant
+  // identity-laundering mints before forwarding. Two routes bypass the broker:
+  //   1. CreateDelegationTokenRequest declares listeners=[broker, controller],
+  //      so an admin client can connect directly to the controller listener;
+  //   2. Any CLUSTER_ACTION holder can wrap the request in an Envelope and
+  //      have the controller re-dispatch it on the original caller's behalf
+  //      via handleEnvelopeRequest.
+  //
+  // The controller listener has no per-listener tenant binding (TenantConfig
+  // is constructed from broker originals to know WHICH tenant ids are known on
+  // this cluster, but the controller never speaks SASL on a tenant listener).
+  // Tenant identity on the controller is therefore derived from the principal
+  // name alone: `__tenant_<id>.<user>` where <id> is a known tenant id.
+  //
+  // Rule (mirrors KafkaApis): a caller whose principal is not within tenant T
+  // cannot mint a token whose owner OR any renewer is within T's principal
+  // namespace.
+  // ---------------------------------------------------------------------------
+
+  private def tenantConfigBinding(tenantId: String, listenerName: String): org.apache.kafka.server.tenant.TenantConfig = {
+    val originals = new java.util.HashMap[String, AnyRef]()
+    originals.put(s"listener.name.${listenerName.toLowerCase}.tenant.id", tenantId)
+    org.apache.kafka.server.tenant.TenantConfig.from(originals)
+  }
+
+  private def buildTokenRequest(
+    request: AbstractRequest,
+    principal: KafkaPrincipal
+  ): RequestChannel.Request = {
+    val buffer = request.serializeWithHeader(new RequestHeader(request.apiKey, request.version, clientID, 0))
+    val header = RequestHeader.parse(buffer)
+    // SASL_PLAINTEXT + non-ANONYMOUS principal so allowTokenRequests() returns
+    // true; the controller-side guard runs before any of the post-allow paths.
+    val context = new RequestContext(
+      header, "1", InetAddress.getLocalHost, principal,
+      ListenerName.normalised("CONTROLLER"),
+      SecurityProtocol.SASL_PLAINTEXT, ClientInformation.EMPTY, false)
+    new RequestChannel.Request(
+      processor = 1, context = context, startTimeNanos = 0,
+      MemoryPool.NONE, buffer, requestChannelMetrics)
+  }
+
+  private def captureSentResponse(request: RequestChannel.Request): AbstractResponse = {
+    val captor: ArgumentCaptor[AbstractResponse] = ArgumentCaptor.forClass(classOf[AbstractResponse])
+    verify(requestChannel).sendResponse(
+      ArgumentMatchers.eq(request),
+      captor.capture(),
+      any())
+    captor.getValue
+  }
+
+  @Test
+  def testControllerCreateDelegationTokenRefusesTenantPrefixedOwnerFromClusterCaller(): Unit = {
+    // Non-tenant caller asking the CONTROLLER to mint a token whose owner is
+    // `__tenant_acme.alice`. The broker-side guard does not apply on this
+    // route — the controller's own guard must refuse and return
+    // DELEGATION_TOKEN_AUTHORIZATION_FAILED. MockController throws if
+    // controller.createDelegationToken is reached, so the test also proves
+    // we did NOT fall through to the controller layer.
+    val createRequest = new CreateDelegationTokenRequest.Builder(
+      new CreateDelegationTokenRequestData()
+        .setOwnerPrincipalType(KafkaPrincipal.USER_TYPE)
+        .setOwnerPrincipalName("__tenant_acme.alice")).build()
+    val request = buildTokenRequest(createRequest, new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = new MockController.Builder().build(),
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    controllerApis.handleCreateDelegationTokenRequest(request).get()
+
+    val response = captureSentResponse(request).asInstanceOf[CreateDelegationTokenResponse]
+    assertEquals(Errors.DELEGATION_TOKEN_AUTHORIZATION_FAILED.code, response.data.errorCode,
+      "non-tenant caller cannot mint a token whose owner sits in a tenant principal namespace")
+  }
+
+  @Test
+  def testControllerCreateDelegationTokenRefusesTenantPrefixedRenewerFromClusterCaller(): Unit = {
+    val renewers = new util.ArrayList[CreateDelegationTokenRequestData.CreatableRenewers]()
+    renewers.add(new CreateDelegationTokenRequestData.CreatableRenewers()
+      .setPrincipalType(KafkaPrincipal.USER_TYPE)
+      .setPrincipalName("__tenant_acme.bob"))
+    val createRequest = new CreateDelegationTokenRequest.Builder(
+      new CreateDelegationTokenRequestData()
+        .setOwnerPrincipalType(KafkaPrincipal.USER_TYPE)
+        .setOwnerPrincipalName("regular-user")
+        .setRenewers(renewers)).build()
+    val request = buildTokenRequest(createRequest, new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = new MockController.Builder().build(),
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    controllerApis.handleCreateDelegationTokenRequest(request).get()
+
+    val response = captureSentResponse(request).asInstanceOf[CreateDelegationTokenResponse]
+    assertEquals(Errors.DELEGATION_TOKEN_AUTHORIZATION_FAILED.code, response.data.errorCode,
+      "non-tenant caller cannot register a renewer inside a tenant principal namespace")
+  }
+
+  @Test
+  def testControllerCreateDelegationTokenAllowsRegularOwnerForClusterCaller(): Unit = {
+    // Control: a non-tenant caller minting for an ordinary principal must
+    // still pass the guard and reach controller.createDelegationToken.
+    val createRequest = new CreateDelegationTokenRequest.Builder(
+      new CreateDelegationTokenRequestData()
+        .setOwnerPrincipalType(KafkaPrincipal.USER_TYPE)
+        .setOwnerPrincipalName("regular-user")).build()
+    val callerPrincipal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "regular-user")
+    val request = buildTokenRequest(createRequest, callerPrincipal)
+
+    val controller = mock(classOf[Controller])
+    when(controller.createDelegationToken(any(classOf[ControllerRequestContext]),
+      any(classOf[CreateDelegationTokenRequestData])))
+      .thenReturn(CompletableFuture.completedFuture(
+        new CreateDelegationTokenResponseData()
+          .setPrincipalType(KafkaPrincipal.USER_TYPE)
+          .setPrincipalName("regular-user")
+          .setTokenRequesterPrincipalType(KafkaPrincipal.USER_TYPE)
+          .setTokenRequesterPrincipalName("regular-user")
+          .setHmac(Array.emptyByteArray)
+          .setTokenId("tid")))
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    controllerApis.handleCreateDelegationTokenRequest(request).get()
+
+    verify(controller).createDelegationToken(
+      any(classOf[ControllerRequestContext]),
+      any(classOf[CreateDelegationTokenRequestData]))
+  }
+
+  @Test
+  def testControllerCreateDelegationTokenAllowsSameTenantCallerForOwnPrincipal(): Unit = {
+    // Legitimate tenant flow: tenant principal __tenant_acme.alice asks (via
+    // envelope re-dispatch or directly) the controller to mint a token for
+    // their own principal. The guard must let it through; the broker-side
+    // guard already covers this case from the other direction.
+    val createRequest = new CreateDelegationTokenRequest.Builder(
+      new CreateDelegationTokenRequestData()
+        .setOwnerPrincipalType(KafkaPrincipal.USER_TYPE)
+        .setOwnerPrincipalName("__tenant_acme.alice")).build()
+    val callerPrincipal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_acme.alice")
+    val request = buildTokenRequest(createRequest, callerPrincipal)
+
+    val controller = mock(classOf[Controller])
+    when(controller.createDelegationToken(any(classOf[ControllerRequestContext]),
+      any(classOf[CreateDelegationTokenRequestData])))
+      .thenReturn(CompletableFuture.completedFuture(
+        new CreateDelegationTokenResponseData()
+          .setPrincipalType(KafkaPrincipal.USER_TYPE)
+          .setPrincipalName("__tenant_acme.alice")
+          .setTokenRequesterPrincipalType(KafkaPrincipal.USER_TYPE)
+          .setTokenRequesterPrincipalName("__tenant_acme.alice")
+          .setHmac(Array.emptyByteArray)
+          .setTokenId("tid")))
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    controllerApis.handleCreateDelegationTokenRequest(request).get()
+
+    verify(controller).createDelegationToken(
+      any(classOf[ControllerRequestContext]),
+      any(classOf[CreateDelegationTokenRequestData]))
   }
 
   @AfterEach
