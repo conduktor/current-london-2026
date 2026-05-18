@@ -48,7 +48,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.Channel;
@@ -249,7 +249,13 @@ public final class IoUringSelector implements BrokerSelector {
      */
     private final List<String> failedSends = new ArrayList<>();
 
-    private final AtomicLong idGen = new AtomicLong();
+    // 32-bit wrapping counter, NOT AtomicLong. ServerConnectionId.fromString parses
+    // the index segment via Integer.parseInt, so a long that exceeds Integer.MAX_VALUE
+    // (~2.1B accepts on a long-running broker — reachable under connection-churn) would
+    // make fromString return Optional.empty, defeating SocketServer.processDisconnected
+    // and leaking connection-quota slots until restart. NIO uses an int that wraps at
+    // Int.MaxValue (SocketServer.scala line 1431-1432); we mirror that wrap exactly.
+    private final AtomicInteger idGen = new AtomicInteger();
     private volatile boolean closed;
 
     /** Test-only constructor: uses processor id 0 and an empty configs map (default principal builder). */
@@ -322,9 +328,10 @@ public final class IoUringSelector implements BrokerSelector {
         // Format must match ServerConnectionId so Processor.processDisconnected can parse it
         // and decrement ConnectionQuotas correctly. Using the synthetic "iouring-N" form
         // would silently break quota release.
+        int connectionIndex = idGen.getAndUpdate(i -> i == Integer.MAX_VALUE ? 0 : i + 1);
         String id = local.getAddress().getHostAddress() + ":" + local.getPort() + "-"
                   + remote.getAddress().getHostAddress() + ":" + remote.getPort() + "-"
-                  + processorId + "-" + idGen.incrementAndGet();
+                  + processorId + "-" + connectionIndex;
         IoUringTransportLayer transport = new IoUringTransportLayer(nettyChannel, remote, local);
         Authenticator authenticator = new IoUringPlaintextAuthenticator(transport, listenerName, configs);
         IoUringChannelMetadataRegistry metadata = new IoUringChannelMetadataRegistry();
@@ -545,26 +552,6 @@ public final class IoUringSelector implements BrokerSelector {
     }
 
     /**
-     * Drain {@link #closingChannels} left over from the previous poll. NIO's
-     * {@code Selector.clear} at {@code clients/.../Selector.java#842-863} is the model:
-     * a channel stays in {@code closingChannels} as long as
-     * <ul>
-     *   <li>{@link #failedSends} did not fire for it this poll (the FAILED_SEND
-     *       notification is the terminal signal — no further reads should be attempted),
-     *       AND</li>
-     *   <li>there is more buffered work we can still deliver: either the channel is
-     *       muted (the Processor will read it after explicit unmute) OR one more read
-     *       can produce a completedReceive.</li>
-     * </ul>
-     * <p>Evict only when nothing more is forthcoming, and at *that* point emit the
-     * disconnect notification. This is what defers {@code disconnected} from the FIN
-     * poll (where the channel still has buffered work) to the eviction poll, matching
-     * NIO and closing the same-poll double-dec window
-     * ({@code processDisconnected} + {@code closeExcessConnections}-&gt;{@code close}).
-     * For pipelined requests followed by FIN this drain is what surfaces R2, R3, …
-     * across successive polls — without it, only R1 reaches the request queue.
-     */
-    /**
      * If the previous poll observed a channel self-mute because {@code memoryPool.tryAllocate}
      * returned null (KafkaChannel.read() flips muteState to MUTED when the pool is dry), and
      * the pool now reports available again, walk every channel and call {@code maybeUnmute()}
@@ -588,6 +575,26 @@ public final class IoUringSelector implements BrokerSelector {
         }
     }
 
+    /**
+     * Drain {@link #closingChannels} left over from the previous poll. NIO's
+     * {@code Selector.clear} at {@code clients/.../Selector.java#842-863} is the model:
+     * a channel stays in {@code closingChannels} as long as
+     * <ul>
+     *   <li>{@link #failedSends} did not fire for it this poll (the FAILED_SEND
+     *       notification is the terminal signal — no further reads should be attempted),
+     *       AND</li>
+     *   <li>there is more buffered work we can still deliver: either the channel is
+     *       muted (the Processor will read it after explicit unmute) OR one more read
+     *       can produce a completedReceive.</li>
+     * </ul>
+     * <p>Evict only when nothing more is forthcoming, and at *that* point emit the
+     * disconnect notification. This is what defers {@code disconnected} from the FIN
+     * poll (where the channel still has buffered work) to the eviction poll, matching
+     * NIO and closing the same-poll double-dec window
+     * ({@code processDisconnected} + {@code closeExcessConnections}-&gt;{@code close}).
+     * For pipelined requests followed by FIN this drain is what surfaces R2, R3, …
+     * across successive polls — without it, only R1 reaches the request queue.
+     */
     private void drainClosingChannels() {
         if (closingChannels.isEmpty()) return;
         Iterator<Map.Entry<String, KafkaChannel>> it = closingChannels.entrySet().iterator();

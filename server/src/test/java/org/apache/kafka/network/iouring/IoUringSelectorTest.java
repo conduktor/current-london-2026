@@ -1069,4 +1069,47 @@ class IoUringSelectorTest {
             "operator-muted closing channel must NOT emit a disconnect yet — eviction is " +
             "deferred until the Processor unmutes and the final receive flushes");
     }
+
+    @Test
+    void connectionIdWrapsAtIntegerMaxValue() throws Exception {
+        // Regression for v9 BLOCKER 2: connection-id index used to be AtomicLong, but
+        // ServerConnectionId.fromString parses the index segment with Integer.parseInt.
+        // A long-running broker that accepted > 2.1B connections would emit IDs that
+        // parse to Optional.empty(), so SocketServer.processDisconnected could not
+        // decrement quotas — leaking connection slots until restart. NIO wraps at
+        // Int.MaxValue (SocketServer.scala line 1431-1432); io_uring must too.
+        IoUringSelector s = newSelector(IDLE_NANOS_NEVER);
+
+        // Pre-seed the internal counter to the wrap boundary via reflection. There is no
+        // production setter for this — the only way to exercise the wrap branch is to put
+        // the counter into the pre-wrap state directly.
+        java.lang.reflect.Field idGenField = IoUringSelector.class.getDeclaredField("idGen");
+        idGenField.setAccessible(true);
+        java.util.concurrent.atomic.AtomicInteger idGen =
+            (java.util.concurrent.atomic.AtomicInteger) idGenField.get(s);
+        idGen.set(Integer.MAX_VALUE);
+
+        // Accept one — index segment must be Integer.MAX_VALUE (still parses to int).
+        EmbeddedChannel first = acceptNew(s, REMOTE_A);
+        String firstId = first.attr(IoUringSelector.CHANNEL_ID_ATTR).get();
+        java.util.Optional<org.apache.kafka.common.network.ServerConnectionId> firstParsed =
+            org.apache.kafka.common.network.ServerConnectionId.fromString(firstId);
+        assertTrue(firstParsed.isPresent(),
+            "id at Integer.MAX_VALUE must still parse — under the old AtomicLong this " +
+            "passed too, the bug only surfaced on the wrap call below");
+        assertEquals(Integer.MAX_VALUE, firstParsed.get().index());
+
+        // Accept another — the wrap must roll the counter back to 0, not to a value
+        // outside int range.
+        EmbeddedChannel second = acceptNew(s, REMOTE_B);
+        String secondId = second.attr(IoUringSelector.CHANNEL_ID_ATTR).get();
+        java.util.Optional<org.apache.kafka.common.network.ServerConnectionId> secondParsed =
+            org.apache.kafka.common.network.ServerConnectionId.fromString(secondId);
+        assertTrue(secondParsed.isPresent(),
+            "after Integer.MAX_VALUE the next index MUST wrap to 0 — under AtomicLong it " +
+            "would be Integer.MAX_VALUE+1L, which Integer.parseInt rejects, breaking " +
+            "SocketServer.processDisconnected and leaking the quota slot");
+        assertEquals(0, secondParsed.get().index(),
+            "wrap target is 0 — matches NIO's SocketServer.scala 'if (... == Int.MaxValue) 0 else +1'");
+    }
 }
