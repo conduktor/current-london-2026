@@ -1285,4 +1285,103 @@ public class ConcentrationKernelTest {
         assertThrows(IllegalStateException.class,
             () -> kernel.backingScanLock(new TopicPartition("shared", 0)));
     }
+
+    // -------- B.7: markBackingUnready evicts cached sidecar handles --------
+
+    @Test
+    public void markBackingUnreadyEvictsCachedSidecarSoNextProduceWritesAtFreshFileOffset() throws IOException {
+        // Reproduces the silent-corruption bug B.7 fixes: a cached LogicalSidecarIndex holds an
+        // in-memory `entries` count that, after a recovery truncate+rebuild via a FRESH handle,
+        // points past the actual end-of-file. Without B.7's eviction the next produce on the
+        // stale handle writes at the old position (entries*8) — overwriting nothing, but creating
+        // a sparse region that resolveBackingOffset reads as 0L instead of the just-written value.
+        kernel.declare(descriptor("orders", 1, "shared", 1));
+        TopicPartition backing = new TopicPartition("shared", 0);
+
+        // Phase 1: produce 5 records — cached handle reaches entries=5, file grows to 40 bytes.
+        long[] originalBackingOffsets = {100L, 200L, 300L, 400L, 500L};
+        for (long backingOffset : originalBackingOffsets) {
+            kernel.commitProduce(kernel.reserveProduce("orders", 0), backingOffset);
+        }
+        File sidecarFile = new File(new File(sidecarDir, "orders"), "0.sidecar");
+        assertEquals(40L, sidecarFile.length(), "pre-condition: 5 entries × 8 bytes");
+
+        // Phase 2: leader-loss simulation. markBackingUnready must evict the cached handle so the
+        // recovery path that follows is free to rebuild the file via a fresh handle without
+        // contention with the stale cached one.
+        kernel.markBackingUnready(backing);
+
+        // Phase 3: recovery rebuild — empty stream truncates the sidecar file to 0 bytes and
+        // restores the tracker to (startOffset=0, nextOffset=0). The cached handle, if it
+        // survived, now points at a zero-byte file but still claims entries=5 internally.
+        kernel.recoverFromBackingScan(
+            java.util.Collections.<RecoveryRecord>emptyIterator(),
+            Set.of(new LogicalPartition("orders", 0)));
+        assertEquals(0L, sidecarFile.length(), "recovery must truncate file");
+        assertEquals(0L, kernel.nextLogicalOffset("orders", 0),
+            "recovery must reset tracker to (0, 0)");
+
+        kernel.markBackingReady(backing);
+
+        // Phase 4: post-recovery produce. With B.7 the next sidecarFor("orders", 0) lazy-opens
+        // a fresh handle that reads file size 0 → entries=0 → write lands at byte 0.
+        // Without B.7 the stale cached handle's entries=5 drives a write at byte 40, leaving
+        // a sparse [0..39] region of zeros that resolveBackingOffset misreads as 0L.
+        kernel.commitProduce(kernel.reserveProduce("orders", 0), 999L);
+
+        assertEquals(8L, sidecarFile.length(),
+            "fresh handle must write at byte 0, producing exactly 8 bytes — not 48 (the "
+                + "stale-handle wrong-offset signature)");
+        assertEquals(999L, kernel.resolveBackingOffset("orders", 0, 0L),
+            "logical offset 0 must resolve to the just-produced backing offset, not 0L from "
+                + "the zero-pad");
+    }
+
+    @Test
+    public void markBackingUnreadyOnNonBackingTopicSkipsEvictionFastPath() {
+        // The fast-path early-return on `!registry.isBackingTopic(...)` keeps the cost of
+        // markBackingUnready on an ordinary (non-concentration) backing tp at the cost of a
+        // single ConcurrentHashMap lookup. We don't need to assert "no I/O happened" directly;
+        // the contract is simply that the method does not throw, the gate-close still bumps
+        // generation, and any subsequent produce on a logical topic that exists on a DIFFERENT
+        // backing is unaffected.
+        TopicPartition notABacking = new TopicPartition("plain-topic", 0);
+        long genBefore = kernel.currentGeneration(notABacking);
+        kernel.markBackingUnready(notABacking);
+        long genAfter = kernel.currentGeneration(notABacking);
+        assertEquals(genBefore + 1L, genAfter,
+            "gate-close generation bump must happen even for non-backing topics");
+        assertFalse(kernel.isBackingReady(notABacking), "gate must be closed");
+    }
+
+    @Test
+    public void markBackingUnreadyEvictsOnlyForTheTargetedBacking() throws IOException {
+        // Two independent backings on the same broker. Marking one unready must not perturb the
+        // cached handle for the other — otherwise we'd unnecessarily force lazy-reopen on every
+        // unrelated leader transition, costing latency on perfectly-healthy partitions.
+        kernel.declare(descriptor("orders", 1, "sharedA", 1));
+        kernel.declare(descriptor("invoices", 1, "sharedB", 1));
+        TopicPartition backingA = new TopicPartition("sharedA", 0);
+        TopicPartition backingB = new TopicPartition("sharedB", 0);
+
+        kernel.commitProduce(kernel.reserveProduce("orders", 0), 10L);
+        kernel.commitProduce(kernel.reserveProduce("invoices", 0), 20L);
+
+        File sidecarA = new File(new File(sidecarDir, "orders"), "0.sidecar");
+        File sidecarB = new File(new File(sidecarDir, "invoices"), "0.sidecar");
+        assertEquals(8L, sidecarA.length());
+        assertEquals(8L, sidecarB.length());
+
+        // Evict only sharedA.
+        kernel.markBackingUnready(backingA);
+
+        // sharedB's cached handle was NOT evicted: a follow-up produce must still resolve cleanly
+        // against the original file contents and append at byte 8 — the canonical "untouched"
+        // signature.
+        kernel.commitProduce(kernel.reserveProduce("invoices", 0), 21L);
+        assertEquals(16L, sidecarB.length(),
+            "sharedB sidecar must continue appending — eviction of sharedA must not have touched it");
+        assertEquals(20L, kernel.resolveBackingOffset("invoices", 0, 0L));
+        assertEquals(21L, kernel.resolveBackingOffset("invoices", 0, 1L));
+    }
 }

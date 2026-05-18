@@ -18,6 +18,9 @@ package org.apache.kafka.storage.internals.concentration;
 
 import org.apache.kafka.common.TopicPartition;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.io.File;
 import java.io.IOException;
 import java.util.ArrayDeque;
@@ -73,6 +76,8 @@ public final class ConcentrationKernel implements AutoCloseable {
      * naming convention, failing broker startup.
      */
     public static final String SIDECAR_DIR_NAME = "_concentration_sidecars";
+
+    private static final Logger log = LoggerFactory.getLogger(ConcentrationKernel.class);
 
     /**
      * Per-(logicalTopic, logicalPartition, producerId) retention of the last
@@ -517,6 +522,63 @@ public final class ConcentrationKernel implements AutoCloseable {
             long nextGen = (prev == null ? 0L : prev.generation) + 1L;
             return new BackingGateState(false, nextGen);
         });
+        // B.7: evict cached sidecar handles for every logical partition mapped onto this backing.
+        // Recovery (KafkaConcentrationLeaderRecoverer.runScan) opens its OWN fresh sidecar handles
+        // via BackingScanRecoverer.openSidecar, calls truncateTo(0), then re-appends from the
+        // backing log. The cached handles still in this map carry pre-recovery in-memory state
+        // (entries count, lastBackingOffset) — which becomes a SILENT DATA CORRUPTION trap once
+        // the gate reopens: the next produce routes through the cached handle, whose stale
+        // `entries` count drives a write at the WRONG byte offset in the freshly-rebuilt file,
+        // overwriting recovered data and shadowing the rest as "out of bounds" on lookup.
+        //
+        // The eviction happens AFTER the gate is closed, so any subsequent produce reaching this
+        // kernel via the broker's gate check will have been rejected first. The only window
+        // remaining is the small one between an in-flight produce's gate check and its
+        // commitProduce call; if that produce holds the cached handle reference at the moment we
+        // close it, its sidecar.append throws IllegalStateException(closed), which
+        // commitProduce's existing try/catch rolls back as a reservation rollback. The client
+        // retries; on retry it hits the now-closed gate and follows the standard
+        // NOT_LEADER_OR_FOLLOWER metadata-refresh path.
+        evictCachedSidecarsForBacking(backing);
+    }
+
+    /**
+     * Remove and close cached {@link LogicalSidecarIndex} handles for every logical partition
+     * that maps onto {@code backing}. Called from {@link #markBackingUnready} as the second leg
+     * of the gate-close → cache-evict → recovery-rebuild pipeline (Codex BLOCKER follow-up B.7).
+     *
+     * <p>Best-effort: a close failure is logged at warn level but does not interrupt the eviction
+     * of remaining partitions. The handle has already been removed from the map at that point,
+     * so a leaked FD is the worst outcome — preferable to leaving stale handles reachable
+     * (silent corruption) or to propagating an exception from {@code markBackingUnready} (which
+     * would leave the gate in an undefined state for the broker glue that called it).
+     *
+     * <p>Visibility note: this method does NOT call {@code ensureOpen} — it is reachable only via
+     * {@link #markBackingUnready}, whose own callers are responsible for not invoking it on a
+     * closed kernel. The map mutation uses {@code ConcurrentHashMap.remove} for thread-safety
+     * relative to {@link #sidecarFor}; the close itself is a one-shot guarded by
+     * {@code LogicalSidecarIndex.closed} so a concurrent close (e.g., from {@link #close()}) is
+     * a no-op on the second caller.
+     */
+    private void evictCachedSidecarsForBacking(TopicPartition backing) {
+        if (!registry.isBackingTopic(backing.topic())) {
+            // No logical topic declared on this backing topic — no sidecar could be cached for
+            // any partition of it. Fast-path avoids allocating an empty Set on every leader-loss
+            // event for non-concentration backings (the common case on a broker that hosts both
+            // logical and ordinary topics).
+            return;
+        }
+        for (LogicalPartition lp : logicalPartitionsForBacking(backing)) {
+            LogicalSidecarIndex cached = sidecars.remove(lp);
+            if (cached != null) {
+                try {
+                    cached.close();
+                } catch (IOException e) {
+                    log.warn("Failed to close cached sidecar for {} during markBackingUnready({})",
+                        lp, backing, e);
+                }
+            }
+        }
     }
 
     /**
