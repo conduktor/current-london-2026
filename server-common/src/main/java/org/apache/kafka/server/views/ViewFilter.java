@@ -17,6 +17,7 @@
 package org.apache.kafka.server.views;
 
 import org.apache.kafka.common.header.Header;
+import org.apache.kafka.common.record.DefaultRecordBatch;
 import org.apache.kafka.common.record.MemoryRecords;
 import org.apache.kafka.common.record.MutableRecordBatch;
 import org.apache.kafka.common.record.Record;
@@ -136,13 +137,75 @@ public final class ViewFilter {
         // the batch checksum. Legacy v0/v1 batches don't carry the field at all and throw on the
         // setter, so we guard on magic >= MAGIC_VALUE_V2 — those batches cannot leak a backing
         // epoch because the field doesn't exist on the wire.
+        // Two scrubs happen here:
+        //   (1) partition_leader_epoch on every retained batch (see comment above).
+        //   (2) on FULLY-FILTERED data batches (RETAIN_EMPTY produced a header but no records),
+        //       producer_id / producer_epoch / base_sequence / max_timestamp / transactional flag
+        //       must also be cleared. Kafka's MemoryRecords.writeEmptyHeader copies these fields
+        //       verbatim from the source batch, so an empty data batch in the view fetch otherwise
+        //       broadcasts the BACKING producer's identity, sequence, timestamp range, and
+        //       transactional status — metadata about records that were specifically filtered
+        //       OUT, leaked through the view's "I filtered them" placeholder. PROMPT.md mandates
+        //       only baseOffset and lastOffset survive on the empty batch ("Preserves source
+        //       offsets"); everything else is leakage.
+        //
+        // Control batches (transaction markers) are NOT scrubbed: READ_COMMITTED isolation needs
+        // intact producer_id / epoch / sequence on COMMIT/ABORT markers so consumers can match
+        // them back to the producing transaction. The data batch's `shouldRetainRecord` retains
+        // the control record itself, so countOrNull() > 0 for control batches in steady state —
+        // we still guard with isControlBatch() to be defensive against a hypothetical empty
+        // control batch reaching this loop.
+        //
+        // The rewrite uses DefaultRecordBatch.writeEmptyHeader (public) into a fresh buffer of
+        // the SAME size as the post-filter output — empty data batches are exactly
+        // RECORD_BATCH_OVERHEAD bytes whether scrubbed or not, and non-empty / control batches
+        // are copied via batch.writeTo unchanged. We skip the rebuild entirely (single pass,
+        // in-place setPartitionLeaderEpoch only) when no empty data batch exists, which is the
+        // common case under permissive predicates.
+        boolean hasEmptyDataBatch = false;
         for (MutableRecordBatch batch : filtered.batches()) {
             if (batch.magic() >= RecordBatch.MAGIC_VALUE_V2) {
                 batch.setPartitionLeaderEpoch(RecordBatch.NO_PARTITION_LEADER_EPOCH);
+                if (isEmptyDataBatch(batch)) {
+                    hasEmptyDataBatch = true;
+                }
             }
+        }
+        if (hasEmptyDataBatch) {
+            ByteBuffer rebuilt = ByteBuffer.allocate(filtered.sizeInBytes());
+            for (MutableRecordBatch batch : filtered.batches()) {
+                if (batch.magic() >= RecordBatch.MAGIC_VALUE_V2 && isEmptyDataBatch(batch)) {
+                    DefaultRecordBatch.writeEmptyHeader(
+                            rebuilt,
+                            RecordBatch.CURRENT_MAGIC_VALUE,
+                            RecordBatch.NO_PRODUCER_ID,
+                            RecordBatch.NO_PRODUCER_EPOCH,
+                            RecordBatch.NO_SEQUENCE,
+                            batch.baseOffset(),
+                            batch.lastOffset(),
+                            RecordBatch.NO_PARTITION_LEADER_EPOCH,
+                            batch.timestampType(),
+                            RecordBatch.NO_TIMESTAMP,
+                            false,  // isTransactional — cleared
+                            false   // isControlRecord — this is a data batch
+                    );
+                } else {
+                    batch.writeTo(rebuilt);
+                }
+            }
+            rebuilt.flip();
+            filtered = MemoryRecords.readableRecords(rebuilt);
         }
         metrics.recordBytes(inputSize, filtered.sizeInBytes());
         return filtered;
+    }
+
+    private static boolean isEmptyDataBatch(MutableRecordBatch batch) {
+        if (batch.isControlBatch()) {
+            return false;
+        }
+        Integer count = batch.countOrNull();
+        return count != null && count == 0;
     }
 
     /**

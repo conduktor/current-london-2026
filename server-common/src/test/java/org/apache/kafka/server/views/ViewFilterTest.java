@@ -390,6 +390,122 @@ class ViewFilterTest {
     }
 
     @Test
+    void fullyFilteredDataBatchesScrubProducerAndTimestampMetadata() {
+        // PROMPT.md acceptance criterion: "Preserves source offsets" — empty batches in
+        // source_sparse mode must keep baseOffset and lastOffset so the consumer advances. They
+        // must NOT keep anything else from the backing batch. Kafka's MemoryRecords.writeEmptyHeader
+        // unconditionally copies producer_id, producer_epoch, base_sequence, max_timestamp, and
+        // the transactional flag from the source batch when RETAIN_EMPTY is requested. For a
+        // fully-filtered DATA batch on a view, those fields describe records the predicate just
+        // REJECTED — leaking them would broadcast the backing producer's identity, the timestamp
+        // range, and whether those filtered records were inside a transaction.
+        //
+        // The filter must scrub these fields on empty data batches while leaving baseOffset and
+        // lastOffset intact for the sparse-offset advance.
+        CompiledPredicate p = compiler.compile("body.color == 'red'");
+        // Build a single transactional data batch with three "blue" records — none match the
+        // predicate, so RETAIN_EMPTY produces an empty header.
+        long backingProducerId = 12345L;
+        short backingProducerEpoch = 7;
+        int backingBaseSequence = 42;
+        long backingTimestamp = 1_700_000_000_000L;
+        ByteBuffer buffer = ByteBuffer.allocate(2048);
+        MemoryRecordsBuilder builder = new MemoryRecordsBuilder(
+                buffer,
+                RecordBatch.CURRENT_MAGIC_VALUE,
+                Compression.NONE,
+                TimestampType.CREATE_TIME,
+                500L,                       // baseOffset
+                0L,                         // logAppendTime
+                backingProducerId,
+                backingProducerEpoch,
+                backingBaseSequence,
+                true,                       // isTransactional
+                false,                      // isControlBatch
+                0,                          // partitionLeaderEpoch
+                buffer.capacity());
+        builder.append(backingTimestamp, null, "{\"color\":\"blue\"}".getBytes(StandardCharsets.UTF_8));
+        builder.append(backingTimestamp + 1, null, "{\"color\":\"green\"}".getBytes(StandardCharsets.UTF_8));
+        builder.append(backingTimestamp + 2, null, "{\"color\":\"yellow\"}".getBytes(StandardCharsets.UTF_8));
+        builder.close();
+        buffer.flip();
+        MemoryRecords input = MemoryRecords.readableRecords(buffer);
+
+        // Sanity: source batch carries the producer/timestamp metadata we expect.
+        MutableRecordBatch source = input.batches().iterator().next();
+        assertEquals(backingProducerId, source.producerId(),
+                "source batch must carry the producer id we'll be checking for scrubbing");
+        assertEquals(backingProducerEpoch, source.producerEpoch(),
+                "source batch must carry the producer epoch we'll be checking for scrubbing");
+        assertTrue(source.isTransactional(),
+                "source batch must be transactional so the strip is observable");
+
+        MemoryRecords output = ViewFilter.apply(p, input, 0);
+
+        assertEquals(List.of(), offsetsOf(output), "no records survive the predicate");
+        int batchCount = 0;
+        for (MutableRecordBatch emptyBatch : output.batches()) {
+            batchCount++;
+            // Sparse-offset advance MUST still work: consumer's lastFetched advances past 502.
+            assertEquals(500L, emptyBatch.baseOffset(),
+                    "baseOffset must survive — source_sparse mode requires it for offset advance");
+            assertEquals(502L, emptyBatch.lastOffset(),
+                    "lastOffset must survive — source_sparse mode requires it for offset advance");
+            // Producer identity must be scrubbed.
+            assertEquals(RecordBatch.NO_PRODUCER_ID, emptyBatch.producerId(),
+                    "backing producer_id must NOT leak through a fully-filtered data batch — the "
+                            + "filtered records' producer identity is gated by the predicate");
+            assertEquals(RecordBatch.NO_PRODUCER_EPOCH, emptyBatch.producerEpoch(),
+                    "backing producer_epoch must NOT leak through a fully-filtered data batch");
+            assertEquals(RecordBatch.NO_SEQUENCE, emptyBatch.baseSequence(),
+                    "backing base_sequence must NOT leak through a fully-filtered data batch");
+            // Transactional flag must be cleared. The records were filtered out, so the consumer
+            // has no business knowing those records were inside a transaction.
+            assertFalse(emptyBatch.isTransactional(),
+                    "transactional flag must be cleared on a fully-filtered data batch — leaving "
+                            + "it set tells the view consumer that filtered records were inside a "
+                            + "transaction, which is metadata about records they cannot read");
+            // maxTimestamp must be cleared — leaking it discloses the timestamp range of the
+            // filtered records.
+            assertEquals(RecordBatch.NO_TIMESTAMP, emptyBatch.maxTimestamp(),
+                    "max_timestamp must NOT leak — exposes the wall-clock range of filtered records");
+            // The control-batch bit on a data batch must remain false (we did not turn it on).
+            assertFalse(emptyBatch.isControlBatch(),
+                    "an empty data batch must not be promoted to a control batch by scrubbing");
+            // CRC must validate after the rewrite.
+            assertTrue(((org.apache.kafka.common.record.DefaultRecordBatch) emptyBatch).isValid(),
+                    "scrubbed empty data batch must carry a valid CRC");
+        }
+        assertEquals(1, batchCount, "exactly one empty header-only batch must remain");
+    }
+
+    @Test
+    void controlBatchProducerMetadataSurvivesScrubBecauseReadCommittedNeedsIt() {
+        // Companion to fullyFilteredDataBatchesScrubProducerAndTimestampMetadata: the scrub MUST
+        // skip control batches. READ_COMMITTED consumers match COMMIT/ABORT markers to the
+        // producing transaction via producer_id + producer_epoch on the control batch. Scrubbing
+        // those fields silently corrupts aborted-producers tracking and leaks aborted records.
+        // The data-batch-only scrub above is the right policy; this test pins that control
+        // batches are NOT collateral damage.
+        CompiledPredicate p = compiler.compile("body.color == 'red'");
+        MemoryRecords output = ViewFilter.apply(p, withDataAndControlMarker(ControlRecordType.ABORT), 0);
+
+        boolean sawControl = false;
+        for (MutableRecordBatch batch : output.batches()) {
+            if (batch.isControlBatch()) {
+                sawControl = true;
+                assertEquals(73L, batch.producerId(),
+                        "control-batch producer_id must NOT be scrubbed — READ_COMMITTED depends on it");
+                assertEquals((short) 0, batch.producerEpoch(),
+                        "control-batch producer_epoch must NOT be scrubbed — READ_COMMITTED depends on it");
+                assertTrue(batch.isTransactional(),
+                        "control-batch transactional flag must NOT be scrubbed — it identifies the marker");
+            }
+        }
+        assertTrue(sawControl, "expected the control batch to propagate through the filter");
+    }
+
+    @Test
     void filteredBatchesAlwaysCarryNoPartitionLeaderEpochRegardlessOfSource() {
         // The view partition keeps its own (lower) leader-epoch ledger. If the filter forwards the
         // backing topic's partition_leader_epoch through filtered records, the consumer's
