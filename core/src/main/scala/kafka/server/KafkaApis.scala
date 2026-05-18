@@ -3824,6 +3824,13 @@ class KafkaApis(val requestChannel: RequestChannel,
     erroneousAndValidPartitionData.validTopicIdPartitions.forEach { case (topicIdPartition, sharePartitionData) =>
       if (!authorizedTopics.contains(topicIdPartition.topicPartition.topic))
         erroneous += topicIdPartition -> ShareFetchResponse.partitionResponse(topicIdPartition, Errors.TOPIC_AUTHORIZATION_FAILED)
+      else if (concentrationKernel.isLogicalTopic(topicIdPartition.topicPartition.topic))
+        // Share groups (KIP-932) need per-record ack tracking keyed by the partition the record
+        // physically lives on. Logical topics fan in to a shared backing partition where multiple
+        // logical TPs interleave records, so the SharePartitionManager would conflate acks across
+        // tenants. Reject explicitly until v2 grows a logical-aware share-fetch path — non-retriable
+        // so clients fail fast instead of looping on UNKNOWN_TOPIC_OR_PARTITION.
+        erroneous += topicIdPartition -> ShareFetchResponse.partitionResponse(topicIdPartition, Errors.INVALID_TOPIC_EXCEPTION)
       else if (!metadataCache.contains(topicIdPartition.topicPartition))
         erroneous += topicIdPartition -> ShareFetchResponse.partitionResponse(topicIdPartition, Errors.UNKNOWN_TOPIC_OR_PARTITION)
       else
@@ -3905,6 +3912,12 @@ class KafkaApis(val requestChannel: RequestChannel,
         if (!authorizedTopics.contains(topicIdPartition.topicPartition.topic))
           erroneous += topicIdPartition ->
             ShareAcknowledgeResponse.partitionResponse(topicIdPartition, Errors.TOPIC_AUTHORIZATION_FAILED)
+        else if (concentrationKernel.isLogicalTopic(topicIdPartition.topicPartition.topic))
+          // Symmetric with handleFetchFromShareFetchRequest: logical topics aren't share-group-eligible
+          // in v1. A client that somehow obtained a logical TopicIdPartition (e.g. via DescribeTopicPartitions)
+          // and now tries to ack must be told this is invalid, not retriable.
+          erroneous += topicIdPartition ->
+            ShareAcknowledgeResponse.partitionResponse(topicIdPartition, Errors.INVALID_TOPIC_EXCEPTION)
         else if (!metadataCache.contains(topicIdPartition.topicPartition))
           erroneous += topicIdPartition ->
             ShareAcknowledgeResponse.partitionResponse(topicIdPartition, Errors.UNKNOWN_TOPIC_OR_PARTITION)
