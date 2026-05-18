@@ -118,6 +118,56 @@ public class RuleEngineTest {
     }
 
     @Test
+    public void activationSupplierThrowingDoesNotPropagateToRequestThread() {
+        // Codex deep-audit P0: activationSupplier.get() runs OUTSIDE the per-rule
+        // try block. A real-world failure mode is ApiMessageActivation walking
+        // a ProduceRequestData whose records() accessor throws (e.g. a
+        // partially-constructed activation map, an Optional accessor that
+        // doesn't tolerate null on certain protocol versions). If the supplier
+        // throws, the exception propagates into KafkaApis.handle() — a buggy
+        // extractor must NEVER be able to crash the request thread. The whole
+        // point of the per-rule fail-open is "a broken governance feature
+        // degrades to ALLOW, never to a broker request failure". The activation
+        // supplier is part of the same surface and must obey the same rule.
+        //
+        // Expected behaviour: evaluate() catches the throw, logs it at WARN,
+        // and returns ALLOW (no rule can be evaluated without an activation
+        // map, so fail-open is the only safe outcome consistent with the
+        // per-rule policy).
+        RuleEngine engine = new RuleEngine();
+        engine.install(new RuleSetBuilder()
+            .put(denyRule("deny-all", ApiKeys.METADATA, "true", 99))
+            .build());
+        RuleDecision d = engine.evaluate(
+            ApiKeys.METADATA, "client", false,
+            () -> {
+                throw new RuntimeException("activation builder blew up");
+            });
+        assertSame(RuleDecision.ALLOW, d,
+            "a throwing activation supplier must fail open, not propagate");
+    }
+
+    @Test
+    public void activationSupplierThrowingErrorAlsoFailsOpen() {
+        // Stronger guarantee: even an Error (StackOverflowError from a deeply
+        // nested ApiMessage walk, OutOfMemoryError from a giant Records buffer)
+        // must not escape evaluate(). Per-rule evaluation already catches
+        // Throwable; the supplier must too. Without this, a single very large
+        // request could crash the broker's request thread.
+        RuleEngine engine = new RuleEngine();
+        engine.install(new RuleSetBuilder()
+            .put(denyRule("deny-all", ApiKeys.METADATA, "true", 99))
+            .build());
+        RuleDecision d = engine.evaluate(
+            ApiKeys.METADATA, "client", false,
+            () -> {
+                throw new StackOverflowError("simulated deep walk");
+            });
+        assertSame(RuleDecision.ALLOW, d,
+            "Errors from the activation supplier must fail open, same as RuntimeExceptions");
+    }
+
+    @Test
     public void ruleEvaluatesWhenApiKeyMatchesAndPredicateIsTrue() {
         RuleEngine engine = new RuleEngine();
         engine.install(new RuleSetBuilder()

@@ -126,7 +126,33 @@ public final class RuleEngine {
         if (rules.isEmpty()) {
             return RuleDecision.ALLOW;
         }
-        Map<String, Object> activation = activationSupplier.get();
+        Map<String, Object> activation;
+        try {
+            activation = activationSupplier.get();
+        } catch (Throwable t) {
+            // Codex deep-audit P0 fix: a throwing activation supplier MUST NOT
+            // propagate into the request thread. The most realistic failure mode
+            // is ApiMessageActivation walking a request whose accessor blows up
+            // (Optional/Stream accessor, partially-constructed protocol object,
+            // version-specific schema mismatch). Without this catch the
+            // exception escapes into KafkaApis.handle(), turning a buggy
+            // governance extractor into a request-thread crash.
+            //
+            // We catch Throwable to match the per-rule policy below: a
+            // StackOverflowError from a deeply nested ApiMessage walk or an
+            // OutOfMemoryError from a giant Records buffer must not be allowed
+            // to take the request thread with it either.
+            //
+            // Posture is "fail-open": a broken governance feature degrades to
+            // ALLOW, never to a broker request failure. This matches the
+            // per-rule fail-open below ("a buggy rule must not be able to
+            // crash the request path") and is the only outcome consistent
+            // with that policy — no rule can be evaluated without an
+            // activation map, so ALLOW is the only available safe answer.
+            LOG.warn("activation supplier failed for apiKey {} — failing open: {}",
+                apiKey, t.toString());
+            return RuleDecision.ALLOW;
+        }
         for (Rule rule : rules) {
             boolean matched;
             try {
