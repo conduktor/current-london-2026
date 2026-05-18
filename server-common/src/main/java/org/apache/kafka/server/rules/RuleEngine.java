@@ -176,6 +176,22 @@ public final class RuleEngine {
     static final long BUDGET_WARN_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(1);
 
     /**
+     * Round-14 BLOCKER L-1 (concurrency sub-agent): throttle the per-rule
+     * fail-open WARN on rule evaluation errors. Same window-and-suppressed-count
+     * pattern as {@link #lastBudgetWarnNanos} above, applied to the WARN emitted
+     * from {@link #evaluate} when a rule throws during {@link
+     * org.apache.kafka.server.rules.cel.CelProgram#evalBoolean}. Without this
+     * throttle, a single rule that consistently throws (e.g. an OOM-trigger or
+     * StackOverflowError-trigger CEL expression) would fire one WARN per
+     * request, per rule — a published-rule-shaped log amplifier. With the
+     * throttle the broker emits at most one line per window plus a
+     * suppressed-count tail.
+     */
+    private final AtomicLong lastEvalErrorWarnNanos = new AtomicLong(0L);
+    final AtomicLong suppressedEvalErrorWarnings = new AtomicLong(0L);
+    static final long EVAL_ERROR_WARN_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(1);
+
+    /**
      * Allow-list of principal strings (e.g. {@code "User:broker"}) that may
      * exercise the privileged-listener bypass. Sourced from the dedicated
      * {@code governance.bypass.principals} broker config — independent of
@@ -583,8 +599,18 @@ public final class RuleEngine {
                         // DoS-defence behaviour: a request cannot multiply the step
                         // budget by the number of rules an operator happens to have
                         // published. See CelLimits.resetSteps javadoc.
-                        LOG.warn("rule '{}' failed open due to evaluation error on apiKey {}: {}",
-                            rule.id(), apiKey, t.toString());
+                        // Round-14 BLOCKER L-1: this WARN sits on the per-rule,
+                        // per-request hot path. A single buggy rule that throws
+                        // consistently would otherwise fire one line per request
+                        // — published-rule-shaped log amplifier. Sanitise the
+                        // exception text (which can carry CelEvaluationException
+                        // messages with wire-derived values) and throttle the
+                        // emission to at most one WARN per window with a
+                        // suppressed-count tail. rule.id() is codec-validated
+                        // (strict charset, length cap) but goes through
+                        // LogSafe for consistency with other wire-into-log
+                        // sites.
+                        maybeWarnEvalError(rule.id(), apiKey, t);
                         continue;
                     }
                     if (matched) {
@@ -686,6 +712,42 @@ public final class RuleEngine {
             }
         } else {
             suppressedBudgetWarnings.incrementAndGet();
+        }
+    }
+
+    /**
+     * Throttled WARN for the per-rule fail-open eval-error path. Round-14
+     * BLOCKER L-1 (concurrency sub-agent). Mirrors {@link
+     * #maybeWarnBudgetExceeded}: window-based CAS, suppressed-count carried
+     * forward to the next emitted line.
+     *
+     * <p>Both wire-into-log slots are sanitised: {@code ruleId} (codec-
+     * validated upstream, but consistent with the rest of the codebase) and
+     * {@code throwable.toString()} (CelEvaluationException messages may carry
+     * trimmed wire-derived values from the activation map). The {@code apiKey}
+     * is enum-typed and printable-safe.
+     *
+     * <p>Two emission shapes — the second includes the suppressed count so
+     * operators see the rate of the storm, not just one example.
+     */
+    private void maybeWarnEvalError(String ruleId, ApiKeys apiKey, Throwable t) {
+        long now = System.nanoTime();
+        long last = lastEvalErrorWarnNanos.get();
+        if (now - last >= EVAL_ERROR_WARN_INTERVAL_NANOS
+            && lastEvalErrorWarnNanos.compareAndSet(last, now)) {
+            long suppressed = suppressedEvalErrorWarnings.getAndSet(0L);
+            if (suppressed > 0) {
+                LOG.warn("rule '{}' failed open due to evaluation error on apiKey {} "
+                    + "(suppressed {} similar events in the previous window): {}",
+                    LogSafe.sanitize(ruleId), apiKey, suppressed,
+                    LogSafe.sanitize(t.toString()));
+            } else {
+                LOG.warn("rule '{}' failed open due to evaluation error on apiKey {}: {}",
+                    LogSafe.sanitize(ruleId), apiKey,
+                    LogSafe.sanitize(t.toString()));
+            }
+        } else {
+            suppressedEvalErrorWarnings.incrementAndGet();
         }
     }
 }

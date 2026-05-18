@@ -293,6 +293,39 @@ public class RuleEngineTest {
     }
 
     @Test
+    public void evalErrorWarnIsThrottledUnderRapidFire() {
+        // Round-14 BLOCKER L-1 (concurrency sub-agent): the fail-open WARN
+        // emitted from RuleEngine.evaluate when a rule's predicate throws sits
+        // on the per-rule, per-request hot path. Before this fix a single
+        // buggy rule could fire one WARN line per request and saturate the
+        // SLF4J appender from a published-rule-shaped trigger. This test
+        // proves the throttle holds: a sustained tight loop of evaluations
+        // against a rule whose CEL throws every time leaves at most one
+        // unsuppressed WARN per ~1-second window. The suppression counter is
+        // package-private exactly so this assertion does not need a slow
+        // wall-clock pause.
+        RuleEngine engine = new RuleEngine();
+        engine.install(new RuleSetBuilder()
+            // 1 / 0 throws CelEvaluationException at evaluation time — the
+            // exact shape an operator-published bug would take.
+            .put(denyRule("explody", ApiKeys.METADATA, "1 / 0 == 0", 99))
+            .build());
+        final int rapidFireCalls = 1_000;
+        for (int i = 0; i < rapidFireCalls; i++) {
+            // Predicate throws, engine fails open → ALLOW.
+            RuleDecision d = engine.evaluate(
+                ApiKeys.METADATA, "client", null, false,
+                () -> Collections.singletonMap("request", Collections.emptyMap()));
+            assertSame(RuleDecision.ALLOW, d,
+                "buggy predicate must fail open — only the WARN is throttled");
+        }
+        long suppressed = engine.suppressedEvalErrorWarnings.get();
+        assertTrue(suppressed >= rapidFireCalls - 2,
+            "expected the eval-error throttle to suppress most rapid-fire WARNs, got " + suppressed
+                + " out of " + rapidFireCalls + " eval-error events");
+    }
+
+    @Test
     public void ruleEvaluatesWhenApiKeyMatchesAndPredicateIsTrue() {
         RuleEngine engine = new RuleEngine();
         engine.install(new RuleSetBuilder()
