@@ -197,7 +197,21 @@ class KafkaConcentrationLeaderRecoverer(
     // lock makes "rebuild the sidecar for this backing" a critical section; the generation
     // re-check below is the stale-fence that lets a queued scan early-exit once a fresher scan
     // has already done the work.
-    scanLock.lock()
+    //
+    // Codex round-7 HIGH 2: must be lockInterruptibly() — the recovery executor's shutdownNow
+    // sends Thread.interrupt to its workers, and an uninterruptible lock acquisition would
+    // strand a queued scan behind a long-running scan on the same backing until that scan
+    // finishes naturally. The interruptible variant lets shutdownNow actually unblock the
+    // queue; we abort with the gate closed (same outcome as InterruptedScanException below).
+    try {
+      scanLock.lockInterruptibly()
+    } catch {
+      case _: InterruptedException =>
+        Thread.currentThread().interrupt()
+        log.info(s"Concentration recovery [task=$taskId] $backingTp: scan lock acquisition " +
+          s"interrupted before this scan could run; aborting (gate stays closed)")
+        return
+    }
     try {
       // Post-acquire generation re-check. If a later leader-acquisition has already bumped the
       // generation while we were queued for the scan lock, the next event's scan will run after

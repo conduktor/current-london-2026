@@ -459,6 +459,70 @@ class KafkaConcentrationLeaderRecovererTest {
   }
 
   @Test
+  def queuedScanBlockedOnScanLockMustHonourShutdownInterrupt(): Unit = {
+    // Codex round-7 HIGH 2. The recovery executor's shutdown sequence is:
+    //   shutdown → awaitTermination(shutdownTimeoutMs) → shutdownNow → awaitTermination(force)
+    // shutdownNow sends Thread.interrupt to every still-running worker. A worker that is
+    // blocked on `scanLock.lock()` (uninterruptible) would ignore the interrupt and stay
+    // queued until the holder releases naturally — stranding broker shutdown behind
+    // arbitrarily long backing-log I/O on the holder. With lockInterruptibly(), the
+    // interrupt unblocks the wait and the worker returns cleanly with the gate still
+    // closed.
+    //
+    // Repro: pre-acquire the scan lock from the test thread, then drive onMakeLeader so
+    // its worker queues on the lock, then call close(). With the fix close() finishes in
+    // shutdownTimeoutMs + ~epsilon; without it close() waits the full force window before
+    // declaring failure.
+    val testShutdownTimeoutMs = 200L
+    val testShutdownForceTimeoutMs = 1_500L
+
+    val kernel = mock(classOf[ConcentrationKernel])
+    val logManager = mock(classOf[LogManager])
+    when(kernel.isBackingTopic(backingTp.topic)).thenReturn(true)
+    when(kernel.currentGeneration(backingTp)).thenReturn(13L)
+    when(kernel.logicalPartitionsForBacking(backingTp)).thenReturn(filterOf("orders", 0))
+    // Pre-held lock — the recoverer's worker will queue on this and stay blocked until
+    // either the lock is released (never, in this test) or the wait is interrupted.
+    val heldLock = new ReentrantLock()
+    heldLock.lock()
+    try {
+      when(kernel.backingScanLock(backingTp)).thenReturn(heldLock)
+      val partition = mock(classOf[Partition])
+      when(partition.getLeaderEpoch).thenReturn(1)
+
+      val executor = Executors.newSingleThreadExecutor()
+      val recoverer = new KafkaConcentrationLeaderRecoverer(kernel, logManager, executor,
+        shutdownTimeoutMs = testShutdownTimeoutMs,
+        shutdownForceTimeoutMs = testShutdownForceTimeoutMs)
+
+      // Submit the scan; the worker reaches lockInterruptibly() and blocks immediately
+      // because the test thread holds the lock.
+      recoverer.onMakeLeader(backingTp, partition)
+      // Give the executor a moment to actually run the submitted Runnable up to the
+      // lock-acquisition point — 200ms is comfortable for any CI.
+      Thread.sleep(200)
+      assertFalse(executor.isTerminated, "worker must still be running, blocked on scan lock")
+
+      val before = System.nanoTime()
+      recoverer.close()
+      val elapsedMs = (System.nanoTime() - before) / 1_000_000L
+
+      assertTrue(executor.isTerminated,
+        "Codex HIGH 2: shutdownNow's interrupt must unblock a queued scan's scanLock " +
+          "wait so the executor terminates")
+      // First await times out (200ms); shutdownNow fires; the worker exits ~immediately
+      // because lockInterruptibly() responds to the interrupt. Total should be a hair
+      // above shutdownTimeoutMs, well below shutdownTimeoutMs + force window.
+      assertTrue(elapsedMs < testShutdownTimeoutMs + 700L,
+        s"close() with interruptible scan lock should return shortly after shutdownNow " +
+          s"fires the interrupt. Elapsed: ${elapsedMs}ms; force window: " +
+          s"${testShutdownForceTimeoutMs}ms")
+    } finally {
+      heldLock.unlock()
+    }
+  }
+
+  @Test
   def closeDrainsExecutorWithinBoundedTimeout(): Unit = {
     // The default executor is a daemon-threaded fixed-thread-pool; close() must drain it
     // so broker shutdown cannot leave concentration recovery threads alive. The bounded
