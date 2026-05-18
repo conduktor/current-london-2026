@@ -306,9 +306,27 @@ final class Evaluator {
         }
         boolean wantDouble = l instanceof Double || r instanceof Double;
         if (wantDouble) {
+            // Same IEEE-safe-integer guard applied in equalsValues / compare must apply here.
+            // Without it, mixed Long/Double arithmetic silently rounds an unsafe Long to its
+            // nearest double, and a follow-up Double-vs-Double equality lets the rounded value
+            // match a literal. E.g. predicate `body.id / 1.0 == 9007199254740992.0` would
+            // match a record with body.id = 9007199254740993 (Long), because
+            // (double) 9007199254740993L rounds to 9007199254740992.0. Refuse the operation
+            // when an operand cannot survive the round trip to double; the predicate evaluates
+            // to null and the record is skipped (consistent with cost-cap / malformed JSON).
+            if (l instanceof Long && unsafeForDouble(((Long) l).longValue())) {
+                return null;
+            }
+            if (r instanceof Long && unsafeForDouble(((Long) r).longValue())) {
+                return null;
+            }
             return arithDouble(((Number) l).doubleValue(), ((Number) r).doubleValue(), op);
         }
         return arithLong(((Number) l).longValue(), ((Number) r).longValue(), op);
+    }
+
+    private static boolean unsafeForDouble(long v) {
+        return v > IEEE_SAFE_INTEGER || v < -IEEE_SAFE_INTEGER;
     }
 
     private static Object arithDouble(double a, double b, Op op) {
@@ -357,11 +375,22 @@ final class Evaluator {
                     if (b == 0) {
                         return null;
                     }
+                    // JLS 15.17.2: Long.MIN_VALUE / -1 overflows silently to Long.MIN_VALUE
+                    // (Math.multiplyExact for Long.MAX_VALUE+1 would throw, but `/` does not).
+                    // Java 17 lacks Math.divideExact(long, long) (added in 18), so trap the
+                    // single overflow case explicitly. Without this, a predicate like
+                    // `body.priority / -1 < -100` admits a record with body.priority = Long.MIN_VALUE:
+                    // the division wraps to Long.MIN_VALUE, which compares <= -100 as true.
+                    if (a == Long.MIN_VALUE && b == -1L) {
+                        return null;
+                    }
                     return a / b;
                 case MOD:
                     if (b == 0) {
                         return null;
                     }
+                    // Long.MIN_VALUE % -1 is defined by JLS 15.17.3 to return 0 (not overflow),
+                    // so no special-case is needed for MOD.
                     return a % b;
                 default:
                     return null;

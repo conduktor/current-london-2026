@@ -303,6 +303,59 @@ class CompiledPredicateTest {
     }
 
     @Test
+    void dividingLongMinValueByMinusOneYieldsUnknownNotSilentWraparound() {
+        // Long.MIN_VALUE / -1 overflows silently to Long.MIN_VALUE in Java (JLS 15.17.2).
+        // Without the explicit overflow guard on DIV, a predicate `body.priority / -1 < -100`
+        // admits a body carrying Long.MIN_VALUE: the division wraps back to Long.MIN_VALUE
+        // and compares <= -100 as true, bypassing an access-control gate. Symmetric to the
+        // negation case above. Java 17 lacks Math.divideExact(long, long); the trap is explicit.
+        CompiledPredicate p = compiler.compile("body.priority / -1 < -100");
+        Optional<Boolean> r = p.evaluate(jsonRecord("{\"priority\":-9223372036854775808}"));
+        assertTrue(r.isEmpty() || !r.get(),
+                () -> "Long.MIN_VALUE / -1 must be unknown/false, not silently wrap, got " + r);
+        // Sanity: ordinary division still works.
+        CompiledPredicate q = compiler.compile("body.x / 2 == 5");
+        assertTrue(q.evaluate(jsonRecord("{\"x\":10}")).orElse(false));
+        // Sanity: division by zero still returns null (no crash).
+        CompiledPredicate z = compiler.compile("body.x / 0 == 0");
+        assertFalse(z.evaluate(jsonRecord("{\"x\":5}")).orElse(true));
+    }
+
+    @Test
+    void modOfLongMinValueByMinusOneIsZero() {
+        // Per JLS 15.17.3, Long.MIN_VALUE % -1 returns 0 (not overflow). Sanity-check that we
+        // do not over-zealously refuse this — a predicate `body.x % -1 == 0` should match.
+        CompiledPredicate p = compiler.compile("body.x % -1 == 0");
+        assertTrue(p.evaluate(jsonRecord("{\"x\":-9223372036854775808}")).orElse(false));
+    }
+
+    @Test
+    void mixedLongDoubleArithmeticRefusesUnsafeLong() {
+        // Even with the IEEE-safe-integer guard on equality and ordered comparison,
+        // arithmetic that mixes a Long and a Double silently rounds the Long to its
+        // nearest double, then the Double-vs-Double equality of the result lets the
+        // rounded value match a literal. Example: `body.id / 1.0 == 9007199254740992.0`
+        // would match body.id = 9007199254740993 (Long) because
+        // (double) 9007199254740993L rounds to 9007199254740992.0 inside the division.
+        // The arithmetic must refuse the operation when an operand is a Long outside
+        // [-2^53, 2^53] and the other side is a Double — propagate as "unknown".
+        CompiledPredicate p = compiler.compile("body.id / 1.0 == 9007199254740992.0");
+        Optional<Boolean> r = p.evaluate(jsonRecord("{\"id\":9007199254740993}"));
+        assertTrue(r.isEmpty() || !r.get(),
+                () -> "unsafe Long / Double must not silently round, got " + r);
+        // Repeat for the other operations to make sure the guard is uniform.
+        for (String op : new String[]{"+", "-", "*"}) {
+            CompiledPredicate q = compiler.compile("body.id " + op + " 0.0 == 9007199254740992.0");
+            Optional<Boolean> rq = q.evaluate(jsonRecord("{\"id\":9007199254740993}"));
+            assertTrue(rq.isEmpty() || !rq.get(),
+                    () -> "unsafe Long " + op + " Double must not silently round, got " + rq);
+        }
+        // Sanity: when the Long IS inside the safe range, mixed arithmetic still works.
+        CompiledPredicate ok = compiler.compile("body.id + 0.0 == 42.0");
+        assertTrue(ok.evaluate(jsonRecord("{\"id\":42}")).orElse(false));
+    }
+
+    @Test
     void rejectsPrecisionLossFloatLiteralAtCompileTime() {
         // 9007199254740993.0 silently rounds to 9007199254740992.0 in Double. A predicate
         // body.x == 9007199254740993.0 therefore matches a Long that the author did not intend.
