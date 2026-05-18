@@ -559,11 +559,34 @@ class BrokerServer(
           case Some("false") | Some("no") | Some("0") => false
           case _ => true
         }
+      // Catchup probe (Codex deep-audit P0b): tells drainStartup when this
+      // broker's local log is safe to drain — i.e. when local HW reflects
+      // a recent cluster-committed point on the governance partition. Two
+      // sufficient conditions, both observable without an RPC to the leader:
+      //   1. This broker IS the leader (its HW is, by definition, the
+      //      cluster-wide commit point).
+      //   2. This broker is a follower IN the ISR (the controller considers
+      //      this broker caught up within replica.lag.time.max.ms).
+      // The probe is unsafe-but-loud in the "partition object not yet
+      // initialised" case: returning false here keeps drainStartup polling
+      // rather than draining stale; if the deadline elapses, drainStartup
+      // throws and BrokerServer aborts startup before opening client
+      // sockets. Operator recovery: investigate replica fetcher / ISR /
+      // leader reachability and restart.
+      val caughtUpProbe: () => Boolean = () => {
+        replicaManager.onlinePartition(
+          new org.apache.kafka.common.TopicPartition(GovernanceTopic.NAME, 0)
+        ).exists { partition =>
+          partition.isLeader ||
+            partition.inSyncReplicaIds.contains(config.nodeId)
+        }
+      }
       governanceBootstrap = new BrokerGovernanceBootstrap(
         replicaManager = replicaManager,
         ruleEngine = ruleEngine,
         localReplicaStatus = localReplicaProbe,
-        requireLocalReplica = requireLocalReplica)
+        requireLocalReplica = requireLocalReplica,
+        caughtUpProbe = caughtUpProbe)
 
       dataPlaneRequestProcessor = new KafkaApis(
         requestChannel = socketServer.dataPlaneRequestChannel,

@@ -115,7 +115,8 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
                                 injectedLoader: GovernanceLoader = null,
                                 localReplicaStatus: () => LocalReplicaStatus =
                                   () => LocalReplicaStatus.TopicAbsent,
-                                requireLocalReplica: Boolean = true)
+                                requireLocalReplica: Boolean = true,
+                                caughtUpProbe: () => Boolean = () => true)
   extends Logging {
 
   // Visible for tests so a Mockito spy/mock can simulate a poisoned record.
@@ -266,11 +267,19 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
    *
    * <p>{@code drainStartup} therefore bounded-waits up to {@code deadlineMs}
    * for the local log to become available, polling every {@code pollIntervalMs}.
-   * Once it appears, the normal drain runs. If the deadline elapses while we
-   * are still a [[LocalReplicaStatus.LocalReplica]] with no local log, the
-   * method throws [[IllegalStateException]] and [[BrokerServer]] aborts
-   * startup with no socket opened — a stale fail-closed is strictly safer than
-   * a silent fail-empty.
+   * Once it appears, a SECOND bounded-wait runs (sharing the same deadline)
+   * for the {@code caughtUpProbe} to return {@code true} — i.e. for this
+   * broker to be either the partition leader OR a follower in the ISR. On a
+   * freshly-started follower the log directory opens with HW=0 / LEO=0 before
+   * the replica-fetcher has pulled any committed records from the leader, so
+   * draining at that instant would commit an empty {@link
+   * org.apache.kafka.server.rules.RuleSet} past rules the leader has already
+   * committed. Waiting for ISR membership (or self-leadership) is the
+   * minimal principled signal that "drain up to local HW" reflects a recent
+   * cluster-committed point. Codex deep-audit P0b. If the deadline elapses
+   * in either phase, the method throws [[IllegalStateException]] and
+   * [[BrokerServer]] aborts startup with no socket opened — a stale
+   * fail-closed is strictly safer than a silent fail-empty.
    *
    * <p>The other no-log branches ([[LocalReplicaStatus.TopicAbsent]],
    * [[LocalReplicaStatus.NonReplica]] under either knob setting) need no
@@ -291,8 +300,58 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
       attempt += 1
       replicaManager.getLog(tp) match {
         case Some(_) =>
-          // Log is open; hand off to the normal drain path.
-          return drainOnce()
+          // Phase 2 (Codex deep-audit P0b): the local log being open is
+          // NOT sufficient on its own. On a freshly-started follower broker
+          // the log directory opens almost immediately (HW=0, LEO=0) but
+          // the replica-fetcher has not yet pulled any committed records
+          // from the leader. Calling drainOnce in that window would read
+          // up to local HW=0 → 0 records → empty RuleSet, then return —
+          // and BrokerServer would then open client sockets with no rules
+          // enforced even though real DENY rules exist on the leader.
+          //
+          // The fix: gate on a caught-up signal before draining. The probe
+          // returns true when this broker is either the partition leader
+          // (its HW IS the cluster-wide commit point) or a follower in
+          // the ISR (the controller considers this broker caught up to
+          // within replica.lag.time.max.ms). Both states are sufficient
+          // for "drain up to local HW" to equal "drain up to a recent
+          // cluster-committed point". A follower NOT in the ISR is by
+          // definition lagging and would read a stale prefix; that is the
+          // case the wait protects against.
+          //
+          // Tests inject a static probe so they don't have to mock the
+          // entire Partition object graph. The default probe is `() =>
+          // true` (caught up), which preserves the historical drainStartup
+          // behaviour for callers that have not opted into the check yet.
+          if (caughtUpProbe()) {
+            return drainOnce()
+          }
+          if (System.nanoTime() >= deadlineNanos) {
+            // Log is open but the broker never caught up to the leader's HW
+            // within the deadline. The bootstrap budget is a hard cap on
+            // total wait, shared with Phase 1 — the operator chose how long
+            // they were willing to delay client traffic in exchange for
+            // catchup. Refusing to open the socket is the safe choice: an
+            // empty drain past a lagging follower would silently bypass
+            // every rule on the leader's log. Operator recovery: check
+            // replica-fetcher status, leader reachability, controller view
+            // of ISR; resolve, then restart.
+            throw new IllegalStateException(
+              s"governance bootstrap timed out after ${deadlineMs}ms " +
+                s"waiting for this broker to catch up to the leader of " +
+                s"$tp; the local log is open but the broker is not yet in " +
+                s"the ISR (per controller metadata). Draining now would " +
+                s"read a stale prefix of the governance log and silently " +
+                s"fail-open every rule the leader has committed. Refusing " +
+                s"to open client traffic — investigate replica-fetcher " +
+                s"status, leader reachability, and ISR state for $tp, " +
+                s"then restart.")
+          }
+          if (attempt == 1 || attempt % 20 == 0) {
+            info(s"governance bootstrap waiting for replica catchup on " +
+              s"$tp (attempt $attempt, deadline ${deadlineMs}ms)")
+          }
+          Thread.sleep(pollIntervalMs)
         case None =>
           localReplicaStatus() match {
             // TopicAbsent and NonReplica are deterministic states — no point

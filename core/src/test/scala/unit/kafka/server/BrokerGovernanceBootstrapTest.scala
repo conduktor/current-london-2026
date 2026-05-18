@@ -584,4 +584,105 @@ class BrokerGovernanceBootstrapTest {
     assertTrue(engine.evaluate(ApiKeys.FETCH, "c", false, () => Collections.emptyMap()).denied)
     assertTrue(engine.evaluate(ApiKeys.CREATE_TOPICS, "c", false, () => Collections.emptyMap()).denied)
   }
+
+  @Test
+  def drainStartupWaitsForReplicaCatchupAfterLogOpens(): Unit = {
+    // Codex deep-audit P0b: the local log being open is not sufficient. On a
+    // freshly-started follower the log directory opens immediately (HW=0)
+    // before the replica-fetcher has pulled any records from the leader.
+    // drainStartup must wait for ISR membership (or self-leadership) before
+    // draining; otherwise the engine commits empty past rules the leader has
+    // already committed. This test simulates a follower that catches up
+    // after a few polls — drainStartup must keep polling until the probe
+    // flips to true, then drain.
+    val rm = mock(classOf[ReplicaManager])
+    val log = mock(classOf[UnifiedLog])
+    val engine = new RuleEngine()
+    when(rm.getLog(tp)).thenReturn(Some(log))
+    when(log.logStartOffset).thenReturn(0L)
+    when(log.highWatermark).thenReturn(1L)
+    when(log.read(0L, 1024 * 1024, FetchIsolation.HIGH_WATERMARK, true)).thenReturn(
+      recordsAt(0L,
+        new SimpleRecord("r1".getBytes(StandardCharsets.UTF_8),
+          envelope("true", ApiKeys.METADATA, 7))))
+
+    // Probe returns false for the first two polls, then true. This models a
+    // follower whose ISR membership lands on the third poll.
+    val callCount = new java.util.concurrent.atomic.AtomicInteger(0)
+    val caughtUpProbe: () => Boolean = () => callCount.incrementAndGet() >= 3
+
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp,
+      injectedLoader = null,
+      localReplicaStatus = () => LocalReplicaStatus.LocalReplica,
+      requireLocalReplica = true,
+      caughtUpProbe = caughtUpProbe)
+
+    val n = boot.drainStartup(deadlineMs = 5000L, pollIntervalMs = 1L)
+    assertEquals(1L, n,
+      "drain must run once the probe reports caught-up, not before")
+    assertEquals(1, engine.active().size())
+    // At least three probe invocations (two false + one true) before drain.
+    assertTrue(callCount.get() >= 3,
+      s"probe must be polled until it returns true, got ${callCount.get()} calls")
+  }
+
+  @Test
+  def drainStartupFailsClosedIfBrokerNeverCatchesUp(): Unit = {
+    // The other half of P0b: if the log is open but the broker never reaches
+    // ISR within the deadline, drainStartup MUST throw rather than drain a
+    // stale prefix. The error must name the partition and steer the operator
+    // toward replica-fetcher / ISR investigation (NOT toward the log-dir
+    // recovery path that the log-never-opened case points to — they need
+    // different fixes).
+    val rm = mock(classOf[ReplicaManager])
+    val log = mock(classOf[UnifiedLog])
+    val engine = new RuleEngine()
+    when(rm.getLog(tp)).thenReturn(Some(log))
+    when(log.logStartOffset).thenReturn(0L)
+    when(log.highWatermark).thenReturn(0L)
+
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp,
+      injectedLoader = null,
+      localReplicaStatus = () => LocalReplicaStatus.LocalReplica,
+      requireLocalReplica = true,
+      caughtUpProbe = () => false)
+
+    val ex = assertThrows(classOf[IllegalStateException],
+      () => boot.drainStartup(deadlineMs = 50L, pollIntervalMs = 1L))
+    val msg = ex.getMessage
+    assertTrue(msg.contains(tp.toString),
+      s"error must name the partition, got: $msg")
+    assertTrue(msg.contains("catch up") || msg.contains("ISR"),
+      s"error must mention replica catchup / ISR, got: $msg")
+    assertEquals(0, engine.active().size(),
+      "no rule must be installed when drainStartup throws")
+  }
+
+  @Test
+  def drainStartupDoesNotWaitForCatchupWhenTopicIsAbsent(): Unit = {
+    // The caughtUpProbe is consulted only in the log-open branch. Topic-absent
+    // and non-replica branches must short-circuit without ever asking the probe
+    // — those are deterministic states where catchup is not even a meaningful
+    // concept (no replica fetcher is running for a topic we don't host).
+    val rm = mock(classOf[ReplicaManager])
+    val engine = new RuleEngine()
+    when(rm.getLog(tp)).thenReturn(None)
+
+    val probeCalls = new java.util.concurrent.atomic.AtomicInteger(0)
+    val caughtUpProbe: () => Boolean = () => {
+      probeCalls.incrementAndGet()
+      false
+    }
+
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp,
+      injectedLoader = null,
+      localReplicaStatus = () => LocalReplicaStatus.TopicAbsent,
+      requireLocalReplica = true,
+      caughtUpProbe = caughtUpProbe)
+
+    val n = boot.drainStartup(deadlineMs = 5000L, pollIntervalMs = 1L)
+    assertEquals(0L, n)
+    assertEquals(0, probeCalls.get(),
+      "TopicAbsent path must short-circuit without consulting the catchup probe")
+  }
 }
