@@ -1170,6 +1170,48 @@ class ControllerApisTest {
         _ => Set("foo", "bar")))
   }
 
+  /**
+   * r17 BLOCKER #127 — DeleteTopics on a declared logical-only name returned
+   * UNKNOWN_TOPIC_OR_PARTITION (via ReplicationControlManager.findTopicIds), breaking the
+   * standard `listTopics → deleteTopics` round-trip — listTopics surfaces logical names
+   * via the broker's DescribeTopicPartitions synthesis, then deleteTopics blows up.
+   *
+   * Symmetric to CreateTopics' shadow rejection (TOPIC_ALREADY_EXISTS with explanatory
+   * message). The required behaviour is INVALID_REQUEST with the operator-facing
+   * remediation. Innocent names in the same request must continue through to the
+   * controller and surface their own (normal) errors.
+   */
+  @Test
+  def testDeleteTopicsRejectsDeclaredLogicalName(): Unit = {
+    val controller = new MockController.Builder().build()
+    val props = new Properties()
+    props.put(ServerConfigs.CONCENTRATION_LOGICAL_TOPICS_CONFIG, "orders:100:shared:4,payments:50:shared:4")
+    controllerApis = createControllerApis(None, controller, props)
+    val request = new DeleteTopicsRequestData().setTopicNames(
+      util.Arrays.asList("orders", "payments", "innocent"))
+    val expectedResponse = Set(
+      new DeletableTopicResult().setName("orders").
+        setErrorCode(INVALID_REQUEST.code()).
+        setErrorMessage("Topic 'orders' is a declared logical topic in concentration.logical.topics on " +
+          "this controller. Logical topics cannot be deleted via DeleteTopics; remove the " +
+          "declaration from the controller's broker config and restart, then any physical " +
+          "topic of the same name can be deleted via the normal path."),
+      new DeletableTopicResult().setName("payments").
+        setErrorCode(INVALID_REQUEST.code()).
+        setErrorMessage("Topic 'payments' is a declared logical topic in concentration.logical.topics on " +
+          "this controller. Logical topics cannot be deleted via DeleteTopics; remove the " +
+          "declaration from the controller's broker config and restart, then any physical " +
+          "topic of the same name can be deleted via the normal path."),
+      new DeletableTopicResult().setName("innocent").
+        setErrorCode(UNKNOWN_TOPIC_OR_PARTITION.code()).
+        setErrorMessage("This server does not host this topic-partition."))
+    assertEquals(expectedResponse, controllerApis.deleteTopics(ANONYMOUS_CONTEXT, request,
+      ApiKeys.DELETE_TOPICS.latestVersion().toInt,
+      hasClusterAuth = true,
+      _ => Set.empty,
+      _ => Set.empty).get().asScala.toSet)
+  }
+
   @ParameterizedTest
   @ValueSource(booleans = Array(true, false))
   def testCreatePartitionsRequest(validateOnly: Boolean): Unit = {
