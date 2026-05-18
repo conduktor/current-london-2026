@@ -4097,6 +4097,558 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testFetchFromViewRewritesToBackingAndFiltersRecords(): Unit = {
+    // The heart of the view feature: a fetch addressed at a view topic must read from the
+    // backing topic, apply the predicate server-side, and return records under the view's
+    // identity (topic name and topic id). This test pins all three:
+    //   - replicaManager.fetchMessages receives the *backing* TopicIdPartition (rewrite happened),
+    //   - the response is keyed at the *view* TopicIdPartition (response remap happened),
+    //   - only records whose body matches the CEL predicate survive (filter happened),
+    //   - source offsets are preserved (sparse offset mode — required by PROMPT.md).
+    val viewTopic = "red-orders"
+    val backingTopic = "orders-raw"
+    val viewTopicId = Uuid.randomUuid()
+    val backingTopicId = Uuid.randomUuid()
+    val partition = 0
+
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, backingTopic)
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.color == 'red'")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+
+    addTopicToMetadataCache(viewTopic, numPartitions = 1, topicId = viewTopicId)
+    addTopicToMetadataCache(backingTopic, numPartitions = 1, topicId = backingTopicId)
+
+    val viewTpId = new TopicIdPartition(viewTopicId, new TopicPartition(viewTopic, partition))
+    val backingTpId = new TopicIdPartition(backingTopicId, new TopicPartition(backingTopic, partition))
+
+    // Records as they exist on the backing topic — three JSON values, only two match "red".
+    // The filter must keep the source offsets (100 and 102), proving sparse-offset semantics.
+    val backingRecords = MemoryRecords.withRecords(100L, Compression.NONE,
+      new SimpleRecord("{\"color\":\"red\"}".getBytes(StandardCharsets.UTF_8)),
+      new SimpleRecord("{\"color\":\"blue\"}".getBytes(StandardCharsets.UTF_8)),
+      new SimpleRecord("{\"color\":\"red\"}".getBytes(StandardCharsets.UTF_8)))
+
+    val fetchInfoCaptor: ArgumentCaptor[Seq[(TopicIdPartition, FetchRequest.PartitionData)]] =
+      ArgumentCaptor.forClass(classOf[Seq[(TopicIdPartition, FetchRequest.PartitionData)]])
+    when(replicaManager.fetchMessages(
+      any[FetchParams],
+      fetchInfoCaptor.capture(),
+      any[ReplicaQuota],
+      any[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]()
+    )).thenAnswer(invocation => {
+      val callback = invocation.getArgument(3).asInstanceOf[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]
+      // ReplicaManager keys the response at the backing — that's exactly the path we exercise:
+      // the handler must rewrite this back to the view in processResponseCallback.
+      callback(Seq(backingTpId -> new FetchPartitionData(Errors.NONE, 200L, 0L, backingRecords,
+        Optional.empty(), OptionalLong.empty(), Optional.empty(), OptionalInt.empty(), false)))
+    })
+
+    val fetchData = Map(viewTpId -> new FetchRequest.PartitionData(viewTopicId, 0, 0, 1000, Optional.empty())).asJava
+    val fetchDataBuilder = Map(viewTpId.topicPartition -> new FetchRequest.PartitionData(viewTopicId, 0, 0, 1000, Optional.empty())).asJava
+    val fetchMetadata = new JFetchMetadata(0, 0)
+    val fetchContext = new FullFetchContext(time, new FetchSessionCacheShard(1000, 100),
+      fetchMetadata, fetchData, true, false)
+    when(fetchManager.newContext(any[Short], any[JFetchMetadata], any[Boolean],
+      any[util.Map[TopicIdPartition, FetchRequest.PartitionData]],
+      any[util.List[TopicIdPartition]],
+      any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val fetchRequest = new FetchRequest.Builder(ApiKeys.FETCH.latestVersion, ApiKeys.FETCH.latestVersion,
+      -1, -1, 100, 0, fetchDataBuilder).build()
+    val request = buildRequest(fetchRequest)
+    kafkaApis = createKafkaApis(configRepository = configRepository)
+    kafkaApis.handleFetchRequest(request)
+
+    // The rewrite must have replaced the view TopicIdPartition with the backing one before
+    // reaching the storage layer — otherwise we'd be asking ReplicaManager to read from a
+    // non-existent log at the view's name.
+    val captured = fetchInfoCaptor.getValue
+    assertEquals(1, captured.size, "exactly one partition reaches fetchMessages")
+    assertEquals(backingTpId, captured.head._1,
+      "the partition handed to ReplicaManager must be keyed at the backing topic, not the view")
+
+    val response = verifyNoThrottling[FetchResponse](request)
+    val responseData = response.responseData(metadataCache.topicIdsToNames(), ApiKeys.FETCH.latestVersion)
+    val viewTp = viewTpId.topicPartition
+    assertTrue(responseData.containsKey(viewTp),
+      "response must surface under the view topic name the consumer asked for")
+    val partitionData = responseData.get(viewTp)
+    assertEquals(Errors.NONE.code, partitionData.errorCode)
+
+    val outputOffsets = scala.collection.mutable.ListBuffer[Long]()
+    FetchResponse.recordsOrFail(partitionData).records.forEach { rec =>
+      outputOffsets += rec.offset
+    }
+    assertEquals(List(100L, 102L), outputOffsets.toList,
+      "only records matching the predicate survive, and they keep their source offsets")
+  }
+
+  @Test
+  def testFetchFromRegularTopicIsNotRewritten(): Unit = {
+    // Counter-test: a topic with no view configs must pass through completely unchanged. Guards
+    // against the redirect over-matching and silently consulting configRepository for everything.
+    val topic = "plain"
+    val topicId = Uuid.randomUuid()
+    val tidp = new TopicIdPartition(topicId, new TopicPartition(topic, 0))
+    addTopicToMetadataCache(topic, numPartitions = 1, topicId = topicId)
+
+    val fetchInfoCaptor: ArgumentCaptor[Seq[(TopicIdPartition, FetchRequest.PartitionData)]] =
+      ArgumentCaptor.forClass(classOf[Seq[(TopicIdPartition, FetchRequest.PartitionData)]])
+    when(replicaManager.fetchMessages(
+      any[FetchParams],
+      fetchInfoCaptor.capture(),
+      any[ReplicaQuota],
+      any[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]()
+    )).thenAnswer(invocation => {
+      val callback = invocation.getArgument(3).asInstanceOf[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]
+      val records = MemoryRecords.withRecords(0L, Compression.NONE,
+        new SimpleRecord("untouched".getBytes(StandardCharsets.UTF_8)))
+      callback(Seq(tidp -> new FetchPartitionData(Errors.NONE, 1L, 0L, records,
+        Optional.empty(), OptionalLong.empty(), Optional.empty(), OptionalInt.empty(), false)))
+    })
+
+    val fetchData = Map(tidp -> new FetchRequest.PartitionData(topicId, 0, 0, 1000, Optional.empty())).asJava
+    val fetchDataBuilder = Map(tidp.topicPartition -> new FetchRequest.PartitionData(topicId, 0, 0, 1000, Optional.empty())).asJava
+    val fetchMetadata = new JFetchMetadata(0, 0)
+    val fetchContext = new FullFetchContext(time, new FetchSessionCacheShard(1000, 100),
+      fetchMetadata, fetchData, true, false)
+    when(fetchManager.newContext(any[Short], any[JFetchMetadata], any[Boolean],
+      any[util.Map[TopicIdPartition, FetchRequest.PartitionData]],
+      any[util.List[TopicIdPartition]],
+      any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val fetchRequest = new FetchRequest.Builder(ApiKeys.FETCH.latestVersion, ApiKeys.FETCH.latestVersion,
+      -1, -1, 100, 0, fetchDataBuilder).build()
+    val request = buildRequest(fetchRequest)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleFetchRequest(request)
+
+    assertEquals(tidp, fetchInfoCaptor.getValue.head._1,
+      "regular topic must be passed through to fetchMessages without rewrite")
+
+    val response = verifyNoThrottling[FetchResponse](request)
+    val responseData = response.responseData(metadataCache.topicIdsToNames(), ApiKeys.FETCH.latestVersion)
+    val record = FetchResponse.recordsOrFail(responseData.get(tidp.topicPartition)).records.iterator.next
+    val payload = new Array[Byte](record.value.remaining)
+    record.value.duplicate.get(payload)
+    assertEquals("untouched", new String(payload, StandardCharsets.UTF_8),
+      "records on a regular topic must not be touched by the view filter")
+  }
+
+  @Test
+  def testFetchFromViewWithMissingBackingTopicReturnsUnknownTopicOrPartition(): Unit = {
+    // A view can point at a backing topic that this broker doesn't know about (typo in config,
+    // or the backing topic was deleted out from under the view). We must:
+    //   - surface UNKNOWN_TOPIC_OR_PARTITION, not a NullPointerException from getTopicId,
+    //   - key the error at the VIEW so the consumer never learns the backing topic name,
+    //   - never reach replicaManager.fetchMessages — there is nothing to fetch.
+    val viewTopic = "orphan-view"
+    val viewTopicId = Uuid.randomUuid()
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, "missing-backing")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.x == 1")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+
+    addTopicToMetadataCache(viewTopic, numPartitions = 1, topicId = viewTopicId)
+    // Deliberately DO NOT add the backing topic.
+
+    val viewTpId = new TopicIdPartition(viewTopicId, new TopicPartition(viewTopic, 0))
+
+    val fetchData = Map(viewTpId -> new FetchRequest.PartitionData(viewTopicId, 0, 0, 1000, Optional.empty())).asJava
+    val fetchDataBuilder = Map(viewTpId.topicPartition -> new FetchRequest.PartitionData(viewTopicId, 0, 0, 1000, Optional.empty())).asJava
+    val fetchMetadata = new JFetchMetadata(0, 0)
+    val fetchContext = new FullFetchContext(time, new FetchSessionCacheShard(1000, 100),
+      fetchMetadata, fetchData, true, false)
+    when(fetchManager.newContext(any[Short], any[JFetchMetadata], any[Boolean],
+      any[util.Map[TopicIdPartition, FetchRequest.PartitionData]],
+      any[util.List[TopicIdPartition]],
+      any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val fetchRequest = new FetchRequest.Builder(ApiKeys.FETCH.latestVersion, ApiKeys.FETCH.latestVersion,
+      -1, -1, 100, 0, fetchDataBuilder).build()
+    val request = buildRequest(fetchRequest)
+    kafkaApis = createKafkaApis(configRepository = configRepository)
+    kafkaApis.handleFetchRequest(request)
+
+    // Nothing reached the storage layer — there was nothing to read.
+    verify(replicaManager, never()).fetchMessages(any[FetchParams],
+      any[Seq[(TopicIdPartition, FetchRequest.PartitionData)]],
+      any[ReplicaQuota],
+      any[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]())
+
+    val response = verifyNoThrottling[FetchResponse](request)
+    val responseData = response.responseData(metadataCache.topicIdsToNames(), ApiKeys.FETCH.latestVersion)
+    val partitionData = responseData.get(viewTpId.topicPartition)
+    assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION.code, partitionData.errorCode,
+      "missing backing topic must surface as UNKNOWN_TOPIC_OR_PARTITION at the view")
+  }
+
+  @Test
+  def testFetchFromViewWithAllRecordsFilteredEmitsHeaderOnlyBatch(): Unit = {
+    // PROMPT.md acceptance criterion: "When all records in a fetched batch fail the predicate:
+    // emit a header-only v2 batch (zero records, source offset range) so the consumer advances
+    // instead of looping." We verify the criterion survives the full fetch path — not just the
+    // ViewFilter unit — because the handler is what the consumer actually talks to.
+    val viewTopic = "all-filtered-view"
+    val backingTopic = "raw"
+    val viewTopicId = Uuid.randomUuid()
+    val backingTopicId = Uuid.randomUuid()
+
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, backingTopic)
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.color == 'red'")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+
+    addTopicToMetadataCache(viewTopic, numPartitions = 1, topicId = viewTopicId)
+    addTopicToMetadataCache(backingTopic, numPartitions = 1, topicId = backingTopicId)
+
+    val viewTpId = new TopicIdPartition(viewTopicId, new TopicPartition(viewTopic, 0))
+    val backingTpId = new TopicIdPartition(backingTopicId, new TopicPartition(backingTopic, 0))
+
+    // None of these match the predicate. The handler must still advance the consumer past
+    // offset 502, otherwise the consumer would refetch [500..502] forever.
+    val backingRecords = MemoryRecords.withRecords(500L, Compression.NONE,
+      new SimpleRecord("{\"color\":\"blue\"}".getBytes(StandardCharsets.UTF_8)),
+      new SimpleRecord("{\"color\":\"green\"}".getBytes(StandardCharsets.UTF_8)),
+      new SimpleRecord("{\"color\":\"yellow\"}".getBytes(StandardCharsets.UTF_8)))
+
+    when(replicaManager.fetchMessages(
+      any[FetchParams],
+      any[Seq[(TopicIdPartition, FetchRequest.PartitionData)]],
+      any[ReplicaQuota],
+      any[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]()
+    )).thenAnswer(invocation => {
+      val callback = invocation.getArgument(3).asInstanceOf[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]
+      callback(Seq(backingTpId -> new FetchPartitionData(Errors.NONE, 600L, 0L, backingRecords,
+        Optional.empty(), OptionalLong.empty(), Optional.empty(), OptionalInt.empty(), false)))
+    })
+
+    val fetchData = Map(viewTpId -> new FetchRequest.PartitionData(viewTopicId, 0, 0, 1000, Optional.empty())).asJava
+    val fetchDataBuilder = Map(viewTpId.topicPartition -> new FetchRequest.PartitionData(viewTopicId, 0, 0, 1000, Optional.empty())).asJava
+    val fetchMetadata = new JFetchMetadata(0, 0)
+    val fetchContext = new FullFetchContext(time, new FetchSessionCacheShard(1000, 100),
+      fetchMetadata, fetchData, true, false)
+    when(fetchManager.newContext(any[Short], any[JFetchMetadata], any[Boolean],
+      any[util.Map[TopicIdPartition, FetchRequest.PartitionData]],
+      any[util.List[TopicIdPartition]],
+      any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val fetchRequest = new FetchRequest.Builder(ApiKeys.FETCH.latestVersion, ApiKeys.FETCH.latestVersion,
+      -1, -1, 100, 0, fetchDataBuilder).build()
+    val request = buildRequest(fetchRequest)
+    kafkaApis = createKafkaApis(configRepository = configRepository)
+    kafkaApis.handleFetchRequest(request)
+
+    val response = verifyNoThrottling[FetchResponse](request)
+    val responseData = response.responseData(metadataCache.topicIdsToNames(), ApiKeys.FETCH.latestVersion)
+    val partitionData = responseData.get(viewTpId.topicPartition)
+    assertEquals(Errors.NONE.code, partitionData.errorCode)
+
+    val outputBatches = FetchResponse.recordsOrFail(partitionData).batches.iterator
+    assertTrue(outputBatches.hasNext, "header-only batch must be present so consumer can advance past 502")
+    val batch = outputBatches.next
+    assertEquals(500L, batch.baseOffset, "source baseOffset preserved")
+    assertEquals(502L, batch.lastOffset, "source lastOffset preserved — consumer can advance past 502")
+    val recordIter = FetchResponse.recordsOrFail(partitionData).records.iterator
+    assertEquals(false, recordIter.hasNext, "no records — but the batch header carried the offsets")
+  }
+
+  @Test
+  def testFollowerFetchOnViewTopicIsNotRewritten(): Unit = {
+    // Views are a consumer-side concept; follower replication mirrors the physical (backing)
+    // topic. A follower asking for a view topic must NOT trigger view redirect, because:
+    //   - the follower expects to replicate the storage state of whatever it asked for,
+    //   - the view has no physical log of its own (the rewrite would be a category error).
+    // In practice no follower should be configured to mirror a view in the first place, but if
+    // it happens we hand the request to ReplicaManager unchanged and let it surface whatever
+    // error it would normally return for a no-log topic.
+    val viewTopic = "follower-view"
+    val viewTopicId = Uuid.randomUuid()
+    val backingTopicId = Uuid.randomUuid()
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, "backing")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.x == 1")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+
+    addTopicToMetadataCache(viewTopic, numPartitions = 1, topicId = viewTopicId)
+    addTopicToMetadataCache("backing", numPartitions = 1, topicId = backingTopicId)
+
+    val viewTpId = new TopicIdPartition(viewTopicId, new TopicPartition(viewTopic, 0))
+
+    val fetchInfoCaptor: ArgumentCaptor[Seq[(TopicIdPartition, FetchRequest.PartitionData)]] =
+      ArgumentCaptor.forClass(classOf[Seq[(TopicIdPartition, FetchRequest.PartitionData)]])
+    when(replicaManager.fetchMessages(
+      any[FetchParams],
+      fetchInfoCaptor.capture(),
+      any[ReplicaQuota],
+      any[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]()
+    )).thenAnswer(invocation => {
+      val callback = invocation.getArgument(3).asInstanceOf[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]
+      callback(Seq(viewTpId -> new FetchPartitionData(Errors.NONE, 0L, 0L, MemoryRecords.EMPTY,
+        Optional.empty(), OptionalLong.empty(), Optional.empty(), OptionalInt.empty(), false)))
+    })
+
+    val fetchData = Map(viewTpId -> new FetchRequest.PartitionData(viewTopicId, 0, 0, 1000, Optional.empty())).asJava
+    val fetchDataBuilder = Map(viewTpId.topicPartition -> new FetchRequest.PartitionData(viewTopicId, 0, 0, 1000, Optional.empty())).asJava
+    val fetchMetadata = new JFetchMetadata(0, 0)
+    val fetchContext = new FullFetchContext(time, new FetchSessionCacheShard(1000, 100),
+      fetchMetadata, fetchData, true, true)  // isFromFollower = true
+    when(fetchManager.newContext(any[Short], any[JFetchMetadata], any[Boolean],
+      any[util.Map[TopicIdPartition, FetchRequest.PartitionData]],
+      any[util.List[TopicIdPartition]],
+      any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    // replicaId = 1 makes this a follower fetch (-1 means consumer). A follower must pass the
+    // ClusterAction authorization check; mock it as ALLOWED so the request reaches the redirect
+    // block we are exercising.
+    val authorizer: Authorizer = mock(classOf[Authorizer])
+    when(authorizer.authorize(any[RequestContext], any[java.util.List[Action]]))
+      .thenAnswer(invocation => {
+        val actions = invocation.getArgument[java.util.List[Action]](1)
+        val results = new java.util.ArrayList[AuthorizationResult](actions.size)
+        actions.forEach(_ => results.add(AuthorizationResult.ALLOWED))
+        results
+      })
+
+    val fetchRequest = new FetchRequest.Builder(ApiKeys.FETCH.latestVersion, ApiKeys.FETCH.latestVersion,
+      1, 1, 100, 0, fetchDataBuilder).metadata(fetchMetadata).build()
+    val request = buildRequest(fetchRequest)
+    kafkaApis = createKafkaApis(authorizer = Some(authorizer), configRepository = configRepository)
+    kafkaApis.handleFetchRequest(request)
+
+    assertEquals(viewTpId, fetchInfoCaptor.getValue.head._1,
+      "follower fetch on a view must NOT be rewritten — the follower asked for the view's storage state")
+  }
+
+  @Test
+  def testFetchMixesViewAndRegularPartitionsInSameRequest(): Unit = {
+    // A consumer can ask for a view and a regular topic in the same fetch. The two paths must
+    // not interfere: the view must rewrite + filter, the regular partition must pass through
+    // unchanged.
+    val viewTopic = "v"
+    val backingTopic = "b"
+    val regularTopic = "r"
+    val viewTopicId = Uuid.randomUuid()
+    val backingTopicId = Uuid.randomUuid()
+    val regularTopicId = Uuid.randomUuid()
+
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, backingTopic)
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.keep == true")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+
+    addTopicToMetadataCache(viewTopic, numPartitions = 1, topicId = viewTopicId)
+    addTopicToMetadataCache(backingTopic, numPartitions = 1, topicId = backingTopicId)
+    addTopicToMetadataCache(regularTopic, numPartitions = 1, topicId = regularTopicId)
+
+    val viewTpId = new TopicIdPartition(viewTopicId, new TopicPartition(viewTopic, 0))
+    val backingTpId = new TopicIdPartition(backingTopicId, new TopicPartition(backingTopic, 0))
+    val regularTpId = new TopicIdPartition(regularTopicId, new TopicPartition(regularTopic, 0))
+
+    val backingRecords = MemoryRecords.withRecords(10L, Compression.NONE,
+      new SimpleRecord("{\"keep\":true}".getBytes(StandardCharsets.UTF_8)),
+      new SimpleRecord("{\"keep\":false}".getBytes(StandardCharsets.UTF_8)))
+    val regularRecords = MemoryRecords.withRecords(0L, Compression.NONE,
+      new SimpleRecord("regular-payload".getBytes(StandardCharsets.UTF_8)))
+
+    val fetchInfoCaptor: ArgumentCaptor[Seq[(TopicIdPartition, FetchRequest.PartitionData)]] =
+      ArgumentCaptor.forClass(classOf[Seq[(TopicIdPartition, FetchRequest.PartitionData)]])
+    when(replicaManager.fetchMessages(
+      any[FetchParams],
+      fetchInfoCaptor.capture(),
+      any[ReplicaQuota],
+      any[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]()
+    )).thenAnswer(invocation => {
+      val callback = invocation.getArgument(3).asInstanceOf[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]
+      callback(Seq(
+        backingTpId -> new FetchPartitionData(Errors.NONE, 12L, 0L, backingRecords,
+          Optional.empty(), OptionalLong.empty(), Optional.empty(), OptionalInt.empty(), false),
+        regularTpId -> new FetchPartitionData(Errors.NONE, 1L, 0L, regularRecords,
+          Optional.empty(), OptionalLong.empty(), Optional.empty(), OptionalInt.empty(), false)))
+    })
+
+    val fetchData = new util.LinkedHashMap[TopicIdPartition, FetchRequest.PartitionData]()
+    fetchData.put(viewTpId, new FetchRequest.PartitionData(viewTopicId, 0, 0, 1000, Optional.empty()))
+    fetchData.put(regularTpId, new FetchRequest.PartitionData(regularTopicId, 0, 0, 1000, Optional.empty()))
+    val fetchDataBuilder = new util.LinkedHashMap[TopicPartition, FetchRequest.PartitionData]()
+    fetchDataBuilder.put(viewTpId.topicPartition, new FetchRequest.PartitionData(viewTopicId, 0, 0, 1000, Optional.empty()))
+    fetchDataBuilder.put(regularTpId.topicPartition, new FetchRequest.PartitionData(regularTopicId, 0, 0, 1000, Optional.empty()))
+    val fetchMetadata = new JFetchMetadata(0, 0)
+    val fetchContext = new FullFetchContext(time, new FetchSessionCacheShard(1000, 100),
+      fetchMetadata, fetchData, true, false)
+    when(fetchManager.newContext(any[Short], any[JFetchMetadata], any[Boolean],
+      any[util.Map[TopicIdPartition, FetchRequest.PartitionData]],
+      any[util.List[TopicIdPartition]],
+      any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val fetchRequest = new FetchRequest.Builder(ApiKeys.FETCH.latestVersion, ApiKeys.FETCH.latestVersion,
+      -1, -1, 100, 0, fetchDataBuilder).build()
+    val request = buildRequest(fetchRequest)
+    kafkaApis = createKafkaApis(configRepository = configRepository)
+    kafkaApis.handleFetchRequest(request)
+
+    val captured = fetchInfoCaptor.getValue.map(_._1).toSet
+    assertTrue(captured.contains(backingTpId),
+      "view partition must be rewritten to its backing in the fetchMessages call")
+    assertTrue(captured.contains(regularTpId),
+      "regular partition must be passed through unchanged in the same call")
+    assertEquals(false, captured.contains(viewTpId),
+      "view TopicIdPartition must NOT appear in the fetchMessages call — it was rewritten")
+
+    val response = verifyNoThrottling[FetchResponse](request)
+    val responseData = response.responseData(metadataCache.topicIdsToNames(), ApiKeys.FETCH.latestVersion)
+
+    val viewOutputOffsets = scala.collection.mutable.ListBuffer[Long]()
+    FetchResponse.recordsOrFail(responseData.get(viewTpId.topicPartition)).records.forEach { rec =>
+      viewOutputOffsets += rec.offset
+    }
+    assertEquals(List(10L), viewOutputOffsets.toList,
+      "view side keeps only records that pass the predicate, at their source offsets")
+
+    val regularRecord = FetchResponse.recordsOrFail(responseData.get(regularTpId.topicPartition)).records.iterator.next
+    val payload = new Array[Byte](regularRecord.value.remaining)
+    regularRecord.value.duplicate.get(payload)
+    assertEquals("regular-payload", new String(payload, StandardCharsets.UTF_8),
+      "regular topic records pass through the handler untouched")
+  }
+
+  @Test
+  def testFetchFromViewWithUncompilablePredicateReturnsInvalidRequest(): Unit = {
+    // If a view config carrying a CEL predicate that the compiler rejects somehow slipped past
+    // LogConfig validation (which is supposed to prevent this), the fetch path must fail safely
+    // instead of crashing. Concretely: any exception thrown by viewRegistry.viewFor() must be
+    // caught, the partition marked erroneous with INVALID_REQUEST, and no fetch issued. This is
+    // the defensive backstop for the registry try/catch block in handleFetchRequest.
+    val viewTopic = "bad-predicate-view"
+    val viewTopicId = Uuid.randomUuid()
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, "raw")
+    // matches() is rejected by the sandbox at compile time — see PredicateCompilerTest.
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.s.matches('.*')")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+
+    addTopicToMetadataCache(viewTopic, numPartitions = 1, topicId = viewTopicId)
+
+    val viewTpId = new TopicIdPartition(viewTopicId, new TopicPartition(viewTopic, 0))
+
+    val fetchData = Map(viewTpId -> new FetchRequest.PartitionData(viewTopicId, 0, 0, 1000, Optional.empty())).asJava
+    val fetchDataBuilder = Map(viewTpId.topicPartition -> new FetchRequest.PartitionData(viewTopicId, 0, 0, 1000, Optional.empty())).asJava
+    val fetchMetadata = new JFetchMetadata(0, 0)
+    val fetchContext = new FullFetchContext(time, new FetchSessionCacheShard(1000, 100),
+      fetchMetadata, fetchData, true, false)
+    when(fetchManager.newContext(any[Short], any[JFetchMetadata], any[Boolean],
+      any[util.Map[TopicIdPartition, FetchRequest.PartitionData]],
+      any[util.List[TopicIdPartition]],
+      any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val fetchRequest = new FetchRequest.Builder(ApiKeys.FETCH.latestVersion, ApiKeys.FETCH.latestVersion,
+      -1, -1, 100, 0, fetchDataBuilder).build()
+    val request = buildRequest(fetchRequest)
+    kafkaApis = createKafkaApis(configRepository = configRepository)
+    kafkaApis.handleFetchRequest(request)
+
+    // The broken predicate must not reach the storage layer — there is nothing meaningful to do
+    // with it.
+    verify(replicaManager, never()).fetchMessages(any[FetchParams],
+      any[Seq[(TopicIdPartition, FetchRequest.PartitionData)]],
+      any[ReplicaQuota],
+      any[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]())
+
+    val response = verifyNoThrottling[FetchResponse](request)
+    val responseData = response.responseData(metadataCache.topicIdsToNames(), ApiKeys.FETCH.latestVersion)
+    val partitionData = responseData.get(viewTpId.topicPartition)
+    assertEquals(Errors.INVALID_REQUEST.code, partitionData.errorCode,
+      "an uncompilable view predicate must surface as INVALID_REQUEST, not crash the handler")
+  }
+
+  @Test
+  def testFetchFromViewWithNonMemoryRecordsFailsClosedToAvoidLeak(): Unit = {
+    // PROMPT.md: "all filtering broker-side". If the storage layer returns records in a form the
+    // filter cannot process in place (FileRecords from a zero-copy path, tier-storage payloads,
+    // future LazyDownConversionRecords), passing them through unfiltered would leak backing-topic
+    // records that the view's predicate is supposed to gate. The handler MUST fail closed —
+    // return KAFKA_STORAGE_ERROR keyed at the view and drop the records — rather than leak.
+    val viewTopic = "view-on-tiered"
+    val backingTopic = "backing-tiered"
+    val viewTopicId = Uuid.randomUuid()
+    val backingTopicId = Uuid.randomUuid()
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, backingTopic)
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.x == 1")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+
+    addTopicToMetadataCache(viewTopic, numPartitions = 1, topicId = viewTopicId)
+    addTopicToMetadataCache(backingTopic, numPartitions = 1, topicId = backingTopicId)
+
+    val viewTpId = new TopicIdPartition(viewTopicId, new TopicPartition(viewTopic, 0))
+    val backingTpId = new TopicIdPartition(backingTopicId, new TopicPartition(backingTopic, 0))
+
+    // Stand-in for "records the broker handed us but we can't filter in-place". We use a Mockito
+    // mock of the Records SAM-style interface so we don't have to construct a real FileRecords;
+    // the handler should never even introspect its contents because the type alone disqualifies
+    // it from filtering.
+    val nonMemoryRecords = mock(classOf[org.apache.kafka.common.record.Records])
+
+    when(replicaManager.fetchMessages(
+      any[FetchParams],
+      any[Seq[(TopicIdPartition, FetchRequest.PartitionData)]],
+      any[ReplicaQuota],
+      any[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]()
+    )).thenAnswer(invocation => {
+      val callback = invocation.getArgument(3).asInstanceOf[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]
+      callback(Seq(backingTpId -> new FetchPartitionData(Errors.NONE, 1L, 0L, nonMemoryRecords,
+        Optional.empty(), OptionalLong.empty(), Optional.empty(), OptionalInt.empty(), false)))
+    })
+
+    val fetchData = Map(viewTpId -> new FetchRequest.PartitionData(viewTopicId, 0, 0, 1000, Optional.empty())).asJava
+    val fetchDataBuilder = Map(viewTpId.topicPartition -> new FetchRequest.PartitionData(viewTopicId, 0, 0, 1000, Optional.empty())).asJava
+    val fetchMetadata = new JFetchMetadata(0, 0)
+    val fetchContext = new FullFetchContext(time, new FetchSessionCacheShard(1000, 100),
+      fetchMetadata, fetchData, true, false)
+    when(fetchManager.newContext(any[Short], any[JFetchMetadata], any[Boolean],
+      any[util.Map[TopicIdPartition, FetchRequest.PartitionData]],
+      any[util.List[TopicIdPartition]],
+      any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val fetchRequest = new FetchRequest.Builder(ApiKeys.FETCH.latestVersion, ApiKeys.FETCH.latestVersion,
+      -1, -1, 100, 0, fetchDataBuilder).build()
+    val request = buildRequest(fetchRequest)
+    kafkaApis = createKafkaApis(configRepository = configRepository)
+    kafkaApis.handleFetchRequest(request)
+
+    val response = verifyNoThrottling[FetchResponse](request)
+    val responseData = response.responseData(metadataCache.topicIdsToNames(), ApiKeys.FETCH.latestVersion)
+    val partitionData = responseData.get(viewTpId.topicPartition)
+    assertEquals(Errors.KAFKA_STORAGE_ERROR.code, partitionData.errorCode,
+      "unfilterable record type must fail closed — not pass through to the consumer")
+    assertEquals(MemoryRecords.EMPTY, FetchResponse.recordsOrFail(partitionData),
+      "no records may reach the consumer when the filter cannot run")
+  }
+
+  @Test
   def testHandleShareFetchRequestSuccessWithoutAcknowledgements(): Unit = {
     val topicName = "foo"
     val topicId = Uuid.randomUuid()

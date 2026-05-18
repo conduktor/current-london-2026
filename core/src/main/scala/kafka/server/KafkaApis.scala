@@ -66,7 +66,7 @@ import org.apache.kafka.server.share.context.ShareFetchContext
 import org.apache.kafka.server.share.{ErroneousAndValidPartitionData, SharePartitionKey}
 import org.apache.kafka.server.share.acknowledge.ShareAcknowledgementBatch
 import org.apache.kafka.server.storage.log.{FetchIsolation, FetchParams, FetchPartitionData}
-import org.apache.kafka.server.views.ViewRegistry
+import org.apache.kafka.server.views.{ViewFilter, ViewRegistry, ViewSpec}
 import org.apache.kafka.storage.internals.log.AppendOrigin
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats
 
@@ -110,6 +110,12 @@ class KafkaApis(val requestChannel: RequestChannel,
 
   type FetchResponseStats = Map[TopicPartition, RecordValidationStats]
   this.logIdent = "[KafkaApi-%d] ".format(brokerId)
+  // One registry per broker: caches compiled view predicates so the fetch hot path never re-parses
+  // CEL text. The config source closes over `configRepository`, which is the broker's live config
+  // snapshot. Misses are cached too — a fetch against a regular topic never re-queries config.
+  // package-private because the broker wiring layer (config change notifications) needs to call
+  // `invalidate(name)` on it; nothing outside the broker should hold a reference.
+  private[server] val viewRegistry: ViewRegistry = new ViewRegistry((name: String) => topicViewConfigsFor(name))
   val configHelper = new ConfigHelper(metadataCache, config, configRepository)
   val authHelper = new AuthHelper(authorizer)
   val requestHelper = new RequestHandlerHelper(requestChannel, quotas, time)
@@ -532,12 +538,19 @@ class KafkaApis(val requestChannel: RequestChannel,
   }
 
   // A topic is a view iff all three view configs are present and non-blank in its Properties.
-  // We deliberately go through TopicViewConfigs.fromMap (the same path used by the view runtime)
-  // so the all-or-none rule lives in exactly one place. Reading configRepository on each call is
-  // fine on the produce path — produce is the slow path and never compiles predicates.
-  private[server] def isViewTopic(topicName: String): Boolean = {
+  // We go through TopicViewConfigs.fromMap (the same path used by the view runtime) so the
+  // all-or-none rule lives in exactly one place. Produce-rejection deliberately uses this
+  // light-touch check instead of viewRegistry.viewFor — produce never needs the compiled
+  // predicate, and skipping compilation here keeps a malformed predicate from masking the
+  // read-only intent of the topic.
+  private[server] def isViewTopic(topicName: String): Boolean =
+    topicViewConfigsFor(topicName).isPresent
+
+  // The config source threaded into viewRegistry. Lives here (not in ViewRegistry) so that the
+  // Properties → Map conversion stays in Scala and the registry stays Properties-free.
+  private def topicViewConfigsFor(topicName: String): Optional[ViewRegistry.TopicViewConfigs] = {
     val props = configRepository.topicConfig(topicName)
-    if (props == null || props.isEmpty) return false
+    if (props == null || props.isEmpty) return Optional.empty[ViewRegistry.TopicViewConfigs]()
     val map = new util.HashMap[String, String]()
     val it = props.stringPropertyNames().iterator()
     while (it.hasNext) {
@@ -545,7 +558,7 @@ class KafkaApis(val requestChannel: RequestChannel,
       val v = props.getProperty(k)
       if (v != null) map.put(k, v)
     }
-    ViewRegistry.TopicViewConfigs.fromMap(map).isPresent
+    ViewRegistry.TopicViewConfigs.fromMap(map)
   }
 
   /**
@@ -610,6 +623,55 @@ class KafkaApis(val requestChannel: RequestChannel,
       }
     }
 
+    // View redirection: any partition whose topic is configured as a view gets rewritten to its
+    // backing topic for the actual fetch. The mapping is recorded here so the response callback
+    // can filter records and key the response back at the view. Follower fetches are skipped on
+    // purpose — views are a consumer-side concept; replicas mirror the physical (backing) topic.
+    val viewRewrites = mutable.Map[TopicIdPartition, (TopicIdPartition, ViewSpec)]()
+    if (!fetchRequest.isFromFollower && interesting.nonEmpty) {
+      val rewritten = new mutable.ArrayBuffer[(TopicIdPartition, FetchRequest.PartitionData)](interesting.size)
+      interesting.foreach { case (viewTpId, data) =>
+        // `routed` tracks whether we already placed viewTpId in either `rewritten` (as itself or
+        // its backing) or `erroneous`. Bookkeeping it locally keeps the outer loop O(n) — an
+        // earlier version scanned `erroneous` with `exists`, which made the whole block O(n²).
+        var routed = false
+        val maybeSpec = try {
+          viewRegistry.viewFor(viewTpId.topic)
+        } catch {
+          case e: Exception =>
+            // A malformed view config (predicate compile failure, self-loop) reaching this point
+            // means LogConfig validation was bypassed somehow. Fail the fetch cleanly instead of
+            // letting the exception escape. WARN (not ERROR) because broker liveness is fine —
+            // only this one view is broken, and operators get the same actionable signal.
+            warn(s"Failed to load view spec for topic ${viewTpId.topic}; rejecting fetch with INVALID_REQUEST", e)
+            erroneous += viewTpId -> FetchResponse.partitionResponse(viewTpId, Errors.INVALID_REQUEST)
+            routed = true
+            Optional.empty[ViewSpec]()
+        }
+        if (maybeSpec.isPresent) {
+          val spec = maybeSpec.get()
+          val backingName = spec.backingTopic()
+          val backingTp = new TopicPartition(backingName, viewTpId.partition)
+          if (!metadataCache.contains(backingTp)) {
+            // The view points at a non-existent (or non-existent-on-this-broker) backing topic.
+            // Surface that as UNKNOWN_TOPIC_OR_PARTITION keyed at the *view* so the consumer
+            // does not learn about the backing topic name.
+            erroneous += viewTpId -> FetchResponse.partitionResponse(viewTpId, Errors.UNKNOWN_TOPIC_OR_PARTITION)
+          } else {
+            val backingTpId = new TopicIdPartition(metadataCache.getTopicId(backingName), backingTp)
+            rewritten += backingTpId -> data
+            viewRewrites.put(backingTpId, (viewTpId, spec))
+          }
+          routed = true
+        }
+        if (!routed) {
+          rewritten += viewTpId -> data
+        }
+      }
+      interesting.clear()
+      interesting ++= rewritten
+    }
+
     def maybeDownConvertStorageError(error: Errors): Errors = {
       // If consumer sends FetchRequest V5 or earlier, the client library is not guaranteed to recognize the error code
       // for KafkaStorageException. In this case the client library will translate KafkaStorageException to
@@ -622,12 +684,67 @@ class KafkaApis(val requestChannel: RequestChannel,
       }
     }
 
+    // Rewrite a single (backingTpId, FetchPartitionData) into its view form: filter records via
+    // the view's predicate and re-key at the view's TopicIdPartition. Errors are passed through
+    // unfiltered (only the key changes) so the consumer sees the failure under the topic name it
+    // asked for, not the backing topic.
+    //
+    // PROMPT.md: "all filtering broker-side". If the storage layer hands us records in a form we
+    // cannot filter in place (FileRecords from zero-copy paths, tier-storage / remote-fetch
+    // payloads, future LazyDownConversionRecords), we MUST NOT pass them through — that would
+    // leak unfiltered backing-topic records to a consumer that only has READ on the view. We
+    // fail loudly with KAFKA_STORAGE_ERROR so the operator sees the misconfiguration; this is
+    // a defensive cap, not a feature gate. Once the storage layer materializes everything to
+    // MemoryRecords before the fetch callback (current production behavior on the local path),
+    // this branch is unreachable.
+    def applyViewFilter(backingTpId: TopicIdPartition,
+                        data: FetchPartitionData,
+                        viewTpId: TopicIdPartition,
+                        spec: ViewSpec): (TopicIdPartition, FetchPartitionData) = {
+      if (data.error != Errors.NONE) return (viewTpId, data)
+      data.records match {
+        case mr: MemoryRecords =>
+          val filteredRecords = ViewFilter.apply(spec.predicate(), mr, viewTpId.partition)
+          (viewTpId, new FetchPartitionData(
+            data.error,
+            data.highWatermark,
+            data.logStartOffset,
+            filteredRecords,
+            data.divergingEpoch,
+            data.lastStableOffset,
+            data.abortedTransactions,
+            data.preferredReadReplica,
+            data.isReassignmentFetch))
+        case _ =>
+          warn(s"View fetch for ${viewTpId.topic} received records of type ${data.records.getClass.getSimpleName} " +
+            s"which cannot be filtered in place; failing with KAFKA_STORAGE_ERROR to avoid leaking unfiltered records.")
+          (viewTpId, new FetchPartitionData(
+            Errors.KAFKA_STORAGE_ERROR,
+            data.highWatermark,
+            data.logStartOffset,
+            MemoryRecords.EMPTY,
+            data.divergingEpoch,
+            data.lastStableOffset,
+            data.abortedTransactions,
+            data.preferredReadReplica,
+            data.isReassignmentFetch))
+      }
+    }
+
     // the callback for process a fetch response, invoked before throttling
     def processResponseCallback(responsePartitionData: Seq[(TopicIdPartition, FetchPartitionData)]): Unit = {
+      val translated: Seq[(TopicIdPartition, FetchPartitionData)] =
+        if (viewRewrites.isEmpty) responsePartitionData
+        else responsePartitionData.map { case (backingTpId, data) =>
+          viewRewrites.get(backingTpId) match {
+            case Some((viewTpId, spec)) => applyViewFilter(backingTpId, data, viewTpId, spec)
+            case None => (backingTpId, data)
+          }
+        }
       val partitions = new util.LinkedHashMap[TopicIdPartition, FetchResponseData.PartitionData]
       val reassigningPartitions = mutable.Set[TopicIdPartition]()
       val nodeEndpoints = new mutable.HashMap[Int, Node]
-      responsePartitionData.foreach { case (tp, data) =>
+      translated.foreach { case (tp, data) =>
         val abortedTransactions = data.abortedTransactions.orElse(null)
         val lastStableOffset: Long = data.lastStableOffset.orElse(FetchResponse.INVALID_LAST_STABLE_OFFSET)
         if (data.isReassignmentFetch) reassigningPartitions.add(tp)
