@@ -2199,6 +2199,81 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testAddPartitionsToTxnRejectsBackingTopicWithInvalidTopicException(): Unit = {
+    // r19 ADV-A BLOCKER #140: backing topics carry interleaved records for multiple logical
+    // tenants. Enrolling a backing partition in a transaction means the eventual
+    // WriteTxnMarkers writes a COMMIT/ABORT control record onto the backing partition — per
+    // PROMPT.md a marker on the backing commits ACROSS every logical topic sharing that
+    // partition, corrupting every other tenant's transactional view. The handler must reject
+    // at the topic level with INVALID_TOPIC_EXCEPTION (non-retriable), mirroring the
+    // produce-side backing rejection at KafkaApis.scala:553.
+    val backingTopic = "backing-topic"
+    addTopicToMetadataCache(backingTopic, numPartitions = 1)
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+    // isLogicalTopic intentionally unstubbed (default false) — if the order regresses and
+    // the backing guard moves below the logical check, the never() verify on txnCoordinator
+    // would still catch it because the fall-through wouldn't add backing-tp to authorized.
+
+    val transactionalId = "txnId1"
+    val producerId = 15L
+    val epoch = 0.toShort
+    val tp = new TopicPartition(backingTopic, 0)
+
+    val addPartitionsToTxnRequest = AddPartitionsToTxnRequest.Builder.forClient(
+      transactionalId,
+      producerId,
+      epoch,
+      Collections.singletonList(tp)).build(3.toShort)
+    val request = buildRequest(addPartitionsToTxnRequest)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleAddPartitionsToTxnRequest(request, RequestLocal.noCaching)
+
+    val response = verifyNoThrottling[AddPartitionsToTxnResponse](request)
+    val error = response.errors().get(AddPartitionsToTxnResponse.V3_AND_BELOW_TXN_ID).get(tp)
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION, error,
+      "AddPartitionsToTxn on a backing topic must be rejected with INVALID_TOPIC_EXCEPTION")
+    // Transaction coordinator must NEVER see the backing partition.
+    verify(txnCoordinator, never()).handleAddPartitionsToTransaction(any(), any(), any(), any(), any(), any(), any())
+    verify(txnCoordinator, never()).handleVerifyPartitionsInTransaction(any(), any(), any(), any(), any())
+  }
+
+  @Test
+  def testAddPartitionsToTxnRejectsLogicalTopicAsNonTransactional(): Unit = {
+    // r19 ADV-A BLOCKER #140 (logical side): logical topics are non-transactional in v1 — a
+    // produce path already rejects transactional batches at KafkaApis.scala:621 with
+    // INVALID_TXN_STATE. Reject at the txn-coord entry point too: otherwise the txn
+    // coordinator records the logical-named partition as a participant, the producer
+    // believes its txn is enrolled, and the eventual commit is silently inconsistent (no
+    // logical-aware LSO tracking in v1).
+    val logicalTopic = "logical-topic"
+    addTopicToMetadataCache(logicalTopic, numPartitions = 1)
+    when(concentrationKernel.isBackingTopic(logicalTopic)).thenReturn(false)
+    when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
+
+    val transactionalId = "txnId1"
+    val producerId = 15L
+    val epoch = 0.toShort
+    val tp = new TopicPartition(logicalTopic, 0)
+
+    val addPartitionsToTxnRequest = AddPartitionsToTxnRequest.Builder.forClient(
+      transactionalId,
+      producerId,
+      epoch,
+      Collections.singletonList(tp)).build(3.toShort)
+    val request = buildRequest(addPartitionsToTxnRequest)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleAddPartitionsToTxnRequest(request, RequestLocal.noCaching)
+
+    val response = verifyNoThrottling[AddPartitionsToTxnResponse](request)
+    val error = response.errors().get(AddPartitionsToTxnResponse.V3_AND_BELOW_TXN_ID).get(tp)
+    assertEquals(Errors.INVALID_TXN_STATE, error,
+      "AddPartitionsToTxn on a logical topic must be rejected with INVALID_TXN_STATE " +
+        "(v1 declares logical topics non-transactional)")
+    verify(txnCoordinator, never()).handleAddPartitionsToTransaction(any(), any(), any(), any(), any(), any(), any())
+    verify(txnCoordinator, never()).handleVerifyPartitionsInTransaction(any(), any(), any(), any(), any())
+  }
+
+  @Test
   def shouldReplaceProducerFencedWithInvalidProducerEpochInEndTxnWithOlderClient(): Unit = {
     val topic = "topic"
     addTopicToMetadataCache(topic, numPartitions = 2)

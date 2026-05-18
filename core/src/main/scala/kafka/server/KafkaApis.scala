@@ -2860,6 +2860,26 @@ class KafkaApis(val requestChannel: RequestChannel,
         for (topicPartition <- partitionsToAdd) {
           if (!authorizedTopics.contains(topicPartition.topic))
             unauthorizedTopicErrors += topicPartition -> Errors.TOPIC_AUTHORIZATION_FAILED
+          else if (concentrationKernel.isBackingTopic(topicPartition.topic))
+            // r19 ADV-A BLOCKER #140: backing topics carry interleaved records for multiple
+            // logical tenants. Enrolling a backing partition in a transaction means the
+            // eventual WriteTxnMarkers writes a COMMIT/ABORT control record onto the
+            // backing partition — and per PROMPT.md a marker on the backing commits ACROSS
+            // every logical topic sharing that partition, corrupting every other tenant's
+            // transactional view. Pin this as INVALID_TOPIC_EXCEPTION so the producer sees
+            // a clear, non-retriable error at the topic level, mirroring the produce-side
+            // backing rejection.
+            nonExistingTopicErrors += topicPartition -> Errors.INVALID_TOPIC_EXCEPTION
+          else if (concentrationKernel.isLogicalTopic(topicPartition.topic))
+            // r19 ADV-A BLOCKER #140 (logical side): logical topics are non-transactional
+            // in v1 — the produce path already rejects transactional batches at
+            // KafkaApis.scala:621 with INVALID_TXN_STATE. We must reject at the txn-coord
+            // entry point too: otherwise the txn coordinator would record the logical-named
+            // partition as a participant, the producer would believe its txn is enrolled,
+            // and the eventual commit would be silently inconsistent (no logical-aware LSO
+            // tracking in v1). Same INVALID_TXN_STATE error code so a transactional producer
+            // gets a coherent end-to-end signal at every step of the protocol.
+            nonExistingTopicErrors += topicPartition -> Errors.INVALID_TXN_STATE
           else if (!metadataCache.contains(topicPartition))
             nonExistingTopicErrors += topicPartition -> Errors.UNKNOWN_TOPIC_OR_PARTITION
           else
