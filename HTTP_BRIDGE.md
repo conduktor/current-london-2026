@@ -39,27 +39,37 @@ server/src/test/java/org/apache/kafka/network/http/
 
 | Component | State | Notes |
 |---|---|---|
-| Value serializer (4-step chain) | **Done** | `ValueSerializer` + 20 tests |
-| HTTP status mapper | **Done** | `HttpStatusMapper`; `statusCarriesRetryAfter` now load-bearing |
-| Retry-After calculator | **Done** | `RetryAfterCalculator.forStatus(status, ms)` enforces spec policy in one place |
+| Value serializer (4-step chain) | **Done** | `ValueSerializer` |
+| HTTP status mapper | **Done** | `HttpStatusMapper`; `statusCarriesRetryAfter` consulted by the calculator, no dead code |
+| Retry-After calculator | **Done** | `RetryAfterCalculator.forStatus(status, ms)` enforces spec policy in one place (yes on 200 / 207 / 503 / 504; no on 400 / 403 / 404) |
 | Produce JSON parser | **Done** | `ProduceRequestParser` |
-| Produce response formatter (207) | **Done** | `ProduceResponseFormatter`; spec mixed scenario passes; Retry-After dropped on 4xx |
+| Produce response formatter (207) | **Done** | `ProduceResponseFormatter`; spec mixed scenario passes; consistent `{topic, results:[...]}` body for 200 / 207 / uniform-failure |
 | Fetch response formatter (HATEOAS) | **Done** | `FetchResponseFormatter`; self / first / previous / next / last; Retry-After dropped on 4xx |
-| Cursor codec | **Done** | `CursorCodec` (base64url `topic\|partition\|offset`) |
+| Content-type negotiation | **Done** | `ContentTypeNegotiator`; HAL+JSON when listed at any q-weight; SSE wins over JSON / HAL when present |
+| Cursor codec | **Done** | `CursorCodec` (base64url `topic\|partition\|offset`); cursors must match the URL topic |
 | Bridge orchestrator | **Done** | `KafkaHttpBridge` + `RequestSubmitter` |
-| Jetty servlet + server | **Done** | `KafkaHttpServlet` + `KafkaHttpServer` + integration test |
-| `BrokerServer` integration | **Scaffolded** | Config keys + lifecycle wiring; uses `NotImplementedRequestSubmitter` until the production submitter lands |
-| Production `RequestSubmitter` | **TODO** | Plug into `RequestChannel` via a per-request completion callback (see plan below) |
-| WebSocket (stretch) | Out of scope for v1 | |
-| SSE (stretch) | Out of scope for v1 | |
+| Jetty servlet + server | **Done** | `KafkaHttpServlet` + `KafkaHttpServer` |
+| Production `RequestSubmitter` | **Done** | `KafkaApiRequestSubmitter` routes HTTP through `RequestChannel` → `KafkaApis`; authorization, quotas, replication inherited from the binary path |
+| `BrokerServer` integration | **Done** | Wired behind `http.bridge.enabled` (default `false`); operator-facing WARN + runbook describe the ANONYMOUS threat model |
+| SSE live tail | **Done** | `SseStreamer` recursive long-poll; `id: <offset>` + `data:` per record; `event: error` on partition errors; real-broker test covers replay → live boundary |
+| End-to-end (real broker) | **Done** | `HttpBridgeEndToEndTest`: HTTP-produce → binary-consume round-trip, mixed-partition 207, ACL deny → 403 (with `errorCode=29`, no Retry-After), SSE replay→live |
+| Operator security guidance | **Done** | Startup WARN names "anonymous Kafka data-plane takeover"; `HTTP_BRIDGE.md` Security model section ships the three-guardrail runbook |
+| WebSocket (stretch) | **Deferred** | Explicit stretch per `PROMPT.md` line 4; not delivered |
+| Real-broker quota test (AC3) | **Deferred** | Quota → 200 + Retry-After is unit-tested in `ProduceResponseFormatterTest`; not yet exercised against a throttled broker over the real wire |
 
-192 tests pass on the HTTP bridge slice of the server module. Full broker still compiles.
+206 unit tests pass in the `server` HTTP bridge slice, plus four real-broker end-to-end tests in `core`. Full broker still compiles. Run them with:
+
+```sh
+JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 ./gradlew \
+  :server:test --tests 'org.apache.kafka.network.http.*' \
+  :core:test --tests 'integration.kafka.network.http.*'
+```
 
 ---
 
 ## What's already in place
 
-### Layer 1 — translation (15 source files, all under `server/src/main/java/org/apache/kafka/network/http/`)
+### Layer 1 — translation (all under `server/src/main/java/org/apache/kafka/network/http/`)
 
 - **`ValueSerializer`** — the four-shape value envelope (`NULL` / `JSON` / `STRING` / `BINARY`). `encode(bytes, contentType)` runs null → content-type → UTF-8 → base64; `decode(envelope)` is the inverse. Tested for content-type charset parameters, JSON that doesn't parse falling through, embedded null bytes forcing BINARY, control characters except `\t \n \r` forcing BINARY.
 - **`HttpStatusMapper`** — `Errors → int` with policy constants (`OK=200`, `MULTI_STATUS=207`, `BAD_REQUEST=400`, `FORBIDDEN=403`, `NOT_FOUND=404`, `INTERNAL_SERVER_ERROR=500`, `SERVICE_UNAVAILABLE=503`, `GATEWAY_TIMEOUT=504`). `statusCarriesRetryAfter(status)` returns true for 503/504 and is now consulted by `RetryAfterCalculator.forStatus` rather than being dead code.
@@ -89,40 +99,39 @@ server/src/test/java/org/apache/kafka/network/http/
   - `http.bridge.port` (Int, default 8082 — matches Confluent REST Proxy convention)
 - **`KafkaConfig.scala`** — exposes the three above as `httpBridgeEnabled` / `httpBridgeHost` / `httpBridgePort`.
 - **`BrokerServer.scala`** — `httpBridgeServer` field, started after the SocketServer acceptors are up, stopped before `socketServer.stopProcessingRequests()`. Gated on `config.httpBridgeEnabled`.
-- **`NotImplementedRequestSubmitter`** — placeholder that returns `Errors.REQUEST_TIMED_OUT` (→ 504) with a clear errorMessage. Lives only until the production submitter lands.
+- **`KafkaApiRequestSubmitter`** (Scala, `core/src/main/scala/kafka/network/http/`) — the production submitter. Builds a `RequestContext` with `KafkaPrincipal.ANONYMOUS`, serializes the request to a `ByteBuffer`, hands it to `RequestChannel.sendRequest` with a per-request completion callback, awaits the `AbstractResponse`, and projects it back into the formatter input shape. The mechanism is described in detail in "How the broker integration works" below.
 
 ---
 
-## What remains — the production `RequestSubmitter`
+## How the broker integration works
 
-The current submitter, `NotImplementedRequestSubmitter`, returns 504 for every request. The next commit must replace it with one that routes through the broker's existing request-handling path so authorization, quotas, and replication are inherited "for free", per PROMPT.md's central design requirement.
+The `RequestChannel` hook is the load-bearing piece of the bridge — it is what lets HTTP requests inherit the binary protocol's authorization, quota, and replication paths without a parallel implementation.
 
-After re-reading `RequestChannel.scala` end-to-end the cleanest hook is **smaller than the Processor-trait extraction first sketched here** — and it doesn't touch `SocketServer.scala` at all. The key observation is that `RequestChannel.sendResponse(req, abstractResponse, onComplete)` (line 392) is the single public entry point KafkaApis uses to publish a response. It currently does two things: wrap the AbstractResponse into a SendResponse, then dispatch to `processors.get(req.processor).enqueueResponse(...)`. If `RequestChannel.Request` carries a per-request completion callback, the dispatch step can be short-circuited for HTTP-bridge requests without disturbing the binary path.
+The mechanism, end-to-end:
 
-Concrete plan, smallest viable commit shape:
+1. **`RequestChannel.Request` carries an optional `requestCompletionCallback: Option[AbstractResponse => Unit]`.** The public `sendResponse(req, abstractResponse, _)` checks this first: when set, it invokes the callback with the `AbstractResponse` and returns. It does not call `buildResponseSend` (no serialization needed — the bridge owns the wire format), does not look up a Processor, does not enqueue a Response. Every binary-path caller leaves the field as `None`, so that flow is unchanged.
 
-1. **Add `requestCompletionCallback: Option[AbstractResponse => Unit]` on `RequestChannel.Request`.** Default `None`. When set, the public `sendResponse(req, abstractResponse, _)` invokes the callback with the `AbstractResponse` and returns — it does **not** call `buildResponseSend` (no need to serialize), does **not** look up a Processor, does **not** enqueue a Response. The binary path is unchanged because every existing caller leaves the field as `None`.
+2. **`KafkaApiRequestSubmitter`** (in `core/src/main/scala/kafka/network/http/`) builds a real `RequestHeader` + `RequestContext` with `KafkaPrincipal.ANONYMOUS` and the inter-broker listener name, serializes the `ProduceRequest` / `FetchRequest` to a `ByteBuffer` (the round-trip is necessary — `RequestContext.parseRequest` is what authorization, quota and metrics machinery downstream all consume), constructs a `RequestChannel.Request` with `processor = -1`, `memoryPool = MemoryPool.NONE`, and `requestCompletionCallback = Some(future::complete)`, then calls `requestChannel.sendRequest(...)` and awaits the future. The unwrap projects `ProduceResponse` / `FetchResponse` into `ProduceResponseFormatter.PartitionResult` / `FetchResponseFormatter.PartitionFetch`, including `throttleTimeMs`.
 
-2. **`KafkaApiRequestSubmitter`** (Scala or Java, lives in `core/src/main/scala/kafka/network/http/`):
-   - Builds a real `RequestHeader` + `RequestContext` with a configurable principal (default `KafkaPrincipal.ANONYMOUS`; the listener can later wire in an authenticator).
-   - Serializes the `ProduceRequest` / `FetchRequest` to a `ByteBuffer` exactly as `KafkaApisTest` does — round-tripping is wasteful but it's the contract `RequestContext.parseRequest` expects, and it's what guarantees the request looks identical to a wire-level one for authorization, quota and metrics purposes.
-   - Constructs a `RequestChannel.Request` with `processor = -1` (no processor — there is no socket to write back to), `memoryPool = MemoryPool.NONE`, the serialized buffer, and `requestCompletionCallback = Some(future::complete)`.
-   - Calls `requestChannel.sendRequest(request)` and awaits the future.
-   - Unwraps the `AbstractResponse` (a `ProduceResponse` or `FetchResponse`) into the `ProduceResponseFormatter.PartitionResult` / `FetchResponseFormatter.PartitionFetch` shapes the formatters expect, including the response's `throttleTimeMs`.
+3. **`BrokerServer.scala`** wires the submitter behind `config.httpBridgeEnabled` and starts the Jetty `KafkaHttpServer` after the SocketServer acceptors are up.
 
-3. **`BrokerServer.scala`** instantiates `KafkaApiRequestSubmitter` with the broker's `RequestChannel` and current principal-builder, then hands it to `KafkaHttpBridge` in place of the `NotImplementedRequestSubmitter`. The wiring is one line — everything else is already in place.
+What this buys, for free:
 
-4. **Authorization** flows for free because `KafkaApis.handleProduceRequest` calls `authHelper.filterByAuthorized(request.context, WRITE, TOPIC, ...)` — the `request.context` we built carries the principal we set, so an unauthorized topic produces a `TOPIC_AUTHORIZATION_FAILED` in the per-partition response, which `HttpStatusMapper` already maps to 403.
+- **Authorization** — `KafkaApis.handleProduceRequest` and `handleFetchRequest` both call `authHelper.filterByAuthorized(request.context, ...)`. The `request.context` carries the principal the submitter set (`ANONYMOUS` in v1); a denied topic produces a `TOPIC_AUTHORIZATION_FAILED` in the per-partition response, mapped to HTTP 403 by `HttpStatusMapper`. Demonstrated by `HttpBridgeEndToEndTest.aclDeniedTopicReturns403` against a real KRaft cluster with a custom `StandardAuthorizer` subclass.
+- **Quotas** — the broker writes `throttleTimeMs` into the response object; the submitter forwards it to the formatter, which renders `Retry-After` on the spec-allowed statuses (200 / 207 / 503 / 504) and drops it on 400 / 403 / 404 (`RetryAfterCalculator.forStatus`).
+- **Replication** — partitions go through the normal `ReplicaManager.appendRecords` path; min-ISR, acks=all, and replica fetch behaviour are inherited unchanged.
 
-5. **Quotas** flow for free because the broker writes `throttleTimeMs` into the response object, which the submitter exposes to `ProduceResponseFormatter` / `FetchResponseFormatter`. With the spec-correct `forStatus(status, throttleMs)` policy in place, the formatter emits `Retry-After` on 200 (quota-on-success), 207, 503, 504, and never on 4xx — matching PROMPT.md acceptance criteria exactly.
+### What is explicitly **not** in v1
 
-6. **Tests**: a unit test on `RequestChannel` itself that asserts the callback path short-circuits the Processor dispatch (with `processors` empty, the callback still completes). Then an end-to-end test that boots an embedded broker, enables the bridge, produces over HTTP, and asserts the record appears via the binary path on the consumer side — the only test that exercises every layer at once and the most valuable signal we have for production-readiness.
+- **Per-request authentication on the HTTP path.** Every request runs as `KafkaPrincipal.ANONYMOUS`. See the Security model section above — this is the project's largest production-readiness caveat and the operator-facing WARN + runbook are the v1 mitigation.
+- **WebSocket subscribe with credit-based flow control** (`PROMPT.md` line 4 stretch).
+- **Real-broker quota test for AC3.** Quota → 200 + `Retry-After` is unit-tested in `ProduceResponseFormatterTest` (`positiveThrottleSetsRetryAfterOn200`, `throttleOn403IsSuppressed`, etc.). The real-broker counterpart would require provisioning a quota at startup, producing enough bytes to trip it, and asserting the `Retry-After` header on the HTTP response. Feasible but not currently exercised.
 
-Out of scope for v1: WebSocket subscribe with credit-based flow control, SSE live tail with `?from=earliest`. PROMPT.md lists both as stretch.
+### Production-readiness summary
 
-### Production-readiness as of this commit
+The pure layer (`server/src/main/java/org/apache/kafka/network/http/`) is exhaustively unit-tested — 206 tests covering content-type negotiation, cursor encoding/decoding, request parsing edge cases, response formatting policy, Retry-After policy, error envelope shape, and SSE framing. The broker integration is covered by four real-broker end-to-end tests in `core/src/test/scala/integration/kafka/network/http/HttpBridgeEndToEndTest.scala` that boot a KRaft cluster via `KafkaClusterTestKit`, enable the bridge, and verify produce/fetch round-trips, mixed-partition 207, ACL-denied 403, and SSE replay-then-live continuity.
 
-The code below the broker integration line is production quality: pure functions, deterministic, exhaustively tested (192 tests in the HTTP slice alone), spec-aligned including the now-fixed Retry-After-on-4xx divergence. The placeholder submitter is intentionally loud — every request returns 504 with a "not yet implemented" envelope so nobody can mistake the listener-is-bound signal for a working bridge. Until step 3 above lands, `http.bridge.enabled=true` should remain off in any real cluster.
+`http.bridge.enabled=true` is safe to set in any cluster where the operator has followed the Security model section above — bound interface, fronting auth proxy, scoped ACLs. The startup WARN repeats the requirement in operator logs.
 
 ---
 
@@ -146,19 +155,28 @@ Per-request authentication (a real principal derived from a client cert, JWT, or
 
 ## How to run what exists
 
+Unit suite (fast, runs in seconds):
+
 ```sh
 JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 ./gradlew :server:test \
   --tests 'org.apache.kafka.network.http.*'
 ```
 
+Real-broker end-to-end suite (boots a KRaft cluster per test):
+
+```sh
+JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 ./gradlew :core:test \
+  --tests 'integration.kafka.network.http.*'
+```
+
 Build with JDK 21 — JDK 27 is too new for the project's Gradle 8.10.2 (class file 71 not yet supported by Groovy).
 
-To start a broker with the bridge enabled (once the production submitter lands), set in `server.properties`:
+To start a broker with the bridge enabled, set in `server.properties`:
 
 ```
 http.bridge.enabled=true
-http.bridge.host=0.0.0.0
+http.bridge.host=127.0.0.1
 http.bridge.port=8082
 ```
 
-Until then, `http.bridge.enabled=true` will start the listener but every request returns 504 with a clear "not yet implemented" message — a deliberately-loud failure mode so nobody mistakes the placeholder for working code.
+Then read the Security model section above before exposing the listener to any network you do not control. The default in the example is `127.0.0.1`, not `0.0.0.0`, because the default a reader copies must not be the dangerous one.
