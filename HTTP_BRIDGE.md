@@ -126,6 +126,24 @@ The code below the broker integration line is production quality: pure functions
 
 ---
 
+## Security model — read this before enabling in any real cluster
+
+The bridge has **no per-request authentication in v1.** Every inbound HTTP request is presented to the broker's authorizer as `KafkaPrincipal.ANONYMOUS`. This is a deliberate scope decision (see `PROMPT.md`: "HTTP requests are translated to existing Kafka request objects and submitted to the existing `RequestChannel`. No new authz or quota path."), not an oversight — but it has direct operational consequences that must be addressed before the listener is exposed.
+
+**The attack to model.** Any host that can reach `http.bridge.host:http.bridge.port` can act as `User:ANONYMOUS`. If `ANONYMOUS` can read a topic, the caller can exfiltrate it; if `ANONYMOUS` can write a topic, the caller can poison it — through normal broker plumbing, with no exploit required. Codex named this "anonymous Kafka data-plane takeover" and we adopted the term in the operator-facing WARN at startup.
+
+**The three guardrails operators must apply** (all three — any one alone is insufficient):
+
+1. **Bind to a specific trusted interface.** Set `http.bridge.host` to loopback (`127.0.0.1`) or a specific address on an access-controlled private network. Never `0.0.0.0` on a host with a public NIC. The bridge's host config is a Jetty bind address, not a CIDR or ACL — Jetty will accept any TCP connection that lands on that interface, so the network itself must be locked down separately (security group, iptables, namespace).
+2. **Force traffic through an authenticating front-end.** A reverse proxy that terminates TLS and enforces an auth scheme (mTLS, OAuth bearer, basic-with-LDAP, etc.) before forwarding to the bridge port. The network must make it impossible to reach the bridge directly — security-group / iptables / namespace-level enforcement, not just convention.
+3. **Scope ACLs for `User:ANONYMOUS`.** Run `kafka-acls --add --allow-principal User:ANONYMOUS --operation Read --operation Write --topic <name>` for exactly the topics the bridge is meant to expose, with each operation passed as its own `--operation` flag (the CLI does not accept `Read|Write`). A default-allow authorizer, no authorizer at all, or `allow.everyone.if.no.acl.found=true` on an otherwise-empty ACL set, all leave topics open to the bridge. The end-to-end ACL deny test (`HttpBridgeEndToEndTest.aclDeniedTopicReturns403`) demonstrates the enforcement path: a denied topic produces HTTP 403 with a per-partition `errorCode=29` (`TOPIC_AUTHORIZATION_FAILED`) and no `Retry-After`.
+
+The startup WARN at `BrokerServer.scala:642` repeats the headline so it cannot be missed in operator logs. If you find yourself silencing the WARN before doing the three steps above, you are configuring the bridge wrong.
+
+Per-request authentication (a real principal derived from a client cert, JWT, or SASL handshake on the HTTP path) is a follow-up item, explicitly out of scope for v1.
+
+---
+
 ## How to run what exists
 
 ```sh

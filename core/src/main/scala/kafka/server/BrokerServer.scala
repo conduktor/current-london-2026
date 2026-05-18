@@ -621,11 +621,25 @@ class BrokerServer(
       // KafkaRequestHandler threads.
       //
       // WARNING — security posture: v1 attributes every HTTP request to KafkaPrincipal.ANONYMOUS. The broker's
-      // configured authorizer evaluates ACLs against this principal exactly as it would for a binary connection that
-      // didn't complete SASL. There is no per-request authentication: callers are not distinguished by identity.
-      // Operators MUST front the bridge with a TLS terminator + auth proxy, restrict the listen interface
-      // (http.bridge.host) to a trusted network, AND either deny ANONYMOUS in the authorizer or accept that every
-      // HTTP client gets ANONYMOUS's grants. Per-request authentication is a follow-up item, not a v1 deliverable.
+      // configured authorizer evaluates ACLs against this principal exactly as it would for an unauthenticated
+      // PLAINTEXT connection, or an SSL connection without client authentication. There is no per-request
+      // authentication: callers are not distinguished by identity.
+      //
+      // Threat model: any host that can reach http.bridge.host:http.bridge.port can act as User:ANONYMOUS — read
+      // from and write to every topic that principal can access. Without scoped ACLs and a trusted network boundary,
+      // this is an "anonymous Kafka data-plane takeover" path: data exfiltration + event poisoning over normal
+      // broker plumbing, no exploit required.
+      //
+      // Operators MUST do all three:
+      //   1. Bind http.bridge.host to a specific trusted interface (loopback, or an address on an access-controlled
+      //      private network) — never 0.0.0.0 on a host with a public NIC. The host config is a Jetty bind address,
+      //      not a CIDR; the network must be locked down separately.
+      //   2. Front the bridge with an authenticating reverse proxy or mTLS ingress that the network forces all
+      //      traffic through.
+      //   3. Author ACLs that grant User:ANONYMOUS exactly the topic operations the bridge is meant to expose, and
+      //      nothing else. A default-allow authorizer (or no authorizer at all) leaves every topic open.
+      //
+      // Per-request authentication is a follow-up item, not a v1 deliverable.
       if (config.httpBridgeEnabled) {
         val submitter = new KafkaApiRequestSubmitter(
           requestChannel = socketServer.dataPlaneRequestChannel,
@@ -639,9 +653,11 @@ class BrokerServer(
           config.httpBridgeHost, config.httpBridgePort, bridge, submitter, new ObjectMapper())
         httpBridgeServer.start()
         info(s"HTTP bridge listening on ${config.httpBridgeHost}:${httpBridgeServer.boundPort()}")
-        warn("HTTP bridge is running every request as KafkaPrincipal.ANONYMOUS. There is no per-request " +
-          "authentication in v1. Front it with a TLS terminator + auth proxy, restrict http.bridge.host " +
-          "to a trusted interface, and review authorizer ACLs for ANONYMOUS before exposing this listener.")
+        warn("HTTP bridge: every request runs as KafkaPrincipal.ANONYMOUS (no per-request authentication in v1). " +
+          "Any host that can reach this listener can act on every topic that ANONYMOUS is authorized for. " +
+          "Before exposing it: (1) bind http.bridge.host to a trusted interface, (2) front it with an " +
+          "authenticating reverse proxy or mTLS ingress, (3) scope ACLs so User:ANONYMOUS has only the topic " +
+          "operations this bridge is intended to expose. See HTTP_BRIDGE.md \"Security model\".")
       }
 
       maybeChangeStatus(STARTING, STARTED)
