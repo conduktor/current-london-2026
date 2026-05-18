@@ -303,8 +303,9 @@ public final class ApiMessageActivation {
      * patterns cover the canonical set defined by
      * {@code org.apache.kafka.common.config.SslConfigs} /
      * {@code SaslConfigs} (the {@code ConfigDef.Type.PASSWORD} fields in those
-     * classes) plus a defensive catch-all for operator-defined sensitive
-     * names that follow Kafka's naming convention.
+     * classes) plus listener-prefixed variants of those keys and a defensive
+     * catch-all for operator-defined sensitive names that follow Kafka's
+     * naming convention.
      *
      * <p>Matching is case-insensitive against the full config key. The
      * patterns are:
@@ -312,13 +313,20 @@ public final class ApiMessageActivation {
      *   <li>ends with {@code .password} — covers
      *       {@code ssl.key.password}, {@code ssl.keystore.password},
      *       {@code ssl.truststore.password} (the three SSL password configs
-     *       defined in {@code SslConfigs}) plus any operator-defined
-     *       {@code *.password} entries.</li>
-     *   <li>equals {@code sasl.jaas.config} — the SASL login module configuration
+     *       defined in {@code SslConfigs}), the listener-prefixed forms such
+     *       as {@code listener.name.internal.ssl.keystore.password}, plus any
+     *       operator-defined {@code *.password} entries.</li>
+     *   <li>equals {@code sasl.jaas.config} OR ends with
+     *       {@code .sasl.jaas.config} — the SASL login module configuration
      *       carries the SASL principal's password as part of its module
-     *       options string.</li>
+     *       options string. Kafka permits per-listener-and-mechanism overrides
+     *       like {@code listener.name.internal.scram-sha-256.sasl.jaas.config}
+     *       (defined in {@code ListenerName} / {@code BrokerSecurityConfigs});
+     *       the prefixed form holds the same secret material and must be
+     *       redacted with the same care. Codex round-2 audit finding.</li>
      *   <li>contains {@code .keystore.key} — PEM-form private key material
-     *       (eg. {@code ssl.keystore.key}, the PEM variant of the keystore).</li>
+     *       (eg. {@code ssl.keystore.key}, the PEM variant of the keystore,
+     *       and its listener-prefixed counterparts).</li>
      *   <li>contains {@code secret} — defensive catch-all for any operator
      *       config whose name advertises that it carries a shared secret.</li>
      * </ul>
@@ -333,6 +341,7 @@ public final class ApiMessageActivation {
         String lc = name.toLowerCase(Locale.ROOT);
         return lc.endsWith(".password")
             || lc.equals("sasl.jaas.config")
+            || lc.endsWith(".sasl.jaas.config")
             || lc.contains(".keystore.key")
             || lc.contains("secret");
     }

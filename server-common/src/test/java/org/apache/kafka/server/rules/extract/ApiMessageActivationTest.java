@@ -672,6 +672,58 @@ public class ApiMessageActivationTest {
     }
 
     @Test
+    public void listenerPrefixedSaslJaasConfigIsAlsoRedacted() {
+        // Codex round-2 audit finding: Kafka permits per-listener-and-mechanism
+        // overrides such as `listener.name.internal.scram-sha-256.sasl.jaas.config`
+        // (see ListenerName / BrokerSecurityConfigs); the prefixed form holds the
+        // exact same SASL principal password as the bare `sasl.jaas.config` key
+        // and MUST be redacted with the same care. A naive `equals("sasl.jaas.config")`
+        // match misses these and leaks credentials. The fix is `endsWith(".sasl.jaas.config")`.
+        AlterableConfigCollection configs = new AlterableConfigCollection();
+        configs.add(new AlterableConfig()
+            .setName("listener.name.internal.scram-sha-256.sasl.jaas.config")
+            .setValue("org.apache.kafka.common.security.scram.ScramLoginModule required username=\"broker\" password=\"hunter2\";"));
+        AlterConfigsResource resource = new AlterConfigsResource()
+            .setResourceType((byte) 2)
+            .setResourceName("audit-events")
+            .setConfigs(configs);
+        AlterConfigsResourceCollection resources = new AlterConfigsResourceCollection();
+        resources.add(resource);
+        AlterConfigsRequestData req = new AlterConfigsRequestData().setResources(resources);
+
+        Map<String, Object> m = ApiMessageActivation.from(req);
+        Map<?, ?> cfg = (Map<?, ?>) ((List<?>) ((Map<?, ?>) ((List<?>) m.get("resources")).get(0)).get("configs")).get(0);
+        assertEquals("listener.name.internal.scram-sha-256.sasl.jaas.config", cfg.get("name"));
+        assertNull(cfg.get("value"),
+            "listener-prefixed sasl.jaas.config carries the SASL principal password and must redact");
+    }
+
+    @Test
+    public void listenerPrefixedKeystorePasswordIsAlsoRedacted() {
+        // Listener-prefixed *.password configs (eg
+        // `listener.name.external.ssl.keystore.password`) are real Kafka
+        // credential keys. The existing `.password` suffix match already
+        // catches them — this test pins that behaviour so a future
+        // narrowing of the pattern cannot regress silently.
+        AlterableConfigCollection configs = new AlterableConfigCollection();
+        configs.add(new AlterableConfig()
+            .setName("listener.name.external.ssl.keystore.password")
+            .setValue("trust-me-bro"));
+        AlterConfigsResource resource = new AlterConfigsResource()
+            .setResourceType((byte) 2)
+            .setResourceName("audit-events")
+            .setConfigs(configs);
+        AlterConfigsResourceCollection resources = new AlterConfigsResourceCollection();
+        resources.add(resource);
+        AlterConfigsRequestData req = new AlterConfigsRequestData().setResources(resources);
+
+        Map<String, Object> m = ApiMessageActivation.from(req);
+        Map<?, ?> cfg = (Map<?, ?>) ((List<?>) ((Map<?, ?>) ((List<?>) m.get("resources")).get(0)).get("configs")).get(0);
+        assertNull(cfg.get("value"),
+            "listener-prefixed keystore.password must redact via the .password suffix match");
+    }
+
+    @Test
     public void sensitiveValueRedactionIsCaseInsensitive() {
         // The pattern matches lowercased input. A protocol that arrived with
         // unusual casing (`SSL.Keystore.Password`) MUST still trigger
