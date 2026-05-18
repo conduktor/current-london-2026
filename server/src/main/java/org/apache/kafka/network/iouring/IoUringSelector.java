@@ -182,6 +182,28 @@ public final class IoUringSelector implements BrokerSelector {
      * path calls {@code connectionQuotas.dec} on a connection that was never {@code inc}'d.
      */
     private final Set<String> justAccepted = new HashSet<>();
+    /**
+     * Channel ids that produced a {@link NetworkReceive} in this poll. The
+     * "one completed receive per channel per poll" invariant — documented in the class
+     * javadoc and enforced by NIO's {@code Selector.addToCompletedReceives} via an
+     * {@code IllegalStateException} on duplicate inserts — needs to hold across the
+     * step-2 read pass <em>and</em> the step-3 disconnect drain. If both fire for the
+     * same channel id (peer FIN arrives mid-poll, with another pipelined frame still
+     * buffered), the request channel would otherwise see two requests for one
+     * connection and the KafkaChannel mute-after-receive contract breaks.
+     */
+    private final Set<String> receivesThisPoll = new HashSet<>();
+    /**
+     * Channels for which {@link #send(NetworkSend)} could not deliver because the peer
+     * had already disconnected (id is in {@link #closingChannels}) or {@link
+     * KafkaChannel#setSend} threw. Drained at the start of the next poll into
+     * {@link #disconnected} with {@link ChannelState#FAILED_SEND}, mirroring NIO's
+     * {@code Selector.failedSends} pipeline so the Processor sees a normal disconnect
+     * notification rather than an {@code IllegalStateException} that would otherwise
+     * propagate up through {@code Processor.processChannelException} and double-dec the
+     * connection quota.
+     */
+    private final List<String> failedSends = new ArrayList<>();
 
     private final AtomicLong idGen = new AtomicLong();
     private volatile boolean closed;
@@ -294,9 +316,13 @@ public final class IoUringSelector implements BrokerSelector {
         // Evict the previous poll's closing channels. The Processor has had its chance to
         // resolve any final completedReceives via closingChannel(id); now we can release
         // the KafkaChannel for real. This mirrors NIO's KSelector.closingChannels lifecycle.
+        // While evicting, drop any failedSends entry for the same id: the disconnect for
+        // those ids was already surfaced in the previous poll, so a duplicate FAILED_SEND
+        // notification this poll would tell processDisconnected to dec the quota twice.
         if (!closingChannels.isEmpty()) {
-            for (KafkaChannel c : closingChannels.values()) {
-                Utils.closeQuietly(c, "closing channel after Processor drained");
+            for (Map.Entry<String, KafkaChannel> entry : closingChannels.entrySet()) {
+                Utils.closeQuietly(entry.getValue(), "closing channel after Processor drained");
+                failedSends.remove(entry.getKey());
             }
             closingChannels.clear();
         }
@@ -307,6 +333,15 @@ public final class IoUringSelector implements BrokerSelector {
         disconnected.clear();
         connected.clear();
         justAccepted.clear();
+        receivesThisPoll.clear();
+
+        // Any failedSends not absorbed by the closingChannels eviction above are NEW
+        // failures (e.g. setSend threw on a healthy channel) — surface them as the
+        // disconnect notification the Processor expects.
+        for (String id : failedSends) {
+            disconnected.put(id, ChannelState.FAILED_SEND);
+        }
+        failedSends.clear();
 
         // Capture once, BEFORE I/O, so a channel that progresses this poll never expires this poll.
         long nowNanos = time.nanoseconds();
@@ -350,6 +385,7 @@ public final class IoUringSelector implements BrokerSelector {
                     NetworkReceive completed = channel.maybeCompleteReceive();
                     if (completed != null) {
                         completedReceives.add(completed);
+                        receivesThisPoll.add(channel.id());
                         madeProgress = true;
                     }
                 } catch (IOException e) {
@@ -388,32 +424,7 @@ public final class IoUringSelector implements BrokerSelector {
         //    closingChannels so this poll's completedReceives still resolve via
         //    closingChannel(id) on the Processor side; we close the channel for real at the
         //    start of the next poll.
-        String disconnectId;
-        while ((disconnectId = pendingDisconnects.poll()) != null) {
-            KafkaChannel channel = channels.remove(disconnectId);
-            nettyChannels.remove(disconnectId);
-            lastActiveNanos.remove(disconnectId);
-            mutedChannelIds.remove(disconnectId);
-            if (channel == null) continue;
-            try {
-                while (channel.ready()) {
-                    long read = channel.read();
-                    NetworkReceive completed = channel.maybeCompleteReceive();
-                    if (completed != null) {
-                        completedReceives.add(completed);
-                        madeProgress = true;
-                        // KSelector emits at most one completedReceive per channel per poll —
-                        // matching that invariant keeps Processor.processCompletedReceives
-                        // accounting (per-IP throttling, request-channel queue) consistent.
-                        break;
-                    }
-                    if (read <= 0) break;
-                }
-            } catch (IOException e) {
-                log.debug("Final read on disconnecting channel {} failed", disconnectId, e);
-            }
-            closingChannels.put(disconnectId, channel);
-            disconnected.put(disconnectId, ChannelState.LOCAL_CLOSE);
+        if (drainPendingDisconnects()) {
             madeProgress = true;
         }
 
@@ -447,6 +458,68 @@ public final class IoUringSelector implements BrokerSelector {
         }
     }
 
+    /**
+     * Step 3 of {@link #poll(long)}: drain {@link #pendingDisconnects}, surface each id
+     * in {@link #disconnected}, and stash the channel in {@link #closingChannels} so the
+     * Processor can still resolve any final completedReceives via
+     * {@code closingChannel(id)} before the next poll evicts it.
+     *
+     * <p>Two invariants are enforced here:
+     * <ul>
+     *   <li><b>same-poll accept+disconnect:</b> a channel in {@link #justAccepted} that
+     *       FINs before the Processor has run {@code applyConnectionQuotasForNewlyAcceptedChannels}
+     *       is dropped silently (no {@code disconnected} entry, removed from
+     *       {@code connected}). Surfacing it would let {@code processDisconnected} call
+     *       {@code connectionQuotas.dec} on a counter that was never {@code inc}'d.
+     *   <li><b>one completedReceive per channel per poll:</b> the final-read drain is
+     *       skipped if step 2 already produced a receive for this id. Remaining buffered
+     *       bytes stay readable through {@code closingChannel(id)} for one more poll —
+     *       same as NIO's {@code Selector.clear()}.
+     * </ul>
+     *
+     * @return {@code true} if any channel transitioned to disconnected (or any silent
+     *         drop happened), so the caller can mark progress and skip the wait at the
+     *         end of {@link #poll(long)}.
+     */
+    private boolean drainPendingDisconnects() {
+        boolean madeProgress = false;
+        String disconnectId;
+        while ((disconnectId = pendingDisconnects.poll()) != null) {
+            KafkaChannel channel = channels.remove(disconnectId);
+            nettyChannels.remove(disconnectId);
+            lastActiveNanos.remove(disconnectId);
+            mutedChannelIds.remove(disconnectId);
+            if (channel == null) continue;
+            if (justAccepted.contains(disconnectId)) {
+                connected.remove(disconnectId);
+                Utils.closeQuietly(channel, "same-poll accept+disconnect, quota never inc'd");
+                madeProgress = true;
+                continue;
+            }
+            if (!receivesThisPoll.contains(disconnectId)) {
+                try {
+                    while (channel.ready()) {
+                        long read = channel.read();
+                        NetworkReceive completed = channel.maybeCompleteReceive();
+                        if (completed != null) {
+                            completedReceives.add(completed);
+                            receivesThisPoll.add(disconnectId);
+                            madeProgress = true;
+                            break;
+                        }
+                        if (read <= 0) break;
+                    }
+                } catch (IOException e) {
+                    log.debug("Final read on disconnecting channel {} failed", disconnectId, e);
+                }
+            }
+            closingChannels.put(disconnectId, channel);
+            disconnected.put(disconnectId, ChannelState.LOCAL_CLOSE);
+            madeProgress = true;
+        }
+        return madeProgress;
+    }
+
     private void acquireWithTimeout(long timeoutMs) {
         try {
             if (wakeup.tryAcquire(timeoutMs, TimeUnit.MILLISECONDS)) {
@@ -474,11 +547,47 @@ public final class IoUringSelector implements BrokerSelector {
 
     @Override
     public void send(NetworkSend send) {
-        KafkaChannel channel = channels.get(send.destinationId());
+        String destinationId = send.destinationId();
+        KafkaChannel channel = channels.get(destinationId);
         if (channel == null) {
-            throw new IllegalStateException("Attempt to send on unknown channel " + send.destinationId());
+            if (closingChannels.containsKey(destinationId)) {
+                // Peer FIN'd between the poll that produced this response and now. NIO
+                // (clients/.../Selector.java:391-413) routes this to failedSends rather
+                // than throwing: the original disconnect notification already fired in
+                // the previous poll, so on the next poll the closingChannels eviction
+                // will drop this id from failedSends and the duplicate is suppressed.
+                // Throwing here would propagate up through Processor.processChannelException
+                // → Processor.close → connectionQuotas.dec on a connection that was
+                // already dec'd by processDisconnected, walking the per-IP counter
+                // negative on every disconnect-races-response.
+                failedSends.add(destinationId);
+                return;
+            }
+            throw new IllegalStateException("Attempt to send on unknown channel " + destinationId);
         }
-        channel.setSend(send);
+        try {
+            channel.setSend(send);
+        } catch (Exception e) {
+            // setSend throws if a send is already in progress — a Processor invariant
+            // violation rather than a network failure, but mirror NIO's behavior:
+            // surface as FAILED_SEND via the standard disconnected pipeline, close the
+            // channel, and re-throw so the bug is not silently swallowed. We are on the
+            // Processor thread between polls, so dropping the channel here is safe —
+            // there is no concurrent step-2 iterator to invalidate. We do NOT add to
+            // `disconnected` directly: the failedSends drain at the top of the next
+            // poll is the single source of truth for this notification, and the
+            // channel is no longer in channels/closingChannels so Processor's
+            // openOrClosingChannel(id) returns None and processChannelException's
+            // close(id) branch is skipped — no double dec.
+            log.error("Unexpected exception during setSend, closing connection {} and rethrowing", destinationId, e);
+            nettyChannels.remove(destinationId);
+            mutedChannelIds.remove(destinationId);
+            lastActiveNanos.remove(destinationId);
+            channels.remove(destinationId);
+            failedSends.add(destinationId);
+            Utils.closeQuietly(channel, "channel after setSend exception");
+            throw e;
+        }
     }
 
     @Override
@@ -655,6 +764,23 @@ public final class IoUringSelector implements BrokerSelector {
         mutedChannelIds.remove(id);
         if (channel != null) {
             Utils.closeQuietly(channel, "channel close(" + id + ")");
+            return;
+        }
+        // Mirror NIO's Selector.close(id) (clients/.../Selector.java:886-899): if the
+        // channel is not in the active map, look in closingChannels and clean it up
+        // there. Without this, closeExcessConnections (called from the Acceptor under
+        // broker-max pressure) can repeatedly select the same closing channel via
+        // lowestPriorityChannel() — closingChannels stays populated until the NEXT
+        // poll's eviction, and within the same poll there is no other way to drain it.
+        // Equally important: the quota for closing channels was already `dec`'d when
+        // they surfaced in `disconnected`. If close(id) re-routed through any path that
+        // re-applies `dec`, the counter would underflow on every excess-eviction race.
+        // Keeping the cleanup local to the selector and silent to the outside (no
+        // entry in `disconnected`) preserves that one-dec-per-channel invariant.
+        KafkaChannel closing = closingChannels.remove(id);
+        if (closing != null) {
+            failedSends.remove(id);
+            Utils.closeQuietly(closing, "closing channel close(" + id + ")");
         }
     }
 }

@@ -264,9 +264,17 @@ final class IoUringTransportLayer implements TransportLayer {
         boolean handedOff = false;
         try {
             buf.writeBytes(src);
-            pendingWriteBytes.addAndGet(remaining);
-            nettyChannel.writeAndFlush(buf).addListener(f -> pendingWriteBytes.addAndGet(-remaining));
+            // Install the dec listener BEFORE incrementing pendingWriteBytes. If the
+            // listener registration itself throws synchronously (DefaultPromise can
+            // throw when the executor is shut down), inc'ing first would strand the
+            // counter positive — hasPendingWrites() then permanently reports true and
+            // KafkaChannel.maybeCompleteSend never advances. The ByteBuf itself is
+            // released by writeAndFlush's promise on either path (success or failure),
+            // so the only leak we have to defend against here is the counter.
+            io.netty.channel.ChannelFuture future = nettyChannel.writeAndFlush(buf);
             handedOff = true;
+            future.addListener(f -> pendingWriteBytes.addAndGet(-remaining));
+            pendingWriteBytes.addAndGet(remaining);
         } finally {
             if (!handedOff) {
                 buf.release();

@@ -423,6 +423,138 @@ class IoUringSelectorTest {
     }
 
     @Test
+    void closeByIdAlsoCleansClosingChannels() throws Exception {
+        // Codex audit blocker: NIO's Selector.close(id) cleans both `channels` and
+        // `closingChannels` (clients/.../Selector.java:886-899). Without that fallthrough,
+        // closeExcessConnections under broker-max pressure would repeatedly select the
+        // same closing channel via lowestPriorityChannel() — the closingChannels map
+        // would not drain until the next poll's eviction, letting the same id be
+        // double-selected within the same Acceptor decision.
+        IoUringSelector s = newSelector(IDLE_NANOS_NEVER);
+        EmbeddedChannel netty = acceptNew(s, REMOTE_A);
+        s.poll(0);
+        String id = s.connected().get(0);
+
+        // Buffer a frame so the disconnect path routes through closingChannels (mirrors
+        // NIO's "keep around for one more poll to flush pending receives" semantics).
+        s.onRead(netty, framed("final-frame"));
+        s.onDisconnect(netty);
+        s.poll(0);
+        assertNull(s.channel(id));
+        assertNotNull(s.closingChannel(id),
+            "preconditions: channel must be in closingChannels for this test to mean anything");
+
+        // close(id) must drain the closing entry.
+        s.close(id);
+        assertNull(s.closingChannel(id),
+            "close(id) must remove the entry from closingChannels — otherwise lowestPriorityChannel " +
+            "would keep selecting it for eviction until the next poll");
+    }
+
+    @Test
+    void samePollAcceptAndDisconnectDoesNotSurfaceDisconnectOrQuotaUnderflow() throws Exception {
+        // Codex audit blocker: if a peer FINs in the same poll window as the accept,
+        // pendingDisconnects fires for an id that SocketServer's
+        // applyConnectionQuotasForNewlyAcceptedChannels has not yet tryInc'd. With
+        // selector.channel(id) returning null (channel already removed), tryInc is
+        // skipped — no inc happens. If we then surfaced this id in disconnected,
+        // processDisconnected would run connectionQuotas.dec on a counter that was
+        // never inc'd, walking it negative on every accept-races-FIN. The selector
+        // must drop the channel silently (close + remove from connected, NOT add to
+        // disconnected) so SocketServer never sees this transient connection.
+        IoUringSelector s = newSelector(IDLE_NANOS_NEVER);
+        EmbeddedChannel netty = acceptNew(s, REMOTE_A);
+        s.onDisconnect(netty);
+
+        s.poll(0);
+
+        assertTrue(s.connected().isEmpty(),
+            "same-poll accept+disconnect: must NOT surface in connected() — quota would never " +
+            "be inc'd anyway because channel(id) is already null when SocketServer looks");
+        assertTrue(s.disconnected().isEmpty(),
+            "same-poll accept+disconnect: must NOT surface in disconnected() — otherwise " +
+            "processDisconnected runs dec() on a never-inc'd counter");
+        assertNull(s.channel(netty.id() == null ? "irrelevant" : "irrelevant"),
+            "the channel id is internal but the channels map must be empty");
+        assertTrue(s.channels().isEmpty(),
+            "channels map must be empty — full resource cleanup happened during the silent drop");
+    }
+
+    @Test
+    void sendOnClosingChannelRoutesToFailedSendsNotThrow() throws Exception {
+        // Mirror NIO Selector.send (clients/.../Selector.java:391-413): when send arrives
+        // for a channel that has just disconnected, the send is recorded as a failedSend
+        // and surfaces as FAILED_SEND on the next poll — it must NOT throw, because
+        // Processor.sendResponse synchronously calls selector.send for any response in
+        // flight and an exception here would propagate up to Processor.processChannelException
+        // → Processor.close, double-dec'ing a quota that was already dec'd when the
+        // original disconnect surfaced.
+        IoUringSelector s = newSelector(IDLE_NANOS_NEVER);
+        EmbeddedChannel netty = acceptNew(s, REMOTE_A);
+        s.poll(0);
+        String id = s.connected().get(0);
+
+        // Buffer bytes so the disconnect routes through closingChannels (matches NIO:
+        // empty-disconnect goes straight to disconnected; partial-receive goes through
+        // closingChannels so the final receive can be flushed).
+        s.onRead(netty, framed("late-request"));
+        s.onDisconnect(netty);
+        s.poll(0);
+        assertNotNull(s.closingChannel(id), "preconditions: must be in closingChannels");
+        // The Processor consumed the initial disconnect notification — clear our own view.
+        // (In the real code, processDisconnected has already run by now and dec'd the quota.)
+
+        // Send for the closing channel MUST NOT throw.
+        ByteBuffer body = ByteBuffer.wrap("late-response".getBytes());
+        s.send(new NetworkSend(id, ByteBufferSend.sizePrefixed(body)));
+
+        // Next poll: surfaces as FAILED_SEND in disconnected.
+        s.poll(0);
+        // Note: the closingChannel was evicted at top of this poll, so the FAILED_SEND
+        // suppresses through that path. There must NOT be a duplicate disconnect for id.
+        assertFalse(s.disconnected().containsKey(id),
+            "the closing channel's original LOCAL_CLOSE already fired; the eviction-time " +
+            "failedSends.remove must suppress the duplicate FAILED_SEND notification — otherwise " +
+            "processDisconnected runs dec() twice for the same connection");
+    }
+
+    @Test
+    void sendOnUnknownChannelStillThrows() throws Exception {
+        // Defensive: send() must only route to failedSends if the id is in closingChannels.
+        // Sending to a never-known id still indicates a Processor bug worth surfacing loud.
+        IoUringSelector s = newSelector(IDLE_NANOS_NEVER);
+        s.poll(0);
+
+        ByteBuffer body = ByteBuffer.wrap("ack".getBytes());
+        assertThrows(IllegalStateException.class,
+            () -> s.send(new NetworkSend("never-existed", ByteBufferSend.sizePrefixed(body))));
+    }
+
+    @Test
+    void atMostOneCompletedReceivePerChannelAcrossStep2AndStep3InSamePoll() throws Exception {
+        // Regression for the cross-step variant of "one receive per channel per poll":
+        // step 2 (read pass on healthy channels) and step 3 (final-read drain on
+        // disconnecting channels) must agree on the cap. If a peer pipelines two frames
+        // and FINs between them mid-poll, step 2 delivers frame 1, then step 3 must NOT
+        // also deliver frame 2 — otherwise the Processor sees two requests for one
+        // connection in a single iteration, breaking the mute-after-receive contract.
+        // The next poll surfaces the remaining frame via closingChannel(id).
+        IoUringSelector s = newSelector(IDLE_NANOS_NEVER);
+        EmbeddedChannel netty = acceptNew(s, REMOTE_A);
+        s.poll(0); // accept settles; channel is no longer justAccepted
+
+        // Two frames buffered + disconnect — all surfaced together in the next poll.
+        s.onRead(netty, framed("first"));
+        s.onRead(netty, framed("second"));
+        s.onDisconnect(netty);
+        s.poll(0);
+
+        assertEquals(1, s.completedReceives().size(),
+            "cross-step cap: step 2 delivers exactly one receive; step 3 must skip the final " +
+            "drain when step 2 already produced a receive for this channel");
+    }
+
+    @Test
     void registerThrowsForIoUringListener() {
         // io_uring listener accepts directly via SO_REUSEPORT; the Acceptor path that hands
         // a SocketChannel to register() is not used. Throwing makes the wiring mismatch loud.
