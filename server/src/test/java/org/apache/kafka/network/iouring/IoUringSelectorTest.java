@@ -17,6 +17,7 @@
 package org.apache.kafka.network.iouring;
 
 import org.apache.kafka.common.memory.MemoryPool;
+import org.apache.kafka.common.memory.SimpleMemoryPool;
 import org.apache.kafka.common.network.ByteBufferSend;
 import org.apache.kafka.common.network.ChannelState;
 import org.apache.kafka.common.network.KafkaChannel;
@@ -878,5 +879,97 @@ class IoUringSelectorTest {
         EmbeddedChannel freshAfterDrain = acceptNew(s, new InetSocketAddress("198.51.100.9", 41000));
         assertTrue(freshAfterDrain.isOpen(),
             "after draining the queue, the counter must reset so new accepts are admitted");
+    }
+
+    @Test
+    void selfMutedChannelUnmutesOnceMemoryPoolRecovers() throws Exception {
+        // Regression for v6 BLOCKER 5: KafkaChannel.read() self-mutes when
+        // memoryPool.tryAllocate returns null (clients/.../KafkaChannel.java:414-417). NIO
+        // Selector.poll() lines 457-466 walks every non-explicitly-muted channel and calls
+        // maybeUnmute() once memoryPool.isOutOfMemory() reports false. Without that
+        // recovery, channels stay MUTED until idle expiry (~10 min default) — under
+        // queued.max.bytes pressure the broker wedges its listener.
+        SimpleMemoryPool pool = new SimpleMemoryPool(64, 64, false, null);
+        // Drain the pool so KafkaChannel.read's tryAllocate returns null on the next call.
+        java.nio.ByteBuffer drain = pool.tryAllocate(64);
+        assertNotNull(drain, "sanity: SimpleMemoryPool starts with capacity");
+        assertTrue(pool.isOutOfMemory(), "sanity: pool is dry after draining");
+        selector = new IoUringSelector(LISTENER, MAX_RECEIVE, pool, IDLE_NANOS_NEVER, time);
+
+        EmbeddedChannel netty = acceptNew(selector, REMOTE_A);
+        selector.poll(0); // surface accept (justAccepted defers reads to the next poll)
+        String id = selector.connected().get(0);
+        KafkaChannel channel = selector.channel(id);
+        assertNotNull(channel);
+        assertFalse(channel.isMuted(), "freshly accepted channel must start unmuted");
+
+        // Drive a framed payload in. KafkaChannel.read() reads the 4-byte size header,
+        // calls memoryPool.tryAllocate(payloadSize), gets null, and self-mutes via
+        // KafkaChannel.mute(). The completedReceive does NOT surface yet.
+        selector.onRead(netty, framed("payload"));
+        selector.poll(0);
+        assertTrue(channel.isMuted(),
+            "channel must self-mute when memoryPool.tryAllocate returns null inside read()");
+        assertTrue(selector.completedReceives().isEmpty(),
+            "self-muted read must not surface a completedReceive");
+        assertFalse(netty.config().isAutoRead(),
+            "self-mute must also flip Netty autoRead off (kernel-level backpressure)");
+
+        // Release the manual allocation — pool now reports memory available again. On the
+        // next poll, recoverFromMemoryPressure() must walk channels, detect this one is
+        // self-muted (not in explicitlyMutedChannels), and call maybeUnmute().
+        pool.release(drain);
+        assertFalse(pool.isOutOfMemory(), "sanity: pool is no longer dry");
+
+        selector.poll(0);
+        assertFalse(channel.isMuted(),
+            "MemoryPool recovery must unmute the previously self-muted channel — without " +
+            "this, the channel stays MUTED until idle expiry and the broker wedges");
+        assertTrue(netty.config().isAutoRead(),
+            "recovery must restore Netty autoRead so the kernel resumes pushing bytes");
+        // The buffered payload now flows through to a completedReceive (size header was
+        // already consumed; the unmute lets the retry tryAllocate succeed and drain the
+        // remaining bytes from the inbound queue).
+        assertEquals(1, selector.completedReceives().size(),
+            "after recovery the previously-blocked frame must surface as a completedReceive");
+    }
+
+    @Test
+    void recoveryDoesNotUnmuteOperatorMutedChannels() throws Exception {
+        // The explicitlyMutedChannels Set keeps operator-driven mutes (RESPONSE_QUEUED,
+        // throttling, KafkaChannel state machine handover) distinct from self-mutes. If the
+        // recovery loop unmuted operator-muted channels, pipelined requests would slip past
+        // the request-handling throttle. Mirrors NIO Selector.unmute()'s explicitlyMutedChannels
+        // gate (clients/.../Selector.java:762-763).
+        SimpleMemoryPool pool = new SimpleMemoryPool(64, 64, false, null);
+        java.nio.ByteBuffer drain = pool.tryAllocate(64);
+        assertNotNull(drain);
+        selector = new IoUringSelector(LISTENER, MAX_RECEIVE, pool, IDLE_NANOS_NEVER, time);
+
+        // Two channels: one will be operator-muted, the other will self-mute.
+        EmbeddedChannel selfMutedNetty = acceptNew(selector, REMOTE_A);
+        EmbeddedChannel operatorMutedNetty = acceptNew(selector, REMOTE_B);
+        selector.poll(0); // surface both accepts
+        List<String> ids = new ArrayList<>(selector.connected());
+        String selfMutedId = ids.get(0);
+        String operatorMutedId = ids.get(1);
+
+        // Operator-mute one channel via the public mute() API — this lands it in
+        // explicitlyMutedChannels. The other receives a frame that drives a self-mute.
+        selector.mute(operatorMutedId);
+        selector.onRead(selfMutedNetty, framed("payload"));
+        selector.poll(0);
+        assertTrue(selector.channel(selfMutedId).isMuted(), "memory-pressure path muted us");
+        assertTrue(selector.channel(operatorMutedId).isMuted(), "operator mute applied");
+
+        // Pool recovers. Recovery loop must unmute ONLY the self-muted channel; the
+        // operator-muted channel must remain muted.
+        pool.release(drain);
+        selector.poll(0);
+        assertFalse(selector.channel(selfMutedId).isMuted(),
+            "self-muted channel must be unmuted by recovery");
+        assertTrue(selector.channel(operatorMutedId).isMuted(),
+            "operator-muted channel must NOT be unmuted by recovery — explicitlyMutedChannels " +
+            "gate protects request-pipeline throttling from being bypassed by memory recovery");
     }
 }

@@ -151,6 +151,32 @@ public final class IoUringSelector implements BrokerSelector {
     /** Crossed by both threads: event loop puts on accept, Processor reads on mute/unmute/close. */
     private final Map<String, Channel> nettyChannels = new ConcurrentHashMap<>();
     private final Map<String, Long> lastActiveNanos = new HashMap<>();
+    /**
+     * Tracks channels that the operator explicitly muted via {@link #mute(String)} or
+     * {@link #muteAll()}, distinct from channels that {@link KafkaChannel#read()} self-muted
+     * because {@link MemoryPool#tryAllocate(int)} returned null. Mirrors NIO's
+     * {@code Selector.explicitlyMutedChannels} (clients/.../Selector.java:108).
+     *
+     * <p>The recovery loop at the top of {@link #poll(long)} must NOT unmute channels in this
+     * set — they are still muted because the request-handling pipeline (RESPONSE_QUEUED →
+     * RESPONSE_SENT mute events) asked us to hold them, not because of memory pressure.
+     * Unmuting them would let pipelined requests slip past the throttle.
+     *
+     * <p>Identity-based set (not id-based) to match NIO's storage; the KafkaChannel instance
+     * is stable for the channel's lifetime.
+     */
+    private final Set<KafkaChannel> explicitlyMutedChannels = new HashSet<>();
+    /**
+     * Set whenever a channel self-mutes because {@code memoryPool.tryAllocate} returned null
+     * during {@link KafkaChannel#read()}. Cleared at the top of the next {@link #poll(long)}
+     * when {@code memoryPool.isOutOfMemory()} reports false again — at that point the
+     * recovery loop walks every non-explicitly-muted channel and calls {@code maybeUnmute()}.
+     *
+     * <p>Without this, channels that self-mute under {@code queued.max.bytes} pressure stay
+     * MUTED forever (until idle expiry, ~10 min by default) — NIO {@code Selector.poll()}
+     * lines 457-466 own this exact recovery path, and the io_uring selector must preserve it.
+     */
+    private boolean outOfMemory;
 
     // Cross-thread queues (event loop pushes, Processor pulls).
     private final Queue<KafkaChannel> pendingAccepts = new ConcurrentLinkedQueue<>();
@@ -361,6 +387,11 @@ public final class IoUringSelector implements BrokerSelector {
         justAccepted.clear();
         receivesThisPoll.clear();
 
+        // MemoryPool recovery: re-admit channels that self-muted due to memory pressure
+        // once the pool reports available again. Helper extracted to keep poll() under
+        // checkstyle's MethodLength limit.
+        recoverFromMemoryPressure();
+
         // Drain closingChannels left over from the previous poll. Helper extracted for
         // both readability and to keep poll() under checkstyle's MethodLength limit.
         drainClosingChannels();
@@ -424,6 +455,13 @@ public final class IoUringSelector implements BrokerSelector {
                         receivesThisPoll.add(channel.id());
                         madeProgress = true;
                     }
+                    // Self-mute detection: KafkaChannel.read() flips muteState to MUTED when
+                    // memoryPool.tryAllocate returns null. If now muted and NOT operator-muted,
+                    // the read self-muted us. Flag outOfMemory so the next poll's
+                    // recoverFromMemoryPressure() walks channels. Mirrors NIO Selector:691-692.
+                    if (channel.isMuted() && !explicitlyMutedChannels.contains(channel)) {
+                        outOfMemory = true;
+                    }
                 } catch (Exception e) {
                     // Catch Exception, not just IOException: KafkaChannel.read() declares
                     // throws IOException, but NetworkReceive throws InvalidReceiveException
@@ -485,6 +523,7 @@ public final class IoUringSelector implements BrokerSelector {
                     KafkaChannel channel = channels.remove(entry.getKey());
                     nettyChannels.remove(entry.getKey());
                     if (channel != null) {
+                        explicitlyMutedChannels.remove(channel);
                         disconnected.put(entry.getKey(), ChannelState.EXPIRED);
                         Utils.closeQuietly(channel, "expired channel");
                     }
@@ -525,6 +564,30 @@ public final class IoUringSelector implements BrokerSelector {
      * For pipelined requests followed by FIN this drain is what surfaces R2, R3, …
      * across successive polls — without it, only R1 reaches the request queue.
      */
+    /**
+     * If the previous poll observed a channel self-mute because {@code memoryPool.tryAllocate}
+     * returned null (KafkaChannel.read() flips muteState to MUTED when the pool is dry), and
+     * the pool now reports available again, walk every channel and call {@code maybeUnmute()}
+     * — but ONLY for channels NOT in {@link #explicitlyMutedChannels} (those stay muted
+     * because the request pipeline is still throttling them, not because of memory pressure).
+     *
+     * <p>Mirrors NIO {@code Selector.poll()} at clients/.../Selector.java:457-466. Without
+     * this recovery loop, channels that self-mute under {@code queued.max.bytes} pressure
+     * stay MUTED until idle expiry (~10 min default) and the broker effectively wedges its
+     * PLAINTEXT listener under sustained memory pressure.
+     */
+    private void recoverFromMemoryPressure() {
+        if (!memoryPool.isOutOfMemory() && outOfMemory) {
+            log.trace("io_uring selector recovering from memory pressure — unmuting self-muted channels");
+            for (KafkaChannel channel : channels.values()) {
+                if (channel.isInMutableState() && !explicitlyMutedChannels.contains(channel)) {
+                    KafkaChannelMuteBridge.maybeUnmute(channel);
+                }
+            }
+            outOfMemory = false;
+        }
+    }
+
     private void drainClosingChannels() {
         if (closingChannels.isEmpty()) return;
         Iterator<Map.Entry<String, KafkaChannel>> it = closingChannels.entrySet().iterator();
@@ -559,6 +622,7 @@ public final class IoUringSelector implements BrokerSelector {
                 }
             }
             if (!keepClosing) {
+                explicitlyMutedChannels.remove(channel);
                 disconnected.put(id, ChannelState.LOCAL_CLOSE);
                 Utils.closeQuietly(channel, "closing channel evicted");
                 it.remove();
@@ -653,6 +717,7 @@ public final class IoUringSelector implements BrokerSelector {
         KafkaChannel channel = channels.get(id);
         if (channel != null) {
             nettyChannels.remove(id);
+            explicitlyMutedChannels.remove(channel);
             disconnected.put(id, state);
             Utils.closeQuietly(channel, "channel after I/O error");
         }
@@ -722,6 +787,10 @@ public final class IoUringSelector implements BrokerSelector {
         if (channel == null) channel = closingChannels.get(id);
         if (channel == null) return;
         KafkaChannelMuteBridge.mute(channel);
+        // Track operator-driven mutes separately from self-mutes due to memory pressure.
+        // The recovery loop at the top of poll() uses this set to decide which channels
+        // are safe to unmute when memory pressure clears.
+        explicitlyMutedChannels.add(channel);
     }
 
     @Override
@@ -730,6 +799,12 @@ public final class IoUringSelector implements BrokerSelector {
         if (channel == null) channel = closingChannels.get(id);
         if (channel == null) return;
         if (KafkaChannelMuteBridge.maybeUnmute(channel)) {
+            // Drop from the operator-muted set only on successful unmute. NIO does the
+            // same (Selector.unmute lines 762-763): if maybeUnmute returns false (e.g.
+            // the channel is in MUTED_AND_RESPONSE_PENDING and not yet ready to leave
+            // MUTED), the set entry stays so the next unmute attempt still respects the
+            // operator intent.
+            explicitlyMutedChannels.remove(channel);
             // unmute may have flipped autoRead on; bytes may now flow into the transport
             // queue and the next read step needs to drain them, so wake any blocking poll.
             wakeup.release();
@@ -740,13 +815,16 @@ public final class IoUringSelector implements BrokerSelector {
     public void muteAll() {
         for (KafkaChannel channel : channels.values()) {
             KafkaChannelMuteBridge.mute(channel);
+            explicitlyMutedChannels.add(channel);
         }
     }
 
     @Override
     public void unmuteAll() {
         for (KafkaChannel channel : channels.values()) {
-            KafkaChannelMuteBridge.maybeUnmute(channel);
+            if (KafkaChannelMuteBridge.maybeUnmute(channel)) {
+                explicitlyMutedChannels.remove(channel);
+            }
         }
         wakeup.release();
     }
@@ -865,6 +943,7 @@ public final class IoUringSelector implements BrokerSelector {
             Utils.closeQuietly(channel, "closing channel on selector close");
         }
         closingChannels.clear();
+        explicitlyMutedChannels.clear();
         nettyChannels.clear();
         lastActiveNanos.clear();
         // Drain queues so any in-flight ByteBufs are released.
@@ -883,6 +962,7 @@ public final class IoUringSelector implements BrokerSelector {
         nettyChannels.remove(id);
         lastActiveNanos.remove(id);
         if (channel != null) {
+            explicitlyMutedChannels.remove(channel);
             Utils.closeQuietly(channel, "channel close(" + id + ")");
             return;
         }
@@ -899,6 +979,7 @@ public final class IoUringSelector implements BrokerSelector {
         // entry in `disconnected`) preserves that one-dec-per-channel invariant.
         KafkaChannel closing = closingChannels.remove(id);
         if (closing != null) {
+            explicitlyMutedChannels.remove(closing);
             failedSends.remove(id);
             Utils.closeQuietly(closing, "closing channel close(" + id + ")");
         }
