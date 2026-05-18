@@ -27,7 +27,9 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.util.Objects;
 import java.util.OptionalInt;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import jakarta.servlet.AsyncContext;
@@ -212,7 +214,30 @@ final class SseStreamer {
         // If the broker returned nothing, the fetch purgatory already held us up to its max-wait. Re-submitting
         // immediately is the correct behaviour — that's how SSE transitions from "replay" to "live tail" without a
         // reconnect.
-        scheduleNextFetch();
+        //
+        // EXCEPT under fetch-quota throttle. The bridge's synthetic RequestChannel.Request has no socket for
+        // KafkaApis.requestHelper.throttle to mute, so a positive `result.throttleTimeMs()` is the only signal
+        // we get to back off; ignoring it would tight-loop the broker under quota pressure. scheduleNextFetchAfter
+        // routes a zero delay back through the immediate path, so the call site here stays branch-free (and the
+        // method's NPath complexity stays under the checkstyle ceiling).
+        scheduleNextFetchAfter(result.throttleTimeMs());
+    }
+
+    private void scheduleNextFetchAfter(long delayMs) {
+        if (closed.get()) {
+            return;
+        }
+        if (delayMs <= 0L) {
+            scheduleNextFetch();
+            return;
+        }
+        try {
+            CompletableFuture.runAsync(this::scheduleNextFetch,
+                CompletableFuture.delayedExecutor(delayMs, TimeUnit.MILLISECONDS, httpExecutor));
+        } catch (RuntimeException e) {
+            LOG.warn("SSE delayed-fetch dispatch failed for {}/{}", topic, partition, e);
+            closeStream();
+        }
     }
 
     private void writeRecordEvent(FetchResponseFormatter.FetchedRecord record) throws IOException {

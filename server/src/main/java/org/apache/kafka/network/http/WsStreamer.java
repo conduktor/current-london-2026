@@ -27,10 +27,13 @@ import org.slf4j.LoggerFactory;
 import java.util.Objects;
 import java.util.OptionalInt;
 import java.util.Queue;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Executor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Drives a credit-gated WebSocket subscription on top of the existing single-partition fetch path.
@@ -89,6 +92,16 @@ public final class WsStreamer {
     // currentOffset, producing out-of-order frames or a stale next-fetch offset.
     private final AtomicBoolean draining = new AtomicBoolean();
     private final AtomicBoolean fetchInFlight = new AtomicBoolean();
+    // Monotonic deadline (System.nanoTime() reading) before which maybeKickFetch must NOT submit a new fetch.
+    // Set when the broker returns a positive throttleTimeMs; cleared once we cross the deadline. The synthetic
+    // RequestChannel request has no socket for KafkaApis.requestHelper.throttle to mute, so this field is the
+    // load-bearing backpressure signal for streaming fetch loops — without it a quota-exhausted subscription
+    // tight-loops. nanoTime rather than currentTimeMillis so a wall-clock backstep (NTP adjust, suspend/resume)
+    // can't extend the throttle window beyond what the broker asked for. Sentinel 0L means "no throttle stamped" —
+    // nanoTime() can legitimately read 0 once per JVM (probability ≈ 1 in 2^63), so the false-negative is
+    // negligible. Note: nanoTime values are signed and can be negative (per Javadoc), but a deadline computed
+    // as nanoTime() + positive-delay is monotonically greater than the read it came from, which is all we use.
+    private final AtomicLong throttleUntilNanos = new AtomicLong(0L);
 
     private volatile long currentOffset;
 
@@ -278,6 +291,23 @@ public final class WsStreamer {
         if (!buffer.isEmpty() || credits.get() <= 0) {
             return;
         }
+        long deadlineNanos = throttleUntilNanos.get();
+        if (deadlineNanos != 0L) {
+            long remainingNanos = deadlineNanos - System.nanoTime();
+            if (remainingNanos > 0) {
+                // Broker-side fetch quota is asking us to back off. Re-arm at the deadline so a future drain
+                // (this one OR a credit-grant racing during the throttle window) issues the fetch then.
+                // scheduleDrain is single-flight, so multiple overlapping delayed wake-ups collapse harmlessly.
+                // Floor at 1ms so a sub-millisecond remainder doesn't spin the timer wheel until the
+                // deadline crosses zero — one extra ms of throttle is well within the broker's tolerance.
+                long remainingMs = Math.max(1L, TimeUnit.NANOSECONDS.toMillis(remainingNanos));
+                scheduleDrainAfter(remainingMs);
+                return;
+            }
+            // Deadline passed — clear it. CAS guards against a concurrent handleFetchResult that just set a
+            // fresher deadline.
+            throttleUntilNanos.compareAndSet(deadlineNanos, 0L);
+        }
         if (!fetchInFlight.compareAndSet(false, true)) {
             return;
         }
@@ -313,7 +343,29 @@ public final class WsStreamer {
         for (FetchResponseFormatter.FetchedRecord r : view.records()) {
             buffer.offer(r);
         }
+        long throttleMs = result.throttleTimeMs();
+        if (throttleMs > 0) {
+            // Broker says back off. Stamp the deadline so maybeKickFetch (this drain pass and any credit-grant
+            // racing in during the window) skips the next fetch until we cross it. We still scheduleDrain so the
+            // staged records (if any) drain now — only the *next fetch* is gated.
+            throttleUntilNanos.set(System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(throttleMs));
+            // Arm a wake-up at the deadline so the fetch resumes even if no client grant arrives.
+            scheduleDrainAfter(throttleMs);
+        }
         scheduleDrain();
+    }
+
+    private void scheduleDrainAfter(long delayMs) {
+        if (closed.get()) {
+            return;
+        }
+        try {
+            CompletableFuture.runAsync(this::scheduleDrain,
+                CompletableFuture.delayedExecutor(delayMs, TimeUnit.MILLISECONDS, httpExecutor));
+        } catch (RuntimeException e) {
+            LOG.warn("WS delayed-drain dispatch failed for {}/{}", topic, partition, e);
+            close();
+        }
     }
 
     private void failFetch(Throwable throwable) {

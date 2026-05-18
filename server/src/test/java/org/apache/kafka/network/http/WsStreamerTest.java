@@ -191,6 +191,61 @@ class WsStreamerTest {
         assertEquals(1, submitter.fetchCallCount(), "paused stream must not issue speculative fetches");
     }
 
+    // ----- broker fetch-quota throttle -----
+
+    @Test
+    void throttledFetchDoesNotImmediatelySubmitNextFetch() {
+        // PROMPT.md AC3 extends to streaming: when the broker returns throttleTimeMs > 0 (consumer fetch
+        // quota exhausted), the streamer must back off. Our synthetic RequestChannel.Request has no socket
+        // for KafkaApis.requestHelper.throttle to mute, so throttleTimeMs is the only signal we get — if we
+        // ignored it the subscription would tight-loop the broker under quota pressure.
+        //
+        // A large throttle (10s) ensures the delayed wake-up cannot fire during this synchronous assertion.
+        submitter.queueFetchWithThrottle(records(0, 0), 10_000L);
+
+        WsStreamer.start(sink, submitter, MAPPER, "t", 0, 0L, OptionalInt.empty(), 10, token, direct());
+
+        assertEquals(1, submitter.fetchCallCount(),
+            "throttled fetch must not be immediately followed by another submission");
+        assertEquals(0, sink.recordCount(), "no records to deliver on an empty throttled response");
+        assertFalse(sink.closed.get(), "stream stays open while throttled — it isn't an error");
+    }
+
+    @Test
+    void throttledFetchDeliversBufferedRecordsButDefersNextFetch() {
+        // Throttle does not block the drain — records the broker did manage to return must still flow up
+        // to the credit budget. Only the *next fetch* is gated.
+        submitter.queueFetchWithThrottle(records(0, 3), 10_000L);
+
+        WsStreamer.start(sink, submitter, MAPPER, "t", 0, 0L, OptionalInt.empty(), 10, token, direct());
+
+        assertEquals(3, sink.recordCount(), "records returned alongside throttle must still be delivered");
+        assertEquals(1, submitter.fetchCallCount(),
+            "throttle window must defer the live-tail next fetch even when credits remain");
+    }
+
+    @Test
+    void fetchResumesAfterThrottleDeadlinePasses() throws InterruptedException {
+        // End-to-end of the throttle cycle: first fetch reports a short throttle, second fetch (after the
+        // delay) returns records and drains. Tight bound — 60ms throttle, 800ms wait — keeps the test
+        // fast while leaving ample headroom for scheduler jitter on a busy CI runner.
+        submitter.queueFetchWithThrottle(records(0, 0), 60L);
+        submitter.queueFetch(records(0, 2));
+
+        WsStreamer.start(sink, submitter, MAPPER, "t", 0, 0L, OptionalInt.empty(), 10, token, direct());
+
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(800L);
+        while (submitter.fetchCallCount() < 2 && System.nanoTime() < deadline) {
+            Thread.sleep(10);
+        }
+        // Records may or may not have been delivered yet by the time the second fetch lands — the second
+        // fetch's handleFetchResult schedules a drain that the direct executor runs synchronously. So once
+        // fetchCallCount==2 we can also assert the records flowed through.
+        assertTrue(submitter.fetchCallCount() >= 2,
+            "next fetch must resume after the throttle deadline; saw " + submitter.fetchCallCount());
+        assertEquals(2, sink.recordCount(), "records returned after the throttle must be delivered");
+    }
+
     // ----- partition-level error -----
 
     @Test
@@ -345,6 +400,14 @@ class WsStreamerTest {
                 FetchResponseFormatter.PartitionFetch view = new FetchResponseFormatter.PartitionFetch(
                     0, Errors.NONE, null, 0L, 0L, 0L, records);
                 return CompletableFuture.completedFuture(new FetchResult(view, 0L));
+            });
+        }
+
+        void queueFetchWithThrottle(List<FetchResponseFormatter.FetchedRecord> records, long throttleMs) {
+            queue.add(() -> {
+                FetchResponseFormatter.PartitionFetch view = new FetchResponseFormatter.PartitionFetch(
+                    0, Errors.NONE, null, 0L, 0L, 0L, records);
+                return CompletableFuture.completedFuture(new FetchResult(view, throttleMs));
             });
         }
 
