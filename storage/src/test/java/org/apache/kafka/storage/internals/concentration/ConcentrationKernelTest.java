@@ -17,6 +17,7 @@
 package org.apache.kafka.storage.internals.concentration;
 
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.Uuid;
 import org.apache.kafka.test.TestUtils;
 
 import org.junit.jupiter.api.AfterEach;
@@ -1489,5 +1490,66 @@ public class ConcentrationKernelTest {
             "happy-path commit must advance the tracker exactly once");
         assertEquals(100L, kernel.resolveBackingOffset("orders", 0, 0L),
             "happy-path commit must persist the sidecar entry");
+    }
+
+    // ============ BLOCKER 8 (Codex r9): logical-topic METADATA synthesis ============
+
+    @Test
+    public void logicalTopicIdIsDeterministicAndNonZero() {
+        // Producers cache topic IDs after the first METADATA round trip. The ID must be stable
+        // across calls on a single broker AND across brokers in the cluster (no controller
+        // persistence in v1 — every broker computes the same ID from the name). The "non-zero"
+        // check guards against ever shipping Uuid.ZERO_UUID, which Kafka treats as "unknown".
+        Uuid id1 = kernel.logicalTopicId("orders");
+        Uuid id2 = kernel.logicalTopicId("orders");
+        assertEquals(id1, id2,
+            "logicalTopicId must return the same UUID for the same name on every call");
+        assertFalse(Uuid.ZERO_UUID.equals(id1),
+            "deterministic logical-topic UUID must never collide with Uuid.ZERO_UUID");
+    }
+
+    @Test
+    public void logicalTopicIdDistinguishesDistinctNames() {
+        // Different names must produce different UUIDs — otherwise two logical topics would
+        // share an ID and the producer's topic-id cache would route records to the wrong one.
+        Uuid orders = kernel.logicalTopicId("orders");
+        Uuid payments = kernel.logicalTopicId("payments");
+        assertFalse(orders.equals(payments),
+            "logicalTopicId must produce distinct UUIDs for distinct names");
+    }
+
+    @Test
+    public void logicalTopicByTopicIdRoundTripsDeclaredNames() {
+        kernel.declare(descriptor("orders", 4, "shared", 2));
+        kernel.declare(descriptor("payments", 3, "shared", 2));
+        Uuid ordersId = kernel.logicalTopicId("orders");
+        Uuid paymentsId = kernel.logicalTopicId("payments");
+        assertEquals("orders", kernel.logicalTopicByTopicId(ordersId).orElseThrow(),
+            "reverse lookup must return the original logical-topic name");
+        assertEquals("payments", kernel.logicalTopicByTopicId(paymentsId).orElseThrow(),
+            "reverse lookup must return the original logical-topic name");
+    }
+
+    @Test
+    public void logicalTopicByTopicIdEmptyForUnknownId() {
+        // METADATA(topicIds=...) sends a mix of physical and logical IDs; the kernel must return
+        // empty for IDs that are not declared logical topics so KafkaApis can route the lookup
+        // through the KRaft metadata cache instead.
+        assertFalse(kernel.logicalTopicByTopicId(Uuid.randomUuid()).isPresent(),
+            "reverse lookup must return empty for IDs that don't match any declared logical topic");
+    }
+
+    @Test
+    public void allLogicalTopicNamesSnapshotsRegistry() {
+        // METADATA(isAllTopics) injects every declared logical topic so adminClient.listTopics()
+        // can discover them. The returned set must reflect the current registry — no stale
+        // pre-declare entries and no missed post-declare entries.
+        assertTrue(kernel.allLogicalTopicNames().isEmpty(),
+            "no declarations means no logical topic names");
+        kernel.declare(descriptor("orders", 4, "shared", 2));
+        kernel.declare(descriptor("payments", 3, "shared", 2));
+        Set<String> names = kernel.allLogicalTopicNames();
+        assertEquals(Set.of("orders", "payments"), names,
+            "allLogicalTopicNames must return every declared logical topic");
     }
 }

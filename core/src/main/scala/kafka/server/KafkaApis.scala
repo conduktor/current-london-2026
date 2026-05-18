@@ -1412,6 +1412,86 @@ class KafkaApis(val requestChannel: RequestChannel,
     }
   }
 
+  /**
+   * Build a synthesized {@link MetadataResponseTopic} for a logical (concentrated) topic. v1
+   * concentration lives entirely in broker config — the KRaft metadata cache knows nothing
+   * about logical topics — so the broker has to manufacture METADATA replies on the fly. The
+   * leadership of each logical partition is the leadership of the backing partition it maps
+   * onto (see {@code LogicalPartitionMapper}), so we look up the backing topic in the cache and
+   * remap its per-partition leader/replica/ISR data into the logical partition index space.
+   *
+   * <p>Failure modes surfaced to the client:
+   * <ul>
+   *   <li>Backing topic absent from the metadata cache (still being created, or operator
+   *       misconfiguration): {@code LEADER_NOT_AVAILABLE} on the topic — retriable, so a stock
+   *       producer keeps re-asking until the backing materialises.</li>
+   *   <li>Backing partition for a logical partition is missing (numBackingPartitions mismatch
+   *       between concentration config and the real backing topic): partition-level
+   *       {@code UNKNOWN_TOPIC_OR_PARTITION} so only the impacted logical partitions surface
+   *       the error.</li>
+   * </ul>
+   */
+  private def synthesizeLogicalTopicMetadata(
+    logicalTopic: String,
+    listenerName: ListenerName,
+    errorUnavailableEndpoints: Boolean,
+    errorUnavailableListeners: Boolean
+  ): MetadataResponseTopic = {
+    val topicId = concentrationKernel.logicalTopicId(logicalTopic)
+    val descriptorOpt = concentrationKernel.describe(logicalTopic)
+    if (!descriptorOpt.isPresent) {
+      // Race: registry entry disappeared between isLogicalTopic() and describe(). Surface as
+      // UNKNOWN_TOPIC_OR_PARTITION so the caller retries against a fresh metadata view.
+      return metadataResponseTopic(
+        Errors.UNKNOWN_TOPIC_OR_PARTITION, logicalTopic, Uuid.ZERO_UUID, isInternal = false,
+        util.Collections.emptyList())
+    }
+    val descriptor = descriptorOpt.get
+    val backingTopic = descriptor.backingTopic
+    val backingMetadata = metadataCache.getTopicMetadata(
+      scala.collection.Set(backingTopic), listenerName,
+      errorUnavailableEndpoints, errorUnavailableListeners)
+    if (backingMetadata.isEmpty) {
+      // Backing topic not yet known to the cluster — retriable so stock producers keep waiting
+      // for the operator to materialise the backing.
+      return metadataResponseTopic(
+        Errors.LEADER_NOT_AVAILABLE, logicalTopic, topicId, isInternal = false,
+        util.Collections.emptyList())
+    }
+    val backingTopicMetadata = backingMetadata.head
+    val backingPartitionsByIndex = backingTopicMetadata.partitions.asScala
+      .map(p => p.partitionIndex -> p).toMap
+
+    val logicalPartitions = new util.ArrayList[MetadataResponsePartition](descriptor.numLogicalPartitions)
+    var lp = 0
+    while (lp < descriptor.numLogicalPartitions) {
+      val backingIdx = concentrationKernel.backingPartitionFor(logicalTopic, lp)
+      backingPartitionsByIndex.get(backingIdx) match {
+        case Some(bp) =>
+          // Copy leader / replica info from the backing partition but rewrite partitionIndex to
+          // the logical index — stock clients address records by (logicalTopic, logicalPartition)
+          // and have no notion of the backing topology.
+          logicalPartitions.add(new MetadataResponsePartition()
+            .setPartitionIndex(lp)
+            .setErrorCode(bp.errorCode)
+            .setLeaderId(bp.leaderId)
+            .setLeaderEpoch(bp.leaderEpoch)
+            .setReplicaNodes(bp.replicaNodes)
+            .setIsrNodes(bp.isrNodes)
+            .setOfflineReplicas(bp.offlineReplicas))
+        case None =>
+          // Real backing topic has fewer partitions than concentration config promised. Mark the
+          // affected logical partition unknown so clients see a precise error rather than the
+          // whole logical topic going down.
+          logicalPartitions.add(new MetadataResponsePartition()
+            .setPartitionIndex(lp)
+            .setErrorCode(Errors.UNKNOWN_TOPIC_OR_PARTITION.code))
+      }
+      lp += 1
+    }
+    metadataResponseTopic(Errors.NONE, logicalTopic, topicId, isInternal = false, logicalPartitions)
+  }
+
   def handleTopicMetadataRequest(request: RequestChannel.Request): Unit = {
     val metadataRequest = request.body[MetadataRequest]
     val requestVersion = request.header.apiVersion
@@ -1432,14 +1512,29 @@ class KafkaApis(val requestChannel: RequestChannel,
     val useTopicId = topicIds.nonEmpty
 
     // Only get topicIds and topicNames when supporting topicId
-    val unknownTopicIds = topicIds.filter(metadataCache.getTopicName(_).isEmpty)
-    val knownTopicNames = topicIds.flatMap(metadataCache.getTopicName)
+    val physicalUnknownTopicIds = topicIds.filter(metadataCache.getTopicName(_).isEmpty)
+    val physicalKnownTopicNames = topicIds.flatMap(metadataCache.getTopicName)
+
+    // Logical topics carry deterministic UUIDs unknown to the KRaft metadata cache, so a client
+    // refreshing metadata by topic-id (the normal path once a topic has been seen once) would
+    // otherwise get UNKNOWN_TOPIC_ID. Resolve any logical IDs locally and route them down the
+    // synthesis path with the rest of the logical-by-name flow.
+    val logicalKnownByTopicId: Map[Uuid, String] = physicalUnknownTopicIds.flatMap { id =>
+      val resolved = concentrationKernel.logicalTopicByTopicId(id)
+      if (resolved.isPresent) Some(id -> resolved.get) else None
+    }.toMap
+    val unknownTopicIds = physicalUnknownTopicIds.diff(logicalKnownByTopicId.keySet)
+    val knownTopicNames = physicalKnownTopicNames ++ logicalKnownByTopicId.values
 
     val unknownTopicIdsTopicMetadata = unknownTopicIds.map(topicId =>
         metadataResponseTopic(Errors.UNKNOWN_TOPIC_ID, null, topicId, isInternal = false, util.Collections.emptyList())).toSeq
 
     val topics = if (metadataRequest.isAllTopics)
-      metadataCache.getAllTopics()
+      // Stock listTopics() / adminClient.listTopics() callers expect every visible topic in the
+      // METADATA(isAllTopics) response. Logical topics live outside the metadata cache so we
+      // overlay them explicitly here — without this, tools like Kafka UI never see them and
+      // operators have no way to discover concentrated topics on a broker.
+      metadataCache.getAllTopics() ++ concentrationKernel.allLogicalTopicNames().asScala
     else if (useTopicId)
       knownTopicNames
     else
@@ -1451,7 +1546,15 @@ class KafkaApis(val requestChannel: RequestChannel,
     var unauthorizedForCreateTopics = Set[String]()
 
     if (authorizedTopics.nonEmpty) {
-      val nonExistingTopics = authorizedTopics.filterNot(metadataCache.contains)
+      // Logical topics never participate in auto-create: the metadata response for them is
+      // synthesized below from the backing topic's partition leadership. If we let them flow
+      // into the autoTopicCreationManager.createTopics path a producer asking for a logical
+      // topic on a broker with auto.create.topics.enable=true would silently create a real
+      // physical topic with the same name, shadowing the logical declaration on every later
+      // produce — the auto-create collision (task #88).
+      val nonExistingTopics = authorizedTopics
+        .filterNot(metadataCache.contains)
+        .filterNot(concentrationKernel.isLogicalTopic)
       if (metadataRequest.allowAutoTopicCreation && config.autoCreateTopicsEnable && nonExistingTopics.nonEmpty) {
         if (!authHelper.authorize(request.context, CREATE, CLUSTER, CLUSTER_NAME, logIfDenied = false)) {
           val authorizedForCreateTopics = authHelper.filterByAuthorized(request.context, CREATE, TOPIC,
@@ -1489,8 +1592,19 @@ class KafkaApis(val requestChannel: RequestChannel,
     val errorUnavailableListeners = requestVersion >= 6
 
     val allowAutoCreation = config.autoCreateTopicsEnable && metadataRequest.allowAutoTopicCreation && !metadataRequest.isAllTopics
-    val topicMetadata = getTopicMetadata(request, metadataRequest.isAllTopics, allowAutoCreation, authorizedTopics,
+    // Separate logical (concentrated) topics from physical topics. The physical set goes through
+    // the stock metadata cache + auto-create path; the logical set is synthesized from the backing
+    // partition leadership data. This keeps the cache-resolution semantics intact for physical
+    // topics and avoids any chance of the autoTopicCreationManager creating a real topic with the
+    // same name as a logical declaration.
+    val (logicalAuthorizedTopics, physicalAuthorizedTopics) =
+      authorizedTopics.partition(concentrationKernel.isLogicalTopic)
+    val topicMetadata = getTopicMetadata(request, metadataRequest.isAllTopics, allowAutoCreation, physicalAuthorizedTopics,
       request.context.listenerName, errorUnavailableEndpoints, errorUnavailableListeners)
+    val logicalTopicMetadata: Seq[MetadataResponseTopic] = logicalAuthorizedTopics.toSeq.map { lt =>
+      synthesizeLogicalTopicMetadata(lt, request.context.listenerName,
+        errorUnavailableEndpoints, errorUnavailableListeners)
+    }
 
     var clusterAuthorizedOperations = Int.MinValue // Default value in the schema
     if (requestVersion >= 8) {
@@ -1512,11 +1626,15 @@ class KafkaApis(val requestChannel: RequestChannel,
           }
         }
         setTopicAuthorizedOperations(topicMetadata)
+        // Stock clients consult topicAuthorizedOperations on logical topics too — without this the
+        // ACL check happens against the logical name, which is what the operator configures
+        // ACLs against in concentration v1 (logical topics are the user-facing namespace).
+        setTopicAuthorizedOperations(logicalTopicMetadata)
       }
     }
 
     val completeTopicMetadata =  unknownTopicIdsTopicMetadata ++
-      topicMetadata ++ unauthorizedForCreateTopicMetadata ++ unauthorizedForDescribeTopicMetadata
+      topicMetadata ++ logicalTopicMetadata ++ unauthorizedForCreateTopicMetadata ++ unauthorizedForDescribeTopicMetadata
 
     val brokers = metadataCache.getAliveBrokerNodes(request.context.listenerName)
 

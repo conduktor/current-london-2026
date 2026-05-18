@@ -17,12 +17,14 @@
 package org.apache.kafka.storage.internals.concentration;
 
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.Uuid;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -34,6 +36,7 @@ import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -209,6 +212,66 @@ public final class ConcentrationKernel implements AutoCloseable {
      */
     public List<LogicalTopicDescriptor> descriptorsFor(String backingTopic) {
         return List.copyOf(registry.descriptorsFor(backingTopic));
+    }
+
+    /**
+     * Snapshot of every declared logical topic name. KafkaApis uses this on the METADATA path to
+     * inject logical topics into a {@code MetadataRequest.isAllTopics} response — without it,
+     * stock {@code listTopics()} / {@code adminClient.listTopics()} callers would not see
+     * concentrated topics and tools like Kafka UI would treat them as nonexistent.
+     */
+    public Set<String> allLogicalTopicNames() {
+        Set<String> out = new HashSet<>();
+        for (LogicalTopicDescriptor d : registry.all()) {
+            out.add(d.logicalName());
+        }
+        return Set.copyOf(out);
+    }
+
+    /**
+     * Deterministic topic ID for a logical topic name. Stock clients identify topics by
+     * {@link Uuid} once they've cached METADATA; we derive the ID from the logical name so it is
+     * stable across broker restarts and identical on every broker in the cluster without needing
+     * a controller-side registry (v1 has no controller integration — declarations live in broker
+     * config). Two brokers with the same {@code concentration.logical.topics} config produce the
+     * same IDs, so producers can round-robin between them without metadata-cache thrash.
+     *
+     * <p>Uses {@link UUID#nameUUIDFromBytes} (RFC 4122 type-3 / MD5 namespace). Stock Kafka topic
+     * IDs are random (type-4) but the wire protocol and client cache treat them as opaque tokens;
+     * neither validates the UUID version. The chance of colliding with a real topic's random UUID
+     * is 1 in 2^122 and is ignored.
+     *
+     * <p>{@link Uuid#ZERO_UUID} is reserved as a sentinel and {@link Uuid#METADATA_TOPIC_ID} is
+     * the internal-metadata topic; both are vanishingly unlikely from
+     * {@link UUID#nameUUIDFromBytes}, but if a hash collision ever surfaces in practice we would
+     * surface it as a declaration error rather than silently shipping a collided ID.
+     */
+    public Uuid logicalTopicId(String logicalName) {
+        Objects.requireNonNull(logicalName, "logicalName");
+        UUID javaId = UUID.nameUUIDFromBytes(logicalName.getBytes(StandardCharsets.UTF_8));
+        return new Uuid(javaId.getMostSignificantBits(), javaId.getLeastSignificantBits());
+    }
+
+    /**
+     * Reverse of {@link #logicalTopicId}: returns the logical-topic name whose deterministic UUID
+     * matches {@code topicId}, or empty if none. KafkaApis calls this when a client sends
+     * {@code METADATA(topicIds=…)} — once a producer has cached the logical topic's ID, refresh
+     * paths can ask for it by ID instead of name, and the broker must map back before routing
+     * through the rest of the metadata pipeline.
+     *
+     * <p>Linear scan over the registry: declarations are stable broker-config config; we don't
+     * expect more than a handful of logical topics and this lookup is off the hot path. If the
+     * registry ever grows large we can memoise — for now keeping it simple avoids a second
+     * concurrent map to keep in sync with declarations.
+     */
+    public Optional<String> logicalTopicByTopicId(Uuid topicId) {
+        Objects.requireNonNull(topicId, "topicId");
+        for (LogicalTopicDescriptor d : registry.all()) {
+            if (logicalTopicId(d.logicalName()).equals(topicId)) {
+                return Optional.of(d.logicalName());
+            }
+        }
+        return Optional.empty();
     }
 
     /**
