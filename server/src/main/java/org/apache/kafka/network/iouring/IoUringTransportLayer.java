@@ -154,10 +154,35 @@ final class IoUringTransportLayer implements TransportLayer {
      */
     private volatile Throwable asyncWriteFailure;
 
+    /**
+     * Wakes the owning {@link IoUringSelector}'s blocking {@code poll(timeoutMs)} when the
+     * Netty writeAndFlush promise completes async on the event-loop thread. Without this,
+     * the listener decrements {@link #pendingWriteBytes} silently — the Processor thread
+     * stays asleep on {@code wakeup.acquireWithTimeout} until the next event (300 ms by
+     * default) and {@code completedSends}/{@code RESPONSE_SENT} are delayed by that whole
+     * window for every small response. {@code onWritabilityChanged} only fires when the
+     * outbound buffer crosses high/low water marks, so a typical sub-watermark response
+     * (e.g. 1 KB) never triggers it. We therefore call this Runnable from inside the
+     * writeAndFlush listener, after {@link #pendingWriteBytes} is decremented and after
+     * any {@link #asyncWriteFailure} is recorded.
+     *
+     * <p>EmbeddedChannel completes writeAndFlush synchronously on the calling thread, so
+     * unit tests using EmbeddedChannel never expose the stall this callback prevents;
+     * see {@code asyncWriteCompletionWakesSelector} for the regression test that uses an
+     * out-of-loop completion to actually exercise the async path.
+     */
+    private final Runnable writeWakeCallback;
+
     IoUringTransportLayer(Channel nettyChannel, InetSocketAddress remote, InetSocketAddress local) {
+        this(nettyChannel, remote, local, () -> { });
+    }
+
+    IoUringTransportLayer(Channel nettyChannel, InetSocketAddress remote, InetSocketAddress local,
+                          Runnable writeWakeCallback) {
         this.nettyChannel = nettyChannel;
         this.socketChannel = new StubSocketChannel(remote, local);
         this.selectionKey = new NoopSelectionKey();
+        this.writeWakeCallback = writeWakeCallback;
         // Match Selector.register: freshly registered channels start with OP_READ set so
         // isMute() reports false. io_uring's autoRead=true is the equivalent of OP_READ.
         this.selectionKey.interestOps(SelectionKey.OP_READ);
@@ -451,6 +476,19 @@ final class IoUringTransportLayer implements TransportLayer {
                     // request the client never saw.
                     asyncWriteFailure = f.cause();
                 }
+                // Wake the Processor's poll(). The listener runs on Netty's event loop
+                // thread (a separate thread from the Processor in production), so without
+                // this callback the Processor stays asleep on its wakeup Semaphore until
+                // the poll timeout expires — even though hasPendingWrites() now reads
+                // false and maybeCompleteSend() would return the completed Send on the
+                // very next poll iteration. For a small response that never crosses the
+                // outbound watermark, channelWritabilityChanged is not invoked, so no
+                // other wakeup source exists. Result without this line: every small
+                // request/response incurs an extra ~300 ms (the default poll timeout)
+                // before the broker emits RESPONSE_SENT. The bug is invisible under
+                // EmbeddedChannel because that channel completes writeAndFlush futures
+                // synchronously on the calling thread.
+                writeWakeCallback.run();
             });
             pendingWriteBytes.addAndGet(safeChunk);
         } finally {

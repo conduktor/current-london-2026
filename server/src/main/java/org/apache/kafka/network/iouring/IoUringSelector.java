@@ -332,7 +332,12 @@ public final class IoUringSelector implements BrokerSelector {
         String id = local.getAddress().getHostAddress() + ":" + local.getPort() + "-"
                   + remote.getAddress().getHostAddress() + ":" + remote.getPort() + "-"
                   + processorId + "-" + connectionIndex;
-        IoUringTransportLayer transport = new IoUringTransportLayer(nettyChannel, remote, local);
+        // Pass wakeup::release as the write-completion callback. Netty fires writeAndFlush's
+        // listener on the event-loop thread, NOT the Processor thread — so the listener must
+        // re-arm the Processor's poll() semaphore, otherwise a small Send (no watermark
+        // crossing → no onWritabilityChanged) leaves poll() asleep until timeoutMs while
+        // completedSends/RESPONSE_SENT are silently pending.
+        IoUringTransportLayer transport = new IoUringTransportLayer(nettyChannel, remote, local, wakeup::release);
         Authenticator authenticator = new IoUringPlaintextAuthenticator(transport, listenerName, configs);
         IoUringChannelMetadataRegistry metadata = new IoUringChannelMetadataRegistry();
         KafkaChannel channel = new KafkaChannel(id, transport, () -> authenticator, maxReceiveSize, memoryPool, metadata);

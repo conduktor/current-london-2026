@@ -694,4 +694,60 @@ class IoUringTransportLayerTest {
         l.close();
         netty.close();
     }
+
+    @Test
+    void writeWakeCallbackFiresOnceForEachWriteAndFlushCompletion() throws Exception {
+        // Regression for v10 BLOCKER: the writeAndFlush listener runs on Netty's event-loop
+        // thread, NOT the Processor thread. Without an explicit wake of the Processor's
+        // poll-side Semaphore from inside the listener, a small Send (one that never crosses
+        // the outbound watermark, so onWritabilityChanged is not invoked) leaves poll() asleep
+        // until the full timeoutMs elapses — typical Kafka small-request latency would grow
+        // by ~300ms per round trip. EmbeddedChannel completes writeAndFlush synchronously, so
+        // this test merely verifies the listener path INVOKES the callback; the real async
+        // path is exercised by IoUringSelectorTest's send/poll integration.
+        EmbeddedChannel netty = new EmbeddedChannel();
+        java.util.concurrent.atomic.AtomicInteger wakeups = new java.util.concurrent.atomic.AtomicInteger();
+        IoUringTransportLayer l = new IoUringTransportLayer(netty, REMOTE, LOCAL, wakeups::incrementAndGet);
+
+        ByteBuffer src = ByteBuffer.wrap(new byte[128]);
+        long wrote = l.write(src);
+        assertEquals(128, wrote);
+
+        assertEquals(1, wakeups.get(),
+            "writeAndFlush listener must wake the Processor exactly once per completed write " +
+            "— otherwise small responses incur a poll-timeout-sized latency penalty before " +
+            "completedSends fires");
+
+        // Drain so AfterEach's close doesn't trip on retained bufs.
+        ByteBuf flushed;
+        while ((flushed = netty.readOutbound()) != null) flushed.release();
+        l.close();
+        netty.close();
+    }
+
+    @Test
+    void writeWakeCallbackFiresOnAsyncWriteFailure() throws Exception {
+        // The wake-on-completion path must also fire when the promise completes
+        // exceptionally — otherwise the Processor stays asleep with asyncWriteFailure
+        // already stashed, and the FAILED_SEND routing is delayed by a full poll timeout.
+        EmbeddedChannel netty = new EmbeddedChannel();
+        java.util.concurrent.atomic.AtomicInteger wakeups = new java.util.concurrent.atomic.AtomicInteger();
+        IoUringTransportLayer l = new IoUringTransportLayer(netty, REMOTE, LOCAL, wakeups::incrementAndGet);
+
+        // Close the channel so writeAndFlush fails with ClosedChannelException.
+        netty.close().syncUninterruptibly();
+
+        ByteBuffer src = ByteBuffer.wrap(new byte[64]);
+        long wrote = l.write(src);
+        // After the channel is closed, write() bypasses the watermark gate and still hands
+        // off the bytes to writeAndFlush; the promise then completes exceptionally.
+        assertEquals(64, wrote, "write should return the bytes handed to writeAndFlush even when " +
+            "the future then fails — the failure surfaces on the next call via asyncWriteFailure");
+
+        assertEquals(1, wakeups.get(),
+            "failure path of writeAndFlush listener must also fire the wake callback — " +
+            "otherwise the Processor stays asleep with asyncWriteFailure stashed and " +
+            "FAILED_SEND routing is delayed by the full poll timeout");
+        l.close();
+    }
 }
