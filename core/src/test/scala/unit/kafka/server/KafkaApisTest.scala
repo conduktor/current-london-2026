@@ -12150,6 +12150,115 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testMetadataClusterWideListenerRejectsTenantPrefixedNamesFromAutoCreate(): Unit = {
+    // Outside-in pollution via the Metadata auto-create path: a super-user on
+    // the cluster-wide (non-tenant) listener requesting Metadata for "acme.foo"
+    // with allowAutoTopicCreation=true would otherwise reach the auto-create
+    // branch, which materialises literal `acme.foo` via the controller. Tenant
+    // acme on its own listener would then see `foo` in ListTopics. Symmetric
+    // to the CreateTopics dispatch guard: the broker refuses the entry before
+    // the auto-create call so the controller never materialises the topic.
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    val metadataRequest = new MetadataRequest.Builder(List("acme.foo").asJava, true).build()
+    val request = buildRequest(metadataRequest)
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleTopicMetadataRequest(request)
+
+    val response = verifyNoThrottling[MetadataResponse](request)
+    val entries = response.topicMetadata().asScala.toSeq
+    assertEquals(1, entries.size)
+    assertEquals("acme.foo", entries.head.topic,
+      "rejection must keep the wire name the cluster-wide caller sent")
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION, entries.head.error,
+      "tenant-prefixed auto-create from a non-tenant listener must be refused")
+    verify(autoTopicCreationManager, never()).createTopics(
+      any[Set[String]](), any[ControllerMutationQuota](), any[Option[RequestContext]]())
+  }
+
+  @Test
+  def testMetadataClusterWideListenerAutoCreatesTenantLookingNameWhenNoTenantsConfigured(): Unit = {
+    // Pollution guard is gated on TenantConfig.allTenants. With no tenants
+    // configured, the broker behaves as a stock single-tenant cluster and the
+    // auto-create path proceeds for names that happen to contain a dot.
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    val metadataRequest = new MetadataRequest.Builder(List("acme.foo").asJava, true).build()
+    val request = buildRequest(metadataRequest)
+
+    val capturedRequest = verifyTopicCreation("acme.foo",
+      enableAutoTopicCreation = true, isInternal = false, request)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleTopicMetadataRequest(request)
+
+    val response = verifyNoThrottling[MetadataResponse](request)
+    assertEquals(1, response.topicMetadata().size,
+      "without a tenant binding the request must surface the auto-create attempt verbatim")
+    assertTrue(capturedRequest.getValue.isDefined,
+      "auto-create must be invoked for the dot-bearing name when no tenants are configured")
+  }
+
+  @Test
+  def testMetadataClusterWideListenerPassesInternalAutoCreateThrough(): Unit = {
+    // Internal topics are never tenant-namespaced. Even with tenants
+    // configured, `__consumer_offsets` must not be misclassified as pollution
+    // — the auto-create path for the offset topic must reach the controller.
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    val metadataRequest = new MetadataRequest.Builder(
+      List(Topic.GROUP_METADATA_TOPIC_NAME).asJava, true).build()
+    val request = buildRequest(metadataRequest)
+
+    val groupConfig = mutable.Map.empty[String, String]
+    groupConfig.put(GroupCoordinatorConfig.OFFSETS_TOPIC_PARTITIONS_CONFIG, "3")
+    groupConfig.put(GroupCoordinatorConfig.OFFSETS_TOPIC_REPLICATION_FACTOR_CONFIG, "3")
+    when(groupCoordinator.groupMetadataTopicConfigs).thenReturn(new Properties)
+
+    val capturedRequest = verifyTopicCreation(Topic.GROUP_METADATA_TOPIC_NAME,
+      enableAutoTopicCreation = true, isInternal = true, request)
+    kafkaApis = createKafkaApis(
+      overrideProperties = groupConfig.toMap,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleTopicMetadataRequest(request)
+
+    verifyNoThrottling[MetadataResponse](request)
+    assertTrue(capturedRequest.getValue.isDefined,
+      "internal topic auto-create must reach the controller even with tenants configured")
+  }
+
+  @Test
+  def testMetadataClusterWideListenerMixesAllowedAndPollutingNames(): Unit = {
+    // Mixed batch: one tenant-prefixed name (rejected, never reaches
+    // auto-create) and one neutral name (forwarded to auto-create). Mirrors
+    // the CreateTopics mixed-batch shape: refuse the polluter, let the rest
+    // flow through.
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    val metadataRequest = new MetadataRequest.Builder(
+      List("acme.foo", "plain-topic").asJava, true).build()
+    val request = buildRequest(metadataRequest)
+
+    val capturedRequest = verifyTopicCreation("plain-topic",
+      enableAutoTopicCreation = true, isInternal = false, request)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleTopicMetadataRequest(request)
+
+    val response = verifyNoThrottling[MetadataResponse](request)
+    val byName = response.topicMetadata().asScala.map(t => t.topic -> t.error).toMap
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION, byName("acme.foo"),
+      "tenant-prefixed entry must be rejected at the broker")
+    assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION, byName("plain-topic"),
+      "neutral entry must surface the auto-create stub from the controller")
+    assertTrue(capturedRequest.getValue.isDefined,
+      "auto-create must be invoked for the neutral entry but not for the polluter")
+    verify(autoTopicCreationManager, never()).createTopics(
+      ArgumentMatchers.eq(Set("acme.foo")),
+      any[ControllerMutationQuota](),
+      any[Option[RequestContext]]())
+    verify(autoTopicCreationManager, never()).createTopics(
+      ArgumentMatchers.eq(Set("acme.foo", "plain-topic")),
+      any[ControllerMutationQuota](),
+      any[Option[RequestContext]]())
+  }
+
+  @Test
   def testNonV1ApiFromPrivilegedCallerOnTenantBoundListenerIsRefusedAtDispatch(): Unit = {
     // The silent-pollution trap extends to every non-v1 API: a super-user on a
     // tenant-bound listener without a `__tenant_` prefix in their principal

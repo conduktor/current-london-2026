@@ -1474,18 +1474,42 @@ class KafkaApis(val requestChannel: RequestChannel,
       topics, logIfDenied = !metadataRequest.isAllTopics)(identity)
     var (authorizedTopics, unauthorizedForDescribeTopics) = topics.partition(authorizedForDescribeTopics.contains)
     var unauthorizedForCreateTopics = Set[String]()
+    // Outside-in pollution via Metadata auto-create: a super-user on a
+    // non-tenant listener with allowAutoTopicCreation=true requesting
+    // "acme.foo" would otherwise trigger getTopicMetadata's auto-create path
+    // and the controller would materialise a literal `acme.foo`. Tenant acme
+    // would then see logical `foo` in ListTopics. Symmetric to the dispatch
+    // guard in handleCreateTopicsRequest. Internal topics are exempt; describe
+    // of existing tenant-prefixed topics is unaffected (metadataCache.contains
+    // gates the auto-create branch).
+    var pollutionRejectedTopics = Set[String]()
 
     if (authorizedTopics.nonEmpty) {
       val nonExistingTopics = authorizedTopics.filterNot(metadataCache.contains)
       if (metadataRequest.allowAutoTopicCreation && config.autoCreateTopicsEnable && nonExistingTopics.nonEmpty) {
-        if (!authHelper.authorize(request.context, CREATE, CLUSTER, CLUSTER_NAME, logIfDenied = false)) {
+        if (!tenantScoped && tenantConfig.allTenants.asScala.nonEmpty) {
+          val knownPrefixes: Set[String] =
+            tenantConfig.allTenants.asScala.toSet.map((id: String) => id + ".")
+          pollutionRejectedTopics = nonExistingTopics.filter(name =>
+            !isInternal(name) && knownPrefixes.exists(name.startsWith))
+          if (pollutionRejectedTopics.nonEmpty) {
+            authorizedTopics = authorizedTopics.diff(pollutionRejectedTopics)
+          }
+        }
+        val stillNonExisting = nonExistingTopics.diff(pollutionRejectedTopics)
+        if (stillNonExisting.nonEmpty &&
+            !authHelper.authorize(request.context, CREATE, CLUSTER, CLUSTER_NAME, logIfDenied = false)) {
           val authorizedForCreateTopics = authHelper.filterByAuthorized(request.context, CREATE, TOPIC,
-            nonExistingTopics)(identity)
-          unauthorizedForCreateTopics = nonExistingTopics.diff(authorizedForCreateTopics)
+            stillNonExisting)(identity)
+          unauthorizedForCreateTopics = stillNonExisting.diff(authorizedForCreateTopics)
           authorizedTopics = authorizedTopics.diff(unauthorizedForCreateTopics)
         }
       }
     }
+
+    val pollutionRejectedTopicMetadata = pollutionRejectedTopics.map(topic =>
+      metadataResponseTopic(Errors.INVALID_TOPIC_EXCEPTION, topic, Uuid.ZERO_UUID,
+        isInternal(topic), util.Collections.emptyList()))
 
     val unauthorizedForCreateTopicMetadata = unauthorizedForCreateTopics.map(topic =>
       // Set topicId to zero since we will never create topic which topicId
@@ -1541,7 +1565,8 @@ class KafkaApis(val requestChannel: RequestChannel,
     }
 
     val completeTopicMetadata =  unknownTopicIdsTopicMetadata ++
-      topicMetadata ++ unauthorizedForCreateTopicMetadata ++ unauthorizedForDescribeTopicMetadata
+      topicMetadata ++ unauthorizedForCreateTopicMetadata ++ unauthorizedForDescribeTopicMetadata ++
+      pollutionRejectedTopicMetadata
 
     // OUT rewrite — at this point every MetadataResponseTopic carries the
     // physical name (from metadataCache / auth lookups / autocreate errors).
