@@ -453,6 +453,76 @@ public class ApiMessageActivationTest {
     }
 
     @Test
+    public void iterableElementBudgetTerminatesGiantFlatScalarList() {
+        // Codex deep-audit P1d fix: the per-accessor budget alone does NOT
+        // bound a wide, flat repeated scalar field. convertIterable iterates
+        // every element and, for scalars (Long, String, byte[], etc.),
+        // convertScalar returns without touching `invocations`. An attacker
+        // who can pack a giant repeated scalar into a max-size request
+        // (e.g. millions of partition ids in a request that legitimately
+        // takes a partition-ids array) gets an unbudgeted O(N) list copy.
+        // Counting each iterated element against the same
+        // MAX_ACCESSOR_INVOCATIONS=10_000 budget fixes this — and this test
+        // pins the fix by feeding a 20_000-long Long list into a fixture and
+        // asserting the budget aborts the walk.
+        WideScalarNode root = new WideScalarNode();
+        java.util.List<Long> ids = new java.util.ArrayList<>();
+        for (long i = 0; i < 20_000; i++) {
+            ids.add(i);
+        }
+        root.ids = ids;
+        IllegalStateException ex = assertThrows(
+            IllegalStateException.class,
+            () -> ApiMessageActivation.from(root));
+        assertTrue(ex.getMessage().contains("accessor budget"),
+            "expected accessor-budget error, got: " + ex.getMessage());
+    }
+
+    /**
+     * Fixture for {@link #iterableElementBudgetTerminatesGiantFlatScalarList}.
+     * Exposes a single field of type {@code List<Long>} — the element type is
+     * a scalar so each item goes through {@code convertScalar()}, exercising
+     * the iterable-element budget specifically (not the per-accessor one,
+     * which was already covered by {@link WideNode}).
+     */
+    @SuppressWarnings("unused")
+    public static final class WideScalarNode implements org.apache.kafka.common.protocol.ApiMessage {
+        public java.util.List<Long> ids = java.util.Collections.emptyList();
+        public java.util.List<Long> ids() {
+            return ids;
+        }
+        @Override public short apiKey() {
+            return -1;
+        }
+        @Override public short lowestSupportedVersion() {
+            return 0;
+        }
+        @Override public short highestSupportedVersion() {
+            return 0;
+        }
+        @Override public org.apache.kafka.common.protocol.Message duplicate() {
+            return new WideScalarNode();
+        }
+        @Override public java.util.List<org.apache.kafka.common.protocol.types.RawTaggedField> unknownTaggedFields() {
+            return java.util.Collections.emptyList();
+        }
+        @Override public void read(org.apache.kafka.common.protocol.Readable readable, short version) {
+        }
+        @Override public void write(org.apache.kafka.common.protocol.Writable writable,
+                                    org.apache.kafka.common.protocol.ObjectSerializationCache cache,
+                                    short version) {
+        }
+        @Override public int size(org.apache.kafka.common.protocol.ObjectSerializationCache cache,
+                                  short version) {
+            return 0;
+        }
+        @Override public void addSize(org.apache.kafka.common.protocol.MessageSizeAccumulator size,
+                                      org.apache.kafka.common.protocol.ObjectSerializationCache cache,
+                                      short version) {
+        }
+    }
+
+    @Test
     public void recursivelyHandlesAllGeneratedKafkaApiTypes() {
         // Smoke-coverage check: instantiate every public, no-arg, concrete
         // generated *RequestData under common.message and confirm extraction

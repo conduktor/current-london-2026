@@ -180,7 +180,18 @@ class KafkaApis(val requestChannel: RequestChannel,
       // the engine logs a WARN at startup and falls back to listener-only semantics.
       val fromPrivilegedListener = request.context.fromPrivilegedListener
       if (ruleEngine.mayDeny(request.header.apiKey, fromPrivilegedListener)) {
-        val principalName = Option(request.context.principal).map(_.toString).orNull
+        // Build the canonical "type:name" form rather than calling toString.
+        // For the default org.apache.kafka.common.security.auth.KafkaPrincipal
+        // the two are identical, but custom KafkaPrincipal subclasses
+        // sometimes override toString to append role/group metadata.
+        // super.users entries are stored canonically (type:name) and parsed
+        // back by KafkaPrincipal.fromString, so a toString-augmented
+        // principal would fail the rule-engine bypass check even when the
+        // operator listed it in super.users. Codex deep-audit P1c — match
+        // the way Kafka's own authorizer canonicalises super-user
+        // comparisons, not the toString contract.
+        val principalName = Option(request.context.principal)
+          .map(p => p.getPrincipalType + ":" + p.getName).orNull
         val ruleDecision = ruleEngine.evaluate(
           request.header.apiKey,
           request.header.clientId,

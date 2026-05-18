@@ -273,8 +273,24 @@ public final class ApiMessageActivation {
     }
 
     private static List<Object> convertIterable(Iterable<?> it, int depth, int[] invocations) {
+        // Codex deep-audit P1d: the per-iteration bump is what bounds a wide
+        // flat scalar list. Without it, an attacker who can fit a giant
+        // repeated scalar field (e.g. millions of partition ids or topic
+        // names) into a max-size protocol request gets an unbudgeted O(N)
+        // list copy through this method, since scalar elements go through
+        // convertScalar() which never touches `invocations`. Counting each
+        // element against the same MAX_ACCESSOR_INVOCATIONS budget folds
+        // iterable widths into the same overall walk-cost ceiling that
+        // bounds nested-object accessor invocations.
         List<Object> list = new ArrayList<>();
         for (Object item : it) {
+            if (++invocations[0] > MAX_ACCESSOR_INVOCATIONS) {
+                throw new IllegalStateException(
+                    "activation walk exceeded accessor budget of "
+                        + MAX_ACCESSOR_INVOCATIONS
+                        + " while walking iterable of "
+                        + it.getClass().getName());
+            }
             list.add(convert(item, depth, invocations));
         }
         return list;

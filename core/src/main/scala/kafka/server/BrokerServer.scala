@@ -559,26 +559,54 @@ class BrokerServer(
           case Some("false") | Some("no") | Some("0") => false
           case _ => true
         }
-      // Catchup probe (Codex deep-audit P0b): tells drainStartup when this
-      // broker's local log is safe to drain — i.e. when local HW reflects
-      // a recent cluster-committed point on the governance partition. Two
-      // sufficient conditions, both observable without an RPC to the leader:
+      // Catchup probe (Codex deep-audit P0b + P0c): tells drainStartup when
+      // this broker's local log is safe to drain — i.e. when local HW
+      // reflects a recent cluster-committed point on the governance
+      // partition. Two sufficient conditions, both observable on this
+      // broker without an RPC to the leader:
       //   1. This broker IS the leader (its HW is, by definition, the
       //      cluster-wide commit point).
-      //   2. This broker is a follower IN the ISR (the controller considers
-      //      this broker caught up within replica.lag.time.max.ms).
-      // The probe is unsafe-but-loud in the "partition object not yet
-      // initialised" case: returning false here keeps drainStartup polling
-      // rather than draining stale; if the deadline elapses, drainStartup
-      // throws and BrokerServer aborts startup before opening client
-      // sockets. Operator recovery: investigate replica fetcher / ISR /
-      // leader reachability and restart.
+      //   2. This broker is a follower IN the controller-published ISR
+      //      (the controller considers this broker caught up within
+      //      replica.lag.time.max.ms).
+      //
+      // P0c subtlety (Codex follow-up review of P0b): the LOCAL Partition
+      // object is the WRONG source for the ISR check on a follower.
+      // Partition.makeFollower clears the local ISR to Set.empty
+      // (kafka.cluster.Partition line 853, `isr = Set.empty`) — that field
+      // is leader-side bookkeeping and is meaningless on followers. Using
+      // `partition.inSyncReplicaIds.contains(nodeId)` on a follower
+      // therefore ALWAYS returns false, so the probe would never flip true
+      // and every follower broker would time out at the drainStartup
+      // deadline. The authoritative source is the controller-published
+      // metadata image, which is what `localReplicaProbe` already uses
+      // for the replicas check above. Reuse that pattern here.
+      //
+      // For the leader detection we still read the local Partition object —
+      // `Partition.isLeader` is set correctly on leaders. Equivalent
+      // metadata-side check would be
+      // `partitionImage.leader == config.nodeId`, but local self-leadership
+      // is the cheaper and stricter answer (we cannot be the active leader
+      // unless our local Partition state agrees).
+      val tpGov = new org.apache.kafka.common.TopicPartition(GovernanceTopic.NAME, 0)
       val caughtUpProbe: () => Boolean = () => {
-        replicaManager.onlinePartition(
-          new org.apache.kafka.common.TopicPartition(GovernanceTopic.NAME, 0)
-        ).exists { partition =>
-          partition.isLeader ||
-            partition.inSyncReplicaIds.contains(config.nodeId)
+        // Self-leadership branch: local Partition state.
+        val isLeader = replicaManager.onlinePartition(tpGov).exists(_.isLeader)
+        if (isLeader) {
+          true
+        } else {
+          // Follower-in-ISR branch: read the controller-published ISR
+          // from the metadata image. This survives the makeFollower
+          // clear-to-empty, and matches the controller's own definition
+          // of "caught up".
+          val image = metadataCache.currentImage()
+          val topicImage = image.topics().getTopic(GovernanceTopic.NAME)
+          if (topicImage == null) {
+            false
+          } else {
+            val part = topicImage.partitions().get(0)
+            part != null && part.isr.contains(config.nodeId)
+          }
         }
       }
       governanceBootstrap = new BrokerGovernanceBootstrap(
