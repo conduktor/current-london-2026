@@ -1932,19 +1932,25 @@ class ReplicaManager(val config: KafkaConfig,
   def getLogConfig(topicPartition: TopicPartition): Option[LogConfig] = localLog(topicPartition).map(_.config)
 
   /**
-   * Look up the server-side compression policy for a partition without allocating an
-   * `Option` on the fast path. Used by the produce request handler, which calls this
-   * for every authorized partition. Returns [[CompressionPolicy.NONE]] (the no-op
-   * singleton) when the partition is not hosted online here or has no log yet, so the
-   * caller can short-circuit with a single identity compare.
+   * Look up the server-side compression policy for a partition without allocating on the
+   * fast path. Called once per authorized partition by the produce request handler, so
+   * any per-call allocation here is paid on every produce.
+   *
+   * The body reads stored references only:
+   *   - `allPartitions.get(tp)` returns the stored `HostedPartition` (or `null`); no boxing.
+   *   - `online.partition.log.orNull` reads the partition's stored `Option[UnifiedLog]`
+   *     field and unwraps it to a `UnifiedLog` reference or `null` without constructing a
+   *     new `Option`.
+   *   - `log.config.compressionPolicy` is two field reads, returning the enum singleton.
+   *
+   * Returns [[CompressionPolicy.NONE]] when the partition is not hosted online here or
+   * has no log yet, so the caller can short-circuit with a single identity compare.
    */
   def compressionPolicy(topicPartition: TopicPartition): CompressionPolicy = {
-    allPartitions.get(topicPartition) match {
-      case online: HostedPartition.Online =>
-        val maybeLog = online.partition.log
-        if (maybeLog.isDefined) maybeLog.get.config.compressionPolicy else CompressionPolicy.NONE
-      case _ => CompressionPolicy.NONE
-    }
+    val hosted = allPartitions.get(topicPartition)
+    if (!hosted.isInstanceOf[HostedPartition.Online]) return CompressionPolicy.NONE
+    val log: UnifiedLog = hosted.asInstanceOf[HostedPartition.Online].partition.log.orNull
+    if (log == null) CompressionPolicy.NONE else log.config.compressionPolicy
   }
 
   def becomeLeaderOrFollower(correlationId: Int,
