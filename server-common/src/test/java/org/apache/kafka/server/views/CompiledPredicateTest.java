@@ -209,6 +209,49 @@ class CompiledPredicateTest {
     }
 
     @Test
+    void skipsRecordWhenOrderedComparisonAcrossLongDoubleLosesPrecision() {
+        // The IEEE-safe-integer guard must apply to ordered comparison too, not just equality.
+        // Without it: body Long 9007199254740993 promotes to (double) 9007199254740992 and
+        // compares <= 9007199254740992.0 as true — bypassing an account_id ceiling check.
+        // Acceptable outcomes: false (compare returned a definite no-match) or empty (compare
+        // returned unknown, propagated as falsy → record skipped by the filter). NOT true.
+        CompiledPredicate p = compiler.compile("body.account_id <= 9007199254740992.0");
+        Optional<Boolean> r = p.evaluate(jsonRecord("{\"account_id\":9007199254740993}"));
+        assertTrue(r.isEmpty() || !r.get(),
+                () -> "expected no precision-loss match in ordered compare, got " + r);
+    }
+
+    @Test
+    void orderedComparisonStillWorksInsideIeeeSafeRange() {
+        // Sanity: mixed Long/Double comparison still works when the Long is safe.
+        CompiledPredicate p = compiler.compile("body.x <= 10.5");
+        assertTrue(p.evaluate(jsonRecord("{\"x\":10}")).orElse(false));
+        assertFalse(p.evaluate(jsonRecord("{\"x\":11}")).orElse(false));
+    }
+
+    @Test
+    void rejectsPrecisionLossFloatLiteralAtCompileTime() {
+        // 9007199254740993.0 silently rounds to 9007199254740992.0 in Double. A predicate
+        // body.x == 9007199254740993.0 therefore matches a Long that the author did not intend.
+        // The lexer rejects the literal at compile time with a clear error.
+        org.apache.kafka.server.views.PredicateValidationException ex =
+                org.junit.jupiter.api.Assertions.assertThrows(
+                        org.apache.kafka.server.views.PredicateValidationException.class,
+                        () -> compiler.compile("body.x == 9007199254740993.0"));
+        assertTrue(ex.getMessage().contains("precision-loss"),
+                () -> "expected precision-loss message, got: " + ex.getMessage());
+    }
+
+    @Test
+    void acceptsCommonFloatLiteralsBelowSafeRange() {
+        // Sanity: 0.1, 1.5, scientific notation with safe magnitudes — none should be rejected.
+        compiler.compile("body.x == 0.1");
+        compiler.compile("body.x == 1.5");
+        compiler.compile("body.x == 1.5e10");
+        compiler.compile("body.x == 9007199254740992.0"); // exactly 2^53 — safe
+    }
+
+    @Test
     void skipsRecordWhenBodyIsMalformedJson() {
         CompiledPredicate p = compiler.compile("body.color == 'red'");
         Optional<Boolean> r = p.evaluate(RecordContexts.builder()

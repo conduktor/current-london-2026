@@ -210,23 +210,56 @@ final class Evaluator {
      * Ordered comparison: returns Boolean for valid numeric (or string-vs-string) compares,
      * null for type mismatches (treated as "unknown", which propagates as falsy in boolean
      * context).
+     *
+     * <p>For mixed Long/Double comparisons the same IEEE-safe-integer guard used by
+     * {@link #equalsValues} applies: a Long outside {@code |L| <= 2^53} cannot be compared in
+     * {@code double} space without precision loss, so the comparison returns {@code null}
+     * rather than silently using a rounded value. Without this guard, a body Long
+     * {@code 2^53 + 1} would compare {@code <= 2^53.0} as true (the rounded double of the Long
+     * equals the literal), letting an adversary bypass an {@code account_id <= 2^53.0}
+     * gate.
      */
     private Object compare(Object l, Object r, int target, boolean inclusive) {
         if (l == null || r == null) return null;
         if (l instanceof Number && r instanceof Number) {
-            int cmp;
-            if (l instanceof Long && r instanceof Long) {
-                cmp = Long.compare((Long) l, (Long) r);
-            } else {
-                cmp = Double.compare(((Number) l).doubleValue(), ((Number) r).doubleValue());
-            }
-            return matches(cmp, target, inclusive);
+            Integer cmp = compareNumeric((Number) l, (Number) r);
+            return cmp == null ? null : matches(cmp, target, inclusive);
         }
         if (l instanceof String && r instanceof String) {
             int cmp = Integer.signum(((String) l).compareTo((String) r));
             return matches(cmp, target, inclusive);
         }
         return null;
+    }
+
+    private static Integer compareNumeric(Number l, Number r) {
+        if (l instanceof Long && r instanceof Long) {
+            return Long.compare((Long) l, (Long) r);
+        }
+        if (l instanceof Long) {
+            return compareLongDouble((Long) l, r.doubleValue(), false);
+        }
+        if (r instanceof Long) {
+            return compareLongDouble((Long) r, l.doubleValue(), true);
+        }
+        return Double.compare(l.doubleValue(), r.doubleValue());
+    }
+
+    /** Compare a Long against a Double under the IEEE-safe-integer guard. {@code longOnRight=true}
+     *  swaps the comparison so the result is relative to the original left-hand operand. */
+    private static Integer compareLongDouble(long longSide, double doubleSide, boolean longOnRight) {
+        if (Double.isNaN(doubleSide) || Double.isInfinite(doubleSide)) {
+            return null;
+        }
+        if (longSide > IEEE_SAFE_INTEGER || longSide < -IEEE_SAFE_INTEGER) {
+            return null;
+        }
+        // Swap operands rather than negating the result: Double.compare doesn't promise the
+        // {-1,0,+1} contract that would make negation safe, and SpotBugs flags negated compares
+        // (RV_NEGATING_RESULT_OF_COMPARETO).
+        return longOnRight
+                ? Double.compare(doubleSide, (double) longSide)
+                : Double.compare((double) longSide, doubleSide);
     }
 
     private static Boolean matches(int cmp, int target, boolean inclusive) {

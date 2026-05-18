@@ -162,6 +162,11 @@ final class Lexer {
         return true;
     }
 
+    /** 2^53 — beyond this magnitude IEEE-754 doubles cannot represent successive integers
+     *  exactly. Float literals with an integer part larger than this round silently, which
+     *  is the precision-loss bypass the spec calls out. */
+    private static final long IEEE_SAFE_INTEGER = 1L << 53;
+
     private Token buildFloatToken(String text, int start) {
         double d;
         try {
@@ -172,7 +177,54 @@ final class Lexer {
         if (Double.isNaN(d) || Double.isInfinite(d)) {
             throw new PredicateValidationException("unsafe numeric literal (NaN/Infinity) at " + start);
         }
+        rejectPrecisionLossInteger(text, start);
         return new Token(Kind.FLOAT_LITERAL, text, d, start);
+    }
+
+    /**
+     * Reject float literals that LOOK like an integer beyond IEEE-754 safe range. The textual
+     * integer part is the digit run before any {@code .} or exponent. {@code 9007199254740993.0}
+     * silently rounds to {@code 9007199254740992.0}; a predicate
+     * {@code body.x == 9007199254740993.0} therefore matches a body containing the rounded value,
+     * not what the author wrote. Catching this at compile time gives a clear error instead of a
+     * silent runtime bypass.
+     *
+     * <p>Decimal-shaped literals like {@code 0.1} or {@code 1.5e20} are NOT rejected — only the
+     * "I wrote a specific integer, expected to mean that integer" case.
+     */
+    private static void rejectPrecisionLossInteger(String text, int start) {
+        String body = text.startsWith("-") ? text.substring(1) : text;
+        int cut = body.length();
+        for (int idx = 0; idx < body.length(); idx++) {
+            char ch = body.charAt(idx);
+            if (ch == '.' || ch == 'e' || ch == 'E') {
+                cut = idx;
+                break;
+            }
+        }
+        String intPart = body.substring(0, cut);
+        if (intPart.isEmpty()) {
+            return;
+        }
+        // 2^53 = 9_007_199_254_740_992 — 16 decimal digits. A 17+ digit integer part is
+        // unconditionally beyond range; for exactly 16 digits, parse and compare.
+        if (intPart.length() > 16) {
+            throw new PredicateValidationException(
+                    "unsafe numeric literal (precision-loss territory) at " + start + ": " + text);
+        }
+        if (intPart.length() == 16) {
+            long magnitude;
+            try {
+                magnitude = Long.parseLong(intPart);
+            } catch (NumberFormatException e) {
+                throw new PredicateValidationException(
+                        "invalid numeric literal at " + start + ": " + text);
+            }
+            if (magnitude > IEEE_SAFE_INTEGER) {
+                throw new PredicateValidationException(
+                        "unsafe numeric literal (precision-loss territory) at " + start + ": " + text);
+            }
+        }
     }
 
     private Token buildIntToken(String text, int start) {
