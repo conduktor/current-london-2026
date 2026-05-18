@@ -200,12 +200,14 @@ class KafkaApis(val requestChannel: RequestChannel,
 
   // CREATE_TOPICS — Forwarded to the controller. We translate the topic names
   // in the request body to physical before forwarding, and translate them back
-  // in the response. A privileged caller on a tenant-bound listener is refused
-  // here rather than forwarded — the controller has no knowledge of listener
-  // tenancy and would happily let the caller create topics in any namespace.
+  // in the response. Any "unsafe" request — privileged caller on a tenant-bound
+  // listener, principal/listener tenant disagreement, or a `__tenant_` prefix
+  // arriving on an unbound listener — is refused here rather than forwarded.
+  // The controller has no knowledge of listener tenancy and would happily let
+  // the caller create topics in any namespace.
   def handleCreateTopicsRequest(request: RequestChannel.Request): Unit = {
     val ctx = tenantContextFor(request)
-    if (ctx.isPrivilegedOnTenantListener) {
+    if (ctx.isUnsafe) {
       val createReq = request.body[CreateTopicsRequest]
       val results = new CreateTopicsResponseData.CreatableTopicResultCollection()
       createReq.data.topics.forEach(t =>
@@ -268,12 +270,12 @@ class KafkaApis(val requestChannel: RequestChannel,
   // resolves to a topic outside the tenant's namespace (or that the broker has
   // never heard of) is rejected with UNKNOWN_TOPIC_ID at the broker, and never
   // reaches the controller. Internal topics ids are treated as foreign.
-  // Privileged caller on a tenant-bound listener is refused outright.
+  // Any unsafe request (see TenantContext.isUnsafe) is refused outright.
   def handleDeleteTopicsRequest(request: RequestChannel.Request): Unit = {
     val ctx = tenantContextFor(request)
     val delReq = request.body[DeleteTopicsRequest]
     val version = delReq.version
-    if (ctx.isPrivilegedOnTenantListener) {
+    if (ctx.isUnsafe) {
       val results = new DeleteTopicsResponseData.DeletableTopicResultCollection()
       delReq.topics.forEach { t =>
         val result = new DeleteTopicsResponseData.DeletableTopicResult()
@@ -613,12 +615,11 @@ class KafkaApis(val requestChannel: RequestChannel,
 
     val tenantCtx = tenantContextFor(request)
     val tenantScoped = tenantCtx.effectiveTenant.isPresent
-    // Refuse a privileged caller hitting a tenant-bound listener without a
-    // tenant principal — see handleTopicMetadataRequest for the rationale.
-    // Each requested topic-partition gets TOPIC_AUTHORIZATION_FAILED carrying
-    // the logical name the caller used; the request reaches neither
+    // Refuse any unsafe request — see TenantContext.isUnsafe. Each requested
+    // topic-partition gets TOPIC_AUTHORIZATION_FAILED carrying the wire name
+    // (logical from the caller's POV); the request reaches neither
     // authorization nor replicaManager.
-    if (tenantCtx.isPrivilegedOnTenantListener) {
+    if (tenantCtx.isUnsafe) {
       val refused = mutable.Map[TopicPartition, PartitionResponse]()
       produceRequest.data.topicData.forEach(t => t.partitionData.forEach(p =>
         refused += new TopicPartition(t.name, p.index) -> new PartitionResponse(Errors.TOPIC_AUTHORIZATION_FAILED)))
@@ -797,11 +798,12 @@ class KafkaApis(val requestChannel: RequestChannel,
 
     val tenantCtx = tenantContextFor(request)
     val tenantScoped = tenantCtx.effectiveTenant.isPresent
-    // Privileged-on-tenant-listener guard. Refuse every requested partition
-    // with TOPIC_AUTHORIZATION_FAILED so the caller cannot piggyback off the
-    // listener binding to access the tenant namespace. The check uses the
+    // Unsafe-request guard (see TenantContext.isUnsafe). Refuse every requested
+    // partition with TOPIC_AUTHORIZATION_FAILED so the caller cannot piggyback
+    // off the listener binding, an attacker-controlled `__tenant_` prefix on an
+    // unbound listener, or a principal/listener mismatch. The check uses the
     // pre-fetch-context view of fetchData() so it does not depend on a session.
-    if (tenantCtx.isPrivilegedOnTenantListener) {
+    if (tenantCtx.isUnsafe) {
       val refused = new util.LinkedHashMap[TopicIdPartition, FetchResponseData.PartitionData]()
       fetchRequest.fetchData(topicNames).forEach { (tip, _) =>
         refused.put(tip, FetchResponse.partitionResponse(tip, Errors.TOPIC_AUTHORIZATION_FAILED))
@@ -1178,13 +1180,17 @@ class KafkaApis(val requestChannel: RequestChannel,
     }
 
     val tenantCtx = tenantContextFor(request)
-    // A privileged caller on a tenant-bound listener WITHOUT a tenant principal
-    // would otherwise have its names silently rewritten into the tenant's
-    // namespace — PROMPT.md flags this as data corruption. Refuse the request
-    // by returning TOPIC_AUTHORIZATION_FAILED per requested topic; for
-    // isAllTopics, an empty response — the caller is not allowed to see the
-    // tenant's namespace at all.
-    if (tenantCtx.isPrivilegedOnTenantListener) {
+    // Unsafe-request guard (see TenantContext.isUnsafe). Three rejection cases:
+    //   1. Privileged caller on a tenant-bound listener (no principal tenant) —
+    //      would otherwise have names rewritten into the tenant's namespace and
+    //      pollute it. PROMPT.md flags this as data corruption.
+    //   2. Principal/listener tenant mismatch — operator-controlled values
+    //      disagree; broker won't pick a winner.
+    //   3. Untrusted `__tenant_` prefix arriving on a listener without
+    //      TenantPrincipalBuilder — closes the SASL_PLAIN username spoof.
+    // For named topics: TOPIC_AUTHORIZATION_FAILED per requested topic; for
+    // isAllTopics: empty response, the caller cannot see the namespace.
+    if (tenantCtx.isUnsafe) {
       sendMetadataAuthorizationFailure(request, metadataRequest, requestVersion)
       return
     }

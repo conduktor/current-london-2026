@@ -11014,6 +11014,118 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testProduceMismatchedPrincipalListenerIsRejected(): Unit = {
+    // The TENANT_ACME listener is bound to "acme", but the principal claims
+    // "__tenant_beta.alice". Operator-controlled values disagree. The broker
+    // MUST refuse rather than pick a winner — otherwise a misconfiguration
+    // could quietly route writes into a foreign tenant's namespace.
+    addTopicToMetadataCache("acme.orders", numPartitions = 1)
+    addTopicToMetadataCache("beta.orders", numPartitions = 1)
+
+    val produceRequest = buildSingleTopicProduceRequest("orders")
+    val request = buildRequest(
+      produceRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("beta", "alice"))
+
+    kafkaApis = createKafkaApis(
+      authorizer = None,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[ProduceResponse](request)
+    assertEquals(1, response.data.responses.size)
+    val topicProduceResponse = response.data.responses.asScala.head
+    assertEquals("orders", topicProduceResponse.name,
+      "rejection echoes the wire name; physical prefixes never appear in the response")
+    val partitionProduceResponse = topicProduceResponse.partitionResponses.asScala.head
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED,
+      Errors.forCode(partitionProduceResponse.errorCode),
+      "principal/listener tenant disagreement must be refused")
+
+    verify(replicaManager, never()).handleProduceAppend(
+      anyLong, anyShort, anyBoolean(), any(), any(), any(), any(), any(), any(), any())
+  }
+
+  @Test
+  def testProduceUntrustedTenantPrincipalOnUnboundListenerIsRejected(): Unit = {
+    // SASL_PLAIN spoof vector: a client picks the username "__tenant_acme.alice"
+    // on a listener that has NO TenantPrincipalBuilder binding. Without a
+    // binding the prefix cannot have been minted by us, so honoring it would
+    // let the client choose its own tenant identity. Refuse outright.
+    addTopicToMetadataCache("acme.orders", numPartitions = 1)
+
+    val produceRequest = buildSingleTopicProduceRequest("orders")
+    // PLAINTEXT listener: no tenant binding for this listener name.
+    val request = buildRequest(
+      produceRequest,
+      principal = tenantPrincipal("acme", "alice"))
+
+    // tenantConfig is empty — no listener has a binding.
+    kafkaApis = createKafkaApis(authorizer = None)
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[ProduceResponse](request)
+    val topicProduceResponse = response.data.responses.asScala.head
+    val partitionProduceResponse = topicProduceResponse.partitionResponses.asScala.head
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED,
+      Errors.forCode(partitionProduceResponse.errorCode),
+      "an untrusted __tenant_ principal on an unbound listener must be refused")
+
+    verify(replicaManager, never()).handleProduceAppend(
+      anyLong, anyShort, anyBoolean(), any(), any(), any(), any(), any(), any(), any())
+  }
+
+  @Test
+  def testMetadataMismatchedPrincipalListenerIsRejected(): Unit = {
+    addTopicToMetadataCache("acme.orders", numPartitions = 1)
+    addTopicToMetadataCache("beta.orders", numPartitions = 1)
+
+    val metadataRequest = new MetadataRequest.Builder(List("orders").asJava, false).build()
+    val request = buildRequest(
+      metadataRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("beta", "alice"))
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    addTopicToMetadataCache("acme.orders", numPartitions = 1)
+    addTopicToMetadataCache("beta.orders", numPartitions = 1)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleTopicMetadataRequest(request)
+
+    val response = verifyNoThrottling[MetadataResponse](request)
+    val errored = response.topicMetadata().asScala.toSeq
+    assertEquals(1, errored.size)
+    assertEquals("orders", errored.head.topic,
+      "rejection echoes the logical name the caller used; never the physical one")
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED, errored.head.error,
+      "principal/listener tenant disagreement must be refused")
+  }
+
+  @Test
+  def testMetadataUntrustedTenantPrincipalOnUnboundListenerIsRejected(): Unit = {
+    // Same spoof vector as Produce: refuse outright when a __tenant_ prefix
+    // arrives on a listener that did not mint it.
+    addTopicToMetadataCache("acme.orders", numPartitions = 1)
+
+    val metadataRequest = new MetadataRequest.Builder(List("orders").asJava, false).build()
+    val request = buildRequest(
+      metadataRequest,
+      principal = tenantPrincipal("acme", "alice"))
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    addTopicToMetadataCache("acme.orders", numPartitions = 1)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleTopicMetadataRequest(request)
+
+    val response = verifyNoThrottling[MetadataResponse](request)
+    val errored = response.topicMetadata().asScala.toSeq
+    assertEquals(1, errored.size)
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED, errored.head.error,
+      "an untrusted __tenant_ principal on an unbound listener must be refused")
+  }
+
+  @Test
   def testProduceNonTenantRequestUnchangedWhenNoBinding(): Unit = {
     // Single-tenant behaviour unchanged: no listener binding, no principal
     // prefix, no rewrite, and no guard fires.
@@ -11501,10 +11613,15 @@ class KafkaApisTest extends Logging {
 
   @Test
   def testDeleteTopicsTenantBoundaryViolationByIdReturnsUnknownTopicId(): Unit = {
-    // Tenant submits a delete-by-id whose id resolves to a foreign tenant's
-    // physical topic ("beta.orders"). The broker must redact the foreign name
-    // and surface UNKNOWN_TOPIC_ID rather than leak the physical prefix.
+    // Tenant submits delete-by-id for a UUID that the broker can resolve to a
+    // foreign tenant's physical topic ("beta.orders"). The broker MUST pre-
+    // reject without forwarding — leaving the decision to the controller would
+    // let a tenant delete arbitrary topics by id. Unknown UUIDs and foreign
+    // UUIDs share the same response shape (null name, UNKNOWN_TOPIC_ID) so
+    // the response cannot be used to probe the existence of foreign topics.
     val foreignId = Uuid.randomUuid()
+    addTopicToMetadataCache("beta.orders", numPartitions = 1, topicId = foreignId)
+
     val deleteRequest = new DeleteTopicsRequest.Builder(new DeleteTopicsRequestData()
       .setTopics(util.Arrays.asList(new DeleteTopicsRequestData.DeleteTopicState().setTopicId(foreignId)))
       .setTimeoutMs(5000)).build()
@@ -11516,17 +11633,9 @@ class KafkaApisTest extends Logging {
     kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
     kafkaApis.handleDeleteTopicsRequest(request)
 
-    val (forwarded, callback) = captureForwardedDeleteTopics(request)
-    val forwardedEntry = forwarded.data.topics.asScala.head
-    assertNull(forwardedEntry.name, "delete-by-id must not synthesize a name when none was provided")
-    assertEquals(foreignId, forwardedEntry.topicId)
-
-    // Simulate controller successfully resolving the id but to a foreign tenant's topic.
-    val controllerResponse = new DeleteTopicsResponse(new DeleteTopicsResponseData()
-      .setResponses(new DeleteTopicsResponseData.DeletableTopicResultCollection(
-        Collections.singleton(new DeleteTopicsResponseData.DeletableTopicResult()
-          .setName("beta.orders").setTopicId(foreignId).setErrorCode(Errors.NONE.code)).iterator)))
-    callback(Some(controllerResponse))
+    // The request never reaches the controller — every UUID is foreign.
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[AbstractRequest](), any[Option[AbstractResponse] => Unit]())
 
     val response = verifyNoThrottling[DeleteTopicsResponse](request)
     val result = response.data.responses.asScala.head

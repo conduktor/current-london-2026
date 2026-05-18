@@ -81,10 +81,40 @@ public final class TenantContext {
         return listenerTenantId != null && principalTenantId == null;
     }
 
+    /**
+     * The principal carries a {@code __tenant_<id>} prefix but the listener it
+     * arrived on is not bound to that same id. The broker won't pick a winner
+     * between the principal's claim and the listener's binding — both are
+     * operator-controlled, and disagreement means the connection is in an
+     * untrusted state.
+     */
     public boolean hasPrincipalListenerMismatch() {
         return listenerTenantId != null
             && principalTenantId != null
             && !listenerTenantId.equals(principalTenantId);
+    }
+
+    /**
+     * The principal carries a {@code __tenant_} prefix but the listener has
+     * no tenant binding at all. The reserved prefix is only trustworthy when
+     * produced by {@link TenantPrincipalBuilder} on a tenant-bound listener;
+     * a prefix arriving via any other path (e.g. SASL_PLAIN username spoof)
+     * must not be honored as a tenant identity.
+     */
+    public boolean hasUntrustedTenantPrincipal() {
+        return principalTenantId != null && listenerTenantId == null;
+    }
+
+    /**
+     * Any of the three rejection cases: super-user piggy-backing on the
+     * listener binding, principal/listener disagreement, or an untrusted
+     * {@code __tenant_} prefix. Handlers refuse such requests outright
+     * instead of trying to disambiguate.
+     */
+    public boolean isUnsafe() {
+        return isPrivilegedOnTenantListener()
+            || hasPrincipalListenerMismatch()
+            || hasUntrustedTenantPrincipal();
     }
 
     public String toPhysical(String logicalTopic) {

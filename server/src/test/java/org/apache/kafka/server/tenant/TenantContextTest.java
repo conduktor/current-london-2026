@@ -81,6 +81,46 @@ class TenantContextTest {
             new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_beta.alice"),
             Optional.of("acme"));
         assertTrue(ctx.hasPrincipalListenerMismatch());
+        assertTrue(ctx.isUnsafe());
+    }
+
+    @Test
+    void principalListenerAgreementIsNotMismatch() {
+        TenantContext ctx = TenantContext.of(ACME, Optional.of("acme"));
+        assertFalse(ctx.hasPrincipalListenerMismatch());
+        assertFalse(ctx.isUnsafe());
+    }
+
+    @Test
+    void untrustedTenantPrincipalOnUnboundListenerIsDetected() {
+        // The SASL_PLAIN spoof: a client picks a username that begins with
+        // __tenant_, but the listener has no TenantPrincipalBuilder binding so
+        // the prefix cannot have been minted by us. Trusting it would let the
+        // client choose its own tenant out of thin air.
+        TenantContext ctx = TenantContext.of(ACME, Optional.empty());
+        assertTrue(ctx.hasUntrustedTenantPrincipal());
+        assertTrue(ctx.isUnsafe());
+    }
+
+    @Test
+    void tenantPrincipalOnBoundListenerIsTrusted() {
+        TenantContext ctx = TenantContext.of(ACME, Optional.of("acme"));
+        assertFalse(ctx.hasUntrustedTenantPrincipal());
+        assertFalse(ctx.isUnsafe());
+    }
+
+    @Test
+    void privilegedOnTenantListenerIsUnsafe() {
+        TenantContext ctx = TenantContext.of(SUPER, Optional.of("acme"));
+        assertTrue(ctx.isUnsafe());
+    }
+
+    @Test
+    void plainPrincipalOnOpenListenerIsSafe() {
+        TenantContext ctx = TenantContext.of(SUPER, Optional.empty());
+        assertFalse(ctx.isUnsafe());
+        assertFalse(ctx.hasPrincipalListenerMismatch());
+        assertFalse(ctx.hasUntrustedTenantPrincipal());
     }
 
     @Test
