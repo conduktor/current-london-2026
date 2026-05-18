@@ -1020,15 +1020,31 @@ class KafkaApis(val requestChannel: RequestChannel,
       }
     }
 
-    // Filter the backing fetch's abortedTransactions list to only retain entries whose
-    // producer_id is still visible in the post-filter records. Visibility = at least one
-    // non-empty data (i.e. non-control) batch carries this producer_id. The round-4 empty-batch
-    // scrub maps the producer_id of fully-filtered batches to NO_PRODUCER_ID, so `hasProducerId`
-    // is exactly the right check. Control batches (ABORT/COMMIT markers) are intentionally
-    // excluded from "visible" because they always retain producer_id for READ_COMMITTED — the
-    // marker by itself does not justify surfacing the aborted-tx entry; only surviving data
-    // does. If the surviving record set is empty for a given producer, the consumer has nothing
-    // to skip and the list entry is pure leakage.
+    // Lightweight projection of a RecordBatch used by the abortedTransactions visibility scan
+    // below. Captures only the three fields the range walk needs so each batch is touched once.
+    // Plain class (not a `case class`) on purpose: Scala's case-class machinery generates a
+    // synthetic `copy` method whose param signature SpotBugs flags as UMAC_UNCALLABLE_METHOD on
+    // a class defined inside a method.
+    class BatchInfo(val baseOffset: Long, val isControl: Boolean, val count: Integer)
+
+    // Filter the backing fetch's abortedTransactions list to retain only entries whose specific
+    // aborted transaction has surviving data records in the post-filter stream. An
+    // `AbortedTransaction(producerId pid, firstOffset f)` entry tells READ_COMMITTED consumers:
+    // "all records from pid starting at offset f belong to the aborted transaction, skip them
+    // until you see pid's matching ABORT control marker." The previous round-5 implementation
+    // was producer-id-wide: if pid had ANY surviving non-control batch anywhere in the response,
+    // we kept the entry. That over-keeps when pid has a hidden aborted transaction TX1 (all data
+    // filtered) and a separate visible transaction TX2 (data retained) in the same fetch — TX1's
+    // `(pid, firstOffset)` was leaked even though the consumer has zero records in TX1's range
+    // to mark aborted. The fix narrows visibility to pid records whose offset falls in TX1's
+    // range, where the range is bounded above by pid's next control batch in the response
+    // (the ABORT/COMMIT marker terminating TX1) or Long.MaxValue if pid's terminator isn't in
+    // this response (consumer still needs the entry to mark forward records pending the marker
+    // arriving on a future fetch).
+    //
+    // Control batches (ABORT/COMMIT markers) are still excluded from "data visibility" — the
+    // marker by itself does not justify surfacing the aborted-tx entry. The marker IS used as
+    // the upper bound when scoping the transaction range.
     def filterAbortedTransactionsByVisibleProducers(
         records: MemoryRecords,
         original: Optional[java.util.List[FetchResponseData.AbortedTransaction]]
@@ -1036,28 +1052,57 @@ class KafkaApis(val requestChannel: RequestChannel,
       if (!original.isPresent || original.get.isEmpty) {
         return original
       }
-      val survivingProducerIds = scala.collection.mutable.HashSet[Long]()
+      // Per-producer ordered (baseOffset, isControl, count) — cheap to build, walked at most once
+      // per AbortedTransaction entry. We sort by baseOffset because Kafka does not guarantee batch
+      // order on the wire matches log order, and the transaction-range search needs ordered scan.
+      val perProducer = scala.collection.mutable.HashMap[Long, scala.collection.mutable.ArrayBuffer[BatchInfo]]()
       records.batches().forEach { batch =>
-        if (!batch.isControlBatch && batch.hasProducerId) {
-          val count = batch.countOrNull()
-          // count==null means "unknown" (legacy v0/v1, which cannot carry transactional records
-          // anyway, so the path is effectively unreachable from a transactional fetch); treat
-          // conservatively as "has surviving data" to preserve correctness if it ever happens.
-          if (count == null || count.intValue() > 0) {
-            survivingProducerIds += batch.producerId()
-          }
+        if (batch.hasProducerId) {
+          val list = perProducer.getOrElseUpdate(batch.producerId(),
+            new scala.collection.mutable.ArrayBuffer[BatchInfo]())
+          list += new BatchInfo(batch.baseOffset(), batch.isControlBatch, batch.countOrNull())
         }
       }
-      if (survivingProducerIds.isEmpty) {
-        return Optional.of(java.util.Collections.emptyList[FetchResponseData.AbortedTransaction]())
-      }
+      perProducer.values.foreach(_.sortInPlaceBy(_.baseOffset))
+
       val filtered = new java.util.ArrayList[FetchResponseData.AbortedTransaction]()
       original.get.forEach { tx =>
-        if (survivingProducerIds.contains(tx.producerId)) {
+        val pidBatches = perProducer.get(tx.producerId)
+        if (pidBatches.isDefined && hasSurvivingDataInRange(pidBatches.get, tx.firstOffset)) {
           filtered.add(tx)
         }
       }
       Optional.of(filtered)
+    }
+
+    /** True iff the producer's sorted batch list contains at least one non-control batch with
+     *  baseOffset >= firstOffset and count > 0 (or count == null, treated conservatively as
+     *  surviving), occurring before the next control batch at or after firstOffset. The next
+     *  control batch is the ABORT/COMMIT marker terminating the transaction; everything past
+     *  it belongs to a different transaction or is post-tx and is not in this entry's range. */
+    def hasSurvivingDataInRange(batches: scala.collection.mutable.ArrayBuffer[BatchInfo],
+                                firstOffset: Long): Boolean = {
+      var i = 0
+      while (i < batches.length) {
+        val b = batches(i)
+        if (b.baseOffset >= firstOffset) {
+          if (b.isControl) {
+            // Terminator for this transaction reached before any surviving data — nothing to mark.
+            return false
+          }
+          // count==null is legacy v0/v1 magic that can't carry transactional batches; if it ever
+          // appears for a producer id, treat as surviving to stay correctness-safe.
+          if (b.count == null || b.count.intValue() > 0) {
+            return true
+          }
+        }
+        i += 1
+      }
+      // No terminator in this response. If we walked off the end seeing only fully-filtered
+      // data batches (count == 0) — the round-4 scrub stripped their producer_id, so they
+      // wouldn't be in this list — return false. If any non-empty data batch appeared in range,
+      // we already returned true above.
+      false
     }
 
     // the callback for process a fetch response, invoked before throttling

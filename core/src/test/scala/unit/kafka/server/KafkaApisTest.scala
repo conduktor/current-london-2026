@@ -5379,6 +5379,151 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testFetchFromViewFiltersAbortedTransactionsPerTransactionRangeNotPerProducer(): Unit = {
+    // Round-5 closed the leak where a producer with ALL its data filtered still surfaced an
+    // AbortedTransaction entry. The round-5 fix was producer-id-wide: keep the entry iff the
+    // producer has ANY non-empty data batch left. That is still wrong when the SAME producer has
+    // multiple transactions in the same fetch — a producer-id-wide check leaks the firstOffset of
+    // any aborted transaction whose data the predicate hid, as long as some OTHER transaction
+    // from that producer (visible or invisible) survives. Real-world reproducer: a producer that
+    // runs many short transactions over the same partition (typical for transactional outbox
+    // writers); each fetch can contain several producer-id-paired (firstOffset, ABORT marker)
+    // ranges, some predicate-visible, some not.
+    //
+    // The fix narrows visibility to the per-transaction RANGE: for an AbortedTransaction entry
+    // (pid, firstOffset), the consumer needs the entry iff there is at least one surviving
+    // non-control batch with that pid whose baseOffset is in [firstOffset, nextControlBatch(pid)),
+    // where nextControlBatch is the first control batch for pid with baseOffset >= firstOffset
+    // (i.e. the ABORT/COMMIT marker terminating THIS transaction). If the only thing in range is
+    // the terminating marker — no surviving data — the entry is pure leakage and must be dropped.
+    //
+    // Test layout: single producer 80. Two aborted transactions in the same fetch.
+    //   - TX1: data batch at offset 100, keep=false (predicate filters out)
+    //   - TX1 ABORT marker at offset 101
+    //   - TX2: data batch at offset 102, keep=true (predicate retains)
+    //   - TX2 ABORT marker at offset 103
+    // abortedTransactions = [(80, 100), (80, 102)]
+    //
+    // Producer-id-wide check (round-5): pid=80 has surviving data (TX2's record) ⇒ keep both
+    //   entries ⇒ LEAK: (80, 100) broadcast for an aborted transaction whose data the predicate
+    //   gated.
+    // Range-aware check (this round): for (80, 100) the next pid=80 batch with offset >= 100 is
+    //   the ABORT marker at 101 (control) → no surviving data in [100, 101) → drop.
+    //   For (80, 102) the next batch is the data batch at 102 (non-control, count=1) → keep.
+    val viewTopic = "txn-perrange-view"
+    val backingTopic = "txn-perrange-backing"
+    val viewTopicId = Uuid.randomUuid()
+    val backingTopicId = Uuid.randomUuid()
+
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, backingTopic)
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.keep == true")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+
+    addTopicToMetadataCache(viewTopic, numPartitions = 1, topicId = viewTopicId)
+    addTopicToMetadataCache(backingTopic, numPartitions = 1, topicId = backingTopicId)
+
+    val viewTpId = new TopicIdPartition(viewTopicId, new TopicPartition(viewTopic, 0))
+    val backingTpId = new TopicIdPartition(backingTopicId, new TopicPartition(backingTopic, 0))
+
+    val pid = 80L
+    val epoch = 0.toShort
+
+    val tx1Data = MemoryRecords.withTransactionalRecords(
+      100L, Compression.NONE, pid, epoch,
+      /* baseSequence  = */ 0,
+      /* partitionLeaderEpoch = */ 0,
+      new SimpleRecord("{\"keep\":false}".getBytes(StandardCharsets.UTF_8)))
+    val tx1Abort = MemoryRecords.withEndTransactionMarker(
+      /* initialOffset = */ 101L, /* timestamp = */ 0L,
+      /* partitionLeaderEpoch = */ 0, pid, epoch,
+      new EndTransactionMarker(ControlRecordType.ABORT, 0))
+    val tx2Data = MemoryRecords.withTransactionalRecords(
+      102L, Compression.NONE, pid, epoch,
+      /* baseSequence  = */ 1,
+      /* partitionLeaderEpoch = */ 0,
+      new SimpleRecord("{\"keep\":true}".getBytes(StandardCharsets.UTF_8)))
+    val tx2Abort = MemoryRecords.withEndTransactionMarker(
+      /* initialOffset = */ 103L, /* timestamp = */ 0L,
+      /* partitionLeaderEpoch = */ 0, pid, epoch,
+      new EndTransactionMarker(ControlRecordType.ABORT, 0))
+
+    val combined = java.nio.ByteBuffer.allocate(
+      tx1Data.sizeInBytes() + tx1Abort.sizeInBytes() + tx2Data.sizeInBytes() + tx2Abort.sizeInBytes())
+    combined.put(tx1Data.buffer().duplicate())
+    combined.put(tx1Abort.buffer().duplicate())
+    combined.put(tx2Data.buffer().duplicate())
+    combined.put(tx2Abort.buffer().duplicate())
+    combined.flip()
+    val backingRecords = MemoryRecords.readableRecords(combined)
+
+    val abortedTxns = List(
+      new FetchResponseData.AbortedTransaction().setProducerId(pid).setFirstOffset(100L),
+      new FetchResponseData.AbortedTransaction().setProducerId(pid).setFirstOffset(102L)
+    ).asJava
+
+    when(replicaManager.fetchMessages(
+      any[FetchParams],
+      any[Seq[(TopicIdPartition, FetchRequest.PartitionData)]],
+      any[ReplicaQuota],
+      any[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]()
+    )).thenAnswer(invocation => {
+      val callback = invocation.getArgument(3).asInstanceOf[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]
+      callback(Seq(backingTpId -> new FetchPartitionData(
+        Errors.NONE,
+        200L,                                  // highWatermark
+        0L,                                    // logStartOffset
+        backingRecords,
+        Optional.empty(),
+        OptionalLong.of(200L),                 // LSO
+        Optional.of(abortedTxns),
+        OptionalInt.empty(),
+        false)))
+    })
+
+    val fetchData = Map(viewTpId -> new FetchRequest.PartitionData(viewTopicId, 0, 0, 1000, Optional.empty())).asJava
+    val fetchDataBuilder = Map(viewTpId.topicPartition -> new FetchRequest.PartitionData(viewTopicId, 0, 0, 1000, Optional.empty())).asJava
+    val fetchMetadata = new JFetchMetadata(0, 0)
+    val fetchContext = new FullFetchContext(time, new FetchSessionCacheShard(1000, 100),
+      fetchMetadata, fetchData, true, false)
+    when(fetchManager.newContext(any[Short], any[JFetchMetadata], any[Boolean],
+      any[util.Map[TopicIdPartition, FetchRequest.PartitionData]],
+      any[util.List[TopicIdPartition]],
+      any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val fetchRequest = new FetchRequest.Builder(ApiKeys.FETCH.latestVersion, ApiKeys.FETCH.latestVersion,
+      -1, -1, 100, 0, fetchDataBuilder).isolationLevel(IsolationLevel.READ_COMMITTED).build()
+    val request = buildRequest(fetchRequest)
+    stubBackingPartitionsLocal()
+    kafkaApis = createKafkaApis(configRepository = configRepository)
+    kafkaApis.handleFetchRequest(request)
+
+    val response = verifyNoThrottling[FetchResponse](request)
+    val responseData = response.responseData(metadataCache.topicIdsToNames(), ApiKeys.FETCH.latestVersion)
+    val partitionData = responseData.get(viewTpId.topicPartition)
+    assertEquals(Errors.NONE.code, partitionData.errorCode)
+
+    val outAborted = partitionData.abortedTransactions
+    assertNotNull(outAborted,
+      "abortedTransactions must still be present (non-null) — the filter only drops entries " +
+        "whose specific transaction has no surviving data in range")
+    // Producer-id-wide check would have kept BOTH entries — the load-bearing pin is that
+    // size==1 and the surviving entry is the one for TX2.
+    assertEquals(1, outAborted.size,
+      "exactly one entry must survive — the TX1 entry must be dropped because no data of TX1 " +
+        "is visible to the consumer after the predicate filter")
+    val survivor = outAborted.get(0)
+    assertEquals(pid, survivor.producerId)
+    assertEquals(102L, survivor.firstOffset,
+      "the surviving entry is TX2's (firstOffset 102) — TX1's entry (firstOffset 100) is gated " +
+        "by the predicate, so leaking it would broadcast (producerId, firstOffset) for a " +
+        "transaction whose data the consumer is supposed to never see.")
+  }
+
+  @Test
   def testFollowerFetchOnViewTopicIsNotRewritten(): Unit = {
     // Views are a consumer-side concept; follower replication mirrors the physical (backing)
     // topic. A follower asking for a view topic must NOT trigger view redirect, because:
