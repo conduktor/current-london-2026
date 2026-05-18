@@ -2787,6 +2787,24 @@ class KafkaApis(val requestChannel: RequestChannel,
     // If this is considered to leak information about the broker version a workaround is to use SSL
     // with client authentication which is performed at an earlier stage of the connection where the
     // ApiVersionRequest is not available.
+    //
+    // Multi-tenancy filter: when the request arrives on a tenant-bound
+    // listener OR carries a `__tenant_` principal (`effectiveTenant.isPresent`),
+    // restrict the advertised surface to KafkaApis.TENANT_ALLOWED_APIS.
+    // Reasons:
+    //   (a) Honest tenant clients (admin / streams / connect) discover the
+    //       surface through ApiVersions; advertising APIs the dispatch gate
+    //       (line ~685) will then refuse causes confusing wire-level errors
+    //       and noisy log spam.
+    //   (b) Advertising the FULL broker surface leaks capability fingerprint
+    //       — controller APIs, share-group APIs, internal txn-coordinator
+    //       APIs — useful only as reconnaissance for a tenant attacker. The
+    //       dispatch gate already refuses these requests but the response of
+    //       this handler itself is a separate channel.
+    // Note: the filter is keyed on listener binding too, so an unauthenticated
+    // client probing a tenant listener gets the same filtered view as a
+    // post-auth tenant principal. This matches the rest of the branch where
+    // the listener owns the tenant binding (see TenantContext.effectiveTenant).
     def createResponseCallback(requestThrottleMs: Int): ApiVersionsResponse = {
       val apiVersionRequest = request.body[ApiVersionsRequest]
       if (apiVersionRequest.hasUnsupportedRequestVersion) {
@@ -2794,7 +2812,19 @@ class KafkaApis(val requestChannel: RequestChannel,
       } else if (!apiVersionRequest.isValid) {
         apiVersionRequest.getErrorResponse(requestThrottleMs, Errors.INVALID_REQUEST.exception)
       } else {
-        apiVersionManager.apiVersionResponse(requestThrottleMs, request.header.apiVersion() < 4)
+        val response = apiVersionManager.apiVersionResponse(requestThrottleMs, request.header.apiVersion() < 4)
+        val tenantCtx = tenantContextFor(request)
+        if (tenantCtx.effectiveTenant.isPresent) {
+          val allowed = KafkaApis.TENANT_ALLOWED_APIS
+          val iter = response.data.apiKeys.iterator
+          while (iter.hasNext) {
+            val entry = iter.next
+            if (!allowed.contains(ApiKeys.forId(entry.apiKey))) {
+              iter.remove()
+            }
+          }
+        }
+        response
       }
     }
     requestHelper.sendResponseMaybeThrottle(request, createResponseCallback)

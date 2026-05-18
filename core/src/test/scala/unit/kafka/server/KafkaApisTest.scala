@@ -12030,6 +12030,92 @@ class KafkaApisTest extends Logging {
     verify(groupCoordinator, never()).describeGroups(any[RequestContext](), any[util.List[String]]())
   }
 
+  @Test
+  def testApiVersionsTenantFiltersResponseToAllowedSurface(): Unit = {
+    // A tenant-bound client (or anyone connecting to a tenant-bound listener
+    // pre-auth) must only see APIs in TENANT_ALLOWED_APIS. Advertising the
+    // full broker surface leaks capability fingerprint AND points honest
+    // tenants at APIs the dispatch gate will refuse — wasting a round-trip
+    // and producing noisy errors.
+    val apiVersionsRequest = new ApiVersionsRequest.Builder().build()
+    val request = buildRequest(
+      apiVersionsRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), any[Long])).thenReturn(0)
+
+    kafkaApis = createKafkaApis(
+      authorizer = None,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleApiVersionsRequest(request)
+
+    val response = verifyNoThrottling[ApiVersionsResponse](request)
+    val advertised = response.data.apiKeys.asScala.map(v => ApiKeys.forId(v.apiKey)).toSet
+    assertEquals(KafkaApis.TENANT_ALLOWED_APIS, advertised,
+      "tenant ApiVersions response must advertise exactly the allow-list, not the full broker surface")
+  }
+
+  @Test
+  def testApiVersionsTenantListenerPreAuthAlsoFiltersResponse(): Unit = {
+    // Pre-SASL handshake, principal is ANONYMOUS but the listener is already
+    // tenant-bound. The filter must fire on listener binding alone — a tenant
+    // client connecting to TENANT_LISTENER gets a filtered surface BEFORE its
+    // SASL handshake completes, so the negotiation itself only references the
+    // APIs it is allowed to invoke. Mirrors TenantContext.effectiveTenant
+    // semantics where the listener owns the binding when the principal is
+    // plain.
+    val apiVersionsRequest = new ApiVersionsRequest.Builder().build()
+    val request = buildRequest(
+      apiVersionsRequest,
+      listenerName = TENANT_LISTENER,
+      principal = KafkaPrincipal.ANONYMOUS)
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), any[Long])).thenReturn(0)
+
+    kafkaApis = createKafkaApis(
+      authorizer = None,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleApiVersionsRequest(request)
+
+    val response = verifyNoThrottling[ApiVersionsResponse](request)
+    val advertised = response.data.apiKeys.asScala.map(v => ApiKeys.forId(v.apiKey)).toSet
+    assertEquals(KafkaApis.TENANT_ALLOWED_APIS, advertised,
+      "pre-auth ApiVersions on a tenant listener must be filtered to the allow-list")
+    assertTrue(advertised.contains(ApiKeys.SASL_HANDSHAKE),
+      "SASL_HANDSHAKE must remain advertised so the client can complete the handshake")
+    assertTrue(advertised.contains(ApiKeys.SASL_AUTHENTICATE),
+      "SASL_AUTHENTICATE must remain advertised so the client can complete the handshake")
+  }
+
+  @Test
+  def testApiVersionsNonTenantListenerReturnsFullSurface(): Unit = {
+    // Cluster-wide (admin) listener with no tenant binding: the response must
+    // advertise the full broker surface unchanged. This is the existing
+    // behaviour the multi-tenancy change must not regress.
+    val apiVersionsRequest = new ApiVersionsRequest.Builder().build()
+    val request = buildRequest(apiVersionsRequest) // default: cluster-wide listener, "Alice"
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), any[Long])).thenReturn(0)
+
+    kafkaApis = createKafkaApis(
+      authorizer = None,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleApiVersionsRequest(request)
+
+    val response = verifyNoThrottling[ApiVersionsResponse](request)
+    val advertised = response.data.apiKeys.asScala.map(v => ApiKeys.forId(v.apiKey)).toSet
+    // Sanity: the unfiltered surface is a strict superset of the allow-list
+    // AND includes APIs we know the tenant filter would strip.
+    assertTrue(KafkaApis.TENANT_ALLOWED_APIS.subsetOf(advertised),
+      "unfiltered response must include every tenant-allowed API")
+    assertTrue(advertised.contains(ApiKeys.DESCRIBE_GROUPS),
+      "unfiltered response must include DESCRIBE_GROUPS (not in TENANT_ALLOWED_APIS)")
+  }
+
   // ---------------------------------------------------------------------------
   // Reserved-physical-form guard — applies to every v1 surface
   //
