@@ -540,4 +540,148 @@ public class ConcentrationKernelTest {
             () -> kernel.reserveProduceBatch("orders", 0, 3));
         kernel = null;
     }
+
+    // ---- Idempotent retry cache (v1 fix for PROMPT scenario 6) ----
+
+    @Test
+    public void lookupIdempotentBatchReturnsEmptyBeforeAnyRecord() {
+        // Cache miss on a never-seen producerId. The broker reads "empty" as "go down the
+        // reserve+stamp+append path" — there's no shortcut to take.
+        kernel.declare(descriptor("orders", 4, "shared", 1));
+        IdempotentBatchKey key = new IdempotentBatchKey(42L, (short) 0, 0, 2);
+        assertTrue(kernel.lookupIdempotentBatch("orders", 0, key).isEmpty());
+    }
+
+    @Test
+    public void recordThenLookupIdempotentBatchReturnsExactResult() {
+        // After a successful commit, the broker records the (key, result) pair. A subsequent
+        // retry sees a hit and returns the SAME logical offsets — never reserving new ones.
+        kernel.declare(descriptor("orders", 4, "shared", 1));
+        IdempotentBatchKey key = new IdempotentBatchKey(42L, (short) 0, 0, 2);
+        IdempotentBatchResult result = new IdempotentBatchResult(500L, 502L, 0L, 1700000000000L);
+        kernel.recordIdempotentBatch("orders", 0, key, result);
+
+        IdempotentBatchResult hit = kernel.lookupIdempotentBatch("orders", 0, key).orElseThrow();
+        assertEquals(500L, hit.logicalBaseOffset());
+        assertEquals(502L, hit.logicalLastOffset());
+        assertEquals(0L, hit.logStartOffset());
+        assertEquals(1700000000000L, hit.logAppendTime());
+    }
+
+    @Test
+    public void differentEpochIsACacheMiss() {
+        // Idempotent epoch bump (Producer.flush + restart of producerId session) MUST reset the
+        // dedup window — a producer with a new epoch is functionally a fresh producer and its
+        // sequence numbers start over. Caching across epoch would wrongly short-circuit valid
+        // appends from the new session.
+        kernel.declare(descriptor("orders", 4, "shared", 1));
+        IdempotentBatchKey original = new IdempotentBatchKey(42L, (short) 0, 0, 2);
+        kernel.recordIdempotentBatch("orders", 0, original,
+            new IdempotentBatchResult(500L, 502L, 0L, 1L));
+
+        IdempotentBatchKey newEpoch = new IdempotentBatchKey(42L, (short) 1, 0, 2);
+        assertTrue(kernel.lookupIdempotentBatch("orders", 0, newEpoch).isEmpty(),
+            "epoch bump must invalidate the cache hit");
+    }
+
+    @Test
+    public void differentSequenceRangeIsACacheMiss() {
+        // The cache key includes BOTH baseSequence and lastSequence — a partial overlap (e.g.,
+        // sequences 0..2 already cached, retry now sending 1..3) is a brand-new batch and must
+        // not hit. The backing log treats it as new too.
+        kernel.declare(descriptor("orders", 4, "shared", 1));
+        kernel.recordIdempotentBatch("orders", 0,
+            new IdempotentBatchKey(42L, (short) 0, 0, 2),
+            new IdempotentBatchResult(500L, 502L, 0L, 1L));
+
+        assertTrue(kernel.lookupIdempotentBatch("orders", 0,
+            new IdempotentBatchKey(42L, (short) 0, 1, 3)).isEmpty(),
+            "different sequence range must be a cache miss");
+    }
+
+    @Test
+    public void cacheCapacityIsCappedAtFivePerProducer() {
+        // Matches UnifiedLog.ProducerStateEntry.NUM_BATCHES_TO_RETAIN. Caching deeper than the
+        // backing log would risk a false-positive on producer.id wraparound after long idle —
+        // we'd hit our cache for a batch the backing has long since forgotten.
+        kernel.declare(descriptor("orders", 4, "shared", 1));
+        for (int i = 0; i < 6; i++) {
+            IdempotentBatchKey key = new IdempotentBatchKey(42L, (short) 0, i, i);
+            kernel.recordIdempotentBatch("orders", 0, key,
+                new IdempotentBatchResult(500L + i, 500L + i, 0L, 1L));
+        }
+        // Oldest (seq=0) evicted; seq=1..5 retained.
+        assertTrue(kernel.lookupIdempotentBatch("orders", 0,
+            new IdempotentBatchKey(42L, (short) 0, 0, 0)).isEmpty(),
+            "FIFO eviction must drop the oldest entry once the 6th lands");
+        for (int i = 1; i <= 5; i++) {
+            assertEquals(500L + i,
+                kernel.lookupIdempotentBatch("orders", 0,
+                    new IdempotentBatchKey(42L, (short) 0, i, i))
+                    .orElseThrow().logicalBaseOffset(),
+                "seq=" + i + " must still be cached");
+        }
+    }
+
+    @Test
+    public void differentProducerIdsAreIsolated() {
+        // Two producers sharing a logical partition must NOT cross-contaminate cache state — a
+        // producer.id collision would otherwise resurface stale entries from a long-dead producer.
+        kernel.declare(descriptor("orders", 4, "shared", 1));
+        kernel.recordIdempotentBatch("orders", 0,
+            new IdempotentBatchKey(42L, (short) 0, 0, 0),
+            new IdempotentBatchResult(500L, 500L, 0L, 1L));
+        kernel.recordIdempotentBatch("orders", 0,
+            new IdempotentBatchKey(99L, (short) 0, 0, 0),
+            new IdempotentBatchResult(501L, 501L, 0L, 1L));
+        assertEquals(500L, kernel.lookupIdempotentBatch("orders", 0,
+            new IdempotentBatchKey(42L, (short) 0, 0, 0)).orElseThrow().logicalBaseOffset());
+        assertEquals(501L, kernel.lookupIdempotentBatch("orders", 0,
+            new IdempotentBatchKey(99L, (short) 0, 0, 0)).orElseThrow().logicalBaseOffset());
+    }
+
+    @Test
+    public void differentLogicalPartitionsAreIsolated() {
+        // A retry against partition 1 must NOT hit the cache populated by partition 0 — the
+        // logical-partition scoping is what lets two stock producers share a backing without
+        // their idempotent state leaking across the demultiplexing boundary.
+        kernel.declare(descriptor("orders", 4, "shared", 1));
+        IdempotentBatchKey key = new IdempotentBatchKey(42L, (short) 0, 0, 0);
+        kernel.recordIdempotentBatch("orders", 0, key,
+            new IdempotentBatchResult(500L, 500L, 0L, 1L));
+        assertTrue(kernel.lookupIdempotentBatch("orders", 1, key).isEmpty(),
+            "partition scoping must isolate cache entries");
+    }
+
+    @Test
+    public void removeLogicalPartitionPurgesIdempotentCache() throws IOException {
+        // Without cache cleanup the kernel would leak entries proportional to total producer.ids
+        // seen on a partition over the broker's lifetime — even after the partition is gone.
+        kernel.declare(descriptor("orders", 4, "shared", 1));
+        kernel.commitProduce(kernel.reserveProduce("orders", 0), 100L);
+        IdempotentBatchKey key = new IdempotentBatchKey(42L, (short) 0, 0, 0);
+        kernel.recordIdempotentBatch("orders", 0, key,
+            new IdempotentBatchResult(0L, 0L, 0L, 1L));
+        assertTrue(kernel.lookupIdempotentBatch("orders", 0, key).isPresent());
+        assertTrue(kernel.removeLogicalPartition("orders", 0));
+        assertTrue(kernel.lookupIdempotentBatch("orders", 0, key).isEmpty(),
+            "removeLogicalPartition must drop the idempotent cache for that partition");
+    }
+
+    @Test
+    public void recordIdempotentBatchAfterCloseIsRejected() {
+        // Closed kernel must refuse cache writes — the underlying maps may still be held by
+        // sidebar code, but the kernel's contract is "no operations after close()".
+        kernel.declare(descriptor("orders", 4, "shared", 1));
+        try {
+            kernel.close();
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+        assertThrows(IllegalStateException.class,
+            () -> kernel.recordIdempotentBatch("orders", 0,
+                new IdempotentBatchKey(42L, (short) 0, 0, 0),
+                new IdempotentBatchResult(0L, 0L, 0L, 1L)));
+        kernel = null;
+    }
 }

@@ -18,10 +18,12 @@ package org.apache.kafka.storage.internals.concentration;
 
 import java.io.File;
 import java.io.IOException;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.Optional;
@@ -67,10 +69,29 @@ public final class ConcentrationKernel implements AutoCloseable {
      */
     public static final String SIDECAR_DIR_NAME = "_concentration_sidecars";
 
+    /**
+     * Per-(logicalTopic, logicalPartition, producerId) retention of the last
+     * {@value #MAX_BATCHES_PER_PRODUCER} idempotent batches. Mirrors UnifiedLog's
+     * {@code ProducerStateEntry.NUM_BATCHES_TO_RETAIN}: that's the dedup window the backing log
+     * uses, and we must NOT cache more aggressively than the backing log — caching a batch that
+     * the backing has already evicted would risk a false-positive hit on a producer.id wraparound
+     * after a long quiet period.
+     */
+    private static final int MAX_BATCHES_PER_PRODUCER = 5;
+
     private final LogicalTopicRegistry registry = new LogicalTopicRegistry();
     private final LogicalOffsetTracker tracker = new LogicalOffsetTracker();
     private final BackingScanRecoverer recoverer;
     private final ConcurrentHashMap<LogicalPartition, LogicalSidecarIndex> sidecars = new ConcurrentHashMap<>();
+    /**
+     * Outer key: logical partition. Inner key: producerId. Value: bounded deque (FIFO, max
+     * {@link #MAX_BATCHES_PER_PRODUCER}) of recent batches. Access is serialised on the inner
+     * deque — concurrent produces against the same producerId already serialise at the tracker
+     * level, and the cost of synchronizing a deque is negligible compared to the produce path's
+     * I/O. The outer maps are concurrent so cross-partition produces don't contend.
+     */
+    private final ConcurrentHashMap<LogicalPartition, ConcurrentHashMap<Long, ArrayDeque<Map.Entry<IdempotentBatchKey, IdempotentBatchResult>>>>
+        idempotentCache = new ConcurrentHashMap<>();
     private volatile boolean closed = false;
 
     public ConcentrationKernel(File sidecarDir) {
@@ -216,6 +237,80 @@ public final class ConcentrationKernel implements AutoCloseable {
         tracker.rollbackBatch(batch);
     }
 
+    // ------------------ Idempotent retry dedup ------------------
+
+    /**
+     * Look up a prior result for this idempotent batch on this logical partition. Returns empty
+     * if the batch has never been recorded (either a fresh produce, or evicted from the bounded
+     * cache). Pure read — does not mutate cache state.
+     *
+     * <p>v1 contract: this is the FIRST check the broker should make before reserving logical
+     * offsets. A cache hit means the producer is retrying a batch that was already successfully
+     * appended; we must short-circuit the produce path and return the original logical offsets
+     * rather than reserving fresh ones — otherwise {@code nextLogicalOffset} jumps without
+     * matching records on the backing log, breaking the contiguity invariant (PROMPT.md scenario
+     * 6). The backing log's {@code ProducerStateManager} will independently dedup if we somehow
+     * still forwarded the batch, but by then we'd have wasted offsets.
+     */
+    public Optional<IdempotentBatchResult> lookupIdempotentBatch(String logicalTopic,
+                                                                  int logicalPartition,
+                                                                  IdempotentBatchKey key) {
+        Objects.requireNonNull(logicalTopic, "logicalTopic");
+        Objects.requireNonNull(key, "key");
+        ConcurrentHashMap<Long, ArrayDeque<Map.Entry<IdempotentBatchKey, IdempotentBatchResult>>> perProducer =
+            idempotentCache.get(new LogicalPartition(logicalTopic, logicalPartition));
+        if (perProducer == null) return Optional.empty();
+        ArrayDeque<Map.Entry<IdempotentBatchKey, IdempotentBatchResult>> deque = perProducer.get(key.producerId());
+        if (deque == null) return Optional.empty();
+        synchronized (deque) {
+            for (Map.Entry<IdempotentBatchKey, IdempotentBatchResult> e : deque) {
+                if (e.getKey().equals(key)) return Optional.of(e.getValue());
+            }
+        }
+        return Optional.empty();
+    }
+
+    /**
+     * Record a successful commit so a subsequent retry sees a cache hit. Capacity-bounded per
+     * producer to {@link #MAX_BATCHES_PER_PRODUCER}; the oldest entry is evicted on overflow.
+     *
+     * <p>Ordering invariant: the broker must call this AFTER
+     * {@link #commitProduceBatch(Reservation[], long)} returns successfully. Recording before the
+     * sidecar is durably appended would leave a phantom hit on crash-and-restart: the cache is
+     * in-memory only, but a crash between cache-write and sidecar-write would lose the sidecar
+     * record while the cache had already been populated had we ordered them the other way — and
+     * any future retry would then return offsets that don't resolve on fetch.
+     */
+    public void recordIdempotentBatch(String logicalTopic,
+                                      int logicalPartition,
+                                      IdempotentBatchKey key,
+                                      IdempotentBatchResult result) {
+        ensureOpen();
+        Objects.requireNonNull(logicalTopic, "logicalTopic");
+        Objects.requireNonNull(key, "key");
+        Objects.requireNonNull(result, "result");
+        LogicalPartition partitionKey = new LogicalPartition(logicalTopic, logicalPartition);
+        ConcurrentHashMap<Long, ArrayDeque<Map.Entry<IdempotentBatchKey, IdempotentBatchResult>>> perProducer =
+            idempotentCache.computeIfAbsent(partitionKey, k -> new ConcurrentHashMap<>());
+        ArrayDeque<Map.Entry<IdempotentBatchKey, IdempotentBatchResult>> deque =
+            perProducer.computeIfAbsent(key.producerId(), k -> new ArrayDeque<>(MAX_BATCHES_PER_PRODUCER));
+        synchronized (deque) {
+            // Replace if same key already present (same retry hitting the cache write path twice
+            // — should not happen given the broker contract, but defensive against double-commit).
+            Iterator<Map.Entry<IdempotentBatchKey, IdempotentBatchResult>> it = deque.iterator();
+            while (it.hasNext()) {
+                if (it.next().getKey().equals(key)) {
+                    it.remove();
+                    break;
+                }
+            }
+            deque.addLast(Map.entry(key, result));
+            while (deque.size() > MAX_BATCHES_PER_PRODUCER) {
+                deque.pollFirst();
+            }
+        }
+    }
+
     // ------------------ Fetch path ------------------
 
     /**
@@ -279,6 +374,13 @@ public final class ConcentrationKernel implements AutoCloseable {
         // outstanding reservation indicates a still-live produce) which propagates without
         // having touched anything yet.
         if (tracker.removePartition(logicalTopic, logicalPartition)) {
+            removedAny = true;
+        }
+        // Purge the idempotent retry cache for this partition. If the partition is being torn
+        // down, future produces against it are by definition new — keeping stale entries would
+        // be a memory leak proportional to the (logicalTopic, logicalPartition, producerId)
+        // tuple count over the broker's lifetime.
+        if (idempotentCache.remove(key) != null) {
             removedAny = true;
         }
         LogicalSidecarIndex sidecar = sidecars.remove(key);
