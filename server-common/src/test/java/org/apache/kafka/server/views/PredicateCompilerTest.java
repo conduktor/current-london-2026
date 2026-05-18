@@ -182,6 +182,48 @@ class PredicateCompilerTest {
     }
 
     @Test
+    void rejectsLongUnaryChainBeforeParserStackOverflow() {
+        // Mirrors the paren-depth defense: a long chain of unary `!` operators would recurse
+        // once per character in parseUnary() before any node-count or post-parse depth check
+        // fires (those are bottom-up; the recursion is already source-length-deep by then).
+        // With a 4KB maxSourceLength a 4000-character chain of `!` could push thousands of
+        // recursive frames onto the JVM stack. The unary-depth cap ensures parseUnary trips
+        // a clean validation error first.
+        PredicateCompiler defaultCompiler = new PredicateCompiler(PredicateLimits.defaults());
+        StringBuilder hostile = new StringBuilder(4000);
+        int layers = 1024; // well over the 32-default maxParenDepth-shared cap
+        for (int j = 0; j < layers; j++) hostile.append('!');
+        hostile.append("true");
+        PredicateValidationException ex = assertThrows(PredicateValidationException.class,
+                () -> defaultCompiler.compile(hostile.toString()));
+        assertTrue(ex.getMessage().toLowerCase(Locale.ROOT).contains("unary"),
+                () -> "expected unary-nesting error, got: " + ex.getMessage());
+    }
+
+    @Test
+    void rejectsLongUnaryMinusChain() {
+        // Same defense for unary minus (`-`).
+        PredicateCompiler defaultCompiler = new PredicateCompiler(PredicateLimits.defaults());
+        StringBuilder hostile = new StringBuilder(200);
+        // 100 layers of unary minus chains. Each '-' triggers a parseUnary recursion.
+        for (int j = 0; j < 100; j++) hostile.append('-');
+        hostile.append("body.x");
+        hostile.append(" == 1");
+        PredicateValidationException ex = assertThrows(PredicateValidationException.class,
+                () -> defaultCompiler.compile(hostile.toString()));
+        assertTrue(ex.getMessage().toLowerCase(Locale.ROOT).contains("unary"),
+                () -> "expected unary-nesting error, got: " + ex.getMessage());
+    }
+
+    @Test
+    void shortUnaryChainParsesSuccessfully() {
+        // Sanity: small unary chains inside the cap compile fine.
+        PredicateCompiler defaultCompiler = new PredicateCompiler(PredicateLimits.defaults());
+        assertNotNull(defaultCompiler.compile("!!body.flag"));
+        assertNotNull(defaultCompiler.compile("--body.x == 1"));
+    }
+
+    @Test
     void deepParensWithinLimitParseSuccessfully() {
         // Sanity: parens inside the cap parse fine — the AST-depth check ignores parens
         // (see Parser#treeDepth), so the predicate compiles even though the source contains

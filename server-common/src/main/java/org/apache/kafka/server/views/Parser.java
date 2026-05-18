@@ -58,6 +58,16 @@ final class Parser {
      * before the recursive descent overflowed the JVM stack.
      */
     private int parenDepth = 0;
+    /**
+     * Live count of nested unary operators (`!`/`-`) while parsing. Capped by
+     * {@link PredicateLimits#maxParenDepth} (shared with parens — both are structural
+     * recursion limits with the same intent). Without this, an adversarial source like
+     * `!!!!!!...!!!!body.x` would recurse once per `!` before any node-count or post-parse
+     * depth check fires: {@code node()} is called on the way back UP the stack, so the
+     * recursion has already gone {@code source.length()} deep by the time the limit trips.
+     * Pre-incrementing here keeps stack depth bounded independent of source length.
+     */
+    private int unaryDepth = 0;
 
     Parser(List<Token> tokens, PredicateLimits limits) {
         this.tokens = tokens;
@@ -162,13 +172,19 @@ final class Parser {
     }
 
     private Ast.Node parseUnary() {
-        if (peek().kind == Kind.NOT) {
+        if (peek().kind == Kind.NOT || peek().kind == Kind.MINUS) {
+            Token t = peek();
+            Ast.Unary.Op op = t.kind == Kind.NOT ? Ast.Unary.Op.NOT : Ast.Unary.Op.NEG;
+            unaryDepth++;
+            if (unaryDepth > limits.maxParenDepth) {
+                throw new PredicateValidationException(
+                        "predicate exceeds unary-nesting limit " + limits.maxParenDepth
+                                + " at position " + t.pos);
+            }
             consume();
-            return node(new Ast.Unary(Ast.Unary.Op.NOT, parseUnary()));
-        }
-        if (peek().kind == Kind.MINUS) {
-            consume();
-            return node(new Ast.Unary(Ast.Unary.Op.NEG, parseUnary()));
+            Ast.Node operand = parseUnary();
+            unaryDepth--;
+            return node(new Ast.Unary(op, operand));
         }
         return parsePrimary();
     }
