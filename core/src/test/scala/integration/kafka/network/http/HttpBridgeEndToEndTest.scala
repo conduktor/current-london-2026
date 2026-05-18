@@ -22,6 +22,7 @@ import org.apache.kafka.clients.admin.{Admin, NewTopic}
 import org.apache.kafka.clients.consumer.{ConsumerConfig, KafkaConsumer}
 import org.apache.kafka.common.TopicPartition
 import org.apache.kafka.common.acl.AclOperation
+import org.apache.kafka.common.quota.{ClientQuotaAlteration, ClientQuotaEntity, ClientQuotaFilter, ClientQuotaFilterComponent}
 import org.apache.kafka.common.resource.ResourceType
 import org.apache.kafka.common.security.auth.KafkaPrincipal
 import org.apache.kafka.common.serialization.StringDeserializer
@@ -629,6 +630,114 @@ class HttpBridgeEndToEndTest {
       val secondNextCursor = secondJson.get("_links").get("next").asText()
       assertNotEquals(nextCursor, secondNextCursor,
         "second page's `next` cursor must advance past the new records, not echo the first page's cursor")
+    } finally {
+      cluster.close()
+    }
+  }
+
+  @Test
+  def quotaThrottleSurfacesRetryAfterOn200(): Unit = {
+    // PROMPT.md AC3 / FS3: when the broker's producer-byte-rate quota for `User:ANONYMOUS` is exceeded, the HTTP
+    // produce response is still 200 (Kafka considers throttled produces successful — records are written, offsets are
+    // assigned) but carries a `Retry-After` header so the client knows to back off. This is the only path in the
+    // bridge where a 200 response carries Retry-After; every other 200 response (an un-throttled produce) drops the
+    // hint. The unit layer covers this in ProduceResponseFormatterTest.positiveThrottleSetsRetryAfterOn200; this is
+    // the real-wire counterpart that exercises broker-side quota enforcement → ProduceResponse.throttleTimeMs →
+    // bridge → HTTP header end-to-end.
+    //
+    // Why the test is fast even with a tight quota: the bridge submitter wires a per-request completion callback
+    // through processor=-1 + memoryPool=NONE on the RequestChannel.Request. RequestChannel.sendResponse short-
+    // circuits on that callback — no Processor lookup, no channel muting, no response queueing. The broker computes
+    // the throttle and embeds it in the ProduceResponse, the callback fires immediately, and the bridge propagates
+    // throttleTimeMs to Retry-After. So a throttle of 18 000 ms (the magnitude this fixture produces) does NOT delay
+    // the HTTP response — it only sets the header.
+    val cluster = new KafkaClusterTestKit.Builder(
+      new TestKitNodes.Builder()
+        .setNumBrokerNodes(1)
+        .setNumControllerNodes(1)
+        .build())
+      .setConfigProp(SocketServerConfigs.HTTP_BRIDGE_ENABLED_CONFIG, "true")
+      .setConfigProp(SocketServerConfigs.HTTP_BRIDGE_HOST_CONFIG, "127.0.0.1")
+      .setConfigProp(SocketServerConfigs.HTTP_BRIDGE_PORT_CONFIG, "0")
+      .build()
+    val topicName = "http-bridge-quota"
+    try {
+      cluster.format()
+      cluster.startup()
+      cluster.waitForReadyBrokers()
+
+      val broker = cluster.brokers().get(0)
+      TestUtils.waitUntilTrue(() => broker.brokerState == BrokerState.RUNNING, "Broker never reached RUNNING.")
+      TestUtils.waitUntilTrue(() => broker.httpBridgeServer != null && broker.httpBridgeServer.boundPort() > 0,
+        "HTTP bridge never bound its port.")
+      val bridgePort = broker.httpBridgeServer.boundPort()
+
+      createTopic(cluster, topicName, partitions = 1)
+
+      // Provision a tight producer-byte-rate quota on User:ANONYMOUS. The bridge submits every HTTP request as
+      // ANONYMOUS, so this targets exactly the bridge's traffic. We pick 1024 B/s — small enough that any payload
+      // larger than the 11-second sliding window quota (11 × 1024 = 11 264 bytes) will trip a positive throttle on
+      // the first request, big enough to be a believable operator setting that isn't fighting the quota algorithm's
+      // sample-window edge cases at the bottom of the range.
+      val admin = Admin.create(cluster.clientProperties())
+      try {
+        val entity = new ClientQuotaEntity(Collections.singletonMap(ClientQuotaEntity.USER, "ANONYMOUS"))
+        val ops = Collections.singletonList(new ClientQuotaAlteration.Op("producer_byte_rate", 1024.0d))
+        admin.alterClientQuotas(Collections.singletonList(
+          new ClientQuotaAlteration(entity, ops))).all().get()
+        // Wait for the quota to land on the broker — alterClientQuotas's future completes when the controller wrote
+        // the metadata record, not necessarily when every broker has consumed it. Polling describeClientQuotas via
+        // an Admin client routed through the broker proves visibility from the broker's quota manager's perspective.
+        val filter = ClientQuotaFilter.containsOnly(Collections.singletonList(
+          ClientQuotaFilterComponent.ofEntity(ClientQuotaEntity.USER, "ANONYMOUS")))
+        TestUtils.waitUntilTrue(() => {
+          val described = admin.describeClientQuotas(filter).entities().get()
+          val ent = described.get(entity)
+          ent != null && ent.containsKey("producer_byte_rate")
+        }, "broker never saw producer_byte_rate quota for User:ANONYMOUS")
+      } finally {
+        admin.close()
+      }
+
+      // Build a single produce body large enough to clear the 11 264-byte window budget by a comfortable margin. The
+      // STRING envelope decodes directly to UTF-8 bytes (no Base64 round-trip on the inbound path — that only applies
+      // to the outbound BINARY envelope), so 24 KiB of ASCII "x" becomes ~24 KiB of record value bytes plus a small
+      // per-record header. We're comfortably above the 11 KiB window budget; the exact throttle magnitude is not
+      // load-bearing — the test only asserts it's positive — so the margin protects against future quota-window
+      // tuning shifting the threshold underneath us.
+      val padding = "x" * 24576
+      val body =
+        s"""
+           |{ "records": [ { "partition": 0, "value": { "type": "STRING", "data": "$padding" } } ] }
+           |""".stripMargin
+
+      val resp = postJson(s"http://127.0.0.1:$bridgePort/v1/topics/$topicName/records", body)
+      assertEquals(200, resp.statusCode(),
+        s"throttled produce must still be 200 (records were written, just rate-limited), body=${resp.body()}")
+
+      // PROMPT.md AC3: a positive throttleTimeMs from the broker MUST surface as a Retry-After header on the HTTP
+      // response. The unit-level mapping is covered by RetryAfterCalculator.forStatus(200, throttleMs); this
+      // assertion proves the broker → bridge → HTTP path actually delivers it end-to-end.
+      val retryAfter = resp.headers().firstValue("Retry-After")
+      assertTrue(retryAfter.isPresent,
+        s"throttled produce must surface Retry-After; headers=${resp.headers().map()}")
+      val seconds = retryAfter.get().toInt
+      // RetryAfterCalculator does ceil(throttleMs/1000) so the floor for any positive throttle is 1 second.
+      assertTrue(seconds >= 1,
+        s"Retry-After must be a positive seconds value (ceiling of throttleMs/1000), was: ${retryAfter.get()}")
+
+      // Sanity: the body is the standard success shape, not an error envelope. Throttled produces still return the
+      // per-partition offset block — they're not errors, just rate-limited successes.
+      val json = parseJson(resp.body())
+      assertEquals(topicName, json.get("topic").asText())
+      val results = json.get("results")
+      assertEquals(1, results.size())
+      val partResult = results.get(0)
+      assertEquals(0, partResult.get("partition").asInt())
+      assertEquals(0, partResult.get("errorCode").asInt(),
+        s"throttled produce records succeed on the broker side — errorCode must be 0, body=${resp.body()}")
+      assertEquals(0L, partResult.get("offset").asLong(),
+        "throttled produce still gets a real offset (Kafka writes the record then sends back the throttle hint)")
     } finally {
       cluster.close()
     }
