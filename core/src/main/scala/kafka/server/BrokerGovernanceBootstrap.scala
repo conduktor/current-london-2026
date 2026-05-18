@@ -143,11 +143,18 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
   // first drain that observes records on this partition exits the up-to-date
   // branch via the normal replay+commit path, which clears the flag.
   //
-  // A boolean field is sufficient (not AtomicBoolean) because drainOnce runs
-  // on a single-threaded executor (the broker's scheduler) — startup runs
-  // before the scheduler is armed, and the scheduler does not overlap calls
-  // with itself.
-  private var holdingStalePostTruncation: Boolean = false
+  // Cross-thread publication: drainStartup runs on the broker main thread
+  // (before scheduleOngoing is called), and subsequent drainOnce calls run on
+  // KafkaScheduler — a ScheduledThreadPoolExecutor backed by
+  // config.backgroundThreads workers. ScheduledExecutorService guarantees that
+  // successive executions of a single periodic task never overlap, but they
+  // may land on different worker threads. The JMM happens-before chain
+  // through the executor's work queue technically covers the field, but
+  // @volatile makes that intent explicit and survives any future refactor
+  // that calls drainOnce from a different thread (e.g. an admin path or a
+  // test harness). One keystroke, no measurable cost on a path that runs at
+  // most every few hundred ms. Codex adversarial-audit HIGH-1.
+  @volatile private var holdingStalePostTruncation: Boolean = false
 
   /**
    * Read every record from `nextOffset` to the current log-end offset, apply
