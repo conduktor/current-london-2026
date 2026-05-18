@@ -1359,6 +1359,23 @@ class KafkaApis(val requestChannel: RequestChannel,
                 // the replica-manager's duplicate handling for ordinary topics.
               } else if (viewDuplicatePartitionIndexes.contains(p.partitionIndex)) {
                 perPartitionErrors += buildErrorResponse(Errors.INVALID_REQUEST, p)
+              } else if (p.timestamp == ListOffsetsRequest.MAX_TIMESTAMP ||
+                         p.timestamp == ListOffsetsRequest.EARLIEST_LOCAL_TIMESTAMP ||
+                         p.timestamp == ListOffsetsRequest.LATEST_TIERED_TIMESTAMP) {
+                // MAX_TIMESTAMP / offsetsForTimes return the offset+timestamp of a SPECIFIC
+                // backing record. For views in source_sparse mode that record may have been
+                // filtered out by the predicate, so returning it would leak the existence and
+                // timestamp of a record the consumer is forbidden to read. Strip the timestamp
+                // in the response below; additionally reject MAX_TIMESTAMP outright since its
+                // semantics ("offset of the record with the maximum timestamp") are inherently
+                // defined over the backing topic — a view-aware "max-timestamp record" would
+                // need to scan and run the predicate over every backing record, which violates
+                // the cost/latency contract of ListOffsets.
+                //
+                // EARLIEST_LOCAL_TIMESTAMP / LATEST_TIERED_TIMESTAMP refer to tiered-storage
+                // boundaries inside the backing log; surfacing them through a view name would
+                // reveal backing tiering state that has no meaning at the view layer.
+                perPartitionErrors += buildErrorResponse(Errors.INVALID_REQUEST, p)
               } else {
                 val epochOpt: Optional[Integer] =
                   if (p.currentLeaderEpoch == ListOffsetsResponse.UNKNOWN_EPOCH) Optional.empty()
@@ -1458,10 +1475,19 @@ class KafkaApis(val requestChannel: RequestChannel,
           backingToView.get(topicResp.name) match {
             case Some(viewName) =>
               val stripped = topicResp.partitions.asScala.map { p =>
+                // Strip the response timestamp. EARLIEST/LATEST/EARLIEST_LOCAL/LATEST_TIERED
+                // return UNKNOWN_TIMESTAMP (-1) from the storage layer, so stripping is a
+                // no-op for them. offsetsForTimes (positive query timestamp) returns the
+                // actual timestamp of the next backing record at or after the queried time,
+                // which may have been filtered out by the view predicate — leaking that
+                // timestamp would reveal a filtered record's wall-clock metadata. Setting
+                // UNKNOWN_TIMESTAMP keeps the offset useful for seek-by-time (consumers
+                // already see backing offsets through the source_sparse Fetch path) without
+                // disclosing per-record timestamps the predicate is supposed to gate.
                 new ListOffsetsPartitionResponse()
                   .setPartitionIndex(p.partitionIndex)
                   .setErrorCode(p.errorCode)
-                  .setTimestamp(p.timestamp)
+                  .setTimestamp(ListOffsetsResponse.UNKNOWN_TIMESTAMP)
                   .setOffset(p.offset)
                   .setLeaderEpoch(ListOffsetsResponse.UNKNOWN_EPOCH)
               }

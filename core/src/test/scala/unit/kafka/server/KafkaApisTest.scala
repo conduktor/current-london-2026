@@ -6435,6 +6435,148 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testListOffsetsFromViewWithMaxTimestampIsRejectedAsInvalidRequest(): Unit = {
+    // ListOffsets MAX_TIMESTAMP returns the offset+timestamp of the SPECIFIC backing record with
+    // the maximum timestamp. For views in source_sparse mode that record may have been filtered
+    // out by the predicate — returning it would leak the existence/offset/timestamp of a record
+    // the consumer is forbidden to read. Beyond that, the semantics ("offset of the max-timestamp
+    // record") are inherently defined over the backing topic; a view-aware version would have to
+    // scan and run the predicate over every backing record, violating ListOffsets' cost contract.
+    // The handler must reject MAX_TIMESTAMP on a view with INVALID_REQUEST, never reaching
+    // ReplicaManager.fetchOffset on the backing.
+    val viewTopic = "list-max-ts-view"
+    val backingTopic = "list-max-ts-backing"
+    val viewTopicId = Uuid.randomUuid()
+    val backingTopicId = Uuid.randomUuid()
+
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, backingTopic)
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.x == 1")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+    addTopicToMetadataCache(viewTopic, numPartitions = 1, topicId = viewTopicId)
+    addTopicToMetadataCache(backingTopic, numPartitions = 1, topicId = backingTopicId)
+
+    when(replicaManager.getPartitionOrError(any[TopicPartition]))
+      .thenAnswer(_ => Right(mock(classOf[Partition])))
+
+    val targetTimes = List(new ListOffsetsTopic()
+      .setName(viewTopic)
+      .setPartitions(List(new ListOffsetsPartition()
+        .setPartitionIndex(0)
+        .setTimestamp(ListOffsetsRequest.MAX_TIMESTAMP)).asJava)).asJava
+    val listOffsetRequest = ListOffsetsRequest.Builder.forConsumer(true, IsolationLevel.READ_UNCOMMITTED)
+      .setTargetTimes(targetTimes).build()
+    val request = buildRequest(listOffsetRequest)
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+    kafkaApis = createKafkaApis(configRepository = configRepository)
+    kafkaApis.handleListOffsetRequest(request)
+
+    verify(replicaManager, never()).fetchOffset(
+      any[Seq[ListOffsetsTopic]](),
+      any[Set[TopicPartition]](),
+      any[IsolationLevel],
+      ArgumentMatchers.anyInt(),
+      ArgumentMatchers.any[String](),
+      ArgumentMatchers.anyInt(),
+      ArgumentMatchers.anyShort(),
+      ArgumentMatchers.any[(Errors, ListOffsetsPartition) => ListOffsetsPartitionResponse](),
+      ArgumentMatchers.any[List[ListOffsetsTopicResponse] => Unit](),
+      ArgumentMatchers.anyInt())
+
+    val response = verifyNoThrottling[ListOffsetsResponse](request)
+    val viewResp = response.topics.asScala.find(_.name == viewTopic)
+    assertTrue(viewResp.isDefined, "view-named entry must be in the response")
+    assertTrue(response.topics.asScala.forall(_.name != backingTopic),
+      "backing topic name must NOT leak in the response")
+    val partResp = viewResp.get.partitions.asScala.head
+    assertEquals(Errors.INVALID_REQUEST.code, partResp.errorCode,
+      "MAX_TIMESTAMP on a view must surface INVALID_REQUEST, not proxy to the backing topic")
+    assertEquals(ListOffsetsResponse.UNKNOWN_OFFSET, partResp.offset,
+      "rejected MAX_TIMESTAMP must not carry any offset payload")
+    assertEquals(ListOffsetsResponse.UNKNOWN_TIMESTAMP, partResp.timestamp,
+      "rejected MAX_TIMESTAMP must not carry any timestamp payload")
+  }
+
+  @Test
+  def testListOffsetsFromViewStripsResponseTimestampToProtectFilteredRecords(): Unit = {
+    // offsetsForTimes (positive query timestamp) returns the actual record TIMESTAMP of the first
+    // backing record at or after the queried time. For views in source_sparse mode that record
+    // may have been filtered out by the predicate — leaking its timestamp through the view
+    // response would disclose per-record wall-clock metadata the predicate is supposed to gate
+    // (the consumer could binary-search by time to fingerprint filtered records).
+    //
+    // The handler must replace the response timestamp with UNKNOWN_TIMESTAMP for view responses.
+    // The offset itself is already exposed through the source_sparse Fetch path (empty batches
+    // preserve source offsets per PROMPT.md), so stripping the timestamp closes the leak while
+    // keeping offsetsForTimes useful for seek-by-time on views.
+    val viewTopic = "list-ts-strip-view"
+    val backingTopic = "list-ts-strip-backing"
+    val viewTopicId = Uuid.randomUuid()
+    val backingTopicId = Uuid.randomUuid()
+    val backingRecordTimestamp = 1_700_000_123_456L
+
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, backingTopic)
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.x == 1")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+    addTopicToMetadataCache(viewTopic, numPartitions = 1, topicId = viewTopicId)
+    addTopicToMetadataCache(backingTopic, numPartitions = 1, topicId = backingTopicId)
+
+    when(replicaManager.getPartitionOrError(any[TopicPartition]))
+      .thenAnswer(_ => Right(mock(classOf[Partition])))
+
+    when(replicaManager.fetchOffset(
+      ArgumentMatchers.any[Seq[ListOffsetsTopic]](),
+      ArgumentMatchers.eq(Set.empty[TopicPartition]),
+      any[IsolationLevel],
+      ArgumentMatchers.eq(ListOffsetsRequest.CONSUMER_REPLICA_ID),
+      ArgumentMatchers.any[String](),
+      ArgumentMatchers.anyInt(),
+      ArgumentMatchers.anyShort(),
+      ArgumentMatchers.any[(Errors, ListOffsetsPartition) => ListOffsetsPartitionResponse](),
+      ArgumentMatchers.any[List[ListOffsetsTopicResponse] => Unit](),
+      ArgumentMatchers.anyInt()
+    )).thenAnswer(ans => {
+      val callback = ans.getArgument[List[ListOffsetsTopicResponse] => Unit](8)
+      // Simulate ReplicaManager.fetchOffset returning a real record timestamp from the backing
+      // (offsetsForTimes path on the storage layer populates this).
+      val partResp = new ListOffsetsPartitionResponse()
+        .setPartitionIndex(0)
+        .setErrorCode(Errors.NONE.code)
+        .setOffset(42L)
+        .setTimestamp(backingRecordTimestamp)
+      callback(List(new ListOffsetsTopicResponse().setName(backingTopic)
+        .setPartitions(List(partResp).asJava)))
+    })
+
+    // Positive query timestamp = offsetsForTimes mode.
+    val targetTimes = List(new ListOffsetsTopic()
+      .setName(viewTopic)
+      .setPartitions(List(new ListOffsetsPartition()
+        .setPartitionIndex(0)
+        .setTimestamp(1_700_000_000_000L)).asJava)).asJava
+    val listOffsetRequest = ListOffsetsRequest.Builder.forConsumer(true, IsolationLevel.READ_UNCOMMITTED)
+      .setTargetTimes(targetTimes).build()
+    val request = buildRequest(listOffsetRequest)
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+    kafkaApis = createKafkaApis(configRepository = configRepository)
+    kafkaApis.handleListOffsetRequest(request)
+
+    val response = verifyNoThrottling[ListOffsetsResponse](request)
+    val viewResp = response.topics.asScala.find(_.name == viewTopic)
+    assertTrue(viewResp.isDefined, "view-named entry must be in the response")
+    val partResp = viewResp.get.partitions.asScala.head
+    assertEquals(Errors.NONE.code, partResp.errorCode)
+    assertEquals(42L, partResp.offset)
+    assertEquals(ListOffsetsResponse.UNKNOWN_TIMESTAMP, partResp.timestamp,
+      "backing record timestamp must NOT leak into the response under the view name — the " +
+        "record may have been filtered out by the predicate and exposing its timestamp would " +
+        "let the consumer fingerprint filtered records via seek-by-time queries.")
+  }
+
+  @Test
   def testOffsetForLeaderEpochOnViewTopicReturnsNonWedgingNoneForConsumer(): Unit = {
     // OffsetsForLeaderEpoch returns (leader_epoch, end_offset) pairs from the partition's own
     // local-log ledger. For view topics, that ledger is meaningless: the view partition never
