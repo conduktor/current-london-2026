@@ -11076,6 +11076,66 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testProduceTenantScrubsPrincipalPrefixFromReplicaManagerErrorMessage(): Unit = {
+    // Coordinator paths (txn coordinator fencer, group coordinator) embed the
+    // PRINCIPAL-prefix form `__tenant_<id>.<name>` in error messages they
+    // bubble up to replicaManager.handleProduceAppend (e.g. "Transactional id
+    // '__tenant_acme.my-txn' is fenced"). scrubMessage must strip this form in
+    // addition to the topic-prefix form, otherwise the tenant learns the
+    // internal principal-id naming convention and can confirm that a sibling
+    // tenant exists by submitting that tenant's id and watching the error.
+    val physicalTopic = "acme.orders"
+    addTopicToMetadataCache(physicalTopic, numPartitions = 1)
+
+    val produceRequest = buildSingleTopicProduceRequest("orders")
+    val request = buildRequest(
+      produceRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    val responseCallback: ArgumentCaptor[Map[TopicPartition, PartitionResponse] => Unit] =
+      ArgumentCaptor.forClass(classOf[Map[TopicPartition, PartitionResponse] => Unit])
+
+    // Embed BOTH forms in the leaked message — exercises the precedence
+    // (principal-prefix must run before topic-prefix or "__tenant_acme."
+    // would be corrupted into "__tenant_" mid-scrub).
+    val leakedMessage = "Transactional id '__tenant_acme.my-txn' is fenced on topic 'acme.orders'"
+    when(replicaManager.handleProduceAppend(
+      anyLong, anyShort, ArgumentMatchers.eq(false), any(),
+      any(), responseCallback.capture(),
+      any(), any(), any(), any())
+    ).thenAnswer(_ => responseCallback.getValue.apply(
+      Map(new TopicPartition(physicalTopic, 0) ->
+        new PartitionResponse(Errors.INVALID_RECORD, leakedMessage))))
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), any[Long])).thenReturn(0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    kafkaApis = createKafkaApis(
+      authorizer = None,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[ProduceResponse](request)
+    val partitionProduceResponse =
+      response.data.responses.asScala.head.partitionResponses.asScala.head
+    val msg = partitionProduceResponse.errorMessage
+    assertNotNull(msg, "errorMessage must be propagated to the client")
+    assertFalse(msg.contains("__tenant_"),
+      s"principal-prefix form must be scrubbed but found in: $msg")
+    assertFalse(msg.contains("acme."),
+      s"any tenant-prefix occurrence must be scrubbed but found in: $msg")
+    // The remaining tokens must still carry useful diagnostics — the txn id
+    // and topic name without the prefix.
+    assertTrue(msg.contains("my-txn"),
+      s"logical txn id must remain in scrubbed message: $msg")
+    assertTrue(msg.contains("orders"),
+      s"logical topic name must remain in scrubbed message: $msg")
+  }
+
+  @Test
   def testProducePrivilegedCallerOnTenantBoundListenerIsRejected(): Unit = {
     // Super-user without a `__tenant_` prefix produces on a tenant-bound
     // listener. The broker MUST refuse every partition rather than silently

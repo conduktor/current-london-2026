@@ -68,7 +68,7 @@ import org.apache.kafka.server.share.context.ShareFetchContext
 import org.apache.kafka.server.share.{ErroneousAndValidPartitionData, SharePartitionKey}
 import org.apache.kafka.server.share.acknowledge.ShareAcknowledgementBatch
 import org.apache.kafka.server.storage.log.{FetchIsolation, FetchParams, FetchPartitionData}
-import org.apache.kafka.server.tenant.{TenantConfig, TenantContext}
+import org.apache.kafka.server.tenant.{TenantConfig, TenantContext, TenantNamespace}
 import org.apache.kafka.storage.internals.log.AppendOrigin
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats
 
@@ -396,15 +396,28 @@ class KafkaApis(val requestChannel: RequestChannel,
     })
   }
 
-  // The controller may embed a physical topic name in an `errorMessage`
-  // string (e.g. "Topic 'acme.orders' already exists"). Strip every physical
-  // occurrence so tenants never see the prefix in human-readable text.
+  // The controller, group/txn coordinators and storage layer may embed a
+  // physical name in an `errorMessage` string. There are TWO physical forms:
+  //   - Topic-prefix form `<tenantId>.<name>`  e.g. "Topic 'acme.orders'…"
+  //   - Principal-prefix form `__tenant_<tenantId>.<name>` used for groups,
+  //     transactional ids and the principal itself
+  //     e.g. "Group '__tenant_acme.app1' not found"
+  //
+  // Strip both forms so tenants never see the prefix in human-readable text.
+  // The principal-prefix form MUST be stripped first because the topic-prefix
+  // is a strict suffix substring of it ("__tenant_acme.foo" contains "acme.");
+  // running the shorter pattern first would corrupt the longer one into
+  // "__tenant_foo" before its own pass.
   private def scrubMessage(msg: String, ctx: TenantContext): String = {
     if (msg == null) return null
     if (!ctx.effectiveTenant.isPresent) return msg
     val tenantId = ctx.effectiveTenant.get
-    val prefix = tenantId + "."
-    if (!msg.contains(prefix)) msg else msg.replace(prefix, "")
+    val principalPrefix = TenantNamespace.PRINCIPAL_PREFIX + tenantId + "."
+    val topicPrefix = tenantId + "."
+    var out = msg
+    if (out.contains(principalPrefix)) out = out.replace(principalPrefix, "")
+    if (out.contains(topicPrefix)) out = out.replace(topicPrefix, "")
+    out
   }
 
   // DELETE_TOPICS — Forwarded to the controller. v0-5 carries a list of topic
@@ -3918,6 +3931,12 @@ class KafkaApis(val requestChannel: RequestChannel,
           }
         case _ =>
       }
+      // Catch-all: scrub any other physical-form occurrence (a different
+      // tenant's resource name embedded in a server-side string, or a
+      // principal-prefix form leaked by a downstream coordinator). The
+      // resource-specific replace above only handles the exact resourceName
+      // for this entry; this generic pass is defence-in-depth.
+      result.setErrorMessage(scrubMessage(result.errorMessage, tenantCtx))
     }
 
     if (refused.nonEmpty) {
