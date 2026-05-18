@@ -124,9 +124,9 @@ public final class ProduceRequestParser {
         private final String topic;
         private final List<RecordEntry> records;
 
-        ProduceCommand(String topic, List<RecordEntry> records) {
-            this.topic = topic;
-            this.records = records;
+        public ProduceCommand(String topic, List<RecordEntry> records) {
+            this.topic = Objects.requireNonNull(topic, "topic must not be null");
+            this.records = Objects.requireNonNull(records, "records must not be null");
         }
 
         public String topic() {
@@ -145,7 +145,7 @@ public final class ProduceRequestParser {
         private final byte[] value;
         private final String contentType;
 
-        RecordEntry(OptionalInt partition, byte[] key, byte[] value, String contentType) {
+        public RecordEntry(OptionalInt partition, byte[] key, byte[] value, String contentType) {
             this.partition = Objects.requireNonNull(partition);
             this.key = key;
             this.value = value;

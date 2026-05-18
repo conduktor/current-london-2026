@@ -16,6 +16,7 @@
  */
 package org.apache.kafka.network.http;
 
+import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalInt;
 
@@ -132,11 +133,11 @@ public final class FetchRequestParser {
         private final long offset;
         private final OptionalInt maxBytes;
 
-        FetchCommand(String topic, int partition, long offset, OptionalInt maxBytes) {
-            this.topic = topic;
+        public FetchCommand(String topic, int partition, long offset, OptionalInt maxBytes) {
+            this.topic = Objects.requireNonNull(topic, "topic must not be null");
             this.partition = partition;
             this.offset = offset;
-            this.maxBytes = maxBytes;
+            this.maxBytes = Objects.requireNonNull(maxBytes, "maxBytes must not be null");
         }
 
         public String topic() {
