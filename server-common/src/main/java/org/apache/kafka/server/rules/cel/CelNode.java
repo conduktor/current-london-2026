@@ -414,6 +414,12 @@ abstract class CelNode {
                 return false;
             }
             for (Object item : (List<?>) lst) {
+                // Same motivation as the comprehension budget: `value in
+                // request.giantList` with an attacker-supplied list lets a
+                // single boolean operator drive O(N) equality checks on the
+                // request thread. Bump per element so the runaway is killed
+                // at the budget rather than after.
+                CelLimits.bumpStep();
                 if (valueEquals(v, item)) {
                     return true;
                 }

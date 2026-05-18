@@ -18,7 +18,7 @@ package org.apache.kafka.server.rules;
 
 /**
  * Constants identifying the broker-internal compacted topic that distributes
- * CEL rule envelopes, and the sentinel client-id prefix the broker uses when
+ * CEL rule envelopes, and the diagnostic client-id prefix the broker uses when
  * reading from it.
  *
  * <p>The topic is a standard Kafka compacted topic — any stock producer can
@@ -26,10 +26,14 @@ package org.apache.kafka.server.rules;
  * ({@link org.apache.kafka.server.rules.json.RuleJsonCodec}) keyed by rule id;
  * tombstones (null values) delete a rule.
  *
- * <p>The broker's own consumer of this topic must use a client-id that starts
- * with {@link RuleEngine#INTERNAL_CLIENT_ID_PREFIX} so it is unconditionally
- * exempt from rule evaluation. Without that, a "deny everything" rule would
- * block the very read that loads its replacement.
+ * <p><b>The broker's own consumer is exempt from rules because it arrives on a
+ * privileged (inter-broker) listener — not because of its client-id.</b> The
+ * client-id prefix is purely diagnostic, used in request-log output. The
+ * authoritative bypass is the {@code fromPrivilegedListener} flag the network
+ * layer attaches to every request based on which TCP listener accepted the
+ * connection; external clients cannot forge it. See
+ * {@link RuleEngine#evaluate(org.apache.kafka.common.protocol.ApiKeys, String, boolean, java.util.function.Supplier)}
+ * for the bypass contract.
  */
 public final class GovernanceTopic {
 
@@ -37,11 +41,12 @@ public final class GovernanceTopic {
     public static final String NAME = "__governance";
 
     /**
-     * Suggested client-id for the broker's internal reader of this topic.
-     * Must start with {@link RuleEngine#INTERNAL_CLIENT_ID_PREFIX} so it is
-     * exempt from rule evaluation. The {@code reader-<brokerId>} suffix lets
-     * each broker's reader be distinguished in client-quota and request-log
-     * output.
+     * Diagnostic client-id for the broker's internal reader of this topic.
+     * The prefix is used only in request logs and quota output to distinguish
+     * the broker-internal reader from operator-driven consumers; rule bypass is
+     * granted by the privileged-listener flag, not by this string. The
+     * {@code reader-<brokerId>} suffix lets each broker's reader be
+     * distinguished in client-quota and request-log output.
      */
     public static String readerClientId(int brokerId) {
         return RuleEngine.INTERNAL_CLIENT_ID_PREFIX + "reader-" + brokerId;

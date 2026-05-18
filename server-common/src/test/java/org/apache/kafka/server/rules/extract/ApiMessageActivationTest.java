@@ -38,6 +38,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -363,6 +364,74 @@ public class ApiMessageActivationTest {
         }
         @Override public org.apache.kafka.common.protocol.Message duplicate() {
             return new SelfReferencingNode();
+        }
+        @Override public java.util.List<org.apache.kafka.common.protocol.types.RawTaggedField> unknownTaggedFields() {
+            return java.util.Collections.emptyList();
+        }
+        @Override public void read(org.apache.kafka.common.protocol.Readable readable, short version) {
+        }
+        @Override public void write(org.apache.kafka.common.protocol.Writable writable,
+                                    org.apache.kafka.common.protocol.ObjectSerializationCache cache,
+                                    short version) {
+        }
+        @Override public int size(org.apache.kafka.common.protocol.ObjectSerializationCache cache,
+                                  short version) {
+            return 0;
+        }
+        @Override public void addSize(org.apache.kafka.common.protocol.MessageSizeAccumulator size,
+                                      org.apache.kafka.common.protocol.ObjectSerializationCache cache,
+                                      short version) {
+        }
+    }
+
+    @Test
+    public void accessorInvocationBudgetTerminatesPathologicalWideWalk() {
+        // Codex deep-audit P1b fix: the depth cap alone is not enough. A shallow
+        // but extremely wide message — say, a list of many self-referencing
+        // nodes, where each one would recurse MAX_DEPTH levels — can still
+        // perform millions of accessor invocations before the depth cap kicks
+        // in at each branch. The total-invocation budget bounds the aggregate
+        // work and raises IllegalStateException long before the request
+        // thread is starved. The engine catches Throwable from the supplier
+        // and fails open.
+        WideNode root = new WideNode();
+        // 1000 children, each recursing MAX_DEPTH levels of self-reference,
+        // is well above MAX_ACCESSOR_INVOCATIONS=10_000. The walk must abort.
+        java.util.List<SelfReferencingNode> kids = new java.util.ArrayList<>();
+        for (int n = 0; n < 1000; n++) {
+            kids.add(new SelfReferencingNode());
+        }
+        root.children = kids;
+        IllegalStateException ex = assertThrows(
+            IllegalStateException.class,
+            () -> ApiMessageActivation.from(root));
+        assertTrue(ex.getMessage().contains("accessor budget"),
+            "expected accessor-budget error, got: " + ex.getMessage());
+    }
+
+    /**
+     * Fixture used only by {@link #accessorInvocationBudgetTerminatesPathologicalWideWalk}.
+     * Exposes a wide list of {@link SelfReferencingNode}s; combined with the
+     * self-reference, the walk would do MAX_DEPTH * |children| accessor
+     * invocations without the budget.
+     */
+    @SuppressWarnings("unused")
+    public static final class WideNode implements org.apache.kafka.common.protocol.ApiMessage {
+        public java.util.List<SelfReferencingNode> children = java.util.Collections.emptyList();
+        public java.util.List<SelfReferencingNode> children() {
+            return children;
+        }
+        @Override public short apiKey() {
+            return -1;
+        }
+        @Override public short lowestSupportedVersion() {
+            return 0;
+        }
+        @Override public short highestSupportedVersion() {
+            return 0;
+        }
+        @Override public org.apache.kafka.common.protocol.Message duplicate() {
+            return new WideNode();
         }
         @Override public java.util.List<org.apache.kafka.common.protocol.types.RawTaggedField> unknownTaggedFields() {
             return java.util.Collections.emptyList();

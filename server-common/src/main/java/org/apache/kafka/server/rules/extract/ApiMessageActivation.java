@@ -139,15 +139,34 @@ public final class ApiMessageActivation {
 
     /**
      * Maximum recursion depth for the reflection walk. Each entry into
-     * {@link #toMap(Object, int)} (the recursive call for a nested message)
-     * counts as one level. Kafka's generated DTOs do not contain reference
-     * cycles, so any legitimate message is far shallower than this. The cap
-     * is defense in depth against a future protocol with deeper nesting than
-     * we anticipated, or a hostile request that constructed a cycle by other
-     * means — the walker cannot tell the difference and must not be allowed to
-     * blow the stack or spin forever.
+     * {@link #toMap(Object, int, int[])} (the recursive call for a nested
+     * message) counts as one level. Kafka's generated DTOs do not contain
+     * reference cycles, so any legitimate message is far shallower than this.
+     * The cap is defense in depth against a future protocol with deeper
+     * nesting than we anticipated, or a hostile request that constructed a
+     * cycle by other means — the walker cannot tell the difference and must
+     * not be allowed to blow the stack or spin forever.
      */
     static final int MAX_DEPTH = 32;
+
+    /**
+     * Maximum number of accessor invocations a single {@link #from(ApiMessage)}
+     * call may perform across the whole walk. The depth cap alone is not
+     * enough: a request with a single shallow layer that contains a
+     * megabyte-sized repeated field (e.g. a {@code Records} batch with a few
+     * hundred-thousand inner records) would walk a flat list whose recursion
+     * depth is 2 but whose element count is unbounded.
+     *
+     * <p>The bound is intentionally generous: a legitimate Kafka admin
+     * request rarely contains more than a few hundred topic/partition
+     * descriptors. 10k accessor invocations leaves three orders of magnitude
+     * of headroom for normal traffic while killing pathological extraction in
+     * single-digit milliseconds. A request that exceeds this raises
+     * {@link IllegalStateException}, which {@link RuleEngine#evaluate} catches
+     * and treats as fail-open (one buggy extraction does not crash the
+     * request thread).
+     */
+    static final int MAX_ACCESSOR_INVOCATIONS = 10_000;
 
     private ApiMessageActivation() {
     }
@@ -186,28 +205,38 @@ public final class ApiMessageActivation {
     }
 
     static Map<String, Object> toMap(Object o) {
-        return toMap(o, 0);
+        return toMap(o, 0, new int[1]);
     }
 
     /**
-     * Recursive form with depth counter. {@code depth} is incremented on each
-     * descent into a nested message. When it reaches {@link #MAX_DEPTH} we
-     * return an empty map rather than recurse further — the rule sees the
-     * upper levels intact, the bottom is truncated. See {@link #MAX_DEPTH}
-     * javadoc for why this matters.
+     * Recursive form with depth counter and shared invocation budget.
+     * {@code depth} is incremented on each descent into a nested message.
+     * When it reaches {@link #MAX_DEPTH} we return an empty map rather than
+     * recurse further — the rule sees the upper levels intact, the bottom is
+     * truncated. {@code invocations} is a one-element array used as a shared
+     * mutable counter across the whole walk; each {@link Accessor#invoke}
+     * call bumps it, and overflowing {@link #MAX_ACCESSOR_INVOCATIONS}
+     * raises {@link IllegalStateException}. A one-element {@code int[]} is
+     * the smallest reliable way to share an integer counter across recursive
+     * calls without boxing or a dedicated holder class.
      */
-    private static Map<String, Object> toMap(Object o, int depth) {
+    private static Map<String, Object> toMap(Object o, int depth, int[] invocations) {
         if (depth >= MAX_DEPTH) {
             return Collections.emptyMap();
         }
         Map<String, Object> out = new LinkedHashMap<>();
         for (Accessor a : accessorsFor(o.getClass())) {
-            out.put(a.name, convert(a.invoke(o), depth));
+            if (++invocations[0] > MAX_ACCESSOR_INVOCATIONS) {
+                throw new IllegalStateException(
+                    "activation walk exceeded accessor budget of "
+                        + MAX_ACCESSOR_INVOCATIONS + " on " + o.getClass().getName());
+            }
+            out.put(a.name, convert(a.invoke(o), depth, invocations));
         }
         return out;
     }
 
-    private static Object convert(Object v, int depth) {
+    private static Object convert(Object v, int depth, int[] invocations) {
         if (v == null) {
             return null;
         }
@@ -216,7 +245,7 @@ public final class ApiMessageActivation {
             return scalar;
         }
         if (v instanceof Iterable) {
-            return convertIterable((Iterable<?>) v, depth);
+            return convertIterable((Iterable<?>) v, depth, invocations);
         }
         // Anything else with accessors: walk recursively. We do NOT restrict to
         // ApiMessage — nested records inside generated classes implement just
@@ -225,7 +254,7 @@ public final class ApiMessageActivation {
         // accessor at all is the signal that this is structured data we want
         // to surface, not an opaque scalar.
         if (!accessorsFor(v.getClass()).isEmpty()) {
-            return toMap(v, depth + 1);
+            return toMap(v, depth + 1, invocations);
         }
         return v;
     }
@@ -243,10 +272,10 @@ public final class ApiMessageActivation {
         return null;
     }
 
-    private static List<Object> convertIterable(Iterable<?> it, int depth) {
+    private static List<Object> convertIterable(Iterable<?> it, int depth, int[] invocations) {
         List<Object> list = new ArrayList<>();
         for (Object item : it) {
-            list.add(convert(item, depth));
+            list.add(convert(item, depth, invocations));
         }
         return list;
     }

@@ -356,6 +356,27 @@ public class CelProgramTest {
     }
 
     @Test
+    public void evalStepBudgetIsAlsoEnforcedForInOperatorOverGiantList() {
+        // Codex deep-audit P1c fix: a single `value in request.giantList` does
+        // O(N) equality comparisons on the request thread without the budget.
+        // The InList loop must bump the per-iteration counter just like the
+        // comprehension loop, so an attacker cannot evade the budget by using
+        // `in` instead of `.exists`. Build a list large enough to exhaust the
+        // budget on its own — this same expression is fine under the cap when
+        // the list is smaller, as covered by `inOperatorForList`.
+        java.util.List<Integer> giant = new java.util.ArrayList<>();
+        for (int n = 0; n < CelLimits.MAX_EVAL_STEPS + 16; n++) {
+            giant.add(n);
+        }
+        Map<String, Object> env = new HashMap<>();
+        env.put("xs", giant);
+        env.put("needle", -1); // never matches → loop scans the full list
+        assertThrows(
+            CelEvaluationException.class,
+            () -> evalBool("needle in xs", env));
+    }
+
+    @Test
     public void matchesStillWorksOnNonStringReceiver() {
         // Behavioural parity with the old MethodCall-based path: a non-string
         // receiver yields false, not an exception. This matters because
