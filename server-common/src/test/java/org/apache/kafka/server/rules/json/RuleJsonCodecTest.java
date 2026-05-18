@@ -200,6 +200,75 @@ public class RuleJsonCodecTest {
     }
 
     @Test
+    public void errorCodeZeroRejected() {
+        // errorCode 0 is Errors.NONE — a DENY decision that returns "no error"
+        // would fire the rule but fail the request *open* (no exception
+        // surfaces to the client). Reject at the parse boundary so the
+        // operator sees the misconfiguration replayed as a clear envelope
+        // error rather than as a silent fail-open at request time.
+        String json = "{\"apiKeys\":[\"METADATA\"],\"action\":\"DENY\","
+            + "\"when\":\"true\",\"errorCode\":0}";
+        RuleEnvelopeException ex = assertThrows(RuleEnvelopeException.class,
+            () -> RuleJsonCodec.decode("k", json.getBytes(StandardCharsets.UTF_8)));
+        assertTrue(ex.getMessage().contains("errorCode"),
+            "error must name the offending field: " + ex.getMessage());
+    }
+
+    @Test
+    public void errorCodeAboveShortMaxRejected() {
+        // KafkaApis narrows the rule's int errorCode to a short. 65536 → 0
+        // → Errors.NONE → silent fail-open. Reject at the parse boundary.
+        String json = "{\"apiKeys\":[\"METADATA\"],\"action\":\"DENY\","
+            + "\"when\":\"true\",\"errorCode\":65536}";
+        RuleEnvelopeException ex = assertThrows(RuleEnvelopeException.class,
+            () -> RuleJsonCodec.decode("k", json.getBytes(StandardCharsets.UTF_8)));
+        assertTrue(ex.getMessage().contains("65536"),
+            "error must name the offending value: " + ex.getMessage());
+    }
+
+    @Test
+    public void errorCodeNegativeRejected() {
+        // Kafka error codes are positive; the wire protocol uses signed
+        // shorts but every assigned Errors enum value is positive. Negatives
+        // are likely operator typos and would, after narrowing, map to
+        // Errors.UNKNOWN_SERVER_ERROR or worse — reject up front.
+        String json = "{\"apiKeys\":[\"METADATA\"],\"action\":\"DENY\","
+            + "\"when\":\"true\",\"errorCode\":-1}";
+        assertThrows(RuleEnvelopeException.class,
+            () -> RuleJsonCodec.decode("k", json.getBytes(StandardCharsets.UTF_8)));
+    }
+
+    @Test
+    public void errorCodeAtShortMaxAccepted() {
+        // Boundary: Short.MAX_VALUE (32767) is the largest expressible code,
+        // so it must round-trip cleanly even though Kafka's currently-assigned
+        // Errors codes top out well below that.
+        String json = "{\"apiKeys\":[\"METADATA\"],\"action\":\"DENY\","
+            + "\"when\":\"true\",\"errorCode\":32767}";
+        Rule r = RuleJsonCodec.decode("k", json.getBytes(StandardCharsets.UTF_8));
+        assertEquals(Short.MAX_VALUE, r.errorCode());
+    }
+
+    @Test
+    public void duplicateApiKeysAreDedupedInDeclaredOrder() {
+        // A rule with apiKeys=["FETCH","FETCH",...] would, without dedup,
+        // appear N times in RuleSetBuilder's per-API-key list and be
+        // evaluated N times per request — a published-rule-shaped DoS amp.
+        // We dedupe at the parse boundary while preserving the *first*
+        // occurrence's position so the documented "first matching DENY in
+        // declared order" semantic still holds across the deduped sequence.
+        String json = "{\"apiKeys\":[\"FETCH\",\"METADATA\",\"FETCH\",\"FETCH\",\"METADATA\"],"
+            + "\"action\":\"DENY\",\"when\":\"true\",\"errorCode\":1}";
+        Rule r = RuleJsonCodec.decode("k", json.getBytes(StandardCharsets.UTF_8));
+        assertEquals(2, r.apiKeys().size(),
+            "duplicate api keys must be collapsed: got " + r.apiKeys());
+        assertEquals(ApiKeys.FETCH, r.apiKeys().get(0),
+            "first declared key must be first after dedup");
+        assertEquals(ApiKeys.METADATA, r.apiKeys().get(1),
+            "second distinct key must be second after dedup");
+    }
+
+    @Test
     public void unknownTopLevelFieldsAreToleratedForForwardCompatibility() {
         // Rule envelopes are written by users / tooling. Tolerate unknown
         // top-level fields so v1 brokers don't reject v2-augmented envelopes.

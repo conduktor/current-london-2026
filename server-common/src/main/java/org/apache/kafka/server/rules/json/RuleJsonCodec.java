@@ -29,6 +29,7 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 
 /**
@@ -121,7 +122,7 @@ public final class RuleJsonCodec {
         List<ApiKeys> apiKeys = parseApiKeys(root.get(FIELD_API_KEYS));
         RuleAction action = parseAction(root.get(FIELD_ACTION));
         String when = parseRequiredString(root, FIELD_WHEN);
-        int errorCode = parseRequiredInt(root, FIELD_ERROR_CODE);
+        int errorCode = parseErrorCode(root.get(FIELD_ERROR_CODE));
         try {
             return new Rule(id, apiKeys, action, when, errorCode, CelCompiler.compile(when));
         } catch (CelCompilationException e) {
@@ -166,7 +167,14 @@ public final class RuleJsonCodec {
         if (node.isEmpty()) {
             throw new RuleEnvelopeException("'apiKeys' must contain at least one api-key name");
         }
-        List<ApiKeys> out = new ArrayList<>(node.size());
+        // Dedupe while preserving declared order. Without this, a rule with
+        // apiKeys=["FETCH","FETCH",...] would, after RuleSetBuilder.build(),
+        // appear N times in the per-API-key evaluation list and be evaluated
+        // N times per request — a published-rule-shaped DoS vector even though
+        // the envelope itself is well under MAX_ENVELOPE_BYTES. LinkedHashSet
+        // gives us O(1) dedup with stable iteration order so the documented
+        // "first matching DENY in declared order" semantics still hold.
+        LinkedHashSet<ApiKeys> out = new LinkedHashSet<>(node.size());
         for (JsonNode el : node) {
             if (!el.isTextual()) {
                 throw new RuleEnvelopeException(
@@ -179,7 +187,7 @@ public final class RuleJsonCodec {
                 throw new RuleEnvelopeException("unknown api key name: '" + name + "'");
             }
         }
-        return out;
+        return new ArrayList<>(out);
     }
 
     private static RuleAction parseAction(JsonNode node) {
@@ -203,11 +211,37 @@ public final class RuleJsonCodec {
         return n.asText();
     }
 
-    private static int parseRequiredInt(JsonNode root, String name) {
-        JsonNode n = root.get(name);
+    /**
+     * Parse and validate the rule's {@code errorCode}. Kafka error codes are
+     * wire-protocol shorts; KafkaApis narrows the rule's int back down to a
+     * short via {@code (short) errorCode} when constructing the deny response.
+     * Without an explicit range check here, an envelope with
+     * {@code "errorCode": 65536} silently truncates to 0 = {@code Errors.NONE}
+     * and fails the request <em>open</em> — the rule fires but no error is
+     * surfaced to the client.
+     *
+     * <p>The accepted range is {@code [1, Short.MAX_VALUE]}:
+     * <ul>
+     *   <li>{@code 0} is reserved for {@code Errors.NONE} — a DENY that returns
+     *       "no error" makes no sense and would also fail open.</li>
+     *   <li>Negative codes are not valid Kafka error codes — Kafka's wire
+     *       protocol uses signed shorts but every assigned {@code Errors} enum
+     *       value is positive. Rejecting negatives here is defense-in-depth
+     *       against future operators copy-pasting an arbitrary int.</li>
+     *   <li>Codes above {@link Short#MAX_VALUE} cannot be expressed on the wire
+     *       at all, so the narrowing to short would silently mis-map them.</li>
+     * </ul>
+     */
+    private static int parseErrorCode(JsonNode n) {
         if (n == null || !n.isInt()) {
-            throw new RuleEnvelopeException("'" + name + "' must be an integer");
+            throw new RuleEnvelopeException("'" + FIELD_ERROR_CODE + "' must be an integer");
         }
-        return n.asInt();
+        int code = n.asInt();
+        if (code < 1 || code > Short.MAX_VALUE) {
+            throw new RuleEnvelopeException(
+                "'" + FIELD_ERROR_CODE + "' must be in [1, " + Short.MAX_VALUE
+                    + "] (Kafka wire-protocol short error code; 0 is Errors.NONE), got " + code);
+        }
+        return code;
     }
 }
