@@ -50,10 +50,19 @@ public enum CompressionPolicy {
         }
     };
 
-    public final String name;
+    private final String value;
 
-    CompressionPolicy(String name) {
-        this.name = name;
+    CompressionPolicy(String value) {
+        this.value = value;
+    }
+
+    /**
+     * @return the configuration value (e.g. {@code "none"}, {@code "required"}) under which
+     *         this policy is exposed in the topic config. Deliberately not called {@code name}
+     *         so it does not shadow {@link Enum#name()}.
+     */
+    public String value() {
+        return value;
     }
 
     /**
@@ -63,13 +72,13 @@ public enum CompressionPolicy {
     public abstract boolean isViolatedBy(CompressionType batchCompression);
 
     public static List<String> names() {
-        return Stream.of(values()).map(p -> p.name).collect(Collectors.toList());
+        return Stream.of(values()).map(p -> p.value).collect(Collectors.toList());
     }
 
     public static CompressionPolicy forName(String n) {
         String lower = n.toLowerCase(Locale.ROOT);
         return Stream.of(values())
-            .filter(p -> p.name.equals(lower))
+            .filter(p -> p.value.equals(lower))
             .findFirst()
             .orElseThrow(() -> new IllegalArgumentException("Unknown compression policy: " + n));
     }

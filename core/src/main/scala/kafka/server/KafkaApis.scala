@@ -532,19 +532,19 @@ class KafkaApis(val requestChannel: RequestChannel,
    * directly into `invalidRequestResponses` as a per-partition `INVALID_RECORD` response.
    *
    * Fast path (the topic's policy is `none` or no `LogConfig` is yet visible for the
-   * partition) returns immediately without walking the batches.
+   * partition) returns immediately after a single identity compare with
+   * [[CompressionPolicy.NONE]] and allocates no `Option`, since
+   * [[ReplicaManager.compressionPolicy]] returns the enum directly.
    */
   private def enforceCompressionPolicy(topicPartition: TopicPartition, records: MemoryRecords): Unit = {
-    val policy = replicaManager.getLogConfig(topicPartition)
-      .map(_.compressionPolicy)
-      .getOrElse(CompressionPolicy.NONE)
+    val policy = replicaManager.compressionPolicy(topicPartition)
     if (policy eq CompressionPolicy.NONE) return
     val batchIter = records.batches.iterator
     while (batchIter.hasNext) {
       val batch = batchIter.next()
       if (policy.isViolatedBy(batch.compressionType)) {
         throw new InvalidRecordException(
-          s"Produce to $topicPartition was rejected by compression.policy=${policy.name}: " +
+          s"Produce to $topicPartition was rejected by compression.policy=${policy.value}: " +
           s"batch has compression.type=${batch.compressionType.name} but the topic requires compressed batches.")
       }
     }

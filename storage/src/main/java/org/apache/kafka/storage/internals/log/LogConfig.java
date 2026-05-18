@@ -133,8 +133,9 @@ public class LogConfig extends AbstractConfig {
             "<code>none</code> (default) preserves vanilla behaviour. " +
             "<code>required</code> rejects produce requests whose batches carry " +
             "<code>compression.type=none</code> with INVALID_RECORD on a per-partition basis. " +
-            "The check applies to client appends only; replication and internal origins are unaffected.";
-    public static final String DEFAULT_COMPRESSION_POLICY = CompressionPolicy.NONE.name;
+            "Enforced in the produce request handler, so replication, transaction-state, " +
+            "and group-coordinator appends bypass the check by construction.";
+    public static final String DEFAULT_COMPRESSION_POLICY = CompressionPolicy.NONE.value();
 
     public static final int DEFAULT_MAX_MESSAGE_BYTES = 1024 * 1024 + Records.LOG_OVERHEAD;
     public static final int DEFAULT_SEGMENT_BYTES = 1024 * 1024 * 1024;

@@ -2008,11 +2008,12 @@ class KafkaApisTest extends Logging {
     for (version <- ApiKeys.PRODUCE.oldestVersion to ApiKeys.PRODUCE.latestVersion) {
 
       reset(replicaManager, clientQuotaManager, clientRequestQuotaManager, requestChannel, txnCoordinator)
-      // KafkaApis.handleProduceRequest now reads the topic's compression.policy via
-      // replicaManager.getLogConfig. The real method returns Option[LogConfig], never null;
-      // Mockito defaults to null. Stub it to None so produce tests that don't care about
-      // log config behave as if the topic has no override (default policy = none).
-      when(replicaManager.getLogConfig(any[TopicPartition])).thenReturn(None)
+      // KafkaApis.handleProduceRequest reads the topic's compression.policy via
+      // replicaManager.compressionPolicy. The real method never returns null; Mockito
+      // defaults to null for non-Option return values. Stub it to CompressionPolicy.NONE
+      // so produce tests that don't care about the policy behave as if the topic has no
+      // override (default policy = none).
+      when(replicaManager.compressionPolicy(any[TopicPartition])).thenReturn(CompressionPolicy.NONE)
 
       val responseCallback: ArgumentCaptor[Map[TopicPartition, PartitionResponse] => Unit] = ArgumentCaptor.forClass(classOf[Map[TopicPartition, PartitionResponse] => Unit])
 
@@ -2072,11 +2073,12 @@ class KafkaApisTest extends Logging {
     for (version <- 10 to ApiKeys.PRODUCE.latestVersion) {
 
       reset(replicaManager, clientQuotaManager, clientRequestQuotaManager, requestChannel, txnCoordinator)
-      // KafkaApis.handleProduceRequest now reads the topic's compression.policy via
-      // replicaManager.getLogConfig. The real method returns Option[LogConfig], never null;
-      // Mockito defaults to null. Stub it to None so produce tests that don't care about
-      // log config behave as if the topic has no override (default policy = none).
-      when(replicaManager.getLogConfig(any[TopicPartition])).thenReturn(None)
+      // KafkaApis.handleProduceRequest reads the topic's compression.policy via
+      // replicaManager.compressionPolicy. The real method never returns null; Mockito
+      // defaults to null for non-Option return values. Stub it to CompressionPolicy.NONE
+      // so produce tests that don't care about the policy behave as if the topic has no
+      // override (default policy = none).
+      when(replicaManager.compressionPolicy(any[TopicPartition])).thenReturn(CompressionPolicy.NONE)
 
       val responseCallback: ArgumentCaptor[Map[TopicPartition, PartitionResponse] => Unit] = ArgumentCaptor.forClass(classOf[Map[TopicPartition, PartitionResponse] => Unit])
 
@@ -2145,11 +2147,12 @@ class KafkaApisTest extends Logging {
     for (version <- 10 to ApiKeys.PRODUCE.latestVersion) {
 
       reset(replicaManager, clientQuotaManager, clientRequestQuotaManager, requestChannel, txnCoordinator)
-      // KafkaApis.handleProduceRequest now reads the topic's compression.policy via
-      // replicaManager.getLogConfig. The real method returns Option[LogConfig], never null;
-      // Mockito defaults to null. Stub it to None so produce tests that don't care about
-      // log config behave as if the topic has no override (default policy = none).
-      when(replicaManager.getLogConfig(any[TopicPartition])).thenReturn(None)
+      // KafkaApis.handleProduceRequest reads the topic's compression.policy via
+      // replicaManager.compressionPolicy. The real method never returns null; Mockito
+      // defaults to null for non-Option return values. Stub it to CompressionPolicy.NONE
+      // so produce tests that don't care about the policy behave as if the topic has no
+      // override (default policy = none).
+      when(replicaManager.compressionPolicy(any[TopicPartition])).thenReturn(CompressionPolicy.NONE)
 
       val responseCallback: ArgumentCaptor[Map[TopicPartition, PartitionResponse] => Unit] = ArgumentCaptor.forClass(classOf[Map[TopicPartition, PartitionResponse] => Unit])
 
@@ -2214,11 +2217,12 @@ class KafkaApisTest extends Logging {
     for (version <- 10 to ApiKeys.PRODUCE.latestVersion) {
 
       reset(replicaManager, clientQuotaManager, clientRequestQuotaManager, requestChannel, txnCoordinator)
-      // KafkaApis.handleProduceRequest now reads the topic's compression.policy via
-      // replicaManager.getLogConfig. The real method returns Option[LogConfig], never null;
-      // Mockito defaults to null. Stub it to None so produce tests that don't care about
-      // log config behave as if the topic has no override (default policy = none).
-      when(replicaManager.getLogConfig(any[TopicPartition])).thenReturn(None)
+      // KafkaApis.handleProduceRequest reads the topic's compression.policy via
+      // replicaManager.compressionPolicy. The real method never returns null; Mockito
+      // defaults to null for non-Option return values. Stub it to CompressionPolicy.NONE
+      // so produce tests that don't care about the policy behave as if the topic has no
+      // override (default policy = none).
+      when(replicaManager.compressionPolicy(any[TopicPartition])).thenReturn(CompressionPolicy.NONE)
 
       val responseCallback: ArgumentCaptor[Map[TopicPartition, PartitionResponse] => Unit] = ArgumentCaptor.forClass(classOf[Map[TopicPartition, PartitionResponse] => Unit])
 
@@ -2284,11 +2288,12 @@ class KafkaApisTest extends Logging {
     for (version <- ApiKeys.PRODUCE.oldestVersion to ApiKeys.PRODUCE.latestVersion) {
 
       reset(replicaManager, clientQuotaManager, clientRequestQuotaManager, requestChannel, txnCoordinator)
-      // KafkaApis.handleProduceRequest now reads the topic's compression.policy via
-      // replicaManager.getLogConfig. The real method returns Option[LogConfig], never null;
-      // Mockito defaults to null. Stub it to None so produce tests that don't care about
-      // log config behave as if the topic has no override (default policy = none).
-      when(replicaManager.getLogConfig(any[TopicPartition])).thenReturn(None)
+      // KafkaApis.handleProduceRequest reads the topic's compression.policy via
+      // replicaManager.compressionPolicy. The real method never returns null; Mockito
+      // defaults to null for non-Option return values. Stub it to CompressionPolicy.NONE
+      // so produce tests that don't care about the policy behave as if the topic has no
+      // override (default policy = none).
+      when(replicaManager.compressionPolicy(any[TopicPartition])).thenReturn(CompressionPolicy.NONE)
 
       val tp = new TopicPartition("topic", 0)
 
@@ -2336,12 +2341,6 @@ class KafkaApisTest extends Logging {
   // flowing through the existing path.
   // ---------------------------------------------------------------------------
 
-  private def compressionPolicyLogConfig(policy: CompressionPolicy): LogConfig = {
-    val props = new Properties()
-    props.put(LogConfig.COMPRESSION_POLICY_CONFIG, policy.name)
-    new LogConfig(props)
-  }
-
   private def buildSingleTopicProduceRequest(tp: TopicPartition, records: MemoryRecords, version: Short): ProduceRequest = {
     ProduceRequest.builder(new ProduceRequestData()
       .setTopicData(new ProduceRequestData.TopicProduceDataCollection(
@@ -2363,8 +2362,8 @@ class KafkaApisTest extends Logging {
     addTopicToMetadataCache(topic, numPartitions = 1)
     val tp = new TopicPartition(topic, 0)
 
-    // Default LogConfig — compression.policy defaults to "none".
-    when(replicaManager.getLogConfig(ArgumentMatchers.eq(tp))).thenReturn(Some(new LogConfig(new Properties())))
+    // Default policy — vanilla behaviour, no enforcement.
+    when(replicaManager.compressionPolicy(ArgumentMatchers.eq(tp))).thenReturn(CompressionPolicy.NONE)
 
     val responseCallback: ArgumentCaptor[Map[TopicPartition, PartitionResponse] => Unit] =
       ArgumentCaptor.forClass(classOf[Map[TopicPartition, PartitionResponse] => Unit])
@@ -2396,8 +2395,8 @@ class KafkaApisTest extends Logging {
     addTopicToMetadataCache(topic, numPartitions = 1)
     val tp = new TopicPartition(topic, 0)
 
-    when(replicaManager.getLogConfig(ArgumentMatchers.eq(tp)))
-      .thenReturn(Some(compressionPolicyLogConfig(CompressionPolicy.REQUIRED)))
+    when(replicaManager.compressionPolicy(ArgumentMatchers.eq(tp)))
+      .thenReturn(CompressionPolicy.REQUIRED)
     when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](), any[Long])).thenReturn(0)
     when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
 
@@ -2421,8 +2420,8 @@ class KafkaApisTest extends Logging {
     addTopicToMetadataCache(topic, numPartitions = 1)
     val tp = new TopicPartition(topic, 0)
 
-    when(replicaManager.getLogConfig(ArgumentMatchers.eq(tp)))
-      .thenReturn(Some(compressionPolicyLogConfig(CompressionPolicy.REQUIRED)))
+    when(replicaManager.compressionPolicy(ArgumentMatchers.eq(tp)))
+      .thenReturn(CompressionPolicy.REQUIRED)
 
     val responseCallback: ArgumentCaptor[Map[TopicPartition, PartitionResponse] => Unit] =
       ArgumentCaptor.forClass(classOf[Map[TopicPartition, PartitionResponse] => Unit])
@@ -2457,16 +2456,20 @@ class KafkaApisTest extends Logging {
     val tpConfigured = new TopicPartition(configuredTopic, 0)
     val tpOpen = new TopicPartition(openTopic, 0)
 
-    when(replicaManager.getLogConfig(ArgumentMatchers.eq(tpConfigured)))
-      .thenReturn(Some(compressionPolicyLogConfig(CompressionPolicy.REQUIRED)))
-    when(replicaManager.getLogConfig(ArgumentMatchers.eq(tpOpen)))
-      .thenReturn(Some(new LogConfig(new Properties()))) // policy = none
+    when(replicaManager.compressionPolicy(ArgumentMatchers.eq(tpConfigured)))
+      .thenReturn(CompressionPolicy.REQUIRED)
+    when(replicaManager.compressionPolicy(ArgumentMatchers.eq(tpOpen)))
+      .thenReturn(CompressionPolicy.NONE)
 
     val responseCallback: ArgumentCaptor[Map[TopicPartition, PartitionResponse] => Unit] =
       ArgumentCaptor.forClass(classOf[Map[TopicPartition, PartitionResponse] => Unit])
+    // Capture the partitions actually forwarded to handleProduceAppend so we can assert that
+    // the rejected partition was excluded from the append, not merely overridden in the response.
+    val entriesCaptor: ArgumentCaptor[Map[TopicPartition, MemoryRecords]] =
+      ArgumentCaptor.forClass(classOf[Map[TopicPartition, MemoryRecords]])
     // Only the open topic's partition reaches handleProduceAppend; mock it to succeed.
-    when(replicaManager.handleProduceAppend(anyLong, anyShort, ArgumentMatchers.eq(false), any(), any(),
-      responseCallback.capture(), any(), any(), any(), any())
+    when(replicaManager.handleProduceAppend(anyLong, anyShort, ArgumentMatchers.eq(false), any(),
+      entriesCaptor.capture(), responseCallback.capture(), any(), any(), any(), any())
     ).thenAnswer(_ => responseCallback.getValue.apply(Map(tpOpen -> new PartitionResponse(Errors.NONE))))
     when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](), any[Long])).thenReturn(0)
     when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
@@ -2498,6 +2501,9 @@ class KafkaApisTest extends Logging {
       "configured topic partition must be rejected with INVALID_RECORD")
     assertEquals(Errors.NONE, Errors.forCode(byTopic(openTopic).errorCode),
       "unconfigured topic partition must succeed in the same response")
+    // The rejected partition must not be forwarded to the append path.
+    assertEquals(Set(tpOpen), entriesCaptor.getValue.keySet,
+      "rejected partition must be excluded from the partitions forwarded to handleProduceAppend")
   }
 
   @Test

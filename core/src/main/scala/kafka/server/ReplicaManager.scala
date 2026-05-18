@@ -58,7 +58,7 @@ import org.apache.kafka.server.share.fetch.{DelayedShareFetchKey, DelayedShareFe
 import org.apache.kafka.server.storage.log.{FetchParams, FetchPartitionData}
 import org.apache.kafka.server.util.{Scheduler, ShutdownableThread}
 import org.apache.kafka.storage.internals.checkpoint.{LazyOffsetCheckpoints, OffsetCheckpointFile, OffsetCheckpoints}
-import org.apache.kafka.storage.internals.log.{AppendOrigin, FetchDataInfo, LeaderHwChange, LogAppendInfo, LogConfig, LogDirFailureChannel, LogOffsetMetadata, LogReadInfo, OffsetResultHolder, RecordValidationException, RemoteLogReadResult, RemoteStorageFetchInfo, VerificationGuard}
+import org.apache.kafka.storage.internals.log.{AppendOrigin, CompressionPolicy, FetchDataInfo, LeaderHwChange, LogAppendInfo, LogConfig, LogDirFailureChannel, LogOffsetMetadata, LogReadInfo, OffsetResultHolder, RecordValidationException, RemoteLogReadResult, RemoteStorageFetchInfo, VerificationGuard}
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats
 
 import java.io.File
@@ -1930,6 +1930,22 @@ class ReplicaManager(val config: KafkaConfig,
   }
 
   def getLogConfig(topicPartition: TopicPartition): Option[LogConfig] = localLog(topicPartition).map(_.config)
+
+  /**
+   * Look up the server-side compression policy for a partition without allocating an
+   * `Option` on the fast path. Used by the produce request handler, which calls this
+   * for every authorized partition. Returns [[CompressionPolicy.NONE]] (the no-op
+   * singleton) when the partition is not hosted online here or has no log yet, so the
+   * caller can short-circuit with a single identity compare.
+   */
+  def compressionPolicy(topicPartition: TopicPartition): CompressionPolicy = {
+    allPartitions.get(topicPartition) match {
+      case online: HostedPartition.Online =>
+        val maybeLog = online.partition.log
+        if (maybeLog.isDefined) maybeLog.get.config.compressionPolicy else CompressionPolicy.NONE
+      case _ => CompressionPolicy.NONE
+    }
+  }
 
   def becomeLeaderOrFollower(correlationId: Int,
                              leaderAndIsrRequest: LeaderAndIsrRequest,
