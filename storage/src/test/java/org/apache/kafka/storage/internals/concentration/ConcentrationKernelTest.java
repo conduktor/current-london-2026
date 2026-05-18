@@ -27,11 +27,14 @@ import java.io.File;
 import java.io.IOException;
 import java.util.List;
 import java.util.NoSuchElementException;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -964,5 +967,201 @@ public class ConcentrationKernelTest {
 
         assertEquals(beforeNextOffset, kernel.nextLogicalOffset("orders", 1));
         assertEquals(beforeStartOffset, kernel.startLogicalOffset("orders", 1));
+    }
+
+    // -------- Per-backing generation token --------
+    //
+    // Codex Q3 on GAP 2: an @volatile leader-epoch read is not sufficient to fence stale
+    // recoveries against the onDeleted / onFailed paths. Partition.clear() (called from delete()
+    // and markOffline()) does NOT reset Partition.leaderEpoch — verified by reading
+    // core/src/main/scala/kafka/cluster/Partition.scala at lines 708-717. So a recoverer that
+    // captures (partition, leaderEpoch=N) and then races against an onDeleted listener firing
+    // markBackingUnready can still observe partition.getLeaderEpoch() == N at publish time and
+    // mistakenly publish stale rebuilt state.
+    //
+    // The fix is a per-backing generation token: every markBackingUnready bumps it; the recoverer
+    // captures it at submit time; publishIfGenerationMatches() does an atomic CAS-style publish
+    // that is rejected iff the generation has moved on since capture. The atomicity matters —
+    // a non-atomic check-then-publish would still race against a concurrent markBackingUnready
+    // squeezed between the check and the publish.
+
+    @Test
+    public void currentGenerationDefaultsToZeroForUnseenBacking() {
+        // No markBackingUnready ever called: generation is 0. Matches the "default ready" stance
+        // for never-observed backings. A recoverer that captures 0 will only publish if the gate
+        // is still pristine — anything that ever closed the gate bumps to >=1 and the captured 0
+        // will not match.
+        assertEquals(0L, kernel.currentGeneration(new TopicPartition("shared", 0)));
+        assertEquals(0L, kernel.currentGeneration(new TopicPartition("never-declared", 42)));
+    }
+
+    @Test
+    public void markBackingUnreadyBumpsGenerationEveryTime() {
+        // The generation is what distinguishes one unready event from the next — distinct from
+        // the boolean "is currently unready". A recoverer that started under generation N must
+        // be fenced out if ANY further markBackingUnready has happened, even if some other code
+        // path subsequently called markBackingReady. We bump the counter on every close, so even
+        // a (unready → ready → unready) cycle increments twice.
+        TopicPartition tp = new TopicPartition("shared", 0);
+        kernel.markBackingUnready(tp);
+        assertEquals(1L, kernel.currentGeneration(tp));
+        kernel.markBackingUnready(tp);
+        assertEquals(2L, kernel.currentGeneration(tp));
+        // markBackingReady does NOT bump — it just opens the gate. The captured generation
+        // represents an unready event we are recovering from; opening the gate is the END of
+        // that event, not a new one.
+        kernel.markBackingReady(tp);
+        assertEquals(2L, kernel.currentGeneration(tp));
+        kernel.markBackingUnready(tp);
+        assertEquals(3L, kernel.currentGeneration(tp));
+    }
+
+    @Test
+    public void generationIsPerBacking() {
+        TopicPartition tp1 = new TopicPartition("shared", 0);
+        TopicPartition tp2 = new TopicPartition("shared", 1);
+        TopicPartition tp3 = new TopicPartition("other", 0);
+        kernel.markBackingUnready(tp1);
+        kernel.markBackingUnready(tp1);
+        kernel.markBackingUnready(tp2);
+        assertEquals(2L, kernel.currentGeneration(tp1));
+        assertEquals(1L, kernel.currentGeneration(tp2));
+        assertEquals(0L, kernel.currentGeneration(tp3));
+    }
+
+    @Test
+    public void publishIfGenerationMatchesRunsAndOpensGateWhenGenerationStillCurrent() {
+        // Steady-state recovery path: close the gate, capture the generation, run the scan,
+        // and publish. The CAS succeeds because nothing else has bumped the generation in
+        // between. publishFn runs exactly once and the gate is reopened atomically with the
+        // publish — no observer can see the gate open while the rebuilt state is still being
+        // applied (the compute() lambda holds the per-key lock for the duration).
+        TopicPartition tp = new TopicPartition("shared", 0);
+        kernel.markBackingUnready(tp);
+        long capturedGen = kernel.currentGeneration(tp);
+        AtomicInteger publishCount = new AtomicInteger();
+        boolean published = kernel.publishIfGenerationMatches(tp, capturedGen, publishCount::incrementAndGet);
+        assertTrue(published, "publish must succeed when captured generation still matches current");
+        assertEquals(1, publishCount.get(), "publishFn must run exactly once on a matching CAS");
+        assertTrue(kernel.isBackingReady(tp), "gate must be reopened atomically with the publish");
+        assertEquals(capturedGen, kernel.currentGeneration(tp),
+            "successful publish does not bump generation — only markBackingUnready does");
+    }
+
+    @Test
+    public void publishIfGenerationMatchesRejectsAndDoesNotRunPublishFnWhenGenerationAdvanced() {
+        // This is the Codex Q3 scenario: captured generation N, then a concurrent
+        // markBackingUnready (e.g. onDeleted firing after the new leader was acquired) bumps to
+        // N+1. The late-arriving publishIfGenerationMatches must NOT publish — the rebuilt state
+        // it carries is based on a backing snapshot that may have been invalidated by whatever
+        // event closed the gate again. Fail-stale-not-empty: leave the gate as the OTHER thread
+        // last set it (closed at N+1), so the next recovery cycle handles the rebuild.
+        TopicPartition tp = new TopicPartition("shared", 0);
+        kernel.markBackingUnready(tp);                  // gen = 1
+        long capturedGen = kernel.currentGeneration(tp);
+        kernel.markBackingUnready(tp);                  // gen = 2 — late onDeleted fires
+        AtomicInteger publishCount = new AtomicInteger();
+        boolean published = kernel.publishIfGenerationMatches(tp, capturedGen, publishCount::incrementAndGet);
+        assertFalse(published, "publish must be rejected when generation advanced after capture");
+        assertEquals(0, publishCount.get(), "publishFn must NOT run on a failed CAS");
+        assertFalse(kernel.isBackingReady(tp),
+            "gate must remain closed — the OTHER unready event is still in flight");
+        assertEquals(2L, kernel.currentGeneration(tp), "rejected publish does not change generation");
+    }
+
+    @Test
+    public void publishIfGenerationMatchesRejectsWhenCapturedFromPristineStateButGateWasClosed() {
+        // Defensive: a recoverer that mis-captured 0 (the default for an unseen backing) must
+        // not be able to publish over a gate that has since been explicitly closed. Captured 0
+        // matches current 0 only when nobody has ever touched this backing — which is exactly
+        // the case where the recoverer has no reason to publish anything.
+        TopicPartition tp = new TopicPartition("shared", 0);
+        kernel.markBackingUnready(tp);
+        AtomicInteger publishCount = new AtomicInteger();
+        boolean published = kernel.publishIfGenerationMatches(tp, 0L, publishCount::incrementAndGet);
+        assertFalse(published);
+        assertEquals(0, publishCount.get());
+        assertFalse(kernel.isBackingReady(tp));
+    }
+
+    @Test
+    public void publishIfGenerationMatchesLeavesGateClosedIfPublishFnThrows() {
+        // Fail-stale-not-empty under partial recovery failure: if the scan publishFn throws
+        // mid-publish, the gate must NOT be reopened. Subsequent produces will keep seeing
+        // NOT_LEADER_OR_FOLLOWER until the next recovery cycle reruns the scan. The alternative —
+        // opening the gate after a partial publish — could expose readers to torn sidecar state.
+        TopicPartition tp = new TopicPartition("shared", 0);
+        kernel.markBackingUnready(tp);
+        long capturedGen = kernel.currentGeneration(tp);
+        RuntimeException boom = new RuntimeException("simulated partial rehydrate failure");
+        RuntimeException thrown = assertThrows(RuntimeException.class,
+            () -> kernel.publishIfGenerationMatches(tp, capturedGen, () -> {
+                throw boom;
+            }));
+        assertSame(boom, thrown, "exception from publishFn must propagate unchanged");
+        assertFalse(kernel.isBackingReady(tp), "gate must remain CLOSED after a failed publish");
+        assertEquals(capturedGen, kernel.currentGeneration(tp),
+            "failed publish does not bump generation — it is the SAME unready event still in flight");
+    }
+
+    @Test
+    public void publishIfGenerationMatchesRejectsNullArgs() {
+        TopicPartition tp = new TopicPartition("shared", 0);
+        assertThrows(NullPointerException.class,
+            () -> kernel.publishIfGenerationMatches(null, 0L, () -> { }));
+        assertThrows(NullPointerException.class,
+            () -> kernel.publishIfGenerationMatches(tp, 0L, null));
+    }
+
+    @Test
+    public void currentGenerationRejectsNullPartition() {
+        assertThrows(NullPointerException.class, () -> kernel.currentGeneration(null));
+    }
+
+    // -------- logicalPartitionsForBacking (B.3 recoverer input) --------
+
+    @Test
+    public void logicalPartitionsForBackingReturnsAllLogicalPartitionsRoutedToOneBacking() {
+        // 100 logical partitions over 4 backing partitions: by modulo, logical partition L routes
+        // to backing partition L % 4. So backing partition 2 covers logical partitions 2, 6, 10,
+        // ..., 98 — 25 entries. The recoverer feeds this filter set into recoverFromBackingScan
+        // so the scan only rebuilds sidecars that this backing TP actually hosts.
+        kernel.declare(descriptor("orders", 100, "shared", 4));
+        Set<LogicalPartition> result = kernel.logicalPartitionsForBacking(new TopicPartition("shared", 2));
+        assertEquals(25, result.size());
+        // Spot-check the modulo math at both ends.
+        assertTrue(result.contains(new LogicalPartition("orders", 2)));
+        assertTrue(result.contains(new LogicalPartition("orders", 98)));
+        // And confirm we did not pick up siblings on a different backing partition.
+        assertFalse(result.contains(new LogicalPartition("orders", 3)));
+        assertFalse(result.contains(new LogicalPartition("orders", 0)));
+    }
+
+    @Test
+    public void logicalPartitionsForBackingMergesAcrossLogicalTopicsSharingTheSameBackingTopic() {
+        // Two logical topics on the same backing topic — both must contribute to the recoverer's
+        // filter set, because both have sidecars to rebuild for that one backing TP.
+        kernel.declare(descriptor("orders", 8, "shared", 4));
+        kernel.declare(descriptor("payments", 8, "shared", 4));
+        Set<LogicalPartition> result = kernel.logicalPartitionsForBacking(new TopicPartition("shared", 1));
+        assertTrue(result.contains(new LogicalPartition("orders", 1)));
+        assertTrue(result.contains(new LogicalPartition("orders", 5)));
+        assertTrue(result.contains(new LogicalPartition("payments", 1)));
+        assertTrue(result.contains(new LogicalPartition("payments", 5)));
+        assertEquals(4, result.size());
+    }
+
+    @Test
+    public void logicalPartitionsForBackingIsEmptyWhenNoLogicalTopicIsDeclared() {
+        // The kernel may be asked about a backing TP it knows nothing about — e.g. during the
+        // window between broker startup (when the recoverer wires up) and config-driven
+        // declaration of logical topics. Return empty rather than throw: the recoverer will
+        // simply have nothing to rebuild and the gate will reopen on an empty publish.
+        assertTrue(kernel.logicalPartitionsForBacking(new TopicPartition("unknown", 0)).isEmpty());
+    }
+
+    @Test
+    public void logicalPartitionsForBackingRejectsNullPartition() {
+        assertThrows(NullPointerException.class, () -> kernel.logicalPartitionsForBacking(null));
     }
 }

@@ -23,6 +23,7 @@ import java.io.IOException;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -111,14 +112,36 @@ public final class ConcentrationKernel implements AutoCloseable {
      * fresh tracker rehydrated from sidecars and/or the backing log under the current leader
      * epoch (see the upcoming {@code KafkaConcentrationLeaderRecoverer}).
      *
-     * <p>The set is consulted on the produce hot path; a membership check on a
-     * {@link java.util.concurrent.ConcurrentHashMap}-backed {@link Set} is one volatile read plus
-     * a hash lookup, so the steady-state cost is negligible. Modelled as "set of unready" rather
-     * than "set of ready" so that a backing the kernel has never observed (e.g. before the first
-     * leadership event for it) is treated as ready — matching the existing behavior where the
-     * kernel trusts the tracker state recovered at broker startup until something invalidates it.
+     * <p>The map is consulted on the produce hot path; a get() on a {@link ConcurrentHashMap} is
+     * one volatile read plus a hash lookup, so the steady-state cost is negligible. Modelled as
+     * "map keyed by unready or recently-recovered backings" — an absent key means the kernel has
+     * never observed this backing and treats it as ready, matching the behavior where the kernel
+     * trusts whatever tracker state was loaded at broker startup until something invalidates it.
+     *
+     * <p>The value carries TWO pieces of state per backing: (a) whether the gate is currently open
+     * (ready) or closed (unready); (b) a monotonic {@code generation} counter that bumps on every
+     * {@link #markBackingUnready} call. The recoverer captures the generation at scan submit time
+     * and replays it through {@link #publishIfGenerationMatches} at publish time; the CAS-style
+     * check fences out stale publishes that race against a later unready event (Codex Q3 — see
+     * {@link #publishIfGenerationMatches} for the full rationale, including why an
+     * {@link kafka.cluster.Partition} leader-epoch fence alone is not sufficient).
      */
-    private final Set<TopicPartition> unreadyBackings = ConcurrentHashMap.newKeySet();
+    private final ConcurrentHashMap<TopicPartition, BackingGateState> backingGateState = new ConcurrentHashMap<>();
+
+    /**
+     * Per-backing readiness gate state. Value object so the entire (ready, generation) pair can be
+     * read or replaced atomically under the {@link ConcurrentHashMap} per-key lock — without it,
+     * a recoverer could observe a "ready" flag updated by one thread while a different thread is
+     * mid-publish on the same backing.
+     */
+    private static final class BackingGateState {
+        final boolean ready;
+        final long generation;
+        BackingGateState(boolean ready, long generation) {
+            this.ready = ready;
+            this.generation = generation;
+        }
+    }
     private volatile boolean closed = false;
 
     public ConcentrationKernel(File sidecarDir) {
@@ -218,6 +241,28 @@ public final class ConcentrationKernel implements AutoCloseable {
         LogicalTopicDescriptor d = registry.get(logicalTopic)
             .orElseThrow(() -> new NoSuchElementException("logical topic not declared: " + logicalTopic));
         return LogicalPartitionMapper.backingPartitionFor(d, logicalPartition);
+    }
+
+    /**
+     * Every {@link LogicalPartition} (logicalTopic, logicalPartition) that maps onto the given
+     * backing {@link TopicPartition}, across all currently-declared logical topics that share this
+     * backing topic. Used by {@code KafkaConcentrationLeaderRecoverer} on leader-acquisition to
+     * compute the filter set fed into {@link #recoverFromBackingScan}: those are the sidecars
+     * that need to be rebuilt for this one backing partition. Returns an empty set if no logical
+     * topic is declared on this backing partition right now.
+     */
+    public Set<LogicalPartition> logicalPartitionsForBacking(TopicPartition backingTp) {
+        ensureOpen();
+        Objects.requireNonNull(backingTp, "backingTp");
+        Set<LogicalPartition> out = new HashSet<>();
+        for (LogicalTopicDescriptor d : registry.descriptorsFor(backingTp.topic())) {
+            for (int lp = 0; lp < d.numLogicalPartitions(); lp++) {
+                if (LogicalPartitionMapper.backingPartitionFor(d, lp) == backingTp.partition()) {
+                    out.add(new LogicalPartition(d.logicalName(), lp));
+                }
+            }
+        }
+        return out;
     }
 
     // ------------------ Produce path ------------------
@@ -441,7 +486,14 @@ public final class ConcentrationKernel implements AutoCloseable {
      */
     public void markBackingUnready(TopicPartition backing) {
         Objects.requireNonNull(backing, "backing");
-        unreadyBackings.add(backing);
+        // Bump generation on EVERY close, even back-to-back closes. The recoverer fences against
+        // generation drift, not against the boolean ready flag, so a (unready → ready → unready)
+        // cycle must produce two distinct generations or the second unready event will be
+        // confused with the first by a recoverer that captured the first generation.
+        backingGateState.compute(backing, (k, prev) -> {
+            long nextGen = (prev == null ? 0L : prev.generation) + 1L;
+            return new BackingGateState(false, nextGen);
+        });
     }
 
     /**
@@ -451,11 +503,31 @@ public final class ConcentrationKernel implements AutoCloseable {
      * and the publish-time epoch fence has confirmed leadership has not advanced.
      *
      * <p>Idempotent. Returns true iff the partition was previously marked unready (useful for
-     * tests and observability).
+     * tests and observability). Does NOT bump the generation — the generation tracks unready
+     * events, and successfully reopening the gate is the END of one such event, not a new one.
+     *
+     * <p>Prefer {@link #publishIfGenerationMatches} from the recoverer: it atomically combines
+     * the publish-and-open into a single CAS that cannot be raced by a concurrent
+     * {@code markBackingUnready}. This direct API exists for tests and for non-recoverer paths
+     * that need to open the gate unconditionally.
      */
     public boolean markBackingReady(TopicPartition backing) {
         Objects.requireNonNull(backing, "backing");
-        return unreadyBackings.remove(backing);
+        // Track "was it previously unready" the way the old set-based API did, so the existing
+        // B.1/B.2 contract (returns true iff a prior mark was cleared) is preserved.
+        boolean[] wasUnready = new boolean[1];
+        backingGateState.compute(backing, (k, prev) -> {
+            if (prev == null) {
+                wasUnready[0] = false;
+                return null; // stay absent — keeps the steady-state map empty
+            }
+            wasUnready[0] = !prev.ready;
+            if (prev.ready) {
+                return prev; // already ready, no change
+            }
+            return new BackingGateState(true, prev.generation);
+        });
+        return wasUnready[0];
     }
 
     /**
@@ -468,7 +540,71 @@ public final class ConcentrationKernel implements AutoCloseable {
      */
     public boolean isBackingReady(TopicPartition backing) {
         Objects.requireNonNull(backing, "backing");
-        return !unreadyBackings.contains(backing);
+        BackingGateState s = backingGateState.get(backing);
+        return s == null || s.ready;
+    }
+
+    /**
+     * Current generation counter for {@code backing}. Returns 0 for any backing the kernel has
+     * never observed. Increments by 1 on every {@link #markBackingUnready} call. Used by the
+     * leader-recoverer to capture a generation token at scan-submit time which is then replayed
+     * through {@link #publishIfGenerationMatches} at publish time.
+     */
+    public long currentGeneration(TopicPartition backing) {
+        Objects.requireNonNull(backing, "backing");
+        BackingGateState s = backingGateState.get(backing);
+        return s == null ? 0L : s.generation;
+    }
+
+    /**
+     * Atomically run {@code publishFn} and reopen the gate for {@code backing} IFF the captured
+     * generation still matches the current generation. Returns true iff the publish ran.
+     *
+     * <p><b>Why this exists.</b> Codex Q3 on the GAP 2 review observed that an
+     * {@code @volatile} read of {@link kafka.cluster.Partition#getLeaderEpoch} is not sufficient
+     * to fence stale recoveries: {@code Partition.clear()} (called from {@code delete()} and
+     * {@code markOffline()}) does not reset {@code leaderEpoch}. Verified by reading
+     * {@code core/src/main/scala/kafka/cluster/Partition.scala} lines 708-717 against
+     * Apache Kafka 4.0.2: {@code clear()} resets {@code log}, {@code futureLog},
+     * {@code leaderReplicaIdOpt}, {@code leaderEpochStartOffsetOpt}, {@code partitionState}, and
+     * {@code assignmentState} — but NOT {@code leaderEpoch}. So a recoverer that captures
+     * {@code (partition, leaderEpoch=N)} after a successful {@code makeLeader(N)} and then races
+     * against an {@code onDeleted} listener firing {@code markBackingUnready} can still observe
+     * {@code partition.getLeaderEpoch() == N} at publish time and mistakenly publish state
+     * rebuilt from a now-invalid backing snapshot.
+     *
+     * <p><b>What this guarantees.</b> The CAS is performed under the {@link ConcurrentHashMap}
+     * per-key lock, so the (check-generation, run-publishFn, mark-ready) sequence is atomic with
+     * respect to any concurrent {@code markBackingUnready} on the same backing. If
+     * {@code publishFn} throws, the gate is left in its current state (closed at the captured
+     * generation) and the exception propagates — fail-stale-not-empty, as the partial publish
+     * may have left torn sidecar state and the next recovery cycle must redo the scan.
+     *
+     * <p><b>Caller contract.</b> {@code publishFn} should be idempotent (the kernel does not
+     * guarantee it runs at most once across multiple recoverer invocations — it does guarantee
+     * at most once per matched generation). It must not call back into the kernel's gate API on
+     * the same backing — doing so would deadlock on the per-key compute lock.
+     */
+    public boolean publishIfGenerationMatches(TopicPartition backing, long capturedGeneration, Runnable publishFn) {
+        Objects.requireNonNull(backing, "backing");
+        Objects.requireNonNull(publishFn, "publishFn");
+        ensureOpen();
+        // compute() holds the per-key lock for the duration. The check, the publish, and the
+        // ready flip are inside the lambda so they are observed atomically by any other writer.
+        boolean[] published = new boolean[1];
+        backingGateState.compute(backing, (k, prev) -> {
+            long currentGen = prev == null ? 0L : prev.generation;
+            if (currentGen != capturedGeneration) {
+                published[0] = false;
+                return prev; // generation moved on — leave state untouched
+            }
+            // Run publishFn under the per-key lock. If it throws, fall through to the catch
+            // below and leave the gate in its prior state (closed at the captured generation).
+            publishFn.run();
+            published[0] = true;
+            return new BackingGateState(true, currentGen);
+        });
+        return published[0];
     }
 
     // ------------------ Fetch path ------------------
