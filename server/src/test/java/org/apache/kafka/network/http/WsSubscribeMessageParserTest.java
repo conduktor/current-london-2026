@@ -19,6 +19,7 @@ package org.apache.kafka.network.http;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -131,6 +132,58 @@ class WsSubscribeMessageParserTest {
         assertThrows(WsSubscribeMessageParser.BadMessageException.class,
             () -> WsSubscribeMessageParser.parse(
                 "{\"type\":\"close\",\"partition\":0,\"offset\":0,\"initialCredits\":5}"));
+    }
+
+    @Test
+    void unknownTypeMessageStripsControlCharsAndTruncates() {
+        // The unknown-type message echoes the attacker-controlled 'type' value into a string that
+        // reaches BOTH the broker log (via SLF4J at the endpoint's debug line) and the WebSocket
+        // close-frame errorMessage envelope. Without sanitisation, CR/LF would let a hostile client
+        // forge log lines on aggregators that parse by line, and unbounded length would bloat the
+        // close frame. The sanitiser substitutes '?' for C0 controls + DEL and truncates above 32
+        // characters with a trailing '...' marker; readable Unicode passes through.
+        WsSubscribeMessageParser.BadMessageException ex = assertThrows(
+            WsSubscribeMessageParser.BadMessageException.class,
+            () -> WsSubscribeMessageParser.parse(
+                "{\"type\":\"foo\\r\\nfake-log-line\",\"partition\":0,\"offset\":0,\"initialCredits\":5}"));
+        // The exact CR / LF / NUL substring must not survive into the message; '?' takes its place.
+        assertFalse(ex.getMessage().contains("\r"), () -> "raw CR leaked: " + ex.getMessage());
+        assertFalse(ex.getMessage().contains("\n"), () -> "raw LF leaked: " + ex.getMessage());
+        // Sanity: the literal 'foo' prefix and the '?' substitutes for \r\n still appear so the
+        // diagnostic stays useful.
+        assertTrue(ex.getMessage().contains("foo??fake-log-line"),
+            () -> "expected sanitised preview, was: " + ex.getMessage());
+
+        // Truncation: a 40-character type field must be capped at 32 chars + "..." in the message.
+        String longType = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN"; // 40 chars
+        WsSubscribeMessageParser.BadMessageException truncated = assertThrows(
+            WsSubscribeMessageParser.BadMessageException.class,
+            () -> WsSubscribeMessageParser.parse(
+                "{\"type\":\"" + longType + "\",\"partition\":0,\"offset\":0,\"initialCredits\":5}"));
+        assertTrue(truncated.getMessage().contains(longType.substring(0, 32) + "..."),
+            () -> "expected 32-char + '...' truncation, was: " + truncated.getMessage());
+        assertFalse(truncated.getMessage().contains(longType),
+            () -> "full type leaked through: " + truncated.getMessage());
+
+        // Unicode (here: Japanese for 'unknown') passes through unchanged — only C0 / DEL are stripped.
+        WsSubscribeMessageParser.BadMessageException unicode = assertThrows(
+            WsSubscribeMessageParser.BadMessageException.class,
+            () -> WsSubscribeMessageParser.parse(
+                "{\"type\":\"\\u8cfc\\u8aad\",\"partition\":0,\"offset\":0,\"initialCredits\":5}"));
+        assertTrue(unicode.getMessage().contains("購読"),
+            () -> "Unicode preview was stripped, was: " + unicode.getMessage());
+
+        // DEL (0x7F) is C1-adjacent and is the canonical "non-printable" character not caught by
+        // the C0 (< 0x20) check. Pin it as substituted too — paranoid log-aggregator parsers can
+        // be confused by stray DEL bytes.
+        WsSubscribeMessageParser.BadMessageException withDel = assertThrows(
+            WsSubscribeMessageParser.BadMessageException.class,
+            () -> WsSubscribeMessageParser.parse(
+                "{\"type\":\"foo\\u007fbar\",\"partition\":0,\"offset\":0,\"initialCredits\":5}"));
+        assertFalse(withDel.getMessage().contains(""),
+            () -> "DEL leaked: " + withDel.getMessage());
+        assertTrue(withDel.getMessage().contains("foo?bar"),
+            () -> "expected '?' substitute for DEL, was: " + withDel.getMessage());
     }
 
     @Test

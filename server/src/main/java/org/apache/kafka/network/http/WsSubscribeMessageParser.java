@@ -79,8 +79,31 @@ public final class WsSubscribeMessageParser {
                 return parseFlow(root);
             default:
                 throw new BadMessageException(
-                    "unknown message type: '" + type + "' (expected 'subscribe' or 'flow')");
+                    "unknown message type: '" + sanitizeShortPreview(type) + "' (expected 'subscribe' or 'flow')");
         }
+    }
+
+    /**
+     * Renders an attacker-controlled string fit to echo into a {@link BadMessageException} message. The exception text
+     * flows both to the broker log (via {@code LOG.debug} in the endpoint) and to the WebSocket close-frame
+     * {@code errorMessage} envelope, so the raw value must not carry CR/LF (log-line forgery on aggregators that parse
+     * by line) and must not balloon the close frame.
+     *
+     * <p>Substitutes a literal {@code '?'} for every C0 control character (0x00–0x1F) and DEL (0x7F); all other code
+     * points pass through unchanged so Unicode field values stay readable for clients debugging their integration.
+     * Truncates above 32 chars with a trailing {@code ...} marker.
+     */
+    private static String sanitizeShortPreview(String value) {
+        int max = Math.min(value.length(), 32);
+        StringBuilder sb = new StringBuilder(max + 3);
+        for (int i = 0; i < max; i++) {
+            char c = value.charAt(i);
+            sb.append(c < 0x20 || c == 0x7F ? '?' : c);
+        }
+        if (value.length() > max) {
+            sb.append("...");
+        }
+        return sb.toString();
     }
 
     private static WsSubscribeCommand parseSubscribe(JsonNode root) {
