@@ -104,6 +104,10 @@
     <allow pkg="com.fasterxml.jackson" />
     <!-- network.* subpackages (e.g. iouring) need to reference siblings such as SocketServerConfigs -->
     <allow pkg="org.apache.kafka.network" />
+    <subpackage name="iouring">
+      <!-- Netty io_uring transport is the implementation backend for this subpackage only. -->
+      <allow pkg="io.netty" />
+    </subpackage>
   </subpackage>
 
 </import-control>
