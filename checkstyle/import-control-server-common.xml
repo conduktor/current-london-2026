@@ -104,11 +104,15 @@
                  language. JSON body navigation needs the Jackson streaming parser. The
                  ViewFilter bridges into MemoryRecords.filterTo which lives under
                  common.record and common.header; building MemoryRecords in tests also
-                 needs common.compress for Compression.NONE. -->
+                 needs common.compress for Compression.NONE. The ViewMetrics class
+                 registers Yammer meters via KafkaMetricsGroup, so the same dependencies
+                 the server.metrics subpackage uses are needed here too. -->
             <allow pkg="com.fasterxml.jackson.core" />
+            <allow pkg="com.yammer.metrics.core" />
             <allow pkg="org.apache.kafka.common.record" />
             <allow pkg="org.apache.kafka.common.header" />
             <allow pkg="org.apache.kafka.common.compress" />
+            <allow pkg="org.apache.kafka.server.metrics" />
             <allow class="org.apache.kafka.server.views.Lexer.Kind" />
             <allow class="org.apache.kafka.server.views.Lexer.Token" />
         </subpackage>

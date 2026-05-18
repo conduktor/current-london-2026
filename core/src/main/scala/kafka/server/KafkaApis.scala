@@ -66,7 +66,7 @@ import org.apache.kafka.server.share.context.ShareFetchContext
 import org.apache.kafka.server.share.{ErroneousAndValidPartitionData, SharePartitionKey}
 import org.apache.kafka.server.share.acknowledge.ShareAcknowledgementBatch
 import org.apache.kafka.server.storage.log.{FetchIsolation, FetchParams, FetchPartitionData}
-import org.apache.kafka.server.views.{ViewFilter, ViewRegistry, ViewSpec}
+import org.apache.kafka.server.views.{ViewFilter, ViewMetrics, ViewRegistry, ViewSpec}
 import org.apache.kafka.storage.internals.log.AppendOrigin
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats
 
@@ -116,7 +116,13 @@ class KafkaApis(val requestChannel: RequestChannel,
   // snapshot. Misses are cached too — a fetch against a regular topic never re-queries config.
   // package-private because the broker wiring layer (config change notifications) needs to call
   // `invalidate(name)` on it; nothing outside the broker should hold a reference.
-  private[server] val viewRegistry: ViewRegistry = new ViewRegistry((name: String) => topicViewConfigsFor(name))
+  // The metrics instance is per-KafkaApis (per-broker) — Yammer registers in a global singleton
+  // registry, so two ViewMetrics in the same JVM would double-register. KafkaApis is per-broker;
+  // shutdown via close() removes the meters so the next broker in the same JVM (mainly test
+  // harness reuse) gets clean readings.
+  private[server] val viewMetrics: ViewMetrics = new ViewMetrics()
+  private[server] val viewRegistry: ViewRegistry =
+    new ViewRegistry((name: String) => topicViewConfigsFor(name), viewMetrics)
   val configHelper = new ConfigHelper(metadataCache, config, configRepository)
   val authHelper = new AuthHelper(authorizer)
   val requestHelper = new RequestHandlerHelper(requestChannel, quotas, time)
@@ -130,6 +136,9 @@ class KafkaApis(val requestChannel: RequestChannel,
 
   def close(): Unit = {
     aclApis.close()
+    // Deregister view-feature meters from the Yammer singleton so a follow-up broker in the same
+    // JVM (test harness reuse) does not see doubled readings.
+    viewMetrics.close()
     info("Shutdown complete.")
   }
 
@@ -736,7 +745,7 @@ class KafkaApis(val requestChannel: RequestChannel,
       if (data.error != Errors.NONE) return (viewTpId, data)
       val filtered: Either[Errors, MemoryRecords] = data.records match {
         case mr: MemoryRecords =>
-          Right(ViewFilter.apply(spec.predicate(), mr, viewTpId.partition))
+          Right(ViewFilter.apply(spec.predicate(), mr, viewTpId.partition, viewMetrics))
         case fr: FileRecords =>
           // Slurp the on-disk slice into a heap buffer and reuse the MemoryRecords filter. This is
           // O(slice) extra allocation per fetch; for non-trivial fetch.max.bytes that's the unavoidable
@@ -749,7 +758,7 @@ class KafkaApis(val requestChannel: RequestChannel,
               val buffer = ByteBuffer.allocate(size)
               fr.readInto(buffer, 0)
               val materialized = MemoryRecords.readableRecords(buffer)
-              Right(ViewFilter.apply(spec.predicate(), materialized, viewTpId.partition))
+              Right(ViewFilter.apply(spec.predicate(), materialized, viewTpId.partition, viewMetrics))
             } catch {
               case e: java.io.IOException =>
                 error(s"View fetch for ${viewTpId.topic} failed to materialize FileRecords for filtering; " +

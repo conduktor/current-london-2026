@@ -42,6 +42,7 @@ public final class ViewRegistry {
 
     private final Function<String, Optional<TopicViewConfigs>> configSource;
     private final PredicateCompiler compiler;
+    private final ViewMetrics metrics;
     private final ConcurrentHashMap<String, Optional<ViewSpec>> cache = new ConcurrentHashMap<>();
 
     /**
@@ -51,18 +52,33 @@ public final class ViewRegistry {
      *                     wraps {@code ConfigRepository.topicConfig(name)}.
      * @param compiler     the CEL compiler. Sharing one compiler across all views is fine —
      *                     it carries only {@link PredicateLimits}, which are immutable.
+     * @param metrics      view-feature meters. Pass {@link ViewMetrics#NOOP} when not running
+     *                     under a broker (unit tests).
      */
     public ViewRegistry(Function<String, Optional<TopicViewConfigs>> configSource,
-                        PredicateCompiler compiler) {
+                        PredicateCompiler compiler,
+                        ViewMetrics metrics) {
         this.configSource = Objects.requireNonNull(configSource, "configSource");
         this.compiler = Objects.requireNonNull(compiler, "compiler");
+        this.metrics = Objects.requireNonNull(metrics, "metrics");
+    }
+
+    /** Backwards-compatible constructor — defaults metrics to {@link ViewMetrics#NOOP}. */
+    public ViewRegistry(Function<String, Optional<TopicViewConfigs>> configSource,
+                        PredicateCompiler compiler) {
+        this(configSource, compiler, ViewMetrics.NOOP);
     }
 
     /**
-     * Convenience constructor using the default {@link PredicateLimits}.
+     * Convenience constructor using the default {@link PredicateLimits} and a no-op metrics sink.
      */
     public ViewRegistry(Function<String, Optional<TopicViewConfigs>> configSource) {
-        this(configSource, new PredicateCompiler(PredicateLimits.defaults()));
+        this(configSource, new PredicateCompiler(PredicateLimits.defaults()), ViewMetrics.NOOP);
+    }
+
+    /** Convenience constructor with default limits but real metrics. */
+    public ViewRegistry(Function<String, Optional<TopicViewConfigs>> configSource, ViewMetrics metrics) {
+        this(configSource, new PredicateCompiler(PredicateLimits.defaults()), metrics);
     }
 
     /**
@@ -118,8 +134,18 @@ public final class ViewRegistry {
             return Optional.empty();
         }
         TopicViewConfigs cfg = maybe.get();
-        CompiledPredicate predicate = compiler.compile(cfg.predicate());
-        return Optional.of(new ViewSpec(viewTopic, cfg.backingTopic(), predicate, cfg.offsetMode()));
+        try {
+            CompiledPredicate predicate = compiler.compile(cfg.predicate());
+            return Optional.of(new ViewSpec(viewTopic, cfg.backingTopic(), predicate, cfg.offsetMode()));
+        } catch (RuntimeException e) {
+            // LogConfig.validateValues rejects bad predicates at config-set time; reaching this
+            // catch means validation was bypassed (config rolled forward to a broker on a different
+            // code version, or a direct write to the metadata log skipped the validator). The
+            // metric makes that situation observable to operators before they get paged on
+            // failing fetches.
+            metrics.recordCompileFailure();
+            throw e;
+        }
     }
 
     /**

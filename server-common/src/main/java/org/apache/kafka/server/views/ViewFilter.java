@@ -51,6 +51,15 @@ public final class ViewFilter {
     }
 
     /**
+     * Backwards-compatible overload: no metrics. Delegates to the metrics-aware overload with
+     * {@link ViewMetrics#NOOP} so existing unit-test call sites that do not care about
+     * observability don't need to thread a metrics instance through.
+     */
+    public static MemoryRecords apply(CompiledPredicate predicate, MemoryRecords input, int partition) {
+        return apply(predicate, input, partition, ViewMetrics.NOOP);
+    }
+
+    /**
      * Apply {@code predicate} to {@code input}, producing a new {@link MemoryRecords} that
      * contains only the matching records.
      *
@@ -59,24 +68,32 @@ public final class ViewFilter {
      *                  topic). Must not be null.
      * @param partition the partition id, exposed to the predicate via the {@code partition}
      *                  binding.
+     * @param metrics   meters for evaluations/skips/bytes. Pass {@link ViewMetrics#NOOP} if you
+     *                  don't have a real metrics wired in (unit tests).
      * @return a fresh {@link MemoryRecords} owning its own buffer.
      */
-    public static MemoryRecords apply(CompiledPredicate predicate, MemoryRecords input, int partition) {
+    public static MemoryRecords apply(CompiledPredicate predicate, MemoryRecords input,
+                                       int partition, ViewMetrics metrics) {
         if (predicate == null) {
             throw new IllegalArgumentException("predicate must not be null");
         }
         if (input == null) {
             throw new IllegalArgumentException("input must not be null");
         }
+        if (metrics == null) {
+            throw new IllegalArgumentException("metrics must not be null (use ViewMetrics.NOOP for none)");
+        }
         int inputSize = input.sizeInBytes();
         ByteBuffer destination = ByteBuffer.allocate(Math.max(inputSize, 1));
         MemoryRecords.FilterResult result = input.filterTo(
-                new RecordFilterImpl(predicate, partition),
+                new RecordFilterImpl(predicate, partition, metrics),
                 destination,
                 BufferSupplier.NO_CACHING);
         ByteBuffer out = result.outputBuffer();
         out.flip();
-        return MemoryRecords.readableRecords(out);
+        MemoryRecords filtered = MemoryRecords.readableRecords(out);
+        metrics.recordBytes(inputSize, filtered.sizeInBytes());
+        return filtered;
     }
 
     /**
@@ -89,11 +106,13 @@ public final class ViewFilter {
     private static final class RecordFilterImpl extends MemoryRecords.RecordFilter {
         private final CompiledPredicate predicate;
         private final int partition;
+        private final ViewMetrics metrics;
 
-        RecordFilterImpl(CompiledPredicate predicate, int partition) {
+        RecordFilterImpl(CompiledPredicate predicate, int partition, ViewMetrics metrics) {
             super(0L, 0L);
             this.predicate = predicate;
             this.partition = partition;
+            this.metrics = metrics;
         }
 
         @Override
@@ -113,9 +132,15 @@ public final class ViewFilter {
             }
             RecordContext ctx = contextFor(batch, record, partition);
             Optional<Boolean> verdict = predicate.evaluate(ctx);
-            // Skip (Optional.empty) and explicit false both drop the record. The distinction
-            // is preserved inside CompiledPredicate for metrics, not for retention.
-            return verdict.orElse(Boolean.FALSE);
+            metrics.recordEvaluation();
+            if (verdict.isEmpty()) {
+                // Predicate skipped this record (cost-cap, malformed JSON, non-boolean, etc.).
+                // Surfaces under PredicateSkipRate so operators see anomalies before consumers
+                // notice silently-dropped records.
+                metrics.recordSkip();
+                return false;
+            }
+            return verdict.get();
         }
     }
 
