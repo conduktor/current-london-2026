@@ -146,6 +146,12 @@ public final class WsStreamer {
      * Add {@code n} credits to the in-flight budget. Caller (the endpoint's onText handler) must have already
      * validated that {@code n > 0} via {@link WsSubscribeMessageParser}; the streamer guards against the
      * after-close race only.
+     *
+     * <p>The running total is saturated at {@link Integer#MAX_VALUE} rather than allowed to wrap. A naive
+     * {@code credits.addAndGet(n)} lets two consecutive {@code Integer.MAX_VALUE} grants overflow to
+     * negative — at which point {@link #drainBufferWhileCredited}'s {@code c <= 0} short-circuit wedges the
+     * stream silently and the client has self-DoS'd its own subscription with no error frame. Saturating
+     * with a CAS loop turns the pathological grant into a no-op at the ceiling instead of a stuck stream.
      */
     public void grantCredits(int n) {
         if (closed.get()) {
@@ -155,7 +161,20 @@ public final class WsStreamer {
         if (n <= 0) {
             throw new IllegalArgumentException("credits to grant must be positive, got " + n);
         }
-        credits.addAndGet(n);
+        while (true) {
+            int current = credits.get();
+            // Saturating add: if current + n would overflow, clamp to MAX_VALUE. The (long) cast prevents
+            // the overflow itself; we then narrow back to int after clamping.
+            long sum = (long) current + (long) n;
+            int next = sum > Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) sum;
+            if (next == current) {
+                // Already at the ceiling — nothing to add and nothing to drain.
+                return;
+            }
+            if (credits.compareAndSet(current, next)) {
+                break;
+            }
+        }
         scheduleDrain();
     }
 
