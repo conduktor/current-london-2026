@@ -598,10 +598,18 @@ public final class IoUringSelector implements BrokerSelector {
             boolean sendFailed = failedSends.remove(id);
             boolean keepClosing = false;
             if (!sendFailed && channel.ready()) {
-                if (channel.isMuted()) {
-                    // Muted closing channel: leave for next poll. The Processor must
-                    // unmute it explicitly before the final buffered receives surface,
-                    // exactly as NIO does at {@code Selector.java#702}.
+                if (explicitlyMutedChannels.contains(channel)) {
+                    // Operator-muted closing channel: leave for next poll. The Processor must
+                    // unmute it explicitly before the final buffered receives surface, exactly
+                    // as NIO does at {@code Selector.java#702}. We intentionally do NOT short-
+                    // circuit on the broader {@code channel.isMuted()}: a channel can also be
+                    // self-muted (memory-pool pressure inside {@link KafkaChannel#read}). Self-
+                    // muted closing channels must still attempt to drain, otherwise a peer FIN
+                    // arriving while {@code queued.max.bytes} is saturated would strand the
+                    // channel here forever — {@link #recoverFromMemoryPressure} only walks
+                    // {@link #channels}, not {@link #closingChannels}, so the channel never
+                    // gets unmuted, never has its connection quota decremented, and Netty's
+                    // inbound {@code ByteBuf}s queued on the transport layer leak indefinitely.
                     keepClosing = true;
                 } else {
                     try {

@@ -972,4 +972,101 @@ class IoUringSelectorTest {
             "operator-muted channel must NOT be unmuted by recovery — explicitlyMutedChannels " +
             "gate protects request-pipeline throttling from being bypassed by memory recovery");
     }
+
+    @Test
+    void selfMutedClosingChannelDrainsRatherThanStickingForever() throws Exception {
+        // Regression for v7 BLOCKER 3: drainClosingChannels() at IoUringSelector.java:601
+        // previously short-circuited on the broader channel.isMuted(), which captures BOTH
+        // operator-driven mutes (RESPONSE_QUEUED, throttling) and self-mutes triggered by
+        // memoryPool.tryAllocate returning null inside KafkaChannel.read.
+        //
+        // NIO's maybeReadFromClosingChannel (clients/.../Selector.java:702) only short-
+        // circuits on explicitlyMutedChannels.contains(channel) — the narrower predicate.
+        // Self-muted closing channels MUST still attempt to drain because
+        // recoverFromMemoryPressure() only walks channels.values(), never closingChannels.
+        // Without this fix, a peer FIN arriving while queued.max.bytes is saturated would
+        // strand the channel here forever: drain skips it, recovery skips it, the
+        // connection-quota slot leaks, and the queued ByteBufs / KafkaChannel memory are
+        // retained until process death.
+        SimpleMemoryPool pool = new SimpleMemoryPool(64, 64, false, null);
+        java.nio.ByteBuffer drain = pool.tryAllocate(64);
+        assertNotNull(drain);
+        selector = new IoUringSelector(LISTENER, MAX_RECEIVE, pool, IDLE_NANOS_NEVER, time);
+
+        EmbeddedChannel netty = acceptNew(selector, REMOTE_A);
+        selector.poll(0);
+        String id = selector.connected().get(0);
+        KafkaChannel channel = selector.channel(id);
+
+        // Drive a frame in. KafkaChannel.read() reads the size header, tryAllocate fails,
+        // self-mutes via KafkaChannel.mute(). channel.isMuted() is now true; the channel is
+        // NOT in explicitlyMutedChannels.
+        selector.onRead(netty, framed("payload"));
+        selector.poll(0);
+        assertTrue(channel.isMuted(), "preconditions: channel must be self-muted");
+
+        // Peer closes. Channel goes through onDisconnect → closingChannels with the
+        // self-mute state still attached. The first post-disconnect poll runs
+        // drainPendingDisconnects (step 3) and routes the channel into closingChannels —
+        // drainClosingChannels (step 2) ran earlier in that same poll, when closingChannels
+        // was still empty, so no eviction work happens yet. NIO behaves identically: a
+        // FIN'd channel gets one extra poll of grace before drainClosingChannels evicts.
+        selector.onDisconnect(netty);
+        selector.poll(0);
+        assertNotNull(selector.closingChannel(id),
+            "preconditions: after one post-disconnect poll the channel must be in closingChannels");
+
+        // Second post-disconnect poll: drainClosingChannels now sees the channel. With the
+        // BUG, the broader isMuted() short-circuit would set keepClosing=true and the
+        // channel would never be evicted. With the FIX, explicitlyMutedChannels.contains
+        // returns false → channel.read() runs → tryAllocate still returns null (we have
+        // NOT released memory) → no completedReceive → keepClosing stays false → the
+        // channel is evicted with LOCAL_CLOSE, recovering the connection-quota slot and
+        // releasing the queued ByteBufs.
+        selector.poll(0);
+
+        assertNull(selector.closingChannel(id),
+            "self-muted closing channel must be evicted by drainClosingChannels even when " +
+            "memory pressure persists — otherwise the connection-quota slot leaks forever");
+        assertEquals(ChannelState.LOCAL_CLOSE, selector.disconnected().get(id),
+            "evicted self-muted closing channel must surface as LOCAL_CLOSE (NIO contract)");
+        pool.release(drain);
+    }
+
+    @Test
+    void operatorMutedClosingChannelStaysUntilProcessorUnmutes() throws Exception {
+        // Counterpart to selfMutedClosingChannelDrainsRatherThanStickingForever: the FIX
+        // narrows the short-circuit from isMuted() to explicitlyMutedChannels.contains().
+        // Operator-muted closing channels MUST still be preserved across polls — the
+        // Processor calls KafkaChannel.maybeCompleteReceive only after the throttling /
+        // RESPONSE_QUEUED handshake releases the mute. Mirrors NIO Selector.java:702
+        // first half of the OR clause.
+        selector = newSelector(IDLE_NANOS_NEVER);
+        EmbeddedChannel netty = acceptNew(selector, REMOTE_A);
+        selector.poll(0);
+        String id = selector.connected().get(0);
+
+        // Buffer a frame so the disconnect path routes through closingChannels.
+        selector.onRead(netty, framed("payload"));
+        selector.poll(0);
+        // First receive surfaces immediately because MemoryPool.NONE always allocates.
+        // Drain the completedReceives so the next poll's surface is clean.
+        selector.completedReceives().clear();
+
+        // Operator-mute — registers in explicitlyMutedChannels.
+        selector.mute(id);
+
+        // Buffer another frame and disconnect: channel routes to closingChannels with the
+        // operator mute attached.
+        selector.onRead(netty, framed("more"));
+        selector.onDisconnect(netty);
+
+        selector.poll(0);
+        assertNotNull(selector.closingChannel(id),
+            "operator-muted closing channel must NOT be evicted on the first drain poll — " +
+            "the Processor still owes an explicit unmute before the buffered receive surfaces");
+        assertFalse(selector.disconnected().containsKey(id),
+            "operator-muted closing channel must NOT emit a disconnect yet — eviction is " +
+            "deferred until the Processor unmutes and the final receive flushes");
+    }
 }
