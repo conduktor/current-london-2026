@@ -2376,6 +2376,260 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testShareFetchOnViewTopicIsRejectedAsInvalidTopic(): Unit = {
+    // Share-fetch bypasses the regular fetch path's view rewrite: SharePartitionManager reads
+    // the view's local placeholder log directly via ReplicaManager.readFromLog
+    // (DelayedShareFetch / ShareFetchUtils), which would either return an empty result (the
+    // happy case) or surface stale local records / control batches under the view name if any
+    // ever leaked through other paths. Until share-fetch grows its own view-aware path, we fail
+    // fast with INVALID_TOPIC_EXCEPTION so the read-only contract holds across both consumer
+    // protocols (classic + share). Mirror partner of the DescribeProducers rejection.
+    val viewTopic = "sf-view"
+    val regularTopic = "sf-regular"
+    val viewTopicId = Uuid.randomUuid()
+    val regularTopicId = Uuid.randomUuid()
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, "sf-backing")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.x == 1")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
+    addTopicToMetadataCache(viewTopic, numPartitions = 1, topicId = viewTopicId)
+    addTopicToMetadataCache(regularTopic, numPartitions = 1, topicId = regularTopicId)
+
+    val viewTp = new TopicIdPartition(viewTopicId, new TopicPartition(viewTopic, 0))
+    val regularTp = new TopicIdPartition(regularTopicId, new TopicPartition(regularTopic, 0))
+
+    val erroneousPartitions: util.Map[TopicIdPartition, ShareFetchResponseData.PartitionData] = new util.HashMap()
+    val validPartitions: util.Map[TopicIdPartition, ShareFetchRequest.SharePartitionData] = new util.HashMap()
+    validPartitions.put(viewTp, new ShareFetchRequest.SharePartitionData(viewTopicId, partitionMaxBytes))
+    validPartitions.put(regularTp, new ShareFetchRequest.SharePartitionData(regularTopicId, partitionMaxBytes))
+    val erroneousAndValidPartitionData = new ErroneousAndValidPartitionData(erroneousPartitions, validPartitions)
+
+    when(sharePartitionManager.fetchMessages(any(), any(), any(), any())).thenReturn(
+      CompletableFuture.completedFuture(Map[TopicIdPartition, ShareFetchResponseData.PartitionData](
+        regularTp -> new ShareFetchResponseData.PartitionData().setPartitionIndex(0).setErrorCode(Errors.NONE.code)
+      ).asJava))
+
+    val shareFetchRequestData = new ShareFetchRequestData()
+      .setGroupId("g")
+      .setMemberId(Uuid.ZERO_UUID.toString)
+      .setShareSessionEpoch(0)
+      .setTopics(List(
+        new ShareFetchRequestData.FetchTopic().setTopicId(viewTopicId).setPartitions(List(
+          new ShareFetchRequestData.FetchPartition().setPartitionIndex(0).setPartitionMaxBytes(partitionMaxBytes)).asJava),
+        new ShareFetchRequestData.FetchTopic().setTopicId(regularTopicId).setPartitions(List(
+          new ShareFetchRequestData.FetchPartition().setPartitionIndex(0).setPartitionMaxBytes(partitionMaxBytes)).asJava)
+      ).asJava)
+    val shareFetchRequest = new ShareFetchRequest.Builder(shareFetchRequestData).build(ApiKeys.SHARE_FETCH.latestVersion)
+    val request = buildRequest(shareFetchRequest)
+
+    val authorizedTopics: Set[String] = Set(viewTopic, regularTopic)
+    kafkaApis = createKafkaApis(
+      configRepository = configRepository,
+      overrideProperties = Map(
+        ServerConfigs.UNSTABLE_API_VERSIONS_ENABLE_CONFIG -> "true",
+        ShareGroupConfig.SHARE_GROUP_ENABLE_CONFIG -> "true"))
+    val result = kafkaApis.handleFetchFromShareFetchRequest(
+      request, erroneousAndValidPartitionData, sharePartitionManager, authorizedTopics).get()
+
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, result(viewTp).errorCode,
+      "SHARE_FETCH on view tp must surface INVALID_TOPIC_EXCEPTION (the read-only contract spans both consumer protocols)")
+    assertEquals(Errors.NONE.code, result(regularTp).errorCode,
+      "non-view partitions in the same share-fetch must pass through to SharePartitionManager")
+    // SharePartitionManager.fetchMessages must NEVER be invoked for the view tp — otherwise the
+    // share path's local-log read at ShareFetchUtils.records would still happen, defeating the
+    // rejection.
+    val fetchedCaptor: ArgumentCaptor[util.LinkedHashMap[TopicIdPartition, Integer]] =
+      ArgumentCaptor.forClass(classOf[util.LinkedHashMap[TopicIdPartition, Integer]])
+    verify(sharePartitionManager).fetchMessages(any(), any(), any(), fetchedCaptor.capture())
+    assertFalse(fetchedCaptor.getValue.containsKey(viewTp),
+      "view tp must be filtered out of the share-fetch batch before SharePartitionManager sees it")
+  }
+
+  @Test
+  def testShareAcknowledgeOnViewTopicIsRejectedAsInvalidTopic(): Unit = {
+    // Symmetric to the SHARE_FETCH rejection: a client that somehow obtained share-partition state
+    // for a view tp (e.g. acquired before the broker was upgraded with the view config) must still
+    // be unable to acknowledge it. Reject up front so SharePartitionManager.acknowledge never
+    // receives a view tp.
+    val viewTopic = "sa-view"
+    val regularTopic = "sa-regular"
+    val viewTopicId = Uuid.randomUuid()
+    val regularTopicId = Uuid.randomUuid()
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, "sa-backing")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.x == 1")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
+    addTopicToMetadataCache(viewTopic, numPartitions = 1, topicId = viewTopicId)
+    addTopicToMetadataCache(regularTopic, numPartitions = 1, topicId = regularTopicId)
+
+    val viewTp = new TopicIdPartition(viewTopicId, new TopicPartition(viewTopic, 0))
+    val regularTp = new TopicIdPartition(regularTopicId, new TopicPartition(regularTopic, 0))
+
+    when(sharePartitionManager.acknowledge(any(), any(), any())).thenReturn(
+      CompletableFuture.completedFuture(Map[TopicIdPartition, ShareAcknowledgeResponseData.PartitionData](
+        regularTp -> new ShareAcknowledgeResponseData.PartitionData().setPartitionIndex(0).setErrorCode(Errors.NONE.code)
+      ).asJava))
+
+    val acknowledgementData = mutable.Map[TopicIdPartition, util.List[ShareAcknowledgementBatch]]()
+    acknowledgementData += (viewTp -> util.Arrays.asList(
+      new ShareAcknowledgementBatch(0, 9, Collections.singletonList(1.toByte))))
+    acknowledgementData += (regularTp -> util.Arrays.asList(
+      new ShareAcknowledgementBatch(0, 9, Collections.singletonList(1.toByte))))
+
+    val erroneous = mutable.Map[TopicIdPartition, ShareAcknowledgeResponseData.PartitionData]()
+
+    kafkaApis = createKafkaApis(
+      configRepository = configRepository,
+      overrideProperties = Map(
+        ServerConfigs.UNSTABLE_API_VERSIONS_ENABLE_CONFIG -> "true",
+        ShareGroupConfig.SHARE_GROUP_ENABLE_CONFIG -> "true"))
+    val result = kafkaApis.handleAcknowledgements(
+      acknowledgementData, erroneous, sharePartitionManager,
+      Set(viewTopic, regularTopic), "g", Uuid.ZERO_UUID.toString).get()
+
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, result(viewTp).errorCode,
+      "SHARE_ACKNOWLEDGE on view tp must surface INVALID_TOPIC_EXCEPTION")
+    assertEquals(Errors.NONE.code, result(regularTp).errorCode,
+      "non-view partitions in the same acknowledge must pass through to SharePartitionManager")
+    // SharePartitionManager.acknowledge must not see the view tp.
+    val ackCaptor: ArgumentCaptor[util.Map[TopicIdPartition, util.List[ShareAcknowledgementBatch]]] =
+      ArgumentCaptor.forClass(classOf[util.Map[TopicIdPartition, util.List[ShareAcknowledgementBatch]]])
+    verify(sharePartitionManager).acknowledge(any(), any(), ackCaptor.capture())
+    assertFalse(ackCaptor.getValue.containsKey(viewTp),
+      "view tp must be filtered out of the acknowledge batch before SharePartitionManager sees it")
+  }
+
+  @Test
+  def testWriteTxnMarkersOnViewTopicIsRejectedAsInvalidTopic(): Unit = {
+    // Views are read-only (PROMPT.md). The txn coordinator already cannot persist a view tp into
+    // transaction state (testAddPartitionsToTxnOnViewTopicIsRejectedAsInvalidTopic), but the
+    // WriteTxnMarkers path is reachable by any inter-broker / cluster-authorized caller. A
+    // misrouted or replayed marker request must never cause replicaManager.appendRecords to
+    // write an EndTxnMarker control batch into the view's local placeholder log — that would
+    // leave operator-visible control batches under the view name and break the read-only
+    // invariant.
+    val viewTopic = "wtm-view"
+    val regularTopic = "wtm-regular"
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, "wtm-backing")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.x == 1")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+    addTopicToMetadataCache(viewTopic, numPartitions = 1)
+    addTopicToMetadataCache(regularTopic, numPartitions = 1)
+
+    val viewTp = new TopicPartition(viewTopic, 0)
+    val regularTp = new TopicPartition(regularTopic, 0)
+    val writeTxnMarkersRequest = new WriteTxnMarkersRequest.Builder(
+      asList(new TxnMarkerEntry(1L, 1.toShort, 0, TransactionResult.COMMIT,
+        asList(viewTp, regularTp)))).build()
+    val request = buildRequest(writeTxnMarkersRequest)
+
+    val capturedResponse: ArgumentCaptor[WriteTxnMarkersResponse] = ArgumentCaptor.forClass(classOf[WriteTxnMarkersResponse])
+    val responseCallback: ArgumentCaptor[Map[TopicPartition, PartitionResponse] => Unit] =
+      ArgumentCaptor.forClass(classOf[Map[TopicPartition, PartitionResponse] => Unit])
+
+    when(replicaManager.onlinePartition(regularTp)).thenReturn(Some(mock(classOf[Partition])))
+    when(groupCoordinator.isNewGroupCoordinator).thenReturn(false)
+
+    val requestLocal = RequestLocal.withThreadConfinedCaching
+    when(replicaManager.appendRecords(anyLong, anyShort,
+      ArgumentMatchers.eq(true),
+      ArgumentMatchers.eq(AppendOrigin.COORDINATOR),
+      any(), responseCallback.capture(), any(), any(),
+      ArgumentMatchers.eq(requestLocal), any(), any()
+    )).thenAnswer(_ => responseCallback.getValue.apply(Map(regularTp -> new PartitionResponse(Errors.NONE))))
+
+    kafkaApis = createKafkaApis(configRepository = configRepository)
+    kafkaApis.handleWriteTxnMarkersRequest(request, requestLocal)
+
+    verify(requestChannel).sendResponse(
+      ArgumentMatchers.eq(request), capturedResponse.capture(), ArgumentMatchers.eq(None))
+    val markersResponse = capturedResponse.getValue
+    val errorsByTp = markersResponse.errorsByProducerId.get(1L)
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION, errorsByTp.get(viewTp),
+      "view tp in WriteTxnMarkers must be rejected with INVALID_TOPIC_EXCEPTION before any append")
+    assertEquals(Errors.NONE, errorsByTp.get(regularTp),
+      "non-view partitions in the same marker must still be appended")
+    // The append entries must NOT include the view tp — otherwise replicaManager would write a
+    // control batch to the view's local log, the very leak this rejection closes.
+    val appendCaptor: ArgumentCaptor[Map[TopicPartition, MemoryRecords]] =
+      ArgumentCaptor.forClass(classOf[Map[TopicPartition, MemoryRecords]])
+    verify(replicaManager).appendRecords(anyLong, anyShort,
+      ArgumentMatchers.eq(true), ArgumentMatchers.eq(AppendOrigin.COORDINATOR),
+      appendCaptor.capture(), any(), any(), any(),
+      ArgumentMatchers.eq(requestLocal), any(), any())
+    assertFalse(appendCaptor.getValue.contains(viewTp),
+      "view tp must be filtered out before reaching replicaManager.appendRecords")
+  }
+
+  @Test
+  def testFetchFromViewClearsPreferredReadReplicaToAvoidWedgedClient(): Unit = {
+    // ReplicaManager computes preferredReadReplica against the BACKING tp's replica set (the fetch
+    // is redirected to the backing). If backing replicas {1,3} and view replicas {1,2} diverge, a
+    // rack-aware backing fetch on broker 1 can suggest broker 3 as PRR. The client would then
+    // retry the VIEW partition against broker 3, which is not a view replica and cannot serve it —
+    // wedging the consumer until PRR expires. Strip PRR on view responses so the client always
+    // retries via the view's actual replica set.
+    val viewTopic = "prr-view"
+    val backingTopic = "prr-backing"
+    val viewTopicId = Uuid.randomUuid()
+    val backingTopicId = Uuid.randomUuid()
+    val partition = 0
+
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, backingTopic)
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.x == 1")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+    addTopicToMetadataCache(viewTopic, numPartitions = 1, topicId = viewTopicId)
+    addTopicToMetadataCache(backingTopic, numPartitions = 1, topicId = backingTopicId)
+
+    val viewTpId = new TopicIdPartition(viewTopicId, new TopicPartition(viewTopic, partition))
+    val backingTpId = new TopicIdPartition(backingTopicId, new TopicPartition(backingTopic, partition))
+
+    // Backing returns PRR=3 (a backing replica not in the view's replica set). The view response
+    // must NOT propagate this — otherwise the consumer would retry the view tp against broker 3.
+    val backingRecords = MemoryRecords.withRecords(0L, Compression.NONE,
+      new SimpleRecord("{\"x\":1}".getBytes(StandardCharsets.UTF_8)))
+    when(replicaManager.fetchMessages(
+      any[FetchParams], any[Seq[(TopicIdPartition, FetchRequest.PartitionData)]],
+      any[ReplicaQuota], any[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]()
+    )).thenAnswer(invocation => {
+      val callback = invocation.getArgument(3).asInstanceOf[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]
+      callback(Seq(backingTpId -> new FetchPartitionData(Errors.NONE, 100L, 0L, backingRecords,
+        Optional.empty(), OptionalLong.empty(), Optional.empty(), OptionalInt.of(3), false)))
+    })
+
+    val fetchData = Map(viewTpId -> new FetchRequest.PartitionData(viewTopicId, 0, 0, 1000, Optional.empty())).asJava
+    val fetchDataBuilder = Map(viewTpId.topicPartition -> new FetchRequest.PartitionData(viewTopicId, 0, 0, 1000, Optional.empty())).asJava
+    val fetchMetadata = new JFetchMetadata(0, 0)
+    val fetchContext = new FullFetchContext(time, new FetchSessionCacheShard(1000, 100),
+      fetchMetadata, fetchData, true, false)
+    when(fetchManager.newContext(any[Short], any[JFetchMetadata], any[Boolean],
+      any[util.Map[TopicIdPartition, FetchRequest.PartitionData]],
+      any[util.List[TopicIdPartition]],
+      any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val fetchRequest = new FetchRequest.Builder(ApiKeys.FETCH.latestVersion, ApiKeys.FETCH.latestVersion,
+      -1, -1, 100, 0, fetchDataBuilder).build()
+    val request = buildRequest(fetchRequest)
+    stubBackingPartitionsLocal()
+    kafkaApis = createKafkaApis(configRepository = configRepository)
+    kafkaApis.handleFetchRequest(request)
+
+    val response = verifyNoThrottling[FetchResponse](request)
+    val responseData = response.responseData(metadataCache.topicIdsToNames(), ApiKeys.FETCH.latestVersion)
+    val partitionData = responseData.get(viewTpId.topicPartition)
+    assertEquals(Errors.NONE.code, partitionData.errorCode)
+    assertEquals(FetchResponse.INVALID_PREFERRED_REPLICA_ID, partitionData.preferredReadReplica,
+      "preferredReadReplica from the backing tp must be stripped on the view response — propagating " +
+      "it would wedge the consumer when backing and view replica sets diverge")
+  }
+
+  @Test
   def testProduceToRegularTopicIsNotRejectedAsView(): Unit = {
     // Counter-test for testProduceToViewTopicIsRejected: a regular topic (no view configs at all)
     // must NOT be rejected. Guards against accidentally treating every topic with non-empty config

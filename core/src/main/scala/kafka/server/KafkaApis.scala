@@ -949,6 +949,17 @@ class KafkaApis(val requestChannel: RequestChannel,
       // AbstractFetcherThread follower-replication path do), but defense-in-depth keeps the view
       // contract intact if a future consumer KIP starts consuming the field.
       val safeDivergingEpoch = Optional.empty[FetchResponseData.EpochEndOffset]()
+      // Clear preferredReadReplica. ReplicaManager computes PRR against the BACKING tp's replica
+      // set (the fetch is redirected to the backing): if the backing has replicas {1,3} and the
+      // view has replicas {1,2}, a rack-aware backing fetch on broker 1 can suggest broker 3 as
+      // the preferred read replica. The client then retries the VIEW partition against broker 3,
+      // which is not a view replica and cannot serve it — wedging the consumer until the PRR
+      // expires. Stripping PRR on view responses costs follower-read latency on view-only consumer
+      // groups (acceptable: today the view leader is required to be a backing replica, so the
+      // leader-served path already works) and is correct: a precise translation would require
+      // intersecting backing and view replica sets, which we do not have here because view
+      // replicas are not threaded into applyViewFilter.
+      val safePreferredReadReplica = java.util.OptionalInt.empty()
       filtered match {
         case Right(records) =>
           (viewTpId, new FetchPartitionData(
@@ -959,7 +970,7 @@ class KafkaApis(val requestChannel: RequestChannel,
             safeDivergingEpoch,
             data.lastStableOffset,
             data.abortedTransactions,
-            data.preferredReadReplica,
+            safePreferredReadReplica,
             data.isReassignmentFetch))
         case Left(err) =>
           (viewTpId, new FetchPartitionData(
@@ -970,7 +981,7 @@ class KafkaApis(val requestChannel: RequestChannel,
             safeDivergingEpoch,
             data.lastStableOffset,
             data.abortedTransactions,
-            data.preferredReadReplica,
+            safePreferredReadReplica,
             data.isReassignmentFetch))
       }
     }
@@ -2419,7 +2430,17 @@ class KafkaApis(val requestChannel: RequestChannel,
 
       val currentErrors = new ConcurrentHashMap[TopicPartition, Errors]()
       marker.partitions.forEach { partition =>
-        replicaManager.onlinePartition(partition) match {
+        if (isViewTopic(partition.topic))
+          // Views are read-only (PROMPT.md). The txn coordinator already cannot persist a view tp
+          // into transaction state (testAddPartitionsToTxnOnViewTopicIsRejectedAsInvalidTopic), so
+          // a well-behaved cluster will never reach this code with a view partition. Defense in
+          // depth for the inter-broker / cluster-authorized path: a misrouted or replayed marker
+          // request must never cause `replicaManager.appendRecords` below to write an
+          // EndTxnMarker control batch into the view's local placeholder log. Surface
+          // INVALID_TOPIC_EXCEPTION so the bug is visible upstream rather than silently leaving
+          // operator-visible artifacts under the view name.
+          currentErrors.put(partition, Errors.INVALID_TOPIC_EXCEPTION)
+        else replicaManager.onlinePartition(partition) match {
           case Some(_)  =>
             partitionsWithCompatibleMessageFormat += partition
           case None =>
@@ -3795,6 +3816,15 @@ class KafkaApis(val requestChannel: RequestChannel,
         erroneous += topicIdPartition -> ShareFetchResponse.partitionResponse(topicIdPartition, Errors.TOPIC_AUTHORIZATION_FAILED)
       else if (!metadataCache.contains(topicIdPartition.topicPartition))
         erroneous += topicIdPartition -> ShareFetchResponse.partitionResponse(topicIdPartition, Errors.UNKNOWN_TOPIC_OR_PARTITION)
+      else if (isViewTopic(topicIdPartition.topicPartition.topic))
+        // Views are read-only (PROMPT.md). Share-fetch bypasses the regular fetch path's view
+        // rewrite (KafkaApis.handleFetchRequest → applyViewFilter): SharePartitionManager reads
+        // the view's local placeholder log directly via ReplicaManager.readFromLog
+        // (DelayedShareFetch / ShareFetchUtils), which would either return an empty result (the
+        // happy case) or surface stale local records / control batches under the view name if any
+        // ever leaked through other paths. Fail fast with INVALID_TOPIC_EXCEPTION, mirroring the
+        // DescribeProducers treatment above, until share-fetch grows its own view-aware path.
+        erroneous += topicIdPartition -> ShareFetchResponse.partitionResponse(topicIdPartition, Errors.INVALID_TOPIC_EXCEPTION)
       else
         interestedWithMaxBytes.put(topicIdPartition, sharePartitionData.maxBytes)
     }
@@ -3877,6 +3907,12 @@ class KafkaApis(val requestChannel: RequestChannel,
         else if (!metadataCache.contains(topicIdPartition.topicPartition))
           erroneous += topicIdPartition ->
             ShareAcknowledgeResponse.partitionResponse(topicIdPartition, Errors.UNKNOWN_TOPIC_OR_PARTITION)
+        else if (isViewTopic(topicIdPartition.topicPartition.topic))
+          // Symmetric to the SHARE_FETCH rejection above: a client that somehow obtained share
+          // partition state for a view tp (it cannot, post-fix) must still be unable to acknowledge
+          // it. Reject up front so SharePartitionManager.acknowledge never sees a view tp.
+          erroneous += topicIdPartition ->
+            ShareAcknowledgeResponse.partitionResponse(topicIdPartition, Errors.INVALID_TOPIC_EXCEPTION)
         else if (acknowledgeBatches.size() == 0)
           emptyAcknowledgements += topicIdPartition ->
             ShareAcknowledgeResponse.partitionResponse(topicIdPartition, Errors.NONE)
