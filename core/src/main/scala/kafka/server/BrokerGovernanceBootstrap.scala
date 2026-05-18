@@ -522,6 +522,19 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
   /**
    * Schedule [[drainOnce]] on `scheduler` every `intervalMs` milliseconds.
    * Returns a handle that the broker calls on shutdown to stop the task.
+   *
+   * <p>If [[drainOnce]] throws on every tick (the canonical example is a
+   * broker that has been reassigned away from {@code __governance-0} mid-
+   * runtime under {@code requireLocalReplica=true}, where every drain
+   * throws an [[IllegalStateException]]), naive logging would burn one
+   * WARN per scheduler tick — at the default interval that is one WARN
+   * every few seconds, indefinitely. The de-dup ledger below collapses a
+   * repeating identical message: the first occurrence WARNs immediately,
+   * subsequent identical occurrences are counted silently and rolled up
+   * into a single WARN every [[FailureWarnIntervalMs]]. A new distinct
+   * message resets the ledger and WARNs immediately again — so an
+   * operator scanning logs always sees the transition to a NEW failure
+   * mode promptly, and a steady-state recurring failure never floods.
    */
   def scheduleOngoing(scheduler: KafkaScheduler,
                       intervalMs: Long): Unit = {
@@ -530,10 +543,46 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
         drainOnce()
       } catch {
         case t: Throwable =>
-          warn(s"governance rules drain failed: ${t.getMessage}")
+          maybeWarnSuppressed(t.getMessage)
       }
     }
     scheduler.schedule("governance-rules-drain", task, intervalMs, intervalMs)
+  }
+
+  private val FailureWarnIntervalMs: Long = 60_000L
+  // Visible for tests so the suppression window can be advanced synthetically.
+  private[server] var failureWarnNowMs: () => Long = () => System.currentTimeMillis()
+  private val lastWarnedMessage = new java.util.concurrent.atomic.AtomicReference[String](null)
+  private val lastWarnAtMs = new AtomicLong(0L)
+  private val suppressedSinceLastWarn = new AtomicLong(0L)
+  // Visible for tests so they can assert how many WARNs actually fired —
+  // capturing SLF4J output across the codebase is heavy and brittle.
+  private[server] val warnEmissions = new AtomicLong(0L)
+
+  private[server] def maybeWarnSuppressed(message: String): Unit = {
+    val msg = if (message == null) "<null>" else message
+    val previous = lastWarnedMessage.get()
+    val now = failureWarnNowMs()
+    if (previous == null || previous != msg) {
+      val suppressed = suppressedSinceLastWarn.getAndSet(0L)
+      lastWarnedMessage.set(msg)
+      lastWarnAtMs.set(now)
+      if (suppressed > 0L && previous != null) {
+        warn(s"governance rules drain failed: $msg (previous failure '$previous' " +
+          s"repeated and was suppressed $suppressed time(s) before this new message)")
+      } else {
+        warn(s"governance rules drain failed: $msg")
+      }
+      warnEmissions.incrementAndGet()
+    } else if (now - lastWarnAtMs.get() >= FailureWarnIntervalMs) {
+      val rolled = suppressedSinceLastWarn.getAndSet(0L)
+      lastWarnAtMs.set(now)
+      warn(s"governance rules drain failed: $msg (same failure repeated $rolled " +
+        s"time(s) in the last ${FailureWarnIntervalMs}ms)")
+      warnEmissions.incrementAndGet()
+    } else {
+      suppressedSinceLastWarn.incrementAndGet()
+    }
   }
 
   /**

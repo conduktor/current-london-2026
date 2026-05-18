@@ -33,6 +33,7 @@ import org.mockito.Mockito.{doAnswer, doThrow, mock, when}
 
 import java.nio.charset.StandardCharsets
 import java.util.Collections
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Unit tests for [[BrokerGovernanceBootstrap]] — the direct-log-read drain
@@ -941,6 +942,64 @@ class BrokerGovernanceBootstrapTest {
     assertTrue(engine.evaluate(ApiKeys.METADATA, "c", false,
       () => Collections.emptyMap()).denied,
       "the newly-drained METADATA rule must be enforced")
+  }
+
+  @Test
+  def scheduledDrainFailureWarningsAreDeduplicatedAndRolledUp(): Unit = {
+    // MINOR-2: when a broker is reassigned away from __governance-0 mid-
+    // runtime under requireLocalReplica=true (or any other deterministic
+    // throw from drainOnce), the scheduled drain runs at sub-second
+    // cadence and would WARN on every tick — quickly burying the rest of
+    // broker.log under the same message. The deduplication policy:
+    //   - first occurrence WARNs (count +1)
+    //   - identical occurrences within FailureWarnIntervalMs are
+    //     silently suppressed and counted
+    //   - the same identical occurrence past the interval rolls up the
+    //     suppressed count into a single WARN
+    //   - a NEW distinct message resets the ledger and WARNs immediately
+    val rm = mock(classOf[ReplicaManager])
+    val engine = new RuleEngine()
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp)
+    val clock = new AtomicLong(0L)
+    boot.failureWarnNowMs = () => clock.get()
+
+    // 1st occurrence — fresh message, fires.
+    boot.maybeWarnSuppressed("reassigned away")
+    assertEquals(1L, boot.warnEmissions.get(),
+      "first occurrence of a fresh failure must WARN")
+
+    // 2nd–6th identical occurrences within the suppression window —
+    // suppressed silently.
+    clock.set(5_000L); boot.maybeWarnSuppressed("reassigned away")
+    clock.set(10_000L); boot.maybeWarnSuppressed("reassigned away")
+    clock.set(20_000L); boot.maybeWarnSuppressed("reassigned away")
+    clock.set(40_000L); boot.maybeWarnSuppressed("reassigned away")
+    clock.set(59_999L); boot.maybeWarnSuppressed("reassigned away")
+    assertEquals(1L, boot.warnEmissions.get(),
+      "identical occurrences inside the suppression window must NOT WARN — " +
+        "the broker.log floor must not be buried under 12 Hz repeats")
+
+    // Crossing the suppression window — same message rolls up.
+    clock.set(60_001L)
+    boot.maybeWarnSuppressed("reassigned away")
+    assertEquals(2L, boot.warnEmissions.get(),
+      "crossing the suppression window with the same message must roll up the count " +
+        "into exactly ONE WARN, not one per skipped occurrence")
+
+    // A new distinct failure resets the ledger and WARNs immediately,
+    // mentioning the previously-suppressed message so an operator
+    // scanning logs sees the transition.
+    clock.set(60_500L)
+    boot.maybeWarnSuppressed("disk faulted")
+    assertEquals(3L, boot.warnEmissions.get(),
+      "a brand-new distinct failure must WARN immediately — operators must see " +
+        "transitions to a new failure mode without waiting for the suppression window")
+
+    // The same new message is now itself suppressed for the next window.
+    clock.set(60_600L); boot.maybeWarnSuppressed("disk faulted")
+    clock.set(80_000L); boot.maybeWarnSuppressed("disk faulted")
+    assertEquals(3L, boot.warnEmissions.get(),
+      "the new failure becomes subject to the same per-message suppression policy")
   }
 
   @Test
