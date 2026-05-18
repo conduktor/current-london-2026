@@ -2114,6 +2114,53 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testDeleteRecordsOnViewTopicIsRejectedAndDoesNotConsultReplicaManager(): Unit = {
+    // PROMPT.md: views are read-only. Produce rejects upfront; DeleteRecords must too, otherwise
+    // the request resolves against the view's local log (no records) and either no-ops or returns
+    // misleading low-watermarks without surfacing that mutation is structurally disallowed. We
+    // reject with INVALID_REQUEST (mirrors produce) and never call replicaManager.deleteRecords
+    // for the view partition — that's the equivalent of produce's "before backing resolution" line.
+    val viewTopic = "dr-view"
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, "dr-backing")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.x == 1")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+    addTopicToMetadataCache(viewTopic, numPartitions = 1)
+
+    val tp = new TopicPartition(viewTopic, 0)
+    val deleteReq = new DeleteRecordsRequest.Builder(
+      new DeleteRecordsRequestData()
+        .setTimeoutMs(5000)
+        .setTopics(Collections.singletonList(new DeleteRecordsRequestData.DeleteRecordsTopic()
+          .setName(tp.topic)
+          .setPartitions(Collections.singletonList(new DeleteRecordsRequestData.DeleteRecordsPartition()
+            .setPartitionIndex(tp.partition)
+            .setOffset(0L)))))).build()
+    val request = buildRequest(deleteReq)
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    kafkaApis = createKafkaApis(configRepository = configRepository)
+    kafkaApis.handleDeleteRecordsRequest(request)
+
+    val response = verifyNoThrottling[DeleteRecordsResponse](request)
+    val topicResult = response.data.topics.asScala.find(_.name == viewTopic)
+    assertTrue(topicResult.isDefined,
+      "view-named entry must be in the response")
+    val partResult = topicResult.get.partitions.asScala.head
+    assertEquals(Errors.INVALID_REQUEST.code, partResult.errorCode,
+      "DeleteRecords on a view topic must be rejected with INVALID_REQUEST (views are read-only)")
+    assertEquals(DeleteRecordsResponse.INVALID_LOW_WATERMARK, partResult.lowWatermark,
+      "rejected partitions must surface the sentinel low-watermark")
+
+    // The mutation must never reach the replica layer. Any call to deleteRecords would mean we
+    // crossed the read-only boundary PROMPT.md says we never cross.
+    verify(replicaManager, never()).deleteRecords(
+      anyLong, any(), any(), anyBoolean())
+  }
+
+  @Test
   def testProduceToRegularTopicIsNotRejectedAsView(): Unit = {
     // Counter-test for testProduceToViewTopicIsRejected: a regular topic (no view configs at all)
     // must NOT be rejected. Guards against accidentally treating every topic with non-empty config
