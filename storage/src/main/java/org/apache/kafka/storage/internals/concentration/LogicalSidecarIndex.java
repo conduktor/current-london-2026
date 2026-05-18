@@ -16,7 +16,7 @@
  */
 package org.apache.kafka.storage.internals.concentration;
 
-import org.apache.kafka.common.errors.CorruptRecordException;
+import org.apache.kafka.storage.internals.log.CorruptIndexException;
 
 import java.io.Closeable;
 import java.io.File;
@@ -62,8 +62,10 @@ public final class LogicalSidecarIndex implements Closeable {
         long length = channel.size();
         if (length % ENTRY_SIZE != 0) {
             // Tail-torn write left a partial entry — surface this as corruption so the caller
-            // can trigger a rebuild from the backing log.
-            throw new CorruptRecordException(
+            // can trigger a rebuild from the backing log. CorruptIndexException is the local
+            // idiom shared with OffsetIndex / TimeIndex; the sidecar is the same flavour of
+            // artefact and should announce corruption the same way.
+            throw new CorruptIndexException(
                 "sidecar " + file + " size " + length + " is not a multiple of " + ENTRY_SIZE);
         }
         this.entries = length / ENTRY_SIZE;

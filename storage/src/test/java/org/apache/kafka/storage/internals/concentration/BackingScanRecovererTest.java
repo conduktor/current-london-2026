@@ -27,6 +27,7 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Behavioural contract of {@link BackingScanRecoverer}.
@@ -106,8 +107,14 @@ public class BackingScanRecovererTest {
             new RecoveryRecord("topicA", 0, 2L, 1L)   // gap: expected 1, got 2
         );
         LogicalOffsetTracker tracker = new LogicalOffsetTracker();
-        assertThrows(IllegalStateException.class,
+        IllegalStateException thrown = assertThrows(IllegalStateException.class,
             () -> recoverer.recoverFromScan(stream.iterator(), tracker));
+        // Pin that the message identifies *which* corruption was detected and on which partition,
+        // so a future change that throws ISE for an unrelated reason does not fool this test.
+        String msg = thrown.getMessage();
+        assertTrue(msg.contains("topicA") && msg.contains("discontinuity")
+                && msg.contains("expected 1") && msg.contains("got 2"),
+            "exception message must identify the gap: " + msg);
     }
 
     @Test
@@ -118,8 +125,11 @@ public class BackingScanRecovererTest {
             new RecoveryRecord("topicA", 0, 1L, 2L)   // duplicate logical offset for topicA[0]
         );
         LogicalOffsetTracker tracker = new LogicalOffsetTracker();
-        assertThrows(IllegalStateException.class,
+        IllegalStateException thrown = assertThrows(IllegalStateException.class,
             () -> recoverer.recoverFromScan(stream.iterator(), tracker));
+        String msg = thrown.getMessage();
+        assertTrue(msg.contains("topicA") && msg.contains("expected 2") && msg.contains("got 1"),
+            "exception message must identify the regression: " + msg);
     }
 
     @Test

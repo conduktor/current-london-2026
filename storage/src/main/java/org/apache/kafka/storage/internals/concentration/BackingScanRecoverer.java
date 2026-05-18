@@ -93,15 +93,25 @@ public final class BackingScanRecoverer {
             while (stream.hasNext()) {
                 RecoveryRecord r = stream.next();
                 LogicalPartition key = new LogicalPartition(r.logicalTopic(), r.logicalPartition());
-                LogicalSidecarIndex sidecar = open.computeIfAbsent(key, k -> {
+                LogicalSidecarIndex sidecar = open.get(key);
+                if (sidecar == null) {
+                    // Open + truncate must be one transaction wrt the open map. If truncateTo
+                    // throws after the sidecar handle has been allocated but before we register
+                    // it, close it inline — otherwise the file descriptor leaks past the finally.
+                    LogicalSidecarIndex fresh = openSidecar(r.logicalTopic(), r.logicalPartition());
                     try {
-                        LogicalSidecarIndex s = openSidecar(k.logicalTopic(), k.logicalPartition());
-                        s.truncateTo(0);
-                        return s;
-                    } catch (IOException e) {
-                        throw new RuntimeException(e);
+                        fresh.truncateTo(0);
+                    } catch (IOException | RuntimeException e) {
+                        try {
+                            fresh.close();
+                        } catch (IOException ignored) {
+                            // original exception takes precedence
+                        }
+                        throw e;
                     }
-                });
+                    open.put(key, fresh);
+                    sidecar = fresh;
+                }
                 long expected = sidecar.size();
                 if (r.logicalOffset() != expected) {
                     throw new IllegalStateException(

@@ -233,4 +233,36 @@ public class LogicalSidecarIndexTest {
         assertEquals(6L, idx.size());
         assertEquals(999L, idx.lookup(5L));
     }
+
+    @Test
+    public void openOnTailTornFileFailsLoudly() throws IOException {
+        // Simulate a crash mid-append: 2 entries written cleanly, then a 3-byte partial entry.
+        // The sidecar must refuse to open and signal that a backing-log rebuild is required,
+        // rather than silently misaddress every entry past the torn point.
+        File file = new File(tempDir, "torn-0.sidecar");
+        try (LogicalSidecarIndex idx = newIndex("torn", 0)) {
+            idx.append(10L);
+            idx.append(20L);
+        }
+        // newIndex registered the index; drop the registration so the close in @AfterEach is a no-op.
+        openIndexes.clear();
+
+        byte[] existing = Files.readAllBytes(file.toPath());
+        byte[] withPartial = new byte[existing.length + 3];
+        System.arraycopy(existing, 0, withPartial, 0, existing.length);
+        // The trailing 3 bytes are zeros — value doesn't matter, only the unaligned length does.
+        Files.write(file.toPath(), withPartial);
+
+        RuntimeException thrown = assertThrows(RuntimeException.class,
+            () -> new LogicalSidecarIndex(file, "torn", 0).close());
+        // Pin both the local idiom (CorruptIndexException — same family as OffsetIndex /
+        // TimeIndex) and that the message identifies the offending file and length.
+        assertEquals("org.apache.kafka.storage.internals.log.CorruptIndexException",
+            thrown.getClass().getName(),
+            "must throw CorruptIndexException (the local Kafka idiom), got " + thrown.getClass());
+        assertTrue(thrown.getMessage().contains(file.getName())
+                && thrown.getMessage().contains("19")
+                && thrown.getMessage().contains("not a multiple"),
+            "message must identify file and torn length: " + thrown.getMessage());
+    }
 }

@@ -35,8 +35,12 @@ public final class LogicalOffsetTracker {
 
     private static final class PartitionState {
         final ReentrantLock lock = new ReentrantLock();
-        long startOffset = 0L;
-        long nextOffset = 0L;
+        // volatile so lockless readers (nextLogicalOffset / startOffset) see writes made by the
+        // lock-holding writers (commit / advanceStartOffset / restorePartition). The lock alone
+        // would create a happens-before for synchronised readers, but these accessors are
+        // intentionally lock-free for the fetch path.
+        volatile long startOffset = 0L;
+        volatile long nextOffset = 0L;
         Reservation outstanding = null;
     }
 

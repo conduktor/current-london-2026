@@ -29,7 +29,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -232,7 +231,6 @@ public class LogicalOffsetTrackerTest {
         Reservation r = tracker.reserve("orders", 9);
         assertEquals("orders", r.logicalTopic());
         assertEquals(9, r.logicalPartition());
-        assertNotNull(r);
         tracker.rollback(r);
     }
 }

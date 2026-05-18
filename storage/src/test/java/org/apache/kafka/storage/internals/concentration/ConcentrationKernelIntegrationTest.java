@@ -246,10 +246,12 @@ public class ConcentrationKernelIntegrationTest {
         assertEquals(backingSizeBefore, backing.get(), "backing log must not have been truncated");
         assertEquals(100L, sidecarFor("topicA", 0).size());
         assertEquals(100L, sidecarFor("topicB", 0).size());
-        // Reads in B's "deleted" logical range still resolve to backing offsets — DeleteRecords
+        // Reads in A's "deleted" logical range still resolve to backing offsets — DeleteRecords
         // only advances the visible low-water, it does not remove sidecar entries. The broker is
-        // responsible for refusing fetches below startOffset.
-        assertEquals(sidecarFor("topicA", 0).lookup(49), sidecarFor("topicA", 0).lookup(49));
+        // responsible for refusing fetches below startOffset. With the produce pattern above
+        // (interleaved A then B), topicA's logical offset i lands at backing offset 2*i.
+        assertEquals(2L * 49, sidecarFor("topicA", 0).lookup(49));
+        assertEquals(0L, sidecarFor("topicA", 0).lookup(0));
     }
 
     /**
