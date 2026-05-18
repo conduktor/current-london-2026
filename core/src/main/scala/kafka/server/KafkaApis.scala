@@ -70,6 +70,7 @@ import org.apache.kafka.server.views.{ViewFilter, ViewRegistry, ViewSpec}
 import org.apache.kafka.storage.internals.log.AppendOrigin
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats
 
+import java.nio.ByteBuffer
 import java.time.Duration
 import java.util
 import java.util.concurrent.atomic.AtomicInteger
@@ -689,37 +690,70 @@ class KafkaApis(val requestChannel: RequestChannel,
     // unfiltered (only the key changes) so the consumer sees the failure under the topic name it
     // asked for, not the backing topic.
     //
-    // PROMPT.md: "all filtering broker-side". If the storage layer hands us records in a form we
-    // cannot filter in place (FileRecords from zero-copy paths, tier-storage / remote-fetch
-    // payloads, future LazyDownConversionRecords), we MUST NOT pass them through — that would
-    // leak unfiltered backing-topic records to a consumer that only has READ on the view. We
-    // fail loudly with KAFKA_STORAGE_ERROR so the operator sees the misconfiguration; this is
-    // a defensive cap, not a feature gate. Once the storage layer materializes everything to
-    // MemoryRecords before the fetch callback (current production behavior on the local path),
-    // this branch is unreachable.
+    // PROMPT.md: "all filtering broker-side". The local-disk fetch path returns FileRecords for
+    // zero-copy network transfer; we cannot pass those through (the predicate has not run) so we
+    // materialize them into MemoryRecords first. This intentionally gives up zero-copy on the
+    // view path — that is the cost of broker-side filtering and is what views opt into. Any
+    // other Records subtype the broker may grow in future (e.g. tier-storage shapes that have not
+    // materialized into MemoryRecords/FileRecords by the time the fetch callback fires, or
+    // unaligned snapshot records that have leaked outside the raft path) is rejected with
+    // KAFKA_STORAGE_ERROR rather than passed through: leaking unfiltered backing-topic bytes to
+    // a consumer that only has READ on the view would defeat the whole feature. Today both
+    // RemoteLogManager and the in-memory replication paths land as MemoryRecords pre-callback,
+    // so the fallback is defensive — but it must stay because a future read-path can ship a new
+    // Records subclass and silently break the view contract otherwise.
+    //
+    // TODO(views): the heap buffer below is allocated fresh per fetch and the existing
+    // ViewFilter then allocates a second buffer of the same size for the filtered output.
+    // Reuse a BufferSupplier for both to halve peak allocation under sustained view-fetch load.
     def applyViewFilter(backingTpId: TopicIdPartition,
                         data: FetchPartitionData,
                         viewTpId: TopicIdPartition,
                         spec: ViewSpec): (TopicIdPartition, FetchPartitionData) = {
       if (data.error != Errors.NONE) return (viewTpId, data)
-      data.records match {
+      val filtered: Either[Errors, MemoryRecords] = data.records match {
         case mr: MemoryRecords =>
-          val filteredRecords = ViewFilter.apply(spec.predicate(), mr, viewTpId.partition)
+          Right(ViewFilter.apply(spec.predicate(), mr, viewTpId.partition))
+        case fr: FileRecords =>
+          // Slurp the on-disk slice into a heap buffer and reuse the MemoryRecords filter. This is
+          // O(slice) extra allocation per fetch; for non-trivial fetch.max.bytes that's the unavoidable
+          // shape of the feature. Empty slices are short-circuited because ByteBuffer.allocate(0) +
+          // readInto on a closed/empty FileRecords would still hit the channel.
+          val size = fr.sizeInBytes()
+          if (size == 0) Right(MemoryRecords.EMPTY)
+          else {
+            try {
+              val buffer = ByteBuffer.allocate(size)
+              fr.readInto(buffer, 0)
+              val materialized = MemoryRecords.readableRecords(buffer)
+              Right(ViewFilter.apply(spec.predicate(), materialized, viewTpId.partition))
+            } catch {
+              case e: java.io.IOException =>
+                error(s"View fetch for ${viewTpId.topic} failed to materialize FileRecords for filtering; " +
+                  s"returning KAFKA_STORAGE_ERROR.", e)
+                Left(Errors.KAFKA_STORAGE_ERROR)
+            }
+          }
+        case _ =>
+          warn(s"View fetch for ${viewTpId.topic} received records of type ${data.records.getClass.getSimpleName} " +
+            s"which cannot be filtered in place; failing with KAFKA_STORAGE_ERROR to avoid leaking unfiltered records.")
+          Left(Errors.KAFKA_STORAGE_ERROR)
+      }
+      filtered match {
+        case Right(records) =>
           (viewTpId, new FetchPartitionData(
             data.error,
             data.highWatermark,
             data.logStartOffset,
-            filteredRecords,
+            records,
             data.divergingEpoch,
             data.lastStableOffset,
             data.abortedTransactions,
             data.preferredReadReplica,
             data.isReassignmentFetch))
-        case _ =>
-          warn(s"View fetch for ${viewTpId.topic} received records of type ${data.records.getClass.getSimpleName} " +
-            s"which cannot be filtered in place; failing with KAFKA_STORAGE_ERROR to avoid leaking unfiltered records.")
+        case Left(err) =>
           (viewTpId, new FetchPartitionData(
-            Errors.KAFKA_STORAGE_ERROR,
+            err,
             data.highWatermark,
             data.logStartOffset,
             MemoryRecords.EMPTY,
