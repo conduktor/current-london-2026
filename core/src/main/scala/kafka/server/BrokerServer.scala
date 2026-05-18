@@ -481,6 +481,21 @@ class BrokerServer(
       // — the same image the broker uses for every other replica-assignment
       // decision — and let BrokerGovernanceBootstrap fail closed (or warn
       // loudly with the config knob off) on the NonReplica state.
+      //
+      // Why this is safe against a "metadata not yet caught up" race
+      // (Codex P1 audit follow-up): the startup-path drainOnce() below is
+      // called AFTER `lifecycleManager.initialCatchUpFuture` AND
+      // `brokerMetadataPublisher.firstPublishFuture` complete — i.e. AFTER
+      // this broker has been acknowledged caught-up by the active controller
+      // and AFTER metadata has been published up to the cluster-metadata
+      // partition's high-water-mark. By that point `metadataCache.currentImage`
+      // reflects a coherent cluster-wide snapshot, not a partial pre-catch-up
+      // view, so `TopicAbsent` here genuinely means "the cluster does not
+      // have __governance yet", not "this broker has not seen the topic
+      // creation record yet". Do NOT move the bootstrap drain before those
+      // catch-up waits; if a refactor ever does, this probe loses its
+      // authority and the TopicAbsent branch becomes a fail-open window for
+      // any broker still catching up at the moment startup runs.
       val localReplicaProbe: () => LocalReplicaStatus = () => {
         val image = metadataCache.currentImage()
         val topicImage = image.topics().getTopic(GovernanceTopic.NAME)
