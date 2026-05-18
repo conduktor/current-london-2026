@@ -470,6 +470,12 @@ class WsStreamerTest {
         // grants. Total delivered records must equal min(total queued, total granted). No over-delivery
         // is the load-bearing invariant — the test would fail if a credit-decrement race let a slot get
         // consumed twice.
+        //
+        // Pre-queue 200 records but issue only 100 grants. A credit-decrement race that consumed one slot
+        // twice manifests as a 101st delivery from offset 100+; asserting the offset window IS in {0..99}
+        // makes that race observable directly, where a count-only check could be subverted by polling-exit
+        // timing on a fast CI host (the loop exits the moment recordCount reaches 100 — any late
+        // over-delivery lands after the assert and would otherwise go unobserved).
         submitter.queueFetch(records(0, 200));
         ExecutorService pool = Executors.newFixedThreadPool(4);
         try {
@@ -481,12 +487,28 @@ class WsStreamerTest {
                 futures.add(CompletableFuture.runAsync(() -> streamer.grantCredits(1), pool));
             }
             CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
-            // Wait for delivery to settle.
+            // Wait for delivery to settle to the expected count, then add a quiescence window so any
+            // race-induced over-delivery has time to land before we assert. Without the settle, the
+            // polling loop exits at exactly 100 and the over-delivery arrives a few ms later, AFTER the
+            // assertion has already returned passing — the bug would be silent.
             long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
             while (sink.recordCount() < 100 && System.nanoTime() < deadline) {
                 Thread.sleep(10);
             }
+            Thread.sleep(200);
             assertEquals(100, sink.recordCount(), "exactly 100 records delivered for 100 grants");
+            // Strong invariant: with 200 records pre-queued but only 100 grants issued, any over-delivery
+            // would necessarily pull from offset 100+. Asserting offset uniqueness AND range catches both
+            // credit-decrement races (extra record from offset >=100) and duplicate-delivery races (same
+            // offset twice within {0..99}).
+            java.util.Set<Long> seen = new java.util.HashSet<>();
+            for (int i = 0; i < sink.recordCount(); i++) {
+                long off = sink.recordOffsetAt(i);
+                assertTrue(off < 100L,
+                    "delivered offset " + off + " is beyond the 100 credits granted — credit-decrement race");
+                assertTrue(seen.add(off),
+                    "offset " + off + " was delivered more than once — credit double-spend");
+            }
         } finally {
             pool.shutdownNow();
             assertTrue(pool.awaitTermination(2, TimeUnit.SECONDS));
