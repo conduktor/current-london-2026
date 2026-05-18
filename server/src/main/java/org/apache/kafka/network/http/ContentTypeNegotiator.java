@@ -31,9 +31,14 @@ package org.apache.kafka.network.http;
  * </ul>
  *
  * <p>Parsing is deliberately minimal: split on comma, strip parameters after {@code ;}, match the bare media type.
- * Q-values are ignored — a client that lists {@code application/hal+json;q=0.1, application/json;q=0.9} is still given
- * HAL+JSON because the body remains valid JSON either way. We are not building a generic RFC 7231 conneg engine; we are
- * answering yes/no questions about specific media types.
+ * Q-value <em>preference</em> ordering is ignored — a client that lists
+ * {@code application/hal+json;q=0.1, application/json;q=0.9} is still given HAL+JSON because the body remains valid
+ * JSON either way. We are not building a generic RFC 7231 conneg engine; we are answering yes/no questions about
+ * specific media types.
+ *
+ * <p>The one q-value we <em>do</em> honour is {@code q=0}: per RFC 9110 §12.5.1 that means "not acceptable", which is
+ * a yes/no answer rather than a preference. A client sending {@code Accept: text/event-stream;q=0, application/json}
+ * is explicitly refusing SSE; handing it an event stream would break a strict JSON parser. Same for HAL.
  */
 final class ContentTypeNegotiator {
 
@@ -45,7 +50,7 @@ final class ContentTypeNegotiator {
 
     /**
      * Returns {@link #TEXT_EVENT_STREAM} if the client asked for SSE, otherwise {@link #APPLICATION_HAL_JSON} if HAL was
-     * listed, otherwise {@link #APPLICATION_JSON}.
+     * listed, otherwise {@link #APPLICATION_JSON}. Media types with {@code q=0} are skipped.
      */
     static String resolve(String acceptHeader) {
         if (acceptHeader == null || acceptHeader.isEmpty()) {
@@ -53,10 +58,19 @@ final class ContentTypeNegotiator {
         }
         boolean sawHal = false;
         for (String range : acceptHeader.split(",")) {
-            String mediaType = range.trim();
-            int semicolon = mediaType.indexOf(';');
+            String entry = range.trim();
+            int semicolon = entry.indexOf(';');
+            String mediaType;
+            String params;
             if (semicolon >= 0) {
-                mediaType = mediaType.substring(0, semicolon).trim();
+                mediaType = entry.substring(0, semicolon).trim();
+                params = entry.substring(semicolon + 1);
+            } else {
+                mediaType = entry;
+                params = "";
+            }
+            if (isExplicitlyRejected(params)) {
+                continue;
             }
             if (TEXT_EVENT_STREAM.equalsIgnoreCase(mediaType)) {
                 return TEXT_EVENT_STREAM;
@@ -66,5 +80,36 @@ final class ContentTypeNegotiator {
             }
         }
         return sawHal ? APPLICATION_HAL_JSON : APPLICATION_JSON;
+    }
+
+    /**
+     * RFC 9110 §12.5.1: {@code q=0} ("0", "0.", "0.0", "0.00", "0.000") means the media type is "not acceptable".
+     * All other q-values — including malformed ones — are treated as no rejection (default acceptability). This is
+     * the only q-value the negotiator inspects; preference ordering above zero stays ignored on purpose.
+     */
+    private static boolean isExplicitlyRejected(String params) {
+        if (params.isEmpty()) {
+            return false;
+        }
+        for (String param : params.split(";")) {
+            String p = param.trim();
+            int eq = p.indexOf('=');
+            if (eq < 0) {
+                continue;
+            }
+            String name = p.substring(0, eq).trim();
+            if (!"q".equalsIgnoreCase(name)) {
+                continue;
+            }
+            String value = p.substring(eq + 1).trim();
+            try {
+                if (Double.parseDouble(value) == 0.0) {
+                    return true;
+                }
+            } catch (NumberFormatException ignored) {
+                // Malformed q-value: leave the media type acceptable rather than guessing intent.
+            }
+        }
+        return false;
     }
 }
