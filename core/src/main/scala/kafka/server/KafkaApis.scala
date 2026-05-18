@@ -135,6 +135,35 @@ class KafkaApis(val requestChannel: RequestChannel,
     TenantContext.of(request.context.principal, tenantConfig.boundTenantFor(request.context.listenerName))
   }
 
+  // Return the PHYSICAL TopicIdPartition the tenant is allowed to fetch, or
+  // None if the topic falls outside the tenant's namespace.
+  //
+  // For Fetch v13+ the topic name was resolved from the broker's id→name map
+  // (metadataCache.topicIdsToNames), so it is already PHYSICAL. The boundary
+  // rule is simply: belongsToTenant or internal — anything else is foreign.
+  //
+  // For Fetch v0-12 the topic name comes from the client wire and is LOGICAL;
+  // we translate it via toPhysical and accept if the result lands within the
+  // tenant's namespace.
+  //
+  // The caller surfaces a boundary violation as UNKNOWN_TOPIC_OR_PARTITION so
+  // the response never reveals whether the foreign topic exists.
+  private def normaliseTenantTopicForFetch(tip: TopicIdPartition,
+                                           ctx: TenantContext,
+                                           versionId: Int): Option[TopicIdPartition] = {
+    if (tip.topic == null) return None
+    if (Topic.isInternal(tip.topic)) return Some(tip)
+    if (versionId >= 13) {
+      if (ctx.belongsToTenant(tip.topic)) Some(tip) else None
+    } else {
+      val physical = ctx.toPhysical(tip.topic)
+      if (ctx.belongsToTenant(physical)) {
+        if (physical == tip.topic) Some(tip)
+        else Some(new TopicIdPartition(tip.topicId, tip.partition, physical))
+      } else None
+    }
+  }
+
   private def forwardToController(request: RequestChannel.Request): Unit = {
     def responseCallback(responseOpt: Option[AbstractResponse]): Unit = {
       responseOpt match {
@@ -581,6 +610,24 @@ class KafkaApis(val requestChannel: RequestChannel,
       else
         Collections.emptyMap[Uuid, String]()
 
+    val tenantCtx = tenantContextFor(request)
+    val tenantScoped = tenantCtx.effectiveTenant.isPresent
+    // Privileged-on-tenant-listener guard. Refuse every requested partition
+    // with TOPIC_AUTHORIZATION_FAILED so the caller cannot piggyback off the
+    // listener binding to access the tenant namespace. The check uses the
+    // pre-fetch-context view of fetchData() so it does not depend on a session.
+    if (tenantCtx.isPrivilegedOnTenantListener) {
+      val refused = new util.LinkedHashMap[TopicIdPartition, FetchResponseData.PartitionData]()
+      fetchRequest.fetchData(topicNames).forEach { (tip, _) =>
+        refused.put(tip, FetchResponse.partitionResponse(tip, Errors.TOPIC_AUTHORIZATION_FAILED))
+      }
+      requestChannel.sendResponse(
+        request,
+        FetchResponse.of(Errors.NONE, 0, FetchMetadata.INVALID_SESSION_ID, refused, Collections.emptyList()),
+        None)
+      return
+    }
+
     val fetchData = fetchRequest.fetchData(topicNames)
     val forgottenTopics = fetchRequest.forgottenTopics(topicNames)
 
@@ -619,8 +666,29 @@ class KafkaApis(val requestChannel: RequestChannel,
         else
           partitionDatas += topicIdPartition -> partitionData
       }
-      val authorizedTopics = authHelper.filterByAuthorized(request.context, READ, TOPIC, partitionDatas)(_._1.topicPartition.topic)
-      partitionDatas.foreach { case (topicIdPartition, data) =>
+      // IN rewrite + tenant boundary check. For v13+ Fetch the topic name on
+      // each TopicIdPartition was resolved from metadataCache.topicIdsToNames
+      // so it is already PHYSICAL; for v0-12 the name is what the client put
+      // on the wire (LOGICAL). We normalise everything to physical here:
+      //   - if the name already belongs to the tenant or is internal, leave it
+      //   - otherwise try toPhysical(name) — if THAT belongs to the tenant,
+      //     adopt it (v0-12 path)
+      //   - otherwise the topic is outside the tenant's namespace; surface
+      //     UNKNOWN_TOPIC_OR_PARTITION rather than reveal whether it exists.
+      // After this pass all interesting/authorized entries have physical names.
+      val normalisedPartitionDatas =
+        if (tenantScoped) {
+          partitionDatas.flatMap { case (tip, data) =>
+            normaliseTenantTopicForFetch(tip, tenantCtx, versionId) match {
+              case Some(physicalTip) => Some(physicalTip -> data)
+              case None =>
+                erroneous += tip -> FetchResponse.partitionResponse(tip, Errors.UNKNOWN_TOPIC_OR_PARTITION)
+                None
+            }
+          }
+        } else partitionDatas
+      val authorizedTopics = authHelper.filterByAuthorized(request.context, READ, TOPIC, normalisedPartitionDatas)(_._1.topicPartition.topic)
+      normalisedPartitionDatas.foreach { case (topicIdPartition, data) =>
         if (!authorizedTopics.contains(topicIdPartition.topic))
           erroneous += topicIdPartition -> FetchResponse.partitionResponse(topicIdPartition, Errors.TOPIC_AUTHORIZATION_FAILED)
         else if (!metadataCache.contains(topicIdPartition.topicPartition))

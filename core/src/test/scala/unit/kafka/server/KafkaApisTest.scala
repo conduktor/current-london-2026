@@ -11048,4 +11048,157 @@ class KafkaApisTest extends Logging {
     val response = verifyNoThrottling[ProduceResponse](request)
     assertEquals(topic, response.data.responses.asScala.head.name)
   }
+
+  // ---------------------------------------------------------------------------
+  // Fetch — multi-tenancy
+  //
+  // Modern (v13+) Fetch is keyed on topic IDs; the tenant client never puts a
+  // name on the wire. The broker resolves the topic ID to a physical name
+  // via metadataCache.topicIdsToNames(), serves data from the physical log,
+  // and the v13+ response carries only the topic ID — so the physical name
+  // never leaks. Three things still matter and are tested here:
+  //
+  //   1. tenant boundary — a tenant must not be able to fetch a topic ID
+  //      whose physical name lives outside its namespace, even if it somehow
+  //      learned that ID. We return UNKNOWN_TOPIC_OR_PARTITION rather than
+  //      revealing whether the topic exists.
+  //   2. privileged-on-tenant-listener guard — same rationale as Produce /
+  //      Metadata: don't let a super-user piggyback off the listener binding.
+  //   3. unchanged single-tenant behaviour when no binding exists.
+  // ---------------------------------------------------------------------------
+
+  private def buildSingleTopicFetchRequest(topicId: Uuid, tp: TopicPartition): FetchRequest = {
+    val fetchDataBuilder = Map(tp -> new FetchRequest.PartitionData(topicId, 0, 0, 1000,
+      Optional.empty())).asJava
+    new FetchRequest.Builder(16, 16, -1, -1, 100, 0, fetchDataBuilder).build()
+  }
+
+  @Test
+  def testFetchTenantRequestRoutesToPhysicalTopicAndDoesNotLeakName(): Unit = {
+    // Tenant fetches by topic ID. metadataCache resolves the ID to "acme.orders"
+    // (physical). replicaManager.fetchMessages must receive a TopicIdPartition
+    // whose topic name is the physical one; the v13+ response carries no name
+    // so the client only sees the topicId.
+    val topicId = Uuid.randomUuid()
+    val physicalTp = new TopicPartition("acme.orders", 0)
+    val tidp = new TopicIdPartition(topicId, physicalTp)
+    addTopicToMetadataCache(physicalTp.topic, numPartitions = 1, numBrokers = 1, topicId)
+
+    when(replicaManager.fetchMessages(
+      any[FetchParams],
+      any[Seq[(TopicIdPartition, FetchRequest.PartitionData)]],
+      any[ReplicaQuota],
+      any[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]()
+    )).thenAnswer(invocation => {
+      val interesting = invocation.getArgument(1).asInstanceOf[Seq[(TopicIdPartition, FetchRequest.PartitionData)]]
+      // Pin down the contract: replicaManager must be called with the physical name.
+      assertEquals(Set(tidp), interesting.map(_._1).toSet)
+      val callback = invocation.getArgument(3).asInstanceOf[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]
+      callback(Seq(tidp -> new FetchPartitionData(Errors.NONE, 100, 0, MemoryRecords.EMPTY,
+        Optional.empty(), OptionalLong.empty(), Optional.empty(), OptionalInt.empty(), false)))
+    })
+
+    val fetchData = Map(tidp -> new FetchRequest.PartitionData(topicId, 0, 0, 1000,
+      Optional.empty())).asJava
+    val fetchMetadata = new JFetchMetadata(0, 0)
+    val fetchContext = new FullFetchContext(time, new FetchSessionCacheShard(1000, 100),
+      fetchMetadata, fetchData, true, false)
+    when(fetchManager.newContext(
+      any[Short], any[JFetchMetadata], any[Boolean],
+      any[util.Map[TopicIdPartition, FetchRequest.PartitionData]],
+      any[util.List[TopicIdPartition]],
+      any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val fetchRequest = buildSingleTopicFetchRequest(topicId, physicalTp)
+    val request = buildRequest(
+      fetchRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(
+      authorizer = None,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleFetchRequest(request)
+
+    val response = verifyNoThrottling[FetchResponse](request)
+    // v13+ response: only topicId is on the wire. The client never sees the
+    // physical name "acme.orders" because the Topic field is absent from v13+.
+    val topicResponses = response.data.responses.asScala.toSeq
+    assertEquals(1, topicResponses.size)
+    assertEquals(topicId, topicResponses.head.topicId)
+    val partitionData = topicResponses.head.partitions.asScala.head
+    assertEquals(Errors.NONE.code, partitionData.errorCode)
+  }
+
+  @Test
+  def testFetchTenantBoundaryViolationReturnsUnknownTopic(): Unit = {
+    // Tenant beta somehow obtains topic ID for "acme.orders" and tries to fetch
+    // it. The broker must surface UNKNOWN_TOPIC_OR_PARTITION rather than serve
+    // data from another tenant's namespace. replicaManager is never invoked.
+    val topicId = Uuid.randomUuid()
+    val physicalTp = new TopicPartition("acme.orders", 0)
+    val tidp = new TopicIdPartition(topicId, physicalTp)
+    addTopicToMetadataCache(physicalTp.topic, numPartitions = 1, numBrokers = 1, topicId)
+
+    val fetchData = Map(tidp -> new FetchRequest.PartitionData(topicId, 0, 0, 1000,
+      Optional.empty())).asJava
+    val fetchMetadata = new JFetchMetadata(0, 0)
+    val fetchContext = new FullFetchContext(time, new FetchSessionCacheShard(1000, 100),
+      fetchMetadata, fetchData, true, false)
+    when(fetchManager.newContext(
+      any[Short], any[JFetchMetadata], any[Boolean],
+      any[util.Map[TopicIdPartition, FetchRequest.PartitionData]],
+      any[util.List[TopicIdPartition]],
+      any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val fetchRequest = buildSingleTopicFetchRequest(topicId, physicalTp)
+    val request = buildRequest(
+      fetchRequest,
+      listenerName = new ListenerName("TENANT_BETA"),
+      principal = tenantPrincipal("beta", "bob"))
+
+    kafkaApis = createKafkaApis(
+      authorizer = None,
+      tenantConfig = tenantConfigBinding("beta", new ListenerName("TENANT_BETA")))
+    kafkaApis.handleFetchRequest(request)
+
+    val response = verifyNoThrottling[FetchResponse](request)
+    val partitionData = response.data.responses.asScala.head.partitions.asScala.head
+    assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION.code, partitionData.errorCode,
+      "tenant must not be able to fetch outside its namespace")
+
+    verify(replicaManager, never()).fetchMessages(any(), any(), any(), any())
+  }
+
+  @Test
+  def testFetchPrivilegedCallerOnTenantBoundListenerIsRejected(): Unit = {
+    // Super-user without `__tenant_` prefix fetching on a tenant-bound
+    // listener: every requested partition gets TOPIC_AUTHORIZATION_FAILED;
+    // replicaManager is never invoked.
+    val topicId = Uuid.randomUuid()
+    val physicalTp = new TopicPartition("acme.orders", 0)
+    addTopicToMetadataCache(physicalTp.topic, numPartitions = 1, numBrokers = 1, topicId)
+
+    val fetchRequest = buildSingleTopicFetchRequest(topicId, physicalTp)
+    val request = buildRequest(
+      fetchRequest,
+      listenerName = TENANT_LISTENER,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "Alice"))
+
+    kafkaApis = createKafkaApis(
+      authorizer = None,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleFetchRequest(request)
+
+    val response = verifyNoThrottling[FetchResponse](request)
+    val partitionData = response.data.responses.asScala.head.partitions.asScala.head
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED.code, partitionData.errorCode,
+      "privileged caller on tenant listener without tenant prefix must be refused")
+
+    verify(replicaManager, never()).fetchMessages(any(), any(), any(), any())
+  }
 }
