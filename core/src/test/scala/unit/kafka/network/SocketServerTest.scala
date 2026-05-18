@@ -2022,7 +2022,7 @@ class SocketServerTest {
                               listenerName: ListenerName,
                               securityProtocol: SecurityProtocol,
                               connectionDisconnectListeners: scala.collection.Seq[ConnectionDisconnectListener] = Seq.empty): Processor = {
-      new TestableProcessor(id, time, requestChannel, listenerName, securityProtocol, endPoint, cfg, connectionQuotas, connectionQueueSize, isPrivilegedListener, socketServer.connectionDisconnectListeners)
+      new TestableProcessor(id, time, requestChannel, listenerName, securityProtocol, endPoint, cfg, connectionQuotas, connectionQueueSize, isPrivilegedListener, socketServer.connectionDisconnectListeners, acceptorBlockedPercentMeter)
     }
 
     def isOpen: Boolean = serverChannel.isOpen
@@ -2038,7 +2038,8 @@ class SocketServerTest {
                           connectionQuotas: ConnectionQuotas,
                           connectionQueueSize: Int,
                           isPrivilegedListener: Boolean,
-                          connectionDisconnectListeners: scala.collection.Seq[ConnectionDisconnectListener])
+                          connectionDisconnectListeners: scala.collection.Seq[ConnectionDisconnectListener],
+                          acceptorBlockedPercentMeter: com.yammer.metrics.core.Meter)
   extends Processor(id,
                     time,
                     10000,
@@ -2058,7 +2059,8 @@ class SocketServerTest {
                     isPrivilegedListener,
                     apiVersionManager,
                     s"TestableProcessor$id",
-                    connectionDisconnectListeners) {
+                    connectionDisconnectListeners,
+                    acceptorBlockedPercentMeter) {
     private var connectionId: Option[String] = None
     private var conn: Option[Socket] = None
 

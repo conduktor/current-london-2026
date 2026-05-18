@@ -526,6 +526,10 @@ private[kafka] abstract class Acceptor(val socketServer: SocketServer,
     s"${metricPrefix()}AcceptorBlockedPercent",
     Map(ListenerMetricTag -> endPoint.listenerName.value).asJava)
   private val blockedPercentMeter = metricsGroup.newMeter(blockedPercentMeterMetricName,"blocked time", TimeUnit.NANOSECONDS)
+  // Exposed so Processor.applyConnectionQuotasForNewlyAcceptedChannels can call
+  // ConnectionQuotas.inc on the io_uring accept path (where the Acceptor doesn't run
+  // inc(), because Netty's event loop handed the channel straight to the Processor).
+  private[network] def acceptorBlockedPercentMeter: com.yammer.metrics.core.Meter = blockedPercentMeter
   private var currentProcessorIndex = 0
   private[network] val throttledSockets = new mutable.PriorityQueue[DelayedCloseSocket]()
   private val started = new AtomicBoolean()
@@ -810,7 +814,8 @@ private[kafka] abstract class Acceptor(val socketServer: SocketServer,
                   isPrivilegedListener,
                   apiVersionManager,
                   name,
-                  connectionDisconnectListeners)
+                  connectionDisconnectListeners,
+                  acceptorBlockedPercentMeter)
   }
 }
 
@@ -881,7 +886,11 @@ private[kafka] class Processor(
   isPrivilegedListener: Boolean,
   apiVersionManager: ApiVersionManager,
   threadName: String,
-  connectionDisconnectListeners: Seq[ConnectionDisconnectListener]
+  connectionDisconnectListeners: Seq[ConnectionDisconnectListener],
+  // Acceptor-owned Yammer meter that gates connectionQuotas.inc. The Acceptor uses it on the
+  // NIO accept path; the Processor needs it on the io_uring path because that's where inc()
+  // runs (Netty's event loop is upstream of us, not Acceptor.accept).
+  acceptorBlockedPercentMeter: com.yammer.metrics.core.Meter
 ) extends Runnable with Logging {
   private val metricsGroup = new KafkaMetricsGroup(this.getClass)
 
@@ -997,6 +1006,11 @@ private[kafka] class Processor(
           // register any new responses for writing
           processNewResponses()
           poll()
+          // io_uring listeners accept on the Netty event loop, so ConnectionQuotas.inc
+          // happens here (after poll) rather than in Acceptor.accept. NIO listeners have
+          // already had inc applied by the Acceptor, and broker-side selector.connected()
+          // is empty for them — so this is effectively a no-op on the NIO path.
+          applyConnectionQuotasForNewlyAcceptedChannels()
           processCompletedReceives()
           processCompletedSends()
           processDisconnected()
@@ -1184,6 +1198,42 @@ private[kafka] class Processor(
     val request = response.request
     val networkThreadTimeNanos = openOrClosingChannel(request.context.connectionId).fold(0L)(_.getAndResetNetworkThreadTimeNanos())
     request.updateRequestMetrics(networkThreadTimeNanos, response)
+  }
+
+  /**
+   * Apply ConnectionQuotas.inc for channels that just surfaced from selector.connected().
+   * io_uring listeners accept inside Netty's event loop and never went through
+   * Acceptor.accept (which is where NIO inc'd the quota), so the gate has to land here
+   * instead. If the quota is exhausted we close the channel via selector — it will then
+   * surface in selector.disconnected() and processDisconnected will run the normal
+   * connectionQuotas.dec / disconnect-listener path.
+   *
+   * For NIO listeners selector.connected() is always empty (broker-side Processors don't
+   * initiate outgoing connections), so this method is a hot-path no-op there.
+   */
+  private def applyConnectionQuotasForNewlyAcceptedChannels(): Unit = {
+    val newlyConnected = selector.connected()
+    if (newlyConnected.isEmpty) return
+    newlyConnected.forEach { connectionId =>
+      val channel = selector.channel(connectionId)
+      if (channel != null) {
+        val address = channel.socketAddress
+        if (address != null) {
+          try {
+            connectionQuotas.inc(listenerName, address, acceptorBlockedPercentMeter)
+          } catch {
+            case e: TooManyConnectionsException =>
+              info(s"Closing io_uring connection $connectionId from ${e.ip}: " +
+                s"already has the configured maximum of ${e.count} connections.")
+              selector.close(connectionId)
+            case e: ConnectionThrottledException =>
+              debug(s"Closing throttled io_uring connection $connectionId from $address " +
+                s"(throttle ${e.throttleTimeMs}ms)")
+              selector.close(connectionId)
+          }
+        }
+      }
+    }
   }
 
   private def processDisconnected(): Unit = {
