@@ -96,6 +96,34 @@ public class GovernanceLoaderTest {
     }
 
     @Test
+    public void workingIsEmptyTracksWorkingSet() {
+        // Round-14 audit BLOCKER C-1: the bootstrap's held-stale flag-clear
+        // gate keys off `applied > 0` AND `!workingIsEmpty()`. This probe
+        // must reflect the working state — not the engine's installed
+        // RuleSet — so a tombstone-only post-truncation batch (which
+        // advances `applied` but leaves the working set empty) defers the
+        // commit and preserves the engine's last-known-good active().
+        RuleEngine engine = new RuleEngine();
+        GovernanceLoader loader = new GovernanceLoader(engine);
+        assertTrue(loader.workingIsEmpty(), "fresh loader: working set empty");
+        loader.apply("r1", envelope("true", ApiKeys.METADATA, 7));
+        assertFalse(loader.workingIsEmpty(), "after PUT r1: working set non-empty");
+        loader.apply("r1", null);
+        assertTrue(loader.workingIsEmpty(), "after tombstone of r1: working set empty");
+        loader.apply("r2", envelope("true", ApiKeys.FETCH, 11));
+        loader.apply("r3", envelope("true", ApiKeys.LIST_OFFSETS, 13));
+        assertFalse(loader.workingIsEmpty(), "after PUT r2+r3: working set non-empty");
+        loader.reset();
+        assertTrue(loader.workingIsEmpty(), "after reset: working set empty");
+        // Idempotent tombstones (the C-1 vector) keep the working set
+        // empty — applied returns true, but workingIsEmpty stays true.
+        loader.apply("never-existed-1", null);
+        loader.apply("never-existed-2", null);
+        assertTrue(loader.workingIsEmpty(),
+            "after only-idempotent-tombstones: working set still empty (C-1 vector)");
+    }
+
+    @Test
     public void appliedRuleSurvivesCommit() {
         RuleEngine engine = new RuleEngine();
         GovernanceLoader loader = new GovernanceLoader(engine);

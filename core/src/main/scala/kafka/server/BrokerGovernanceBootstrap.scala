@@ -331,13 +331,33 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
         // prevent. Defer the commit; the next drain that successfully applies
         // at least one record will rebuild and install fresh state. The
         // cursor still advances so we don't busy-loop on the same poison.
-        if (holdingStalePostTruncation && result.applied == 0L) {
-          warn(s"governance partition $tp held-stale: drain read " +
-            s"${result.read} record(s) but the loader applied none — every " +
-            s"record was rejected (null key, malformed envelope, cap hit). " +
+        //
+        // Round-14 audit BLOCKER C-1 extension: a drain that READ records
+        // AND APPLIED them, BUT left the working set empty, is the
+        // tombstone-only-post-truncation shape. GovernanceLoader.apply()
+        // returns true for every tombstone (idempotent on absent ids), so
+        // the original applied>0 gate fires even when the entire batch was
+        // tombstones for ids that the reset() already cleared. Without this
+        // extension, the commit installs RuleSet.EMPTY over a previously-good
+        // active() — exactly the regression the held-stale flag exists to
+        // prevent. Pairing applied>0 with !workingIsEmpty() closes it: a
+        // tombstone-only batch advances the cursor, leaves the flag set,
+        // and defers the commit. Operator recovery is documented on
+        // GovernanceLoader.workingIsEmpty.
+        if (holdingStalePostTruncation && (result.applied == 0L || loader.workingIsEmpty())) {
+          val reason =
+            if (result.applied == 0L)
+              s"drain read ${result.read} record(s) but the loader applied none — every " +
+                s"record was rejected (null key, malformed envelope, cap hit)"
+            else
+              s"drain applied ${result.applied} of ${result.read} record(s) but the working set " +
+                s"is empty (tombstone-only batch post-reset)"
+          warn(s"governance partition $tp held-stale: $reason. " +
             s"Deferring commit so the engine keeps its last-known-good " +
-            s"active RuleSet. Next drain that successfully applies a record " +
-            s"will rebuild and install fresh state.")
+            s"active RuleSet. Next drain that lands a non-empty working " +
+            s"state will rebuild and install fresh state. To recover when " +
+            s"every rule is intentionally deleted, publish any valid update " +
+            s"to transition the working set off-empty.")
           return result.read
         }
         loader.commit()
@@ -348,7 +368,10 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
         // working state has not rebuilt anything from the topic, so the
         // "post-truncation, no records yet observed" condition is unchanged.
         // Codex audit follow-on, paired with the field-promotion fix above.
-        if (holdingStalePostTruncation && result.applied > 0L) {
+        // Round-14 BLOCKER C-1: AND with !workingIsEmpty() so the gate above
+        // and the gate below remain in perfect symmetry — never clear the
+        // flag in a state where commit would have been deferred.
+        if (holdingStalePostTruncation && result.applied > 0L && !loader.workingIsEmpty()) {
           holdingStalePostTruncation = false
         }
         result.read

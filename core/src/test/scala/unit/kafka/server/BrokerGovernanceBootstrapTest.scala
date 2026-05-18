@@ -1185,6 +1185,104 @@ class BrokerGovernanceBootstrapTest {
   }
 
   @Test
+  def drainOnceTruncationFollowedByTombstonesOnlyKeepsPreviouslyGoodRuleSet(): Unit = {
+    // Round-14 audit BLOCKER C-1 regression pin. Sibling to
+    // `drainOnceTruncationFollowedByAllMalformedRecordsKeepsPreviouslyGoodRuleSet`
+    // (audit B1) — same fail-stale-to-empty risk, different vector.
+    //
+    // The B1 fix gated the held-stale-clearance commit on `applied > 0`,
+    // closing the malformed-records vector. But GovernanceLoader.apply()
+    // returns true for EVERY tombstone (null-value record) — idempotent
+    // on absent ids, documented behaviour. So a post-truncation re-drain
+    // that reads ONLY tombstones (a realistic compacted-topic shape:
+    // operator has just pruned every rule and the surviving updates were
+    // compacted out before the broker re-read) satisfies `applied > 0`,
+    // the held-stale flag clears, loader.commit() installs RuleSet.EMPTY,
+    // and every DENY rule fail-opens. That is the exact regression the
+    // held-stale flag exists to prevent, reopened through the tombstone
+    // channel.
+    //
+    // The C-1 fix pairs `applied > 0` with `!loader.workingIsEmpty()`:
+    // a tombstone-only batch advances the cursor, leaves the flag set,
+    // and DEFERS the commit. Engine keeps its last-known-good RuleSet.
+    val rm = mock(classOf[ReplicaManager])
+    val log = mock(classOf[UnifiedLog])
+    val engine = new RuleEngine()
+    when(rm.getLog(tp)).thenReturn(Some(log))
+
+    // Drain 1: install two good rules.
+    when(log.logStartOffset).thenReturn(0L)
+    when(log.highWatermark).thenReturn(2L)
+    when(log.read(0L, 1024 * 1024, FetchIsolation.HIGH_WATERMARK, true)).thenReturn(
+      recordsAt(0L,
+        new SimpleRecord("r1".getBytes(StandardCharsets.UTF_8),
+          envelope("true", ApiKeys.METADATA, 7)),
+        new SimpleRecord("r2".getBytes(StandardCharsets.UTF_8),
+          envelope("true", ApiKeys.FETCH, 11))))
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp)
+    assertEquals(2L, boot.drainOnce())
+    val previouslyGood = engine.active()
+    assertEquals(2, previouslyGood.size(), "baseline: two rules installed")
+
+    // Truncation race: HW drops below cursor (forces the truncation guard
+    // to fire), then logStartOffset jumps to 100 with three TOMBSTONE
+    // records — null values, no surviving updates. The codec routes
+    // tombstones around decode (they are key-only), and the loader's
+    // apply() returns true for each tombstone idempotently.
+    when(log.logStartOffset).thenReturn(100L)
+    when(log.highWatermark).thenReturn(1L)
+    assertEquals(0L, boot.drainOnce(),
+      "drain 2a: truncation guard fires, replay range is empty, defer commit")
+    assertSame(previouslyGood, engine.active(),
+      "drain 2a must preserve previously-good active() (truncation defer)")
+
+    when(log.highWatermark).thenReturn(103L)
+    when(log.read(100L, 1024 * 1024, FetchIsolation.HIGH_WATERMARK, true)).thenReturn(
+      recordsAt(100L,
+        new SimpleRecord("r1".getBytes(StandardCharsets.UTF_8), null.asInstanceOf[Array[Byte]]),
+        new SimpleRecord("r2".getBytes(StandardCharsets.UTF_8), null.asInstanceOf[Array[Byte]]),
+        new SimpleRecord("r3-never-existed".getBytes(StandardCharsets.UTF_8),
+          null.asInstanceOf[Array[Byte]])))
+    val nTombstones = boot.drainOnce()
+    assertEquals(3L, nTombstones,
+      "drain 2b: read=3 (all three tombstones were iterated)")
+    assertSame(previouslyGood, engine.active(),
+      "drain 2b is the C-1 regression pin: drain READ 3 tombstones and APPLIED " +
+        "3 of them (loader.apply returns true idempotently for tombstones), but " +
+        "the working set is empty after reset+replay. Committing here would " +
+        "publish RuleSet.EMPTY over previously-good rules — the fail-stale-to-" +
+        "empty regression through the tombstone channel. Engine must keep its " +
+        "last-known-good RuleSet until a drain lands a non-empty working state.")
+    assertTrue(engine.evaluate(ApiKeys.METADATA, "c", false,
+      () => Collections.emptyMap()).denied,
+      "previously-good METADATA DENY must still be enforced after tombstone-only drain")
+    assertTrue(engine.evaluate(ApiKeys.FETCH, "c", false,
+      () => Collections.emptyMap()).denied,
+      "previously-good FETCH DENY must still be enforced after tombstone-only drain")
+
+    // Recovery: a single good record lands. The drain reads 1, applies 1,
+    // working set becomes non-empty, held-stale flag clears, engine swaps
+    // to the fresh set. The operator-recovery escape hatch documented on
+    // GovernanceLoader.workingIsEmpty.
+    when(log.highWatermark).thenReturn(104L)
+    when(log.read(103L, 1024 * 1024, FetchIsolation.HIGH_WATERMARK, true)).thenReturn(
+      recordsAt(103L,
+        new SimpleRecord("good".getBytes(StandardCharsets.UTF_8),
+          envelope("true", ApiKeys.LIST_OFFSETS, 23))))
+    assertEquals(1L, boot.drainOnce(),
+      "recovery drain reads the one good record")
+    val fresh = engine.active()
+    assertEquals(1, fresh.size())
+    assertNotSame(previouslyGood, fresh,
+      "recovery commit must replace the held-stale RuleSet with the fresh one")
+    assertTrue(engine.evaluate(ApiKeys.LIST_OFFSETS, "c", false,
+      () => Collections.emptyMap()).denied)
+    assertSame(RuleDecision.ALLOW,
+      engine.evaluate(ApiKeys.METADATA, "c", false, () => Collections.emptyMap()),
+      "after recovery commit, previously-held-stale METADATA rule is dropped")
+  }
+
+  @Test
   def drainOnceProceedsEvenWhenADenyAllFetchRuleIsActive(): Unit = {
     // Adversarial M4: PROMPT.md requires the broker to keep enforcing the
     // governance topic itself even if an operator publishes a deny-all rule

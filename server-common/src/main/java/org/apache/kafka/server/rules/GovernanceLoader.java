@@ -209,4 +209,33 @@ public final class GovernanceLoader {
     public void reset() {
         working.from(RuleSet.EMPTY);
     }
+
+    /**
+     * True when the working set holds zero rules.
+     *
+     * <p>Round-14 audit BLOCKER C-1: introduced to let the bootstrap detect
+     * the "post-truncation re-drain that read only tombstones" case. {@link
+     * #apply} returns {@code true} for every tombstone (idempotent on absent
+     * ids — documented behaviour), so the broker's
+     * {@code holdingStalePostTruncation} flag-clear gate (which keys off
+     * "applied &gt; 0") would otherwise fire on a tombstone-only batch,
+     * commit the empty working set, and silently install {@link
+     * RuleSet#EMPTY} over the engine's previously-good {@link RuleSet}.
+     * Every DENY rule fail-opens until the next non-tombstone update lands.
+     *
+     * <p>Pairing the existing "applied &gt; 0" check with "working not
+     * empty" closes the hole: a tombstone-only post-truncation batch
+     * advances the cursor but leaves the held-stale flag set and DEFERS
+     * the commit, so the engine keeps its last-known-good {@link RuleSet}
+     * until a non-tombstone update lands on the topic. To recover when the
+     * operator legitimately wants to delete every rule, publish any valid
+     * update (even a single rule with a never-matching CEL) — that lands a
+     * non-empty working state, clears the flag, and the subsequent
+     * tombstone (or omitted PUT) takes effect.
+     *
+     * <p>O(1) — backed by {@code rulesById.isEmpty()}.
+     */
+    public boolean workingIsEmpty() {
+        return working.size() == 0;
+    }
 }
