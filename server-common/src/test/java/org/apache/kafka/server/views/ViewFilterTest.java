@@ -291,10 +291,18 @@ class ViewFilterTest {
                 if (batch.isControlBatch()) {
                     sawControlBatch = true;
                     // Control batch must remain empty after filtering (filterTo writes the header
-                    // through; no records). The fetcher reads the marker type from the header
-                    // bytes — we don't need to re-parse here, just assert structure survives.
+                    // through; no records).
                     assertFalse(batch.iterator().hasNext(),
                             "control batch must carry no user records (type=" + type + ")");
+                    // Producer-id / producer-epoch must round-trip — the consumer's
+                    // OffsetForLeaderEpoch and LSO logic both key off these. If the filter
+                    // accidentally rewrote them the consumer would mis-track the transaction.
+                    assertEquals(73L, batch.producerId(),
+                            "control batch producerId must survive filter (type=" + type + ")");
+                    assertEquals((short) 0, batch.producerEpoch(),
+                            "control batch producerEpoch must survive filter (type=" + type + ")");
+                    assertTrue(batch.isTransactional(),
+                            "control batch transactional flag must survive (type=" + type + ")");
                 } else {
                     sawDataBatch = true;
                 }
