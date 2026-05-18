@@ -16,6 +16,7 @@
  */
 package org.apache.kafka.storage.internals.concentration;
 
+import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.test.TestUtils;
 
 import org.junit.jupiter.api.AfterEach;
@@ -887,5 +888,81 @@ public class ConcentrationKernelTest {
     public void assertBackingTopicNotCompactedRejectsNullBackingTopic() {
         assertThrows(NullPointerException.class,
             () -> kernel.assertBackingTopicNotCompacted(null, "delete"));
+    }
+
+    // ------------------ Per-backing readiness gate (Commit B.1) ------------------
+
+    @Test
+    public void unseenBackingDefaultsToReady() {
+        // Default for any never-observed backing is "ready" — the kernel trusts whatever tracker
+        // state was loaded at broker startup until something explicitly invalidates it. This
+        // matches the steady-state expectation that an idle broker holds a quiescent ready set
+        // and pays nothing on the produce hot path.
+        assertTrue(kernel.isBackingReady(new TopicPartition("shared", 0)));
+        assertTrue(kernel.isBackingReady(new TopicPartition("never-declared", 42)));
+    }
+
+    @Test
+    public void markBackingUnreadyClosesGate() {
+        TopicPartition tp = new TopicPartition("shared", 3);
+        kernel.markBackingUnready(tp);
+        assertFalse(kernel.isBackingReady(tp));
+        // Sibling partitions of the same backing topic remain ready — readiness is per-
+        // (topic, partition), not per topic, because the broker may be leader of partition 3
+        // and follower of partition 5 of the same backing.
+        assertTrue(kernel.isBackingReady(new TopicPartition("shared", 4)));
+        // Other backings are unaffected.
+        assertTrue(kernel.isBackingReady(new TopicPartition("other-shared", 3)));
+    }
+
+    @Test
+    public void markBackingReadyClearsGateAndReportsPriorState() {
+        TopicPartition tp = new TopicPartition("shared", 1);
+        // First clear on a never-marked partition returns false (nothing to clear).
+        assertFalse(kernel.markBackingReady(tp));
+        kernel.markBackingUnready(tp);
+        // First clear after a mark returns true (the mark was removed).
+        assertTrue(kernel.markBackingReady(tp));
+        // Second clear is a no-op and returns false. Idempotent.
+        assertFalse(kernel.markBackingReady(tp));
+        assertTrue(kernel.isBackingReady(tp));
+    }
+
+    @Test
+    public void markBackingUnreadyIsIdempotent() {
+        TopicPartition tp = new TopicPartition("shared", 2);
+        kernel.markBackingUnready(tp);
+        kernel.markBackingUnready(tp);
+        kernel.markBackingUnready(tp);
+        assertFalse(kernel.isBackingReady(tp));
+        // One clear undoes all the marks (set semantics, not a counter).
+        assertTrue(kernel.markBackingReady(tp));
+        assertTrue(kernel.isBackingReady(tp));
+    }
+
+    @Test
+    public void readinessGateRejectsNullPartition() {
+        assertThrows(NullPointerException.class, () -> kernel.markBackingUnready(null));
+        assertThrows(NullPointerException.class, () -> kernel.markBackingReady(null));
+        assertThrows(NullPointerException.class, () -> kernel.isBackingReady(null));
+    }
+
+    @Test
+    public void readinessGateIsIndependentOfIdempotentCacheAndTracker() {
+        // The gate is pure metadata — flipping it must not touch the tracker or the idempotent
+        // cache. This is what lets B.2 sequence the operations: close the gate FIRST, then drop
+        // the tracker; re-open AFTER the rehydrate publishes. Reversing those steps would leak
+        // produces against a stale tracker; flipping the gate must therefore be cheap and
+        // observable in isolation.
+        kernel.declare(descriptor("orders", 4, "shared", 2));
+        TopicPartition tp = new TopicPartition("shared", 1);
+        long beforeNextOffset = kernel.nextLogicalOffset("orders", 1);
+        long beforeStartOffset = kernel.startLogicalOffset("orders", 1);
+
+        kernel.markBackingUnready(tp);
+        kernel.markBackingReady(tp);
+
+        assertEquals(beforeNextOffset, kernel.nextLogicalOffset("orders", 1));
+        assertEquals(beforeStartOffset, kernel.startLogicalOffset("orders", 1));
     }
 }

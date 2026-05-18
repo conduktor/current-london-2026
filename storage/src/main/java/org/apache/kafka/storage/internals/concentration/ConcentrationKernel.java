@@ -16,6 +16,8 @@
  */
 package org.apache.kafka.storage.internals.concentration;
 
+import org.apache.kafka.common.TopicPartition;
+
 import java.io.File;
 import java.io.IOException;
 import java.util.ArrayDeque;
@@ -27,6 +29,7 @@ import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -101,6 +104,21 @@ public final class ConcentrationKernel implements AutoCloseable {
      */
     private final ConcurrentHashMap<LogicalPartition, ConcurrentHashMap<Long, ArrayDeque<Map.Entry<IdempotentBatchKey, IdempotentBatchResult>>>>
         idempotentCache = new ConcurrentHashMap<>();
+    /**
+     * Backing topic-partitions whose tracker is NOT trustworthy right now. Default empty
+     * (everything is ready). Populated by the broker glue on a leader-loss transition (see
+     * {@code KafkaConcentrationPartitionListener}), and cleared after the recoverer publishes a
+     * fresh tracker rehydrated from sidecars and/or the backing log under the current leader
+     * epoch (see the upcoming {@code KafkaConcentrationLeaderRecoverer}).
+     *
+     * <p>The set is consulted on the produce hot path; a membership check on a
+     * {@link java.util.concurrent.ConcurrentHashMap}-backed {@link Set} is one volatile read plus
+     * a hash lookup, so the steady-state cost is negligible. Modelled as "set of unready" rather
+     * than "set of ready" so that a backing the kernel has never observed (e.g. before the first
+     * leadership event for it) is treated as ready — matching the existing behavior where the
+     * kernel trusts the tracker state recovered at broker startup until something invalidates it.
+     */
+    private final Set<TopicPartition> unreadyBackings = ConcurrentHashMap.newKeySet();
     private volatile boolean closed = false;
 
     public ConcentrationKernel(File sidecarDir) {
@@ -405,6 +423,52 @@ public final class ConcentrationKernel implements AutoCloseable {
                 idempotentCache.remove(new LogicalPartition(descriptor.logicalName(), p));
             }
         }
+    }
+
+    // ------------------ Per-backing readiness gate ------------------
+
+    /**
+     * Mark a backing topic-partition as NOT ready to accept produces routed through the kernel.
+     * Called by the broker on leader-loss transitions (follower/failed/deleted) BEFORE the
+     * tracker is dropped, so that any produce arriving in the small window between this call
+     * and the listener's tracker-drop step also sees the gate closed.
+     *
+     * <p>Idempotent. Safe to call when the backing was already marked unready.
+     *
+     * <p>This is the broker-glue half of the rehydrate contract. The other half — clearing the
+     * gate after a successful epoch-fenced rehydrate publish — lives in
+     * {@link #markBackingReady(TopicPartition)}, called by the leader-recoverer shim.
+     */
+    public void markBackingUnready(TopicPartition backing) {
+        Objects.requireNonNull(backing, "backing");
+        unreadyBackings.add(backing);
+    }
+
+    /**
+     * Clear the unready mark for {@code backing}, signalling that the kernel's tracker for every
+     * logical partition routed onto this backing is consistent with the current leader's state.
+     * Called by the leader-recoverer shim AFTER the rehydrate has published its rebuilt state
+     * and the publish-time epoch fence has confirmed leadership has not advanced.
+     *
+     * <p>Idempotent. Returns true iff the partition was previously marked unready (useful for
+     * tests and observability).
+     */
+    public boolean markBackingReady(TopicPartition backing) {
+        Objects.requireNonNull(backing, "backing");
+        return unreadyBackings.remove(backing);
+    }
+
+    /**
+     * True iff the kernel's tracker for {@code backing} is trustworthy. The produce hot path
+     * consults this gate and returns {@code NOT_LEADER_OR_FOLLOWER} to the client when it's
+     * false, which stock idempotent producers handle by refreshing metadata and retrying.
+     *
+     * <p>Default state for any never-seen backing is "ready" — the kernel trusts whatever
+     * tracker state was loaded at broker startup until an explicit transition invalidates it.
+     */
+    public boolean isBackingReady(TopicPartition backing) {
+        Objects.requireNonNull(backing, "backing");
+        return !unreadyBackings.contains(backing);
     }
 
     // ------------------ Fetch path ------------------
