@@ -3826,9 +3826,41 @@ class KafkaApis(val requestChannel: RequestChannel,
     val original = request.body[AlterConfigsRequest]
     val preprocessingResponses = configManager.preprocess(original.data())
     val remaining = ConfigAdminManager.copyWithoutPreprocessed(original.data(), preprocessingResponses)
+    // Outside-in pollution guard. A privileged caller on a non-tenant listener
+    // could otherwise alter `acme.orders` directly (retention, segment.bytes, ...)
+    // — silently mutating a tenant's storage. Tenant principals never reach
+    // here (ALTER_CONFIGS is outside TENANT_ALLOWED_APIS); the guard is purely
+    // for cluster-wide callers. Mirrors the CreateTopics outside-in pattern.
+    val pollutionRejected = new util.ArrayList[AlterConfigsResponseData.AlterConfigsResourceResponse]()
+    if (!tenantContextFor(request).effectiveTenant.isPresent) {
+      val keep = new AlterConfigsRequestData.AlterConfigsResourceCollection(remaining.resources.size)
+      remaining.resources.forEach { r =>
+        if (ConfigResource.Type.forId(r.resourceType) == ConfigResource.Type.TOPIC
+            && isReservedTenantNamespace(r.resourceName)) {
+          pollutionRejected.add(new AlterConfigsResponseData.AlterConfigsResourceResponse()
+            .setErrorCode(Errors.INVALID_TOPIC_EXCEPTION.code)
+            .setErrorMessage("Topic name '" + r.resourceName + "' is reserved (tenant namespace prefix)")
+            .setResourceType(r.resourceType)
+            .setResourceName(r.resourceName))
+        } else {
+          keep.add(r.duplicate())
+        }
+      }
+      if (!pollutionRejected.isEmpty) {
+        remaining.setResources(keep)
+      }
+    }
     def sendResponse(secondPart: Option[ApiMessage]): Unit = {
       secondPart match {
         case Some(result: AlterConfigsResponseData) =>
+          if (!pollutionRejected.isEmpty) {
+            // Defensive copy: don't assume result.responses is mutable.
+            val merged = new util.ArrayList[AlterConfigsResponseData.AlterConfigsResourceResponse](
+              result.responses.size + pollutionRejected.size)
+            merged.addAll(result.responses)
+            merged.addAll(pollutionRejected)
+            result.setResponses(merged)
+          }
           requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
             new AlterConfigsResponse(ConfigAdminManager.reassembleLegacyResponse(
               original.data(),
@@ -3851,10 +3883,40 @@ class KafkaApis(val requestChannel: RequestChannel,
     val preprocessingResponses = configManager.preprocess(original.data(),
       (rType, rName) => authHelper.authorize(request.context, ALTER_CONFIGS, rType, rName))
     val remaining = ConfigAdminManager.copyWithoutPreprocessed(original.data(), preprocessingResponses)
+    // Outside-in pollution guard; see handleAlterConfigsRequest. Mutating an
+    // individual config key (cleanup.policy=delete on a compacted log) is the
+    // same level of damage as a full alter — same defence.
+    val pollutionRejected = new util.ArrayList[IncrementalAlterConfigsResponseData.AlterConfigsResourceResponse]()
+    if (!tenantContextFor(request).effectiveTenant.isPresent) {
+      val keep = new IncrementalAlterConfigsRequestData.AlterConfigsResourceCollection(remaining.resources.size)
+      remaining.resources.forEach { r =>
+        if (ConfigResource.Type.forId(r.resourceType) == ConfigResource.Type.TOPIC
+            && isReservedTenantNamespace(r.resourceName)) {
+          pollutionRejected.add(new IncrementalAlterConfigsResponseData.AlterConfigsResourceResponse()
+            .setErrorCode(Errors.INVALID_TOPIC_EXCEPTION.code)
+            .setErrorMessage("Topic name '" + r.resourceName + "' is reserved (tenant namespace prefix)")
+            .setResourceType(r.resourceType)
+            .setResourceName(r.resourceName))
+        } else {
+          keep.add(r.duplicate())
+        }
+      }
+      if (!pollutionRejected.isEmpty) {
+        remaining.setResources(keep)
+      }
+    }
 
     def sendResponse(secondPart: Option[ApiMessage]): Unit = {
       secondPart match {
         case Some(result: IncrementalAlterConfigsResponseData) =>
+          if (!pollutionRejected.isEmpty) {
+            // Defensive copy: don't assume result.responses is mutable.
+            val merged = new util.ArrayList[IncrementalAlterConfigsResponseData.AlterConfigsResourceResponse](
+              result.responses.size + pollutionRejected.size)
+            merged.addAll(result.responses)
+            merged.addAll(pollutionRejected)
+            result.setResponses(merged)
+          }
           requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
             new IncrementalAlterConfigsResponse(ConfigAdminManager.reassembleIncrementalResponse(
               original.data(),

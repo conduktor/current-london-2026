@@ -12474,6 +12474,186 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testAlterConfigsClusterWideListenerRejectsTenantPrefixedTopic(): Unit = {
+    // Outside-in pollution: a super-user on the cluster-wide listener could
+    // otherwise AlterConfigs(TOPIC, "acme.foo", retention.ms=...) and silently
+    // mutate tenant acme's storage. The broker refuses the entry before
+    // forwarding so the controller never sees `acme.foo`. Mirrors the
+    // CreateTopics outside-in guard.
+    val resource = new ConfigResource(ConfigResource.Type.TOPIC, "acme.foo")
+    val configEntries = new util.ArrayList[AlterConfigsRequest.ConfigEntry]()
+    configEntries.add(new AlterConfigsRequest.ConfigEntry("retention.ms", "60000"))
+    val configs = Map(resource -> new AlterConfigsRequest.Config(configEntries)).asJava
+    val alterRequest = new AlterConfigsRequest.Builder(configs, false).build()
+    val request = buildRequest(alterRequest)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleAlterConfigsRequest(request)
+
+    val response = verifyNoThrottling[AlterConfigsResponse](request)
+    val byName = response.data.responses.asScala.map(r => r.resourceName -> r).toMap
+    assertEquals(1, byName.size, "single resource in / single response out")
+    val rejected = byName("acme.foo")
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, rejected.errorCode,
+      "tenant-prefixed topic must be refused on cluster-wide listener")
+    assertEquals(ConfigResource.Type.TOPIC.id, rejected.resourceType)
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[AbstractRequest](), any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
+  def testAlterConfigsClusterWideListenerMixesAllowedAndRejectedEntries(): Unit = {
+    // Mixed batch: one tenant-prefixed TOPIC (rejected), one neutral TOPIC
+    // (forwarded). The pollution guard splits the batch, the neutral entry
+    // reaches the controller, both surface in the merged response.
+    val polluting = new ConfigResource(ConfigResource.Type.TOPIC, "acme.foo")
+    val neutral = new ConfigResource(ConfigResource.Type.TOPIC, "plain-topic")
+    val configEntries = new util.ArrayList[AlterConfigsRequest.ConfigEntry]()
+    configEntries.add(new AlterConfigsRequest.ConfigEntry("retention.ms", "60000"))
+    val configs = Map(
+      polluting -> new AlterConfigsRequest.Config(configEntries),
+      neutral -> new AlterConfigsRequest.Config(configEntries)).asJava
+    val alterRequest = new AlterConfigsRequest.Builder(configs, false).build()
+    val request = buildRequest(alterRequest)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleAlterConfigsRequest(request)
+
+    val bodyCaptor: ArgumentCaptor[AbstractRequest] = ArgumentCaptor.forClass(classOf[AbstractRequest])
+    val callbackCaptor: ArgumentCaptor[Option[AbstractResponse] => Unit] =
+      ArgumentCaptor.forClass(classOf[Option[AbstractResponse] => Unit])
+    verify(forwardingManager).forwardRequest(
+      ArgumentMatchers.eq(request),
+      bodyCaptor.capture(),
+      callbackCaptor.capture())
+    val forwarded = bodyCaptor.getValue.asInstanceOf[AlterConfigsRequest]
+    val forwardedNames = forwarded.data.resources.asScala.map(_.resourceName).toSet
+    assertEquals(Set("plain-topic"), forwardedNames,
+      "only the non-polluting entry must reach the controller")
+
+    val controllerResponse = new AlterConfigsResponseData().setResponses(asList(
+      new LAlterConfigsResourceResponse()
+        .setErrorCode(Errors.NONE.code)
+        .setResourceName("plain-topic")
+        .setResourceType(ConfigResource.Type.TOPIC.id)))
+    val alterCallback = callbackCaptor.getValue
+    alterCallback(Some(new AlterConfigsResponse(controllerResponse)))
+
+    val response = verifyNoThrottling[AlterConfigsResponse](request)
+    val byName = response.data.responses.asScala.map(r => r.resourceName -> r.errorCode).toMap
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, byName("acme.foo"),
+      "polluting entry rejected at the broker")
+    assertEquals(Errors.NONE.code, byName("plain-topic"),
+      "non-polluting entry surfaces controller's outcome unchanged")
+  }
+
+  @Test
+  def testAlterConfigsClusterWideListenerLeavesNonTopicResourcesAlone(): Unit = {
+    // The guard only targets TOPIC-typed resources. A CLIENT_METRICS
+    // subscription whose name happens to share a tenant prefix is NOT topic
+    // pollution and must be forwarded verbatim — the tenant namespace lives in
+    // topics + coordinator records, not in metric subscriptions.
+    val resource = new ConfigResource(ConfigResource.Type.CLIENT_METRICS, "acme.metrics")
+    val configEntries = new util.ArrayList[AlterConfigsRequest.ConfigEntry]()
+    configEntries.add(new AlterConfigsRequest.ConfigEntry("metrics", "x.y"))
+    val configs = Map(resource -> new AlterConfigsRequest.Config(configEntries)).asJava
+    val alterRequest = new AlterConfigsRequest.Builder(configs, false).build()
+    val request = buildRequest(alterRequest)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleAlterConfigsRequest(request)
+
+    verify(forwardingManager, times(1)).forwardRequest(any[RequestChannel.Request](),
+      any[AbstractRequest](), any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
+  def testAlterConfigsClusterWideListenerForwardsTenantLookingNamesWhenNoTenantsConfigured(): Unit = {
+    // Guard is gated on TenantConfig.allTenants. With no tenants configured the
+    // broker behaves as a stock cluster — `acme.foo` is just a topic name, not
+    // a pollution signal.
+    val resource = new ConfigResource(ConfigResource.Type.TOPIC, "acme.foo")
+    val configEntries = new util.ArrayList[AlterConfigsRequest.ConfigEntry]()
+    configEntries.add(new AlterConfigsRequest.ConfigEntry("retention.ms", "60000"))
+    val configs = Map(resource -> new AlterConfigsRequest.Config(configEntries)).asJava
+    val alterRequest = new AlterConfigsRequest.Builder(configs, false).build()
+    val request = buildRequest(alterRequest)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleAlterConfigsRequest(request)
+
+    verify(forwardingManager, times(1)).forwardRequest(any[RequestChannel.Request](),
+      any[AbstractRequest](), any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
+  def testIncrementalAlterConfigsClusterWideListenerRejectsTenantPrefixedTopic(): Unit = {
+    // Same outside-in pollution as the legacy alter — incremental form lets a
+    // super-user flip `cleanup.policy=delete` on a compacted tenant log, with
+    // the same level of damage. Reject at the broker before forwarding.
+    val resource = new ConfigResource(ConfigResource.Type.TOPIC, "acme.foo")
+    val incrementalRequest = getIncrementalAlterConfigRequestBuilder(
+      Seq(resource), "retention.ms", "60000").build()
+    val request = buildRequest(incrementalRequest)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleIncrementalAlterConfigsRequest(request)
+
+    val response = verifyNoThrottling[IncrementalAlterConfigsResponse](request)
+    val byName = response.data.responses.asScala.map(r => r.resourceName -> r).toMap
+    assertEquals(1, byName.size)
+    val rejected = byName("acme.foo")
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, rejected.errorCode,
+      "tenant-prefixed topic must be refused on cluster-wide listener")
+    assertEquals(ConfigResource.Type.TOPIC.id, rejected.resourceType)
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[AbstractRequest](), any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
+  def testIncrementalAlterConfigsClusterWideListenerMixesAllowedAndRejectedEntries(): Unit = {
+    val polluting = new ConfigResource(ConfigResource.Type.TOPIC, "acme.foo")
+    val neutral = new ConfigResource(ConfigResource.Type.TOPIC, "plain-topic")
+    val incrementalRequest = getIncrementalAlterConfigRequestBuilder(
+      Seq(polluting, neutral), "retention.ms", "60000").build()
+    val request = buildRequest(incrementalRequest)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleIncrementalAlterConfigsRequest(request)
+
+    val bodyCaptor: ArgumentCaptor[AbstractRequest] = ArgumentCaptor.forClass(classOf[AbstractRequest])
+    val callbackCaptor: ArgumentCaptor[Option[AbstractResponse] => Unit] =
+      ArgumentCaptor.forClass(classOf[Option[AbstractResponse] => Unit])
+    verify(forwardingManager).forwardRequest(
+      ArgumentMatchers.eq(request),
+      bodyCaptor.capture(),
+      callbackCaptor.capture())
+    val forwarded = bodyCaptor.getValue.asInstanceOf[IncrementalAlterConfigsRequest]
+    val forwardedNames = forwarded.data.resources.asScala.map(_.resourceName).toSet
+    assertEquals(Set("plain-topic"), forwardedNames,
+      "only the non-polluting entry must reach the controller")
+
+    val controllerResponse = new IncrementalAlterConfigsResponseData().setResponses(asList(
+      new IAlterConfigsResourceResponse()
+        .setErrorCode(Errors.NONE.code)
+        .setResourceName("plain-topic")
+        .setResourceType(ConfigResource.Type.TOPIC.id)))
+    val incrementalCallback = callbackCaptor.getValue
+    incrementalCallback(Some(new IncrementalAlterConfigsResponse(controllerResponse)))
+
+    val response = verifyNoThrottling[IncrementalAlterConfigsResponse](request)
+    val byName = response.data.responses.asScala.map(r => r.resourceName -> r.errorCode).toMap
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, byName("acme.foo"))
+    assertEquals(Errors.NONE.code, byName("plain-topic"))
+  }
+
+  @Test
   def testDeleteTopicsTenantRejectsReservedPhysicalFormLogicalName(): Unit = {
     // DeleteTopics by-name with `acme.orders` would rewrite to `acme.acme.orders`,
     // which (if it exists at all) is a phantom artefact rather than the topic the
