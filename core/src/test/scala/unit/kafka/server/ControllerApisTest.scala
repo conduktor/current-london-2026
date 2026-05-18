@@ -1278,6 +1278,83 @@ class ControllerApisTest {
     ).get().asScala.toSet)
   }
 
+  /**
+   * r19 ADV-A1-followup BLOCKER #128-regression — DeleteTopics by UUID must observe the
+   * same shadow guard as DeleteTopics by name. Before this fix, the ID iterator filtered
+   * only on !deletable, so a principal with DELETE on "orders" could send
+   * DeleteTopics(UUID=<physical "orders" id>) and the physical backing topic of a declared
+   * logical name was silently deleted — exactly the data-loss bug commit 0a5844d477 was
+   * supposed to close, but reopened via the UUID path. UUIDs are trivial to obtain (any
+   * metadata response surfaces them), so this is reachable in the wild, not a theoretical
+   * gap.
+   */
+  @Test
+  def testDeleteTopicsByIdRejectsDeclaredLogicalName(): Unit = {
+    val ordersId = Uuid.fromString("vZKYST0pSA2HO5x_6hoO2Q")
+    val innocentId = Uuid.fromString("VlFu5c51ToiNx64wtwkhQw")
+    val controller = new MockController.Builder().
+      newInitialTopic("orders", ordersId).
+      newInitialTopic("innocent", innocentId).build()
+    val props = new Properties()
+    props.put(ServerConfigs.CONCENTRATION_LOGICAL_TOPICS_CONFIG, "orders:100:shared:4")
+    controllerApis = createControllerApis(None, controller, props)
+    val request = new DeleteTopicsRequestData()
+    request.topics().add(new DeleteTopicState().setName(null).setTopicId(ordersId))
+    request.topics().add(new DeleteTopicState().setName(null).setTopicId(innocentId))
+
+    // ordersId resolves to "orders" — declared logical, so refuse with the operator
+    // message (auth has already cleared because hasClusterAuth=true). innocentId resolves
+    // to "innocent" — non-declared, deletion proceeds normally.
+    val expectedResponse = Set(
+      new DeletableTopicResult().setName("orders").setTopicId(ordersId).
+        setErrorCode(INVALID_REQUEST.code()).
+        setErrorMessage("Topic 'orders' is a declared logical topic in concentration.logical.topics on " +
+          "this controller. Logical topics cannot be deleted via DeleteTopics; remove the " +
+          "declaration from the controller's broker config and restart, then any physical " +
+          "topic of the same name can be deleted via the normal path."),
+      new DeletableTopicResult().setName("innocent").setTopicId(innocentId))
+    assertEquals(expectedResponse, controllerApis.deleteTopics(ANONYMOUS_CONTEXT, request,
+      ApiKeys.DELETE_TOPICS.latestVersion().toInt,
+      hasClusterAuth = true,
+      _ => Set.empty,
+      _ => Set.empty).get().asScala.toSet)
+  }
+
+  /**
+   * r19 ADV-A1-followup BLOCKER #128-regression — auth-precedence parity for the UUID
+   * path. A principal that can describe "orders" via the UUID but cannot delete it must
+   * see TOPIC_AUTHORIZATION_FAILED (identical shape to a real-but-unauthorized topic),
+   * NOT the operator's INVALID_REQUEST message. Otherwise the UUID path becomes an
+   * enumeration oracle on the declared logical-topic set for describe-only principals,
+   * symmetric to the name-path oracle the previous test pinned shut.
+   */
+  @Test
+  def testDeleteTopicsByIdLogicalRejectionRequiresDeletePermission(): Unit = {
+    val ordersId = Uuid.fromString("vZKYST0pSA2HO5x_6hoO2Q")
+    val controller = new MockController.Builder().
+      newInitialTopic("orders", ordersId).build()
+    val props = new Properties()
+    props.put(ServerConfigs.CONCENTRATION_LOGICAL_TOPICS_CONFIG, "orders:100:shared:4")
+    controllerApis = createControllerApis(None, controller, props)
+    val request = new DeleteTopicsRequestData()
+    request.topics().add(new DeleteTopicState().setName(null).setTopicId(ordersId))
+
+    // Describable but NOT deletable: the ID iterator's existing !deletable branch
+    // already returns TOPIC_AUTHORIZATION_FAILED, which is the correct masking shape —
+    // identical to what a real-but-unauthorized topic would return. This test pins
+    // that the regression fix did not accidentally widen disclosure.
+    val expectedResponse = Set(
+      new DeletableTopicResult().setName("orders").setTopicId(ordersId).
+        setErrorCode(TOPIC_AUTHORIZATION_FAILED.code()).
+        setErrorMessage(TOPIC_AUTHORIZATION_FAILED.message()))
+    assertEquals(expectedResponse, controllerApis.deleteTopics(ANONYMOUS_CONTEXT, request,
+      ApiKeys.DELETE_TOPICS.latestVersion().toInt,
+      hasClusterAuth = false,
+      _ => Set("orders"), // describable
+      _ => Set.empty       // not deletable
+    ).get().asScala.toSet)
+  }
+
   @ParameterizedTest
   @ValueSource(booleans = Array(true, false))
   def testCreatePartitionsRequest(validateOnly: Boolean): Unit = {

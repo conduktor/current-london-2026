@@ -341,6 +341,23 @@ class ControllerApis(
             appendResponse(null, id, new ApiError(TOPIC_AUTHORIZATION_FAILED))
           }
           iterator.remove()
+        } else if (declaredLogicalTopicNames.contains(name)) {
+          // r19 ADV-A1-followup BLOCKER #128-regression: The name-path shadow check at
+          // line ~358 below blocks DeleteTopics-by-NAME for declared logical topics, but
+          // the ID-path here was bypassing it. After findTopicNames resolves the UUID to
+          // a name, if that name is declared logical on this controller, we must refuse
+          // the delete identically — otherwise a principal holding DELETE on "orders"
+          // who passes DeleteTopics(UUID=<physical "orders" id>) (UUID readily obtained
+          // via any metadata response) gets the physical backing topic deleted even
+          // though the same request BY NAME returns INVALID_REQUEST. Authz has already
+          // cleared (deletable.contains is true), so disclosing the operator-remediation
+          // message is safe — same logic as the name-path describable+deletable branch.
+          appendResponse(name, id, new ApiError(INVALID_REQUEST,
+            s"Topic '$name' is a declared logical topic in concentration.logical.topics on " +
+              "this controller. Logical topics cannot be deleted via DeleteTopics; remove the " +
+              "declaration from the controller's broker config and restart, then any physical " +
+              "topic of the same name can be deleted via the normal path."))
+          iterator.remove()
         }
       }
       // For each topic that was provided by name, check if authentication failed.
