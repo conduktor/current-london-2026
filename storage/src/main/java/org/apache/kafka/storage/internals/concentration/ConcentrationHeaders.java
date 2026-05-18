@@ -41,4 +41,15 @@ public final class ConcentrationHeaders {
      * or stale.
      */
     public static final String LOGICAL_OFFSET_HEADER = "__concentration_logical_offset";
+
+    /**
+     * 4-byte big-endian {@code int} carrying the logical partition the producer targeted. Required
+     * by full-scan recovery: {@link LogicalPartitionMapper} is many-to-one (N logical partitions
+     * fan into M backing partitions, M ≪ N), so {@link BackingScanRecoverer} cannot recover the
+     * logical partition from a record's backing partition alone — multiple logical partitions of
+     * the same logical topic legitimately share a backing partition. Without this header a backing
+     * scan would have to assume one logical partition per backing partition, which would lose
+     * data on every concentrated topic.
+     */
+    public static final String LOGICAL_PARTITION_HEADER = "__concentration_logical_partition";
 }

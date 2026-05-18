@@ -32,14 +32,17 @@ import java.util.Objects;
 
 /**
  * Rebuilds a {@link MemoryRecords} batch produced against a logical topic, augmenting each record
- * with the two concentration headers ({@link ConcentrationHeaders#LOGICAL_TOPIC_HEADER},
+ * with the three concentration headers ({@link ConcentrationHeaders#LOGICAL_TOPIC_HEADER},
+ * {@link ConcentrationHeaders#LOGICAL_PARTITION_HEADER},
  * {@link ConcentrationHeaders#LOGICAL_OFFSET_HEADER}) so that:
  *
  * <ul>
  *   <li>The fetch path can demultiplex records that share a backing partition with another
  *       logical topic.</li>
  *   <li>{@link BackingScanRecoverer} can rebuild the sidecar entirely from a backing-log scan
- *       when the durable sidecar is missing.</li>
+ *       when the durable sidecar is missing — the partition header is required here because
+ *       {@link LogicalPartitionMapper} is many-to-one and the backing partition alone is
+ *       insufficient to recover the originating logical partition.</li>
  * </ul>
  *
  * <p>This is a pure function. The original {@code MemoryRecords} is read but never mutated; a
@@ -58,17 +61,27 @@ public final class LogicalProduceStamper {
 
     /**
      * Return a new {@link MemoryRecords} whose records are identical to {@code source}'s except
-     * that each has two extra headers appended:
-     * {@code __concentration_logical_topic = utf8(logicalTopic)} and
+     * that each has three extra headers appended:
+     * {@code __concentration_logical_topic = utf8(logicalTopic)},
+     * {@code __concentration_logical_partition = bigEndian(logicalPartition)}, and
      * {@code __concentration_logical_offset = bigEndian(logicalOffsets[i])}.
      *
-     * @throws IllegalArgumentException if {@code source} has zero or more-than-one batches, or
-     *     if the number of records does not equal {@code logicalOffsets.length}.
+     * @throws IllegalArgumentException if {@code source} has zero or more-than-one batches, if
+     *     the number of records does not equal {@code logicalOffsets.length}, or if
+     *     {@code logicalPartition} is negative.
      */
-    public static MemoryRecords stamp(MemoryRecords source, String logicalTopic, long[] logicalOffsets) {
+    public static MemoryRecords stamp(
+        MemoryRecords source,
+        String logicalTopic,
+        int logicalPartition,
+        long[] logicalOffsets
+    ) {
         Objects.requireNonNull(source, "source");
         Objects.requireNonNull(logicalTopic, "logicalTopic");
         Objects.requireNonNull(logicalOffsets, "logicalOffsets");
+        if (logicalPartition < 0) {
+            throw new IllegalArgumentException("logicalPartition must be non-negative: " + logicalPartition);
+        }
 
         Iterator<? extends RecordBatch> batchIter = source.batches().iterator();
         if (!batchIter.hasNext()) {
@@ -97,16 +110,18 @@ public final class LogicalProduceStamper {
         }
 
         byte[] logicalTopicBytes = logicalTopic.getBytes(StandardCharsets.UTF_8);
+        byte[] logicalPartitionBytes = ByteBuffer.allocate(Integer.BYTES).putInt(logicalPartition).array();
 
-        // Estimate output size: original batch size + 2 extra headers per record. Headers are
-        // small (key + 8-byte value + per-record overhead) but the per-record varint encoding
+        // Estimate output size: original batch size + 3 extra headers per record. Headers are
+        // small (key + small-int value + per-record overhead) but the per-record varint encoding
         // means even small additions accumulate. Allocate generously — the buffer is shrunk by
         // build() if it's bigger than needed. Mirror LogValidator's pattern of summing
         // AbstractRecords.estimateSizeInBytes for the records body and adding fixed margins.
         int headerOverheadPerRecord =
             ConcentrationHeaders.LOGICAL_TOPIC_HEADER.length() + logicalTopicBytes.length
+            + ConcentrationHeaders.LOGICAL_PARTITION_HEADER.length() + Integer.BYTES
             + ConcentrationHeaders.LOGICAL_OFFSET_HEADER.length() + Long.BYTES
-            + 32; // varint and header-count growth margin
+            + 48; // varint and header-count growth margin
         int estimatedSize = AbstractRecords.estimateSizeInBytes(
             batch.magic(),
             batch.baseOffset(),
@@ -135,14 +150,17 @@ public final class LogicalProduceStamper {
         int offsetIndex = 0;
         for (Record record : batch) {
             Header[] orig = record.headers();
-            Header[] augmented = new Header[orig.length + 2];
+            Header[] augmented = new Header[orig.length + 3];
             System.arraycopy(orig, 0, augmented, 0, orig.length);
             augmented[orig.length] = new RecordHeader(
                 ConcentrationHeaders.LOGICAL_TOPIC_HEADER,
                 logicalTopicBytes);
+            augmented[orig.length + 1] = new RecordHeader(
+                ConcentrationHeaders.LOGICAL_PARTITION_HEADER,
+                logicalPartitionBytes);
             ByteBuffer offsetValue = ByteBuffer.allocate(Long.BYTES);
             offsetValue.putLong(logicalOffsets[offsetIndex++]).flip();
-            augmented[orig.length + 1] = new RecordHeader(
+            augmented[orig.length + 2] = new RecordHeader(
                 ConcentrationHeaders.LOGICAL_OFFSET_HEADER,
                 offsetValue.array());
             builder.appendWithOffset(offsetCursor++, record.timestamp(),

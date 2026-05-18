@@ -123,10 +123,12 @@ public class LogicalFetchTranslatorTest {
         assertEquals(1, hs.length, "concentration headers must be stripped; user header kept");
         assertEquals("x-trace-id", hs[0].key());
         assertArrayEquals("trace-99".getBytes(StandardCharsets.UTF_8), hs[0].value());
-        // Defensive: explicitly check neither concentration header survives.
+        // Defensive: explicitly check no concentration header survives.
         for (Header h : hs) {
             assertFalse(ConcentrationHeaders.LOGICAL_TOPIC_HEADER.equals(h.key()),
                 "logical-topic header must not leak to consumer");
+            assertFalse(ConcentrationHeaders.LOGICAL_PARTITION_HEADER.equals(h.key()),
+                "logical-partition header must not leak to consumer");
             assertFalse(ConcentrationHeaders.LOGICAL_OFFSET_HEADER.equals(h.key()),
                 "logical-offset header must not leak to consumer");
         }
@@ -232,7 +234,7 @@ public class LogicalFetchTranslatorTest {
             new SimpleRecord("k1".getBytes(), "payload-1".getBytes()),
             new SimpleRecord("k2".getBytes(), "payload-2".getBytes()));
 
-        MemoryRecords stamped = LogicalProduceStamper.stamp(original, "orders",
+        MemoryRecords stamped = LogicalProduceStamper.stamp(original, "orders", 0,
             new long[] {100L, 101L, 102L});
         MemoryRecords translated = LogicalFetchTranslator.translate(stamped, "orders");
 
@@ -328,7 +330,7 @@ public class LogicalFetchTranslatorTest {
         for (InterleavedRecord ir : records) {
             MemoryRecords single = MemoryRecords.withRecords(Compression.NONE,
                 new SimpleRecord(ir.timestamp, ir.key, ir.value, ir.userHeaders));
-            MemoryRecords stamped = LogicalProduceStamper.stamp(single, ir.logicalTopic, new long[] {ir.logicalOffset});
+            MemoryRecords stamped = LogicalProduceStamper.stamp(single, ir.logicalTopic, 0, new long[] {ir.logicalOffset});
             stampedBatches.add(stamped);
             total += stamped.sizeInBytes();
         }

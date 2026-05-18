@@ -60,21 +60,24 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 public class LogicalProduceStamperTest {
 
     @Test
-    public void stampAddsBothHeadersToEveryRecord() {
+    public void stampAddsAllThreeHeadersToEveryRecord() {
         MemoryRecords source = MemoryRecords.withRecords(Compression.NONE,
             new SimpleRecord("k1".getBytes(), "v1".getBytes()),
             new SimpleRecord("k2".getBytes(), "v2".getBytes()),
             new SimpleRecord("k3".getBytes(), "v3".getBytes()));
 
-        MemoryRecords stamped = LogicalProduceStamper.stamp(source, "orders", new long[] {10L, 11L, 12L});
+        MemoryRecords stamped = LogicalProduceStamper.stamp(source, "orders", 7, new long[] {10L, 11L, 12L});
 
         List<Record> records = collectRecords(stamped);
         assertEquals(3, records.size());
         for (int i = 0; i < 3; i++) {
             Header[] hs = records.get(i).headers();
-            // Stamped headers come after the source's original headers (here, none).
-            assertEquals(ConcentrationHeaders.LOGICAL_TOPIC_HEADER, hs[hs.length - 2].key());
-            assertEquals("orders", new String(hs[hs.length - 2].value(), StandardCharsets.UTF_8));
+            // Stamped headers come after the source's original headers (here, none) in stamp
+            // order: topic, partition, offset.
+            assertEquals(ConcentrationHeaders.LOGICAL_TOPIC_HEADER, hs[hs.length - 3].key());
+            assertEquals("orders", new String(hs[hs.length - 3].value(), StandardCharsets.UTF_8));
+            assertEquals(ConcentrationHeaders.LOGICAL_PARTITION_HEADER, hs[hs.length - 2].key());
+            assertEquals(7, ByteBuffer.wrap(hs[hs.length - 2].value()).getInt());
             assertEquals(ConcentrationHeaders.LOGICAL_OFFSET_HEADER, hs[hs.length - 1].key());
             assertEquals(10L + i, ByteBuffer.wrap(hs[hs.length - 1].value()).getLong());
         }
@@ -90,17 +93,19 @@ public class LogicalProduceStamperTest {
             new SimpleRecord(System.currentTimeMillis(), "k".getBytes(), "v".getBytes(),
                 new Header[] {h1, h2}));
 
-        MemoryRecords stamped = LogicalProduceStamper.stamp(source, "orders", new long[] {0L});
+        MemoryRecords stamped = LogicalProduceStamper.stamp(source, "orders", 3, new long[] {0L});
 
         Record r = collectRecords(stamped).get(0);
         Header[] hs = r.headers();
-        assertEquals(4, hs.length, "expected 2 original + 2 concentration headers");
+        assertEquals(5, hs.length, "expected 2 original + 3 concentration headers");
         assertEquals("x-request-id", hs[0].key());
         assertArrayEquals("abc-123".getBytes(StandardCharsets.UTF_8), hs[0].value());
         assertEquals("x-trace", hs[1].key());
         assertArrayEquals("trace-1".getBytes(StandardCharsets.UTF_8), hs[1].value());
         assertEquals(ConcentrationHeaders.LOGICAL_TOPIC_HEADER, hs[2].key());
-        assertEquals(ConcentrationHeaders.LOGICAL_OFFSET_HEADER, hs[3].key());
+        assertEquals(ConcentrationHeaders.LOGICAL_PARTITION_HEADER, hs[3].key());
+        assertEquals(3, ByteBuffer.wrap(hs[3].value()).getInt());
+        assertEquals(ConcentrationHeaders.LOGICAL_OFFSET_HEADER, hs[4].key());
     }
 
     @Test
@@ -109,7 +114,7 @@ public class LogicalProduceStamperTest {
         MemoryRecords source = MemoryRecords.withRecords(Compression.NONE,
             new SimpleRecord(ts, "key-a".getBytes(), "value-a".getBytes()));
 
-        MemoryRecords stamped = LogicalProduceStamper.stamp(source, "orders", new long[] {42L});
+        MemoryRecords stamped = LogicalProduceStamper.stamp(source, "orders", 0, new long[] {42L});
 
         Record r = collectRecords(stamped).get(0);
         assertEquals(ts, r.timestamp());
@@ -136,7 +141,7 @@ public class LogicalProduceStamperTest {
         b.appendWithOffset(1L, new SimpleRecord(1001L, "k2".getBytes(), "v2".getBytes()));
         MemoryRecords source = b.build();
 
-        MemoryRecords stamped = LogicalProduceStamper.stamp(source, "orders", new long[] {0L, 1L});
+        MemoryRecords stamped = LogicalProduceStamper.stamp(source, "orders", 1, new long[] {0L, 1L});
 
         RecordBatch outBatch = stamped.batches().iterator().next();
         assertEquals(producerId, outBatch.producerId());
@@ -154,10 +159,18 @@ public class LogicalProduceStamperTest {
 
         // 3 offsets for 2 records — must reject loudly rather than silently drop one.
         assertThrows(IllegalArgumentException.class,
-            () -> LogicalProduceStamper.stamp(source, "orders", new long[] {0L, 1L, 2L}));
+            () -> LogicalProduceStamper.stamp(source, "orders", 0, new long[] {0L, 1L, 2L}));
         // 1 offset for 2 records.
         assertThrows(IllegalArgumentException.class,
-            () -> LogicalProduceStamper.stamp(source, "orders", new long[] {0L}));
+            () -> LogicalProduceStamper.stamp(source, "orders", 0, new long[] {0L}));
+    }
+
+    @Test
+    public void stampRejectsNegativeLogicalPartition() {
+        MemoryRecords source = MemoryRecords.withRecords(Compression.NONE,
+            new SimpleRecord("a".getBytes()));
+        assertThrows(IllegalArgumentException.class,
+            () -> LogicalProduceStamper.stamp(source, "orders", -1, new long[] {0L}));
     }
 
     @Test
@@ -166,7 +179,7 @@ public class LogicalProduceStamperTest {
         // for the broker hook to forward).
         MemoryRecords empty = MemoryRecords.EMPTY;
         assertThrows(IllegalArgumentException.class,
-            () -> LogicalProduceStamper.stamp(empty, "orders", new long[] {}));
+            () -> LogicalProduceStamper.stamp(empty, "orders", 0, new long[] {}));
 
         // Multi-batch: synthesize a MemoryRecords with two batches by concatenating the buffers.
         MemoryRecords batchA = MemoryRecords.withRecords(0L, Compression.NONE,
@@ -180,7 +193,7 @@ public class LogicalProduceStamperTest {
         MemoryRecords multi = MemoryRecords.readableRecords(joined);
 
         assertThrows(IllegalArgumentException.class,
-            () -> LogicalProduceStamper.stamp(multi, "orders", new long[] {0L, 1L}));
+            () -> LogicalProduceStamper.stamp(multi, "orders", 0, new long[] {0L, 1L}));
     }
 
     @Test
@@ -188,11 +201,11 @@ public class LogicalProduceStamperTest {
         MemoryRecords source = MemoryRecords.withRecords(Compression.NONE,
             new SimpleRecord("a".getBytes()));
         assertThrows(NullPointerException.class,
-            () -> LogicalProduceStamper.stamp(null, "orders", new long[] {0L}));
+            () -> LogicalProduceStamper.stamp(null, "orders", 0, new long[] {0L}));
         assertThrows(NullPointerException.class,
-            () -> LogicalProduceStamper.stamp(source, null, new long[] {0L}));
+            () -> LogicalProduceStamper.stamp(source, null, 0, new long[] {0L}));
         assertThrows(NullPointerException.class,
-            () -> LogicalProduceStamper.stamp(source, "orders", null));
+            () -> LogicalProduceStamper.stamp(source, "orders", 0, null));
     }
 
     @Test
@@ -218,7 +231,7 @@ public class LogicalProduceStamperTest {
         MemoryRecords source = MemoryRecords.withRecords(Compression.NONE,
             new SimpleRecord("payload".getBytes()));
 
-        MemoryRecords stamped = LogicalProduceStamper.stamp(source, "t", new long[] {0x0123_4567_89AB_CDEFL});
+        MemoryRecords stamped = LogicalProduceStamper.stamp(source, "t", 0, new long[] {0x0123_4567_89AB_CDEFL});
 
         Record r = collectRecords(stamped).get(0);
         Header offsetHeader = r.headers()[r.headers().length - 1];
@@ -237,7 +250,7 @@ public class LogicalProduceStamperTest {
             new SimpleRecord("k1".getBytes(), "v1".getBytes()),
             new SimpleRecord("k2".getBytes(), "v2".getBytes()));
 
-        MemoryRecords stamped = LogicalProduceStamper.stamp(source, "orders", new long[] {0L, 1L});
+        MemoryRecords stamped = LogicalProduceStamper.stamp(source, "orders", 0, new long[] {0L, 1L});
 
         RecordBatch outBatch = stamped.batches().iterator().next();
         assertEquals(source.batches().iterator().next().compressionType(),
@@ -253,12 +266,12 @@ public class LogicalProduceStamperTest {
         MemoryRecords source = MemoryRecords.withRecords(Compression.NONE,
             new SimpleRecord(null, "value-only".getBytes()));
 
-        MemoryRecords stamped = LogicalProduceStamper.stamp(source, "orders", new long[] {0L});
+        MemoryRecords stamped = LogicalProduceStamper.stamp(source, "orders", 0, new long[] {0L});
 
         Record r = collectRecords(stamped).get(0);
         assertNull(r.key());
         assertArrayEquals("value-only".getBytes(), bytes(r.value()));
-        assertTrue(r.headers().length >= 2);
+        assertTrue(r.headers().length >= 3);
     }
 
     // ---- helpers ----

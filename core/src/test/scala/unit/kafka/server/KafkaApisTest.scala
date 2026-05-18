@@ -2191,10 +2191,13 @@ class KafkaApisTest extends Logging {
     while (stampedRecords.hasNext) {
       val r = stampedRecords.next()
       val hs = r.headers()
-      assertTrue(hs.length >= 2, s"record $i missing concentration headers")
-      assertEquals(ConcentrationHeaders.LOGICAL_TOPIC_HEADER, hs(hs.length - 2).key())
-      assertEquals(logicalTopic, new String(hs(hs.length - 2).value(),
+      assertTrue(hs.length >= 3, s"record $i missing concentration headers")
+      assertEquals(ConcentrationHeaders.LOGICAL_TOPIC_HEADER, hs(hs.length - 3).key())
+      assertEquals(logicalTopic, new String(hs(hs.length - 3).value(),
         java.nio.charset.StandardCharsets.UTF_8))
+      assertEquals(ConcentrationHeaders.LOGICAL_PARTITION_HEADER, hs(hs.length - 2).key())
+      assertEquals(0, java.nio.ByteBuffer.wrap(hs(hs.length - 2).value()).getInt,
+        "logical partition stamped on the record must equal the producer's target logical partition")
       assertEquals(ConcentrationHeaders.LOGICAL_OFFSET_HEADER, hs(hs.length - 1).key())
       assertEquals(500L + i,
         java.nio.ByteBuffer.wrap(hs(hs.length - 1).value()).getLong)
@@ -2862,15 +2865,17 @@ class KafkaApisTest extends Logging {
   }
 
   // Helper for fetch-hook tests: build a MemoryRecords as if it had been produced through the
-  // logical-topic stamper, with each record carrying ConcentrationHeaders for `logicalTopic`
-  // and `logicalOffset`. Mirrors the wire shape the fetch hook sees coming off the backing log.
+  // logical-topic stamper, with each record carrying ConcentrationHeaders for `logicalTopic`,
+  // `logicalPartition`, and `logicalOffset`. Mirrors the wire shape the fetch hook sees coming
+  // off the backing log. The logical partition is fixed at 0 because the existing fetch tests
+  // only assert on (topic, offset) — the partition header is exercised by the recovery path.
   private def backingRecordsFromInterleaved(records: (String, Long, String, String)*): MemoryRecords = {
     val stamped = new scala.collection.mutable.ArrayBuffer[MemoryRecords]()
     var total = 0
     records.foreach { case (logicalTopic, logicalOffset, key, value) =>
       val single = MemoryRecords.withRecords(Compression.NONE,
         new SimpleRecord(key.getBytes(StandardCharsets.UTF_8), value.getBytes(StandardCharsets.UTF_8)))
-      val s = LogicalProduceStamper.stamp(single, logicalTopic, Array(logicalOffset))
+      val s = LogicalProduceStamper.stamp(single, logicalTopic, 0, Array(logicalOffset))
       stamped += s
       total += s.sizeInBytes()
     }

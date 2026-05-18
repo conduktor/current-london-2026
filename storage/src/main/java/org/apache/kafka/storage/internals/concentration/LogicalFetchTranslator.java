@@ -35,8 +35,9 @@ import java.util.Objects;
  * Demultiplex-and-rewrite pass on a {@link MemoryRecords} fetched from a backing partition.
  * Keeps only the records whose {@link ConcentrationHeaders#LOGICAL_TOPIC_HEADER} matches
  * {@code targetLogicalTopic}, and rewrites each kept record's offset to the value carried by its
- * {@link ConcentrationHeaders#LOGICAL_OFFSET_HEADER}. The two concentration headers are stripped
- * from the output; user-supplied headers, key, value, and timestamp survive verbatim.
+ * {@link ConcentrationHeaders#LOGICAL_OFFSET_HEADER}. The three concentration headers
+ * (topic / partition / offset) are stripped from the output; user-supplied headers, key, value,
+ * and timestamp survive verbatim.
  *
  * <p>This is the consume-side mirror of {@link LogicalProduceStamper}: where the stamper adds
  * the two headers so a backing record can be identified by logical topic, this translator removes
@@ -194,6 +195,7 @@ public final class LogicalFetchTranslator {
 
     private static boolean isConcentrationHeader(Header h) {
         return ConcentrationHeaders.LOGICAL_TOPIC_HEADER.equals(h.key())
+            || ConcentrationHeaders.LOGICAL_PARTITION_HEADER.equals(h.key())
             || ConcentrationHeaders.LOGICAL_OFFSET_HEADER.equals(h.key());
     }
 

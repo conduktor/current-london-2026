@@ -461,7 +461,8 @@ class KafkaApis(val requestChannel: RequestChannel,
                 val logicalOffsets = new Array[Long](reservations.length)
                 var i = 0
                 while (i < reservations.length) { logicalOffsets(i) = reservations(i).logicalOffset; i += 1 }
-                val stamped = LogicalProduceStamper.stamp(memoryRecords, topicPartition.topic, logicalOffsets)
+                val stamped = LogicalProduceStamper.stamp(
+                  memoryRecords, topicPartition.topic, topicPartition.partition, logicalOffsets)
                 authorizedRequestInfo += (backingTp -> stamped)
                 logicalByBacking += (backingTp -> (topicPartition, reservations))
               }
