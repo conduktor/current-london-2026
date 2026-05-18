@@ -80,11 +80,31 @@ public final class IoUringServerListener implements AutoCloseable {
     private final int boundPort;
     private volatile boolean closed;
 
+    /** Sentinel meaning "leave the OS default in place" — matches {@code Selectable.USE_DEFAULT_BUFFER_SIZE}. */
+    public static final int USE_DEFAULT_BUFFER_SIZE = -1;
+
     public IoUringServerListener(InetSocketAddress bindAddress, IoUringSelector selector) {
-        this(bindAddress, selector, /*soBacklog*/ 128);
+        this(bindAddress, selector, /*soBacklog*/ 128, USE_DEFAULT_BUFFER_SIZE, USE_DEFAULT_BUFFER_SIZE);
     }
 
     public IoUringServerListener(InetSocketAddress bindAddress, IoUringSelector selector, int soBacklog) {
+        this(bindAddress, selector, soBacklog, USE_DEFAULT_BUFFER_SIZE, USE_DEFAULT_BUFFER_SIZE);
+    }
+
+    /**
+     * @param sendBufferSize    {@code SO_SNDBUF} applied to every accepted child channel, or
+     *                          {@link #USE_DEFAULT_BUFFER_SIZE} to leave the OS default in place
+     *                          ({@code socket.send.buffer.bytes} on the NIO path).
+     * @param receiveBufferSize {@code SO_RCVBUF} applied to the listening socket so newly accepted
+     *                          children inherit it via standard TCP semantics, or
+     *                          {@link #USE_DEFAULT_BUFFER_SIZE} for the OS default
+     *                          ({@code socket.receive.buffer.bytes} on the NIO path).
+     */
+    public IoUringServerListener(InetSocketAddress bindAddress,
+                                 IoUringSelector selector,
+                                 int soBacklog,
+                                 int sendBufferSize,
+                                 int receiveBufferSize) {
         Objects.requireNonNull(bindAddress, "bindAddress");
         this.selector = Objects.requireNonNull(selector, "selector");
         if (!IoUringSupport.isAvailable()) {
@@ -95,23 +115,44 @@ public final class IoUringServerListener implements AutoCloseable {
         this.eventLoopGroup = new MultiThreadIoEventLoopGroup(1, IoUringIoHandler.newFactory());
 
         try {
+            // Mirror NIO Acceptor.configureAcceptedSocketChannel (SocketServer.scala:740-746):
+            // every accepted broker connection gets TCP_NODELAY=true and SO_KEEPALIVE=true.
+            // TCP_NODELAY disables Nagle's algorithm — critical for Kafka request/response
+            // latency since requests are batched at the producer/consumer layer and Nagle
+            // would add hundreds of microseconds on every flush. SO_KEEPALIVE detects half-open
+            // connections so the broker doesn't keep a dead peer slot indefinitely.
+            // SO_SNDBUF is applied per-child when the operator overrides the default; SO_RCVBUF
+            // is applied to the LISTEN socket (children inherit via TCP) matching how NIO sets
+            // it on serverSocket.openServerSocket(..., recvBufferSize) at SocketServer.scala:667.
             ServerBootstrap bootstrap = new ServerBootstrap()
                 .group(eventLoopGroup)
                 .channel(IoUringServerSocketChannel.class)
                 .option(ChannelOption.SO_BACKLOG, soBacklog)
                 .option(UnixChannelOption.SO_REUSEPORT, true)
                 .childOption(ChannelOption.AUTO_READ, true)
+                .childOption(ChannelOption.TCP_NODELAY, true)
+                .childOption(ChannelOption.SO_KEEPALIVE, true)
                 .childHandler(new ChannelInitializer<Channel>() {
                     @Override
                     protected void initChannel(Channel ch) {
                         ch.pipeline().addLast(new ChildHandler(selector));
                     }
                 });
+            if (sendBufferSize != USE_DEFAULT_BUFFER_SIZE) {
+                bootstrap.childOption(ChannelOption.SO_SNDBUF, sendBufferSize);
+            }
+            if (receiveBufferSize != USE_DEFAULT_BUFFER_SIZE) {
+                // SO_RCVBUF on the LISTEN socket: TCP semantics propagate it to every accepted
+                // child at the moment of accept. Setting it per-child would be ineffective
+                // because the OS sizes the receive buffer at accept time, not afterwards.
+                bootstrap.option(ChannelOption.SO_RCVBUF, receiveBufferSize);
+            }
 
             ChannelFuture future = bootstrap.bind(bindAddress).sync();
             this.serverChannel = future.channel();
             this.boundPort = ((InetSocketAddress) serverChannel.localAddress()).getPort();
-            log.info("io_uring listener bound to {} (port {})", bindAddress, boundPort);
+            log.info("io_uring listener bound to {} (port {}, sendBufferSize={}, receiveBufferSize={})",
+                bindAddress, boundPort, sendBufferSize, receiveBufferSize);
         } catch (InterruptedException ie) {
             eventLoopGroup.shutdownGracefully();
             Thread.currentThread().interrupt();

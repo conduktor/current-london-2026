@@ -955,8 +955,17 @@ private[kafka] class Processor(
         id,
         ioUringChannelConfigs)
       val bindAddress = new java.net.InetSocketAddress(endPoint.host, endPoint.port)
+      // Apply socket.send.buffer.bytes/socket.receive.buffer.bytes so io_uring matches the
+      // NIO Acceptor parity at SocketServer.scala:740-746 / openServerSocket(..., recvBuf).
+      // Without this, an operator-tuned SO_SNDBUF/SO_RCVBUF silently has no effect on the
+      // io_uring listener and per-connection throughput diverges from the NIO baseline on
+      // the same broker.
       val listener = new org.apache.kafka.network.iouring.IoUringServerListener(
-        bindAddress, ioUringSelector, config.socketListenBacklogSize)
+        bindAddress,
+        ioUringSelector,
+        config.socketListenBacklogSize,
+        config.socketSendBufferBytes,
+        config.socketReceiveBufferBytes)
       ProcessorIoBundle(ioUringSelector, Some(listener))
     } else {
       ProcessorIoBundle(new NioBrokerSelector(createSelector(
