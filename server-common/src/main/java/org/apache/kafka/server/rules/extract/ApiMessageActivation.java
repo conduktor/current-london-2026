@@ -16,6 +16,7 @@
  */
 package org.apache.kafka.server.rules.extract;
 
+import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.protocol.ApiMessage;
 import org.apache.kafka.common.record.BaseRecords;
 
@@ -452,6 +453,21 @@ public final class ApiMessageActivation {
         }
         if (v instanceof Number || v instanceof byte[] || v instanceof ByteBuffer) {
             return v;
+        }
+        // Uuid identifies topics (MetadataRequest v10+, FetchRequest v13+,
+        // OffsetForLeaderEpoch, DeleteTopics by id, etc.). Without this branch
+        // the walker would descend into Uuid via its mostSignificantBits/
+        // leastSignificantBits accessors and emit a two-entry map. A rule
+        // author writing the natural predicate
+        // `request.topics.exists(t, t.topicId == "<base64url>")` would then
+        // silently always evaluate to false — a rule-bypass-by-shape failure
+        // mode the engine cannot diagnose. Normalising to Kafka's canonical
+        // base64url string form (Uuid.toString) makes id-based rules behave
+        // the way operators expect: identifiers go in as strings, comparisons
+        // use string equality / startsWith / matches. Audit round-5 finding
+        // afa1a332 (MEDIUM).
+        if (v instanceof Uuid) {
+            return v.toString();
         }
         return null;
     }
