@@ -18,8 +18,10 @@ package kafka.api
 
 import kafka.server.{KafkaBroker, KafkaConfig, QuorumTestHarness}
 import kafka.utils.TestUtils
+import org.apache.kafka.clients.admin.NewTopic
 import org.apache.kafka.clients.producer.{KafkaProducer, ProducerConfig, ProducerRecord}
 import org.apache.kafka.common.InvalidRecordException
+import org.apache.kafka.common.errors.InvalidConfigurationException
 import org.apache.kafka.common.network.ListenerName
 import org.apache.kafka.common.security.auth.SecurityProtocol
 import org.apache.kafka.common.serialization.ByteArraySerializer
@@ -27,7 +29,7 @@ import org.apache.kafka.storage.internals.log.LogConfig
 import org.junit.jupiter.api.Assertions._
 import org.junit.jupiter.api.{AfterEach, BeforeEach, Test, TestInfo}
 
-import java.util.Properties
+import java.util.{Collections, Properties}
 import java.util.concurrent.ExecutionException
 
 /**
@@ -103,6 +105,87 @@ class CompressionPolicyIntegrationTest extends QuorumTestHarness {
       assertEquals(0L, metaRequired.offset())
     } finally {
       compressed.close()
+    }
+  }
+
+  /**
+   * Pins the per-partition response shape end-to-end on a real broker: one configured
+   * topic and one open topic, both targeted by the same uncompressed producer.
+   *
+   * The unit tests in `KafkaApisTest` (mock-based) already pin the same-request shape;
+   * this test pins the contract against a real `ReplicaManager` / `MetadataCache` to
+   * catch any wiring regression where a single broker response could conflate the two
+   * topics.
+   */
+  @Test
+  def testCompressionPolicyAppliesPerPartitionAcrossMixedTopicsEndToEnd(): Unit = {
+    val requiredTopic = "mixed-required"
+    val openTopic = "mixed-open"
+
+    val admin = TestUtils.createAdminClient(Seq(broker),
+      ListenerName.forSecurityProtocol(SecurityProtocol.PLAINTEXT))
+    try {
+      val requiredCfg = new Properties()
+      requiredCfg.put(LogConfig.COMPRESSION_POLICY_CONFIG, "required")
+      TestUtils.createTopicWithAdmin(admin, requiredTopic, Seq(broker), controllerServers,
+        topicConfig = requiredCfg)
+      TestUtils.createTopicWithAdmin(admin, openTopic, Seq(broker), controllerServers)
+    } finally {
+      admin.close()
+    }
+
+    val bootstrapServers = TestUtils.plaintextBootstrapServers(Seq(broker))
+    val producer = newProducer(bootstrapServers, "none")
+    try {
+      // Send both records before driving completion so the producer has the chance to
+      // batch them; with a single broker this typically lands as a single ProduceRequest.
+      // Even if the producer chose to split, the broker-side per-partition contract is the
+      // same and is what we assert here.
+      val openFuture = producer.send(new ProducerRecord(openTopic, "v".getBytes))
+      val requiredFuture = producer.send(new ProducerRecord(requiredTopic, "v".getBytes))
+
+      val ee = assertThrows(classOf[ExecutionException], () => requiredFuture.get())
+      assertTrue(ee.getCause.isInstanceOf[InvalidRecordException],
+        s"required-topic partition must be rejected with InvalidRecordException, got " +
+          s"${ee.getCause.getClass.getName}: ${ee.getCause.getMessage}")
+
+      val openMeta = openFuture.get()
+      assertEquals(0L, openMeta.offset(),
+        "open-topic partition in the same producer run must succeed independently of the rejected one")
+    } finally {
+      producer.close()
+    }
+  }
+
+  /**
+   * Pins the `compression.policy` validator at the CreateTopic API boundary. The
+   * `LogConfig`-constructor-level rejection is unit-tested in `LogConfigTest`; this
+   * test confirms the value-set validator is actually wired through the AdminClient
+   * surface, so an unknown value (e.g. `"yes"`) is rejected before the topic is created.
+   */
+  @Test
+  def testCreateTopicRejectsUnknownCompressionPolicyValue(): Unit = {
+    val topic = "compression-bad-policy"
+    val admin = TestUtils.createAdminClient(Seq(broker),
+      ListenerName.forSecurityProtocol(SecurityProtocol.PLAINTEXT))
+    try {
+      val badConfig = new java.util.HashMap[String, String]()
+      badConfig.put(LogConfig.COMPRESSION_POLICY_CONFIG, "yes")
+
+      val result = admin.createTopics(Collections.singletonList(
+        new NewTopic(topic, 1, 1.toShort).configs(badConfig)))
+
+      val ee = assertThrows(classOf[ExecutionException], () => result.all().get())
+      assertTrue(ee.getCause.isInstanceOf[InvalidConfigurationException],
+        s"expected InvalidConfigurationException for unknown compression.policy value, got " +
+          s"${ee.getCause.getClass.getName}: ${ee.getCause.getMessage}")
+
+      // The topic must not have been created.
+      val listed = admin.listTopics().names().get()
+      assertFalse(listed.contains(topic),
+        s"topic $topic must not exist after CreateTopic rejected its compression.policy value")
+    } finally {
+      admin.close()
     }
   }
 
