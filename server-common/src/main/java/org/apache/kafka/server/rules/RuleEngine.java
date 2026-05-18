@@ -21,9 +21,11 @@ import org.apache.kafka.common.protocol.ApiKeys;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 
@@ -35,21 +37,27 @@ import java.util.function.Supplier;
  * new snapshot — concurrent readers observe either the previous or the new
  * snapshot, never a torn intermediate state.
  *
- * <p>{@link #evaluate(ApiKeys, String, boolean, Supplier)} is on the hot path of
- * {@code KafkaApis.handle()} and is designed to do the absolute minimum
- * work when no rule targets the request:
+ * <p>{@link #evaluate(ApiKeys, String, String, boolean, Supplier)} is on the
+ * hot path of {@code KafkaApis.handle()} and is designed to do the absolute
+ * minimum work when no rule targets the request:
  *
  * <ol>
  *   <li>If the request arrived on a <em>privileged listener</em>
- *       (typically the broker's inter-broker listener), short-circuit to
- *       ALLOW. This is the bootstrap-safety hatch: the broker's own consumer
- *       of the governance topic must never be rule-blocked, even under a
- *       misconfigured "deny everything" rule set. Crucially, the
- *       {@code fromPrivilegedListener} bit is set by the network layer
- *       based on which TCP listener accepted the connection — it is not
- *       derived from any wire field a client controls, so external clients
- *       cannot bypass the engine by spoofing a client-id, principal, or
- *       any other application-level identifier.</li>
+ *       (typically the broker's inter-broker listener) AND the peer
+ *       principal is in the trusted-bypass allow-list configured at
+ *       construction time, short-circuit to ALLOW. This is the
+ *       bootstrap-safety hatch: the broker's own consumer of the governance
+ *       topic must never be rule-blocked, even under a misconfigured "deny
+ *       everything" rule set. The {@code fromPrivilegedListener} bit is set
+ *       by the network layer based on which TCP listener accepted the
+ *       connection — clients cannot forge it. The principal check is the
+ *       defence-in-depth against a misconfiguration where the operator
+ *       points the inter-broker listener at a listener also accepting
+ *       client traffic: even then, only requests whose authenticated
+ *       principal appears in the allow-list ride the bypass. When the
+ *       allow-list is empty (legacy construction), the principal check is
+ *       skipped — a WARN is logged at construction time so the operator
+ *       sees the gap.</li>
  *   <li>Bitset check: if no DENY rule in the snapshot targets the request's
  *       API key, return ALLOW without invoking the activation supplier.
  *       This keeps the cost of "rules feature enabled but no rule applies"
@@ -82,6 +90,58 @@ public final class RuleEngine {
     private final AtomicReference<RuleSet> active = new AtomicReference<>(RuleSet.EMPTY);
 
     /**
+     * Allow-list of principal strings (e.g. {@code "User:broker"}) that may
+     * exercise the privileged-listener bypass. When empty, the bypass falls
+     * back to listener-only — preserving legacy behaviour for deployments
+     * that haven't yet configured the broker principal.
+     *
+     * <p>The set is constructor-immutable. Operators rotate broker
+     * credentials by restarting brokers, so a hot-reload knob would buy
+     * nothing operational while widening the in-memory surface a runaway
+     * thread could observe at the wrong moment.
+     */
+    private final Set<String> trustedBypassPrincipals;
+
+    /**
+     * Backwards-compatible constructor for tests and old callers that don't
+     * configure a trusted-principal allow-list. Equivalent to
+     * {@code new RuleEngine(Collections.emptySet())}: the privileged-listener
+     * bypass falls back to listener-only semantics. New code should pass
+     * the broker's configured {@code super.users} principal set so that a
+     * client connecting on a mis-configured shared listener cannot ride the
+     * bypass.
+     */
+    public RuleEngine() {
+        this(Collections.emptySet());
+    }
+
+    /**
+     * Construct an engine that requires {@code principalName ∈ trustedBypassPrincipals}
+     * in addition to {@code fromPrivilegedListener=true} to grant the bypass.
+     * Pass {@code Collections.emptySet()} to preserve listener-only behaviour.
+     *
+     * <p>The recommended source for {@code trustedBypassPrincipals} is the
+     * broker's {@code super.users} config: by Kafka convention, the broker's
+     * own principal is enrolled there. Passing the parsed super-user set
+     * narrows the bypass to "privileged listener AND principal is broker /
+     * super-user", which is the production-safe posture.
+     */
+    public RuleEngine(Set<String> trustedBypassPrincipals) {
+        this.trustedBypassPrincipals = Set.copyOf(trustedBypassPrincipals);
+        if (this.trustedBypassPrincipals.isEmpty()) {
+            LOG.warn("RuleEngine constructed with no trusted-bypass principals; "
+                + "privileged-listener bypass will rely on listener flag alone. "
+                + "If the inter-broker listener is shared with client traffic this "
+                + "lets any client on that listener evade rule evaluation. Configure "
+                + "super.users (and ensure the broker principal is in it) to close "
+                + "this gap.");
+        } else {
+            LOG.info("RuleEngine privileged-listener bypass narrowed to principals: {}",
+                this.trustedBypassPrincipals);
+        }
+    }
+
+    /**
      * Atomically swap the active rule set. Concurrent readers will observe
      * either the previous or the new {@code rs}, never a partial state.
      */
@@ -100,11 +160,19 @@ public final class RuleEngine {
      * @param apiKey the request's API key
      * @param clientId the request's client-id (may be null/empty; purely
      *                 diagnostic — used in WARN logs, never authoritative)
+     * @param principalName the authenticated peer principal as a string (e.g.
+     *                 {@code "User:broker"}); may be null when the request is
+     *                 unauthenticated. Authoritative for narrowing the
+     *                 privileged-listener bypass.
      * @param fromPrivilegedListener {@code true} iff the request arrived on a
-     *                 listener the broker treats as inter-broker. This is the
-     *                 sole authoritative bypass; external clients cannot
-     *                 forge it because the network layer derives it from the
-     *                 accepting listener, not the wire payload.
+     *                 listener the broker treats as inter-broker. Necessary
+     *                 but not sufficient for the bypass: if the engine was
+     *                 constructed with a non-empty trusted-bypass principal
+     *                 allow-list, the {@code principalName} must also appear
+     *                 there. External clients cannot forge
+     *                 {@code fromPrivilegedListener} because the network
+     *                 layer derives it from the accepting listener, not the
+     *                 wire payload.
      * @param activationSupplier lazy builder of the CEL activation map; only
      *                           invoked if at least one rule targets the API
      *                           key, and only once per call regardless of how
@@ -113,9 +181,10 @@ public final class RuleEngine {
      */
     public RuleDecision evaluate(ApiKeys apiKey,
                                  String clientId,
+                                 String principalName,
                                  boolean fromPrivilegedListener,
                                  Supplier<Map<String, Object>> activationSupplier) {
-        if (fromPrivilegedListener) {
+        if (fromPrivilegedListener && bypassIsAuthorisedFor(principalName)) {
             return RuleDecision.ALLOW;
         }
         RuleSet snapshot = active.get();
@@ -175,27 +244,54 @@ public final class RuleEngine {
     }
 
     /**
-     * Cheap fast-path guard: returns {@code true} only if the active snapshot
-     * has at least one DENY rule that <em>could</em> apply to this request.
-     * Callers use this to skip allocating an activation supplier closure on
-     * the request hot path when there is no possible deny outcome.
+     * Backwards-compatible 4-argument form: passes {@code null} as the
+     * principal name. Equivalent to legacy behaviour iff the engine was
+     * constructed without a trusted-bypass principal set — in that case the
+     * principal is ignored anyway. When a trusted set IS configured this
+     * form will never grant the bypass (null principal cannot match), so
+     * callers that want the principal narrowing to actually take effect
+     * must use the 5-argument form. Provided so existing governance unit
+     * tests need not change in lockstep with the engine surface change.
+     */
+    public RuleDecision evaluate(ApiKeys apiKey,
+                                 String clientId,
+                                 boolean fromPrivilegedListener,
+                                 Supplier<Map<String, Object>> activationSupplier) {
+        return evaluate(apiKey, clientId, null, fromPrivilegedListener, activationSupplier);
+    }
+
+    /**
+     * Cheap fast-path guard: returns {@code true} when the active snapshot
+     * <em>might</em> deny this request. Callers use this to skip allocating
+     * an activation supplier closure when no deny outcome is possible.
      *
-     * <p>Specifically, returns {@code false} when either:
-     * <ul>
-     *   <li>the request arrived on a privileged (inter-broker) listener — the
-     *       network layer sets {@code fromPrivilegedListener} for those and
-     *       external clients cannot forge it; or</li>
-     *   <li>no DENY rule in the active snapshot targets this API key.</li>
-     * </ul>
-     *
-     * <p>This method makes no allocations and does no reflection. Wire it
-     * directly into {@code KafkaApis.handle()} as the gate around the
-     * activation-supplier lambda.
+     * <p>Important: this guard does NOT short-circuit on
+     * {@code fromPrivilegedListener=true}. The full bypass is principal-aware
+     * (see {@link #evaluate}) and the principal is not in scope at this
+     * fast-path call site without an extra lookup. Returning {@code true} on
+     * the privileged listener is harmless: the call site re-checks the
+     * authoritative bypass inside {@link #evaluate} and short-circuits there
+     * for legitimate broker traffic. The cost is one extra string-compare
+     * against the (typically tiny) trusted-principal set for the small
+     * subset of requests on the privileged listener — far below the cost of
+     * actually denying a misrouted external client.
      */
     public boolean mayDeny(ApiKeys apiKey, boolean fromPrivilegedListener) {
-        if (fromPrivilegedListener) {
-            return false;
-        }
         return active.get().hasDenyRuleFor(apiKey.id);
+    }
+
+    /**
+     * Returns true when the privileged-listener bypass is authorised for the
+     * given peer principal. When no allow-list is configured, falls back to
+     * legacy listener-only behaviour (already logged at construction time).
+     * When an allow-list IS configured, the principal must appear in it —
+     * matched as a verbatim string against the principal's
+     * {@code toString()} representation (e.g. {@code "User:broker"}).
+     */
+    private boolean bypassIsAuthorisedFor(String principalName) {
+        if (trustedBypassPrincipals.isEmpty()) {
+            return true;
+        }
+        return principalName != null && trustedBypassPrincipals.contains(principalName);
     }
 }

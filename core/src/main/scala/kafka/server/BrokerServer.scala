@@ -491,7 +491,28 @@ class BrokerServer(
       // (initially empty) RuleSet to consult from the very first request.
       // The actual drain from the __governance log happens below, before
       // SocketServer.enableRequestProcessing — see governanceBootstrap.
-      ruleEngine = new RuleEngine()
+      //
+      // Pass super.users as the trusted-bypass principal allow-list. The
+      // privileged-listener bypass for inter-broker traffic is necessary
+      // but not sufficient on its own: an operator who mis-configures the
+      // inter-broker listener to share traffic with a client listener would
+      // otherwise let every client on that listener evade rule evaluation.
+      // Requiring the peer principal to also match super.users closes that
+      // gap. Empty super.users means legacy behaviour (listener-only) and a
+      // WARN at construction time — see RuleEngine constructor for details.
+      val superUserSet: java.util.Set[String] = {
+        val raw = config.originals().get("super.users")
+        if (raw == null) java.util.Collections.emptySet[String]()
+        else {
+          val out = new java.util.HashSet[String]()
+          raw.toString.split(";").foreach { v =>
+            val trimmed = v.trim
+            if (trimmed.nonEmpty) out.add(trimmed)
+          }
+          out
+        }
+      }
+      ruleEngine = new RuleEngine(superUserSet)
 
       // Authoritative probe for "is this broker a replica of __governance-0?".
       // The legacy bootstrap conflated "topic absent" with "broker not a

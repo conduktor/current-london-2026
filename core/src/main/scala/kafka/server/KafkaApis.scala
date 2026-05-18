@@ -171,15 +171,20 @@ class KafkaApis(val requestChannel: RequestChannel,
       // RuleEngine.mayDeny — one bitset bit-test, no closure allocation, no body decode. The
       // activation supplier closure is constructed only when mayDeny returns true.
       //
-      // The privileged-listener bypass is authoritative: a request landing on the broker's
-      // inter-broker listener is exempt regardless of clientId/principal. External clients
-      // cannot forge fromPrivilegedListener because the network layer derives it from the
-      // accepting listener, not the wire payload.
+      // The privileged-listener bypass is necessary but not sufficient: the engine ALSO
+      // requires the peer principal to be in a trusted-bypass allow-list (typically
+      // super.users). The listener flag is forged-resistant — set by the network layer
+      // based on the accepting listener — but on its own it cannot defend against an
+      // operator misconfiguration where the inter-broker listener is shared with client
+      // traffic. The principal check closes that gap. When no allow-list is configured
+      // the engine logs a WARN at startup and falls back to listener-only semantics.
       val fromPrivilegedListener = request.context.fromPrivilegedListener
       if (ruleEngine.mayDeny(request.header.apiKey, fromPrivilegedListener)) {
+        val principalName = Option(request.context.principal).map(_.toString).orNull
         val ruleDecision = ruleEngine.evaluate(
           request.header.apiKey,
           request.header.clientId,
+          principalName,
           fromPrivilegedListener,
           () => ApiMessageActivation.requestActivation(request.body[AbstractRequest].data()))
         if (ruleDecision.denied) {
