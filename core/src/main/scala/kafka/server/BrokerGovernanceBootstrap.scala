@@ -80,9 +80,10 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
     if (injectedLoader != null) injectedLoader
     else new GovernanceLoader(ruleEngine)
 
-  // Per-partition cursor of the last offset we already replayed. Records at
-  // offsets <= this cursor are skipped. Starts at -1 so a brand-new log
-  // (start offset 0) is fully consumed on the first drainOnce.
+  // Per-partition cursor of the next offset to replay. Records at offsets
+  // >= this cursor are eligible; everything below has already been replayed.
+  // Starts at 0 so a brand-new log (start offset 0) is fully consumed on the
+  // first drainOnce.
   private val nextOffset = new AtomicLong(0L)
 
   /**
@@ -110,7 +111,14 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
 
       case Some(log) =>
         val startOffset = math.max(log.logStartOffset, nextOffset.get())
-        val endOffset = log.logEndOffset
+        // Bound the drain by the high-watermark, not the local log-end offset.
+        // On a follower, LEO may be ahead of HW (records replicated locally but
+        // not yet acknowledged by enough replicas to advance the cluster-wide
+        // commit point). Reading past HW would let this broker enforce rules
+        // that could still be truncated by a leader-election — i.e. enforce a
+        // rule that no other broker enforces. The matching FetchIsolation in
+        // replay() must agree, so this bound and that isolation move together.
+        val endOffset = log.highWatermark
         if (startOffset >= endOffset) {
           // Up to date — commit once so the engine reflects the working state
           // even when nothing new arrived (idempotent install).
@@ -150,7 +158,10 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
       val fetchInfo = log.read(
         startOffset = currentOffset,
         maxLength = readBufferBytes,
-        isolation = FetchIsolation.LOG_END,
+        // HIGH_WATERMARK: enforce only durably-committed rules. Anything past
+        // HW could be truncated on leader-election and would diverge this
+        // broker's view of governance from the rest of the cluster.
+        isolation = FetchIsolation.HIGH_WATERMARK,
         minOneMessage = true)
       val records = fetchInfo.records
       val sizeInBytes = records.sizeInBytes()

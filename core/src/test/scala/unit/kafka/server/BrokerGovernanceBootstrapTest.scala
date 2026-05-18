@@ -79,8 +79,9 @@ class BrokerGovernanceBootstrapTest {
     val engine = new RuleEngine()
     when(rm.getLog(tp)).thenReturn(Some(log))
     when(log.logStartOffset).thenReturn(0L)
-    when(log.logEndOffset).thenReturn(3L)
-    when(log.read(0L, 1024 * 1024, FetchIsolation.LOG_END, true)).thenReturn(
+    // HW is the drain bound; on a happy-path single-broker test it matches LEO.
+    when(log.highWatermark).thenReturn(3L)
+    when(log.read(0L, 1024 * 1024, FetchIsolation.HIGH_WATERMARK, true)).thenReturn(
       recordsAt(0L,
         new SimpleRecord("r1".getBytes(StandardCharsets.UTF_8), envelope("true", ApiKeys.METADATA, 7)),
         new SimpleRecord("r2".getBytes(StandardCharsets.UTF_8), envelope("true", ApiKeys.FETCH, 11)),
@@ -103,8 +104,8 @@ class BrokerGovernanceBootstrapTest {
     val engine = new RuleEngine()
     when(rm.getLog(tp)).thenReturn(Some(log))
     when(log.logStartOffset).thenReturn(0L)
-    when(log.logEndOffset).thenReturn(2L)
-    when(log.read(0L, 1024 * 1024, FetchIsolation.LOG_END, true)).thenReturn(
+    when(log.highWatermark).thenReturn(2L)
+    when(log.read(0L, 1024 * 1024, FetchIsolation.HIGH_WATERMARK, true)).thenReturn(
       recordsAt(0L,
         new SimpleRecord("r1".getBytes(StandardCharsets.UTF_8), envelope("true", ApiKeys.METADATA, 7)),
         // tombstone (null value) — should remove r1
@@ -127,9 +128,9 @@ class BrokerGovernanceBootstrapTest {
     when(rm.getLog(tp)).thenReturn(Some(log))
     when(log.logStartOffset).thenReturn(0L)
 
-    // First call: log end offset is 1, one record present.
-    when(log.logEndOffset).thenReturn(1L)
-    when(log.read(0L, 1024 * 1024, FetchIsolation.LOG_END, true)).thenReturn(
+    // First call: HW is at 1, one record committed.
+    when(log.highWatermark).thenReturn(1L)
+    when(log.read(0L, 1024 * 1024, FetchIsolation.HIGH_WATERMARK, true)).thenReturn(
       recordsAt(0L,
         new SimpleRecord("r1".getBytes(StandardCharsets.UTF_8), envelope("true", ApiKeys.METADATA, 7))))
 
@@ -165,8 +166,8 @@ class BrokerGovernanceBootstrapTest {
 
     when(rm.getLog(tp)).thenReturn(Some(log))
     when(log.logStartOffset).thenReturn(0L)
-    when(log.logEndOffset).thenReturn(3L)
-    when(log.read(0L, 1024 * 1024, FetchIsolation.LOG_END, true)).thenReturn(
+    when(log.highWatermark).thenReturn(3L)
+    when(log.read(0L, 1024 * 1024, FetchIsolation.HIGH_WATERMARK, true)).thenReturn(
       recordsAt(0L,
         new SimpleRecord("r1".getBytes(StandardCharsets.UTF_8), envelope("true", ApiKeys.METADATA, 7)),
         new SimpleRecord("r2".getBytes(StandardCharsets.UTF_8), envelope("true", ApiKeys.FETCH, 11)),
@@ -181,7 +182,6 @@ class BrokerGovernanceBootstrapTest {
 
     // A second drainOnce on the same log MUST be a no-op: the cursor advanced
     // past the poison, so the bug doesn't loop forever.
-    when(log.logEndOffset).thenReturn(3L)
     val second = boot.drainOnce()
     assertEquals(0L, second, "cursor must have advanced past the poison")
   }
@@ -203,8 +203,8 @@ class BrokerGovernanceBootstrapTest {
     val engine = new RuleEngine()
     when(rm.getLog(tp)).thenReturn(Some(log))
     when(log.logStartOffset).thenReturn(0L)
-    when(log.logEndOffset).thenReturn(5L)
-    when(log.read(0L, 1024 * 1024, FetchIsolation.LOG_END, true))
+    when(log.highWatermark).thenReturn(5L)
+    when(log.read(0L, 1024 * 1024, FetchIsolation.HIGH_WATERMARK, true))
       .thenThrow(new org.apache.kafka.common.errors.CorruptRecordException("simulated corrupt segment"))
 
     val boot = new BrokerGovernanceBootstrap(rm, engine, tp)
@@ -224,7 +224,7 @@ class BrokerGovernanceBootstrapTest {
     val engine = new RuleEngine()
     when(rm.getLog(tp)).thenReturn(Some(log))
     when(log.logStartOffset).thenReturn(0L)
-    when(log.logEndOffset).thenReturn(0L)
+    when(log.highWatermark).thenReturn(0L)
 
     val boot = new BrokerGovernanceBootstrap(rm, engine, tp)
     val n = boot.drainOnce()
@@ -232,5 +232,57 @@ class BrokerGovernanceBootstrapTest {
     assertEquals(0L, n)
     assertNotNull(engine.active(), "engine must have a non-null active RuleSet")
     assertEquals(0, engine.active().size())
+  }
+
+  @Test
+  def drainOnceStopsAtHighWatermarkEvenWhenLogEndOffsetIsAhead(): Unit = {
+    // Regression-locking test for the LOG_END → HIGH_WATERMARK change.
+    //
+    // Scenario: this broker is a replica of __governance whose local log has
+    // advanced LEO past the committed cluster-wide HW (e.g. it just replicated
+    // records from the leader but the cluster hasn't yet acknowledged them as
+    // committed). Reading past HW would let this broker enforce rules that
+    // could still be lost on a leader-election truncation — i.e. enforce a
+    // rule that no other broker enforces. The drain must stop at HW.
+    //
+    // We seed LEO = 3 and HW = 1. Only the first record must reach the engine;
+    // records at offsets 1 and 2 (past HW) must be ignored. Crucially, the
+    // cursor must also stop at HW so the next drainOnce — after HW advances —
+    // picks them up.
+    val rm = mock(classOf[ReplicaManager])
+    val log = mock(classOf[UnifiedLog])
+    val engine = new RuleEngine()
+    when(rm.getLog(tp)).thenReturn(Some(log))
+    when(log.logStartOffset).thenReturn(0L)
+    when(log.logEndOffset).thenReturn(3L) // leader-end position, stale here
+    when(log.highWatermark).thenReturn(1L)
+    when(log.read(0L, 1024 * 1024, FetchIsolation.HIGH_WATERMARK, true)).thenReturn(
+      recordsAt(0L,
+        new SimpleRecord("r1".getBytes(StandardCharsets.UTF_8),
+          envelope("true", ApiKeys.METADATA, 7))))
+
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp)
+    val first = boot.drainOnce()
+    assertEquals(1L, first, "only committed (HW) records should be replayed")
+    assertEquals(1, engine.active().size())
+    assertTrue(engine.evaluate(ApiKeys.METADATA, "c", false, () => Collections.emptyMap()).denied)
+
+    // HW catches up to LEO; the deferred records become committed and the
+    // next drain MUST pick them up — the previous drain stopped at HW=1, so
+    // its cursor is 1, not LEO=3. If we had used LOG_END semantics, the
+    // cursor would have already been set to 3 and these would be lost forever.
+    when(log.highWatermark).thenReturn(3L)
+    when(log.read(1L, 1024 * 1024, FetchIsolation.HIGH_WATERMARK, true)).thenReturn(
+      recordsAt(1L,
+        new SimpleRecord("r2".getBytes(StandardCharsets.UTF_8),
+          envelope("true", ApiKeys.FETCH, 11)),
+        new SimpleRecord("r3".getBytes(StandardCharsets.UTF_8),
+          envelope("true", ApiKeys.CREATE_TOPICS, 13))))
+
+    val second = boot.drainOnce()
+    assertEquals(2L, second, "deferred records become enforceable once HW advances")
+    assertEquals(3, engine.active().size())
+    assertTrue(engine.evaluate(ApiKeys.FETCH, "c", false, () => Collections.emptyMap()).denied)
+    assertTrue(engine.evaluate(ApiKeys.CREATE_TOPICS, "c", false, () => Collections.emptyMap()).denied)
   }
 }
