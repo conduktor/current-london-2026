@@ -77,7 +77,16 @@ final class Evaluator {
                 if (v instanceof Boolean) return !((Boolean) v);
                 return null; // non-boolean → unknown
             case NEG:
-                if (v instanceof Long) return -((Long) v);
+                if (v instanceof Long) {
+                    long lv = (Long) v;
+                    // -Long.MIN_VALUE silently wraps to Long.MIN_VALUE in Java 2's-complement.
+                    // arithLong already converts equivalent overflows on +/-/* to null via
+                    // Math.*Exact; NEG must do the same so predicates like `-body.priority < -100`
+                    // don't admit a Long.MIN_VALUE payload through the wrap. Predicates are an
+                    // access-control boundary; "unknown" (null) is the safe result.
+                    if (lv == Long.MIN_VALUE) return null;
+                    return -lv;
+                }
                 if (v instanceof Double) return -((Double) v);
                 return null;
             default:

@@ -286,6 +286,23 @@ class CompiledPredicateTest {
     }
 
     @Test
+    void negatingLongMinValueYieldsUnknownNotSilentWraparound() {
+        // -Long.MIN_VALUE silently wraps to Long.MIN_VALUE in Java 2's-complement. Without an
+        // overflow guard on NEG, a predicate like `-body.priority < -100` admits a body carrying
+        // Long.MIN_VALUE (the wrap stays negative, satisfies `< -100`). arithLong already converts
+        // equivalent overflows on +/-/* to null via Math.*Exact; NEG must match. Predicates are an
+        // access-control boundary; "unknown" (null) → falsy → record skipped is the safe outcome.
+        CompiledPredicate p = compiler.compile("-body.priority < -100");
+        Optional<Boolean> r = p.evaluate(jsonRecord("{\"priority\":-9223372036854775808}"));
+        assertTrue(r.isEmpty() || !r.get(),
+                () -> "Long.MIN_VALUE negation must be unknown/false, not silently wrap, got " + r);
+        // Sanity: ordinary negation still works.
+        CompiledPredicate q = compiler.compile("-body.priority < -100");
+        assertTrue(q.evaluate(jsonRecord("{\"priority\":200}")).orElse(false));
+        assertFalse(q.evaluate(jsonRecord("{\"priority\":50}")).orElse(true));
+    }
+
+    @Test
     void rejectsPrecisionLossFloatLiteralAtCompileTime() {
         // 9007199254740993.0 silently rounds to 9007199254740992.0 in Double. A predicate
         // body.x == 9007199254740993.0 therefore matches a Long that the author did not intend.
