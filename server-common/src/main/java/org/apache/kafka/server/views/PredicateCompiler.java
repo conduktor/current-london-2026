@@ -43,6 +43,15 @@ public final class PredicateCompiler {
         if (source == null) {
             throw new PredicateValidationException("predicate source must not be null");
         }
+        // Bound the input BEFORE any further work. This is the cheapest defense against
+        // adversarial input shapes (e.g. deep parenthesisation) that would otherwise force the
+        // recursive-descent parser into a JVM stack overflow before the post-parse maxDepth
+        // check could fire. The parser also enforces maxParenDepth as the structural backstop.
+        if (source.length() > limits.maxSourceLength) {
+            throw new PredicateValidationException(
+                    "predicate source exceeds maxSourceLength=" + limits.maxSourceLength
+                            + " (got " + source.length() + ")");
+        }
         String trimmed = source.trim();
         if (trimmed.isEmpty()) {
             throw new PredicateValidationException("predicate source must not be empty");

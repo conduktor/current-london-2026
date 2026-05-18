@@ -182,8 +182,8 @@ class CompiledPredicateTest {
 
     @Test
     void skipsRecordWhenStepCapExceeded() {
-        PredicateLimits cheap = new PredicateLimits(256, 16, 256, /*maxStepsPerEval*/3,
-                1 << 20, 32);
+        PredicateLimits cheap = new PredicateLimits(4096, 32, 256, 16, 256,
+                /*maxStepsPerEval*/3, 1 << 20, 32);
         CompiledPredicate p = new PredicateCompiler(cheap)
                 .compile("body.a == 1 && body.b == 2 && body.c == 3 && body.d == 4");
         Optional<Boolean> r = p.evaluate(jsonRecord("{\"a\":1,\"b\":2,\"c\":3,\"d\":4}"));
@@ -193,7 +193,7 @@ class CompiledPredicateTest {
 
     @Test
     void skipsRecordWhenBodyExceedsByteCap() {
-        PredicateLimits tightBody = new PredicateLimits(256, 16, 256, 1000,
+        PredicateLimits tightBody = new PredicateLimits(4096, 32, 256, 16, 256, 1000,
                 /*maxBodyBytes*/8, 32);
         CompiledPredicate p = new PredicateCompiler(tightBody).compile("body.x == 1");
         Optional<Boolean> r = p.evaluate(jsonRecord("{\"x\":1, \"padding\":\"too-big\"}", tightBody));
@@ -203,7 +203,7 @@ class CompiledPredicateTest {
 
     @Test
     void skipsRecordWhenJsonDepthExceedsCap() {
-        PredicateLimits shallowJson = new PredicateLimits(256, 16, 256, 1000,
+        PredicateLimits shallowJson = new PredicateLimits(4096, 32, 256, 16, 256, 1000,
                 1 << 20, /*maxJsonDepth*/2);
         CompiledPredicate p = new PredicateCompiler(shallowJson).compile("body.a.b.c == 1");
         Optional<Boolean> r = p.evaluate(jsonRecord("{\"a\":{\"b\":{\"c\":1}}}", shallowJson));

@@ -21,6 +21,14 @@ package org.apache.kafka.server.views;
  * and AST size; runtime limits cap per-record evaluation cost.
  *
  * Every limit guards against a real failure mode:
+ *  - maxSourceLength: oversized predicate text — fail fast before lexing/parsing. Also closes the
+ *    "deep parenthesisation → parser stack overflow" attack: parens don't add AST nodes, so a
+ *    predicate like `(((((...)))))` would slip past maxNodes/maxDepth (the depth check runs
+ *    POST-parse) and blow the JVM stack inside the recursive-descent parser. Capping source
+ *    length is the cheapest hard ceiling on input size; {@link #maxParenDepth} catches the
+ *    pathological shape directly during parsing.
+ *  - maxParenDepth: explicit cap on parenthesis nesting during parse. Hard guarantee against
+ *    parser recursion overflow on adversarial input, independent of source length.
  *  - maxNodes / maxDepth: malicious or buggy predicates that would balloon parser/evaluator memory or recursion.
  *  - maxStringLiteralLength: oversized literals embedded in the predicate text.
  *  - maxStepsPerEval: catastrophic per-record cost on a hot path.
@@ -28,6 +36,8 @@ package org.apache.kafka.server.views;
  *  - maxJsonDepth: deeply nested JSON exhausting the parser stack.
  */
 public final class PredicateLimits {
+    public final int maxSourceLength;
+    public final int maxParenDepth;
     public final int maxNodes;
     public final int maxDepth;
     public final int maxStringLiteralLength;
@@ -35,14 +45,19 @@ public final class PredicateLimits {
     public final int maxBodyBytes;
     public final int maxJsonDepth;
 
-    public PredicateLimits(int maxNodes, int maxDepth, int maxStringLiteralLength,
+    public PredicateLimits(int maxSourceLength, int maxParenDepth,
+                           int maxNodes, int maxDepth, int maxStringLiteralLength,
                            int maxStepsPerEval, int maxBodyBytes, int maxJsonDepth) {
+        if (maxSourceLength <= 0) throw new IllegalArgumentException("maxSourceLength must be > 0");
+        if (maxParenDepth <= 0) throw new IllegalArgumentException("maxParenDepth must be > 0");
         if (maxNodes <= 0) throw new IllegalArgumentException("maxNodes must be > 0");
         if (maxDepth <= 0) throw new IllegalArgumentException("maxDepth must be > 0");
         if (maxStringLiteralLength <= 0) throw new IllegalArgumentException("maxStringLiteralLength must be > 0");
         if (maxStepsPerEval <= 0) throw new IllegalArgumentException("maxStepsPerEval must be > 0");
         if (maxBodyBytes <= 0) throw new IllegalArgumentException("maxBodyBytes must be > 0");
         if (maxJsonDepth <= 0) throw new IllegalArgumentException("maxJsonDepth must be > 0");
+        this.maxSourceLength = maxSourceLength;
+        this.maxParenDepth = maxParenDepth;
         this.maxNodes = maxNodes;
         this.maxDepth = maxDepth;
         this.maxStringLiteralLength = maxStringLiteralLength;
@@ -53,6 +68,8 @@ public final class PredicateLimits {
 
     public static PredicateLimits defaults() {
         return new PredicateLimits(
+            /*maxSourceLength*/ 4096,
+            /*maxParenDepth*/ 32,
             /*maxNodes*/ 128,
             /*maxDepth*/ 16,
             /*maxStringLiteralLength*/ 1024,

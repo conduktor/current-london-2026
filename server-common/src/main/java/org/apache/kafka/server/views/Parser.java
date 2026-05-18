@@ -50,6 +50,14 @@ final class Parser {
     private final PredicateLimits limits;
     private int pos = 0;
     private int nodeCount = 0;
+    /**
+     * Live count of open parentheses while parsing. Each '(' in primary increments this,
+     * each ')' decrements. Capped by {@link PredicateLimits#maxParenDepth}. This is the
+     * structural defense against `(((...)))` adversarial input: parens don't add AST nodes,
+     * so neither {@code maxNodes} nor the post-parse {@code maxDepth} check would fire
+     * before the recursive descent overflowed the JVM stack.
+     */
+    private int parenDepth = 0;
 
     Parser(List<Token> tokens, PredicateLimits limits) {
         this.tokens = tokens;
@@ -178,8 +186,15 @@ final class Parser {
                 return node(new Ast.Literal(t.value));
             case LPAREN: {
                 consume();
+                parenDepth++;
+                if (parenDepth > limits.maxParenDepth) {
+                    throw new PredicateValidationException(
+                            "predicate exceeds maxParenDepth=" + limits.maxParenDepth
+                                    + " at position " + t.pos);
+                }
                 Ast.Node inner = parseOr();
                 expect(Kind.RPAREN);
+                parenDepth--;
                 return inner;
             }
             case LBRACKET:

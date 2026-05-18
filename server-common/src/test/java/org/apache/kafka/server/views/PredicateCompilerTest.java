@@ -18,6 +18,8 @@ package org.apache.kafka.server.views;
 
 import org.junit.jupiter.api.Test;
 
+import java.util.Locale;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -119,7 +121,9 @@ class PredicateCompilerTest {
 
     @Test
     void rejectsExpressionsExceedingNodeLimit() {
-        PredicateLimits tight = new PredicateLimits(/*maxNodes*/5, /*maxDepth*/16,
+        PredicateLimits tight = new PredicateLimits(
+                /*maxSourceLength*/4096, /*maxParenDepth*/32,
+                /*maxNodes*/5, /*maxDepth*/16,
                 /*maxStringLiteralLength*/256, /*maxStepsPerEval*/1000,
                 /*maxBodyBytes*/1 << 20, /*maxJsonDepth*/32);
         PredicateCompiler tightCompiler = new PredicateCompiler(tight);
@@ -129,7 +133,9 @@ class PredicateCompilerTest {
 
     @Test
     void rejectsExpressionsExceedingDepthLimit() {
-        PredicateLimits shallow = new PredicateLimits(/*maxNodes*/256, /*maxDepth*/3,
+        PredicateLimits shallow = new PredicateLimits(
+                /*maxSourceLength*/4096, /*maxParenDepth*/32,
+                /*maxNodes*/256, /*maxDepth*/3,
                 /*maxStringLiteralLength*/256, /*maxStepsPerEval*/1000,
                 /*maxBodyBytes*/1 << 20, /*maxJsonDepth*/32);
         PredicateCompiler shallowCompiler = new PredicateCompiler(shallow);
@@ -139,9 +145,61 @@ class PredicateCompilerTest {
     }
 
     @Test
+    void rejectsSourceLongerThanMaxSourceLength() {
+        // maxSourceLength is the cheapest pre-lex defence against adversarial input shapes that
+        // would otherwise be expensive to detect during parsing (e.g. very long expressions).
+        PredicateLimits tinyMax = new PredicateLimits(
+                /*maxSourceLength*/8, /*maxParenDepth*/32,
+                64, 16, 256, 1000, 1 << 20, 32);
+        PredicateCompiler tinyCompiler = new PredicateCompiler(tinyMax);
+        PredicateValidationException ex = assertThrows(PredicateValidationException.class,
+                () -> tinyCompiler.compile("body.color == 'red'"));
+        assertTrue(ex.getMessage().contains("maxSourceLength"),
+                () -> "expected maxSourceLength in message, got: " + ex.getMessage());
+    }
+
+    @Test
+    void rejectsDeeplyParenthesizedSourceBeforeParserStackOverflow() {
+        // Without maxParenDepth, the recursive-descent parser would blow the JVM stack here.
+        // The point of this test is that the broker REJECTS the input cleanly with a validation
+        // error, NOT that the JVM stack happens to be big enough today. Use the production
+        // defaults so we exercise the real ceiling.
+        PredicateCompiler defaultCompiler = new PredicateCompiler(PredicateLimits.defaults());
+        StringBuilder hostile = new StringBuilder(4096);
+        // 1024 layers of parens is well over the 32-default maxParenDepth and below maxSourceLength.
+        int layers = 1024;
+        for (int j = 0; j < layers; j++) hostile.append('(');
+        hostile.append("true");
+        for (int j = 0; j < layers; j++) hostile.append(')');
+        // Whatever fires first — source length OR paren depth — both are valid hard rejections.
+        // Using defaults the source is 2052 chars which IS under the 4096 cap, so the paren-depth
+        // cap is the one that should fire. Pinning the assertion to "paren" makes the test fail
+        // loudly if the source-length cap is later raised past 2052 (and we lose the paren defence).
+        PredicateValidationException ex = assertThrows(PredicateValidationException.class,
+                () -> defaultCompiler.compile(hostile.toString()));
+        assertTrue(ex.getMessage().toLowerCase(Locale.ROOT).contains("paren"),
+                () -> "expected paren-depth error, got: " + ex.getMessage());
+    }
+
+    @Test
+    void deepParensWithinLimitParseSuccessfully() {
+        // Sanity: parens inside the cap parse fine — the AST-depth check ignores parens
+        // (see Parser#treeDepth), so the predicate compiles even though the source contains
+        // many open/close pairs.
+        PredicateCompiler defaultCompiler = new PredicateCompiler(PredicateLimits.defaults());
+        StringBuilder s = new StringBuilder();
+        // maxParenDepth default is 32; use 8 to stay well within both limits.
+        int layers = 8;
+        for (int j = 0; j < layers; j++) s.append('(');
+        s.append("body.x == 1");
+        for (int j = 0; j < layers; j++) s.append(')');
+        assertNotNull(defaultCompiler.compile(s.toString()));
+    }
+
+    @Test
     void rejectsStringLiteralLongerThanLimit() {
-        PredicateLimits tight = new PredicateLimits(64, 16, /*maxStringLiteralLength*/4,
-                1000, 1 << 20, 32);
+        PredicateLimits tight = new PredicateLimits(4096, 32, 64, 16,
+                /*maxStringLiteralLength*/4, 1000, 1 << 20, 32);
         PredicateCompiler tightCompiler = new PredicateCompiler(tight);
         assertThrows(PredicateValidationException.class,
                 () -> tightCompiler.compile("body.s == 'too-long'"));
