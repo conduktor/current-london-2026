@@ -150,12 +150,23 @@ class BrokerMetadataPublisher(
           // leakage window the N2 ordering was meant to prevent (isLogicalTopic still
           // returns true for some declared names while the cache exposes a physical topic
           // of the same name). Treat as fatal: the kernel either throws on a programming
-          // bug or a JVM-level error, neither of which is transient. Re-throw after the
-          // fatal handler to short-circuit the rest of onMetadataUpdate so the test
-          // harness (which doesn't actually halt) also skips setImage.
+          // bug or a JVM-level error, neither of which is transient.
           fatalFaultHandler.handleFault(
             s"Fatal: error refreshing concentration shadow overlay in $deltaName; " +
               "shadow state is indeterminate, refusing to publish metadata image", t)
+          // r18 ADV-A HIGH #130 — fail the first-publish future BEFORE re-throwing.
+          // The outer `finally` block at the bottom of this method unconditionally calls
+          // firstPublishFuture.complete(null). If we let that run on the success path
+          // after applyShadowOverlay threw, BrokerServer.startup() unblocks on the future
+          // and the broker proceeds with metadataCache.setImage having NEVER fired —
+          // exactly the inconsistent-state startup the fatal handler is supposed to
+          // prevent. Completing exceptionally here makes the subsequent .complete(null)
+          // a no-op (CompletableFuture: first completion wins) and any awaiter
+          // (BrokerServer.scala:635 FutureUtils.waitWithLogging) surfaces the original
+          // throwable instead of silently succeeding.
+          firstPublishFuture.completeExceptionally(t)
+          // Re-throw to short-circuit the rest of onMetadataUpdate so the test harness
+          // (which doesn't actually halt the JVM in the fatal handler) also skips setImage.
           throw t
       }
 

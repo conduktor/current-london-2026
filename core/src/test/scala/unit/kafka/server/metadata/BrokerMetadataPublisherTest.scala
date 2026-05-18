@@ -403,4 +403,68 @@ class BrokerMetadataPublisherTest {
     // setImage was NEVER called — this is the invariant under test.
     verify(metadataCache, never()).setImage(any())
   }
+
+  @Test
+  def testShadowOverlayThrowFailsFirstPublishFuture(): Unit = {
+    // r18 ADV-A HIGH #130: when applyShadowOverlay throws on the first metadata image,
+    // firstPublishFuture must NOT complete successfully. BrokerServer.startup() waits on
+    // this future before unfencing the broker — letting it succeed when the shadow
+    // overlay failed lets the broker proceed without metadataCache.setImage having fired,
+    // i.e. exactly the inconsistent-state startup the fatal handler is supposed to
+    // prevent. The first-publish future must surface the original throwable.
+    val config = KafkaConfig.fromProps(TestUtils.createBrokerConfig(0))
+    val metadataCache = mock(classOf[KRaftMetadataCache])
+    val logManager = mock(classOf[LogManager])
+    val replicaManager = mock(classOf[ReplicaManager])
+    val groupCoordinator = mock(classOf[GroupCoordinator])
+    val fatalFaultHandler = mock(classOf[FaultHandler])
+    val metadataPublishingFaultHandler = mock(classOf[FaultHandler])
+    val concentrationKernel = mock(classOf[ConcentrationKernel])
+
+    val cause = new RuntimeException("simulated kernel programming bug")
+    doThrow(cause).when(concentrationKernel).applyShadowOverlay(any())
+
+    val metadataPublisher = new BrokerMetadataPublisher(
+      config,
+      metadataCache,
+      logManager,
+      replicaManager,
+      groupCoordinator,
+      mock(classOf[TransactionCoordinator]),
+      Some(mock(classOf[ShareCoordinator])),
+      mock(classOf[DynamicConfigPublisher]),
+      mock(classOf[DynamicClientQuotaPublisher]),
+      mock(classOf[DynamicTopicClusterQuotaPublisher]),
+      mock(classOf[ScramPublisher]),
+      mock(classOf[DelegationTokenPublisher]),
+      mock(classOf[AclPublisher]),
+      fatalFaultHandler,
+      metadataPublishingFaultHandler,
+      concentrationKernel
+    )
+
+    val image = MetadataImage.EMPTY
+    val delta = new MetadataDelta.Builder().setImage(image).build()
+
+    metadataPublisher.onMetadataUpdate(delta, image,
+      LogDeltaManifest.newBuilder()
+        .provenance(MetadataProvenance.EMPTY)
+        .leaderAndEpoch(LeaderAndEpoch.UNKNOWN)
+        .numBatches(1)
+        .elapsedNs(100)
+        .numBytes(42)
+        .build())
+
+    // The future must be done — and done exceptionally with the original throwable.
+    assertTrue(metadataPublisher.firstPublishFuture.isDone,
+      "firstPublishFuture must be complete after onMetadataUpdate returns")
+    assertTrue(metadataPublisher.firstPublishFuture.isCompletedExceptionally,
+      "firstPublishFuture must complete exceptionally when applyShadowOverlay throws — " +
+        "successful completion would let BrokerServer.startup proceed past a fatal overlay error")
+    val thrown = org.junit.jupiter.api.Assertions.assertThrows(
+      classOf[java.util.concurrent.ExecutionException],
+      () => metadataPublisher.firstPublishFuture.get())
+    assertEquals(cause, thrown.getCause,
+      "firstPublishFuture must surface the original kernel throwable to any awaiter")
+  }
 }
