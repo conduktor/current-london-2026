@@ -4540,6 +4540,82 @@ class KafkaApisTest extends Logging {
     assertEquals(expectedErrors, markersResponse.errorsByProducerId.get(1L))
   }
 
+  @Test
+  def testWriteTxnMarkersRejectsBackingTopicWithUnknownTopicOrPartition(): Unit = {
+    // r19 ADV-A BLOCKER #141: defense-in-depth backstop for #140. WriteTxnMarkers is the
+    // last point at which a marker could land on a backing partition; if a buggy/compromised
+    // peer broker, a stale txn-coordinator state, or any path that bypasses
+    // AddPartitionsToTxn slips a backing partition in here, the marker would write a
+    // COMMIT/ABORT control record onto the backing log — per PROMPT.md that atomically
+    // commits/aborts EVERY co-tenant logical topic interleaved on that partition, silently
+    // corrupting cross-tenant transactional state. The handler must reject backing
+    // partitions before appendRecords is reached.
+    val backingTopic = "backing-topic"
+    val backingTp = new TopicPartition(backingTopic, 0)
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+    // isLogicalTopic intentionally unstubbed (default false) — backing check fires first.
+
+    val (_, request) = createWriteTxnMarkersRequest(asList(backingTp))
+    val capturedResponse: ArgumentCaptor[WriteTxnMarkersResponse] =
+      ArgumentCaptor.forClass(classOf[WriteTxnMarkersResponse])
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleWriteTxnMarkersRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    verify(requestChannel).sendResponse(
+      ArgumentMatchers.eq(request),
+      capturedResponse.capture(),
+      ArgumentMatchers.eq(None)
+    )
+    val markersResponse = capturedResponse.getValue
+    val expectedErrors = Map(backingTp -> Errors.UNKNOWN_TOPIC_OR_PARTITION).asJava
+    assertEquals(expectedErrors, markersResponse.errorsByProducerId.get(1L),
+      "WriteTxnMarkers on a backing topic must be rejected with UNKNOWN_TOPIC_OR_PARTITION " +
+        "to prevent cross-tenant COMMIT/ABORT corruption")
+    // replicaManager.appendRecords must NEVER be called with the backing partition.
+    verify(replicaManager, never()).appendRecords(anyLong, anyShort, any(), any(), any(),
+      any(), any(), any(), any(), any(), any())
+    // Likewise onlinePartition must not even be consulted — the guard runs first so we
+    // never expose backing topics to the marker-append path at any layer.
+    verify(replicaManager, never()).onlinePartition(backingTp)
+  }
+
+  @Test
+  def testWriteTxnMarkersRejectsLogicalTopicWithUnknownTopicOrPartition(): Unit = {
+    // r19 ADV-A BLOCKER #141 (logical side): logical topics are non-transactional in v1.
+    // produce-side rejects transactional batches at KafkaApis.scala:621 (INVALID_TXN_STATE),
+    // AddPartitionsToTxn rejects enrollment at :2872 (#140). If a marker still arrives for a
+    // logical partition the upstream guards already failed — this is the final fence. There
+    // is no logical-aware LSO tracking, so even attempting to materialise a control record
+    // for a logical-named partition is unsafe. Mirror the backing branch with
+    // UNKNOWN_TOPIC_OR_PARTITION.
+    val logicalTopic = "logical-topic"
+    val logicalTp = new TopicPartition(logicalTopic, 0)
+    when(concentrationKernel.isBackingTopic(logicalTopic)).thenReturn(false)
+    when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
+
+    val (_, request) = createWriteTxnMarkersRequest(asList(logicalTp))
+    val capturedResponse: ArgumentCaptor[WriteTxnMarkersResponse] =
+      ArgumentCaptor.forClass(classOf[WriteTxnMarkersResponse])
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleWriteTxnMarkersRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    verify(requestChannel).sendResponse(
+      ArgumentMatchers.eq(request),
+      capturedResponse.capture(),
+      ArgumentMatchers.eq(None)
+    )
+    val markersResponse = capturedResponse.getValue
+    val expectedErrors = Map(logicalTp -> Errors.UNKNOWN_TOPIC_OR_PARTITION).asJava
+    assertEquals(expectedErrors, markersResponse.errorsByProducerId.get(1L),
+      "WriteTxnMarkers on a logical topic must be rejected with UNKNOWN_TOPIC_OR_PARTITION " +
+        "(v1 declares logical topics non-transactional, no logical-aware LSO tracking)")
+    verify(replicaManager, never()).appendRecords(anyLong, anyShort, any(), any(), any(),
+      any(), any(), any(), any(), any(), any())
+    verify(replicaManager, never()).onlinePartition(logicalTp)
+  }
+
   @ParameterizedTest
   @ValueSource(strings = Array("ALTER", "CLUSTER_ACTION"))
   def shouldAppendToLogOnWriteTxnMarkersWhenCorrectMagicVersion(allowedAclOperation: String): Unit = {

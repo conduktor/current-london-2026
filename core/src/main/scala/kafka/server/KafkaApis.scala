@@ -2702,11 +2702,36 @@ class KafkaApis(val requestChannel: RequestChannel,
 
       val currentErrors = new ConcurrentHashMap[TopicPartition, Errors]()
       marker.partitions.forEach { partition =>
-        replicaManager.onlinePartition(partition) match {
-          case Some(_)  =>
-            partitionsWithCompatibleMessageFormat += partition
-          case None =>
-            currentErrors.put(partition, Errors.UNKNOWN_TOPIC_OR_PARTITION)
+        if (concentrationKernel.isBackingTopic(partition.topic)) {
+          // r19 ADV-A BLOCKER #141: defense-in-depth backstop for #140. A WriteTxnMarkers
+          // request carrying a backing partition — whether from a buggy/compromised peer
+          // broker, a stale txn-coordinator state, or any path that bypasses the
+          // AddPartitionsToTxn guard — would write a COMMIT/ABORT control record onto the
+          // backing log. Per PROMPT.md a marker on the backing partition atomically
+          // commits/aborts EVERY co-tenant logical topic interleaved on that partition,
+          // silently corrupting cross-tenant transactional state. Reject with
+          // UNKNOWN_TOPIC_OR_PARTITION — the same error the existing onlinePartition=None
+          // branch uses for unhosted partitions, so the txn coordinator's existing
+          // partition-error handling treats it as a not-here partition (which it is, from
+          // the client's logical view: backing topics are not client-addressable).
+          currentErrors.put(partition, Errors.UNKNOWN_TOPIC_OR_PARTITION)
+        } else if (concentrationKernel.isLogicalTopic(partition.topic)) {
+          // r19 ADV-A BLOCKER #141 (logical side): logical topics are non-transactional in
+          // v1 — produce-side rejects at :621 with INVALID_TXN_STATE, AddPartitionsToTxn
+          // rejects at :2872 (#140). If a marker arrives for a logical partition the
+          // upstream guards already failed; this is the final fence. There is no logical
+          // partition record store to receive a control record, so this also fails closed.
+          // Use UNKNOWN_TOPIC_OR_PARTITION to mirror the backing branch and the existing
+          // onlinePartition=None semantics — the txn coordinator already knows how to
+          // handle this error category for marker delivery.
+          currentErrors.put(partition, Errors.UNKNOWN_TOPIC_OR_PARTITION)
+        } else {
+          replicaManager.onlinePartition(partition) match {
+            case Some(_)  =>
+              partitionsWithCompatibleMessageFormat += partition
+            case None =>
+              currentErrors.put(partition, Errors.UNKNOWN_TOPIC_OR_PARTITION)
+          }
         }
       }
 
