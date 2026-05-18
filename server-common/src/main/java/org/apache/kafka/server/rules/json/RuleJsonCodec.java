@@ -29,8 +29,10 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
 import java.util.ArrayList;
+import java.util.EnumSet;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * JSON {@link Rule} codec for the {@code __governance} compacted topic.
@@ -88,6 +90,62 @@ public final class RuleJsonCodec {
      * even hitting the per-field validation.
      */
     static final int MAX_ENVELOPE_BYTES = 65 * 1024;
+
+    /**
+     * Api-keys on which a DENY rule would brick the cluster — rejected at rule
+     * load time. The CEL engine sits at the top of {@code KafkaApis.handle()}
+     * (single interception point per PROMPT.md), which means a DENY rule on a
+     * pre-authentication api-key short-circuits the request BEFORE the
+     * authentication state machine gets to run. The result for an operator is
+     * a soft brick: no client can connect, no SASL exchange completes, no
+     * control-plane forwarding lands.
+     *
+     * <p>This is a static, intentionally short list — explicitly enumerated
+     * here rather than derived from {@code ApiKeys.clusterAction} or similar
+     * because the upstream metadata covers authorisation policy, not "this
+     * api-key is part of the handshake itself". The four cases enumerated:
+     *
+     * <ul>
+     *   <li>{@code API_VERSIONS} — the very first request every client sends.
+     *       Clients negotiate the protocol version before anything else; a
+     *       DENY here means every connection (data-plane producer, consumer,
+     *       admin, AND broker replica fetcher) is unable to handshake.</li>
+     *   <li>{@code SASL_HANDSHAKE} — selects the SASL mechanism on a
+     *       SASL_PLAINTEXT / SASL_SSL listener. A DENY blocks every
+     *       authenticating client and the broker's own SASL inter-broker
+     *       traffic.</li>
+     *   <li>{@code SASL_AUTHENTICATE} — carries the SASL credentials
+     *       themselves. A DENY here matches the SASL_HANDSHAKE failure mode
+     *       for the same reason.</li>
+     *   <li>{@code ENVELOPE} — broker→controller forwarding (KIP-590). The
+     *       broker is the sender, the controller's {@code ControllerApis} is
+     *       the receiver, so the broker's {@code KafkaApis} does not handle
+     *       inbound ENVELOPE today and a DENY rule has no live effect on
+     *       this code path. We still reject the rule at intake: it is
+     *       operator-confusion-shaped (the operator thinks they are denying
+     *       admin forwarding when in fact the rule is a no-op), and the
+     *       reservation costs nothing.</li>
+     * </ul>
+     *
+     * <p>The list is small on purpose. We do NOT extend it to "every
+     * inter-broker api-key" — that is the privileged-listener bypass's job,
+     * and adding more api-keys here would make the deny-list a second,
+     * parallel mechanism that drifts from the bypass over time. The contract
+     * is narrow: "rules on api-keys whose denial cannot be recovered from
+     * without operator intervention". Operators who genuinely need a DENY
+     * rule on, say, {@code METADATA} can author one — the privileged-listener
+     * bypass protects inter-broker traffic, and external metadata callers
+     * surfacing a denial can retry on a different broker or refresh their
+     * connection.
+     *
+     * <p>EnumSet is used so the contains-check on the hot path of rule load
+     * is bit-test cheap.
+     */
+    static final Set<ApiKeys> FORBIDDEN_API_KEYS = EnumSet.of(
+        ApiKeys.API_VERSIONS,
+        ApiKeys.SASL_HANDSHAKE,
+        ApiKeys.SASL_AUTHENTICATE,
+        ApiKeys.ENVELOPE);
 
     private RuleJsonCodec() {
     }
@@ -195,11 +253,28 @@ public final class RuleJsonCodec {
                     "'apiKeys' entries must be strings; got " + el.getNodeType());
             }
             String name = el.asText();
+            ApiKeys parsed;
             try {
-                out.add(ApiKeys.valueOf(name));
+                parsed = ApiKeys.valueOf(name);
             } catch (IllegalArgumentException e) {
                 throw new RuleEnvelopeException("unknown api key name: '" + name + "'");
             }
+            // Pre-auth and broker→controller forwarding api-keys are
+            // unrulable: a DENY would brick handshake / control plane (see
+            // FORBIDDEN_API_KEYS javadoc). Reject at intake so the rule never
+            // lands in the live RuleSet — the operator sees a clear error
+            // pointing at the offending key rather than a soft cluster brick.
+            if (FORBIDDEN_API_KEYS.contains(parsed)) {
+                throw new RuleEnvelopeException(
+                    "api key '" + name + "' is on the engine's forbidden list "
+                        + "and cannot be the target of a DENY rule. A rule on this "
+                        + "api-key would prevent clients from completing the "
+                        + "pre-authentication handshake (API_VERSIONS / SASL_*) "
+                        + "or block broker→controller forwarding (ENVELOPE), "
+                        + "with no path to recovery without operator intervention. "
+                        + "Forbidden api-keys: " + FORBIDDEN_API_KEYS);
+            }
+            out.add(parsed);
         }
         return new ArrayList<>(out);
     }

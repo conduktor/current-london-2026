@@ -291,6 +291,49 @@ public class RuleJsonCodecTest {
     }
 
     @Test
+    public void preAuthAndForwardingApiKeysRejected() {
+        // Round-8 BLOCKER: the CEL engine sits at the top of
+        // KafkaApis.handle() — a single interception point per PROMPT.md.
+        // That gate is shared by every api-key the broker dispatches,
+        // including the pre-authentication handshake (API_VERSIONS,
+        // SASL_HANDSHAKE, SASL_AUTHENTICATE) and the broker→controller
+        // forwarding wire (ENVELOPE). A DENY rule on any of those would
+        // soft-brick the cluster (no client can connect; no SASL exchange
+        // completes; no admin forwarding lands) with no path to recovery
+        // without operator intervention. Reject at intake so the rule never
+        // reaches RuleSet.
+        for (String name : new String[]{"API_VERSIONS", "SASL_HANDSHAKE", "SASL_AUTHENTICATE", "ENVELOPE"}) {
+            String json = "{\"apiKeys\":[\"" + name + "\"],\"action\":\"DENY\","
+                + "\"when\":\"true\",\"errorCode\":1}";
+            RuleEnvelopeException ex = assertThrows(
+                RuleEnvelopeException.class,
+                () -> RuleJsonCodec.decode("brick-" + name, json.getBytes(StandardCharsets.UTF_8)),
+                "forbidden api-key " + name + " must be rejected at intake");
+            assertTrue(ex.getMessage().contains(name),
+                "rejection message must name the offending api-key: " + ex.getMessage());
+            assertTrue(ex.getMessage().contains("forbidden"),
+                "rejection message must explain the contract: " + ex.getMessage());
+        }
+    }
+
+    @Test
+    public void forbiddenApiKeyAmongAllowedKeysStillRejectsWholeEnvelope() {
+        // A rule must not silently lose its forbidden entry by partial
+        // acceptance: rejecting only the forbidden api-key and keeping the
+        // rest would let an operator publish `[METADATA, API_VERSIONS]`
+        // and end up with an active METADATA-only rule that they did not
+        // explicitly author at that scope. Reject the whole envelope so
+        // the operator sees the error replayed verbatim and re-authors.
+        String json = "{\"apiKeys\":[\"METADATA\",\"API_VERSIONS\"],"
+            + "\"action\":\"DENY\",\"when\":\"true\",\"errorCode\":1}";
+        RuleEnvelopeException ex = assertThrows(
+            RuleEnvelopeException.class,
+            () -> RuleJsonCodec.decode("mixed", json.getBytes(StandardCharsets.UTF_8)));
+        assertTrue(ex.getMessage().contains("API_VERSIONS"),
+            "rejection must name the forbidden entry, not just say \"some key invalid\": " + ex.getMessage());
+    }
+
+    @Test
     public void unknownTopLevelFieldsAreToleratedForForwardCompatibility() {
         // Rule envelopes are written by users / tooling. Tolerate unknown
         // top-level fields so v1 brokers don't reject v2-augmented envelopes.
