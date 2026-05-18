@@ -335,6 +335,13 @@ class KafkaApiRequestSubmitterTest {
     val ex = assertThrows(classOf[java.util.concurrent.ExecutionException], () => future.get(5, TimeUnit.SECONDS))
     assertTrue(ex.getCause.isInstanceOf[ClassCastException],
       s"expected ClassCastException, was ${ex.getCause.getClass.getName}: ${ex.getCause.getMessage}")
+    // Second half of the contract: the CCE must escape via future.completeExceptionally ONLY.
+    // A refactor that catches the CCE, completes the future exceptionally AND rethrows would let the
+    // future-side assertion above pass while silently killing the broker's request-handler thread.
+    // Verify the handler is still running.
+    assertTrue(fakeHandler.isAlive,
+      "handler thread must survive a translate-callback ClassCastException — the exception must propagate " +
+        "via future.completeExceptionally only, never escape onto the handler's run() loop")
   }
 
   @Test
