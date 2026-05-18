@@ -4096,6 +4096,16 @@ class KafkaApisTest extends Logging {
     assertEquals(Seq("broker2"), node.map(_.host))
   }
 
+  /** Pretend every backing partition is locally hosted on this broker so the view-fetch routing
+   *  pass in KafkaApis.handleFetchRequest (which now requires `replicaManager.getPartitionOrError`
+   *  to return Right — see ViewSpec "Partition-assignment constraint") does not fail-fast with
+   *  UNKNOWN_TOPIC_OR_PARTITION. Tests that exercise the cross-broker error path stub the
+   *  specific TopicPartition explicitly and skip this default. */
+  private def stubBackingPartitionsLocal(): Unit = {
+    when(replicaManager.getPartitionOrError(any[TopicPartition]))
+      .thenAnswer(_ => Right(mock(classOf[Partition])))
+  }
+
   @Test
   def testFetchFromViewRewritesToBackingAndFiltersRecords(): Unit = {
     // The heart of the view feature: a fetch addressed at a view topic must read from the
@@ -4160,6 +4170,7 @@ class KafkaApisTest extends Logging {
     val fetchRequest = new FetchRequest.Builder(ApiKeys.FETCH.latestVersion, ApiKeys.FETCH.latestVersion,
       -1, -1, 100, 0, fetchDataBuilder).build()
     val request = buildRequest(fetchRequest)
+    stubBackingPartitionsLocal()
     kafkaApis = createKafkaApis(configRepository = configRepository)
     kafkaApis.handleFetchRequest(request)
 
@@ -4294,6 +4305,71 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testFetchFromViewWithCrossBrokerBackingReturnsUnknownTopicOrPartition(): Unit = {
+    // The view's backing topic exists in cluster metadata, but this broker is NOT a replica of
+    // the backing partition for which it is the view leader. PROMPT.md does not require
+    // cross-broker proxying (see ViewSpec javadoc — "Partition-assignment constraint"), so the
+    // handler must fail-fast at routing time with UNKNOWN_TOPIC_OR_PARTITION keyed at the view.
+    // The alternative is letting the fetch reach replicaManager.fetchMessages where it would
+    // surface as NOT_LEADER_OR_FOLLOWER and trigger a client metadata-refresh-retry loop (the
+    // view leader hasn't moved, so the consumer would hammer this broker forever). We also
+    // assert that replicaManager.fetchMessages is NEVER called — the misconfig must be caught
+    // before we touch the storage layer.
+    val viewTopic = "remote-backing-view"
+    val backingTopic = "raw"
+    val viewTopicId = Uuid.randomUuid()
+    val backingTopicId = Uuid.randomUuid()
+
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, backingTopic)
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.keep == true")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+
+    addTopicToMetadataCache(viewTopic, numPartitions = 1, topicId = viewTopicId)
+    addTopicToMetadataCache(backingTopic, numPartitions = 1, topicId = backingTopicId)
+    // Stub the backing partition as NOT locally hosted — the broker is the view's leader, but
+    // the view+backing replica assignments are misaligned and the backing partition lives on a
+    // different broker. This is exactly the production misconfig the guard is designed to catch.
+    val backingTp = new TopicPartition(backingTopic, 0)
+    when(replicaManager.getPartitionOrError(backingTp))
+      .thenReturn(Left(Errors.NOT_LEADER_OR_FOLLOWER))
+
+    val viewTpId = new TopicIdPartition(viewTopicId, new TopicPartition(viewTopic, 0))
+
+    val fetchData = Map(viewTpId -> new FetchRequest.PartitionData(viewTopicId, 0, 0, 1000, Optional.empty())).asJava
+    val fetchDataBuilder = Map(viewTpId.topicPartition -> new FetchRequest.PartitionData(viewTopicId, 0, 0, 1000, Optional.empty())).asJava
+    val fetchMetadata = new JFetchMetadata(0, 0)
+    val fetchContext = new FullFetchContext(time, new FetchSessionCacheShard(1000, 100),
+      fetchMetadata, fetchData, true, false)
+    when(fetchManager.newContext(any[Short], any[JFetchMetadata], any[Boolean],
+      any[util.Map[TopicIdPartition, FetchRequest.PartitionData]],
+      any[util.List[TopicIdPartition]],
+      any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val fetchRequest = new FetchRequest.Builder(ApiKeys.FETCH.latestVersion, ApiKeys.FETCH.latestVersion,
+      -1, -1, 100, 0, fetchDataBuilder).build()
+    val request = buildRequest(fetchRequest)
+    kafkaApis = createKafkaApis(configRepository = configRepository)
+    kafkaApis.handleFetchRequest(request)
+
+    // The locality guard must short-circuit BEFORE the fetch hits the replica layer.
+    verify(replicaManager, never()).fetchMessages(any[FetchParams],
+      any[Seq[(TopicIdPartition, FetchRequest.PartitionData)]],
+      any[ReplicaQuota],
+      any[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]())
+
+    val response = verifyNoThrottling[FetchResponse](request)
+    val responseData = response.responseData(metadataCache.topicIdsToNames(), ApiKeys.FETCH.latestVersion)
+    val partitionData = responseData.get(viewTpId.topicPartition)
+    assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION.code, partitionData.errorCode,
+      "non-local backing partition must surface as UNKNOWN_TOPIC_OR_PARTITION at the view " +
+        "(view and backing must share replica assignment — see ViewSpec javadoc)")
+  }
+
+  @Test
   def testFetchFromViewWithAllRecordsFilteredEmitsHeaderOnlyBatch(): Unit = {
     // PROMPT.md acceptance criterion: "When all records in a fetched batch fail the predicate:
     // emit a header-only v2 batch (zero records, source offset range) so the consumer advances
@@ -4349,6 +4425,7 @@ class KafkaApisTest extends Logging {
     val fetchRequest = new FetchRequest.Builder(ApiKeys.FETCH.latestVersion, ApiKeys.FETCH.latestVersion,
       -1, -1, 100, 0, fetchDataBuilder).build()
     val request = buildRequest(fetchRequest)
+    stubBackingPartitionsLocal()
     kafkaApis = createKafkaApis(configRepository = configRepository)
     kafkaApis.handleFetchRequest(request)
 
@@ -4503,6 +4580,7 @@ class KafkaApisTest extends Logging {
     val fetchRequest = new FetchRequest.Builder(ApiKeys.FETCH.latestVersion, ApiKeys.FETCH.latestVersion,
       -1, -1, 100, 0, fetchDataBuilder).build()
     val request = buildRequest(fetchRequest)
+    stubBackingPartitionsLocal()
     kafkaApis = createKafkaApis(configRepository = configRepository)
     kafkaApis.handleFetchRequest(request)
 
@@ -4596,6 +4674,7 @@ class KafkaApisTest extends Logging {
     // Build at v12 so the wire-level effect matches the test scenario name.
     val fetchRequest = new FetchRequest.Builder(12, 12, -1, -1, 100, 0, fetchDataBuilder).build()
     val request = buildRequest(fetchRequest)
+    stubBackingPartitionsLocal()
     kafkaApis = createKafkaApis(configRepository = configRepository)
     kafkaApis.handleFetchRequest(request)
 
@@ -4715,6 +4794,7 @@ class KafkaApisTest extends Logging {
     val fetchRequest = new FetchRequest.Builder(ApiKeys.FETCH.latestVersion, ApiKeys.FETCH.latestVersion,
       -1, -1, 100, 0, fetchDataBuilder).build()
     val request = buildRequest(fetchRequest)
+    stubBackingPartitionsLocal()
     kafkaApis = createKafkaApis(configRepository = configRepository)
     kafkaApis.handleFetchRequest(request)
 

@@ -715,9 +715,26 @@ class KafkaApis(val requestChannel: RequestChannel,
             val backingName = spec.backingTopic()
             val backingTp = new TopicPartition(backingName, viewTpId.partition)
             if (!metadataCache.contains(backingTp)) {
-              // The view points at a non-existent (or non-existent-on-this-broker) backing topic.
-              // Surface that as UNKNOWN_TOPIC_OR_PARTITION keyed at the *view* so the consumer
-              // does not learn about the backing topic name.
+              // The view points at a non-existent backing topic in cluster metadata (typo in
+              // config, or the backing topic was deleted out from under the view). Surface that
+              // as UNKNOWN_TOPIC_OR_PARTITION keyed at the *view* so the consumer does not learn
+              // about the backing topic name.
+              erroneous += viewTpId -> FetchResponse.partitionResponse(viewTpId, Errors.UNKNOWN_TOPIC_OR_PARTITION)
+            } else if (replicaManager.getPartitionOrError(backingTp).isLeft) {
+              // The backing topic exists in cluster metadata but this broker is not a replica of
+              // backing partition N. We reached this broker because it is the leader of view
+              // partition N; without aligned partition assignment we cannot read backing N
+              // locally and PROMPT.md does not call for cross-broker proxying (see ViewSpec
+              // javadoc — "Partition-assignment constraint"). Fail-fast at routing time with
+              // UNKNOWN_TOPIC_OR_PARTITION keyed at the view; the alternative is letting the
+              // fetch reach replicaManager.fetchMessages where it would surface as
+              // NOT_LEADER_OR_FOLLOWER and trigger client metadata-refresh-retry loops (the view
+              // leader hasn't moved, so the consumer would hammer this broker forever). The WARN
+              // makes the misconfig visible to operators in the broker log.
+              warn(s"Fetch rejected: view ${viewTpId.topic} redirects to backing partition $backingTp, " +
+                s"but this broker is not a replica of the backing partition. View and backing must " +
+                s"share the same replica assignment (see ViewSpec javadoc). Returning " +
+                s"UNKNOWN_TOPIC_OR_PARTITION keyed at the view.")
               erroneous += viewTpId -> FetchResponse.partitionResponse(viewTpId, Errors.UNKNOWN_TOPIC_OR_PARTITION)
             } else {
               val backingTpId = new TopicIdPartition(metadataCache.getTopicId(backingName), backingTp)
@@ -1114,9 +1131,23 @@ class KafkaApis(val requestChannel: RequestChannel,
           val anyMissing = topic.partitions.asScala.exists { p =>
             !metadataCache.contains(new TopicPartition(backingName, p.partitionIndex))
           }
+          // Every requested backing partition must also be local to this broker. If a backing
+          // partition lives on a different broker, replicaManager.fetchOffset would return
+          // NOT_LEADER_OR_FOLLOWER and the consumer would loop against the view's leader
+          // (see ViewSpec javadoc "Partition-assignment constraint" and the matching guard in
+          // handleFetchRequest). Fail-fast at routing time keyed at the view.
+          lazy val anyNonLocal = topic.partitions.asScala.exists { p =>
+            replicaManager.getPartitionOrError(new TopicPartition(backingName, p.partitionIndex)).isLeft
+          }
           if (anyMissing) {
             // Mirror handleFetchRequest: surface UNKNOWN_TOPIC_OR_PARTITION keyed at the view
             // so the consumer never learns the backing topic name.
+            rejectAllPartitions(topic, Errors.UNKNOWN_TOPIC_OR_PARTITION)
+          } else if (anyNonLocal) {
+            warn(s"ListOffsets rejected: view ${topic.name} redirects to backing topic $backingName, " +
+              s"but this broker is not a replica of every requested backing partition. View and " +
+              s"backing must share the same replica assignment (see ViewSpec javadoc). Returning " +
+              s"UNKNOWN_TOPIC_OR_PARTITION keyed at the view.")
             rejectAllPartitions(topic, Errors.UNKNOWN_TOPIC_OR_PARTITION)
           } else if (directNames.contains(backingName)) {
             warn(s"ListOffsets rejected: view ${topic.name} redirects to backing topic $backingName " +

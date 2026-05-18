@@ -25,6 +25,29 @@ import java.util.Objects;
  * {@code view.cel.predicate}, {@code view.offset.mode}) — the broker keeps one per active view
  * inside {@link ViewRegistry}. The compiled predicate is reused across every fetch, so we
  * never re-parse the CEL text on the hot path.
+ *
+ * <h2>Partition-assignment constraint</h2>
+ *
+ * <p>Filtering happens on the broker that serves the view's fetch — that is, the leader of the
+ * view's partition. For the broker to read the backing partition locally it must also host that
+ * backing partition (as leader or follower replica). Concretely:
+ *
+ * <ul>
+ *   <li>The view topic and the backing topic must have the <em>same number of partitions</em>;
+ *       fetches for view partition {@code N} are rewritten to backing partition {@code N}.</li>
+ *   <li>For every partition {@code N}, the leader of view partition {@code N} must also be a
+ *       replica of backing partition {@code N}. The simplest way to guarantee this is to give
+ *       view and backing the <em>same replica assignment</em> (admin command: create the view
+ *       with {@code --replica-assignment} matching the backing topic).</li>
+ * </ul>
+ *
+ * <p>If this constraint is violated at fetch time — for example, the view's leader has moved to
+ * a broker that does not replicate the backing partition — the broker fails the fetch with
+ * {@code UNKNOWN_TOPIC_OR_PARTITION} keyed at the view (see {@code KafkaApis.handleFetchRequest}
+ * routing pass). Cross-broker proxying is intentionally <em>not</em> implemented: it would turn
+ * every view fetch into a second hop, defeat zero-copy on the receiving broker, and require new
+ * inter-broker auth flows for predicate-filtered traffic. The constraint is documented and
+ * enforced by the operator-facing config tooling instead.</p>
  */
 public final class ViewSpec {
 
