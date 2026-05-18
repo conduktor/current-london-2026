@@ -2630,6 +2630,124 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testFetchFromViewClearsPreferredReadReplicaOnBackingError(): Unit = {
+    // Same wedging hazard as testFetchFromViewClearsPreferredReadReplicaToAvoidWedgedClient, but
+    // exercising the BACKING-ERROR early return inside applyViewFilter. The success-path strip
+    // landed in e2e7a0d048; the early-error return at the top of applyViewFilter was missed and
+    // would still copy `data.preferredReadReplica` unchanged on an error response. A rack-aware
+    // consumer that hits an error on broker 1 would still be told to retry on broker 3 (the
+    // backing's PRR), which is not a view replica — same wedge, different code path.
+    val viewTopic = "prr-err-view"
+    val backingTopic = "prr-err-backing"
+    val viewTopicId = Uuid.randomUuid()
+    val backingTopicId = Uuid.randomUuid()
+    val partition = 0
+
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, backingTopic)
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.x == 1")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+    addTopicToMetadataCache(viewTopic, numPartitions = 1, topicId = viewTopicId)
+    addTopicToMetadataCache(backingTopic, numPartitions = 1, topicId = backingTopicId)
+
+    val viewTpId = new TopicIdPartition(viewTopicId, new TopicPartition(viewTopic, partition))
+    val backingTpId = new TopicIdPartition(backingTopicId, new TopicPartition(backingTopic, partition))
+
+    // Backing returns a non-leader-routing error but still carries PRR=3. We use
+    // KAFKA_STORAGE_ERROR (rather than NOT_LEADER_OR_FOLLOWER) because the FetchResponse builder
+    // calls getCurrentLeader on NOT_LEADER_OR_FOLLOWER / FENCED_LEADER_EPOCH, which would need
+    // additional Partition leader stubbing unrelated to what's under test. KAFKA_STORAGE_ERROR
+    // exercises the same applyViewFilter early-error return path.
+    when(replicaManager.fetchMessages(
+      any[FetchParams], any[Seq[(TopicIdPartition, FetchRequest.PartitionData)]],
+      any[ReplicaQuota], any[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]()
+    )).thenAnswer(invocation => {
+      val callback = invocation.getArgument(3).asInstanceOf[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]
+      callback(Seq(backingTpId -> new FetchPartitionData(Errors.KAFKA_STORAGE_ERROR, 100L, 0L,
+        MemoryRecords.EMPTY, Optional.empty(), OptionalLong.empty(), Optional.empty(),
+        OptionalInt.of(3), false)))
+    })
+
+    val fetchData = Map(viewTpId -> new FetchRequest.PartitionData(viewTopicId, 0, 0, 1000, Optional.empty())).asJava
+    val fetchDataBuilder = Map(viewTpId.topicPartition -> new FetchRequest.PartitionData(viewTopicId, 0, 0, 1000, Optional.empty())).asJava
+    val fetchMetadata = new JFetchMetadata(0, 0)
+    val fetchContext = new FullFetchContext(time, new FetchSessionCacheShard(1000, 100),
+      fetchMetadata, fetchData, true, false)
+    when(fetchManager.newContext(any[Short], any[JFetchMetadata], any[Boolean],
+      any[util.Map[TopicIdPartition, FetchRequest.PartitionData]],
+      any[util.List[TopicIdPartition]],
+      any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val fetchRequest = new FetchRequest.Builder(ApiKeys.FETCH.latestVersion, ApiKeys.FETCH.latestVersion,
+      -1, -1, 100, 0, fetchDataBuilder).build()
+    val request = buildRequest(fetchRequest)
+    stubBackingPartitionsLocal()
+    kafkaApis = createKafkaApis(configRepository = configRepository)
+    kafkaApis.handleFetchRequest(request)
+
+    val response = verifyNoThrottling[FetchResponse](request)
+    val responseData = response.responseData(metadataCache.topicIdsToNames(), ApiKeys.FETCH.latestVersion)
+    val partitionData = responseData.get(viewTpId.topicPartition)
+    assertEquals(Errors.KAFKA_STORAGE_ERROR.code, partitionData.errorCode,
+      "backing-side error must surface as-is to the view consumer")
+    assertEquals(FetchResponse.INVALID_PREFERRED_REPLICA_ID, partitionData.preferredReadReplica,
+      "preferredReadReplica from the backing tp must be stripped on the view response even on " +
+      "the backing-error path — propagating it would wedge the consumer just like the success path")
+  }
+
+  @Test
+  def testShareAcknowledgeEmptyBatchesNotDroppedWhenAllNonEmptyAreRejected(): Unit = {
+    // Regression guard. handleAcknowledgements short-circuits when `interested` is empty: before
+    // the view-aware rejection added view tps to `erroneous`, this branch was only reachable when
+    // every tp was erroneous, so dropping `emptyAcknowledgements` was a no-op. After the
+    // rejection, a request that contains one view tp (now erroneous) plus any number of non-view
+    // empty-batch tps lands here — and the empty-batch responses must NOT be silently dropped.
+    // The client would otherwise retry forever waiting on a response for tps it just acked.
+    val viewTopic = "sa-empty-view"
+    val regularTopic = "sa-empty-regular"
+    val viewTopicId = Uuid.randomUuid()
+    val regularTopicId = Uuid.randomUuid()
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, "sa-empty-backing")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.x == 1")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
+    addTopicToMetadataCache(viewTopic, numPartitions = 1, topicId = viewTopicId)
+    addTopicToMetadataCache(regularTopic, numPartitions = 1, topicId = regularTopicId)
+
+    val viewTp = new TopicIdPartition(viewTopicId, new TopicPartition(viewTopic, 0))
+    val regularTp = new TopicIdPartition(regularTopicId, new TopicPartition(regularTopic, 0))
+
+    val acknowledgementData = mutable.Map[TopicIdPartition, util.List[ShareAcknowledgementBatch]]()
+    // View tp with a non-empty batch — will be rejected to erroneous.
+    acknowledgementData += (viewTp -> util.Arrays.asList(
+      new ShareAcknowledgementBatch(0, 9, Collections.singletonList(1.toByte))))
+    // Non-view tp with an EMPTY batch list — goes to emptyAcknowledgements, interested stays empty.
+    acknowledgementData += (regularTp -> Collections.emptyList[ShareAcknowledgementBatch]())
+
+    val erroneous = mutable.Map[TopicIdPartition, ShareAcknowledgeResponseData.PartitionData]()
+
+    kafkaApis = createKafkaApis(
+      configRepository = configRepository,
+      overrideProperties = Map(
+        ServerConfigs.UNSTABLE_API_VERSIONS_ENABLE_CONFIG -> "true",
+        ShareGroupConfig.SHARE_GROUP_ENABLE_CONFIG -> "true"))
+    val result = kafkaApis.handleAcknowledgements(
+      acknowledgementData, erroneous, sharePartitionManager,
+      Set(viewTopic, regularTopic), "g", Uuid.ZERO_UUID.toString).get()
+
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, result(viewTp).errorCode,
+      "view tp must be rejected as INVALID_TOPIC_EXCEPTION")
+    assertEquals(Errors.NONE.code, result(regularTp).errorCode,
+      "empty-batch acks on non-view tps must surface a NONE response even when interested.isEmpty " +
+      "short-circuits the SharePartitionManager call")
+    // SharePartitionManager.acknowledge must NOT have been invoked (interested empty).
+    verify(sharePartitionManager, org.mockito.Mockito.never()).acknowledge(any(), any(), any())
+  }
+
+  @Test
   def testProduceToRegularTopicIsNotRejectedAsView(): Unit = {
     // Counter-test for testProduceToViewTopicIsRejected: a regular topic (no view configs at all)
     // must NOT be rejected. Guards against accidentally treating every topic with non-empty config

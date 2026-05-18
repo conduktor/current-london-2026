@@ -879,13 +879,20 @@ class KafkaApis(val requestChannel: RequestChannel,
                         spec: ViewSpec,
                         bufferSupplier: BufferSupplier): (TopicIdPartition, FetchPartitionData) = {
       if (data.error != Errors.NONE) {
-        // Even on a backing-side error, scrub divergingEpoch. Today no error-producing
-        // LogReadResult carries a non-empty divergingEpoch (the replica layer only computes the
-        // marker on successful reads through Partition.readRecords), but we keep the strip here
-        // so a future path that combines an error response with a divergence marker cannot leak
-        // the backing's epoch under the view name. The other fields (highWatermark/logStartOffset/
-        // abortedTransactions/preferredReadReplica) are not leader-epoch-ledger values, so they
-        // pass through unchanged.
+        // Even on a backing-side error, scrub the two response fields that would otherwise
+        // wedge or mislead a view consumer:
+        //  - divergingEpoch: today no error-producing LogReadResult carries a non-empty
+        //    marker (the replica layer only computes it on successful reads through
+        //    Partition.readRecords), but defense-in-depth keeps the backing epoch out of the
+        //    view-named response if a future path combines an error with a divergence marker.
+        //  - preferredReadReplica: ReplicaManager computes PRR against the BACKING tp's replica
+        //    set (the fetch is redirected). On an error response the suggestion would still
+        //    point at a backing replica that may not exist in the view's replica set, wedging
+        //    rack-aware consumers exactly as in the success path. Same justification as the
+        //    main applyViewFilter return below — the prior fix (e2e7a0d048) covered both
+        //    Right(records) and Left(err) but missed this early-error return.
+        // highWatermark/logStartOffset/abortedTransactions pass through (source-sparse offsets
+        // are inherent to the view design per PROMPT.md).
         return (viewTpId, new FetchPartitionData(
           data.error,
           data.highWatermark,
@@ -894,7 +901,7 @@ class KafkaApis(val requestChannel: RequestChannel,
           Optional.empty[FetchResponseData.EpochEndOffset](),
           data.lastStableOffset,
           data.abortedTransactions,
-          data.preferredReadReplica,
+          java.util.OptionalInt.empty(),
           data.isReassignmentFetch))
       }
       val filtered: Either[Errors, MemoryRecords] = data.records match {
@@ -3922,7 +3929,17 @@ class KafkaApis(val requestChannel: RequestChannel,
     }
 
     if (interested.isEmpty) {
-      CompletableFuture.completedFuture(erroneous)
+      // Combine erroneous + emptyAcknowledgements in the short-circuit return too. Before
+      // the view-aware rejection added empty-batch tps to `emptyAcknowledgements`, this
+      // path was only reachable when ALL tps were erroneous and there was nothing else to
+      // return. After the rejection, a request with a single view-tp ack (now erroneous)
+      // and any number of non-view empty-batch acks can land here — and the empty-batch
+      // responses must not be silently dropped, or the client retries forever waiting on
+      // a response for tps it just acknowledged.
+      val combined = mutable.Map.empty[TopicIdPartition, ShareAcknowledgeResponseData.PartitionData]
+      erroneous.foreach { case (tp, data) => combined += (tp -> data) }
+      emptyAcknowledgements.foreach { case (tp, data) => combined += (tp -> data) }
+      CompletableFuture.completedFuture(combined.toMap)
     } else {
       // call the share partition manager to acknowledge messages in the share partition
       sharePartitionManagerInstance.acknowledge(
