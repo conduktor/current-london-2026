@@ -4846,21 +4846,24 @@ object KafkaApis {
   // handler leak physical names or pollute another tenant's namespace.
   // SASL_HANDSHAKE / SASL_AUTHENTICATE / API_VERSIONS happen during connection
   // setup before a tenant identity is meaningful and must remain reachable.
-  // INIT_PRODUCER_ID is admitted because modern Java producers default to
-  // idempotent mode (enable.idempotence=true) and call InitProducerId at
-  // start-up with a null transactionalId — refusing it here would make a
-  // stock producer unable to bootstrap. The transactional path is still
-  // blocked inside handleInitProducerIdRequest (transactionalId != null)
-  // because v1 explicitly excludes transactions for tenants.
+  // INIT_PRODUCER_ID is admitted for both the idempotent path (null
+  // transactionalId — modern Java producers default to enable.idempotence=true
+  // and call InitProducerId at start-up) and the transactional path. The
+  // handler rewrites a non-null transactionalId to its physical form via
+  // toPhysicalTxnId before authorisation and before reaching the transaction
+  // coordinator; the __transaction_state log is keyed by hash(transactionalId)
+  // so two tenants sharing the same external id resolve to distinct
+  // coordinator records.
   // Note: ListTopics is the all-topics variant of Metadata and is covered by
   // ApiKeys.METADATA.
   //
   // Phase 2 (consumer-group ID rewrites) admits the runtime consumer APIs.
-  // FIND_COORDINATOR routes a group lookup to its coordinator node;
-  // JOIN_GROUP/SYNC_GROUP/HEARTBEAT/LEAVE_GROUP drive the rebalance protocol;
-  // OFFSET_COMMIT/OFFSET_FETCH persist and read committed offsets. Each
-  // handler rewrites the group id (and topic names where present) on the way
-  // in and back on the way out.
+  // FIND_COORDINATOR routes a group lookup to its coordinator node (Phase 3b
+  // extended this to TRANSACTION coordinator lookups with the same physical
+  // rewrite);  JOIN_GROUP/SYNC_GROUP/HEARTBEAT/LEAVE_GROUP drive the rebalance
+  // protocol; OFFSET_COMMIT/OFFSET_FETCH persist and read committed offsets.
+  // Each handler rewrites the group id (and topic names where present) on the
+  // way in and back on the way out.
   //
   // Phase 3a admits ListOffsets and DeleteRecords — both are pure topic-name
   // rewrites that key on physical names for authorization and replicaManager
@@ -4869,8 +4872,9 @@ object KafkaApis {
   // tenant's logical low-water mark" requires these handlers to be tenant-
   // aware rather than refused.
   //
-  // Transactional / share / consumer-group v2 APIs remain refused at this
-  // dispatch boundary.
+  // The remaining transactional handlers (AddPartitionsToTxn, AddOffsetsToTxn,
+  // EndTxn, TxnOffsetCommit) and the share / consumer-group v2 APIs remain
+  // refused at this dispatch boundary until later phases lift them.
   private[server] val TENANT_ALLOWED_APIS: Set[ApiKeys] = Set(
     ApiKeys.PRODUCE,
     ApiKeys.FETCH,

@@ -12838,6 +12838,36 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testInitProducerIdPrivilegedCallerOnTenantBoundListenerWithTransactionalIdIsRefused(): Unit = {
+    // Companion of the idempotent-path refusal: a super-user without a
+    // `__tenant_` prefix on the tenant-bound listener, this time submitting
+    // a transactional id. The unsafe-context guard MUST run before the
+    // rewrite — otherwise the listener binding alone would silently wrap
+    // "my-txn" into "__tenant_acme.my-txn" and the privileged caller would
+    // end up driving the tenant's coordinator state.
+    val initRequest = new InitProducerIdRequest.Builder(new InitProducerIdRequestData()
+      .setTransactionalId("my-txn")
+      .setTransactionTimeoutMs(TimeUnit.MINUTES.toMillis(1).toInt)
+      .setProducerId(RecordBatch.NO_PRODUCER_ID)
+      .setProducerEpoch(RecordBatch.NO_PRODUCER_EPOCH))
+      .build()
+    val request = buildRequest(initRequest,
+      listenerName = TENANT_LISTENER,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "Alice")) // no tenant prefix
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleInitProducerIdRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[InitProducerIdResponse](request)
+    assertEquals(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.code, response.data.errorCode,
+      "privileged caller on a tenant listener with a transactional id must be refused " +
+        "with TRANSACTIONAL_ID_AUTHORIZATION_FAILED, not silently wrapped under the listener binding")
+    verify(txnCoordinator, never()).handleInitProducerId(
+      any[String](), anyInt(), any[Option[ProducerIdAndEpoch]](),
+      any[InitProducerIdResult => Unit](), any[RequestLocal]())
+  }
+
+  @Test
   def testInitProducerIdPrivilegedCallerOnTenantBoundListenerIsRefused(): Unit = {
     // The standing trap: a super-user without a `__tenant_` prefix lands on
     // the tenant-bound listener. Without the unsafe-context guard the broker
@@ -13010,6 +13040,25 @@ class KafkaApisTest extends Logging {
     kafkaApis.handleFindCoordinatorRequest(request)
 
     verify(groupCoordinator).partitionFor("__tenant_acme.orders-consumer")
+  }
+
+  @Test
+  def testFindCoordinatorV3TenantRewritesTransactionalKeyToPhysicalForm(): Unit = {
+    // v0-3 carries a single non-batched key. handleFindCoordinatorRequestLessThanV4
+    // is a separate codepath from V4+; both must rewrite TRANSACTION keys the
+    // same way. Without this test, a regression in the V<4 branch (e.g. someone
+    // adds a per-key rewrite to V4+ only) would slip through silently.
+    val findCoord = new FindCoordinatorRequest.Builder(new FindCoordinatorRequestData()
+      .setKeyType(CoordinatorType.TRANSACTION.id)
+      .setKey("txn-1")).build(3.toShort)
+    val request = buildRequest(findCoord,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleFindCoordinatorRequest(request)
+
+    verify(txnCoordinator).partitionFor("__tenant_acme.txn-1")
   }
 
   @Test
