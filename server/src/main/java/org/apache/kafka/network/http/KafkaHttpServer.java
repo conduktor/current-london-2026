@@ -23,12 +23,17 @@ import org.eclipse.jetty.ee10.servlet.ServletContextHandler;
 import org.eclipse.jetty.ee10.servlet.ServletContextRequest;
 import org.eclipse.jetty.ee10.servlet.ServletHolder;
 import org.eclipse.jetty.ee10.websocket.server.config.JettyWebSocketServletContainerInitializer;
+import org.eclipse.jetty.http.HttpHeader;
+import org.eclipse.jetty.server.Request;
+import org.eclipse.jetty.server.Response;
 import org.eclipse.jetty.server.Server;
 import org.eclipse.jetty.server.ServerConnector;
+import org.eclipse.jetty.util.Callback;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.util.Objects;
 import java.util.concurrent.TimeoutException;
 
@@ -224,6 +229,15 @@ public final class KafkaHttpServer {
             });
         });
 
+        // Server-level (core) handler for errors that escape the servlet context entirely:
+        //   - URI rejections by Jetty's HTTP parser (CRLF in headers, ambiguous %2F, path traversal, control chars)
+        //   - Requests to paths outside the /v1 context (no ServletContextHandler matched)
+        //   - Bad-message errors raised before request dispatch
+        // The context-level JsonErrorHandler above only fires for errors dispatched *inside* the servlet context
+        // (servlet sendError, WS upgrade rejection). Without this Server-level handler, those earlier rejections
+        // emit Jetty's stock HTML error page — including the "Powered by Jetty <version>" footer — which violates
+        // PROMPT.md "every error response includes errorCode and errorMessage fields" and leaks the server fingerprint.
+        jetty.setErrorHandler(new CoreJsonErrorHandler(mapper));
         jetty.setHandler(context);
         jetty.start();
 
@@ -325,6 +339,53 @@ public final class KafkaHttpServer {
             byte[] payload = mapper.writeValueAsBytes(ErrorEnvelope.forMessage(mapper, code, message));
             resp.setContentLength(payload.length);
             resp.getOutputStream().write(payload);
+        }
+    }
+
+    /**
+     * Server-level error handler that emits the {@code {errorCode, errorMessage}} JSON envelope for failures that
+     * never reach the servlet context — URI parser rejections (CRLF, {@code %2F}, control chars), bad-message errors,
+     * and requests to paths outside {@code /v1} that no {@link ServletContextHandler} matched.
+     *
+     * <p>This complements {@link JsonErrorHandler} above: the servlet handler covers in-context dispatches
+     * ({@code sendError} from the servlet or the WS upgrade gate), and this one covers everything that fails before
+     * dispatch begins. Without the Server-level handler, those earlier rejections fall through to Jetty's default
+     * error renderer — which emits an HTML body that includes the Jetty version string, simultaneously breaking the
+     * bridge's documented error shape and leaking the server fingerprint.
+     *
+     * <p>Override target is {@code generateResponse} (not {@code generateAcceptableResponse}) so we bypass Jetty's
+     * built-in content negotiation entirely: every error response is JSON regardless of the client's {@code Accept}
+     * header. A client that asks for {@code text/html} on an SSE URL still gets the JSON envelope, which is the only
+     * shape the bridge documents.
+     */
+    static final class CoreJsonErrorHandler extends org.eclipse.jetty.server.handler.ErrorHandler {
+
+        private final ObjectMapper mapper;
+
+        CoreJsonErrorHandler(ObjectMapper mapper) {
+            this.mapper = mapper;
+            // Defence in depth: even if a future change accidentally routes through generateAcceptableResponse,
+            // these flags keep the rendered output free of Jetty's stack traces, exception chain, and message-in-title
+            // markup. The bridge's envelope is the only thing a client should ever see.
+            setShowStacks(false);
+            setShowCauses(false);
+            setShowMessageInTitle(false);
+            setDefaultResponseMimeType(ContentTypeNegotiator.APPLICATION_JSON);
+        }
+
+        @Override
+        protected void generateResponse(Request request, Response response, int code, String message,
+                                        Throwable cause, Callback callback) throws IOException {
+            // Mirror the servlet-side guard: if the response is already committed there's nothing useful we can do
+            // (writing again would corrupt HTTP/1.1 framing or throw on HTTP/2). The status code is preserved.
+            if (response.isCommitted()) {
+                callback.succeeded();
+                return;
+            }
+            response.setStatus(code);
+            response.getHeaders().put(HttpHeader.CONTENT_TYPE, ContentTypeNegotiator.APPLICATION_JSON);
+            byte[] payload = mapper.writeValueAsBytes(ErrorEnvelope.forMessage(mapper, code, message));
+            response.write(true, ByteBuffer.wrap(payload), callback);
         }
     }
 }

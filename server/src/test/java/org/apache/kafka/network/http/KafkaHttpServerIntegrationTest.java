@@ -1145,6 +1145,76 @@ class KafkaHttpServerIntegrationTest {
     }
 
     @Test
+    void requestOutsideV1ContextReturnsJsonEnvelopeNotHtml() throws Exception {
+        // Pre-servlet rejection: nothing is mounted outside /v1, so the request never enters the
+        // ServletContextHandler. Without the Server-level CoreJsonErrorHandler, Jetty's stock HTML
+        // error page renders instead — violating PROMPT.md "every error response includes errorCode
+        // and errorMessage fields" and leaking the "Powered by Jetty <version>" fingerprint.
+        ContentResponse resp = client.newRequest(url("/no-such-context"))
+            .method(HttpMethod.GET)
+            .send();
+
+        assertEquals(404, resp.getStatus());
+        String contentType = resp.getHeaders().get("Content-Type");
+        assertNotNull(contentType, "error response must declare a Content-Type");
+        assertTrue(contentType.startsWith("application/json"),
+            "pre-servlet rejection must render the JSON envelope, got Content-Type: " + contentType);
+        String body = new String(resp.getContent(), StandardCharsets.UTF_8);
+        assertFalse(body.contains("<html>") || body.toLowerCase(java.util.Locale.ROOT).contains("<!doctype"),
+            "pre-servlet rejection body must not be HTML, got: " + body);
+        assertFalse(body.contains("Jetty"),
+            "pre-servlet rejection body must not leak the Jetty version string, got: " + body);
+        JsonNode envelope = asJson(resp.getContent());
+        assertEquals(404, envelope.get("errorCode").asInt(),
+            "envelope errorCode must mirror HTTP status per the bridge contract");
+        assertNotNull(envelope.get("errorMessage"),
+            "envelope must carry errorMessage per the bridge contract");
+    }
+
+    @Test
+    void rootRequestReturnsJsonEnvelopeNotHtml() throws Exception {
+        // A bare `/` request is the most common probe a misconfigured load-balancer / health checker sends.
+        // It must surface the bridge's documented error shape, not Jetty's default HTML page.
+        ContentResponse resp = client.newRequest(url("/"))
+            .method(HttpMethod.GET)
+            .send();
+
+        assertEquals(404, resp.getStatus());
+        String contentType = resp.getHeaders().get("Content-Type");
+        assertNotNull(contentType);
+        assertTrue(contentType.startsWith("application/json"),
+            "root-path rejection must render the JSON envelope, got Content-Type: " + contentType);
+        String body = new String(resp.getContent(), StandardCharsets.UTF_8);
+        assertFalse(body.contains("Jetty"),
+            "root-path rejection body must not leak the Jetty version string, got: " + body);
+        JsonNode envelope = asJson(resp.getContent());
+        assertEquals(404, envelope.get("errorCode").asInt());
+        assertNotNull(envelope.get("errorMessage"));
+    }
+
+    @Test
+    void htmlAcceptHeaderStillRendersJsonEnvelope() throws Exception {
+        // A client that explicitly requests text/html on an unmounted path must still receive the JSON envelope —
+        // it is the only error shape the bridge documents. Defends against accidental content-negotiation drift
+        // in a future Jetty upgrade.
+        ContentResponse resp = client.newRequest(url("/no-such-context"))
+            .method(HttpMethod.GET)
+            .headers(h -> h.put("Accept", "text/html"))
+            .send();
+
+        assertEquals(404, resp.getStatus());
+        String contentType = resp.getHeaders().get("Content-Type");
+        assertNotNull(contentType);
+        assertTrue(contentType.startsWith("application/json"),
+            "even with Accept: text/html, the bridge must reply with JSON, got: " + contentType);
+        String body = new String(resp.getContent(), StandardCharsets.UTF_8);
+        assertFalse(body.contains("<html>") || body.toLowerCase(java.util.Locale.ROOT).contains("<!doctype"),
+            "Accept: text/html must not unlock the HTML branch, got: " + body);
+        assertFalse(body.contains("Jetty"),
+            "Accept: text/html must not unlock the Jetty version leak, got: " + body);
+    }
+
+    @Test
     void rootPathReturns404() throws Exception {
         ContentResponse resp = client.newRequest(url("/v1/topics//records"))
             .method(HttpMethod.GET)
