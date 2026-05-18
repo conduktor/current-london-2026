@@ -66,7 +66,7 @@ import org.apache.kafka.server.share.context.ShareFetchContext
 import org.apache.kafka.server.share.{ErroneousAndValidPartitionData, SharePartitionKey}
 import org.apache.kafka.server.share.acknowledge.ShareAcknowledgementBatch
 import org.apache.kafka.server.storage.log.{FetchIsolation, FetchParams, FetchPartitionData}
-import org.apache.kafka.storage.internals.concentration.{ConcentrationKernel, LogicalFetchTranslator, LogicalProduceStamper, Reservation}
+import org.apache.kafka.storage.internals.concentration.{ConcentrationKernel, IdempotentBatchKey, IdempotentBatchResult, LogicalFetchTranslator, LogicalProduceStamper, Reservation}
 import org.apache.kafka.storage.internals.log.AppendOrigin
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats
 
@@ -399,11 +399,13 @@ class KafkaApis(val requestChannel: RequestChannel,
     val invalidRequestResponses = mutable.Map[TopicPartition, PartitionResponse]()
     val authorizedRequestInfo = mutable.Map[TopicPartition, MemoryRecords]()
     // Concentration hook #2 side-map. Each entry pins one logical-topic produce that has been
-    // rewritten in authorizedRequestInfo to its backing-topic key. We need three pieces at
+    // rewritten in authorizedRequestInfo to its backing-topic key. We need four pieces at
     // response time: the original logical TopicPartition (to remap the response back so the
-    // producer sees its own topic+partition), and the Reservation[] (so we can commit on
-    // success / rollback on error). Kept empty unless any logical topic appears in this request.
-    val logicalByBacking = mutable.Map[TopicPartition, (TopicPartition, Array[Reservation])]()
+    // producer sees its own topic+partition), the Reservation[] (to commit on success / roll back
+    // on error), and an optional IdempotentBatchKey (to record on successful commit so a future
+    // retry hits the kernel cache and short-circuits before reservation — see PROMPT scenario 6).
+    // Kept empty unless any logical topic appears in this request.
+    val logicalByBacking = mutable.Map[TopicPartition, (TopicPartition, Array[Reservation], IdempotentBatchKey)]()
     // cache the result to avoid redundant authorization calls
     val authorizedTopics = authHelper.filterByAuthorized(request.context, WRITE, TOPIC,
       produceRequest.data().topicData().asScala)(_.name())
@@ -460,23 +462,58 @@ class KafkaApis(val requestChannel: RequestChannel,
                   Errors.INVALID_TXN_STATE,
                   "concentration v1 does not support transactional produce to logical topics")
               } else {
-                val k = LogicalProduceStamper.countRecords(memoryRecords)
-                if (k == 0) {
-                  // Empty batch — pass through as NONE so the producer sees an immediate ack
-                  // without us consuming any logical offsets. Mirrors stock-topic behaviour:
-                  // ProduceRequest.validateRecords already accepted it, no further work needed.
-                  invalidRequestResponses += topicPartition -> new PartitionResponse(Errors.NONE,
-                    -1L, RecordBatch.NO_TIMESTAMP, -1L)
+                // Idempotent-retry pre-check (PROMPT scenario 6). If this batch carries a
+                // producerId and a non-negative baseSequence, it's an idempotent batch and may be
+                // a retry of an already-committed append. The kernel cache holds the last 5 such
+                // batches per producerId on this logical partition; on a hit, return the cached
+                // logical offsets directly. We MUST short-circuit BEFORE reserveProduceBatch:
+                // burning fresh logical offsets and letting the backing log dedup later would
+                // leave a non-contiguous gap and write phantom sidecar entries that map new
+                // logical offsets to the same backing offsets.
+                val idempotentKey: IdempotentBatchKey =
+                  if (firstBatch != null && firstBatch.hasProducerId && firstBatch.baseSequence >= 0)
+                    new IdempotentBatchKey(firstBatch.producerId, firstBatch.producerEpoch,
+                      firstBatch.baseSequence, firstBatch.lastSequence)
+                  else null
+
+                val cachedResult: java.util.Optional[IdempotentBatchResult] =
+                  if (idempotentKey != null)
+                    concentrationKernel.lookupIdempotentBatch(
+                      topicPartition.topic, topicPartition.partition, idempotentKey)
+                  else
+                    java.util.Optional.empty[IdempotentBatchResult]()
+
+                if (cachedResult.isPresent) {
+                  // Retry detected. Return the ORIGINAL logical offsets exactly as the first
+                  // attempt was acknowledged. logAppendTime is preserved so the client's
+                  // bookkeeping doesn't drift; logStartOffset is the kernel's current value
+                  // (DeleteRecords may have advanced it since the original append, and an
+                  // idempotent producer comparing logStartOffset to detect truncation needs
+                  // the up-to-date answer).
+                  val r = cachedResult.get
+                  val resp = new PartitionResponse(Errors.NONE, r.logicalBaseOffset,
+                    r.logAppendTime, r.logStartOffset)
+                  resp.lastOffset = r.logicalLastOffset
+                  invalidRequestResponses += topicPartition -> resp
                 } else {
-                  val reservations = concentrationKernel.reserveProduceBatch(
-                    topicPartition.topic, topicPartition.partition, k)
-                  val logicalOffsets = new Array[Long](reservations.length)
-                  var i = 0
-                  while (i < reservations.length) { logicalOffsets(i) = reservations(i).logicalOffset; i += 1 }
-                  val stamped = LogicalProduceStamper.stamp(
-                    memoryRecords, topicPartition.topic, topicPartition.partition, logicalOffsets)
-                  authorizedRequestInfo += (backingTp -> stamped)
-                  logicalByBacking += (backingTp -> (topicPartition, reservations))
+                  val k = LogicalProduceStamper.countRecords(memoryRecords)
+                  if (k == 0) {
+                    // Empty batch — pass through as NONE so the producer sees an immediate ack
+                    // without us consuming any logical offsets. Mirrors stock-topic behaviour:
+                    // ProduceRequest.validateRecords already accepted it, no further work needed.
+                    invalidRequestResponses += topicPartition -> new PartitionResponse(Errors.NONE,
+                      -1L, RecordBatch.NO_TIMESTAMP, -1L)
+                  } else {
+                    val reservations = concentrationKernel.reserveProduceBatch(
+                      topicPartition.topic, topicPartition.partition, k)
+                    val logicalOffsets = new Array[Long](reservations.length)
+                    var i = 0
+                    while (i < reservations.length) { logicalOffsets(i) = reservations(i).logicalOffset; i += 1 }
+                    val stamped = LogicalProduceStamper.stamp(
+                      memoryRecords, topicPartition.topic, topicPartition.partition, logicalOffsets)
+                    authorizedRequestInfo += (backingTp -> stamped)
+                    logicalByBacking += (backingTp -> (topicPartition, reservations, idempotentKey))
+                  }
                 }
               }
             } catch {
@@ -516,7 +553,7 @@ class KafkaApis(val requestChannel: RequestChannel,
         if (logicalByBacking.isEmpty) responseStatus
         else responseStatus.map { case (tp, status) =>
           logicalByBacking.get(tp) match {
-            case Some((logicalTp, reservations)) =>
+            case Some((logicalTp, reservations, idempotentKey)) =>
               if (status.error == Errors.NONE) {
                 try {
                   concentrationKernel.commitProduceBatch(reservations, status.baseOffset)
@@ -527,10 +564,25 @@ class KafkaApis(val requestChannel: RequestChannel,
                   // producers compare it against their session bookkeeping to detect log
                   // truncation, and leaking the backing topic's value here makes a sibling
                   // logical topic's DeleteRecords look like truncation under their feet.
-                  status.baseOffset = reservations(0).logicalOffset
-                  status.lastOffset = reservations(reservations.length - 1).logicalOffset
-                  status.logStartOffset = concentrationKernel.startLogicalOffset(
+                  val logicalBase = reservations(0).logicalOffset
+                  val logicalLast = reservations(reservations.length - 1).logicalOffset
+                  val logicalStart = concentrationKernel.startLogicalOffset(
                     logicalTp.topic, logicalTp.partition)
+                  status.baseOffset = logicalBase
+                  status.lastOffset = logicalLast
+                  status.logStartOffset = logicalStart
+                  // Record idempotent commit AFTER commitProduceBatch returned successfully — the
+                  // ordering matters because the cache is in-memory only. If we cached first and
+                  // the sidecar append then failed, a subsequent retry would hit the cache and
+                  // return offsets that the sidecar can't resolve on fetch. By caching last, a
+                  // crash here just means the retry takes the slow path (backing dedup) the next
+                  // time — correct, only slower.
+                  if (idempotentKey != null) {
+                    concentrationKernel.recordIdempotentBatch(
+                      logicalTp.topic, logicalTp.partition, idempotentKey,
+                      new IdempotentBatchResult(logicalBase, logicalLast, logicalStart,
+                        status.logAppendTime))
+                  }
                   logicalTp -> status
                 } catch {
                   case e: Throwable =>
