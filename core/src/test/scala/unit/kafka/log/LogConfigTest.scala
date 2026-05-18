@@ -476,7 +476,12 @@ class LogConfigTest {
       ("none", CompressionPolicy.NONE),
       ("required", CompressionPolicy.REQUIRED),
       ("forbidden", CompressionPolicy.FORBIDDEN),
-      (" REQUIRED ", CompressionPolicy.REQUIRED) // case-insensitive + whitespace must still hit the singleton
+      // Mixed-case + whitespace variants of NONE specifically: NONE is the fast-path target
+      // the Scala loop short-circuits on, so its singleton identity through every input
+      // normalisation must be pinned at the LogConfig boundary, not just at parse().
+      (" NONE ", CompressionPolicy.NONE),
+      ("None", CompressionPolicy.NONE),
+      (" REQUIRED ", CompressionPolicy.REQUIRED)
     ).foreach { case (configValue, expected) =>
       val props = new Properties()
       props.setProperty(LogConfig.COMPRESSION_POLICY_CONFIG, configValue)

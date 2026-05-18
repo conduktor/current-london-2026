@@ -225,14 +225,18 @@ Allow-list values cover the "I want to accept some codecs but not others"
 use case that the three keywords cannot express on their own (e.g. accept
 `lz4` and `zstd` but reject `gzip` for CPU-cost reasons).
 
-Caveat (same shape as the one on `forbidden`): an allow-list gates the
-*entry* codec only. The separate, pre-existing topic-level
-`compression.type` config can still rewrite incoming batches on the way to
-the log (e.g. `compression.type=gzip` recompresses everything to gzip
-regardless of the allow-list). Operators who need the on-disk codec to
-match the entry codec must set `compression.type=producer` (or
-`compression.type=uncompressed`) alongside the allow-list — for the same
-reason as the `forbidden` shape.
+Caveat (same shape as the one on `forbidden`, but with a different
+follow-up): an allow-list gates the *entry* codec only. The separate,
+pre-existing topic-level `compression.type` config can still rewrite
+incoming batches on the way to the log (e.g. `compression.type=gzip`
+recompresses everything to gzip regardless of the allow-list). Operators
+who need the on-disk codec to match the entry codec must set
+`compression.type=producer` alongside the allow-list. Unlike the
+`forbidden` shape, `compression.type=uncompressed` is **not** an
+equivalent fallback here: an allow-list of compressed codecs combined
+with `compression.type=uncompressed` would still admit the batch at the
+boundary but then strip compression on disk, which is almost never what
+the operator setting an allow-list wants.
 
 ### `CompressionPolicy` value class
 
