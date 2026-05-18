@@ -633,20 +633,25 @@ class BrokerServer(
       // opening the SocketServer to client connections. Direct-log read via
       // ReplicaManager.getLog bypasses the network entirely, so this works
       // without the chicken-and-egg of a KafkaConsumer needing the socket
-      // open in order to fetch from this very broker. If the log doesn't
-      // exist locally yet (fresh cluster, or this broker isn't a replica),
-      // drainOnce is a no-op and the engine stays at the empty RuleSet —
-      // which is the correct enforcement state when no rules have been
-      // published.
-      try {
-        val drained = governanceBootstrap.drainOnce()
-        info(s"governance bootstrap drained $drained rule record(s) from " +
-          s"${GovernanceTopic.NAME} before opening request processing")
-      } catch {
-        case t: Throwable =>
-          warn(s"governance bootstrap failed; engine remains at the empty RuleSet: " +
-            s"${t.getMessage}", t)
-      }
+      // open in order to fetch from this very broker.
+      //
+      // Fail-closed policy: if drainOnce throws, do NOT catch it — let it
+      // propagate so broker startup aborts before SocketServer opens. The
+      // alternative (catch + WARN + continue) is silent fail-open: a broker
+      // that IS a replica of __governance but can't read its local log
+      // (corrupt segment, disk fault) would open client traffic with an
+      // empty RuleSet while real DENY rules exist on the topic, evading
+      // enforcement. The "log does not exist locally" path is already
+      // handled inside drainOnce (returns 0L silently) and is the right
+      // state when this broker isn't a replica — that's not an error.
+      //
+      // What we still log: drained count on success. Hard failures crash
+      // startup with the original exception in the broker log, which is
+      // the visibility we want — an operator must intervene rather than
+      // a security-critical event sliding by at WARN level.
+      val drained = governanceBootstrap.drainOnce()
+      info(s"governance bootstrap drained $drained rule record(s) from " +
+        s"${GovernanceTopic.NAME} before opening request processing")
       // Schedule ongoing re-drain so rule updates published after startup
       // are picked up without restart.
       governanceBootstrap.scheduleOngoing(kafkaScheduler,

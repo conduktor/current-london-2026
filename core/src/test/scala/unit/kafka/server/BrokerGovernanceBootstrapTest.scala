@@ -187,6 +187,37 @@ class BrokerGovernanceBootstrapTest {
   }
 
   @Test
+  def drainOncePropagatesHardLogReadFailureSoBrokerCanFailClosed(): Unit = {
+    // The bootstrap drain runs before SocketServer.enableRequestProcessing and
+    // is the security-critical entry point. If the broker IS a replica of
+    // __governance but the local log is unreadable (corrupt segment, disk I/O
+    // error, etc.), drainOnce MUST propagate — otherwise BrokerServer would
+    // swallow the failure and open the request socket with an empty RuleSet
+    // while real DENY rules exist on the topic. That's silent fail-open.
+    //
+    // The "log does not exist" path (None) is different: there are no rules
+    // to enforce on this broker, and an empty RuleSet is the correct state.
+    // Only the unreadable-replica path should throw.
+    val rm = mock(classOf[ReplicaManager])
+    val log = mock(classOf[UnifiedLog])
+    val engine = new RuleEngine()
+    when(rm.getLog(tp)).thenReturn(Some(log))
+    when(log.logStartOffset).thenReturn(0L)
+    when(log.logEndOffset).thenReturn(5L)
+    when(log.read(0L, 1024 * 1024, FetchIsolation.LOG_END, true))
+      .thenThrow(new org.apache.kafka.common.errors.CorruptRecordException("simulated corrupt segment"))
+
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp)
+    val ex = assertThrows(classOf[org.apache.kafka.common.errors.CorruptRecordException],
+      () => boot.drainOnce())
+    assertEquals("simulated corrupt segment", ex.getMessage)
+    assertEquals(0, engine.active().size(),
+      "no rules should be installed when read fails — engine stays at the empty state " +
+        "the broker started with, and the broker is expected to refuse to open " +
+        "request processing until the operator resolves the disk fault")
+  }
+
+  @Test
   def drainOnceWhenNothingNewStillProducesAValidRuleSet(): Unit = {
     val rm = mock(classOf[ReplicaManager])
     val log = mock(classOf[UnifiedLog])
