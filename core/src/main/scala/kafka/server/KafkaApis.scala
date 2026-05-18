@@ -1161,7 +1161,44 @@ class KafkaApis(val requestChannel: RequestChannel,
         (topic, result)
       }
 
-      val directNames: Set[String] = classified.collect {
+      // Coalesce same-name view (or malformed-view) entries: the wire protocol only forbids
+      // duplicate (topic-name, partition-index) PAIRS (caught request-side by
+      // duplicatePartitions(), see ListOffsetsRequest.java:127), not duplicate topic names.
+      // Without this merge, two ListOffsetsTopic entries naming the same view would either
+      // (a) trip the "different view sharing same backing" guard below with a misleading
+      //     error message that rejects the second entry's partitions, or
+      // (b) synthesize two ListOffsetsTopicResponse entries with the same name (one per
+      //     entry), which a consumer parses as just the first.
+      // Non-view entries are left untouched: the downstream replica layer handles duplicate-name
+      // direct topics with the same semantics it did before the view rewrite was added.
+      val classifiedCoalesced: Seq[(ListOffsetsTopic, Either[Exception, Optional[ViewSpec]])] = {
+        val viewByName = mutable.LinkedHashMap[String, (ListOffsetsTopic, Either[Exception, Optional[ViewSpec]])]()
+        val nonViewEntries = mutable.ArrayBuffer[(ListOffsetsTopic, Either[Exception, Optional[ViewSpec]])]()
+        classified.foreach { entry =>
+          val (topic, result) = entry
+          val isView = result match {
+            case Right(opt) => opt.isPresent
+            case Left(_)    => true
+          }
+          if (isView) {
+            viewByName.get(topic.name) match {
+              case Some((existing, existingResult)) =>
+                val mergedPartitions = new util.ArrayList[ListOffsetsPartition](existing.partitions)
+                mergedPartitions.addAll(topic.partitions)
+                viewByName.put(topic.name,
+                  (new ListOffsetsTopic().setName(topic.name).setPartitions(mergedPartitions),
+                    existingResult))
+              case None =>
+                viewByName.put(topic.name, entry)
+            }
+          } else {
+            nonViewEntries += entry
+          }
+        }
+        (viewByName.values ++ nonViewEntries).toSeq
+      }
+
+      val directNames: Set[String] = classifiedCoalesced.collect {
         case (topic, Right(opt)) if !opt.isPresent => topic.name
       }.toSet
 
@@ -1171,7 +1208,7 @@ class KafkaApis(val requestChannel: RequestChannel,
           .setPartitions(topic.partitions.asScala.map(p => buildErrorResponse(err, p)).asJava)
       }
 
-      classified.foreach {
+      classifiedCoalesced.foreach {
         case (topic, Left(e)) =>
           // A malformed view config (predicate compile failure, self-loop) reaching this point
           // means LogConfig validation was bypassed somehow. Mirrors handleFetchRequest.

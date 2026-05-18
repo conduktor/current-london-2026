@@ -5486,6 +5486,124 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testListOffsetsFromViewWithSameNameAcrossTopicEntriesCoalescesIntoSingleResponse(): Unit = {
+    // Wire-protocol-only forbids duplicate (topic-name, partition-index) PAIRS; it does NOT
+    // forbid duplicate topic names. A client that produces two `ListOffsetsTopic` entries with
+    // the same view name and DIFFERENT partitions is legal upstream — and broker-side it must
+    // produce ONE `ListOffsetsTopicResponse` for that view name containing both partitions.
+    //
+    // Before the coalesce fix, the view path tripped two bugs on this shape:
+    //   (a) The second entry hit the "different view sharing same backing" guard and was
+    //       rejected with INVALID_REQUEST under a misleading error message.
+    //   (b) Even when (a) did not fire, the per-entry `processedPartitionIndexes` reset
+    //       allowed the second entry to synthesize a separate `ListOffsetsTopicResponse`
+    //       with the same name as the first, leaving the consumer parsing only the first.
+    //
+    // Both are correctness regressions vs. the pre-view-rewrite behaviour. Pin that:
+    //   - replicaManager.fetchOffset receives ONE ListOffsetsTopic keyed at the backing,
+    //     carrying BOTH partitions merged from the duplicate-name entries,
+    //   - the response carries ONE ListOffsetsTopicResponse keyed at the view, with one
+    //     ListOffsetsPartitionResponse per partition index,
+    //   - the backing name never leaks.
+    val viewTopic = "list-merge-view"
+    val backingTopic = "list-merge-backing"
+    val viewTopicId = Uuid.randomUuid()
+    val backingTopicId = Uuid.randomUuid()
+
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, backingTopic)
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.x == 1")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+    addTopicToMetadataCache(viewTopic, numPartitions = 2, topicId = viewTopicId)
+    addTopicToMetadataCache(backingTopic, numPartitions = 2, topicId = backingTopicId)
+
+    val viewPartition0 = mock(classOf[Partition])
+    val viewPartition1 = mock(classOf[Partition])
+    when(viewPartition0.localLogWithEpochOrThrow(any[Optional[Integer]], anyBoolean))
+      .thenReturn(mock(classOf[UnifiedLog]))
+    when(viewPartition1.localLogWithEpochOrThrow(any[Optional[Integer]], anyBoolean))
+      .thenReturn(mock(classOf[UnifiedLog]))
+    when(replicaManager.getPartitionOrError(new TopicPartition(viewTopic, 0)))
+      .thenReturn(Right(viewPartition0))
+    when(replicaManager.getPartitionOrError(new TopicPartition(viewTopic, 1)))
+      .thenReturn(Right(viewPartition1))
+    when(replicaManager.getPartitionOrError(new TopicPartition(backingTopic, 0)))
+      .thenReturn(Right(mock(classOf[Partition])))
+    when(replicaManager.getPartitionOrError(new TopicPartition(backingTopic, 1)))
+      .thenReturn(Right(mock(classOf[Partition])))
+
+    val topicsCaptor: ArgumentCaptor[Seq[ListOffsetsTopic]] =
+      ArgumentCaptor.forClass(classOf[Seq[ListOffsetsTopic]])
+    when(replicaManager.fetchOffset(
+      topicsCaptor.capture(),
+      ArgumentMatchers.eq(Set.empty[TopicPartition]),
+      any[IsolationLevel],
+      ArgumentMatchers.eq(ListOffsetsRequest.CONSUMER_REPLICA_ID),
+      ArgumentMatchers.any[String](),
+      ArgumentMatchers.anyInt(),
+      ArgumentMatchers.anyShort(),
+      ArgumentMatchers.any[(Errors, ListOffsetsPartition) => ListOffsetsPartitionResponse](),
+      ArgumentMatchers.any[List[ListOffsetsTopicResponse] => Unit](),
+      ArgumentMatchers.anyInt()
+    )).thenAnswer(ans => {
+      val callback = ans.getArgument[List[ListOffsetsTopicResponse] => Unit](8)
+      val p0 = new ListOffsetsPartitionResponse()
+        .setPartitionIndex(0)
+        .setErrorCode(Errors.NONE.code)
+        .setOffset(11L)
+        .setTimestamp(ListOffsetsResponse.UNKNOWN_TIMESTAMP)
+      val p1 = new ListOffsetsPartitionResponse()
+        .setPartitionIndex(1)
+        .setErrorCode(Errors.NONE.code)
+        .setOffset(22L)
+        .setTimestamp(ListOffsetsResponse.UNKNOWN_TIMESTAMP)
+      callback(List(new ListOffsetsTopicResponse().setName(backingTopic)
+        .setPartitions(List(p0, p1).asJava)))
+    })
+
+    // SAME view name across two ListOffsetsTopic entries, distinct partitions.
+    val targetTimes = List(
+      new ListOffsetsTopic().setName(viewTopic).setPartitions(List(
+        new ListOffsetsPartition().setPartitionIndex(0)
+          .setCurrentLeaderEpoch(ListOffsetsResponse.UNKNOWN_EPOCH)
+          .setTimestamp(ListOffsetsRequest.LATEST_TIMESTAMP)).asJava),
+      new ListOffsetsTopic().setName(viewTopic).setPartitions(List(
+        new ListOffsetsPartition().setPartitionIndex(1)
+          .setCurrentLeaderEpoch(ListOffsetsResponse.UNKNOWN_EPOCH)
+          .setTimestamp(ListOffsetsRequest.LATEST_TIMESTAMP)).asJava)
+    ).asJava
+    val listOffsetRequest = ListOffsetsRequest.Builder.forConsumer(true, IsolationLevel.READ_UNCOMMITTED)
+      .setTargetTimes(targetTimes).build()
+    val request = buildRequest(listOffsetRequest)
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+    kafkaApis = createKafkaApis(configRepository = configRepository)
+    kafkaApis.handleListOffsetRequest(request)
+
+    val capturedTopics = topicsCaptor.getValue
+    assertEquals(1, capturedTopics.size,
+      "duplicate-name view entries must collapse into one backing entry, not two")
+    assertEquals(backingTopic, capturedTopics.head.name)
+    val backingPartIndexes = capturedTopics.head.partitions.asScala.map(_.partitionIndex).toSet
+    assertEquals(Set(0, 1), backingPartIndexes,
+      "partitions from BOTH source entries must be merged into the single backing entry")
+
+    val response = verifyNoThrottling[ListOffsetsResponse](request)
+    val viewEntries = response.topics.asScala.filter(_.name == viewTopic)
+    assertEquals(1, viewEntries.size,
+      "the response must carry exactly one ListOffsetsTopicResponse for the view name, not one per source entry")
+    assertTrue(response.topics.asScala.forall(_.name != backingTopic),
+      "backing topic name must never leak in the response")
+    val byIndex = viewEntries.head.partitions.asScala.map(p => p.partitionIndex -> p).toMap
+    assertEquals(Set(0, 1), byIndex.keySet,
+      "both partitions must appear in the single coalesced response entry")
+    assertEquals(Errors.NONE.code, byIndex(0).errorCode)
+    assertEquals(11L, byIndex(0).offset)
+    assertEquals(Errors.NONE.code, byIndex(1).errorCode)
+    assertEquals(22L, byIndex(1).offset)
+  }
+
+  @Test
   def testOffsetForLeaderEpochOnViewTopicReturnsInvalidRequestAndDoesNotConsultReplicaManager(): Unit = {
     // OffsetsForLeaderEpoch returns (leader_epoch, end_offset) pairs from the partition's own
     // local-log ledger. For view topics, that ledger is meaningless: the view partition never
