@@ -1209,11 +1209,8 @@ class KafkaApis(val requestChannel: RequestChannel,
     val useTopicId = topicIds.nonEmpty
 
     // Only get topicIds and topicNames when supporting topicId
-    val unknownTopicIds = topicIds.filter(metadataCache.getTopicName(_).isEmpty)
-    val knownTopicNames = topicIds.flatMap(metadataCache.getTopicName)
-
-    val unknownTopicIdsTopicMetadata = unknownTopicIds.map(topicId =>
-        metadataResponseTopic(Errors.UNKNOWN_TOPIC_ID, null, topicId, isInternal = false, util.Collections.emptyList())).toSeq
+    val rawUnknownTopicIds = topicIds.filter(metadataCache.getTopicName(_).isEmpty)
+    val rawKnownTopicNames = topicIds.flatMap(metadataCache.getTopicName)
 
     // IN rewrite — the request carries logical names; downstream metadataCache /
     // authorization / auto-topic-creation all operate on physical names.
@@ -1221,16 +1218,35 @@ class KafkaApis(val requestChannel: RequestChannel,
     //     tenant (their physical prefix matches), plus pristine internal topics
     //     that pass through untouched.
     //   - useTopicId: lookup by id is already physical; just scope it to topics
-    //     belonging to this tenant.
+    //     belonging to this tenant. IDs whose resolved name is foreign get the
+    //     same UNKNOWN_TOPIC_ID shape as IDs the broker has never seen — the
+    //     response cannot be used to probe foreign-topic existence.
     //   - explicit logical names: map each through toPhysical(...).
     // For non-tenant requests, tenantCtx is none() and these all reduce to
     // identity, so existing single-tenant behaviour is unchanged.
     val tenantScoped = tenantCtx.effectiveTenant.isPresent
+
+    val (unknownTopicIds, knownTopicNames) = if (tenantScoped && useTopicId) {
+      // For tenant-scoped id lookups, demote every id whose resolved name lies
+      // outside the tenant's namespace (and is not an internal topic) to the
+      // unknown set — same wire shape as IDs the broker actually does not know.
+      val foreignKnownIds = topicIds.filter(id =>
+        metadataCache.getTopicName(id) match {
+          case opt if opt.isEmpty => false
+          case opt => opt.exists(name => !tenantCtx.belongsToTenant(name) && !isInternal(name))
+        })
+      (rawUnknownTopicIds ++ foreignKnownIds,
+        rawKnownTopicNames.filter(t => tenantCtx.belongsToTenant(t) || isInternal(t)))
+    } else (rawUnknownTopicIds, rawKnownTopicNames)
+
+    val unknownTopicIdsTopicMetadata = unknownTopicIds.map(topicId =>
+        metadataResponseTopic(Errors.UNKNOWN_TOPIC_ID, null, topicId, isInternal = false, util.Collections.emptyList())).toSeq
+
     val topics = if (metadataRequest.isAllTopics) {
       val all = metadataCache.getAllTopics()
       if (tenantScoped) all.filter(t => tenantCtx.belongsToTenant(t) || isInternal(t)) else all
     } else if (useTopicId) {
-      if (tenantScoped) knownTopicNames.filter(t => tenantCtx.belongsToTenant(t) || isInternal(t)) else knownTopicNames
+      knownTopicNames
     } else {
       metadataRequest.topics.asScala.toSet.map(tenantCtx.toPhysical)
     }

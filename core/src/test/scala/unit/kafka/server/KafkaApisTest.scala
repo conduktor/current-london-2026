@@ -10871,6 +10871,47 @@ class KafkaApisTest extends Logging {
     assertEquals(Set("plain-topic"), topics)
   }
 
+  @Test
+  def testMetadataByIdTenantForeignAndUnknownIdsShareTheSameShape(): Unit = {
+    // Metadata-by-id with two ids: one is unknown to the broker; the other
+    // resolves to a topic owned by another tenant. If foreign ids were dropped
+    // (the old code path) and unknown ids surfaced as UNKNOWN_TOPIC_ID, the
+    // shape of the response would be a probe oracle for foreign-topic
+    // existence. Both must surface as UNKNOWN_TOPIC_ID with null name and the
+    // queried id echoed back.
+    val foreignId = Uuid.randomUuid()
+    val unknownId = Uuid.randomUuid()
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    addTopicToMetadataCache("beta.orders", numPartitions = 1, topicId = foreignId)
+
+    val metadataRequest = new MetadataRequest.Builder(
+      new MetadataRequestData()
+        .setTopics(util.Arrays.asList(
+          new MetadataRequestData.MetadataRequestTopic().setTopicId(foreignId),
+          new MetadataRequestData.MetadataRequestTopic().setTopicId(unknownId)))
+        .setAllowAutoTopicCreation(false))
+      .build(ApiKeys.METADATA.latestVersion)
+    val request = buildRequest(
+      metadataRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleTopicMetadataRequest(request)
+
+    val response = verifyNoThrottling[MetadataResponse](request)
+    val resultsById = response.topicMetadata().asScala.map(t => t.topicId -> t).toMap
+    assertEquals(Set(foreignId, unknownId), resultsById.keySet,
+      "both ids must appear in the response so foreign and unknown are indistinguishable")
+    Set(foreignId, unknownId).foreach { id =>
+      val entry = resultsById(id)
+      assertEquals(Errors.UNKNOWN_TOPIC_ID, entry.error,
+        s"id $id must surface as UNKNOWN_TOPIC_ID regardless of whether the broker knows it")
+      assertNull(entry.topic, s"id $id must not carry any topic name in the response")
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Produce — multi-tenancy
   //
