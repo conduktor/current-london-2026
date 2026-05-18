@@ -4804,6 +4804,7 @@ class KafkaApis(val requestChannel: RequestChannel,
 
   def handleDescribeProducersRequest(request: RequestChannel.Request): Unit = {
     val describeProducersRequest = request.body[DescribeProducersRequest]
+    val tenantCtx = tenantContextFor(request)
 
     def partitionError(
       topicPartition: TopicPartition,
@@ -4822,8 +4823,23 @@ class KafkaApis(val requestChannel: RequestChannel,
 
       val invalidTopicError = checkValidTopic(topicRequest.name)
 
+      // Outside-in existence oracle: a non-tenant caller naming `acme.orders`
+      // would otherwise get UNKNOWN_TOPIC_OR_PARTITION when the topic doesn't
+      // exist and full producer state (producerId, epoch, currentTxnStartOffset)
+      // when it does. The mismatch lets them probe tenant topic existence —
+      // and on a hit, learn enough about in-flight transactions to coordinate
+      // a WriteTxnMarkers fence. Refuse with TOPIC_AUTHORIZATION_FAILED before
+      // touching `metadataCache.contains`, matching the wire shape an authz
+      // refusal already produces so nothing distinguishes the two responses.
+      // Tenant principals never reach here — DESCRIBE_PRODUCERS is outside
+      // TENANT_ALLOWED_APIS — so the guard only fires for non-tenant callers.
+      val outsideInRefused = !tenantCtx.effectiveTenant.isPresent &&
+        isReservedTenantNamespace(topicRequest.name)
+
       val topicError = invalidTopicError.orElse {
-        if (!authHelper.authorize(request.context, READ, TOPIC, topicRequest.name)) {
+        if (outsideInRefused) {
+          Some(new ApiError(Errors.TOPIC_AUTHORIZATION_FAILED))
+        } else if (!authHelper.authorize(request.context, READ, TOPIC, topicRequest.name)) {
           Some(new ApiError(Errors.TOPIC_AUTHORIZATION_FAILED))
         } else if (!metadataCache.contains(topicRequest.name))
           Some(new ApiError(Errors.UNKNOWN_TOPIC_OR_PARTITION))

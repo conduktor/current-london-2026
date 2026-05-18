@@ -16278,6 +16278,106 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testDescribeProducersOutsideInRefusesTenantPhysicalTopic(): Unit = {
+    // A non-tenant caller on the cluster-wide listener asking for the producer
+    // state of `acme.orders` (the PHYSICAL form of acme's logical `orders`)
+    // could otherwise distinguish "topic doesn't exist" (UNKNOWN_TOPIC_OR_PARTITION)
+    // from "topic exists and these producers are writing to it" (NONE +
+    // ProducerState[]). The mismatch is an existence oracle on tenant topics,
+    // and on a hit it leaks producerId / producerEpoch / currentTxnStartOffset —
+    // enough to issue a forged WriteTxnMarkers and fence the tenant's producer.
+    // Refuse before consulting metadataCache or replicaManager, returning the
+    // same TOPIC_AUTHORIZATION_FAILED shape that an authz refusal produces.
+    val acmeOrders = new TopicPartition("acme.orders", 0)
+    val regular = new TopicPartition("regular-topic", 0)
+
+    val data = new DescribeProducersRequestData().setTopics(List(
+      new DescribeProducersRequestData.TopicRequest()
+        .setName(acmeOrders.topic)
+        .setPartitionIndexes(List(Int.box(acmeOrders.partition)).asJava),
+      new DescribeProducersRequestData.TopicRequest()
+        .setName(regular.topic)
+        .setPartitionIndexes(List(Int.box(regular.partition)).asJava)
+    ).asJava)
+    val describeProducersRequest = new DescribeProducersRequest.Builder(data).build()
+    val request = buildRequest(describeProducersRequest)
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    // Both physical topics exist in metadata; without the guard, the response
+    // would diverge across the existence axis (the second-stage check is
+    // metadataCache.contains).
+    addTopicToMetadataCache(acmeOrders.topic, numPartitions = 1)
+    addTopicToMetadataCache(regular.topic, numPartitions = 1)
+    when(replicaManager.activeProducerState(regular))
+      .thenReturn(new DescribeProducersResponseData.PartitionResponse()
+        .setErrorCode(Errors.NONE.code)
+        .setPartitionIndex(regular.partition)
+        .setActiveProducers(List(
+          new DescribeProducersResponseData.ProducerState()
+            .setProducerId(42L)
+            .setProducerEpoch(3)
+        ).asJava))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDescribeProducersRequest(request)
+
+    val response = verifyNoThrottling[DescribeProducersResponse](request)
+    val byTopic = response.data.topics.asScala.map(t => t.name -> t).toMap
+
+    val acmePart = byTopic(acmeOrders.topic).partitions.asScala.find(_.partitionIndex == acmeOrders.partition).get
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED.code, acmePart.errorCode,
+      "reserved-physical-form topic must be refused with TOPIC_AUTHORIZATION_FAILED")
+    assertTrue(acmePart.activeProducers.isEmpty,
+      "refused topic must not leak any producer state")
+    val regularPart = byTopic(regular.topic).partitions.asScala.find(_.partitionIndex == regular.partition).get
+    assertEquals(Errors.NONE.code, regularPart.errorCode,
+      "sibling non-reserved topic must still succeed in the same batch")
+    assertEquals(1, regularPart.activeProducers.size)
+    assertEquals(42L, regularPart.activeProducers.get(0).producerId)
+
+    // The guard must short-circuit before reaching replicaManager — otherwise
+    // a probe could time the partition lookup and still derive existence.
+    verify(replicaManager, never()).activeProducerState(acmeOrders)
+  }
+
+  @Test
+  def testDescribeProducersClusterWideListenerForwardsTenantLookingNamesWhenNoTenantsConfigured(): Unit = {
+    // Without any configured tenants, the `<id>.<topic>` form is not a tenant
+    // reservation — it is just a topic name with a dot. The guard must not
+    // fire here, otherwise legitimate non-tenant clusters lose the ability to
+    // describe producers for any topic with a dot in its name.
+    val dotted = new TopicPartition("acme.orders", 0)
+    val data = new DescribeProducersRequestData().setTopics(List(
+      new DescribeProducersRequestData.TopicRequest()
+        .setName(dotted.topic)
+        .setPartitionIndexes(List(Int.box(dotted.partition)).asJava)
+    ).asJava)
+    val request = buildRequest(new DescribeProducersRequest.Builder(data).build())
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    addTopicToMetadataCache(dotted.topic, numPartitions = 1)
+    when(replicaManager.activeProducerState(dotted))
+      .thenReturn(new DescribeProducersResponseData.PartitionResponse()
+        .setErrorCode(Errors.NONE.code)
+        .setPartitionIndex(dotted.partition)
+        .setActiveProducers(List(
+          new DescribeProducersResponseData.ProducerState()
+            .setProducerId(99L).setProducerEpoch(1)
+        ).asJava))
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleDescribeProducersRequest(request)
+
+    val response = verifyNoThrottling[DescribeProducersResponse](request)
+    val part = response.data.topics.asScala.head.partitions.asScala.head
+    assertEquals(Errors.NONE.code, part.errorCode,
+      "with no tenants configured the dotted topic name is not reserved")
+    assertEquals(99L, part.activeProducers.get(0).producerId)
+  }
+
+  @Test
   def testListTransactionsOutsideInFiltersTenantPrincipalNamespace(): Unit = {
     val data = new ListTransactionsRequestData()
     val request = buildRequest(new ListTransactionsRequest.Builder(data).build())
