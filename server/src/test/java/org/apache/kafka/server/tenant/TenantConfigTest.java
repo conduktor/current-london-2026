@@ -129,4 +129,109 @@ class TenantConfigTest {
     void allTenantsReturnsEmptyWhenUnconfigured() {
         assertTrue(TenantConfig.empty().allTenants().isEmpty());
     }
+
+    @Test
+    void validatePrincipalBuilderBindingsPassesWhenListenerHasTenantBuilder() {
+        Map<String, Object> props = new HashMap<>();
+        props.put("listener.name.tenant_acme.tenant.id", "acme");
+        props.put("listener.name.tenant_acme.principal.builder.class",
+            TenantPrincipalBuilder.class.getName());
+
+        TenantConfig.validatePrincipalBuilderBindings(props, /*default*/ null);
+    }
+
+    @Test
+    void validatePrincipalBuilderBindingsAcceptsBrokerWideDefault() {
+        // Operator sets principal.builder.class once at the broker level; the
+        // tenant listener inherits it without a listener-prefixed override.
+        Map<String, Object> props = new HashMap<>();
+        props.put("listener.name.tenant_acme.tenant.id", "acme");
+
+        TenantConfig.validatePrincipalBuilderBindings(props, TenantPrincipalBuilder.class);
+    }
+
+    @Test
+    void validatePrincipalBuilderBindingsAcceptsClassObjectOverride() {
+        // KafkaConfig stores the listener-prefixed override as a Class object
+        // (post-ConfigDef parsing) on some code paths. The check must accept
+        // both raw String values and resolved Class<?> values.
+        Map<String, Object> props = new HashMap<>();
+        props.put("listener.name.tenant_acme.tenant.id", "acme");
+        props.put("listener.name.tenant_acme.principal.builder.class",
+            TenantPrincipalBuilder.class);
+
+        TenantConfig.validatePrincipalBuilderBindings(props, null);
+    }
+
+    @Test
+    void validatePrincipalBuilderBindingsRejectsDefaultBuilder() {
+        // The trap Codex round-3 flagged: a tenant-bound listener inherits the
+        // stock DefaultKafkaPrincipalBuilder, SASL produces a plain principal,
+        // KafkaApis refuses every request as `isPrivilegedOnTenantListener`.
+        Map<String, Object> props = new HashMap<>();
+        props.put("listener.name.tenant_acme.tenant.id", "acme");
+        props.put("listener.name.tenant_acme.principal.builder.class",
+            "org.apache.kafka.common.security.authenticator.DefaultKafkaPrincipalBuilder");
+
+        ConfigException ex = assertThrows(ConfigException.class,
+            () -> TenantConfig.validatePrincipalBuilderBindings(props, null));
+        assertTrue(ex.getMessage().contains("tenant_acme"),
+            "error should name the offending listener; was: " + ex.getMessage());
+        assertTrue(ex.getMessage().contains(TenantPrincipalBuilder.class.getName()),
+            "error should name the required builder; was: " + ex.getMessage());
+    }
+
+    @Test
+    void validatePrincipalBuilderBindingsRejectsBrokerWideNonTenantDefault() {
+        // No per-listener override; broker-wide default is the stock builder.
+        // The listener is tenant-bound, so inheritance produces a silent DoS.
+        Map<String, Object> props = new HashMap<>();
+        props.put("listener.name.tenant_acme.tenant.id", "acme");
+
+        // Pass a non-tenant class as the broker-wide default.
+        ConfigException ex = assertThrows(ConfigException.class,
+            () -> TenantConfig.validatePrincipalBuilderBindings(props, String.class));
+        assertTrue(ex.getMessage().contains("tenant_acme"),
+            "error should name the offending listener; was: " + ex.getMessage());
+    }
+
+    @Test
+    void validatePrincipalBuilderBindingsAggregatesAllOffenders() {
+        // Operator misconfigures two listeners at once; we report both so they
+        // can be fixed in a single deploy.
+        Map<String, Object> props = new HashMap<>();
+        props.put("listener.name.tenant_acme.tenant.id", "acme");
+        props.put("listener.name.tenant_acme.principal.builder.class",
+            "org.apache.kafka.common.security.authenticator.DefaultKafkaPrincipalBuilder");
+        props.put("listener.name.tenant_beta.tenant.id", "beta");
+        props.put("listener.name.tenant_beta.principal.builder.class",
+            "org.apache.kafka.common.security.authenticator.DefaultKafkaPrincipalBuilder");
+
+        ConfigException ex = assertThrows(ConfigException.class,
+            () -> TenantConfig.validatePrincipalBuilderBindings(props, null));
+        assertTrue(ex.getMessage().contains("tenant_acme"),
+            "error should name both offenders; was: " + ex.getMessage());
+        assertTrue(ex.getMessage().contains("tenant_beta"),
+            "error should name both offenders; was: " + ex.getMessage());
+    }
+
+    @Test
+    void validatePrincipalBuilderBindingsNoOpWhenNoTenantListeners() {
+        // Untouched cluster — no tenant.id keys anywhere — must not refuse to
+        // start regardless of what principal.builder.class is set to.
+        Map<String, Object> props = new HashMap<>();
+        TenantConfig.validatePrincipalBuilderBindings(props, String.class);
+    }
+
+    @Test
+    void validatePrincipalBuilderBindingsFailsWhenNoBuilderConfigured() {
+        Map<String, Object> props = new HashMap<>();
+        props.put("listener.name.tenant_acme.tenant.id", "acme");
+
+        // Neither listener-prefixed nor broker-wide default.
+        ConfigException ex = assertThrows(ConfigException.class,
+            () -> TenantConfig.validatePrincipalBuilderBindings(props, null));
+        assertTrue(ex.getMessage().contains("tenant_acme"),
+            "error should name the offending listener; was: " + ex.getMessage());
+    }
 }

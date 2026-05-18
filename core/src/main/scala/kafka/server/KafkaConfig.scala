@@ -761,6 +761,12 @@ class KafkaConfig private(doLog: Boolean, val props: util.Map[_, _])
     require(principalBuilderClass != null, s"${BrokerSecurityConfigs.PRINCIPAL_BUILDER_CLASS_CONFIG} must be non-null")
     require(classOf[KafkaPrincipalSerde].isAssignableFrom(principalBuilderClass),
       s"${BrokerSecurityConfigs.PRINCIPAL_BUILDER_CLASS_CONFIG} must implement KafkaPrincipalSerde")
+
+    // Refuse to start a broker whose tenant-bound listener is paired with the
+    // wrong principal builder. Without TenantPrincipalBuilder, SASL on that
+    // listener produces an unstamped principal and KafkaApis refuses every
+    // request as `isPrivilegedOnTenantListener` — a silent denial of service.
+    org.apache.kafka.server.tenant.TenantConfig.validatePrincipalBuilderBindings(originals, principalBuilderClass)
   }
 
   /**
