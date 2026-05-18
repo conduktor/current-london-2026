@@ -216,6 +216,17 @@ class KafkaApisTest extends Logging {
       concentrationKernel = concentrationKernel)
   }
 
+  // Logical-topic non-produce paths (Fetch / ListOffsets / DeleteRecords) require this broker
+  // to be the leader of the backing partition (Codex Q5 — see KafkaApis.handleFetchRequest).
+  // Tests that exercise the happy path on those paths must stub onlinePartition to return a
+  // Partition with isLeader=true; otherwise the new check rejects with NOT_LEADER_OR_FOLLOWER
+  // before the path under test ever runs.
+  private def stubBackingPartitionAsLeader(): Unit = {
+    val backingPartition = mock(classOf[Partition])
+    when(backingPartition.isLeader).thenReturn(true)
+    when(replicaManager.onlinePartition(any[TopicPartition])).thenReturn(Some(backingPartition))
+  }
+
   private def setupFeatures(featureVersions: Seq[FeatureVersion]): Unit = {
     if (featureVersions.isEmpty) return
 
@@ -2494,6 +2505,11 @@ class KafkaApisTest extends Logging {
     when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
     when(concentrationKernel.describe(logicalTopic)).thenReturn(Optional.of(descriptor))
     when(concentrationKernel.backingPartitionFor(logicalTopic, 0)).thenReturn(2)
+    // Local broker IS the leader of the backing partition — pins this test on the readiness
+    // gate path (not the leader-check path added for Codex Q5). Without this, default Mockito
+    // returns None for onlinePartition, the leader check fires first, and the test passes for
+    // the wrong reason.
+    stubBackingPartitionAsLeader()
     // Gate explicitly closed for the backing partition this fetch would route to.
     when(concentrationKernel.isBackingReady(new TopicPartition(backingTopic, 2))).thenReturn(false)
 
@@ -2551,6 +2567,8 @@ class KafkaApisTest extends Logging {
     when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
     when(concentrationKernel.describe(logicalTopic)).thenReturn(Optional.of(descriptor))
     when(concentrationKernel.backingPartitionFor(logicalTopic, 0)).thenReturn(2)
+    // Local broker IS leader — pin this test on the gate, not the new leader-check (Codex Q5).
+    stubBackingPartitionAsLeader()
     when(concentrationKernel.isBackingReady(new TopicPartition(backingTopic, 2))).thenReturn(false)
 
     val targetTimes = List(new ListOffsetsTopic()
@@ -2590,6 +2608,8 @@ class KafkaApisTest extends Logging {
     when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
     when(concentrationKernel.describe(logicalTopic)).thenReturn(Optional.of(descriptor))
     when(concentrationKernel.backingPartitionFor(logicalTopic, 0)).thenReturn(2)
+    // Local broker IS leader — pin this test on the gate, not the new leader-check (Codex Q5).
+    stubBackingPartitionAsLeader()
     when(concentrationKernel.isBackingReady(new TopicPartition(backingTopic, 2))).thenReturn(false)
 
     val deleteRecordsRequest = new DeleteRecordsRequest.Builder(new DeleteRecordsRequestData()
@@ -2614,6 +2634,161 @@ class KafkaApisTest extends Logging {
     assertEquals(DeleteRecordsResponse.INVALID_LOW_WATERMARK, partitionResult.lowWatermark)
     // Gate must short-circuit BEFORE any tracker mutation.
     verify(concentrationKernel, never()).advanceStartOffset(any[String], anyInt, anyLong)
+  }
+
+  @Test
+  def testFetchOnLogicalTopicWhenLocalBrokerIsNotLeaderReturnsNotLeaderOrFollower(): Unit = {
+    // Codex Q5 on GAP 2: stock consumers can be directed to fetch from a follower replica via
+    // FetchResponse.preferred_read_replica + RackAwareReplicaSelector. Only the LEADER of the
+    // backing partition has authoritative kernel state — the tracker on a follower reflects
+    // no produces (the listener never opens its gate on a follower) or, worse, stale state
+    // left over from a prior leadership term. Returning NOT_LEADER_OR_FOLLOWER routes the
+    // consumer through metadata refresh, which will redirect it back to the leader.
+    //
+    // Pinned: the leader check fires BEFORE the readiness gate. Without this ordering, a
+    // follower with a half-rebuilt tracker could pass an open gate left over from before
+    // the leadership flip and serve garbage.
+    val logicalTopic = "orders"
+    val backingTopic = "concentrated"
+    val backingTopicId = Uuid.randomUuid()
+    val logicalTopicId = Uuid.randomUuid()
+    val descriptor = new LogicalTopicDescriptor(logicalTopic, 1024, backingTopic, 4)
+    addTopicToMetadataCache(backingTopic, numPartitions = 4, topicId = backingTopicId)
+    addTopicToMetadataCache(logicalTopic, numPartitions = 1024, topicId = logicalTopicId)
+
+    when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
+    when(concentrationKernel.describe(logicalTopic)).thenReturn(Optional.of(descriptor))
+    when(concentrationKernel.backingPartitionFor(logicalTopic, 0)).thenReturn(2)
+    // Local broker is a FOLLOWER of the backing partition: onlinePartition returns a partition
+    // whose isLeader is false. (Returning None — the default Mockito behaviour — would also
+    // trigger the rejection, but stubbing isLeader=false here exercises the explicit follower
+    // case that motivated this check.)
+    val backingPartition = mock(classOf[Partition])
+    when(backingPartition.isLeader).thenReturn(false)
+    when(replicaManager.onlinePartition(any[TopicPartition])).thenReturn(Some(backingPartition))
+
+    val logicalTip = new TopicIdPartition(logicalTopicId, new TopicPartition(logicalTopic, 0))
+    val fetchData = Map(logicalTip ->
+      new FetchRequest.PartitionData(logicalTip.topicId, 100L, 0L, 1_000_000, Optional.empty())).asJava
+    val fetchDataBuilder = Map(logicalTip.topicPartition ->
+      new FetchRequest.PartitionData(logicalTip.topicId, 100L, 0L, 1_000_000, Optional.empty())).asJava
+    val fetchContext = new FullFetchContext(time, new FetchSessionCacheShard(1000, 100),
+      new JFetchMetadata(0, 0), fetchData, false, false)
+    when(fetchManager.newContext(
+      any[Short], any[JFetchMetadata], any[Boolean],
+      any[util.Map[TopicIdPartition, FetchRequest.PartitionData]],
+      any[util.List[TopicIdPartition]], any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val fetchRequest = new FetchRequest.Builder(ApiKeys.FETCH.latestVersion,
+      ApiKeys.FETCH.latestVersion, -1, -1, 100, 0, fetchDataBuilder).build()
+    val request = buildRequest(fetchRequest)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleFetchRequest(request)
+
+    // No backing fetch — the leader check fired first.
+    verify(replicaManager, never()).fetchMessages(any[FetchParams],
+      any[Seq[(TopicIdPartition, FetchRequest.PartitionData)]],
+      any[ReplicaQuota],
+      any[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]())
+    // Leader-check ordering: BEFORE the readiness gate (isBackingReady) and BEFORE any kernel
+    // offset translation. The order matters — a follower with an open-by-default gate must
+    // still be rejected before we trust its tracker.
+    verify(concentrationKernel, never()).isBackingReady(any[TopicPartition])
+    verify(concentrationKernel, never()).resolveBackingOffset(any[String], anyInt, anyLong)
+    verify(concentrationKernel, never()).nextLogicalOffset(any[String], anyInt)
+    verify(concentrationKernel, never()).startLogicalOffset(any[String], anyInt)
+
+    val response = verifyNoThrottling[FetchResponse](request)
+    val byTopic = response.data.responses.asScala.find(_.topicId == logicalTopicId).get
+    val partitionResponse = byTopic.partitions.asScala.head
+    assertEquals(Errors.NOT_LEADER_OR_FOLLOWER.code, partitionResponse.errorCode,
+      "Fetch on a backing follower must surface as NOT_LEADER_OR_FOLLOWER so the consumer " +
+        "refreshes metadata and is redirected to the leader (Codex Q5)")
+  }
+
+  @Test
+  def testListOffsetsOnLogicalTopicWhenLocalBrokerIsNotLeaderReturnsNotLeaderOrFollower(): Unit = {
+    // Codex Q5: same contract on ListOffsets. seekToBeginning / seekToEnd against a follower
+    // would return offsets derived from a tracker that never observed the produces. Reject
+    // before any kernel offset read.
+    val logicalTopic = "orders"
+    val backingTopic = "concentrated"
+    val descriptor = new LogicalTopicDescriptor(logicalTopic, 1024, backingTopic, 4)
+    addTopicToMetadataCache(backingTopic, numPartitions = 4)
+
+    when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
+    when(concentrationKernel.describe(logicalTopic)).thenReturn(Optional.of(descriptor))
+    when(concentrationKernel.backingPartitionFor(logicalTopic, 0)).thenReturn(2)
+    val backingPartition = mock(classOf[Partition])
+    when(backingPartition.isLeader).thenReturn(false)
+    when(replicaManager.onlinePartition(any[TopicPartition])).thenReturn(Some(backingPartition))
+
+    val targetTimes = List(new ListOffsetsTopic()
+      .setName(logicalTopic)
+      .setPartitions(List(
+        new ListOffsetsPartition().setPartitionIndex(0).setTimestamp(ListOffsetsRequest.LATEST_TIMESTAMP)
+      ).asJava)).asJava
+    val listOffsetRequest = ListOffsetsRequest.Builder.forConsumer(true, IsolationLevel.READ_UNCOMMITTED)
+      .setTargetTimes(targetTimes).build()
+    val request = buildRequest(listOffsetRequest)
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleListOffsetRequest(request)
+
+    val response = verifyNoThrottling[ListOffsetsResponse](request)
+    val partitionResp = response.topics.asScala.find(_.name == logicalTopic).get.partitions.asScala.head
+    assertEquals(Errors.NOT_LEADER_OR_FOLLOWER.code, partitionResp.errorCode,
+      "ListOffsets on a backing follower must surface as NOT_LEADER_OR_FOLLOWER (Codex Q5)")
+    // Ordering: BEFORE the readiness gate and BEFORE any kernel offset read.
+    verify(concentrationKernel, never()).isBackingReady(any[TopicPartition])
+    verify(concentrationKernel, never()).nextLogicalOffset(any[String], anyInt)
+    verify(concentrationKernel, never()).startLogicalOffset(any[String], anyInt)
+  }
+
+  @Test
+  def testDeleteRecordsOnLogicalTopicWhenLocalBrokerIsNotLeaderReturnsNotLeaderOrFollower(): Unit = {
+    // Codex Q5: admin clients normally route DeleteRecords to the leader via metadata, but the
+    // protocol allows the request to land anywhere. Mutating kernel start offsets on a follower
+    // would silently drift the follower's view of logical start from the leader's, causing
+    // post-truncation reads to disagree across replicas after the next leadership flip.
+    val logicalTopic = "orders"
+    val backingTopic = "concentrated"
+    val descriptor = new LogicalTopicDescriptor(logicalTopic, 1024, backingTopic, 4)
+    when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
+    when(concentrationKernel.describe(logicalTopic)).thenReturn(Optional.of(descriptor))
+    when(concentrationKernel.backingPartitionFor(logicalTopic, 0)).thenReturn(2)
+    val backingPartition = mock(classOf[Partition])
+    when(backingPartition.isLeader).thenReturn(false)
+    when(replicaManager.onlinePartition(any[TopicPartition])).thenReturn(Some(backingPartition))
+
+    val deleteRecordsRequest = new DeleteRecordsRequest.Builder(new DeleteRecordsRequestData()
+      .setTopics(Collections.singletonList(new DeleteRecordsTopic()
+        .setName(logicalTopic)
+        .setPartitions(Collections.singletonList(new DeleteRecordsPartition()
+          .setOffset(50L)
+          .setPartitionIndex(0)))))
+      .setTimeoutMs(5000)).build()
+    val request = buildRequest(deleteRecordsRequest)
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleDeleteRecordsRequest(request)
+
+    val response = verifyNoThrottling[DeleteRecordsResponse](request)
+    val partitionResult = response.data.topics.asScala.head.partitions.asScala.head
+    assertEquals(Errors.NOT_LEADER_OR_FOLLOWER.code, partitionResult.errorCode,
+      "DeleteRecords on a backing follower must surface as NOT_LEADER_OR_FOLLOWER (Codex Q5)")
+    assertEquals(DeleteRecordsResponse.INVALID_LOW_WATERMARK, partitionResult.lowWatermark)
+    // Ordering: BEFORE the readiness gate and BEFORE any tracker mutation.
+    verify(concentrationKernel, never()).isBackingReady(any[TopicPartition])
+    verify(concentrationKernel, never()).advanceStartOffset(any[String], anyInt, anyLong)
+    verify(replicaManager, never()).deleteRecords(anyLong, any(), any(), anyBoolean)
   }
 
   @Test
@@ -2870,6 +3045,7 @@ class KafkaApisTest extends Logging {
     when(concentrationKernel.describe(logicalTopic))
       .thenReturn(Optional.of(new LogicalTopicDescriptor(logicalTopic, 4, "backing-topic", 1)))
     when(concentrationKernel.isBackingReady(any[TopicPartition])).thenReturn(true)
+    stubBackingPartitionAsLeader()
     when(concentrationKernel.startLogicalOffset(logicalTopic, 0)).thenReturn(targetOffset)
 
     val deleteRecordsRequest = new DeleteRecordsRequest.Builder(new DeleteRecordsRequestData()
@@ -2912,6 +3088,7 @@ class KafkaApisTest extends Logging {
     when(concentrationKernel.describe(logicalTopic))
       .thenReturn(Optional.of(new LogicalTopicDescriptor(logicalTopic, 4, "backing-topic", 1)))
     when(concentrationKernel.isBackingReady(any[TopicPartition])).thenReturn(true)
+    stubBackingPartitionAsLeader()
     when(concentrationKernel.nextLogicalOffset(logicalTopic, 0)).thenReturn(highWaterMark)
     when(concentrationKernel.startLogicalOffset(logicalTopic, 0)).thenReturn(highWaterMark)
 
@@ -2948,6 +3125,7 @@ class KafkaApisTest extends Logging {
     when(concentrationKernel.describe(logicalTopic))
       .thenReturn(Optional.of(new LogicalTopicDescriptor(logicalTopic, 4, "backing-topic", 1)))
     when(concentrationKernel.isBackingReady(any[TopicPartition])).thenReturn(true)
+    stubBackingPartitionAsLeader()
     doThrow(new IllegalArgumentException("offset past HW"))
       .when(concentrationKernel).advanceStartOffset(logicalTopic, 0, 9999L)
 
@@ -3023,6 +3201,7 @@ class KafkaApisTest extends Logging {
     when(concentrationKernel.describe(logicalTopic))
       .thenReturn(Optional.of(new LogicalTopicDescriptor(logicalTopic, 4, "backing-topic", 1)))
     when(concentrationKernel.isBackingReady(any[TopicPartition])).thenReturn(true)
+    stubBackingPartitionAsLeader()
     doThrow(new IllegalStateException("ConcentrationKernel is closed"))
       .when(concentrationKernel).advanceStartOffset(logicalTopic, 0, 42L)
 
@@ -3078,6 +3257,7 @@ class KafkaApisTest extends Logging {
     when(concentrationKernel.describe(logicalTopic)).thenReturn(Optional.of(descriptor))
     when(concentrationKernel.backingPartitionFor(logicalTopic, 0)).thenReturn(2)
     when(concentrationKernel.isBackingReady(any[TopicPartition])).thenReturn(true)
+    stubBackingPartitionAsLeader()
     when(concentrationKernel.nextLogicalOffset(logicalTopic, 0)).thenReturn(103L)
     when(concentrationKernel.startLogicalOffset(logicalTopic, 0)).thenReturn(0L)
     when(concentrationKernel.resolveBackingOffset(logicalTopic, 0, 100L)).thenReturn(7777L)
@@ -3193,6 +3373,8 @@ class KafkaApisTest extends Logging {
 
     when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
     when(concentrationKernel.describe(logicalTopic)).thenReturn(Optional.of(descriptor))
+    when(concentrationKernel.isBackingReady(any[TopicPartition])).thenReturn(true)
+    stubBackingPartitionAsLeader()
     // Both logical partitions map to the SAME backing partition — the bug condition.
     when(concentrationKernel.backingPartitionFor(logicalTopic, 0)).thenReturn(2)
     when(concentrationKernel.backingPartitionFor(logicalTopic, 4)).thenReturn(2)
@@ -3316,6 +3498,7 @@ class KafkaApisTest extends Logging {
     when(concentrationKernel.describe(logicalTopic)).thenReturn(Optional.of(descriptor))
     when(concentrationKernel.backingPartitionFor(logicalTopic, 0)).thenReturn(2)
     when(concentrationKernel.isBackingReady(any[TopicPartition])).thenReturn(true)
+    stubBackingPartitionAsLeader()
     when(concentrationKernel.nextLogicalOffset(logicalTopic, 0)).thenReturn(42L)
     when(concentrationKernel.startLogicalOffset(logicalTopic, 0)).thenReturn(0L)
 
@@ -3373,6 +3556,7 @@ class KafkaApisTest extends Logging {
     when(concentrationKernel.describe(logicalTopic)).thenReturn(Optional.of(descriptor))
     when(concentrationKernel.backingPartitionFor(logicalTopic, 0)).thenReturn(2)
     when(concentrationKernel.isBackingReady(any[TopicPartition])).thenReturn(true)
+    stubBackingPartitionAsLeader()
     when(concentrationKernel.nextLogicalOffset(logicalTopic, 0)).thenReturn(50L)
     when(concentrationKernel.startLogicalOffset(logicalTopic, 0)).thenReturn(10L)
 
@@ -4270,6 +4454,7 @@ class KafkaApisTest extends Logging {
     when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
     when(concentrationKernel.describe(logicalTopic)).thenReturn(Optional.of(descriptor))
     when(concentrationKernel.isBackingReady(any[TopicPartition])).thenReturn(true)
+    stubBackingPartitionAsLeader()
     // Pin three distinct values so the assertion proves we forwarded the EARLIEST→start and
     // LATEST→next routing rather than transposing them (a transposition would still pass any
     // "non-zero" check).
@@ -4326,6 +4511,7 @@ class KafkaApisTest extends Logging {
     when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
     when(concentrationKernel.describe(logicalTopic)).thenReturn(Optional.of(descriptor))
     when(concentrationKernel.isBackingReady(any[TopicPartition])).thenReturn(true)
+    stubBackingPartitionAsLeader()
 
     val targetTimes = List(new ListOffsetsTopic()
       .setName(logicalTopic)

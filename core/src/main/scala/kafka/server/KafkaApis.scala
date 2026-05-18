@@ -891,7 +891,19 @@ class KafkaApis(val requestChannel: RequestChannel,
             } else {
               val backingPartition = concentrationKernel.backingPartitionFor(logicalTopic, logicalPartition)
               val backingTp = new TopicIdPartition(backingTopicId, new TopicPartition(backingTopicName, backingPartition))
-              if (!concentrationKernel.isBackingReady(backingTp.topicPartition)) {
+              // Codex Q5 on GAP 2: stock consumers can be directed to fetch from a non-leader
+              // replica via the FetchResponse.preferred_read_replica mechanism (RackAwareReplicaSelector
+              // and friends). A follower of the BACKING partition has no authoritative kernel
+              // state — only the leader's tracker reflects the produces that defined logical
+              // offsets. Serving a logical fetch from a non-leader would either return
+              // OFFSET_OUT_OF_RANGE against a tracker that's been at 0 since boot or, worse,
+              // mis-translate against state left over from a prior leadership term. v1 keeps
+              // the contract narrow: logical fetches must land on the leader of the backing
+              // partition. Returning NOT_LEADER_OR_FOLLOWER routes the consumer through metadata
+              // refresh, which will direct it back to the leader.
+              if (!replicaManager.onlinePartition(backingTp.topicPartition).exists(_.isLeader)) {
+                erroneous += topicIdPartition -> FetchResponse.partitionResponse(topicIdPartition, Errors.NOT_LEADER_OR_FOLLOWER)
+              } else if (!concentrationKernel.isBackingReady(backingTp.topicPartition)) {
                 // Readiness gate closed for this backing partition. The local sidecar / tracker
                 // for this backing TP is being rebuilt after a leader-loss / leader-acquisition
                 // transition. Serving a fetch now would translate against stale physical→logical
@@ -1246,6 +1258,16 @@ class KafkaApis(val requestChannel: RequestChannel,
           val descriptor = descriptorOpt.get
           if (part.partitionIndex < 0 || part.partitionIndex >= descriptor.numLogicalPartitions) {
             buildErrorResponse(Errors.UNKNOWN_TOPIC_OR_PARTITION, part)
+          } else if (!replicaManager.onlinePartition(
+              new TopicPartition(descriptor.backingTopic,
+                concentrationKernel.backingPartitionFor(topic.name, part.partitionIndex)))
+              .exists(_.isLeader)) {
+            // Codex Q5: same leader-only contract as Fetch. ListOffsets called against a
+            // non-leader broker would consult a kernel tracker that has never observed the
+            // produces (only the leader did) — returning startLogicalOffset = 0 / next = 0
+            // misleads seekToBeginning / seekToEnd. NOT_LEADER_OR_FOLLOWER routes the consumer
+            // through metadata refresh back to the leader.
+            buildErrorResponse(Errors.NOT_LEADER_OR_FOLLOWER, part)
           } else if (!concentrationKernel.isBackingReady(
               new TopicPartition(descriptor.backingTopic,
                 concentrationKernel.backingPartitionFor(topic.name, part.partitionIndex)))) {
@@ -2026,6 +2048,18 @@ class KafkaApis(val requestChannel: RequestChannel,
           logicalTopicResponses += topicPartition -> new DeleteRecordsPartitionResult()
             .setLowWatermark(DeleteRecordsResponse.INVALID_LOW_WATERMARK)
             .setErrorCode(Errors.UNKNOWN_TOPIC_OR_PARTITION.code)
+        } else if (!replicaManager.onlinePartition(
+            new TopicPartition(descriptor.backingTopic,
+              concentrationKernel.backingPartitionFor(topicPartition.topic, topicPartition.partition)))
+            .exists(_.isLeader)) {
+          // Codex Q5: admin clients normally route DeleteRecords to the leader via metadata,
+          // but the protocol allows the request to land on any broker. Mutating kernel start
+          // offsets on a non-leader would silently drift the follower's view of logical start
+          // from the leader's, causing post-truncation reads to disagree across replicas after
+          // the next leadership flip. Reject and force the admin client to refresh metadata.
+          logicalTopicResponses += topicPartition -> new DeleteRecordsPartitionResult()
+            .setLowWatermark(DeleteRecordsResponse.INVALID_LOW_WATERMARK)
+            .setErrorCode(Errors.NOT_LEADER_OR_FOLLOWER.code)
         } else if (!concentrationKernel.isBackingReady(
             new TopicPartition(descriptor.backingTopic,
               concentrationKernel.backingPartitionFor(topicPartition.topic, topicPartition.partition)))) {
