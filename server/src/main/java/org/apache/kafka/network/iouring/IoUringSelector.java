@@ -170,6 +170,18 @@ public final class IoUringSelector implements BrokerSelector {
     private final List<NetworkSend> completedSends = new ArrayList<>();
     private final Map<String, ChannelState> disconnected = new HashMap<>();
     private final List<String> connected = new ArrayList<>();
+    /**
+     * Channels that just surfaced in {@link #connected} during this poll. The read step
+     * (poll step 2) skips them so a newly-accepted channel cannot produce a
+     * {@code completedReceive} in the same poll where it first appears to the Processor —
+     * otherwise SocketServer.applyConnectionQuotasForNewlyAcceptedChannels (which runs
+     * AFTER poll and may refuse the channel via {@code selector.close}) would leave a
+     * receive in {@link #completedReceives} pointing at a channel already removed, and
+     * Processor.processCompletedReceives would (a) emit the request to the request queue
+     * before the refusal completes, and (b) trip an IllegalStateException whose cleanup
+     * path calls {@code connectionQuotas.dec} on a connection that was never {@code inc}'d.
+     */
+    private final Set<String> justAccepted = new HashSet<>();
 
     private final AtomicLong idGen = new AtomicLong();
     private volatile boolean closed;
@@ -294,6 +306,7 @@ public final class IoUringSelector implements BrokerSelector {
         completedSends.clear();
         disconnected.clear();
         connected.clear();
+        justAccepted.clear();
 
         // Capture once, BEFORE I/O, so a channel that progresses this poll never expires this poll.
         long nowNanos = time.nanoseconds();
@@ -312,14 +325,19 @@ public final class IoUringSelector implements BrokerSelector {
                 log.debug("PLAINTEXT prepare unexpectedly failed for {}", acceptedChannel.id(), e);
             }
             connected.add(acceptedChannel.id());
+            justAccepted.add(acceptedChannel.id());
             madeProgress = true;
         }
 
         // 2. For each active channel, do at most one read and one write step.
+        //    Channels in justAccepted (added this same poll's step 1) are deferred until
+        //    the next poll — SocketServer must run applyConnectionQuotasForNewlyAcceptedChannels
+        //    against the freshly-connected channel before we surface any receive from it.
         for (Iterator<Map.Entry<String, KafkaChannel>> it = channels.entrySet().iterator(); it.hasNext(); ) {
             Map.Entry<String, KafkaChannel> entry = it.next();
             KafkaChannel channel = entry.getValue();
             if (!channel.ready()) continue;
+            if (justAccepted.contains(channel.id())) continue;
 
             // Read step.
             if (!mutedChannelIds.contains(channel.id())) {

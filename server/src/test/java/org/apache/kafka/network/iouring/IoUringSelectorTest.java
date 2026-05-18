@@ -156,6 +156,35 @@ class IoUringSelectorTest {
     }
 
     @Test
+    void newlyAcceptedChannelDoesNotSurfaceReceiveInSamePoll() throws Exception {
+        // Regression: a freshly-accepted channel that receives bytes in the same poll
+        // window as the accept must not produce a completedReceive on that poll. The
+        // Processor's loop is poll() -> applyConnectionQuotasForNewlyAcceptedChannels()
+        // -> processCompletedReceives(); if a receive surfaced before the quota check
+        // had run, a refused connection (tryInc=false, or TooMany after close) would
+        // (a) leak a request into the request queue and (b) trip an IllegalStateException
+        // in processCompletedReceives whose cleanup path calls connectionQuotas.dec on
+        // a never-inc'd connection.
+        IoUringSelector s = newSelector(IDLE_NANOS_NEVER);
+        EmbeddedChannel netty = acceptNew(s, REMOTE_A);
+
+        // Bytes arrive before the very first poll — same window as the accept.
+        s.onRead(netty, framed("payload"));
+
+        s.poll(0);
+
+        assertEquals(1, s.connected().size(),
+            "channel must still surface in connected() on the accept poll");
+        assertTrue(s.completedReceives().isEmpty(),
+            "no receive may surface on the same poll as the accept — quota gate must run first");
+
+        // The very next poll, with no fresh accepts, drains the buffered receive.
+        s.poll(0);
+        assertEquals(1, s.completedReceives().size(),
+            "buffered receive surfaces on the next poll, once the quota gate has had a chance to refuse");
+    }
+
+    @Test
     void atMostOneCompletedReceivePerChannelPerPoll() throws Exception {
         // Mirrors org.apache.kafka.common.network.Selector's "one completed receive per channel
         // per poll" invariant — the broker's request-handling expects that fairness guarantee.

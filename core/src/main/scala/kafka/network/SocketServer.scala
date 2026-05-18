@@ -1210,9 +1210,18 @@ private[kafka] class Processor(
    * Apply ConnectionQuotas.inc for channels that just surfaced from selector.connected().
    * io_uring listeners accept inside Netty's event loop and never went through
    * Acceptor.accept (which is where NIO inc'd the quota), so the gate has to land here
-   * instead. If the quota is exhausted we close the channel via selector — it will then
-   * surface in selector.disconnected() and processDisconnected will run the normal
-   * connectionQuotas.dec / disconnect-listener path.
+   * instead.
+   *
+   * Refusal paths:
+   *  - tryInc returns false (broker max-connections hit, or listener connection-rate
+   *    throttle): no inc happened, so we just close the selector channel.
+   *  - TooManyConnectionsException: tryInc increments the per-IP / listener / total
+   *    counters BEFORE checking the per-IP max (see ConnectionQuotas.tryInc), so by
+   *    the time the exception fires the inc has already landed. selector.close on the
+   *    io_uring path is silent (it does NOT surface in selector.disconnected, so
+   *    processDisconnected will not run the normal dec). Roll the inc back here.
+   *  - ConnectionThrottledException: thrown by recordIpConnectionMaybeThrottle, which
+   *    runs before the inc, so no rollback is needed.
    *
    * For NIO listeners selector.connected() is always empty (broker-side Processors don't
    * initiate outgoing connections), so this method is a hot-path no-op there.
@@ -1228,9 +1237,7 @@ private[kafka] class Processor(
           try {
             // tryInc — never blocks. On NIO the dedicated Acceptor thread can wait for a
             // slot via inc(); here the caller is the Processor's poll loop, so a wait
-            // would stall every other channel on this Processor. Refusal here closes the
-            // channel; the next disconnect tick runs the normal dec()/disconnect-listener
-            // path. See ConnectionQuotas.tryInc for the un-record accounting.
+            // would stall every other channel on this Processor.
             if (!connectionQuotas.tryInc(listenerName, address)) {
               info(s"Closing io_uring connection $connectionId from $address: broker- or " +
                 s"listener-level connection slot unavailable or rate-limited.")
@@ -1240,6 +1247,11 @@ private[kafka] class Processor(
             case e: TooManyConnectionsException =>
               info(s"Closing io_uring connection $connectionId from ${e.ip}: " +
                 s"already has the configured maximum of ${e.count} connections.")
+              // tryInc incremented counts before throwing; selector.close is silent on
+              // the io_uring path, so processDisconnected will not run dec. Roll back
+              // the inc explicitly, otherwise the per-IP / listener / total counters
+              // leak permanently and the next refusal compares against a stale count.
+              connectionQuotas.dec(listenerName, address)
               selector.close(connectionId)
             case e: ConnectionThrottledException =>
               debug(s"Closing throttled io_uring connection $connectionId from $address " +

@@ -991,6 +991,41 @@ class ConnectionQuotasTest {
   }
 
   @Test
+  def testTryIncIncrementsBeforeThrowingTooManyConnectionsException(): Unit = {
+    // Contract: tryInc bumps the per-IP / listener / total counters BEFORE checking the
+    // per-IP max, so when it throws TooManyConnectionsException the inc has already
+    // landed. Callers MUST roll the increment back with dec(); otherwise the counter
+    // leaks permanently and the next refusal compares against a stale count. This is
+    // the contract relied upon by SocketServer.applyConnectionQuotasForNewlyAcceptedChannels
+    // on the io_uring path, where selector.close is silent (no processDisconnected dec).
+    val maxConnectionsPerIp = 2
+    val props = brokerPropsWithDefaultConnectionLimits
+    props.put(SocketServerConfigs.MAX_CONNECTIONS_PER_IP_CONFIG, maxConnectionsPerIp.toString)
+    val config = KafkaConfig.fromProps(props)
+    connectionQuotas = new ConnectionQuotas(config, time, metrics)
+    addListenersAndVerify(config, connectionQuotas)
+
+    val external = listeners("EXTERNAL")
+    // Saturate the per-IP limit.
+    for (_ <- 0 until maxConnectionsPerIp)
+      assertTrue(connectionQuotas.tryInc(external.listenerName, external.defaultIp))
+    assertEquals(maxConnectionsPerIp, connectionQuotas.get(external.defaultIp))
+
+    // The next tryInc throws TooManyConnectionsException, but only AFTER bumping the
+    // counter past the limit. Verify the bump landed by reading get() in the catch.
+    assertThrows(classOf[TooManyConnectionsException],
+      () => connectionQuotas.tryInc(external.listenerName, external.defaultIp))
+    assertEquals(maxConnectionsPerIp + 1, connectionQuotas.get(external.defaultIp),
+      "tryInc must have incremented the counter before throwing — caller is responsible for rolling back via dec")
+
+    // The applyConnectionQuotasForNewlyAcceptedChannels TooManyConnectionsException catch
+    // handler rolls the inc back with dec(); after that the count is back at the cap.
+    connectionQuotas.dec(external.listenerName, external.defaultIp)
+    assertEquals(maxConnectionsPerIp, connectionQuotas.get(external.defaultIp),
+      "after rollback the per-IP count must reflect only the genuine connections")
+  }
+
+  @Test
   def testTryIncReturnsTrueAndIncrementsCountInTheHappyPath(): Unit = {
     // Plain success case: well within all quotas, tryInc must accept and bump the
     // per-IP/listener counters identically to inc().
