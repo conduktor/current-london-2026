@@ -638,6 +638,18 @@ class KafkaApis(val requestChannel: RequestChannel,
     // can filter records and key the response back at the view. Follower fetches are skipped on
     // purpose — views are a consumer-side concept; replicas mirror the physical (backing) topic.
     //
+    // AUTHORIZATION MODEL: the READ-on-TOPIC check above (line ~625) ran against the view's
+    // topic name. The redirect to the backing topic happens HERE, after the ACL decision; the
+    // backing topic's ACLs are deliberately NOT re-checked on the redirect path. This is the
+    // intended behavior: views exist to expose a filtered projection of a sensitive backing
+    // topic to consumers who should not be able to read the unfiltered stream. Operators must
+    // therefore treat the choice of view.cel.predicate as a security-relevant decision — a
+    // permissive predicate effectively grants READ on the matching subset of the backing topic.
+    // See ViewTopicConfig javadoc for the full model. Do NOT add a second READ check against
+    // the backing topic here without first reviewing the threat model: it would defeat the
+    // primary use case of views (selective READ access). Restrictions on view consumers reading
+    // the backing topic *directly* are still enforced by the backing topic's own ACLs.
+    //
     // Single-view-per-backing-partition-per-request invariant: if a single FetchRequest contains
     // two views over the SAME backing partition, the second is rejected with INVALID_REQUEST. The
     // honest answer here is that the replica fetch API is keyed by TopicIdPartition, so two views
