@@ -180,6 +180,26 @@ public class RuleJsonCodecTest {
     }
 
     @Test
+    public void oversizedEnvelopeRejectedBeforeParsing() {
+        // A single admin-published record at the broker's max.message.bytes
+        // would otherwise force the drain thread to allocate a multi-MB
+        // JsonNode tree. RuleJsonCodec caps the input size up front; the
+        // operator sees a clear error pointing at the rule id, the broker's
+        // drain thread never walks the payload.
+        StringBuilder pad = new StringBuilder("{\"apiKeys\":[\"METADATA\"],\"action\":\"DENY\","
+            + "\"when\":\"true\",\"errorCode\":1,\"padding\":\"");
+        for (int n = 0; n < RuleJsonCodec.MAX_ENVELOPE_BYTES + 64; n++) {
+            pad.append('x');
+        }
+        pad.append("\"}");
+        RuleEnvelopeException ex = assertThrows(
+            RuleEnvelopeException.class,
+            () -> RuleJsonCodec.decode("huge", pad.toString().getBytes(StandardCharsets.UTF_8)));
+        assertTrue(ex.getMessage().contains("max allowed"),
+            "expected size-limit error, got: " + ex.getMessage());
+    }
+
+    @Test
     public void unknownTopLevelFieldsAreToleratedForForwardCompatibility() {
         // Rule envelopes are written by users / tooling. Tolerate unknown
         // top-level fields so v1 brokers don't reject v2-augmented envelopes.

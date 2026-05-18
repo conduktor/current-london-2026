@@ -70,6 +70,24 @@ public final class RuleJsonCodec {
     private static final String FIELD_WHEN = "when";
     private static final String FIELD_ERROR_CODE = "errorCode";
 
+    /**
+     * Maximum envelope size accepted by {@link #decode(String, byte[])}.
+     * A legitimate envelope is well under 1 KB — four fields, with the longest
+     * being the CEL source (itself bounded by
+     * {@code CelLimits.MAX_EXPR_LEN}=8192) and an apiKeys array (bounded by
+     * ApiKeys.values().length). 65 KB leaves three orders of magnitude of
+     * headroom for any legitimate authoring tool while bounding the work the
+     * broker's drain thread does on a malicious or accidentally-large record
+     * before Jackson's parser has to walk it.
+     *
+     * <p>The cap is a defense-in-depth complement to the broker-side
+     * {@code max.message.bytes} (default 1 MiB). Without this cap a single
+     * adversarial admin-published record at the broker-config limit would
+     * force the drain thread to allocate a multi-MB JsonNode tree before
+     * even hitting the per-field validation.
+     */
+    static final int MAX_ENVELOPE_BYTES = 65 * 1024;
+
     private RuleJsonCodec() {
     }
 
@@ -86,6 +104,15 @@ public final class RuleJsonCodec {
         }
         if (value == null) {
             throw new RuleEnvelopeException("rule envelope is null (tombstones must be handled by the loader, not the codec)");
+        }
+        // Reject oversized envelopes before letting Jackson walk them. The
+        // broker drain thread allocates a JsonNode tree proportional to the
+        // input; capping the input size bounds that allocation regardless of
+        // the broker's max.message.bytes configuration.
+        if (value.length > MAX_ENVELOPE_BYTES) {
+            throw new RuleEnvelopeException(
+                "rule envelope is " + value.length + " bytes; max allowed is "
+                    + MAX_ENVELOPE_BYTES + " (rule id: '" + id + "')");
         }
         JsonNode root = parseJson(value);
         if (!root.isObject()) {
