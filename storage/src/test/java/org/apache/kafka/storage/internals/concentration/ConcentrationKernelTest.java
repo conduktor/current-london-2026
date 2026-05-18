@@ -726,14 +726,53 @@ public class ConcentrationKernelTest {
     }
 
     @Test
-    public void assertBackingTopicNotCompactedCachesValidatedBackingsForHotPath() {
-        // After the first successful check, subsequent calls must NOT re-evaluate the policy
-        // argument — the broker passes whatever it has resolved on the hot path, and a cached
-        // backing must short-circuit before reaching the "compact" string check. We assert this by
-        // calling first with "delete" (validates + caches), then with "compact" (would normally
-        // throw) and confirming no exception: the cache hit short-circuits the check.
+    public void assertBackingTopicNotCompactedShortCircuitsOnSamePolicyRepeated() {
+        // Repeated calls with the SAME policy must short-circuit so the hot path pays only a
+        // ConcurrentHashMap.get + String.equals. We assert no exception is thrown across many
+        // calls; the absence of a re-evaluation can only be observed indirectly (any thrown
+        // exception would surface here), but the post-condition we care about is correctness.
         kernel.assertBackingTopicNotCompacted("shared", "delete");
-        kernel.assertBackingTopicNotCompacted("shared", "compact");
+        for (int i = 0; i < 10; i++) {
+            kernel.assertBackingTopicNotCompacted("shared", "delete");
+        }
+    }
+
+    @Test
+    public void assertBackingTopicNotCompactedRevalidatesAfterAlterConfigsFlipToCompact() {
+        // The staleness vector: once a backing was validated as "delete", a subsequent
+        // AlterConfigs flipping cleanup.policy to "compact" must be caught on the next produce.
+        // The broker calls assertBackingTopicNotCompacted with the freshly-resolved policy string
+        // every time, so a change in the argument has to invalidate the cached verdict instead of
+        // being suppressed by it.
+        kernel.assertBackingTopicNotCompacted("shared", "delete");
+        IllegalStateException e = assertThrows(IllegalStateException.class,
+            () -> kernel.assertBackingTopicNotCompacted("shared", "compact"));
+        assertTrue(e.getMessage().contains("shared"));
+        assertTrue(e.getMessage().contains("compact"));
+    }
+
+    @Test
+    public void assertBackingTopicNotCompactedRejectsOnEveryCallAfterCompactFlip() {
+        // Once we have rejected "compact" for a backing, a subsequent call with the same
+        // "compact" must STILL throw — the rejection must NOT have been cached as a "fine"
+        // verdict, and the stale "delete" verdict must have been removed so it doesn't suppress
+        // the second rejection either.
+        kernel.assertBackingTopicNotCompacted("shared", "delete");
+        assertThrows(IllegalStateException.class,
+            () -> kernel.assertBackingTopicNotCompacted("shared", "compact"));
+        assertThrows(IllegalStateException.class,
+            () -> kernel.assertBackingTopicNotCompacted("shared", "compact"));
+    }
+
+    @Test
+    public void assertBackingTopicNotCompactedRecoversWhenPolicyFlipsBackToDelete() {
+        // After a transient compact verdict (operator typo, rolled back), flipping back to
+        // delete must succeed on the next call — no permanent quarantine of a backing once
+        // a stale verdict was observed.
+        kernel.assertBackingTopicNotCompacted("shared", "delete");
+        assertThrows(IllegalStateException.class,
+            () -> kernel.assertBackingTopicNotCompacted("shared", "compact"));
+        kernel.assertBackingTopicNotCompacted("shared", "delete");
     }
 
     @Test

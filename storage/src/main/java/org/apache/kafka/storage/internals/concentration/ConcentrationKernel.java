@@ -84,13 +84,14 @@ public final class ConcentrationKernel implements AutoCloseable {
     private final BackingScanRecoverer recoverer;
     private final ConcurrentHashMap<LogicalPartition, LogicalSidecarIndex> sidecars = new ConcurrentHashMap<>();
     /**
-     * Set of backing topic names whose cleanup.policy has already been confirmed non-compacted in
-     * this broker process. v1 cannot serve concentration on a compacted backing — see
-     * {@link #assertBackingTopicNotCompacted(String, String)} for the rationale. Once confirmed,
-     * subsequent checks short-circuit to a single hash lookup so the produce/fetch hot path pays
-     * essentially nothing.
+     * Backing topic name → last cleanup.policy string we validated as non-compacted. v1 cannot
+     * serve concentration on a compacted backing — see {@link #assertBackingTopicNotCompacted}
+     * for the rationale. The cache is keyed on (backing, policy) rather than backing alone so
+     * that a dynamic {@code AlterConfigs} flipping a backing to {@code compact} is caught on the
+     * next produce instead of being suppressed forever by a one-time "fine" verdict. Cost on the
+     * hot path is still one {@code ConcurrentHashMap.get} plus a string equality check.
      */
-    private final ConcurrentHashMap<String, Boolean> validatedBackingTopics = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, String> validatedBackingTopics = new ConcurrentHashMap<>();
     /**
      * Outer key: logical partition. Inner key: producerId. Value: bounded deque (FIFO, max
      * {@link #MAX_BATCHES_PER_PRODUCER}) of recent batches. Access is serialised on the inner
@@ -166,18 +167,26 @@ public final class ConcentrationKernel implements AutoCloseable {
      */
     public void assertBackingTopicNotCompacted(String backingTopic, String cleanupPolicy) {
         Objects.requireNonNull(backingTopic, "backingTopic");
-        if (validatedBackingTopics.containsKey(backingTopic)) {
+        String resolved = cleanupPolicy == null ? "delete" : cleanupPolicy;
+        // Compare to the LAST policy we validated, not just "have we ever validated this backing".
+        // A dynamic AlterConfigs that flips cleanup.policy to compact must invalidate the verdict
+        // — otherwise the broker would keep serving logical produces on a now-compacted backing
+        // and silently lose records when the cleaner runs.
+        String lastValidated = validatedBackingTopics.get(backingTopic);
+        if (resolved.equals(lastValidated)) {
             return;
         }
-        String resolved = cleanupPolicy == null ? "delete" : cleanupPolicy;
         if (resolved.contains("compact")) {
+            // Drop any stale "fine" verdict for this backing so a subsequent flip-back to delete
+            // forces a fresh validation rather than returning instantly with the old verdict.
+            validatedBackingTopics.remove(backingTopic);
             throw new IllegalStateException(
                 "Backing topic '" + backingTopic + "' has cleanup.policy='" + resolved
                 + "'; concentration v1 requires a non-compacted backing — compaction would let "
                 + "different logical topics tombstone each other on shared keys (silent data loss). "
                 + "Set cleanup.policy=delete on the backing topic before declaring logical topics on it.");
         }
-        validatedBackingTopics.put(backingTopic, Boolean.TRUE);
+        validatedBackingTopics.put(backingTopic, resolved);
     }
 
     // ------------------ Routing ------------------
