@@ -345,7 +345,7 @@ class CompiledPredicateTest {
     @Test
     void skipsRecordWhenStepCapExceeded() {
         PredicateLimits cheap = new PredicateLimits(4096, 32, 256, 16, 256,
-                /*maxStepsPerEval*/3, 1 << 20, 32);
+                /*maxStepsPerEval*/3, 1 << 20, 32, 64 * 1024);
         CompiledPredicate p = new PredicateCompiler(cheap)
                 .compile("body.a == 1 && body.b == 2 && body.c == 3 && body.d == 4");
         Optional<Boolean> r = p.evaluate(jsonRecord("{\"a\":1,\"b\":2,\"c\":3,\"d\":4}"));
@@ -356,7 +356,7 @@ class CompiledPredicateTest {
     @Test
     void skipsRecordWhenBodyExceedsByteCap() {
         PredicateLimits tightBody = new PredicateLimits(4096, 32, 256, 16, 256, 1000,
-                /*maxBodyBytes*/8, 32);
+                /*maxBodyBytes*/8, 32, 64 * 1024);
         CompiledPredicate p = new PredicateCompiler(tightBody).compile("body.x == 1");
         Optional<Boolean> r = p.evaluate(jsonRecord("{\"x\":1, \"padding\":\"too-big\"}", tightBody));
         assertTrue(r.isEmpty(),
@@ -366,11 +366,38 @@ class CompiledPredicateTest {
     @Test
     void skipsRecordWhenJsonDepthExceedsCap() {
         PredicateLimits shallowJson = new PredicateLimits(4096, 32, 256, 16, 256, 1000,
-                1 << 20, /*maxJsonDepth*/2);
+                1 << 20, /*maxJsonDepth*/2, 64 * 1024);
         CompiledPredicate p = new PredicateCompiler(shallowJson).compile("body.a.b.c == 1");
         Optional<Boolean> r = p.evaluate(jsonRecord("{\"a\":{\"b\":{\"c\":1}}}", shallowJson));
         assertTrue(r.isEmpty(),
                 () -> "expected skip when JSON depth exceeds cap, got " + r);
+    }
+
+    @Test
+    void oversizedJsonScalarStringSkipsRecord() {
+        // PROMPT.md scenario list explicitly calls out "oversized JSON strings" as record-skip.
+        // A single string field whose length exceeds maxScalarStringChars must NOT slip past
+        // just because the surrounding body fits inside maxBodyBytes — otherwise an adversary
+        // who can write a 2 MiB single-field payload bypasses the per-scalar cost ceiling.
+        PredicateLimits tightScalar = new PredicateLimits(4096, 32, 256, 16, 256, 1000,
+                1 << 20, 32, /*maxScalarStringChars*/8);
+        CompiledPredicate p = new PredicateCompiler(tightScalar).compile("body.s != 'foo'");
+        // 16 chars > cap of 8. Without the cap the predicate would see "aaaaaaaaaaaaaaaa" != "foo"
+        // and retain the record — verify it skips instead.
+        Optional<Boolean> r = p.evaluate(jsonRecord("{\"s\":\"aaaaaaaaaaaaaaaa\"}", tightScalar));
+        assertTrue(r.isEmpty(),
+                () -> "expected skip when JSON scalar string exceeds maxScalarStringChars, got " + r);
+    }
+
+    @Test
+    void subCapJsonScalarStringEvaluatesNormally() {
+        // Sanity: strings up to maxScalarStringChars still resolve and feed the predicate.
+        PredicateLimits cap = new PredicateLimits(4096, 32, 256, 16, 256, 1000,
+                1 << 20, 32, /*maxScalarStringChars*/8);
+        CompiledPredicate p = new PredicateCompiler(cap).compile("body.s == 'abcdefgh'");
+        Optional<Boolean> r = p.evaluate(jsonRecord("{\"s\":\"abcdefgh\"}", cap));
+        assertTrue(r.isPresent() && r.get(),
+                () -> "expected true for at-cap scalar string, got " + r);
     }
 
     @Test

@@ -34,6 +34,10 @@ package org.apache.kafka.server.views;
  *  - maxStepsPerEval: catastrophic per-record cost on a hot path.
  *  - maxBodyBytes: oversized record values feeding the JSON parser.
  *  - maxJsonDepth: deeply nested JSON exhausting the parser stack.
+ *  - maxScalarStringChars: an individual JSON string scalar that exceeds this length is treated
+ *    as malformed (record-skip) even when the surrounding body fits inside maxBodyBytes. The spec
+ *    (PROMPT.md scenario list) calls out "oversized JSON strings" as a record-skip case, so a
+ *    multi-MB single-field value cannot slip through merely because the rest of the body is small.
  */
 public final class PredicateLimits {
     public final int maxSourceLength;
@@ -44,18 +48,21 @@ public final class PredicateLimits {
     public final int maxStepsPerEval;
     public final int maxBodyBytes;
     public final int maxJsonDepth;
+    public final int maxScalarStringChars;
 
     public PredicateLimits(int maxSourceLength, int maxParenDepth,
                            int maxNodes, int maxDepth, int maxStringLiteralLength,
-                           int maxStepsPerEval, int maxBodyBytes, int maxJsonDepth) {
-        if (maxSourceLength <= 0) throw new IllegalArgumentException("maxSourceLength must be > 0");
-        if (maxParenDepth <= 0) throw new IllegalArgumentException("maxParenDepth must be > 0");
-        if (maxNodes <= 0) throw new IllegalArgumentException("maxNodes must be > 0");
-        if (maxDepth <= 0) throw new IllegalArgumentException("maxDepth must be > 0");
-        if (maxStringLiteralLength <= 0) throw new IllegalArgumentException("maxStringLiteralLength must be > 0");
-        if (maxStepsPerEval <= 0) throw new IllegalArgumentException("maxStepsPerEval must be > 0");
-        if (maxBodyBytes <= 0) throw new IllegalArgumentException("maxBodyBytes must be > 0");
-        if (maxJsonDepth <= 0) throw new IllegalArgumentException("maxJsonDepth must be > 0");
+                           int maxStepsPerEval, int maxBodyBytes, int maxJsonDepth,
+                           int maxScalarStringChars) {
+        requirePositive("maxSourceLength", maxSourceLength);
+        requirePositive("maxParenDepth", maxParenDepth);
+        requirePositive("maxNodes", maxNodes);
+        requirePositive("maxDepth", maxDepth);
+        requirePositive("maxStringLiteralLength", maxStringLiteralLength);
+        requirePositive("maxStepsPerEval", maxStepsPerEval);
+        requirePositive("maxBodyBytes", maxBodyBytes);
+        requirePositive("maxJsonDepth", maxJsonDepth);
+        requirePositive("maxScalarStringChars", maxScalarStringChars);
         this.maxSourceLength = maxSourceLength;
         this.maxParenDepth = maxParenDepth;
         this.maxNodes = maxNodes;
@@ -64,6 +71,11 @@ public final class PredicateLimits {
         this.maxStepsPerEval = maxStepsPerEval;
         this.maxBodyBytes = maxBodyBytes;
         this.maxJsonDepth = maxJsonDepth;
+        this.maxScalarStringChars = maxScalarStringChars;
+    }
+
+    private static void requirePositive(String name, int value) {
+        if (value <= 0) throw new IllegalArgumentException(name + " must be > 0");
     }
 
     public static PredicateLimits defaults() {
@@ -75,7 +87,8 @@ public final class PredicateLimits {
             /*maxStringLiteralLength*/ 1024,
             /*maxStepsPerEval*/ 1000,
             /*maxBodyBytes*/ 1 << 20,
-            /*maxJsonDepth*/ 32
+            /*maxJsonDepth*/ 32,
+            /*maxScalarStringChars*/ 64 * 1024
         );
     }
 }

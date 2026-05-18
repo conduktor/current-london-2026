@@ -207,7 +207,7 @@ public final class RecordContexts {
             if (cachedBodyPaths.containsKey(cacheKey)) {
                 return cachedBodyPaths.get(cacheKey);
             }
-            Object result = parseAndNavigate(body, path, limits.maxJsonDepth);
+            Object result = parseAndNavigate(body, path, limits.maxJsonDepth, limits.maxScalarStringChars);
             if (result == BODY_UNUSABLE) {
                 bodyUnusable = true;
                 return BODY_UNUSABLE;
@@ -256,13 +256,13 @@ public final class RecordContexts {
      * predicates whose path traverses an intermediate level with duplicate sibling keys
      * always refuse the record rather than silently picking one occurrence.
      */
-    private static Object parseAndNavigate(byte[] body, List<String> path, int maxDepth) {
+    private static Object parseAndNavigate(byte[] body, List<String> path, int maxDepth, int maxScalarStringChars) {
         // Replay parsers (one per intermediate-level descent that captured a subtree into a
         // TokenBuffer) must be closed alongside the root parser. Tracked in a list because we
         // only know how many we need as we descend.
         List<JsonParser> open = new ArrayList<>(1);
         try {
-            return navigate(body, path, maxDepth, open);
+            return navigate(body, path, maxDepth, maxScalarStringChars, open);
         } catch (IOException e) {
             return RecordContext.BODY_UNUSABLE;
         } finally {
@@ -273,8 +273,8 @@ public final class RecordContexts {
     /** The descent body of {@link #parseAndNavigate}. Pulled out so the outer method holds only
      *  the resource-management try/catch/finally — the descent logic alone keeps NPath complexity
      *  inside the project's checkstyle threshold. */
-    private static Object navigate(byte[] body, List<String> path, int maxDepth, List<JsonParser> open)
-            throws IOException {
+    private static Object navigate(byte[] body, List<String> path, int maxDepth, int maxScalarStringChars,
+                                   List<JsonParser> open) throws IOException {
         JsonParser current = JSON_FACTORY.createParser(new ByteArrayInputStream(body));
         open.add(current);
         JsonToken t = current.nextToken();
@@ -289,7 +289,7 @@ public final class RecordContexts {
             if (pi + 1 > maxDepth) {
                 return RecordContext.BODY_UNUSABLE;
             }
-            NavStep step = findField(current, path.get(pi), pi == path.size() - 1);
+            NavStep step = findField(current, path.get(pi), pi == path.size() - 1, maxScalarStringChars);
             if (step == NavStep.MALFORMED) {
                 return RecordContext.BODY_UNUSABLE;
             }
@@ -313,7 +313,7 @@ public final class RecordContexts {
         }
         // Leaf wasn't pre-captured (e.g. compound at leaf position, or empty path so {@code t}
         // is still the root). Fall back to reading at the current parser position.
-        return extractLeaf(current, t);
+        return extractLeaf(current, t, maxScalarStringChars);
     }
 
     private static void closeAll(List<JsonParser> parsers) {
@@ -347,7 +347,8 @@ public final class RecordContexts {
      * {@link TokenBuffer}, and a replay parser ({@link NavStep#replayParser}) is handed back
      * so the outer loop can descend into the captured subtree on the next iteration.
      */
-    private static NavStep findField(JsonParser p, String wanted, boolean isLastStep) throws IOException {
+    private static NavStep findField(JsonParser p, String wanted, boolean isLastStep, int maxScalarStringChars)
+            throws IOException {
         JsonToken t;
         JsonToken matchedToken = null;
         Object capturedScalar = ScalarSlot.UNSET;
@@ -366,7 +367,7 @@ public final class RecordContexts {
                 matchedToken = valueToken;
                 if (isLastStep) {
                     // Leaf level: capture the scalar value before the parser moves on.
-                    capturedScalar = extractLeaf(p, valueToken);
+                    capturedScalar = extractLeaf(p, valueToken, maxScalarStringChars);
                     if (valueToken == JsonToken.START_OBJECT || valueToken == JsonToken.START_ARRAY) {
                         // Compound at leaf position; captured value is null (extractLeaf semantics).
                         // We still must skip children so the duplicate-scan stays at the correct level.
@@ -419,9 +420,15 @@ public final class RecordContexts {
         }
     }
 
-    private static Object extractLeaf(JsonParser p, JsonToken t) throws IOException {
+    private static Object extractLeaf(JsonParser p, JsonToken t, int maxScalarStringChars) throws IOException {
         switch (t) {
             case VALUE_STRING:
+                // PROMPT.md scenario: "oversized JSON strings ... silently skips those records".
+                // Jackson exposes the un-decoded character length on the parser without forcing
+                // a String allocation, so we can refuse over-cap scalars before they materialise.
+                if (p.getTextLength() > maxScalarStringChars) {
+                    return RecordContext.BODY_UNUSABLE;
+                }
                 return p.getValueAsString();
             case VALUE_NUMBER_INT:
                 return extractLongOrNull(p);

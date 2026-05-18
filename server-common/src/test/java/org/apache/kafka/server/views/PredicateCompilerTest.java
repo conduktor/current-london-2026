@@ -125,7 +125,8 @@ class PredicateCompilerTest {
                 /*maxSourceLength*/4096, /*maxParenDepth*/32,
                 /*maxNodes*/5, /*maxDepth*/16,
                 /*maxStringLiteralLength*/256, /*maxStepsPerEval*/1000,
-                /*maxBodyBytes*/1 << 20, /*maxJsonDepth*/32);
+                /*maxBodyBytes*/1 << 20, /*maxJsonDepth*/32,
+                /*maxScalarStringChars*/64 * 1024);
         PredicateCompiler tightCompiler = new PredicateCompiler(tight);
         assertThrows(PredicateValidationException.class,
                 () -> tightCompiler.compile("body.a == 1 && body.b == 2 && body.c == 3"));
@@ -137,7 +138,8 @@ class PredicateCompilerTest {
                 /*maxSourceLength*/4096, /*maxParenDepth*/32,
                 /*maxNodes*/256, /*maxDepth*/3,
                 /*maxStringLiteralLength*/256, /*maxStepsPerEval*/1000,
-                /*maxBodyBytes*/1 << 20, /*maxJsonDepth*/32);
+                /*maxBodyBytes*/1 << 20, /*maxJsonDepth*/32,
+                /*maxScalarStringChars*/64 * 1024);
         PredicateCompiler shallowCompiler = new PredicateCompiler(shallow);
         // Tree depth = 4 (AND over AND over EQ over MUL) — exceeds maxDepth=3.
         assertThrows(PredicateValidationException.class,
@@ -150,7 +152,7 @@ class PredicateCompilerTest {
         // would otherwise be expensive to detect during parsing (e.g. very long expressions).
         PredicateLimits tinyMax = new PredicateLimits(
                 /*maxSourceLength*/8, /*maxParenDepth*/32,
-                64, 16, 256, 1000, 1 << 20, 32);
+                64, 16, 256, 1000, 1 << 20, 32, 64 * 1024);
         PredicateCompiler tinyCompiler = new PredicateCompiler(tinyMax);
         PredicateValidationException ex = assertThrows(PredicateValidationException.class,
                 () -> tinyCompiler.compile("body.color == 'red'"));
@@ -241,7 +243,7 @@ class PredicateCompilerTest {
     @Test
     void rejectsStringLiteralLongerThanLimit() {
         PredicateLimits tight = new PredicateLimits(4096, 32, 64, 16,
-                /*maxStringLiteralLength*/4, 1000, 1 << 20, 32);
+                /*maxStringLiteralLength*/4, 1000, 1 << 20, 32, 64 * 1024);
         PredicateCompiler tightCompiler = new PredicateCompiler(tight);
         assertThrows(PredicateValidationException.class,
                 () -> tightCompiler.compile("body.s == 'too-long'"));
