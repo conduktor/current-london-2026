@@ -75,6 +75,19 @@ public class ConcentrationKernelTest {
     }
 
     @Test
+    public void isLogicalTopicTrueForDeclaredAndFalseForBackingAndUnknown() {
+        kernel.declare(descriptor("orders", 100, "shared", 4));
+        // Declared logical topic — true. Reused by every broker hot path (produce, fetch,
+        // DeleteRecords) to decide whether to route through the kernel.
+        assertTrue(kernel.isLogicalTopic("orders"));
+        // Backing physical topic — false. The kernel keeps logical and backing namespaces
+        // disjoint at declaration time; isLogicalTopic must respect that.
+        assertFalse(kernel.isLogicalTopic("shared"));
+        // Never-seen name — false.
+        assertFalse(kernel.isLogicalTopic("never-declared"));
+    }
+
+    @Test
     public void backingPartitionForUsesModuloMapping() {
         kernel.declare(descriptor("orders", 100, "shared", 4));
         assertEquals(0, kernel.backingPartitionFor("orders", 0));

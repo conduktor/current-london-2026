@@ -43,6 +43,8 @@ import org.apache.kafka.common.message.ApiMessageType.ListenerType
 import org.apache.kafka.common.message.ConsumerGroupDescribeResponseData.{DescribedGroup, TopicPartitions}
 import org.apache.kafka.common.message.CreateTopicsRequestData.CreatableTopic
 import org.apache.kafka.common.message.CreateTopicsResponseData.CreatableTopicResult
+import org.apache.kafka.common.message.DeleteRecordsRequestData
+import org.apache.kafka.common.message.DeleteRecordsRequestData.{DeleteRecordsPartition, DeleteRecordsTopic}
 import org.apache.kafka.common.message.IncrementalAlterConfigsRequestData.{AlterConfigsResource => IAlterConfigsResource, AlterConfigsResourceCollection => IAlterConfigsResourceCollection, AlterableConfig => IAlterableConfig, AlterableConfigCollection => IAlterableConfigCollection}
 import org.apache.kafka.common.message.IncrementalAlterConfigsResponseData.{AlterConfigsResourceResponse => IAlterConfigsResourceResponse}
 import org.apache.kafka.common.message.LeaveGroupRequestData.MemberIdentity
@@ -2106,6 +2108,112 @@ class KafkaApisTest extends Logging {
     // otherwise the rejection would be racing the real append rather than short-circuiting it.
     verify(replicaManager, never()).handleProduceAppend(anyLong, anyShort, ArgumentMatchers.eq(false),
       any(), any(), any(), any(), any(), any(), any())
+  }
+
+  @Test
+  def testDeleteRecordsOnLogicalTopicAdvancesKernelStartOffsetAndBypassesReplicaManager(): Unit = {
+    // Concentration v1 PROMPT.md acceptance criterion 3: DeleteRecords on a logical topic
+    // advances ONLY that logical partition's start offset; the backing log is not truncated.
+    // KafkaApis.handleDeleteRecordsRequest must therefore route the partition to the kernel
+    // and NEVER touch ReplicaManager.deleteRecords for logical-topic partitions.
+    val logicalTopic = "logical-topic"
+    val targetOffset = 50L
+    when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
+    when(concentrationKernel.startLogicalOffset(logicalTopic, 0)).thenReturn(targetOffset)
+
+    val deleteRecordsRequest = new DeleteRecordsRequest.Builder(new DeleteRecordsRequestData()
+      .setTopics(Collections.singletonList(new DeleteRecordsTopic()
+        .setName(logicalTopic)
+        .setPartitions(Collections.singletonList(new DeleteRecordsPartition()
+          .setOffset(targetOffset)
+          .setPartitionIndex(0)))))
+      .setTimeoutMs(5000)).build()
+    val request = buildRequest(deleteRecordsRequest)
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleDeleteRecordsRequest(request)
+
+    val response = verifyNoThrottling[DeleteRecordsResponse](request)
+    assertEquals(1, response.data.topics.size)
+    val topicResult = response.data.topics.asScala.head
+    assertEquals(logicalTopic, topicResult.name)
+    assertEquals(1, topicResult.partitions.size)
+    val partitionResult = topicResult.partitions.asScala.head
+    assertEquals(Errors.NONE, Errors.forCode(partitionResult.errorCode))
+    assertEquals(targetOffset, partitionResult.lowWatermark)
+
+    // Kernel got the advance; ReplicaManager.deleteRecords never did.
+    verify(concentrationKernel).advanceStartOffset(logicalTopic, 0, targetOffset)
+    verify(replicaManager, never()).deleteRecords(anyLong, any(), any(), anyBoolean)
+  }
+
+  @Test
+  def testDeleteRecordsOnLogicalTopicSentinelResolvesToNextLogicalOffset(): Unit = {
+    // DeleteRecordsRequest.HIGH_WATERMARK (-1) means "delete up to the high water mark". For a
+    // logical topic that is the kernel's nextLogicalOffset, not the backing log's LEO. The
+    // hook must translate the sentinel before calling advanceStartOffset.
+    val logicalTopic = "logical-topic"
+    val highWaterMark = 100L
+    when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
+    when(concentrationKernel.nextLogicalOffset(logicalTopic, 0)).thenReturn(highWaterMark)
+    when(concentrationKernel.startLogicalOffset(logicalTopic, 0)).thenReturn(highWaterMark)
+
+    val deleteRecordsRequest = new DeleteRecordsRequest.Builder(new DeleteRecordsRequestData()
+      .setTopics(Collections.singletonList(new DeleteRecordsTopic()
+        .setName(logicalTopic)
+        .setPartitions(Collections.singletonList(new DeleteRecordsPartition()
+          .setOffset(DeleteRecordsRequest.HIGH_WATERMARK)
+          .setPartitionIndex(0)))))
+      .setTimeoutMs(5000)).build()
+    val request = buildRequest(deleteRecordsRequest)
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleDeleteRecordsRequest(request)
+
+    val response = verifyNoThrottling[DeleteRecordsResponse](request)
+    val partitionResult = response.data.topics.asScala.head.partitions.asScala.head
+    assertEquals(Errors.NONE, Errors.forCode(partitionResult.errorCode))
+    assertEquals(highWaterMark, partitionResult.lowWatermark)
+    // The kernel was asked to advance to the resolved high water mark, not the sentinel.
+    verify(concentrationKernel).advanceStartOffset(logicalTopic, 0, highWaterMark)
+  }
+
+  @Test
+  def testDeleteRecordsOnLogicalTopicMapsIllegalArgumentToOffsetOutOfRange(): Unit = {
+    // The tracker throws IllegalArgumentException when newStart > nextLogicalOffset (past HW)
+    // or newStart < currentStartOffset (moving backward). Both are client-visible as
+    // OFFSET_OUT_OF_RANGE — the same error stock DeleteRecords returns for the same condition.
+    val logicalTopic = "logical-topic"
+    when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
+    doThrow(new IllegalArgumentException("offset past HW"))
+      .when(concentrationKernel).advanceStartOffset(logicalTopic, 0, 9999L)
+
+    val deleteRecordsRequest = new DeleteRecordsRequest.Builder(new DeleteRecordsRequestData()
+      .setTopics(Collections.singletonList(new DeleteRecordsTopic()
+        .setName(logicalTopic)
+        .setPartitions(Collections.singletonList(new DeleteRecordsPartition()
+          .setOffset(9999L)
+          .setPartitionIndex(0)))))
+      .setTimeoutMs(5000)).build()
+    val request = buildRequest(deleteRecordsRequest)
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleDeleteRecordsRequest(request)
+
+    val response = verifyNoThrottling[DeleteRecordsResponse](request)
+    val partitionResult = response.data.topics.asScala.head.partitions.asScala.head
+    assertEquals(Errors.OFFSET_OUT_OF_RANGE, Errors.forCode(partitionResult.errorCode))
+    assertEquals(DeleteRecordsResponse.INVALID_LOW_WATERMARK, partitionResult.lowWatermark)
+    verify(replicaManager, never()).deleteRecords(anyLong, any(), any(), anyBoolean)
   }
 
   @Test

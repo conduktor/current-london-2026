@@ -83,6 +83,16 @@ public final class ConcentrationKernel implements AutoCloseable {
     }
 
     /**
+     * True if {@code name} has been declared as a logical topic on this broker. Used by broker hot
+     * paths (produce / fetch / DeleteRecords) to decide whether to route a request through the
+     * kernel or treat it as a stock physical-topic request. Cheap concurrent read — the registry
+     * is a {@link java.util.concurrent.ConcurrentHashMap} under the hood.
+     */
+    public boolean isLogicalTopic(String name) {
+        return registry.contains(name);
+    }
+
+    /**
      * Returns the registry signal for broker fan-out: every logical topic whose backing is
      * {@code backingTopic}. The broker uses this on the fetch path to know which logical topics
      * may have records on a given backing partition. The returned list is an immutable snapshot

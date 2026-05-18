@@ -1477,6 +1477,7 @@ class KafkaApis(val requestChannel: RequestChannel,
 
     val unauthorizedTopicResponses = mutable.Map[TopicPartition, DeleteRecordsPartitionResult]()
     val nonExistingTopicResponses = mutable.Map[TopicPartition, DeleteRecordsPartitionResult]()
+    val logicalTopicResponses = mutable.Map[TopicPartition, DeleteRecordsPartitionResult]()
     val authorizedForDeleteTopicOffsets = mutable.Map[TopicPartition, Long]()
 
     val topics = deleteRecordsRequest.data.topics.asScala
@@ -1491,6 +1492,34 @@ class KafkaApis(val requestChannel: RequestChannel,
         unauthorizedTopicResponses += topicPartition -> new DeleteRecordsPartitionResult()
           .setLowWatermark(DeleteRecordsResponse.INVALID_LOW_WATERMARK)
           .setErrorCode(Errors.TOPIC_AUTHORIZATION_FAILED.code)
+      else if (concentrationKernel.isLogicalTopic(topicPartition.topic)) {
+        // Concentration v1: a logical-topic DeleteRecords advances only THIS logical partition's
+        // start offset; the backing log is not truncated and sibling logical topics on the same
+        // backing partition retain their full readable ranges. PROMPT.md acceptance criterion 3.
+        //
+        // Sentinel -1 (DeleteRecordsRequest.HIGH_WATERMARK) means "delete up to the high
+        // watermark" — for a logical topic that is the kernel's nextLogicalOffset.
+        val targetOffset =
+          if (offset == DeleteRecordsRequest.HIGH_WATERMARK)
+            concentrationKernel.nextLogicalOffset(topicPartition.topic, topicPartition.partition)
+          else offset
+        try {
+          concentrationKernel.advanceStartOffset(topicPartition.topic, topicPartition.partition, targetOffset)
+          val newLowWatermark =
+            concentrationKernel.startLogicalOffset(topicPartition.topic, topicPartition.partition)
+          logicalTopicResponses += topicPartition -> new DeleteRecordsPartitionResult()
+            .setLowWatermark(newLowWatermark)
+            .setErrorCode(Errors.NONE.code)
+        } catch {
+          case _: IllegalArgumentException =>
+            // newStart < current startOffset, or newStart > nextLogicalOffset (past HW). Both
+            // are client-visible as OFFSET_OUT_OF_RANGE — the same error stock DeleteRecords
+            // returns when the requested low-water is outside the readable range.
+            logicalTopicResponses += topicPartition -> new DeleteRecordsPartitionResult()
+              .setLowWatermark(DeleteRecordsResponse.INVALID_LOW_WATERMARK)
+              .setErrorCode(Errors.OFFSET_OUT_OF_RANGE.code)
+        }
+      }
       else if (!metadataCache.contains(topicPartition))
         nonExistingTopicResponses += topicPartition -> new DeleteRecordsPartitionResult()
           .setLowWatermark(DeleteRecordsResponse.INVALID_LOW_WATERMARK)
@@ -1501,7 +1530,7 @@ class KafkaApis(val requestChannel: RequestChannel,
 
     // the callback for sending a DeleteRecordsResponse
     def sendResponseCallback(authorizedTopicResponses: Map[TopicPartition, DeleteRecordsPartitionResult]): Unit = {
-      val mergedResponseStatus = authorizedTopicResponses ++ unauthorizedTopicResponses ++ nonExistingTopicResponses
+      val mergedResponseStatus = authorizedTopicResponses ++ unauthorizedTopicResponses ++ nonExistingTopicResponses ++ logicalTopicResponses
       mergedResponseStatus.foreachEntry { (topicPartition, status) =>
         if (status.errorCode != Errors.NONE.code) {
           debug("DeleteRecordsRequest with correlation id %d from client %s on partition %s failed due to %s".format(
