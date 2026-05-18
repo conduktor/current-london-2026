@@ -110,7 +110,9 @@ class KafkaConcentrationLeaderRecoverer(
     kernel: ConcentrationKernel,
     logManager: LogManager,
     executor: ExecutorService,
-    readBufferBytes: Int = 1 << 20) extends AutoCloseable {
+    readBufferBytes: Int = 1 << 20,
+    shutdownTimeoutMs: Long = KafkaConcentrationLeaderRecoverer.SHUTDOWN_TIMEOUT_MS,
+    shutdownForceTimeoutMs: Long = KafkaConcentrationLeaderRecoverer.SHUTDOWN_FORCE_TIMEOUT_MS) extends AutoCloseable {
 
   import KafkaConcentrationLeaderRecoverer._
 
@@ -281,6 +283,16 @@ class KafkaConcentrationLeaderRecoverer(
           "will be rebuilt on next leader acquisition")
       }
     } catch {
+      case _: InterruptedScanException =>
+        // Cooperative interrupt from BackingLogPageIterator (B.6). Typical trigger: broker
+        // shutdown calling close → shutdownNow → Thread.interrupt on the executor's worker.
+        // The gate stays closed (publishIfGenerationMatches was not reached). Log at info,
+        // not warn — shutdown-time abort is expected behaviour and operators should not be
+        // paged for it. The interrupt flag has already been restored by the thrower so the
+        // executor's awaitTermination observes a properly-cancelled thread.
+        log.info(s"Concentration recovery [task=$taskId] $backingTp interrupted mid-scan at " +
+          s"epoch=$capturedEpoch gen=$capturedGeneration; gate stays closed (shutdown or " +
+          s"forced cancellation)")
       case t: Throwable =>
         // Any throw leaves the gate closed (publishIfGenerationMatches was either not reached
         // or itself preserves the closed state on throw). The next leadership event retries.
@@ -303,10 +315,25 @@ class KafkaConcentrationLeaderRecoverer(
   override def close(): Unit = {
     executor.shutdown()
     try {
-      if (!executor.awaitTermination(SHUTDOWN_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
-        log.warn(s"Concentration recovery executor did not drain in ${SHUTDOWN_TIMEOUT_MS}ms; " +
+      if (!executor.awaitTermination(shutdownTimeoutMs, TimeUnit.MILLISECONDS)) {
+        log.warn(s"Concentration recovery executor did not drain in ${shutdownTimeoutMs}ms; " +
           "forcing cancellation of in-flight scans (gate stays closed for those backings)")
         executor.shutdownNow()
+        // Second awaitTermination (B.6). shutdownNow only SIGNALS via Thread.interrupt — it does
+        // NOT wait. In-flight scans honour the signal at the next page boundary via
+        // BackingLogPageIterator.refill's Thread.interrupted() check, but that takes time to
+        // observe. Without this wait, close() returns while scan threads are still running:
+        // - UnifiedLog handles stay open past kernel.close (next broker boot races on them)
+        // - executor worker threads leak (KafkaThread daemons exit only on JVM termination,
+        //   but a unit test or graceful-restart context hangs on them)
+        // - half-baked scan state may yet call publishIfGenerationMatches with a stale gen,
+        //   which is a no-op for correctness but pollutes logs and confuses operators
+        // Bounded wait so a pathological scan cannot block shutdown indefinitely.
+        if (!executor.awaitTermination(shutdownForceTimeoutMs, TimeUnit.MILLISECONDS)) {
+          log.warn(s"Concentration recovery executor did not honour interrupt within " +
+            s"${shutdownForceTimeoutMs}ms after shutdownNow; some scan threads may still " +
+            s"be running. Per-backing gates remain closed for those backings.")
+        }
       }
     } catch {
       case _: InterruptedException =>
@@ -325,6 +352,13 @@ object KafkaConcentrationLeaderRecoverer {
   // backing log at 1 MiB per page is well under a second of I/O), short enough that a
   // pathological scan cannot stall broker shutdown indefinitely.
   private val SHUTDOWN_TIMEOUT_MS: Long = 10_000L
+
+  // Bounded post-shutdownNow wait (B.6). After we forcibly interrupt in-flight scans we still
+  // need to let them honour the interrupt at the next page boundary (~1 MiB per page in
+  // BackingLogPageIterator.refill). Five seconds covers a couple of slow I/O pages plus the
+  // unwinding through the recoverer's try/finally. Beyond that we give up — there is no
+  // graceful path left, only logging.
+  private val SHUTDOWN_FORCE_TIMEOUT_MS: Long = 5_000L
 
   /**
    * Default pool: 4 threads. Backing-log scans are I/O-bound; oversizing the pool hurts more

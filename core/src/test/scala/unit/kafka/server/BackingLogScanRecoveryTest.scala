@@ -193,6 +193,54 @@ class BackingLogScanRecoveryTest {
   }
 
   @Test
+  def scanHonoursThreadInterruptAtPageBoundary(): Unit = {
+    // B.6 cooperative-cancellation contract. A scan runs on the recovery executor; broker
+    // shutdown calls executor.shutdownNow which sets Thread.interrupt on the worker. The
+    // iterator MUST notice this at the next page-read boundary and abort with
+    // InterruptedScanException — without the check, a long backing log would keep paging
+    // for arbitrarily long and stall shutdown.
+    //
+    // We exercise the path through BackingLogScanRecovery.run() running on a side thread so
+    // the test thread can interrupt it from outside. Using the public driver (rather than
+    // poking the file-private BackingLogPageIterator directly) verifies the contract end-to-
+    // end: page-iterator interrupt-check propagates through kernel.recoverFromBackingScan
+    // back to the caller as a plain throw.
+    val backingTopic = "backing-interrupt"
+    kernel.declare(new LogicalTopicDescriptor("orders", 1, backingTopic, 1))
+    // Enough records to span multiple page reads of the iterator's 1 MiB buffer at the
+    // default broker config — but in this test the read buffer is set to 16 bytes so even
+    // a handful of records forces multiple refill loops, giving the interrupt a place to land.
+    for (i <- 0 until 16) {
+      appendStamped("orders", 0, Array(i.toLong), key = s"k$i", value = s"v$i")
+    }
+    val tp = new TopicPartition(backingTopic, 0)
+    when(logManager.getLog(tp, false)).thenReturn(Some(unifiedLog))
+
+    val started = new java.util.concurrent.CountDownLatch(1)
+    val raised = new java.util.concurrent.atomic.AtomicReference[Throwable](null)
+    val scanThread = new Thread(() => {
+      started.countDown()
+      try {
+        // Pre-interrupt before starting the scan: the first refill() iteration sees the flag
+        // and throws. Deterministic enough for the test without coordinating "exactly at
+        // refill #N" — the contract is "honoured at the NEXT page boundary".
+        Thread.currentThread().interrupt()
+        new BackingLogScanRecovery(kernel, logManager, readBufferBytes = 16).run()
+      } catch {
+        case t: Throwable => raised.set(t)
+      }
+    }, "scan-interrupt-test")
+    scanThread.start()
+    assertTrue(started.await(5, java.util.concurrent.TimeUnit.SECONDS), "scan thread must start")
+    scanThread.join(5_000L)
+    assertFalse(scanThread.isAlive, "scan thread must terminate after interrupt")
+    val t = raised.get()
+    assertNotNull(t, "scan must propagate an exception when interrupted, not swallow it")
+    assertTrue(t.isInstanceOf[InterruptedScanException],
+      s"expected InterruptedScanException, got ${t.getClass.getSimpleName}: ${t.getMessage}")
+  }
+
+  @Test
   def runIgnoresUnstampedRecordsOnBackingLog(): Unit = {
     // A backing partition could in principle contain pre-feature records or records produced
     // by a path that bypassed the stamper. The scan must skip them silently rather than crash.

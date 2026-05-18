@@ -159,6 +159,16 @@ private class BackingLogPageIterator(
 
   private def refill(): Unit = {
     while (buffer.isEmpty && nextOffset < endOffset) {
+      // Cooperative cancellation point. Reached once per page (~1 MiB), so worst-case latency
+      // between executor.shutdownNow and the scan bailing out is bounded by one page read —
+      // not by the full backing log. Without this check, a wedged or simply long-running scan
+      // would keep running past close(), holding UnifiedLog file handles open and blocking the
+      // executor's worker thread from terminating. The interrupt flag is restored before the
+      // throw so the executor's awaitTermination sees a properly-interrupted thread.
+      if (Thread.interrupted()) {
+        Thread.currentThread().interrupt()
+        throw new InterruptedScanException()
+      }
       val fdi = unifiedLog.read(
         startOffset = nextOffset,
         maxLength = pageBytes,
@@ -188,6 +198,15 @@ private class BackingLogPageIterator(
     }
   }
 }
+
+/**
+ * Sentinel thrown by {@link BackingLogPageIterator} when the carrier thread has been interrupted
+ * mid-scan (typically by {@code ExecutorService.shutdownNow} during broker shutdown). Distinct
+ * from generic Throwables so the caller can log "scan interrupted" at info rather than warn —
+ * a shutdown-time abort is not a fault. The thrower restores the interrupt flag before raising,
+ * so {@code awaitTermination} downstream sees the thread as actually interrupted (B.6).
+ */
+class InterruptedScanException extends RuntimeException("scan interrupted")
 
 object BackingLogScanRecovery {
   // Default page size: 1 MiB. Matches the load-buffer size used by other broker startup scans

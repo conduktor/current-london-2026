@@ -381,6 +381,84 @@ class KafkaConcentrationLeaderRecovererTest {
   }
 
   @Test
+  def closeWaitsForInFlightScanAfterShutdownNowToHonourInterrupt(): Unit = {
+    // B.6 second-awaitTermination contract. The scenario: a scan is mid-flight when broker
+    // shutdown calls recoverer.close(). The first awaitTermination times out (the scan is
+    // still running). close() then calls shutdownNow which sends Thread.interrupt to the
+    // worker. WITHOUT a second awaitTermination, close() would return immediately and the
+    // worker thread would still be racing with the broker's other shutdown steps — closing
+    // log handles, terminating other thread pools — leading to a window where in-flight
+    // scan I/O races against kernel.close.
+    //
+    // We pin the contract by:
+    //   1. Submitting a long task that respects Thread.interrupt (the standard
+    //      cooperative-cancel pattern that BackingLogPageIterator.refill follows).
+    //   2. Calling close() with the production close paths but compressed timeouts so the
+    //      test completes quickly while still exercising the full two-phase drain.
+    //   3. Asserting close() returns ONLY after the worker has finished honouring the
+    //      interrupt — i.e. that the executor's awaitTermination was called twice and the
+    //      second one actually waited.
+    val testShutdownTimeoutMs = 200L
+    val testShutdownForceTimeoutMs = 2_000L
+    val executor = Executors.newSingleThreadExecutor()
+    val taskStarted = new java.util.concurrent.CountDownLatch(1)
+    val taskFinished = new java.util.concurrent.atomic.AtomicBoolean(false)
+    // The task sleeps comfortably longer than the first shutdown window so the first
+    // awaitTermination is guaranteed to time out. Then it cooperatively-checks the
+    // interrupt flag — same pattern as the page iterator. Without the close-second-wait,
+    // the test's taskFinished assertion would fail (the task is interrupted but
+    // close() returned before the catch+finally ran).
+    executor.submit(new Runnable {
+      override def run(): Unit = {
+        taskStarted.countDown()
+        try {
+          // Long enough that the first awaitTermination definitely times out, but short
+          // enough that the SECOND awaitTermination has time to observe completion within
+          // its own bounded window.
+          Thread.sleep(testShutdownTimeoutMs * 5)
+        } catch {
+          case _: InterruptedException =>
+            // Cooperative honour: restore the flag and exit cleanly, exactly as
+            // BackingLogPageIterator.refill is required to do.
+            Thread.currentThread().interrupt()
+        } finally {
+          taskFinished.set(true)
+        }
+      }
+    })
+    assertTrue(taskStarted.await(2, TimeUnit.SECONDS), "task must start")
+
+    val kernel = mock(classOf[ConcentrationKernel])
+    val logManager = mock(classOf[LogManager])
+    val recoverer = new KafkaConcentrationLeaderRecoverer(kernel, logManager, executor,
+      shutdownTimeoutMs = testShutdownTimeoutMs,
+      shutdownForceTimeoutMs = testShutdownForceTimeoutMs)
+
+    val before = System.nanoTime()
+    recoverer.close()
+    val elapsedMs = (System.nanoTime() - before) / 1_000_000L
+
+    // After close() returns:
+    //   - The task MUST have observed the interrupt and exited the finally block. That is
+    //     the second-awaitTermination's job.
+    //   - The total elapsed time MUST be at least testShutdownTimeoutMs (first wait timed
+    //     out) and well under the worst-case ceiling (first + force) because the task
+    //     exits promptly on interrupt, so the second wait returns early.
+    assertTrue(taskFinished.get,
+      "B.6: close() must wait for in-flight task to honour interrupt before returning")
+    assertTrue(executor.isTerminated, "executor must be terminated after close()")
+    assertTrue(elapsedMs >= testShutdownTimeoutMs,
+      s"close() must wait at least the first-shutdown window (${testShutdownTimeoutMs} ms); " +
+        s"actual elapsed: ${elapsedMs}ms")
+    // Sanity: we should be well under the worst case (first + force = 2.2s).
+    // 1500ms leaves enough buffer for CI jitter while still detecting a regression where
+    // close() ends up waiting the full second-window.
+    assertTrue(elapsedMs < testShutdownTimeoutMs + 1_500L,
+      s"close() should return shortly after the interrupted task exits, not wait the " +
+        s"full second window. Elapsed: ${elapsedMs}ms")
+  }
+
+  @Test
   def closeDrainsExecutorWithinBoundedTimeout(): Unit = {
     // The default executor is a daemon-threaded fixed-thread-pool; close() must drain it
     // so broker shutdown cannot leave concentration recovery threads alive. The bounded
