@@ -99,6 +99,14 @@
             <allow pkg="org.apache.kafka.server.util" />
         </subpackage>
 
+        <subpackage name="views">
+            <!-- Topic Views: broker-side filtering of records using a sandboxed predicate
+                 language. JSON body navigation needs the Jackson streaming parser. -->
+            <allow pkg="com.fasterxml.jackson.core" />
+            <allow class="org.apache.kafka.server.views.Lexer.Kind" />
+            <allow class="org.apache.kafka.server.views.Lexer.Token" />
+        </subpackage>
+
         <subpackage name="share">
           <allow pkg="org.apache.kafka.server.share" />
           <subpackage name="persister">
