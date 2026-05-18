@@ -312,9 +312,19 @@ class KafkaApis(val requestChannel: RequestChannel,
         } else {
           // Otherwise, we check all partitions to ensure that they all exist.
           val topicWithValidPartitions = new OffsetCommitRequestData.OffsetCommitRequestTopic().setName(topic.name)
+          val isView = isViewTopic(topic.name)
 
           topic.partitions.forEach { partition =>
             if (metadataCache.getLeaderAndIsr(topic.name, partition.partitionIndex).nonEmpty) {
+              // Normalize committedLeaderEpoch on view partitions: views have no client-validatable
+              // epoch ledger (see handleOffsetForLeaderEpochRequest), so accepting a non-(-1) value
+              // would persist a backing-derived or stale epoch under the view name in
+              // __consumer_offsets. On the next session start, OffsetFetch would replay it into
+              // SubscriptionState.position.offsetEpoch → AWAIT_VALIDATION → OFLE → infinite retry.
+              // The OffsetFetch response scrub at handleOffsetFetchRequest's allOf callback already
+              // catches replay; this request-side normalization closes the write side so the
+              // poisoned value never reaches the offset store in the first place.
+              if (isView) partition.setCommittedLeaderEpoch(-1)
               topicWithValidPartitions.partitions.add(partition)
             } else {
               responseBuilder.addPartition(topic.name, partition.partitionIndex, Errors.UNKNOWN_TOPIC_OR_PARTITION)
@@ -2569,6 +2579,13 @@ class KafkaApis(val requestChannel: RequestChannel,
             unauthorizedTopicErrors += topicPartition -> Errors.TOPIC_AUTHORIZATION_FAILED
           else if (!metadataCache.contains(topicPartition))
             nonExistingTopicErrors += topicPartition -> Errors.UNKNOWN_TOPIC_OR_PARTITION
+          else if (isViewTopic(topicPartition.topic))
+            // Views are read-only (PROMPT.md, see handleProduceRequest). Reject AddPartitionsToTxn
+            // before the txn coordinator persists the view tp into transaction state — otherwise a
+            // subsequent WriteTxnMarkers would attempt to append EndTxnMarker control records to the
+            // view's local placeholder log, violating the read-only invariant. Same INVALID_TOPIC_EXCEPTION
+            // shape as the produce-side rejection so the client error model is uniform.
+            unauthorizedTopicErrors += topicPartition -> Errors.INVALID_TOPIC_EXCEPTION
           else
             authorizedPartitions.add(topicPartition)
         }
@@ -2721,9 +2738,14 @@ class KafkaApis(val requestChannel: RequestChannel,
         } else {
           // Otherwise, we check all partitions to ensure that they all exist.
           val topicWithValidPartitions = new TxnOffsetCommitRequestData.TxnOffsetCommitRequestTopic().setName(topic.name)
+          val isView = isViewTopic(topic.name)
 
           topic.partitions.forEach { partition =>
             if (metadataCache.getLeaderAndIsr(topic.name, partition.partitionIndex).nonEmpty) {
+              // Mirror the OffsetCommit-side committedLeaderEpoch normalization on the
+              // transactional path so a view tp never has a non-(-1) epoch persisted by either
+              // commit shape. Same rationale: views have no client-validatable epoch ledger.
+              if (isView) partition.setCommittedLeaderEpoch(-1)
               topicWithValidPartitions.partitions.add(partition)
             } else {
               responseBuilder.addPartition(topic.name, partition.partitionIndex, Errors.UNKNOWN_TOPIC_OR_PARTITION)
@@ -2933,7 +2955,15 @@ class KafkaApis(val requestChannel: RequestChannel,
   def handleAlterReplicaLogDirsRequest(request: RequestChannel.Request): Unit = {
     val alterReplicaDirsRequest = request.body[AlterReplicaLogDirsRequest]
     if (authHelper.authorize(request.context, ALTER, CLUSTER, CLUSTER_NAME)) {
-      val result = replicaManager.alterReplicaLogDirs(alterReplicaDirsRequest.partitionDirs.asScala)
+      // Views have no on-disk storage of their own (the placeholder log is never written to). Moving
+      // it between log dirs is meaningless and would leave operator-visible artifacts under the
+      // view name that could later be mistaken for real data. Fail loudly on view partitions and
+      // pass the rest through to the replica manager.
+      val (viewPartitions, nonViewPartitions) = alterReplicaDirsRequest.partitionDirs.asScala.toMap.partition {
+        case (tp, _) => isViewTopic(tp.topic)
+      }
+      val viewResults: Map[TopicPartition, Errors] = viewPartitions.map { case (tp, _) => tp -> Errors.INVALID_TOPIC_EXCEPTION }
+      val result = replicaManager.alterReplicaLogDirs(nonViewPartitions) ++ viewResults
       requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
         new AlterReplicaLogDirsResponse(new AlterReplicaLogDirsResponseData()
           .setResults(result.groupBy(_._1.topic).map {
@@ -3232,6 +3262,13 @@ class KafkaApis(val requestChannel: RequestChannel,
           Some(new ApiError(Errors.TOPIC_AUTHORIZATION_FAILED))
         } else if (!metadataCache.contains(topicRequest.name))
           Some(new ApiError(Errors.UNKNOWN_TOPIC_OR_PARTITION))
+        else if (isViewTopic(topicRequest.name))
+          // Views have no producers (produce is rejected before backing resolution). Reading the
+          // view's local placeholder log producer-state-snapshot would either return an empty
+          // result (today) or expose internal-control-record producer IDs if any txn-coordinator
+          // bug ever leaked one. Fail fast with INVALID_TOPIC_EXCEPTION to make the read-only
+          // contract uniform across describe-style APIs.
+          Some(new ApiError(Errors.INVALID_TOPIC_EXCEPTION))
         else {
           None
         }

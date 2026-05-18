@@ -2161,6 +2161,221 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testAddPartitionsToTxnOnViewTopicIsRejectedAsInvalidTopic(): Unit = {
+    // Views are read-only (PROMPT.md): a transactional producer cannot include a view tp in its
+    // participant set. Otherwise the txn coordinator persists the view tp into transaction state
+    // and WriteTxnMarkers later appends EndTxnMarker control records to the view's local
+    // placeholder log — violating the read-only invariant.
+    val viewTopic = "tx-view"
+    val regularTopic = "tx-regular"
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, "tx-backing")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.x == 1")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+    addTopicToMetadataCache(viewTopic, numPartitions = 1)
+    addTopicToMetadataCache(regularTopic, numPartitions = 1)
+
+    val viewTp = new TopicPartition(viewTopic, 0)
+    val regularTp = new TopicPartition(regularTopic, 0)
+    // version >= 4 skips the WRITE-on-TRANSACTIONAL_ID auth path (inter-broker context)
+    val addPartitionsRequest = AddPartitionsToTxnRequest.Builder.forBroker(
+      new AddPartitionsToTxnTransactionCollection(util.Collections.singletonList(
+        new AddPartitionsToTxnTransaction()
+          .setTransactionalId("txnId")
+          .setProducerId(15L)
+          .setProducerEpoch(0.toShort)
+          .setVerifyOnly(false)
+          .setTopics(new AddPartitionsToTxnTopicCollection(util.Arrays.asList(
+            new AddPartitionsToTxnTopic().setName(viewTp.topic).setPartitions(util.Collections.singletonList(Integer.valueOf(viewTp.partition))),
+            new AddPartitionsToTxnTopic().setName(regularTp.topic).setPartitions(util.Collections.singletonList(Integer.valueOf(regularTp.partition)))).iterator))).iterator)).build()
+    val request = buildRequest(addPartitionsRequest)
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    kafkaApis = createKafkaApis(configRepository = configRepository)
+    kafkaApis.handleAddPartitionsToTxnRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[AddPartitionsToTxnResponse](request)
+    val errorsByTp = response.errors().get("txnId")
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION, errorsByTp.get(viewTp),
+      "view tp must be rejected with INVALID_TOPIC_EXCEPTION before the txn coordinator persists it")
+    // The non-view partition was authorized but the whole transaction fails the atomicity check —
+    // we get OPERATION_NOT_ATTEMPTED for it (mirrors the existing nonExistingTopicErrors path).
+    assertEquals(Errors.OPERATION_NOT_ATTEMPTED, errorsByTp.get(regularTp),
+      "non-view partitions in the same batch must surface OPERATION_NOT_ATTEMPTED so the client retries cleanly")
+    // The txn coordinator must never see the view tp. Stronger: it must not be called at all
+    // because the atomicity rule fails the whole batch.
+    verify(txnCoordinator, never()).handleAddPartitionsToTransaction(any(), anyLong, anyShort, any(), any(), any(), any())
+  }
+
+  @Test
+  def testOffsetCommitOnViewTopicNormalizesCommittedLeaderEpoch(): Unit = {
+    // Views have no client-validatable epoch ledger (see handleOffsetForLeaderEpochRequest). If a
+    // consumer commits a non-(-1) leader epoch on a view tp, OffsetFetch's response scrub catches
+    // it on replay — but request-side normalization closes the write side so the poisoned value
+    // never reaches __consumer_offsets.
+    val viewTopic = "oc-view"
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, "oc-backing")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.x == 1")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+    addTopicToMetadataCache(viewTopic, numPartitions = 1)
+
+    val offsetCommitRequest = new OffsetCommitRequest.Builder(
+      new OffsetCommitRequestData()
+        .setGroupId("g")
+        .setTopics(util.Collections.singletonList(
+          new OffsetCommitRequestData.OffsetCommitRequestTopic()
+            .setName(viewTopic)
+            .setPartitions(util.Collections.singletonList(
+              new OffsetCommitRequestData.OffsetCommitRequestPartition()
+                .setPartitionIndex(0)
+                .setCommittedOffset(42L)
+                .setCommittedLeaderEpoch(99)
+                .setCommittedMetadata("")))))).build()
+    val request = buildRequest(offsetCommitRequest)
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+    val captor: ArgumentCaptor[OffsetCommitRequestData] = ArgumentCaptor.forClass(classOf[OffsetCommitRequestData])
+    val future = new CompletableFuture[OffsetCommitResponseData]()
+    when(groupCoordinator.commitOffsets(any(), captor.capture(), any())).thenReturn(future)
+
+    kafkaApis = createKafkaApis(configRepository = configRepository)
+    kafkaApis.handleOffsetCommitRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val captured = captor.getValue
+    assertEquals(1, captured.topics.size)
+    val topic = captured.topics.get(0)
+    assertEquals(viewTopic, topic.name)
+    val partition = topic.partitions.get(0)
+    assertEquals(-1, partition.committedLeaderEpoch,
+      "view tp committedLeaderEpoch must be normalized to -1 before reaching the group coordinator")
+    assertEquals(42L, partition.committedOffset,
+      "the committed offset itself must survive normalization unchanged")
+  }
+
+  @Test
+  def testTxnOffsetCommitOnViewTopicNormalizesCommittedLeaderEpoch(): Unit = {
+    // Mirror of testOffsetCommitOnViewTopicNormalizesCommittedLeaderEpoch on the transactional
+    // commit path so neither commit shape can poison __consumer_offsets with a non-(-1) epoch
+    // under a view name.
+    val viewTopic = "toc-view"
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, "toc-backing")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.x == 1")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+    addTopicToMetadataCache(viewTopic, numPartitions = 1)
+
+    val viewTp = new TopicPartition(viewTopic, 0)
+    val committed = new TxnOffsetCommitRequest.CommittedOffset(42L, "", Optional.of(Integer.valueOf(99)))
+    val txnOffsetCommitRequest = new TxnOffsetCommitRequest.Builder(
+      "txnId", "g", 15L, 0.toShort, Map(viewTp -> committed).asJava, true).build()
+    val request = buildRequest(txnOffsetCommitRequest)
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+    val captor: ArgumentCaptor[TxnOffsetCommitRequestData] = ArgumentCaptor.forClass(classOf[TxnOffsetCommitRequestData])
+    val future = new CompletableFuture[TxnOffsetCommitResponseData]()
+    when(groupCoordinator.commitTransactionalOffsets(any(), captor.capture(), any())).thenReturn(future)
+
+    kafkaApis = createKafkaApis(configRepository = configRepository)
+    kafkaApis.handleTxnOffsetCommitRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val captured = captor.getValue
+    assertEquals(1, captured.topics.size)
+    val topic = captured.topics.get(0)
+    assertEquals(viewTopic, topic.name)
+    val partition = topic.partitions.get(0)
+    assertEquals(-1, partition.committedLeaderEpoch,
+      "view tp committedLeaderEpoch must be normalized to -1 on the transactional commit path")
+    assertEquals(42L, partition.committedOffset,
+      "the transactional commit offset must survive normalization unchanged")
+  }
+
+  @Test
+  def testDescribeProducersOnViewTopicReturnsInvalidTopic(): Unit = {
+    // Views have no producers (produce is rejected before backing resolution). Reading the view's
+    // local placeholder log producer-state-snapshot would either be empty (today) or leak
+    // control-record producer IDs if a txn-coordinator bug ever wrote one. Fail fast.
+    val viewTopic = "dp-view"
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, "dp-backing")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.x == 1")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+    addTopicToMetadataCache(viewTopic, numPartitions = 1)
+
+    val describeProducersRequest = new DescribeProducersRequest.Builder(
+      new DescribeProducersRequestData()
+        .setTopics(util.Collections.singletonList(
+          new DescribeProducersRequestData.TopicRequest()
+            .setName(viewTopic)
+            .setPartitionIndexes(util.Collections.singletonList(Integer.valueOf(0)))))).build()
+    val request = buildRequest(describeProducersRequest)
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    kafkaApis = createKafkaApis(configRepository = configRepository)
+    kafkaApis.handleDescribeProducersRequest(request)
+
+    val response = verifyNoThrottling[DescribeProducersResponse](request)
+    val topicData = response.data.topics.asScala.find(_.name == viewTopic).get
+    val partition = topicData.partitions.asScala.head
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, partition.errorCode,
+      "DescribeProducers on view topic must surface INVALID_TOPIC_EXCEPTION (views have no producers)")
+    // Must not touch the replica-manager producer state — that would defeat the fail-fast guarantee.
+    verify(replicaManager, never()).activeProducerState(any[TopicPartition]())
+  }
+
+  @Test
+  def testAlterReplicaLogDirsOnViewTopicReturnsInvalidTopic(): Unit = {
+    // Views have no on-disk storage of their own. Moving a view's placeholder log between log dirs
+    // is meaningless and would leave operator-visible artifacts under the view name. Reject view
+    // partitions while passing the rest through to the replica manager.
+    val viewTopic = "ar-view"
+    val regularTopic = "ar-regular"
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, "ar-backing")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.x == 1")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+    addTopicToMetadataCache(viewTopic, numPartitions = 1)
+    addTopicToMetadataCache(regularTopic, numPartitions = 1)
+
+    val viewTp = new TopicPartition(viewTopic, 0)
+    val regularTp = new TopicPartition(regularTopic, 0)
+    when(replicaManager.alterReplicaLogDirs(any())).thenAnswer { invocation =>
+      val arg = invocation.getArgument[Map[TopicPartition, String]](0)
+      // Replica manager must NEVER see the view tp.
+      assertFalse(arg.contains(viewTp), "view tp must be filtered out before reaching replicaManager")
+      arg.map { case (tp, _) => tp -> Errors.NONE }
+    }
+
+    val alterReq = new AlterReplicaLogDirsRequest.Builder(
+      new AlterReplicaLogDirsRequestData()
+        .setDirs(new AlterReplicaLogDirsRequestData.AlterReplicaLogDirCollection(util.Collections.singletonList(
+          new AlterReplicaLogDirsRequestData.AlterReplicaLogDir()
+            .setPath("/log-dir-a")
+            .setTopics(new AlterReplicaLogDirsRequestData.AlterReplicaLogDirTopicCollection(util.Arrays.asList(
+              new AlterReplicaLogDirsRequestData.AlterReplicaLogDirTopic()
+                .setName(viewTopic).setPartitions(util.Collections.singletonList(Integer.valueOf(viewTp.partition))),
+              new AlterReplicaLogDirsRequestData.AlterReplicaLogDirTopic()
+                .setName(regularTopic).setPartitions(util.Collections.singletonList(Integer.valueOf(regularTp.partition)))).iterator))).iterator))).build()
+    val request = buildRequest(alterReq)
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    kafkaApis = createKafkaApis(configRepository = configRepository)
+    kafkaApis.handleAlterReplicaLogDirsRequest(request)
+
+    val response = verifyNoThrottling[AlterReplicaLogDirsResponse](request)
+    val results = response.data.results.asScala
+    val viewResult = results.find(_.topicName == viewTopic).get.partitions.asScala.head
+    val regularResult = results.find(_.topicName == regularTopic).get.partitions.asScala.head
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, viewResult.errorCode,
+      "AlterReplicaLogDirs on a view tp must be rejected with INVALID_TOPIC_EXCEPTION")
+    assertEquals(Errors.NONE.code, regularResult.errorCode,
+      "non-view partitions in the same request must reach the replica manager and succeed")
+  }
+
+  @Test
   def testProduceToRegularTopicIsNotRejectedAsView(): Unit = {
     // Counter-test for testProduceToViewTopicIsRejected: a regular topic (no view configs at all)
     // must NOT be rejected. Guards against accidentally treating every topic with non-empty config
