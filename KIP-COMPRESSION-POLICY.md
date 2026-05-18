@@ -404,10 +404,16 @@ Items closed since the initial KIP-MVP cut (no longer Future Work):
   `InvalidRecordException`. Pinned by `KafkaApisTest`. Existing JMX /
   Prometheus scrapers pick it up with no config change.
 - **`compression.policy=forbidden`.** The mirror image of `required`: any
-  batch with `compression.type` other than `none` is rejected with
-  `INVALID_RECORD`. Use case: topics that must hold raw payloads (e.g.
-  downstream tooling that reads the on-disk batch format directly without
-  per-codec decompression).
+  batch arriving with `compression.type` other than `none` is rejected with
+  `INVALID_RECORD` at the broker handler. Use case: topics whose producers
+  must send uncompressed batches (e.g. downstream tooling that reads the
+  on-disk batch format directly without per-codec decompression). Caveat:
+  this policy gates the *entry* codec only. The separate, pre-existing
+  topic-level `compression.type` config can still recompress on disk
+  (`compression.type=gzip` will rewrite incoming uncompressed batches as
+  gzip on the way to the log). Operators who need raw on-disk bytes must
+  set both `compression.policy=forbidden` and `compression.type=producer`
+  (or `compression.type=uncompressed`).
 
 ## Implementation map
 
