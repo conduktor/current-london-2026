@@ -49,6 +49,18 @@ public final class TenantNamespace {
 
     public static String encodePrincipalName(String tenantId, String userName) {
         validateTenantId(tenantId);
+        if (userName != null && userName.startsWith(PRINCIPAL_PREFIX)) {
+            // Defence-in-depth: callers (TenantPrincipalBuilder) already refuse
+            // a pre-stamped base name. Refuse here too so any other code path
+            // that lands a `__tenant_*` user name in this function — admin
+            // tooling, future builders — surfaces the bug at the call site
+            // rather than materialising a double-stamped principal whose
+            // parseTenantId then resolves to the OUTER tenant and crosses the
+            // isolation boundary.
+            throw new IllegalArgumentException(
+                "User name '" + userName + "' begins with the reserved tenant prefix '"
+                    + PRINCIPAL_PREFIX + "' and cannot be tenant-encoded");
+        }
         return PRINCIPAL_PREFIX + tenantId + SEPARATOR + userName;
     }
 

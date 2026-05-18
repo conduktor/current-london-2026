@@ -177,6 +177,99 @@ class TenantPrincipalBuilderTest {
         assertThrows(ConfigException.class, () -> builder.configure(configs));
     }
 
+    @Test
+    void refusesCrossListenerTenantPrefixedBasePrincipal() throws Exception {
+        // Delegation-token replay attack: tenant `acme` issues a token; the
+        // token owner is "__tenant_acme.alice". An attacker presents the token
+        // on tenant `beta`'s listener. SCRAM/tokenauth surfaces the token owner
+        // as authorizationID, so the delegate-built base name already starts
+        // with __tenant_. Without this guard, build() would stamp the listener
+        // binding again — yielding "__tenant_beta.__tenant_acme.alice", which
+        // TenantNamespace.parseTenantId splits at the first dot and resolves
+        // to "beta". The connection would silently produce/fetch inside beta's
+        // physical namespace using a credential that was only ever issued
+        // inside acme.
+        TenantPrincipalBuilder builder = new TenantPrincipalBuilder();
+        Map<String, Object> configs = new HashMap<>();
+        configs.put("listener.name.tenant_acme.tenant.id", "acme");
+        configs.put("listener.name.tenant_beta.tenant.id", "beta");
+        builder.configure(configs);
+
+        KafkaPrincipal p = builder.build(saslContextOn("__tenant_acme.alice", "TENANT_BETA"));
+
+        assertEquals(KafkaPrincipal.ANONYMOUS, p);
+    }
+
+    @Test
+    void preservesSameTenantTokenReauthUnchanged() throws Exception {
+        // Legitimate path: tenant `acme` issues a token, the holder reconnects
+        // on `acme`'s OWN listener. The base name is "__tenant_acme.alice", the
+        // listener binding is also acme — re-stamping would double-prefix and
+        // break authorization (ACLs are written against "__tenant_acme.alice").
+        // Return the base principal unchanged.
+        TenantPrincipalBuilder builder = new TenantPrincipalBuilder();
+        Map<String, Object> configs = new HashMap<>();
+        configs.put("listener.name.tenant_acme.tenant.id", "acme");
+        builder.configure(configs);
+
+        KafkaPrincipal p = builder.build(saslContextOn("__tenant_acme.alice", "TENANT_ACME"));
+
+        assertEquals(KafkaPrincipal.USER_TYPE, p.getPrincipalType());
+        assertEquals("__tenant_acme.alice", p.getName());
+    }
+
+    @Test
+    void refusesTenantPrefixedBaseOnUnboundListener() throws Exception {
+        // A connection on a non-tenant listener (PLAINTEXT, INTERNAL, ...) must
+        // not be allowed to assert a tenant identity by encoding it in the SASL
+        // username. The presence of __tenant_ in the base name on an unbound
+        // listener is by definition spoof-shaped — there is no listener
+        // binding for parseTenantId(base).get() to match against.
+        TenantPrincipalBuilder builder = new TenantPrincipalBuilder();
+        Map<String, Object> configs = new HashMap<>();
+        configs.put("listener.name.tenant_acme.tenant.id", "acme");
+        builder.configure(configs);
+
+        KafkaPrincipal p = builder.build(saslContextOn("__tenant_acme.alice", "PUBLIC"));
+
+        assertEquals(KafkaPrincipal.ANONYMOUS, p);
+    }
+
+    @Test
+    void refusesMalformedReservedPrefixBasePrincipal() throws Exception {
+        // The base name carries the reserved prefix but is malformed (no dot,
+        // or empty tenant segment). parseTenantId returns empty; the safe
+        // answer is ANONYMOUS regardless of which listener we're on. Otherwise
+        // a SCRAM credential literally named "__tenant_" would slip through
+        // and confuse downstream tenant-resolution.
+        TenantPrincipalBuilder builder = new TenantPrincipalBuilder();
+        Map<String, Object> configs = new HashMap<>();
+        configs.put("listener.name.tenant_acme.tenant.id", "acme");
+        builder.configure(configs);
+
+        assertEquals(KafkaPrincipal.ANONYMOUS,
+            builder.build(saslContextOn("__tenant_", "TENANT_ACME")));
+        assertEquals(KafkaPrincipal.ANONYMOUS,
+            builder.build(saslContextOn("__tenant_acme", "TENANT_ACME")));
+        // Empty tenant segment: "__tenant_.alice" → parseTenantId sees dot at
+        // PRINCIPAL_PREFIX.length() and rejects (the second guard in parseTenantId).
+        assertEquals(KafkaPrincipal.ANONYMOUS,
+            builder.build(saslContextOn("__tenant_.alice", "TENANT_ACME")));
+    }
+
+    @Test
+    void refusesTenantPrefixedBaseWhenNoListenerBindings() throws Exception {
+        // Edge case: a builder with no bindings at all (legacy/test path).
+        // Without a listener binding there is no "same tenant" answer that can
+        // be true, so the reserved-prefix base is uniformly unsafe.
+        TenantPrincipalBuilder builder = new TenantPrincipalBuilder();
+        builder.configure(new HashMap<>());
+
+        KafkaPrincipal p = builder.build(saslContextOn("__tenant_acme.alice", "PLAINTEXT"));
+
+        assertEquals(KafkaPrincipal.ANONYMOUS, p);
+    }
+
     private static SaslAuthenticationContext saslContextOn(String authId, String listener) throws UnknownHostException {
         SaslServer saslServer = Mockito.mock(SaslServer.class);
         Mockito.when(saslServer.getMechanismName()).thenReturn("PLAIN");

@@ -29,6 +29,7 @@ import org.apache.kafka.common.security.ssl.SslPrincipalMapper;
 import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * A {@link KafkaPrincipalBuilder} that wraps {@link DefaultKafkaPrincipalBuilder}
@@ -133,12 +134,38 @@ public class TenantPrincipalBuilder
     @Override
     public KafkaPrincipal build(AuthenticationContext context) {
         KafkaPrincipal base = delegate.build(context);
-        String tenantId = tenantFor(context);
-        if (tenantId == null) {
-            return base;
-        }
         if (KafkaPrincipal.ANONYMOUS.equals(base)) {
             // Refuse to attach tenant identity to an unauthenticated connection.
+            return base;
+        }
+        String tenantId = tenantFor(context);
+        if (base.getName().startsWith(TenantNamespace.PRINCIPAL_PREFIX)) {
+            // The base principal already carries the reserved tenant prefix.
+            // Three ways this happens:
+            //   1. Delegation-token replay: a token issued under tenant A is
+            //      presented on tenant B's listener. SCRAM/tokenauth surfaces
+            //      the token owner name as authorizationID, so base name is
+            //      "__tenant_A.<user>". Stamping again would yield
+            //      "__tenant_B.__tenant_A.<user>" which TenantNamespace splits
+            //      at the first dot and resolves to tenant B — silently
+            //      crossing the isolation boundary.
+            //   2. SCRAM username spoof: an operator-created SCRAM credential
+            //      named "__tenant_..." used as authorizationID on any listener.
+            //   3. A test or admin-tool oversight passing a pre-stamped name.
+            // In all three cases the safe answer is ANONYMOUS unless the base
+            // principal's tenant matches this listener exactly (same-tenant
+            // re-auth, preserved unchanged so the existing connection identity
+            // is honoured).
+            Optional<String> baseTenant = TenantNamespace.parseTenantId(base);
+            if (baseTenant.isEmpty()) {
+                return KafkaPrincipal.ANONYMOUS;
+            }
+            if (tenantId != null && tenantId.equals(baseTenant.get())) {
+                return base;
+            }
+            return KafkaPrincipal.ANONYMOUS;
+        }
+        if (tenantId == null) {
             return base;
         }
         return new KafkaPrincipal(

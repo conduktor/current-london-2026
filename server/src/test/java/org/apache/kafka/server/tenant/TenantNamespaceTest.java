@@ -42,6 +42,34 @@ class TenantNamespaceTest {
     }
 
     @Test
+    void encodePrincipalNameRefusesUserNameWithReservedPrefix() {
+        // Defence-in-depth against the delegation-token cross-listener replay
+        // vector. If a user name "__tenant_acme.alice" reached this function we
+        // would silently produce "__tenant_beta.__tenant_acme.alice", which
+        // parseTenantId splits at the FIRST dot and resolves to "beta". This
+        // is the path TenantPrincipalBuilder.build closes off — but any other
+        // caller (admin tooling, future builders) that lands here with such a
+        // user name must fail fast rather than materialise an
+        // identity-laundering principal.
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+            () -> TenantNamespace.encodePrincipalName("beta", "__tenant_acme.alice"));
+        assertTrue(ex.getMessage().contains("__tenant_acme.alice"),
+            "error should quote the offending user name; was: " + ex.getMessage());
+        assertTrue(ex.getMessage().contains("__tenant_"),
+            "error should explain the reserved prefix; was: " + ex.getMessage());
+    }
+
+    @Test
+    void encodePrincipalNameRefusesBareReservedPrefix() {
+        // A SCRAM credential literally named "__tenant_" must not slip
+        // through. parseTenantId would return empty (no dot), but the
+        // defence-in-depth refuses any user name that starts with the prefix
+        // — including the bare prefix itself.
+        assertThrows(IllegalArgumentException.class,
+            () -> TenantNamespace.encodePrincipalName("acme", "__tenant_"));
+    }
+
+    @Test
     void parseTenantFromPrincipalReturnsTenantWhenPrefixed() {
         KafkaPrincipal p = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_acme.alice");
         assertEquals(Optional.of("acme"), TenantNamespace.parseTenantId(p));
