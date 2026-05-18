@@ -1140,15 +1140,6 @@ class UnifiedLog(@volatile var logStartOffset: Long,
           s"be 0, but it is ${batch.baseOffset}")
       }
 
-      // Topic-level compression policy: enforced only on client appends so replication and internal
-      // origins (e.g. transaction state, group coordinator) can carry whatever payload they need.
-      // The default policy (NONE) returns false unconditionally so the fast path is allocation-free.
-      if (origin == AppendOrigin.CLIENT && config.compressionPolicy.isViolatedBy(batch.compressionType)) {
-        throw new InvalidRecordException(s"Produce to $topicPartition was rejected by compression.policy=" +
-          s"${config.compressionPolicy.name}: batch has compression.type=${batch.compressionType.name} " +
-          s"but the topic requires compressed batches.")
-      }
-
       /* During replication of uncommitted data it is possible for the remote replica to send record batches after it lost
        * leadership. This can happen if sending FETCH responses is slow. There is a race between sending the FETCH
        * response and the replica truncating and appending to the log. The replicating replica resolves this issue by only
