@@ -111,6 +111,83 @@ class TenantPrincipalBuilderTest {
         assertEquals("__tenant_acme.alice", restored.getName());
     }
 
+    @Test
+    void resolvesTenantFromBrokerPrefixedConfig() throws Exception {
+        // Production path: Kafka hands the broker's full original configs to the
+        // builder (the listener prefix is preserved because tenant.id is not a
+        // defined ConfigDef key). The builder must extract the binding from
+        // listener.name.<lname>.tenant.id and match it against
+        // AuthenticationContext.listenerName().
+        TenantPrincipalBuilder builder = new TenantPrincipalBuilder();
+        Map<String, Object> configs = new HashMap<>();
+        configs.put("listener.name.tenant_acme.tenant.id", "acme");
+        builder.configure(configs);
+
+        KafkaPrincipal p = builder.build(saslContext("alice"));
+
+        assertEquals("__tenant_acme.alice", p.getName());
+    }
+
+    @Test
+    void resolvesPerListenerBindingFromMixedConfig() throws Exception {
+        // Multiple tenant listeners on the same broker: each connection must be
+        // wrapped with its own listener's tenant id, not a shared global.
+        TenantPrincipalBuilder builder = new TenantPrincipalBuilder();
+        Map<String, Object> configs = new HashMap<>();
+        configs.put("listener.name.tenant_acme.tenant.id", "acme");
+        configs.put("listener.name.tenant_beta.tenant.id", "beta");
+        configs.put("listener.name.public.ssl.protocol", "TLSv1.3"); // unrelated noise
+        builder.configure(configs);
+
+        KafkaPrincipal acme = builder.build(saslContextOn("alice", "TENANT_ACME"));
+        KafkaPrincipal beta = builder.build(saslContextOn("bob", "TENANT_BETA"));
+        KafkaPrincipal plain = builder.build(saslContextOn("admin", "PUBLIC"));
+
+        assertEquals("__tenant_acme.alice", acme.getName());
+        assertEquals("__tenant_beta.bob", beta.getName());
+        // No binding for PUBLIC → principal stays unwrapped.
+        assertEquals("admin", plain.getName());
+    }
+
+    @Test
+    void brokerPrefixedListenerLookupIsCaseInsensitive() throws Exception {
+        // Kafka normalizes listener names by uppercasing them in the listener
+        // name registry but config keys are lower-cased. Both ends must agree.
+        TenantPrincipalBuilder builder = new TenantPrincipalBuilder();
+        Map<String, Object> configs = new HashMap<>();
+        configs.put("listener.name.tenant_acme.tenant.id", "acme");
+        builder.configure(configs);
+
+        // AuthenticationContext sees the upper-cased form.
+        KafkaPrincipal upper = builder.build(saslContextOn("alice", "TENANT_ACME"));
+        // Defensive: even a lower-cased listener name resolves.
+        KafkaPrincipal lower = builder.build(saslContextOn("alice", "tenant_acme"));
+
+        assertEquals("__tenant_acme.alice", upper.getName());
+        assertEquals("__tenant_acme.alice", lower.getName());
+    }
+
+    @Test
+    void brokerPrefixedConfigWithInvalidTenantIdIsRejected() {
+        TenantPrincipalBuilder builder = new TenantPrincipalBuilder();
+        Map<String, Object> configs = new HashMap<>();
+        configs.put("listener.name.tenant_bad.tenant.id", "__reserved");
+        // A reserved-prefix tenant id arriving via the listener-prefixed key
+        // must be refused with the same ConfigException as the unprefixed path.
+        assertThrows(ConfigException.class, () -> builder.configure(configs));
+    }
+
+    private static SaslAuthenticationContext saslContextOn(String authId, String listener) throws UnknownHostException {
+        SaslServer saslServer = Mockito.mock(SaslServer.class);
+        Mockito.when(saslServer.getMechanismName()).thenReturn("PLAIN");
+        Mockito.when(saslServer.getAuthorizationID()).thenReturn(authId);
+        return new SaslAuthenticationContext(
+            saslServer,
+            SecurityProtocol.SASL_PLAINTEXT,
+            InetAddress.getByName("127.0.0.1"),
+            listener);
+    }
+
     private static Map<String, Object> configMap(String tenantId) {
         Map<String, Object> m = new HashMap<>();
         m.put(TenantPrincipalBuilder.TENANT_ID_CONFIG, tenantId);

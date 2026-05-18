@@ -26,23 +26,34 @@ import org.apache.kafka.common.security.authenticator.DefaultKafkaPrincipalBuild
 import org.apache.kafka.common.security.kerberos.KerberosShortNamer;
 import org.apache.kafka.common.security.ssl.SslPrincipalMapper;
 
+import java.util.HashMap;
+import java.util.Locale;
 import java.util.Map;
 
 /**
  * A {@link KafkaPrincipalBuilder} that wraps {@link DefaultKafkaPrincipalBuilder}
  * and stamps the resulting principal with a tenant prefix when the listener it
- * was loaded on has a configured tenant id.
+ * arrived on is bound to a tenant id.
  *
- * <p>Configured via per-listener overrides:
+ * <p>Configured via per-listener overrides at the broker level:
  * <pre>
  *   listener.name.tenant_acme.principal.builder.class = \
  *       org.apache.kafka.server.tenant.TenantPrincipalBuilder
  *   listener.name.tenant_acme.tenant.id = acme
  * </pre>
  *
- * <p>If {@value #TENANT_ID_CONFIG} is absent, the builder behaves as the
- * default — useful for inter-broker / cluster-wide listeners that should not be
- * forcibly bound to a tenant.
+ * <p>The resolution is intentionally done from the broker-wide originals — not
+ * from the per-listener stripped configs Kafka hands to {@link #configure}.
+ * Kafka strips a listener prefix only when the stripped key is a known
+ * {@code ConfigDef} entry, and {@code tenant.id} is not one. Without this
+ * indirection a listener-prefixed {@code tenant.id} would arrive at the
+ * builder under its full key, the lookup of {@code tenant.id} would miss, and
+ * principals on that listener would silently stay unwrapped — making every
+ * tenant request look "privileged-on-tenant-listener" and get refused.
+ *
+ * <p>The build path uses {@link AuthenticationContext#listenerName()} to pick
+ * the right binding for the connection at hand. This is also why a single
+ * builder instance correctly serves multiple tenant listeners.
  *
  * <p>{@link KafkaPrincipal#ANONYMOUS} is never wrapped; an unauthenticated
  * connection must not be able to claim a tenant identity.
@@ -51,9 +62,10 @@ public class TenantPrincipalBuilder
         implements KafkaPrincipalBuilder, KafkaPrincipalSerde, Configurable {
 
     public static final String TENANT_ID_CONFIG = "tenant.id";
+    public static final String LISTENER_PREFIX = "listener.name.";
 
     private final DefaultKafkaPrincipalBuilder delegate;
-    private String tenantId;  // null → behave as default
+    private Map<String, String> tenantByListener;  // upper-cased listener name → tenant id
 
     public TenantPrincipalBuilder() {
         // KerberosShortNamer / SslPrincipalMapper are not propagated through
@@ -66,27 +78,62 @@ public class TenantPrincipalBuilder
     // Visible for delegate injection from tests; not part of the public API.
     TenantPrincipalBuilder(DefaultKafkaPrincipalBuilder delegate) {
         this.delegate = delegate;
+        this.tenantByListener = new HashMap<>();
     }
 
     @Override
     public void configure(Map<String, ?> configs) {
+        Map<String, String> bindings = new HashMap<>();
+        // 1. Broker-wide originals: listener.name.<lname>.tenant.id=<id>. This
+        //    path is what production deployments hit — the listener prefix is
+        //    preserved because tenant.id is not a defined ConfigDef key.
+        for (Map.Entry<String, ?> e : configs.entrySet()) {
+            String key = e.getKey();
+            if (!key.startsWith(LISTENER_PREFIX)) {
+                continue;
+            }
+            int suffixStart = key.indexOf('.', LISTENER_PREFIX.length());
+            if (suffixStart < 0) {
+                continue;
+            }
+            String suffix = key.substring(suffixStart + 1);
+            if (!suffix.equals(TENANT_ID_CONFIG)) {
+                continue;
+            }
+            String listener = key.substring(LISTENER_PREFIX.length(), suffixStart);
+            String tenantId = String.valueOf(e.getValue()).trim();
+            if (tenantId.isEmpty()) {
+                continue;
+            }
+            validateOrThrow(key, e.getValue(), tenantId);
+            bindings.put(listener.toUpperCase(Locale.ROOT), tenantId);
+        }
+        // 2. Unprefixed tenant.id: legacy / test path. The empty listener key
+        //    acts as a wildcard so a builder instantiated directly (no broker
+        //    config plumbing) still resolves a tenant for every connection.
         Object raw = configs.get(TENANT_ID_CONFIG);
-        if (raw == null) {
-            this.tenantId = null;
-            return;
+        if (raw != null) {
+            String tenantId = raw.toString().trim();
+            if (!tenantId.isEmpty()) {
+                validateOrThrow(TENANT_ID_CONFIG, raw, tenantId);
+                bindings.put("", tenantId);
+            }
         }
-        String id = raw.toString().trim();
+        this.tenantByListener = bindings;
+    }
+
+    private static void validateOrThrow(String configKey, Object raw, String tenantId) {
         try {
-            TenantNamespace.validateTenantId(id);
+            TenantNamespace.validateTenantId(tenantId);
         } catch (IllegalArgumentException e) {
-            throw new ConfigException(TENANT_ID_CONFIG, raw, e.getMessage());
+            throw new ConfigException(configKey, raw, e.getMessage());
         }
-        this.tenantId = id;
     }
 
     @Override
     public KafkaPrincipal build(AuthenticationContext context) {
         KafkaPrincipal base = delegate.build(context);
+        String tenantId = tenantFor(context);
         if (tenantId == null) {
             return base;
         }
@@ -98,6 +145,21 @@ public class TenantPrincipalBuilder
             base.getPrincipalType(),
             TenantNamespace.encodePrincipalName(tenantId, base.getName()),
             base.tokenAuthenticated());
+    }
+
+    private String tenantFor(AuthenticationContext context) {
+        if (tenantByListener.isEmpty()) {
+            return null;
+        }
+        String listener = context.listenerName();
+        if (listener != null) {
+            String bound = tenantByListener.get(listener.toUpperCase(Locale.ROOT));
+            if (bound != null) {
+                return bound;
+            }
+        }
+        // Wildcard / unprefixed binding (test path).
+        return tenantByListener.get("");
     }
 
     @Override
