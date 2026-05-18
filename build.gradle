@@ -2142,6 +2142,7 @@ project(':server-common') {
     implementation libs.joptSimple
     implementation libs.jacksonDatabind
     implementation libs.pcollections
+    implementation libs.re2j
     implementation libs.slf4jApi
 
     testImplementation project(':clients')

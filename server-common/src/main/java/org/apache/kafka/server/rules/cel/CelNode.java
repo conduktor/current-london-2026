@@ -22,7 +22,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.function.Function;
-import java.util.regex.Pattern;
+
+import com.google.re2j.Pattern;
 
 /**
  * AST for the CEL-subset interpreter. Each subclass implements
@@ -162,18 +163,26 @@ abstract class CelNode {
     /**
      * Specialised method-call node for {@code receiver.matches(<literal>)}.
      * The pattern is compiled exactly once at parse time and stored on the
-     * node; runtime evaluation only invokes the matcher. This serves two
+     * node; runtime evaluation only invokes the matcher. This serves three
      * goals at once:
      *
      * <ol>
-     *   <li><b>Bad regex caught early.</b> A {@link java.util.regex.PatternSyntaxException}
-     *       on a malformed literal raises {@link CelCompilationException} at
-     *       rule load time, not on the request hot path.</li>
-     *   <li><b>ReDoS surface reduced.</b> The receiver string is bounded by
-     *       {@link CelLimits#MAX_REGEX_INPUT_LENGTH}; longer inputs raise
-     *       {@link CelEvaluationException} (which the engine fails open on),
-     *       so a request crafted to feed a megabyte-long field to a
-     *       backtracking regex cannot stall the request thread.</li>
+     *   <li><b>Bad regex caught early.</b> A
+     *       {@link com.google.re2j.PatternSyntaxException} on a malformed
+     *       literal raises {@link CelCompilationException} at rule load time,
+     *       not on the request hot path.</li>
+     *   <li><b>Linear-time matching guaranteed.</b> The implementation is
+     *       {@code com.google.re2j} (Google's RE2 Java port), not
+     *       {@code java.util.regex}. RE2 is worst-case linear in the input
+     *       length regardless of pattern shape — a pattern like
+     *       {@code (a+)+b} (catastrophic backtracking in the JDK regex
+     *       engine on a no-match input) runs in linear time here. Codex/Gemini
+     *       final-audit P1#4.</li>
+     *   <li><b>ReDoS surface eliminated.</b> Combined with #2, even an
+     *       operator who unwittingly writes a JDK-pathological pattern
+     *       cannot cause a request thread to stall on attacker-shaped input.
+     *       {@link CelLimits#MAX_REGEX_INPUT_LENGTH} remains as defense in
+     *       depth — see its javadoc.</li>
      * </ol>
      *
      * <p>The parser only emits this node when the argument is a string

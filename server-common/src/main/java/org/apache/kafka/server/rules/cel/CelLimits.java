@@ -41,10 +41,11 @@ package org.apache.kafka.server.rules.cel;
  * </ul>
  *
  * <p>Separately, {@link #MAX_REGEX_INPUT_LENGTH} caps the string fed to
- * {@code Pattern.matcher().matches()}. A pre-compiled regex with bounded
- * input length cannot exhibit catastrophic backtracking that escapes the
- * request thread — the matcher's worst case is bounded by the input length
- * times the pattern's NFA size, both finite.
+ * {@code Pattern.matcher().matches()}. The primary defence against
+ * catastrophic backtracking is the {@code com.google.re2j} engine used by
+ * {@code CelNode.RegexMatch} (linear time in input length regardless of
+ * pattern shape); the input-length cap is defence in depth that bounds
+ * worst-case CPU even on legitimate non-pathological patterns.
  *
  * <p>None of these limits are tunable at runtime. Operators who want to
  * relax them are signalling that they are about to make their broker
@@ -108,11 +109,12 @@ final class CelLimits {
     /**
      * Maximum length of the receiver string passed to {@code Pattern.matches}.
      * Kafka identifiers are short by spec — topic names cap at 249 chars,
-     * client/group IDs are typically &lt; 256. 16KB is three orders of
-     * magnitude over that, but bounds the worst case of catastrophic
-     * backtracking even when a pattern with a degenerate NFA slips past
-     * review. A receiver longer than this raises {@link CelEvaluationException},
-     * which the engine fails open on per its policy.
+     * client/group IDs are typically &lt; 256. With the RE2 engine in place
+     * (linear-time matching regardless of pattern shape), this cap is no
+     * longer the primary backtracking defence — it bounds worst-case CPU
+     * for legitimate patterns on adversarial inputs. A receiver longer than
+     * this raises {@link CelEvaluationException}, which the engine fails
+     * open on per its policy.
      */
     static final int MAX_REGEX_INPUT_LENGTH = 16384;
 

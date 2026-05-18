@@ -397,6 +397,42 @@ public class CelProgramTest {
     }
 
     @Test
+    public void catastrophicBacktrackingPatternIsHandledInLinearTime() {
+        // Codex/Gemini final-audit P1#4: the JDK's java.util.regex engine
+        // exhibits catastrophic backtracking on patterns like `(a+)+b` when
+        // matched against an input of repeated 'a' (no terminal 'b'). On
+        // MAX_REGEX_INPUT_LENGTH=16384 the JDK engine would spin for minutes
+        // — easily long enough to hang a request thread and turn a single
+        // attacker-crafted request into a broker-wide DoS.
+        //
+        // The engine has been switched to com.google.re2j (Google's RE2 Java
+        // port) which is worst-case linear in input length regardless of
+        // pattern shape. This test pins that behaviour: a pathological
+        // (operator-authored, attacker-targeted) pattern matched against a
+        // 16384-char no-match receiver must complete promptly. A generous
+        // 5-second deadline catches any regression to a backtracking engine
+        // (the JDK engine would take many minutes on this input); a healthy
+        // re2j eval is well under 100ms on a modern broker.
+        StringBuilder huge = new StringBuilder();
+        for (int n = 0; n < 16384; n++) {
+            huge.append('a');
+        }
+        Map<String, Object> env = new HashMap<>();
+        env.put("name", huge.toString());
+        // Pattern that catastrophically backtracks on `a*` no-`b` input under
+        // java.util.regex. Wrapped in System.nanoTime so a regression to a
+        // backtracking engine fails loudly with a timing assertion rather
+        // than wedging the test runner forever.
+        long t0 = System.nanoTime();
+        boolean result = evalBool("name.matches(\"(a+)+b\")", env);
+        long elapsedNanos = System.nanoTime() - t0;
+        assertFalse(result, "no 'b' in input — must not match");
+        assertTrue(elapsedNanos < 5_000_000_000L,
+            "RE2 must finish in linear time — took " + (elapsedNanos / 1_000_000) +
+                "ms (>5s); regression to a backtracking engine?");
+    }
+
+    @Test
     public void matchesStillWorksOnNonStringReceiver() {
         // Behavioural parity with the old MethodCall-based path: a non-string
         // receiver yields false, not an exception. This matters because

@@ -20,8 +20,9 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.regex.Pattern;
-import java.util.regex.PatternSyntaxException;
+
+import com.google.re2j.Pattern;
+import com.google.re2j.PatternSyntaxException;
 
 /**
  * Lexer + recursive-descent parser for the CEL subset supported by the
@@ -494,6 +495,18 @@ public final class CelCompiler {
          * <p>The compile happens here, at rule load. A malformed regex
          * surfaces as {@link CelCompilationException} to the rule submitter,
          * not as a runtime exception on the broker request path.
+         *
+         * <p>The compiler is {@code com.google.re2j} (the Java port of Google's
+         * RE2), not {@code java.util.regex}. RE2 guarantees worst-case linear
+         * time in the input length regardless of pattern shape; it is
+         * impossible to write a CEL regex that exhibits catastrophic
+         * backtracking on a hostile receiver. The trade-off is that RE2 does
+         * not support backreferences ({@code \1}), lookaround
+         * ({@code (?=...)} / {@code (?!...)} / {@code (?<=...)} /
+         * {@code (?<!...)}), or possessive quantifiers ({@code a*+},
+         * {@code a++}). A rule that needs any of those should be rewritten as
+         * multiple simpler rules; the linear-time guarantee on the request
+         * thread is the more valuable property. Codex/Gemini final-audit P1#4.
          */
         private CelNode buildRegexMatch(CelNode receiver, List<CelNode> args) {
             if (args.size() != 1) {

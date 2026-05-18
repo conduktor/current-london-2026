@@ -133,9 +133,14 @@
 
         <subpackage name="rules">
             <!-- CEL rules engine: needs Jackson for JSON envelopes, Kafka protocol
-                 message types for generic field extraction, and the clients
-                 Consumer API for the internal __governance topic reader. -->
+                 message types for generic field extraction, the clients
+                 Consumer API for the internal __governance topic reader, and
+                 com.google.re2j for linear-time regex matching in
+                 CelNode.RegexMatch (replaces java.util.regex to eliminate the
+                 catastrophic-backtracking ReDoS surface — Codex/Gemini
+                 final-audit P1#4). -->
             <allow pkg="com.fasterxml.jackson" />
+            <allow pkg="com.google.re2j" />
             <allow pkg="org.apache.kafka.common.protocol" />
             <allow pkg="org.apache.kafka.common.requests" />
             <allow pkg="org.apache.kafka.common.message" />
