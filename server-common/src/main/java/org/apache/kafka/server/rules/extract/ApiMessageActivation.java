@@ -451,7 +451,52 @@ public final class ApiMessageActivation {
         if (v instanceof Integer || v instanceof Short || v instanceof Byte) {
             return ((Number) v).longValue();
         }
-        if (v instanceof Number || v instanceof byte[] || v instanceof ByteBuffer) {
+        // byte[] / ByteBuffer fields surface ONLY as a {sizeInBytes} descriptor,
+        // mirroring the BaseRecords policy. Audit round-6 finding B1 (BLOCKER)
+        // / H1 (HIGH): without this normalisation the walker handed back the
+        // live byte[] or ByteBuffer, which created two compounding hazards on
+        // the rule path:
+        //
+        //   1. Shape: CEL has no usable contract for a raw byte[] or
+        //      ByteBuffer. A rule of the form
+        //      `request.requestData == b"<prefix>"` or
+        //      `request.requestData.size() > 0` either compares by JVM
+        //      reference identity (silently false, even for content-equal
+        //      arrays) or raises a CEL type mismatch. Either way, the rule
+        //      fails open — RuleEngine.evaluate catches the throw and
+        //      returns ALLOW (documented fail-open posture for broken
+        //      predicates). A rule the operator believes is enforcing is
+        //      silently bypassed on every request.
+        //
+        //   2. Cost / leak: ByteBuffer turns up on EnvelopeRequestData,
+        //      PushTelemetryRequestData, ConsumerProtocolSubscription, and
+        //      similar. EnvelopeRequest's payload is a whole *serialised
+        //      inner request*, potentially carrying SASL bytes or admin
+        //      mutation data, and is bounded only by
+        //      socket.request.max.bytes. Handing this back as a live buffer
+        //      pinned in the activation map is both a memory hazard and a
+        //      defence-in-depth gap relative to the BaseRecords carve-out
+        //      that exists precisely so PRODUCE payloads cannot be probed
+        //      via rule predicates.
+        //
+        // SENSITIVE_NAMES already strips authBytes / salt / saltedPassword /
+        // hmac / secret accessors at the toMap level, so byte-shaped
+        // credentials never reach convertScalar. This branch is the
+        // defence-in-depth for the remaining non-credential byte fields
+        // (envelope payload, telemetry blob, raft-voter directory id, etc.).
+        // Operators wanting size-bounded DENY rules can still write
+        // `request.requestData.sizeInBytes > N`.
+        if (v instanceof byte[]) {
+            Map<String, Object> descriptor = new LinkedHashMap<>(1);
+            descriptor.put("sizeInBytes", (long) ((byte[]) v).length);
+            return descriptor;
+        }
+        if (v instanceof ByteBuffer) {
+            Map<String, Object> descriptor = new LinkedHashMap<>(1);
+            descriptor.put("sizeInBytes", (long) ((ByteBuffer) v).remaining());
+            return descriptor;
+        }
+        if (v instanceof Number) {
             return v;
         }
         // Uuid identifies topics (MetadataRequest v10+, FetchRequest v13+,
