@@ -5028,6 +5028,314 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testListOffsetsFromViewRewritesToBackingAndTranslatesResponse(): Unit = {
+    // Baseline: a ListOffsets request against a view topic must redirect to the backing topic
+    // for the actual offset lookup, then translate the response back under the view's name so
+    // the consumer never observes the backing topic. Existing fetch tests pin this for the
+    // FETCH path; here we pin the equivalent for LIST_OFFSETS. Also pins that the consumer-side
+    // request can omit currentLeaderEpoch (UNKNOWN_EPOCH = -1) and pass straight through.
+    val viewTopic = "list-view"
+    val backingTopic = "list-backing"
+    val viewTopicId = Uuid.randomUuid()
+    val backingTopicId = Uuid.randomUuid()
+
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, backingTopic)
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.x == 1")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+    addTopicToMetadataCache(viewTopic, numPartitions = 1, topicId = viewTopicId)
+    addTopicToMetadataCache(backingTopic, numPartitions = 1, topicId = backingTopicId)
+
+    when(replicaManager.getPartitionOrError(any[TopicPartition]))
+      .thenAnswer(_ => Right(mock(classOf[Partition])))
+
+    val topicsCaptor: ArgumentCaptor[Seq[ListOffsetsTopic]] =
+      ArgumentCaptor.forClass(classOf[Seq[ListOffsetsTopic]])
+    when(replicaManager.fetchOffset(
+      topicsCaptor.capture(),
+      ArgumentMatchers.eq(Set.empty[TopicPartition]),
+      any[IsolationLevel],
+      ArgumentMatchers.eq(ListOffsetsRequest.CONSUMER_REPLICA_ID),
+      ArgumentMatchers.any[String](),
+      ArgumentMatchers.anyInt(),
+      ArgumentMatchers.anyShort(),
+      ArgumentMatchers.any[(Errors, ListOffsetsPartition) => ListOffsetsPartitionResponse](),
+      ArgumentMatchers.any[List[ListOffsetsTopicResponse] => Unit](),
+      ArgumentMatchers.anyInt()
+    )).thenAnswer(ans => {
+      val callback = ans.getArgument[List[ListOffsetsTopicResponse] => Unit](8)
+      val partResp = new ListOffsetsPartitionResponse()
+        .setPartitionIndex(0)
+        .setErrorCode(Errors.NONE.code)
+        .setOffset(42L)
+        .setTimestamp(ListOffsetsResponse.UNKNOWN_TIMESTAMP)
+      callback(List(new ListOffsetsTopicResponse().setName(backingTopic)
+        .setPartitions(List(partResp).asJava)))
+    })
+
+    val targetTimes = List(new ListOffsetsTopic()
+      .setName(viewTopic)
+      .setPartitions(List(new ListOffsetsPartition()
+        .setPartitionIndex(0)
+        .setTimestamp(ListOffsetsRequest.LATEST_TIMESTAMP)).asJava)).asJava
+    val listOffsetRequest = ListOffsetsRequest.Builder.forConsumer(true, IsolationLevel.READ_UNCOMMITTED)
+      .setTargetTimes(targetTimes).build()
+    val request = buildRequest(listOffsetRequest)
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+    kafkaApis = createKafkaApis(configRepository = configRepository)
+    kafkaApis.handleListOffsetRequest(request)
+
+    val capturedTopics = topicsCaptor.getValue
+    assertEquals(1, capturedTopics.size)
+    assertEquals(backingTopic, capturedTopics.head.name,
+      "the entry handed to ReplicaManager.fetchOffset must be keyed at the backing topic")
+
+    val response = verifyNoThrottling[ListOffsetsResponse](request)
+    val viewResp = response.topics.asScala.find(_.name == viewTopic)
+    assertTrue(viewResp.isDefined,
+      "response must surface under the view name the consumer asked for, not the backing name")
+    assertTrue(response.topics.asScala.forall(_.name != backingTopic),
+      "backing topic name must NOT leak in the response")
+    val partResp = viewResp.get.partitions.asScala.head
+    assertEquals(Errors.NONE.code, partResp.errorCode)
+    assertEquals(42L, partResp.offset)
+  }
+
+  @Test
+  def testListOffsetsFromViewStripsConsumerLeaderEpochBeforeRedirectingToBacking(): Unit = {
+    // KIP-595 leader-epoch boundary: view and backing topics have independent epoch ledgers.
+    // The consumer's `currentLeaderEpoch` describes the VIEW's ledger and would mis-validate
+    // against the backing partition's ledger inside ReplicaManager.fetchOffset → FENCED or
+    // UNKNOWN on every modern-client ListOffsets call. The handler must validate against the
+    // view partition, then strip currentLeaderEpoch (UNKNOWN_EPOCH = -1) on the rewritten
+    // partition before the redirect.
+    val viewTopic = "list-strip-view"
+    val backingTopic = "list-strip-backing"
+    val viewTopicId = Uuid.randomUuid()
+    val backingTopicId = Uuid.randomUuid()
+    val consumerEpoch = 9
+
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, backingTopic)
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.x == 1")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+    addTopicToMetadataCache(viewTopic, numPartitions = 1, topicId = viewTopicId)
+    addTopicToMetadataCache(backingTopic, numPartitions = 1, topicId = backingTopicId)
+
+    val viewPartition = mock(classOf[Partition])
+    when(viewPartition.localLogWithEpochOrThrow(any[Optional[Integer]], anyBoolean))
+      .thenReturn(mock(classOf[UnifiedLog]))
+    when(replicaManager.getPartitionOrError(new TopicPartition(viewTopic, 0)))
+      .thenReturn(Right(viewPartition))
+    when(replicaManager.getPartitionOrError(new TopicPartition(backingTopic, 0)))
+      .thenReturn(Right(mock(classOf[Partition])))
+
+    val topicsCaptor: ArgumentCaptor[Seq[ListOffsetsTopic]] =
+      ArgumentCaptor.forClass(classOf[Seq[ListOffsetsTopic]])
+    when(replicaManager.fetchOffset(
+      topicsCaptor.capture(),
+      ArgumentMatchers.eq(Set.empty[TopicPartition]),
+      any[IsolationLevel],
+      ArgumentMatchers.eq(ListOffsetsRequest.CONSUMER_REPLICA_ID),
+      ArgumentMatchers.any[String](),
+      ArgumentMatchers.anyInt(),
+      ArgumentMatchers.anyShort(),
+      ArgumentMatchers.any[(Errors, ListOffsetsPartition) => ListOffsetsPartitionResponse](),
+      ArgumentMatchers.any[List[ListOffsetsTopicResponse] => Unit](),
+      ArgumentMatchers.anyInt()
+    )).thenAnswer(ans => {
+      val callback = ans.getArgument[List[ListOffsetsTopicResponse] => Unit](8)
+      callback(List(new ListOffsetsTopicResponse().setName(backingTopic).setPartitions(
+        List(new ListOffsetsPartitionResponse()
+          .setPartitionIndex(0).setErrorCode(Errors.NONE.code).setOffset(7L)
+          .setTimestamp(ListOffsetsResponse.UNKNOWN_TIMESTAMP)).asJava)))
+    })
+
+    val targetTimes = List(new ListOffsetsTopic()
+      .setName(viewTopic)
+      .setPartitions(List(new ListOffsetsPartition()
+        .setPartitionIndex(0)
+        .setCurrentLeaderEpoch(consumerEpoch)
+        .setTimestamp(ListOffsetsRequest.LATEST_TIMESTAMP)).asJava)).asJava
+    val listOffsetRequest = ListOffsetsRequest.Builder.forConsumer(true, IsolationLevel.READ_UNCOMMITTED)
+      .setTargetTimes(targetTimes).build()
+    val request = buildRequest(listOffsetRequest)
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+    kafkaApis = createKafkaApis(configRepository = configRepository)
+    kafkaApis.handleListOffsetRequest(request)
+
+    // View-side epoch validation must have run against the VIEW partition.
+    verify(viewPartition).localLogWithEpochOrThrow(
+      ArgumentMatchers.eq(Optional.of(Integer.valueOf(consumerEpoch))), anyBoolean)
+
+    // The partition handed to ReplicaManager.fetchOffset must carry NO leader-epoch — the
+    // backing's ledger is independent and would reject a view-epoch.
+    val backingPartitions = topicsCaptor.getValue.head.partitions.asScala
+    assertEquals(1, backingPartitions.size)
+    assertEquals(ListOffsetsResponse.UNKNOWN_EPOCH, backingPartitions.head.currentLeaderEpoch,
+      "consumer's view-epoch must NOT be forwarded to the backing fetchOffset — independent " +
+        "epoch ledgers (KIP-595)")
+  }
+
+  @Test
+  def testListOffsetsFromViewWithStaleConsumerEpochReturnsFencedLeaderEpoch(): Unit = {
+    // The view's local epoch is AHEAD of the consumer's. View-side localLogWithEpochOrThrow
+    // throws FencedLeaderEpochException; the handler must surface FENCED_LEADER_EPOCH keyed at
+    // the view and skip the replica fetch path for that partition entirely.
+    val viewTopic = "list-fenced-view"
+    val backingTopic = "list-fenced-backing"
+    val viewTopicId = Uuid.randomUuid()
+    val backingTopicId = Uuid.randomUuid()
+
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, backingTopic)
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.x == 1")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+    addTopicToMetadataCache(viewTopic, numPartitions = 1, topicId = viewTopicId)
+    addTopicToMetadataCache(backingTopic, numPartitions = 1, topicId = backingTopicId)
+
+    val viewPartition = mock(classOf[Partition])
+    when(viewPartition.localLogWithEpochOrThrow(any[Optional[Integer]], anyBoolean))
+      .thenThrow(new FencedLeaderEpochException("view ahead of consumer"))
+    when(replicaManager.getPartitionOrError(new TopicPartition(viewTopic, 0)))
+      .thenReturn(Right(viewPartition))
+    when(replicaManager.getPartitionOrError(new TopicPartition(backingTopic, 0)))
+      .thenReturn(Right(mock(classOf[Partition])))
+
+    val targetTimes = List(new ListOffsetsTopic()
+      .setName(viewTopic)
+      .setPartitions(List(new ListOffsetsPartition()
+        .setPartitionIndex(0)
+        .setCurrentLeaderEpoch(2)
+        .setTimestamp(ListOffsetsRequest.LATEST_TIMESTAMP)).asJava)).asJava
+    val listOffsetRequest = ListOffsetsRequest.Builder.forConsumer(true, IsolationLevel.READ_UNCOMMITTED)
+      .setTargetTimes(targetTimes).build()
+    val request = buildRequest(listOffsetRequest)
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+    kafkaApis = createKafkaApis(configRepository = configRepository)
+    kafkaApis.handleListOffsetRequest(request)
+
+    // The view-epoch check must short-circuit before the replica layer is consulted.
+    verify(replicaManager, never()).fetchOffset(
+      ArgumentMatchers.any[Seq[ListOffsetsTopic]](),
+      ArgumentMatchers.any[Set[TopicPartition]](),
+      ArgumentMatchers.any[IsolationLevel](),
+      ArgumentMatchers.anyInt(),
+      ArgumentMatchers.any[String](),
+      ArgumentMatchers.anyInt(),
+      ArgumentMatchers.anyShort(),
+      ArgumentMatchers.any[(Errors, ListOffsetsPartition) => ListOffsetsPartitionResponse](),
+      ArgumentMatchers.any[List[ListOffsetsTopicResponse] => Unit](),
+      ArgumentMatchers.anyInt()
+    )
+
+    val response = verifyNoThrottling[ListOffsetsResponse](request)
+    val partResp = response.topics.asScala.find(_.name == viewTopic).get.partitions.asScala.head
+    assertEquals(Errors.FENCED_LEADER_EPOCH.code, partResp.errorCode,
+      "view-side epoch validation must surface FENCED_LEADER_EPOCH keyed at the view " +
+        "(NOT translated into a backing-partition error)")
+  }
+
+  @Test
+  def testListOffsetsFromViewWithMixedEpochValidityReturnsPerPartitionErrors(): Unit = {
+    // A view request whose partitions span BOTH a stale and a current consumer epoch must
+    // surface a single ListOffsetsTopicResponse for the view containing both the per-partition
+    // error AND the per-partition offset — protocol invariant: one TopicResponse per topic name.
+    // This pins the splice in viewAwareSendResponseCallback that merges per-partition epoch
+    // errors with the storage-layer-returned partitions.
+    val viewTopic = "list-mixed-view"
+    val backingTopic = "list-mixed-backing"
+    val viewTopicId = Uuid.randomUuid()
+    val backingTopicId = Uuid.randomUuid()
+
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, backingTopic)
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.x == 1")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+    addTopicToMetadataCache(viewTopic, numPartitions = 2, topicId = viewTopicId)
+    addTopicToMetadataCache(backingTopic, numPartitions = 2, topicId = backingTopicId)
+
+    val viewPartition0 = mock(classOf[Partition])
+    val viewPartition1 = mock(classOf[Partition])
+    // Partition 0 → fences (consumer's epoch 2 is behind view's local epoch).
+    when(viewPartition0.localLogWithEpochOrThrow(any[Optional[Integer]], anyBoolean))
+      .thenThrow(new FencedLeaderEpochException("stale on partition 0"))
+    // Partition 1 → accepts (consumer's epoch 5 matches view's local epoch).
+    when(viewPartition1.localLogWithEpochOrThrow(any[Optional[Integer]], anyBoolean))
+      .thenReturn(mock(classOf[UnifiedLog]))
+    when(replicaManager.getPartitionOrError(new TopicPartition(viewTopic, 0)))
+      .thenReturn(Right(viewPartition0))
+    when(replicaManager.getPartitionOrError(new TopicPartition(viewTopic, 1)))
+      .thenReturn(Right(viewPartition1))
+    when(replicaManager.getPartitionOrError(new TopicPartition(backingTopic, 0)))
+      .thenReturn(Right(mock(classOf[Partition])))
+    when(replicaManager.getPartitionOrError(new TopicPartition(backingTopic, 1)))
+      .thenReturn(Right(mock(classOf[Partition])))
+
+    val topicsCaptor: ArgumentCaptor[Seq[ListOffsetsTopic]] =
+      ArgumentCaptor.forClass(classOf[Seq[ListOffsetsTopic]])
+    when(replicaManager.fetchOffset(
+      topicsCaptor.capture(),
+      ArgumentMatchers.eq(Set.empty[TopicPartition]),
+      any[IsolationLevel],
+      ArgumentMatchers.eq(ListOffsetsRequest.CONSUMER_REPLICA_ID),
+      ArgumentMatchers.any[String](),
+      ArgumentMatchers.anyInt(),
+      ArgumentMatchers.anyShort(),
+      ArgumentMatchers.any[(Errors, ListOffsetsPartition) => ListOffsetsPartitionResponse](),
+      ArgumentMatchers.any[List[ListOffsetsTopicResponse] => Unit](),
+      ArgumentMatchers.anyInt()
+    )).thenAnswer(ans => {
+      val callback = ans.getArgument[List[ListOffsetsTopicResponse] => Unit](8)
+      // Only partition 1 should reach the replica layer — partition 0 was rejected at the gate.
+      callback(List(new ListOffsetsTopicResponse().setName(backingTopic).setPartitions(
+        List(new ListOffsetsPartitionResponse()
+          .setPartitionIndex(1).setErrorCode(Errors.NONE.code).setOffset(99L)
+          .setTimestamp(ListOffsetsResponse.UNKNOWN_TIMESTAMP)).asJava)))
+    })
+
+    val targetTimes = List(new ListOffsetsTopic()
+      .setName(viewTopic)
+      .setPartitions(List(
+        new ListOffsetsPartition().setPartitionIndex(0).setCurrentLeaderEpoch(2)
+          .setTimestamp(ListOffsetsRequest.LATEST_TIMESTAMP),
+        new ListOffsetsPartition().setPartitionIndex(1).setCurrentLeaderEpoch(5)
+          .setTimestamp(ListOffsetsRequest.LATEST_TIMESTAMP)).asJava)).asJava
+    val listOffsetRequest = ListOffsetsRequest.Builder.forConsumer(true, IsolationLevel.READ_UNCOMMITTED)
+      .setTargetTimes(targetTimes).build()
+    val request = buildRequest(listOffsetRequest)
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+    kafkaApis = createKafkaApis(configRepository = configRepository)
+    kafkaApis.handleListOffsetRequest(request)
+
+    // The replica fetchOffset must be called with ONLY partition 1 (epoch-cleared).
+    val backingPartitions = topicsCaptor.getValue.head.partitions.asScala
+    assertEquals(1, backingPartitions.size,
+      "only the partitions that passed view-side epoch validation reach the storage layer")
+    assertEquals(1, backingPartitions.head.partitionIndex)
+    assertEquals(ListOffsetsResponse.UNKNOWN_EPOCH, backingPartitions.head.currentLeaderEpoch)
+
+    val response = verifyNoThrottling[ListOffsetsResponse](request)
+    // Exactly ONE topic entry under the view's name — protocol invariant. Both partitions
+    // surface inside it: the epoch-failed one as FENCED, the surviving one as NONE/offset.
+    val viewEntries = response.topics.asScala.filter(_.name == viewTopic)
+    assertEquals(1, viewEntries.size,
+      "the response must carry exactly one ListOffsetsTopicResponse per topic name (protocol " +
+        "invariant); per-partition epoch errors must be spliced into the same topic entry as " +
+        "the per-partition successes")
+    val byPart = viewEntries.head.partitions.asScala.map(p => p.partitionIndex -> p).toMap
+    assertEquals(Set(0, 1), byPart.keySet)
+    assertEquals(Errors.FENCED_LEADER_EPOCH.code, byPart(0).errorCode,
+      "partition 0 must surface its FencedLeaderEpoch")
+    assertEquals(Errors.NONE.code, byPart(1).errorCode)
+    assertEquals(99L, byPart(1).offset, "partition 1 must surface its replica-layer offset")
+  }
+
+  @Test
   def testHandleShareFetchRequestSuccessWithoutAcknowledgements(): Unit = {
     val topicName = "foo"
     val topicId = Uuid.randomUuid()

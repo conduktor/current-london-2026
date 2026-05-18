@@ -1143,6 +1143,12 @@ class KafkaApis(val requestChannel: RequestChannel,
     val backingToView = mutable.LinkedHashMap[String, String]() // backingName → viewName, response translation
     val viewRewriteResponses = mutable.ArrayBuffer[ListOffsetsTopicResponse]()
     val rewrittenAuthorizedInfo = mutable.ArrayBuffer[ListOffsetsTopic]()
+    // Per-view, per-partition epoch errors. Used when only SOME partitions of a view fail
+    // currentLeaderEpoch validation — we still route the surviving partitions through the
+    // replica layer, then splice these per-partition error responses back into the view's
+    // ListOffsetsTopicResponse before sending. Keyed by view name (not backing) so the splice
+    // happens after backing→view translation in viewAwareSendResponseCallback.
+    val viewPartialPartitionErrors = mutable.LinkedHashMap[String, mutable.ArrayBuffer[ListOffsetsPartitionResponse]]()
 
     if (authorizedRequestInfo.nonEmpty) {
       // First pass: classify each authorized topic — view (with spec) / direct / malformed view.
@@ -1208,10 +1214,69 @@ class KafkaApis(val requestChannel: RequestChannel,
               s"$backingName in one ListOffsetsRequest; failing the second view with INVALID_REQUEST.")
             rejectAllPartitions(topic, Errors.INVALID_REQUEST)
           } else {
-            rewrittenAuthorizedInfo += new ListOffsetsTopic()
-              .setName(backingName)
-              .setPartitions(topic.partitions)
-            backingToView.put(backingName, topic.name)
+            // Leader-epoch boundary (KIP-595): each ListOffsetsPartition.currentLeaderEpoch
+            // reflects the VIEW's leader-epoch ledger, which evolves independently of the
+            // backing's (a view-leader change does not bump the backing's epoch and vice versa).
+            // Forwarding the partitions unchanged would let replicaManager.fetchOffset validate
+            // the view's epoch against the backing partition's epoch and surface FENCED/UNKNOWN
+            // on every modern-client ListOffsets call.
+            //
+            // Validate per-partition against the VIEW partition's local log, then build a
+            // rewritten ListOffsetsTopic that points at the backing topic but strips every
+            // partition's currentLeaderEpoch (UNKNOWN_EPOCH = -1) so the backing fetchOffset
+            // sees an epoch-less request. Partitions whose epoch fails validation are surfaced
+            // as per-partition errors against the VIEW name (FENCED_LEADER_EPOCH /
+            // UNKNOWN_LEADER_EPOCH / NOT_LEADER_OR_FOLLOWER) via viewPartialPartitionErrors;
+            // the surviving partitions go through the storage layer normally.
+            //
+            // `fetchOnlyFromLeader = true` mirrors `ReplicaManager.fetchOffset`'s decision
+            // (replicaId != DEBUGGING_REPLICA_ID) for consumer and inter-broker ListOffsets.
+            val validatedPartitions = new util.ArrayList[ListOffsetsPartition]()
+            val perPartitionErrors = mutable.ArrayBuffer[ListOffsetsPartitionResponse]()
+            topic.partitions.asScala.foreach { p =>
+              val epochOpt: Optional[Integer] =
+                if (p.currentLeaderEpoch == ListOffsetsResponse.UNKNOWN_EPOCH) Optional.empty()
+                else Optional.of(Integer.valueOf(p.currentLeaderEpoch))
+              val epochError: Errors =
+                if (!epochOpt.isPresent) {
+                  Errors.NONE
+                } else {
+                  replicaManager.getPartitionOrError(new TopicPartition(topic.name, p.partitionIndex)) match {
+                    case Left(error) => error
+                    case Right(viewPartition) =>
+                      try {
+                        viewPartition.localLogWithEpochOrThrow(epochOpt, true)
+                        Errors.NONE
+                      } catch {
+                        case e: ApiException => Errors.forException(e)
+                      }
+                  }
+                }
+              if (epochError != Errors.NONE) {
+                perPartitionErrors += buildErrorResponse(epochError, p)
+              } else {
+                validatedPartitions.add(new ListOffsetsPartition()
+                  .setPartitionIndex(p.partitionIndex)
+                  .setCurrentLeaderEpoch(ListOffsetsResponse.UNKNOWN_EPOCH)
+                  .setTimestamp(p.timestamp))
+              }
+            }
+            if (perPartitionErrors.nonEmpty && validatedPartitions.isEmpty) {
+              // All partitions failed epoch validation → synthesise the view response directly,
+              // skip the replica layer entirely.
+              viewRewriteResponses += new ListOffsetsTopicResponse()
+                .setName(topic.name)
+                .setPartitions(perPartitionErrors.asJava)
+            } else {
+              if (perPartitionErrors.nonEmpty) {
+                viewPartialPartitionErrors.getOrElseUpdate(topic.name,
+                  mutable.ArrayBuffer[ListOffsetsPartitionResponse]()) ++= perPartitionErrors
+              }
+              rewrittenAuthorizedInfo += new ListOffsetsTopic()
+                .setName(backingName)
+                .setPartitions(validatedPartitions)
+              backingToView.put(backingName, topic.name)
+            }
           }
 
         case (topic, Right(_)) =>
@@ -1235,16 +1300,22 @@ class KafkaApis(val requestChannel: RequestChannel,
       }
     }
 
-    // Wrap the original sendResponseCallback so we (a) translate backing names back to view names
-    // and (b) append any view-rewrite rejection responses we built above. The original callback
-    // also tacks on the topic-authorization-failure responses.
+    // Wrap the original sendResponseCallback so we (a) translate backing names back to view names,
+    // (b) splice in per-partition epoch errors for views whose other partitions reached the
+    // storage layer, and (c) append any view-rewrite rejection responses we built above. The
+    // original callback also tacks on the topic-authorization-failure responses.
+    //
+    // The splice keeps the protocol invariant of one ListOffsetsTopicResponse per topic name —
+    // duplicate-name entries would be ambiguous to the consumer (only the first parsed wins).
     def viewAwareSendResponseCallback(response: Seq[ListOffsetsTopicResponse]): Unit = {
       val translated: Seq[ListOffsetsTopicResponse] =
         if (backingToView.isEmpty) response
         else response.map { topicResp =>
           backingToView.get(topicResp.name) match {
             case Some(viewName) =>
-              new ListOffsetsTopicResponse().setName(viewName).setPartitions(topicResp.partitions)
+              val combined = new util.ArrayList[ListOffsetsPartitionResponse](topicResp.partitions)
+              viewPartialPartitionErrors.get(viewName).foreach(errs => combined.addAll(errs.asJava))
+              new ListOffsetsTopicResponse().setName(viewName).setPartitions(combined)
             case None => topicResp
           }
         }
