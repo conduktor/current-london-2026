@@ -295,17 +295,36 @@ class KafkaApis(val requestChannel: RequestChannel,
           // to the response with TOPIC_AUTHORIZATION_FAILED.
           responseBuilder.addPartitions[OffsetCommitRequestData.OffsetCommitRequestPartition](
             topic.name, topic.partitions, _.partitionIndex, Errors.TOPIC_AUTHORIZATION_FAILED)
-        } else if (!metadataCache.contains(topic.name)) {
-          // If the topic is unknown, we add the topic and all its partitions
-          // to the response with UNKNOWN_TOPIC_OR_PARTITION.
+        } else if (!metadataCache.contains(topic.name) && !concentrationKernel.isLogicalTopic(topic.name)) {
+          // If the topic is unknown (neither in the KRaft cache nor declared as a logical
+          // topic) we add the topic and all its partitions to the response with
+          // UNKNOWN_TOPIC_OR_PARTITION. Logical topics intentionally live outside the cache —
+          // without this concentration-aware check a stock consumer can fetch but never commit
+          // its offsets, breaking group-managed consumption (Codex r12 BLOCKER #101).
           responseBuilder.addPartitions[OffsetCommitRequestData.OffsetCommitRequestPartition](
             topic.name, topic.partitions, _.partitionIndex, Errors.UNKNOWN_TOPIC_OR_PARTITION)
         } else {
           // Otherwise, we check all partitions to ensure that they all exist.
           val topicWithValidPartitions = new OffsetCommitRequestData.OffsetCommitRequestTopic().setName(topic.name)
+          // For logical topics, partition existence is governed by the declared
+          // numLogicalPartitions (kernel-resident), not the metadata cache. Leadership of each
+          // logical partition belongs to the backing partition; OffsetCommit is a store-only
+          // operation in the group coordinator and doesn't need leader liveness here — the
+          // bound check below is sufficient.
+          val logicalNumPartitions: Int =
+            if (concentrationKernel.isLogicalTopic(topic.name))
+              concentrationKernel.describe(topic.name)
+                .map[Integer](d => Integer.valueOf(d.numLogicalPartitions))
+                .orElse(Integer.valueOf(-1)).intValue()
+            else -1
 
           topic.partitions.forEach { partition =>
-            if (metadataCache.getLeaderAndIsr(topic.name, partition.partitionIndex).nonEmpty) {
+            val partitionExists =
+              if (logicalNumPartitions >= 0)
+                partition.partitionIndex >= 0 && partition.partitionIndex < logicalNumPartitions
+              else
+                metadataCache.getLeaderAndIsr(topic.name, partition.partitionIndex).nonEmpty
+            if (partitionExists) {
               topicWithValidPartitions.partitions.add(partition)
             } else {
               responseBuilder.addPartition(topic.name, partition.partitionIndex, Errors.UNKNOWN_TOPIC_OR_PARTITION)
