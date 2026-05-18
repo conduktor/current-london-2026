@@ -21,7 +21,6 @@ import org.apache.kafka.common.record.MemoryRecords;
 import org.apache.kafka.common.record.Record;
 import org.apache.kafka.common.record.RecordBatch;
 import org.apache.kafka.common.utils.BufferSupplier;
-import org.apache.kafka.common.utils.Utils;
 
 import java.nio.ByteBuffer;
 import java.util.Optional;
@@ -174,17 +173,21 @@ public final class ViewFilter {
     }
 
     /**
-     * Builds a {@link RecordContext} from a single {@link Record}, copying out the key, value,
-     * and header bytes. We materialize {@code byte[]} eagerly so the underlying record buffer
-     * may be advanced safely by Kafka after evaluation; JSON parsing and UTF-8 decoding remain
-     * lazy inside the context implementation.
+     * Builds a {@link RecordContext} from a single {@link Record} without copying the key/value
+     * bytes. The buffers are stable for the duration of {@link #shouldRetainRecord} — Kafka does
+     * not advance the underlying record stream until {@code shouldRetainRecord} returns — so the
+     * context can hold ByteBuffer references directly. Materialising a byte[] is deferred to the
+     * (rare) {@link RecordContext#rawKey()} / {@link RecordContext#rawBody()} call.
+     *
+     * <p>Headers are still copied into the context's per-record map (`b.header` clones the byte[]
+     * reference into a list, then DefaultRecordContext copies into a HashMap). That overhead is
+     * bounded by the small header count typical of Kafka records and is dwarfed by the body-copy
+     * win.</p>
      */
     private static RecordContext contextFor(RecordBatch batch, Record record, int partition) {
-        byte[] key = bytesOrNull(record.hasKey() ? record.key() : null);
-        byte[] body = bytesOrNull(record.hasValue() ? record.value() : null);
         RecordContexts.Builder b = RecordContexts.builder()
-                .key(key)
-                .body(body)
+                .keyBuffer(record.hasKey() ? record.key() : null)
+                .bodyBuffer(record.hasValue() ? record.value() : null)
                 .offset(record.offset())
                 .partition(partition)
                 .timestamp(record.timestamp() == RecordBatch.NO_TIMESTAMP
@@ -198,13 +201,6 @@ public final class ViewFilter {
             }
         }
         return b.build();
-    }
-
-    private static byte[] bytesOrNull(ByteBuffer buf) {
-        if (buf == null) {
-            return null;
-        }
-        return Utils.toArray(buf);
     }
 
     /**

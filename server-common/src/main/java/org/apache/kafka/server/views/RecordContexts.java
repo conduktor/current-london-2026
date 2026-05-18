@@ -22,7 +22,6 @@ import com.fasterxml.jackson.core.JsonToken;
 import com.fasterxml.jackson.core.StreamReadConstraints;
 import com.fasterxml.jackson.databind.util.TokenBuffer;
 
-import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.CharacterCodingException;
@@ -52,19 +51,34 @@ public final class RecordContexts {
     }
 
     public static final class Builder {
-        private byte[] key;
-        private byte[] body;
+        private ByteBuffer key;
+        private ByteBuffer body;
         private final List<Header> headers = new ArrayList<>();
         private long offset;
         private int partition;
         private long timestamp;
 
         public Builder key(byte[] key) {
-            this.key = key;
+            this.key = key == null ? null : ByteBuffer.wrap(key);
             return this;
         }
 
         public Builder body(byte[] body) {
+            this.body = body == null ? null : ByteBuffer.wrap(body);
+            return this;
+        }
+
+        /** Zero-copy entry point used by the fetch hot path — stores the ByteBuffer reference
+         *  directly so we don't copy the underlying record bytes per record. The buffer's
+         *  position/limit are NOT mutated: every consumer (raw-byte materialisation, JSON parse)
+         *  reads via index or via a duplicate. The caller must keep the buffer valid for the
+         *  lifetime of the resulting RecordContext (typically one shouldRetainRecord call). */
+        public Builder keyBuffer(ByteBuffer key) {
+            this.key = key;
+            return this;
+        }
+
+        public Builder bodyBuffer(ByteBuffer body) {
             this.body = body;
             return this;
         }
@@ -118,14 +132,21 @@ public final class RecordContexts {
     }
 
     private static final class DefaultRecordContext implements RecordContext {
-        private final byte[] key;
-        private final byte[] body;
+        // Bytes are held as ByteBuffer references so the fetch hot path can pass through the
+        // underlying record buffer without copying. byte[] materialisation is lazy — most
+        // predicates touch one or two derived values and never need the raw bytes at all.
+        private final ByteBuffer keyBuf;
+        private final ByteBuffer bodyBuf;
         private final Map<String, byte[]> headers;
         private final long offset;
         private final int partition;
         private final long timestamp;
         private final PredicateLimits limits;
 
+        private byte[] cachedRawKey;
+        private boolean rawKeyMaterialised;
+        private byte[] cachedRawBody;
+        private boolean rawBodyMaterialised;
         private Optional<String> cachedKeyString;
         private final Map<String, Optional<String>> cachedHeaderStrings = new HashMap<>();
         // Map of accessor-path key → resolved scalar (or null for missing). When we discover the
@@ -134,8 +155,8 @@ public final class RecordContexts {
         private boolean bodyUnusable;
 
         DefaultRecordContext(Builder b, PredicateLimits limits) {
-            this.key = b.key;
-            this.body = b.body;
+            this.keyBuf = b.key;
+            this.bodyBuf = b.body;
             this.offset = b.offset;
             this.partition = b.partition;
             this.timestamp = b.timestamp;
@@ -148,11 +169,19 @@ public final class RecordContexts {
         }
 
         @Override public byte[] rawKey() {
-            return key;
+            if (!rawKeyMaterialised) {
+                cachedRawKey = bufferToArray(keyBuf);
+                rawKeyMaterialised = true;
+            }
+            return cachedRawKey;
         }
 
         @Override public byte[] rawBody() {
-            return body;
+            if (!rawBodyMaterialised) {
+                cachedRawBody = bufferToArray(bodyBuf);
+                rawBodyMaterialised = true;
+            }
+            return cachedRawBody;
         }
 
         @Override public byte[] rawHeader(String name) {
@@ -176,7 +205,7 @@ public final class RecordContexts {
             if (cachedKeyString != null) {
                 return cachedKeyString;
             }
-            cachedKeyString = decodeUtf8Strict(key);
+            cachedKeyString = decodeUtf8Strict(keyBuf);
             return cachedKeyString;
         }
 
@@ -193,13 +222,13 @@ public final class RecordContexts {
 
         @Override
         public Object bodyAt(List<String> path) {
-            if (body == null) {
+            if (bodyBuf == null) {
                 return BODY_UNUSABLE;
             }
             if (bodyUnusable) {
                 return BODY_UNUSABLE;
             }
-            if (body.length > limits.maxBodyBytes) {
+            if (bodyBuf.remaining() > limits.maxBodyBytes) {
                 bodyUnusable = true;
                 return BODY_UNUSABLE;
             }
@@ -207,7 +236,7 @@ public final class RecordContexts {
             if (cachedBodyPaths.containsKey(cacheKey)) {
                 return cachedBodyPaths.get(cacheKey);
             }
-            Object result = parseAndNavigate(body, path, limits.maxJsonDepth, limits.maxScalarStringChars);
+            Object result = parseAndNavigate(bodyBuf, path, limits.maxJsonDepth, limits.maxScalarStringChars);
             if (result == BODY_UNUSABLE) {
                 bodyUnusable = true;
                 return BODY_UNUSABLE;
@@ -256,7 +285,7 @@ public final class RecordContexts {
      * predicates whose path traverses an intermediate level with duplicate sibling keys
      * always refuse the record rather than silently picking one occurrence.
      */
-    private static Object parseAndNavigate(byte[] body, List<String> path, int maxDepth, int maxScalarStringChars) {
+    private static Object parseAndNavigate(ByteBuffer body, List<String> path, int maxDepth, int maxScalarStringChars) {
         // Replay parsers (one per intermediate-level descent that captured a subtree into a
         // TokenBuffer) must be closed alongside the root parser. Tracked in a list because we
         // only know how many we need as we descend.
@@ -273,9 +302,9 @@ public final class RecordContexts {
     /** The descent body of {@link #parseAndNavigate}. Pulled out so the outer method holds only
      *  the resource-management try/catch/finally — the descent logic alone keeps NPath complexity
      *  inside the project's checkstyle threshold. */
-    private static Object navigate(byte[] body, List<String> path, int maxDepth, int maxScalarStringChars,
+    private static Object navigate(ByteBuffer body, List<String> path, int maxDepth, int maxScalarStringChars,
                                    List<JsonParser> open) throws IOException {
-        JsonParser current = JSON_FACTORY.createParser(new ByteArrayInputStream(body));
+        JsonParser current = parserFor(body);
         open.add(current);
         JsonToken t = current.nextToken();
         if (t == null) {
@@ -460,14 +489,47 @@ public final class RecordContexts {
 
     private static Optional<String> decodeUtf8Strict(byte[] bytes) {
         if (bytes == null) return Optional.empty();
+        return decodeUtf8Strict(ByteBuffer.wrap(bytes));
+    }
+
+    private static Optional<String> decodeUtf8Strict(ByteBuffer buf) {
+        if (buf == null) return Optional.empty();
+        // Duplicate so the strict decoder advances its own position cursor rather than the
+        // caller's. The cost is a small wrapper object; the underlying bytes are NOT copied.
         try {
             return Optional.of(StandardCharsets.UTF_8.newDecoder()
                     .onMalformedInput(REPORT)
                     .onUnmappableCharacter(REPORT)
-                    .decode(ByteBuffer.wrap(bytes))
+                    .decode(buf.duplicate())
                     .toString());
         } catch (CharacterCodingException e) {
             return Optional.empty();
         }
+    }
+
+    /** Materialise a ByteBuffer into a fresh byte[]. Only called when a predicate explicitly asks
+     *  for raw bytes (e.g. {@link RecordContext#rawKey()}); the hot path stays on ByteBuffer. */
+    private static byte[] bufferToArray(ByteBuffer buf) {
+        if (buf == null) return null;
+        ByteBuffer view = buf.duplicate();
+        byte[] out = new byte[view.remaining()];
+        view.get(out);
+        return out;
+    }
+
+    /** Create a Jackson parser over a ByteBuffer without copying the underlying bytes when the
+     *  buffer is heap-backed (the common Kafka case — MemoryRecords are heap-backed). For direct
+     *  buffers we have no choice but to materialise a byte[]; this path is unreachable from the
+     *  normal fetch flow but stays safe in case a caller hands us one. */
+    private static JsonParser parserFor(ByteBuffer body) throws IOException {
+        if (body.hasArray()) {
+            return JSON_FACTORY.createParser(
+                    body.array(),
+                    body.arrayOffset() + body.position(),
+                    body.remaining());
+        }
+        byte[] tmp = new byte[body.remaining()];
+        body.duplicate().get(tmp);
+        return JSON_FACTORY.createParser(tmp);
     }
 }
