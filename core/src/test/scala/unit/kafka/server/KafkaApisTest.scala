@@ -11410,6 +11410,100 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testFetchTenantForeignPartitionMustNotEnterSession(): Unit = {
+    // The CRITICAL leak: if a foreign TopicIdPartition (a topic id whose
+    // physical name lives outside the tenant's namespace) is passed to
+    // fetchManager.newContext, the FetchSession will cache it. A later
+    // incremental fetch on that session would iterate the cached entry via
+    // foreachPartition with no per-request "foreign" marker, and any
+    // permissive authorizer (or a misconfigured cluster) would then read
+    // foreign data. The defence is: don't let foreign TIPs into the session
+    // at all. We still surface UNKNOWN_TOPIC_OR_PARTITION for them so the
+    // response is identical to "topic doesn't exist".
+    val topicId = Uuid.randomUuid()
+    val physicalTp = new TopicPartition("acme.orders", 0)
+    addTopicToMetadataCache(physicalTp.topic, numPartitions = 1, numBrokers = 1, topicId)
+
+    val emptyFetchData = new util.LinkedHashMap[TopicIdPartition, FetchRequest.PartitionData]()
+    val fetchMetadata = new JFetchMetadata(0, 0)
+    val fetchContext = new FullFetchContext(time, new FetchSessionCacheShard(1000, 100),
+      fetchMetadata, emptyFetchData, true, false)
+    val newContextFetchDataCaptor = ArgumentCaptor.forClass(classOf[util.Map[TopicIdPartition, FetchRequest.PartitionData]])
+    when(fetchManager.newContext(
+      any[Short], any[JFetchMetadata], any[Boolean],
+      newContextFetchDataCaptor.capture(),
+      any[util.List[TopicIdPartition]],
+      any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val fetchRequest = buildSingleTopicFetchRequest(topicId, physicalTp)
+    val request = buildRequest(
+      fetchRequest,
+      listenerName = new ListenerName("TENANT_BETA"),
+      principal = tenantPrincipal("beta", "bob"))
+
+    kafkaApis = createKafkaApis(
+      authorizer = None,
+      tenantConfig = tenantConfigBinding("beta", new ListenerName("TENANT_BETA")))
+    kafkaApis.handleFetchRequest(request)
+
+    assertTrue(newContextFetchDataCaptor.getValue.isEmpty,
+      s"foreign TIPs must not enter fetchManager.newContext; saw ${newContextFetchDataCaptor.getValue.keySet}")
+    val response = verifyNoThrottling[FetchResponse](request)
+    val partitionData = response.data.responses.asScala.head.partitions.asScala.head
+    assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION.code, partitionData.errorCode,
+      "tenant probing a foreign id must still see UNKNOWN_TOPIC_OR_PARTITION on the first request")
+  }
+
+  @Test
+  def testFetchTenantForgottenUnresolvableIdIsPassedThroughForSessionRemoval(): Unit = {
+    // When a tenant deletes a topic and then issues an incremental fetch
+    // forgetting it, the topic id no longer resolves via
+    // metadataCache.topicIdsToNames — so the TIP coming off the wire has
+    // topic=null. The broker must still pass the forgotten entry through to
+    // FetchSession.update so the stale session record is dropped. Previously
+    // the forgotten id was filtered out entirely, leaving a zombie session
+    // entry that kept producing errors until the client reset the session.
+    val deletedId = Uuid.randomUuid()
+    // Note: deletedId is intentionally NOT registered with metadataCache so
+    // topicIdsToNames() will not have a mapping for it.
+    val emptyFetchData = new util.LinkedHashMap[TopicIdPartition, FetchRequest.PartitionData]()
+    val fetchMetadata = new JFetchMetadata(0, 0)
+    val fetchContext = new FullFetchContext(time, new FetchSessionCacheShard(1000, 100),
+      fetchMetadata, emptyFetchData, true, false)
+    val forgottenCaptor = ArgumentCaptor.forClass(classOf[util.List[TopicIdPartition]])
+    when(fetchManager.newContext(
+      any[Short], any[JFetchMetadata], any[Boolean],
+      any[util.Map[TopicIdPartition, FetchRequest.PartitionData]],
+      forgottenCaptor.capture(),
+      any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val toForgetTidp = new TopicIdPartition(deletedId, 0, null)
+    val fetchDataBuilder = new util.LinkedHashMap[TopicPartition, FetchRequest.PartitionData]()
+    val fetchRequest = new FetchRequest.Builder(13, 13, -1, -1, 100, 0, fetchDataBuilder)
+      .removed(util.Arrays.asList(toForgetTidp))
+      .build(13.toShort)
+    val request = buildRequest(
+      fetchRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(
+      authorizer = None,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleFetchRequest(request)
+
+    val forwardedForgotten = forgottenCaptor.getValue.asScala
+    assertEquals(1, forwardedForgotten.size,
+      s"forgotten ids with null name must reach FetchSession.update so the stale session entry can be removed; saw $forwardedForgotten")
+    assertEquals(deletedId, forwardedForgotten.head.topicId,
+      "the forgotten topic id must be the one the client asked to remove")
+  }
+
+  @Test
   def testFetchPrivilegedCallerOnTenantBoundListenerIsRejected(): Unit = {
     // Super-user without `__tenant_` prefix fetching on a tenant-bound
     // listener: every requested partition gets TOPIC_AUTHORIZATION_FAILED;

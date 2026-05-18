@@ -1055,21 +1055,23 @@ class KafkaApis(val requestChannel: RequestChannel,
     // is built so session tracking, replicaManager, updateAndGenerateResponseData
     // and recordBytesOutMetric all run in physical space end-to-end. For v13+
     // the TIPs are already physical (resolved from metadataCache.topicIdsToNames);
-    // for v0-12 they carry the logical name from the wire. Foreign topics
-    // (outside the tenant namespace) are kept in fetchContext.fetchData under
-    // their original wire name so updateAndGenerateResponseData can still look
-    // up reqData for the erroneous bucket — they are surfaced as
-    // UNKNOWN_TOPIC_OR_PARTITION below so the response never reveals whether
-    // the foreign topic exists.
-    val foreignTipForTenant = new mutable.HashSet[TopicIdPartition]
+    // for v0-12 they carry the logical name from the wire.
+    //
+    // Foreign TIPs (outside the tenant namespace, e.g. tenant beta probing a
+    // topic id whose name resolves to "acme.orders") MUST NOT enter
+    // fetchManager.newContext. If they did, an incremental fetch on the same
+    // session would later iterate them via foreachPartition with no record of
+    // their foreign-ness — and any permissive authorizer would then read foreign
+    // data. We collect foreign TIPs in a side buffer and merge them into the
+    // erroneous bucket after context creation, so the session is built only on
+    // tenant-owned partitions.
+    val foreignFetchTips = new util.LinkedHashMap[TopicIdPartition, FetchRequest.PartitionData]()
     val fetchData = if (tenantScoped) {
       val rewritten = new util.LinkedHashMap[TopicIdPartition, FetchRequest.PartitionData](rawFetchData.size)
       rawFetchData.forEach { (tip, data) =>
         normaliseTenantTopicForFetch(tip, tenantCtx, versionId) match {
           case Some(physicalTip) => rewritten.put(physicalTip, data)
-          case None =>
-            rewritten.put(tip, data)
-            foreignTipForTenant += tip
+          case None => foreignFetchTips.put(tip, data)
         }
       }
       rewritten
@@ -1079,7 +1081,13 @@ class KafkaApis(val requestChannel: RequestChannel,
       rawForgottenTopics.forEach { tip =>
         normaliseTenantTopicForFetch(tip, tenantCtx, versionId) match {
           case Some(physicalTip) => rewritten.add(physicalTip)
-          case None => () // foreign topics are dropped from the forgotten set entirely
+          case None =>
+            // Forgotten ids that no longer resolve (topic deleted between
+            // fetches) or that resolved to a foreign name still need to be
+            // removed from the session. Passing the tip through as-is lets
+            // FetchSession.update drop the stale entry; otherwise it would
+            // linger forever until session reset.
+            rewritten.add(tip)
         }
       }
       rewritten
@@ -1095,13 +1103,36 @@ class KafkaApis(val requestChannel: RequestChannel,
 
     val erroneous = mutable.ArrayBuffer[(TopicIdPartition, FetchResponseData.PartitionData)]()
     val interesting = mutable.ArrayBuffer[(TopicIdPartition, FetchRequest.PartitionData)]()
+    // Foreign TIPs are surfaced as UNKNOWN_TOPIC_OR_PARTITION but must NOT enter
+    // the `partitions` map handed to FullFetchContext.updateAndGenerateResponseData:
+    // that map seeds the session cache via `new CachedPartition(part, fetchData.get(part), ...)`
+    // and would (a) NPE for parts absent from fetchData, and (b) silently
+    // resurrect the foreign TIP in the next incremental fetch on the same
+    // session. Instead, we keep them in a side list and merge them into the
+    // FetchResponse AFTER session creation, so the session never knows about
+    // them. See `appendForeignErroneousRows` below.
+    val foreignErroneous = new util.LinkedHashMap[TopicIdPartition, FetchResponseData.PartitionData]()
+    foreignFetchTips.forEach { (tip, _) =>
+      foreignErroneous.put(tip, FetchResponse.partitionResponse(tip, Errors.UNKNOWN_TOPIC_OR_PARTITION))
+    }
+    // Defence-in-depth: a session entry that resolves to a physical name
+    // outside the effective tenant must still be surfaced as
+    // UNKNOWN_TOPIC_OR_PARTITION rather than fetched. For an Incremental
+    // context this entry is in session.partitionMap, so it would be safe to
+    // route through `erroneous` → `updates` (PartitionIterator finds it); for a
+    // Full context we filtered foreign per-request entries out of fetchData
+    // already, so anything reaching foreachPartition is owned by the tenant.
+    // We still keep the check as a hard backstop.
+    def isForeignForTenant(tip: TopicIdPartition): Boolean =
+      tenantScoped && tip.topic != null && !isInternal(tip.topic) &&
+        !tenantCtx.belongsToTenant(tip.topic)
     if (fetchRequest.isFromFollower) {
       // The follower must have ClusterAction on ClusterResource in order to fetch partition data.
       if (authHelper.authorize(request.context, CLUSTER_ACTION, CLUSTER, CLUSTER_NAME)) {
         fetchContext.foreachPartition { (topicIdPartition, data) =>
           if (topicIdPartition.topic == null)
             erroneous += topicIdPartition -> FetchResponse.partitionResponse(topicIdPartition, Errors.UNKNOWN_TOPIC_ID)
-          else if (foreignTipForTenant.contains(topicIdPartition))
+          else if (isForeignForTenant(topicIdPartition))
             erroneous += topicIdPartition -> FetchResponse.partitionResponse(topicIdPartition, Errors.UNKNOWN_TOPIC_OR_PARTITION)
           else if (!metadataCache.contains(topicIdPartition.topicPartition))
             erroneous += topicIdPartition -> FetchResponse.partitionResponse(topicIdPartition, Errors.UNKNOWN_TOPIC_OR_PARTITION)
@@ -1119,7 +1150,7 @@ class KafkaApis(val requestChannel: RequestChannel,
       fetchContext.foreachPartition { (topicIdPartition, partitionData) =>
         if (topicIdPartition.topic == null)
           erroneous += topicIdPartition -> FetchResponse.partitionResponse(topicIdPartition, Errors.UNKNOWN_TOPIC_ID)
-        else if (foreignTipForTenant.contains(topicIdPartition))
+        else if (isForeignForTenant(topicIdPartition))
           erroneous += topicIdPartition -> FetchResponse.partitionResponse(topicIdPartition, Errors.UNKNOWN_TOPIC_OR_PARTITION)
         else
           partitionDatas += topicIdPartition -> partitionData
@@ -1198,9 +1229,37 @@ class KafkaApis(val requestChannel: RequestChannel,
         }
       }
 
+      // Merge UNKNOWN_TOPIC_OR_PARTITION rows for foreign TIPs into the response.
+      // These rows bypassed the session cache entirely (foreign TIPs were never
+      // added to fetchData/partitions), so the session never gains a foothold
+      // into another tenant's namespace. For v0-12 the topic name surfaced is
+      // exactly the logical name the client sent on the wire; for v13+ the
+      // topic field is not serialised so the choice does not matter.
+      def appendForeignErroneousRows(fetchResponse: FetchResponse): Unit = {
+        if (foreignErroneous.isEmpty) return
+        val responses = fetchResponse.data.responses
+        // Group consecutive foreign TIPs by (topicId, topic) so we emit one
+        // FetchableTopicResponse per topic.
+        var currentTopicResp: FetchResponseData.FetchableTopicResponse = null
+        foreignErroneous.forEach { (tip, partData) =>
+          if (currentTopicResp == null
+              || (!currentTopicResp.topicId.equals(Uuid.ZERO_UUID) && !currentTopicResp.topicId.equals(tip.topicId))
+              || (currentTopicResp.topicId.equals(Uuid.ZERO_UUID) && !currentTopicResp.topic.equals(tip.topicPartition.topic))) {
+            currentTopicResp = new FetchResponseData.FetchableTopicResponse()
+              .setTopic(tip.topicPartition.topic)
+              .setTopicId(tip.topicId)
+              .setPartitions(new util.ArrayList[FetchResponseData.PartitionData]())
+            responses.add(currentTopicResp)
+          }
+          partData.setPartitionIndex(tip.partition)
+          currentTopicResp.partitions.add(partData)
+        }
+      }
+
       if (fetchRequest.isFromFollower) {
         // We've already evaluated against the quota and are good to go. Just need to record it now.
         val fetchResponse = fetchContext.updateAndGenerateResponseData(partitions, Seq.empty.asJava)
+        appendForeignErroneousRows(fetchResponse)
         val responseSize = KafkaApis.sizeOfThrottledPartitions(versionId, fetchResponse, quotas.leader)
         quotas.leader.record(responseSize)
         val responsePartitionsSize = fetchResponse.data().responses().stream().mapToInt(_.partitions().size()).sum()
@@ -1240,6 +1299,7 @@ class KafkaApis(val requestChannel: RequestChannel,
           fetchResponse
         }
 
+        appendForeignErroneousRows(fetchResponse)
         recordBytesOutMetric(fetchResponse)
         rewriteFetchResponseToLogical(fetchResponse, tenantCtx)
         // Send the response immediately.
