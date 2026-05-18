@@ -271,4 +271,105 @@ class TenantNamespaceTest {
         String tooLong = "a".repeat(250);
         assertTrue(TenantNamespace.isInvalidLogicalForm("acme", tooLong));
     }
+
+    // --- Consumer-group ID rewrites (PROMPT.md scenario 49) ---
+
+    @Test
+    void groupToPhysicalPrefixesLogicalIdWithTenantPrincipalPrefix() {
+        // The group prefix reuses PRINCIPAL_PREFIX so the wire form cannot
+        // collide with a topic name (topic uses just `<id>.`).
+        assertEquals("__tenant_acme.orders-consumer",
+            TenantNamespace.groupToPhysical("acme", "orders-consumer"));
+    }
+
+    @Test
+    void groupToPhysicalPassesThroughAlreadyPrefixedIdForSameTenant() {
+        // PROMPT.md scenario 49: an admin tool explicitly addressing
+        // `__tenant_acme.foo` must succeed without double-prefixing into
+        // `__tenant_acme.__tenant_acme.foo`.
+        assertEquals("__tenant_acme.foo",
+            TenantNamespace.groupToPhysical("acme", "__tenant_acme.foo"));
+    }
+
+    @Test
+    void groupToPhysicalRejectsCrossTenantPrefixedId() {
+        // A tenant addressing `__tenant_other.foo` is either hostile or
+        // confused; refusing here keeps the broker from ever storing an
+        // uglier `__tenant_acme.__tenant_other.foo` in acme's namespace.
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+            () -> TenantNamespace.groupToPhysical("acme", "__tenant_other.foo"));
+        assertTrue(ex.getMessage().contains("reserved prefix"));
+    }
+
+    @Test
+    void groupToPhysicalRejectsReservedPrefixWithoutDot() {
+        // `__tenant_xyz` (no separator) cannot be a valid encoded form for any
+        // tenant; treating it as logical would silently materialise the name
+        // in this tenant's namespace.
+        assertThrows(IllegalArgumentException.class,
+            () -> TenantNamespace.groupToPhysical("acme", "__tenant_xyz"));
+    }
+
+    @Test
+    void groupToPhysicalReturnsNullForNullInput() {
+        // Some protocol versions allow an empty/null groupId (e.g. legacy
+        // OffsetCommit). The namespace helper treats null as "no opinion" so
+        // handlers can call it unconditionally before reaching the coordinator.
+        assertEquals(null, TenantNamespace.groupToPhysical("acme", null));
+    }
+
+    @Test
+    void groupToPhysicalAllowsEmptyLogicalId() {
+        // Kafka does not forbid empty group ids at the protocol layer; we
+        // mirror that: an empty logical id maps to the bare prefix. The
+        // coordinator owns any further validation.
+        assertEquals("__tenant_acme.", TenantNamespace.groupToPhysical("acme", ""));
+    }
+
+    @Test
+    void groupToPhysicalAllowsDotsInsideLogicalId() {
+        // Unlike topic names, group ids have no charset restriction. A
+        // logical id `foo.bar` must round-trip to `__tenant_acme.foo.bar`.
+        assertEquals("__tenant_acme.foo.bar",
+            TenantNamespace.groupToPhysical("acme", "foo.bar"));
+    }
+
+    @Test
+    void groupToPhysicalRejectsNullOrEmptyTenantId() {
+        // The same invariant that protects principal encoding: a tenant id
+        // missing here would mean we're rewriting on behalf of nobody.
+        assertThrows(IllegalArgumentException.class,
+            () -> TenantNamespace.groupToPhysical(null, "foo"));
+        assertThrows(IllegalArgumentException.class,
+            () -> TenantNamespace.groupToPhysical("", "foo"));
+    }
+
+    @Test
+    void groupToLogicalStripsTenantPrefixWhenPresent() {
+        assertEquals("orders-consumer",
+            TenantNamespace.groupToLogical("acme", "__tenant_acme.orders-consumer"));
+    }
+
+    @Test
+    void groupToLogicalReturnsForeignGroupIdUnchanged() {
+        // Defensive: the coordinator should never hand back a foreign group
+        // to a tenant request, but if it did, do not silently rewrite — keep
+        // the wire form so the surprise is visible.
+        assertEquals("__tenant_other.foo",
+            TenantNamespace.groupToLogical("acme", "__tenant_other.foo"));
+    }
+
+    @Test
+    void groupToLogicalReturnsNullForNullInput() {
+        assertEquals(null, TenantNamespace.groupToLogical("acme", null));
+    }
+
+    @Test
+    void groupBelongsToOnlyMatchesExactTenantPrefix() {
+        assertTrue(TenantNamespace.groupBelongsTo("acme", "__tenant_acme.foo"));
+        assertFalse(TenantNamespace.groupBelongsTo("acme", "__tenant_other.foo"));
+        assertFalse(TenantNamespace.groupBelongsTo("acme", "foo"));
+        assertFalse(TenantNamespace.groupBelongsTo("acme", "__tenant_acmebis.foo"));
+        assertFalse(TenantNamespace.groupBelongsTo("acme", null));
+    }
 }

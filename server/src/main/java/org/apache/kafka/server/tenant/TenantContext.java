@@ -174,4 +174,29 @@ public final class TenantContext {
             .map(t -> TenantNamespace.belongsTo(t, physicalTopic))
             .orElse(false);
     }
+
+    /**
+     * Rewrites a tenant's logical consumer-group id to its physical form. If no
+     * tenant is in scope the id passes through untouched, so handlers may call
+     * this unconditionally before reaching the coordinator.
+     */
+    public String toPhysicalGroup(String logicalGroupId) {
+        return effectiveTenant()
+            .map(t -> TenantNamespace.groupToPhysical(t, logicalGroupId))
+            .orElse(logicalGroupId);
+    }
+
+    /** Inverse of {@link #toPhysicalGroup}; strips the tenant prefix on response. */
+    public String toLogicalGroup(String physicalGroupId) {
+        return effectiveTenant()
+            .map(t -> TenantNamespace.groupToLogical(t, physicalGroupId))
+            .orElse(physicalGroupId);
+    }
+
+    /** True if {@code physicalGroupId} is in the effective tenant's namespace. */
+    public boolean groupBelongsToTenant(String physicalGroupId) {
+        return effectiveTenant()
+            .map(t -> TenantNamespace.groupBelongsTo(t, physicalGroupId))
+            .orElse(false);
+    }
 }

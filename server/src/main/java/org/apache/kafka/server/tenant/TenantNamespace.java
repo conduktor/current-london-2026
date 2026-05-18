@@ -152,6 +152,67 @@ public final class TenantNamespace {
         return Topic.isInternal(topic);
     }
 
+    /**
+     * Translates a tenant's logical consumer-group id to the physical form the
+     * broker stores: {@code __tenant_<id>.<logicalGroupId>}. The reserved
+     * principal prefix is reused so the wire form is self-describing and never
+     * collides with a topic name (topic prefix is just {@code <id>.}).
+     *
+     * <p>If the caller already passes the physical form (i.e. the id already
+     * starts with this tenant's prefix), it is returned as-is. This implements
+     * PROMPT.md scenario 49: an admin tool that explicitly addresses
+     * {@code __tenant_acme.foo} must succeed without double-prefixing.
+     *
+     * <p>Any other {@code __tenant_} prefix is rejected — it would either be a
+     * cross-tenant attempt or, if accepted, would silently materialise an
+     * uglier physical name in this tenant's namespace.
+     */
+    public static String groupToPhysical(String tenantId, String logicalGroupId) {
+        validateTenantId(tenantId);
+        if (logicalGroupId == null) {
+            return null;
+        }
+        String prefix = PRINCIPAL_PREFIX + tenantId + SEPARATOR;
+        if (logicalGroupId.startsWith(prefix)) {
+            return logicalGroupId;
+        }
+        if (logicalGroupId.startsWith(PRINCIPAL_PREFIX)) {
+            throw new IllegalArgumentException(
+                "Group id '" + logicalGroupId + "' uses reserved prefix '"
+                    + PRINCIPAL_PREFIX + "' but does not match tenant '" + tenantId + "'");
+        }
+        return prefix + logicalGroupId;
+    }
+
+    /**
+     * Inverse of {@link #groupToPhysical(String, String)}. If the physical id
+     * carries this tenant's prefix, returns the logical part; otherwise returns
+     * the input unchanged. Used on the response side so the tenant only ever
+     * sees the logical name it submitted.
+     */
+    public static String groupToLogical(String tenantId, String physicalGroupId) {
+        if (physicalGroupId == null) {
+            return null;
+        }
+        String prefix = PRINCIPAL_PREFIX + tenantId + SEPARATOR;
+        if (physicalGroupId.startsWith(prefix)) {
+            return physicalGroupId.substring(prefix.length());
+        }
+        return physicalGroupId;
+    }
+
+    /**
+     * True if {@code physicalGroupId} is in {@code tenantId}'s namespace, i.e.
+     * starts with {@code __tenant_<id>.}. Handlers use this to filter
+     * all-partitions OffsetFetch responses or to refuse cross-tenant lookups.
+     */
+    public static boolean groupBelongsTo(String tenantId, String physicalGroupId) {
+        if (physicalGroupId == null) {
+            return false;
+        }
+        return physicalGroupId.startsWith(PRINCIPAL_PREFIX + tenantId + SEPARATOR);
+    }
+
     public static void validateTenantId(String tenantId) {
         if (tenantId == null || tenantId.isEmpty()) {
             throw new IllegalArgumentException("Tenant id must be non-empty");

@@ -171,4 +171,36 @@ class TenantContextTest {
         TenantContext ctx = TenantContext.of(SUPER, Optional.empty());
         assertEquals("acme.orders", ctx.toLogical("acme.orders"));
     }
+
+    @Test
+    void groupRewriteInDelegatesToNamespace() {
+        TenantContext ctx = TenantContext.of(ACME, Optional.empty());
+        assertEquals("__tenant_acme.orders-consumer", ctx.toPhysicalGroup("orders-consumer"));
+    }
+
+    @Test
+    void groupRewriteInIsIdentityForNonTenantContext() {
+        TenantContext ctx = TenantContext.of(SUPER, Optional.empty());
+        assertEquals("orders-consumer", ctx.toPhysicalGroup("orders-consumer"));
+    }
+
+    @Test
+    void groupRewriteOutDelegatesToNamespace() {
+        TenantContext ctx = TenantContext.of(ACME, Optional.empty());
+        assertEquals("orders-consumer", ctx.toLogicalGroup("__tenant_acme.orders-consumer"));
+    }
+
+    @Test
+    void groupBelongsToTenantOnlyMatchesPrefixedForms() {
+        TenantContext ctx = TenantContext.of(ACME, Optional.empty());
+        assertTrue(ctx.groupBelongsToTenant("__tenant_acme.foo"));
+        assertFalse(ctx.groupBelongsToTenant("__tenant_other.foo"));
+        assertFalse(ctx.groupBelongsToTenant("foo"));
+    }
+
+    @Test
+    void groupBelongsToTenantIsFalseWhenNoTenantInScope() {
+        TenantContext ctx = TenantContext.of(SUPER, Optional.empty());
+        assertFalse(ctx.groupBelongsToTenant("__tenant_acme.foo"));
+    }
 }

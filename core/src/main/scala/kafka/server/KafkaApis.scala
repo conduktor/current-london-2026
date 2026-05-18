@@ -769,62 +769,130 @@ class KafkaApis(val requestChannel: RequestChannel,
     requestLocal: RequestLocal
   ): CompletableFuture[Unit] = {
     val offsetCommitRequest = request.body[OffsetCommitRequest]
+    val tenantCtx = tenantContextFor(request)
 
-    // Reject the request if not authorized to the group
-    if (!authHelper.authorize(request.context, READ, GROUP, offsetCommitRequest.data.groupId)) {
-      requestHelper.sendMaybeThrottle(request, offsetCommitRequest.getErrorResponse(Errors.GROUP_AUTHORIZATION_FAILED.exception))
-      CompletableFuture.completedFuture[Unit](())
-    } else {
-      val authorizedTopics = authHelper.filterByAuthorized(
-        request.context,
-        READ,
-        TOPIC,
-        offsetCommitRequest.data.topics.asScala
-      )(_.name)
-
-      val responseBuilder = new OffsetCommitResponse.Builder()
-      val authorizedTopicsRequest = new mutable.ArrayBuffer[OffsetCommitRequestData.OffsetCommitRequestTopic]()
-      offsetCommitRequest.data.topics.forEach { topic =>
-        if (!authorizedTopics.contains(topic.name)) {
-          // If the topic is not authorized, we add the topic and all its partitions
-          // to the response with TOPIC_AUTHORIZATION_FAILED.
-          responseBuilder.addPartitions[OffsetCommitRequestData.OffsetCommitRequestPartition](
-            topic.name, topic.partitions, _.partitionIndex, Errors.TOPIC_AUTHORIZATION_FAILED)
-        } else if (!metadataCache.contains(topic.name)) {
-          // If the topic is unknown, we add the topic and all its partitions
-          // to the response with UNKNOWN_TOPIC_OR_PARTITION.
-          responseBuilder.addPartitions[OffsetCommitRequestData.OffsetCommitRequestPartition](
-            topic.name, topic.partitions, _.partitionIndex, Errors.UNKNOWN_TOPIC_OR_PARTITION)
+    rewriteTenantGroupId(tenantCtx, offsetCommitRequest.data.groupId) match {
+      case Left(err) =>
+        // groupId is still the logical wire form on the request data — the
+        // default error response echoes only the partition-shape we already
+        // have, so no further rewriting is required.
+        requestHelper.sendMaybeThrottle(request, offsetCommitRequest.getErrorResponse(err.exception))
+        CompletableFuture.completedFuture[Unit](())
+      case Right(physicalGroupId) =>
+        // Reject the request if not authorized to the group (auth on the
+        // physical name — that's the resource the broker actually stores).
+        if (!authHelper.authorize(request.context, READ, GROUP, physicalGroupId)) {
+          requestHelper.sendMaybeThrottle(request, offsetCommitRequest.getErrorResponse(Errors.GROUP_AUTHORIZATION_FAILED.exception))
+          CompletableFuture.completedFuture[Unit](())
         } else {
-          // Otherwise, we check all partitions to ensure that they all exist.
-          val topicWithValidPartitions = new OffsetCommitRequestData.OffsetCommitRequestTopic().setName(topic.name)
+          offsetCommitRequest.data.setGroupId(physicalGroupId)
+          // Pre-rejected entries (reserved-physical-form topics from this
+          // tenant) bypass auth + coordinator entirely and surface as
+          // UNKNOWN_TOPIC_OR_PARTITION; their topic.name on the response
+          // must stay the LITERAL form the caller sent. We hold them in a
+          // side list AND track their names so the out-rewrite below skips
+          // them — otherwise toLogical("acme", "acme.foo") would strip the
+          // prefix and silently rewrite the caller's literal request.
+          val rejectedLogical = new mutable.ArrayBuffer[OffsetCommitRequestData.OffsetCommitRequestTopic]()
+          val rejectedNames = new util.HashSet[String]()
+          if (tenantCtx.effectiveTenant.isPresent) {
+            val accepted = new util.ArrayList[OffsetCommitRequestData.OffsetCommitRequestTopic]()
+            offsetCommitRequest.data.topics.forEach { topic =>
+              try {
+                topic.setName(tenantCtx.toPhysical(topic.name))
+                accepted.add(topic)
+              } catch {
+                case _: org.apache.kafka.common.errors.InvalidTopicException =>
+                  rejectedLogical += topic
+                  rejectedNames.add(topic.name)
+              }
+            }
+            offsetCommitRequest.data.setTopics(accepted)
+          }
 
-          topic.partitions.forEach { partition =>
-            if (metadataCache.getLeaderAndIsr(topic.name, partition.partitionIndex).nonEmpty) {
-              topicWithValidPartitions.partitions.add(partition)
+          val authorizedTopics = authHelper.filterByAuthorized(
+            request.context,
+            READ,
+            TOPIC,
+            offsetCommitRequest.data.topics.asScala
+          )(_.name)
+
+          val responseBuilder = new OffsetCommitResponse.Builder()
+          val authorizedTopicsRequest = new mutable.ArrayBuffer[OffsetCommitRequestData.OffsetCommitRequestTopic]()
+          offsetCommitRequest.data.topics.forEach { topic =>
+            if (!authorizedTopics.contains(topic.name)) {
+              // If the topic is not authorized, we add the topic and all its partitions
+              // to the response with TOPIC_AUTHORIZATION_FAILED.
+              responseBuilder.addPartitions[OffsetCommitRequestData.OffsetCommitRequestPartition](
+                topic.name, topic.partitions, _.partitionIndex, Errors.TOPIC_AUTHORIZATION_FAILED)
+            } else if (!metadataCache.contains(topic.name)) {
+              // If the topic is unknown, we add the topic and all its partitions
+              // to the response with UNKNOWN_TOPIC_OR_PARTITION.
+              responseBuilder.addPartitions[OffsetCommitRequestData.OffsetCommitRequestPartition](
+                topic.name, topic.partitions, _.partitionIndex, Errors.UNKNOWN_TOPIC_OR_PARTITION)
             } else {
-              responseBuilder.addPartition(topic.name, partition.partitionIndex, Errors.UNKNOWN_TOPIC_OR_PARTITION)
+              // Otherwise, we check all partitions to ensure that they all exist.
+              val topicWithValidPartitions = new OffsetCommitRequestData.OffsetCommitRequestTopic().setName(topic.name)
+
+              topic.partitions.forEach { partition =>
+                if (metadataCache.getLeaderAndIsr(topic.name, partition.partitionIndex).nonEmpty) {
+                  topicWithValidPartitions.partitions.add(partition)
+                } else {
+                  responseBuilder.addPartition(topic.name, partition.partitionIndex, Errors.UNKNOWN_TOPIC_OR_PARTITION)
+                }
+              }
+
+              if (!topicWithValidPartitions.partitions.isEmpty) {
+                authorizedTopicsRequest += topicWithValidPartitions
+              }
             }
           }
 
-          if (!topicWithValidPartitions.partitions.isEmpty) {
-            authorizedTopicsRequest += topicWithValidPartitions
+          // Reserved-form topic names the tenant submitted: per-topic
+          // UNKNOWN_TOPIC_OR_PARTITION, keyed by the LOGICAL name (already
+          // unmodified in rejectedLogical), so the rejection wire form
+          // matches what the client sent.
+          rejectedLogical.foreach { topic =>
+            responseBuilder.addPartitions[OffsetCommitRequestData.OffsetCommitRequestPartition](
+              topic.name, topic.partitions, _.partitionIndex, Errors.UNKNOWN_TOPIC_OR_PARTITION)
+          }
+
+          if (authorizedTopicsRequest.isEmpty) {
+            val response = responseBuilder.build()
+            rewriteOffsetCommitResponseToLogical(response, tenantCtx, rejectedNames)
+            requestHelper.sendMaybeThrottle(request, response)
+            CompletableFuture.completedFuture(())
+          } else {
+            // For version > 0, store offsets in Coordinator.
+            commitOffsetsToCoordinator(
+              request,
+              offsetCommitRequest,
+              authorizedTopicsRequest,
+              responseBuilder,
+              requestLocal,
+              tenantCtx,
+              rejectedNames
+            )
           }
         }
-      }
+    }
+  }
 
-      if (authorizedTopicsRequest.isEmpty) {
-        requestHelper.sendMaybeThrottle(request, responseBuilder.build())
-        CompletableFuture.completedFuture(())
-      } else {
-        // For version > 0, store offsets in Coordinator.
-        commitOffsetsToCoordinator(
-          request,
-          offsetCommitRequest,
-          authorizedTopicsRequest,
-          responseBuilder,
-          requestLocal
-        )
+  // Rewrite physical topic names back to the LOGICAL form the tenant sent,
+  // and drop the tenant prefix from anything still wearing it (including
+  // partial coordinator failures that may quote the physical name).
+  // {@code skipNames} carries the LITERAL names the caller already echoed
+  // back unchanged (reserved-physical-form rejections); we must not run
+  // toLogical on them or "acme.foo" would silently become "foo".
+  private def rewriteOffsetCommitResponseToLogical(
+    response: OffsetCommitResponse,
+    tenantCtx: TenantContext,
+    skipNames: util.Set[String]
+  ): Unit = {
+    if (!tenantCtx.effectiveTenant.isPresent) return
+    response.data().topics().forEach { t =>
+      if (!skipNames.contains(t.name)) {
+        t.setName(tenantCtx.toLogical(t.name))
       }
     }
   }
@@ -834,7 +902,9 @@ class KafkaApis(val requestChannel: RequestChannel,
     offsetCommitRequest: OffsetCommitRequest,
     authorizedTopicsRequest: mutable.ArrayBuffer[OffsetCommitRequestData.OffsetCommitRequestTopic],
     responseBuilder: OffsetCommitResponse.Builder,
-    requestLocal: RequestLocal
+    requestLocal: RequestLocal,
+    tenantCtx: TenantContext,
+    rejectedNames: util.Set[String]
   ): CompletableFuture[Unit] = {
     val offsetCommitRequestData = new OffsetCommitRequestData()
       .setGroupId(offsetCommitRequest.data.groupId)
@@ -850,9 +920,16 @@ class KafkaApis(val requestChannel: RequestChannel,
       requestLocal.bufferSupplier
     ).handle[Unit] { (results, exception) =>
       if (exception != null) {
-        requestHelper.sendMaybeThrottle(request, offsetCommitRequest.getErrorResponse(exception))
+        // Exception-path response is built from the (mutated) request, but
+        // only carries shape — no topic names from coordinator state. Still
+        // run the out-rewrite for symmetry with the success path.
+        val errResponse = offsetCommitRequest.getErrorResponse(exception)
+        rewriteOffsetCommitResponseToLogical(errResponse, tenantCtx, rejectedNames)
+        requestHelper.sendMaybeThrottle(request, errResponse)
       } else {
-        requestHelper.sendMaybeThrottle(request, responseBuilder.merge(results).build())
+        val response = responseBuilder.merge(results).build()
+        rewriteOffsetCommitResponseToLogical(response, tenantCtx, rejectedNames)
+        requestHelper.sendMaybeThrottle(request, response)
       }
     }
   }
@@ -1878,28 +1955,52 @@ class KafkaApis(val requestChannel: RequestChannel,
     val offsetFetchRequest = request.body[OffsetFetchRequest]
     val groups = offsetFetchRequest.groups()
     val requireStable = offsetFetchRequest.requireStable()
+    val tenantCtx = tenantContextFor(request)
+    val tenantScoped = tenantCtx.effectiveTenant.isPresent
 
     val futures = new mutable.ArrayBuffer[CompletableFuture[OffsetFetchResponseData.OffsetFetchResponseGroup]](groups.size)
     groups.forEach { groupOffsetFetch =>
-      val isAllPartitions = groupOffsetFetch.topics == null
-      if (!authHelper.authorize(request.context, DESCRIBE, GROUP, groupOffsetFetch.groupId)) {
-        futures += CompletableFuture.completedFuture(OffsetFetchResponse.groupError(
-          groupOffsetFetch,
-          Errors.GROUP_AUTHORIZATION_FAILED,
-          request.header.apiVersion()
-        ))
-      } else if (isAllPartitions) {
-        futures += fetchAllOffsetsForGroup(
-          request.context,
-          groupOffsetFetch,
-          requireStable
-        )
-      } else {
-        futures += fetchOffsetsForGroup(
-          request.context,
-          groupOffsetFetch,
-          requireStable
-        )
+      val logicalGroupId = groupOffsetFetch.groupId
+      rewriteTenantGroupId(tenantCtx, logicalGroupId) match {
+        case Left(err) =>
+          futures += CompletableFuture.completedFuture(OffsetFetchResponse.groupError(
+            groupOffsetFetch, err, request.header.apiVersion()))
+        case Right(physicalGroupId) =>
+          if (!authHelper.authorize(request.context, DESCRIBE, GROUP, physicalGroupId)) {
+            futures += CompletableFuture.completedFuture(OffsetFetchResponse.groupError(
+              groupOffsetFetch, Errors.GROUP_AUTHORIZATION_FAILED, request.header.apiVersion()))
+          } else {
+            // Mutate for the coordinator call. The success-path response will
+            // have its groupId reset to the logical form on its way out.
+            groupOffsetFetch.setGroupId(physicalGroupId)
+            // Rewrite topic names (specific-topics path). Reserved-physical
+            // forms are silently dropped — the coordinator can't have stored
+            // offsets under such names through this path anyway.
+            if (tenantScoped && groupOffsetFetch.topics != null) {
+              val accepted = new util.ArrayList[OffsetFetchRequestData.OffsetFetchRequestTopics]()
+              groupOffsetFetch.topics.forEach { t =>
+                try {
+                  t.setName(tenantCtx.toPhysical(t.name))
+                  accepted.add(t)
+                } catch {
+                  case _: org.apache.kafka.common.errors.InvalidTopicException => // drop
+                }
+              }
+              groupOffsetFetch.setTopics(accepted)
+            }
+            val coordFuture =
+              if (groupOffsetFetch.topics == null)
+                fetchAllOffsetsForGroup(request.context, groupOffsetFetch, requireStable)
+              else
+                fetchOffsetsForGroup(request.context, groupOffsetFetch, requireStable)
+            // Restore logical groupId + rewrite physical topic names back
+            // to the logical form before the response reaches the wire.
+            futures += coordFuture.thenApply { resp =>
+              resp.setGroupId(logicalGroupId)
+              rewriteOffsetFetchResponseTopicsToLogical(resp, tenantCtx)
+              resp
+            }
+          }
       }
     }
 
@@ -1908,6 +2009,27 @@ class KafkaApis(val requestChannel: RequestChannel,
       futures.foreach(future => groupResponses += future.get())
       requestHelper.sendMaybeThrottle(request, new OffsetFetchResponse(groupResponses.asJava, request.context.apiVersion))
     }
+  }
+
+  // Rewrite topic names on an OffsetFetch response group back to the LOGICAL
+  // form. Foreign-namespace and unprefixed names are dropped defensively:
+  // every commit went through toPhysical, so any stored topic missing the
+  // tenant prefix is either pre-tenancy residue or an injection attempt —
+  // either way the tenant must not see it. Internal topic names are
+  // impossible here (offsets aren't stored against `__consumer_offsets`).
+  private def rewriteOffsetFetchResponseTopicsToLogical(
+    resp: OffsetFetchResponseData.OffsetFetchResponseGroup,
+    tenantCtx: TenantContext
+  ): Unit = {
+    if (!tenantCtx.effectiveTenant.isPresent || resp.topics == null) return
+    val kept = new util.ArrayList[OffsetFetchResponseData.OffsetFetchResponseTopics]()
+    resp.topics.forEach { t =>
+      if (tenantCtx.belongsToTenant(t.name)) {
+        t.setName(tenantCtx.toLogical(t.name))
+        kept.add(t)
+      }
+    }
+    resp.setTopics(kept)
   }
 
   private def fetchAllOffsetsForGroup(
@@ -2000,17 +2122,61 @@ class KafkaApis(val requestChannel: RequestChannel,
     }
   }
 
+  // Tenant gate for FindCoordinator. Returns a non-empty Errors when the tenant
+  // context forbids the lookup for the given key type (unsafe context, or a
+  // non-GROUP key from a tenant — v1 excludes transactions and share groups).
+  // None means the call may proceed to getCoordinator with the rewritten key.
+  private def rejectTenantFindCoordinator(
+    tenantCtx: TenantContext,
+    keyType: Byte
+  ): Option[Errors] = {
+    if (!tenantCtx.effectiveTenant.isPresent && !tenantCtx.isUnsafe) return None
+    if (tenantCtx.isUnsafe) {
+      // Privileged-on-tenant / mismatch / spoof: surface the auth error that
+      // matches the caller-visible resource type so the client sees the same
+      // shape it would for a regular unauthorised request.
+      return Some(keyType match {
+        case t if t == CoordinatorType.GROUP.id => Errors.GROUP_AUTHORIZATION_FAILED
+        case t if t == CoordinatorType.TRANSACTION.id => Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED
+        case _ => Errors.INVALID_REQUEST
+      })
+    }
+    // Tenant principal: only GROUP keys are admitted in this phase.
+    keyType match {
+      case t if t == CoordinatorType.GROUP.id => None
+      case t if t == CoordinatorType.TRANSACTION.id => Some(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED)
+      case _ => Some(Errors.INVALID_REQUEST)
+    }
+  }
+
   private def handleFindCoordinatorRequestV4AndAbove(request: RequestChannel.Request): Unit = {
     val findCoordinatorRequest = request.body[FindCoordinatorRequest]
+    val tenantCtx = tenantContextFor(request)
+    val keyType = findCoordinatorRequest.data.keyType
+    val tenantReject = rejectTenantFindCoordinator(tenantCtx, keyType)
 
-    val coordinators = findCoordinatorRequest.data.coordinatorKeys.asScala.map { key =>
-      val (error, node) = getCoordinator(request, findCoordinatorRequest.data.keyType, key)
-      new FindCoordinatorResponseData.Coordinator()
-        .setKey(key)
-        .setErrorCode(error.code)
-        .setHost(node.host)
-        .setNodeId(node.id)
-        .setPort(node.port)
+    val coordinators = findCoordinatorRequest.data.coordinatorKeys.asScala.map { logicalKey =>
+      tenantReject match {
+        case Some(err) =>
+          new FindCoordinatorResponseData.Coordinator()
+            .setKey(logicalKey)
+            .setErrorCode(err.code)
+            .setHost(Node.noNode.host)
+            .setNodeId(Node.noNode.id)
+            .setPort(Node.noNode.port)
+        case None =>
+          val physicalKey =
+            if (keyType == CoordinatorType.GROUP.id) tenantCtx.toPhysicalGroup(logicalKey)
+            else logicalKey
+          val (error, node) = getCoordinator(request, keyType, physicalKey)
+          new FindCoordinatorResponseData.Coordinator()
+            // Echo the LOGICAL key back — the tenant never sees the physical form.
+            .setKey(logicalKey)
+            .setErrorCode(error.code)
+            .setHost(node.host)
+            .setNodeId(node.id)
+            .setPort(node.port)
+      }
     }
     def createResponse(requestThrottleMs: Int): AbstractResponse = {
       val response = new FindCoordinatorResponse(
@@ -2026,8 +2192,18 @@ class KafkaApis(val requestChannel: RequestChannel,
 
   private def handleFindCoordinatorRequestLessThanV4(request: RequestChannel.Request): Unit = {
     val findCoordinatorRequest = request.body[FindCoordinatorRequest]
+    val tenantCtx = tenantContextFor(request)
+    val keyType = findCoordinatorRequest.data.keyType
+    val tenantReject = rejectTenantFindCoordinator(tenantCtx, keyType)
 
-    val (error, node) = getCoordinator(request, findCoordinatorRequest.data.keyType, findCoordinatorRequest.data.key)
+    val (error, node) = tenantReject match {
+      case Some(err) => (err, Node.noNode)
+      case None =>
+        val physicalKey =
+          if (keyType == CoordinatorType.GROUP.id) tenantCtx.toPhysicalGroup(findCoordinatorRequest.data.key)
+          else findCoordinatorRequest.data.key
+        getCoordinator(request, keyType, physicalKey)
+    }
     def createResponse(requestThrottleMs: Int): AbstractResponse = {
       val responseBody = new FindCoordinatorResponse(
           new FindCoordinatorResponseData()
@@ -2183,27 +2359,57 @@ class KafkaApis(val requestChannel: RequestChannel,
     }
   }
 
+  // Rewrite a logical group id to its physical form, refusing unsafe contexts
+  // (privileged-on-tenant-listener / mismatch / spoof) and cross-tenant
+  // prefix attempts. Returns Left(error) if the caller must be rejected
+  // outright; Right(physical) if the call may proceed against the rewritten
+  // id. Identity for non-tenant contexts.
+  private def rewriteTenantGroupId(
+    tenantCtx: TenantContext,
+    logicalGroupId: String
+  ): Either[Errors, String] = {
+    if (tenantCtx.isUnsafe) {
+      Left(Errors.GROUP_AUTHORIZATION_FAILED)
+    } else {
+      try Right(tenantCtx.toPhysicalGroup(logicalGroupId))
+      catch {
+        // A tenant addressing `__tenant_other.foo` — refuse with the same
+        // shape an authz failure would produce, so the wire response never
+        // hints at the foreign tenant's existence.
+        case _: IllegalArgumentException => Left(Errors.GROUP_AUTHORIZATION_FAILED)
+      }
+    }
+  }
+
   def handleJoinGroupRequest(
     request: RequestChannel.Request,
     requestLocal: RequestLocal
   ): CompletableFuture[Unit] = {
     val joinGroupRequest = request.body[JoinGroupRequest]
+    val tenantCtx = tenantContextFor(request)
 
-    if (!authHelper.authorize(request.context, READ, GROUP, joinGroupRequest.data.groupId)) {
-      requestHelper.sendMaybeThrottle(request, joinGroupRequest.getErrorResponse(Errors.GROUP_AUTHORIZATION_FAILED.exception))
-      CompletableFuture.completedFuture[Unit](())
-    } else {
-      groupCoordinator.joinGroup(
-        request.context,
-        joinGroupRequest.data,
-        requestLocal.bufferSupplier
-      ).handle[Unit] { (response, exception) =>
-        if (exception != null) {
-          requestHelper.sendMaybeThrottle(request, joinGroupRequest.getErrorResponse(exception))
+    rewriteTenantGroupId(tenantCtx, joinGroupRequest.data.groupId) match {
+      case Left(err) =>
+        requestHelper.sendMaybeThrottle(request, joinGroupRequest.getErrorResponse(err.exception))
+        CompletableFuture.completedFuture[Unit](())
+      case Right(physicalGroupId) =>
+        joinGroupRequest.data.setGroupId(physicalGroupId)
+        if (!authHelper.authorize(request.context, READ, GROUP, physicalGroupId)) {
+          requestHelper.sendMaybeThrottle(request, joinGroupRequest.getErrorResponse(Errors.GROUP_AUTHORIZATION_FAILED.exception))
+          CompletableFuture.completedFuture[Unit](())
         } else {
-          requestHelper.sendMaybeThrottle(request, new JoinGroupResponse(response, request.context.apiVersion))
+          groupCoordinator.joinGroup(
+            request.context,
+            joinGroupRequest.data,
+            requestLocal.bufferSupplier
+          ).handle[Unit] { (response, exception) =>
+            if (exception != null) {
+              requestHelper.sendMaybeThrottle(request, joinGroupRequest.getErrorResponse(exception))
+            } else {
+              requestHelper.sendMaybeThrottle(request, new JoinGroupResponse(response, request.context.apiVersion))
+            }
+          }
         }
-      }
     }
   }
 
@@ -2212,26 +2418,34 @@ class KafkaApis(val requestChannel: RequestChannel,
     requestLocal: RequestLocal
   ): CompletableFuture[Unit] = {
     val syncGroupRequest = request.body[SyncGroupRequest]
+    val tenantCtx = tenantContextFor(request)
 
     if (!syncGroupRequest.areMandatoryProtocolTypeAndNamePresent()) {
       // Starting from version 5, ProtocolType and ProtocolName fields are mandatory.
       requestHelper.sendMaybeThrottle(request, syncGroupRequest.getErrorResponse(Errors.INCONSISTENT_GROUP_PROTOCOL.exception))
       CompletableFuture.completedFuture[Unit](())
-    } else if (!authHelper.authorize(request.context, READ, GROUP, syncGroupRequest.data.groupId)) {
-      requestHelper.sendMaybeThrottle(request, syncGroupRequest.getErrorResponse(Errors.GROUP_AUTHORIZATION_FAILED.exception))
-      CompletableFuture.completedFuture[Unit](())
-    } else {
-      groupCoordinator.syncGroup(
-        request.context,
-        syncGroupRequest.data,
-        requestLocal.bufferSupplier
-      ).handle[Unit] { (response, exception) =>
-        if (exception != null) {
-          requestHelper.sendMaybeThrottle(request, syncGroupRequest.getErrorResponse(exception))
+    } else rewriteTenantGroupId(tenantCtx, syncGroupRequest.data.groupId) match {
+      case Left(err) =>
+        requestHelper.sendMaybeThrottle(request, syncGroupRequest.getErrorResponse(err.exception))
+        CompletableFuture.completedFuture[Unit](())
+      case Right(physicalGroupId) =>
+        syncGroupRequest.data.setGroupId(physicalGroupId)
+        if (!authHelper.authorize(request.context, READ, GROUP, physicalGroupId)) {
+          requestHelper.sendMaybeThrottle(request, syncGroupRequest.getErrorResponse(Errors.GROUP_AUTHORIZATION_FAILED.exception))
+          CompletableFuture.completedFuture[Unit](())
         } else {
-          requestHelper.sendMaybeThrottle(request, new SyncGroupResponse(response))
+          groupCoordinator.syncGroup(
+            request.context,
+            syncGroupRequest.data,
+            requestLocal.bufferSupplier
+          ).handle[Unit] { (response, exception) =>
+            if (exception != null) {
+              requestHelper.sendMaybeThrottle(request, syncGroupRequest.getErrorResponse(exception))
+            } else {
+              requestHelper.sendMaybeThrottle(request, new SyncGroupResponse(response))
+            }
+          }
         }
-      }
     }
   }
 
@@ -2275,41 +2489,57 @@ class KafkaApis(val requestChannel: RequestChannel,
 
   def handleHeartbeatRequest(request: RequestChannel.Request): CompletableFuture[Unit] = {
     val heartbeatRequest = request.body[HeartbeatRequest]
+    val tenantCtx = tenantContextFor(request)
 
-    if (!authHelper.authorize(request.context, READ, GROUP, heartbeatRequest.data.groupId)) {
-      requestHelper.sendMaybeThrottle(request, heartbeatRequest.getErrorResponse(Errors.GROUP_AUTHORIZATION_FAILED.exception))
-      CompletableFuture.completedFuture[Unit](())
-    } else {
-      groupCoordinator.heartbeat(
-        request.context,
-        heartbeatRequest.data
-      ).handle[Unit] { (response, exception) =>
-        if (exception != null) {
-          requestHelper.sendMaybeThrottle(request, heartbeatRequest.getErrorResponse(exception))
+    rewriteTenantGroupId(tenantCtx, heartbeatRequest.data.groupId) match {
+      case Left(err) =>
+        requestHelper.sendMaybeThrottle(request, heartbeatRequest.getErrorResponse(err.exception))
+        CompletableFuture.completedFuture[Unit](())
+      case Right(physicalGroupId) =>
+        heartbeatRequest.data.setGroupId(physicalGroupId)
+        if (!authHelper.authorize(request.context, READ, GROUP, physicalGroupId)) {
+          requestHelper.sendMaybeThrottle(request, heartbeatRequest.getErrorResponse(Errors.GROUP_AUTHORIZATION_FAILED.exception))
+          CompletableFuture.completedFuture[Unit](())
         } else {
-          requestHelper.sendMaybeThrottle(request, new HeartbeatResponse(response))
+          groupCoordinator.heartbeat(
+            request.context,
+            heartbeatRequest.data
+          ).handle[Unit] { (response, exception) =>
+            if (exception != null) {
+              requestHelper.sendMaybeThrottle(request, heartbeatRequest.getErrorResponse(exception))
+            } else {
+              requestHelper.sendMaybeThrottle(request, new HeartbeatResponse(response))
+            }
+          }
         }
-      }
     }
   }
 
   def handleLeaveGroupRequest(request: RequestChannel.Request): CompletableFuture[Unit] = {
     val leaveGroupRequest = request.body[LeaveGroupRequest]
+    val tenantCtx = tenantContextFor(request)
 
-    if (!authHelper.authorize(request.context, READ, GROUP, leaveGroupRequest.data.groupId)) {
-      requestHelper.sendMaybeThrottle(request, leaveGroupRequest.getErrorResponse(Errors.GROUP_AUTHORIZATION_FAILED.exception))
-      CompletableFuture.completedFuture[Unit](())
-    } else {
-      groupCoordinator.leaveGroup(
-        request.context,
-        leaveGroupRequest.normalizedData()
-      ).handle[Unit] { (response, exception) =>
-        if (exception != null) {
-          requestHelper.sendMaybeThrottle(request, leaveGroupRequest.getErrorResponse(exception))
+    rewriteTenantGroupId(tenantCtx, leaveGroupRequest.data.groupId) match {
+      case Left(err) =>
+        requestHelper.sendMaybeThrottle(request, leaveGroupRequest.getErrorResponse(err.exception))
+        CompletableFuture.completedFuture[Unit](())
+      case Right(physicalGroupId) =>
+        leaveGroupRequest.data.setGroupId(physicalGroupId)
+        if (!authHelper.authorize(request.context, READ, GROUP, physicalGroupId)) {
+          requestHelper.sendMaybeThrottle(request, leaveGroupRequest.getErrorResponse(Errors.GROUP_AUTHORIZATION_FAILED.exception))
+          CompletableFuture.completedFuture[Unit](())
         } else {
-          requestHelper.sendMaybeThrottle(request, new LeaveGroupResponse(response, leaveGroupRequest.version))
+          groupCoordinator.leaveGroup(
+            request.context,
+            leaveGroupRequest.normalizedData()
+          ).handle[Unit] { (response, exception) =>
+            if (exception != null) {
+              requestHelper.sendMaybeThrottle(request, leaveGroupRequest.getErrorResponse(exception))
+            } else {
+              requestHelper.sendMaybeThrottle(request, new LeaveGroupResponse(response, leaveGroupRequest.version))
+            }
+          }
         }
-      }
     }
   }
 
@@ -4421,6 +4651,14 @@ object KafkaApis {
   // because v1 explicitly excludes transactions for tenants.
   // Note: ListTopics is the all-topics variant of Metadata and is covered by
   // ApiKeys.METADATA.
+  //
+  // Phase 2 (consumer-group ID rewrites) admits the runtime consumer APIs.
+  // FIND_COORDINATOR routes a group lookup to its coordinator node;
+  // JOIN_GROUP/SYNC_GROUP/HEARTBEAT/LEAVE_GROUP drive the rebalance protocol;
+  // OFFSET_COMMIT/OFFSET_FETCH persist and read committed offsets. Each
+  // handler rewrites the group id (and topic names where present) on the way
+  // in and back on the way out. Transactional / share / consumer-group v2
+  // APIs remain refused at this dispatch boundary.
   private[server] val TENANT_ALLOWED_APIS: Set[ApiKeys] = Set(
     ApiKeys.PRODUCE,
     ApiKeys.FETCH,
@@ -4428,6 +4666,13 @@ object KafkaApis {
     ApiKeys.CREATE_TOPICS,
     ApiKeys.DELETE_TOPICS,
     ApiKeys.INIT_PRODUCER_ID,
+    ApiKeys.FIND_COORDINATOR,
+    ApiKeys.JOIN_GROUP,
+    ApiKeys.SYNC_GROUP,
+    ApiKeys.HEARTBEAT,
+    ApiKeys.LEAVE_GROUP,
+    ApiKeys.OFFSET_COMMIT,
+    ApiKeys.OFFSET_FETCH,
     ApiKeys.SASL_HANDSHAKE,
     ApiKeys.SASL_AUTHENTICATE,
     ApiKeys.API_VERSIONS

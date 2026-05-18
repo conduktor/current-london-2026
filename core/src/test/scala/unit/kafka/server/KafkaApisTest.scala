@@ -12778,4 +12778,431 @@ class KafkaApisTest extends Logging {
       any[InitProducerIdResult => Unit](), any[RequestLocal]())
   }
 
+  // ---------------------------------------------------------------------------
+  // Phase 2 (PROMPT.md scenario 49): consumer-group id rewrites.
+  //
+  // A tenant submits a LOGICAL group id (e.g. "orders-consumer"); the broker
+  // stores and addresses the group under the PHYSICAL form
+  // "__tenant_<id>.<name>" — the principal prefix is reused so the wire form
+  // can never collide with a tenant topic name. The tenant must only ever see
+  // its logical id back in responses; the physical prefix is the broker's
+  // private bookkeeping. These tests verify the rewrite-in / rewrite-out
+  // contract for every consumer-runtime handler we admit in this phase, plus
+  // the unsafe-context refusals (privileged-on-tenant-listener, transactional
+  // FindCoordinator, cross-tenant prefix attempts).
+  // ---------------------------------------------------------------------------
+
+  @Test
+  def testFindCoordinatorV4TenantRewritesGroupKeyInAndEchoesLogicalKeyOut(): Unit = {
+    val findCoord = new FindCoordinatorRequest.Builder(new FindCoordinatorRequestData()
+      .setKeyType(CoordinatorType.GROUP.id)
+      .setCoordinatorKeys(asList("orders-consumer"))).build(ApiKeys.FIND_COORDINATOR.latestVersion)
+    val request = buildRequest(findCoord,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleFindCoordinatorRequest(request)
+
+    verify(groupCoordinator).partitionFor("__tenant_acme.orders-consumer")
+    val response = verifyNoThrottling[FindCoordinatorResponse](request)
+    val coord = response.data.coordinators.get(0)
+    assertEquals("orders-consumer", coord.key,
+      "tenant must see the LOGICAL coordinator key, never the physical form")
+  }
+
+  @Test
+  def testFindCoordinatorV4TenantRefusesTransactionalKey(): Unit = {
+    // Transactional coordinator lookups are explicitly out of v1 scope; the
+    // broker must refuse them with TRANSACTIONAL_ID_AUTHORIZATION_FAILED
+    // before touching the txn coordinator, and echo the LOGICAL key so the
+    // tenant doesn't see a physical form leak through the error response.
+    val findCoord = new FindCoordinatorRequest.Builder(new FindCoordinatorRequestData()
+      .setKeyType(CoordinatorType.TRANSACTION.id)
+      .setCoordinatorKeys(asList("txn-1"))).build(ApiKeys.FIND_COORDINATOR.latestVersion)
+    val request = buildRequest(findCoord,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleFindCoordinatorRequest(request)
+
+    val response = verifyNoThrottling[FindCoordinatorResponse](request)
+    val coord = response.data.coordinators.get(0)
+    assertEquals(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.code, coord.errorCode)
+    assertEquals("txn-1", coord.key, "logical key must be echoed back unchanged")
+    verify(txnCoordinator, never()).partitionFor(anyString())
+    verify(groupCoordinator, never()).partitionFor(anyString())
+  }
+
+  @Test
+  def testFindCoordinatorV4PrivilegedCallerOnTenantListenerIsRefused(): Unit = {
+    // Standing PROMPT.md trap: a super-user with no `__tenant_` prefix hits the
+    // tenant-bound listener. The broker must NOT silently resolve "orders" into
+    // "__tenant_acme.orders" using the listener binding — that would let the
+    // privileged caller drive a tenant's coordinator without owning the tenant
+    // principal. The unsafe-context guard returns GROUP_AUTHORIZATION_FAILED
+    // and never invokes the coordinator.
+    val findCoord = new FindCoordinatorRequest.Builder(new FindCoordinatorRequestData()
+      .setKeyType(CoordinatorType.GROUP.id)
+      .setCoordinatorKeys(asList("orders-consumer"))).build(ApiKeys.FIND_COORDINATOR.latestVersion)
+    val request = buildRequest(findCoord,
+      listenerName = TENANT_LISTENER,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleFindCoordinatorRequest(request)
+
+    val response = verifyNoThrottling[FindCoordinatorResponse](request)
+    val coord = response.data.coordinators.get(0)
+    assertEquals(Errors.GROUP_AUTHORIZATION_FAILED.code, coord.errorCode)
+    assertEquals("orders-consumer", coord.key)
+    verify(groupCoordinator, never()).partitionFor(anyString())
+  }
+
+  @Test
+  def testFindCoordinatorV3TenantRewritesGroupKeyToPhysicalForm(): Unit = {
+    // v0-3 carries a single non-batched key on the `key` field. The rewrite
+    // must apply there too, not just on the v4+ `coordinatorKeys` list.
+    val findCoord = new FindCoordinatorRequest.Builder(new FindCoordinatorRequestData()
+      .setKeyType(CoordinatorType.GROUP.id)
+      .setKey("orders-consumer")).build(3.toShort)
+    val request = buildRequest(findCoord,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleFindCoordinatorRequest(request)
+
+    verify(groupCoordinator).partitionFor("__tenant_acme.orders-consumer")
+  }
+
+  @Test
+  def testJoinGroupTenantRewritesGroupIdToPhysical(): Unit = {
+    val data = new JoinGroupRequestData()
+      .setGroupId("orders-consumer")
+      .setMemberId("member-1")
+      .setProtocolType("consumer")
+      .setRebalanceTimeoutMs(1000)
+      .setSessionTimeoutMs(2000)
+    val joinReq = new JoinGroupRequest.Builder(data).build(ApiKeys.JOIN_GROUP.latestVersion)
+    val request = buildRequest(joinReq,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    // The handler mutates the in-place data: by the time Mockito's equality
+    // matcher runs, the request's groupId field has been overwritten with the
+    // physical form. The expected object mirrors that mutation.
+    val expected = new JoinGroupRequestData()
+      .setGroupId("__tenant_acme.orders-consumer")
+      .setMemberId("member-1")
+      .setProtocolType("consumer")
+      .setRebalanceTimeoutMs(1000)
+      .setSessionTimeoutMs(2000)
+
+    val future = new CompletableFuture[JoinGroupResponseData]()
+    when(groupCoordinator.joinGroup(
+      request.context,
+      expected,
+      RequestLocal.noCaching.bufferSupplier
+    )).thenReturn(future)
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleJoinGroupRequest(request, RequestLocal.noCaching)
+
+    future.complete(new JoinGroupResponseData().setMemberId("member-1"))
+    verifyNoThrottling[JoinGroupResponse](request)
+    verify(groupCoordinator).joinGroup(
+      ArgumentMatchers.eq(request.context),
+      ArgumentMatchers.eq(expected),
+      ArgumentMatchers.eq(RequestLocal.noCaching.bufferSupplier))
+  }
+
+  @Test
+  def testJoinGroupTenantRefusesCrossTenantPrefixedGroupId(): Unit = {
+    // A tenant addressing `__tenant_other.foo` is either confused or hostile;
+    // the broker refuses with GROUP_AUTHORIZATION_FAILED so the wire response
+    // never hints at the existence of any other tenant's namespace.
+    val data = new JoinGroupRequestData()
+      .setGroupId("__tenant_other.foo")
+      .setMemberId("member-1")
+      .setProtocolType("consumer")
+      .setRebalanceTimeoutMs(1000)
+      .setSessionTimeoutMs(2000)
+    val request = buildRequest(new JoinGroupRequest.Builder(data).build(),
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleJoinGroupRequest(request, RequestLocal.noCaching)
+
+    val response = verifyNoThrottling[JoinGroupResponse](request)
+    assertEquals(Errors.GROUP_AUTHORIZATION_FAILED, response.error)
+    verify(groupCoordinator, never()).joinGroup(
+      any[RequestContext](),
+      any[JoinGroupRequestData](),
+      any[org.apache.kafka.common.utils.BufferSupplier]())
+  }
+
+  @Test
+  def testSyncGroupTenantRewritesGroupIdToPhysical(): Unit = {
+    val data = new SyncGroupRequestData()
+      .setGroupId("orders-consumer")
+      .setMemberId("member-1")
+      .setGenerationId(0)
+      .setProtocolType("consumer")
+      .setProtocolName("range")
+    val request = buildRequest(new SyncGroupRequest.Builder(data).build(),
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    val expected = new SyncGroupRequestData()
+      .setGroupId("__tenant_acme.orders-consumer")
+      .setMemberId("member-1")
+      .setGenerationId(0)
+      .setProtocolType("consumer")
+      .setProtocolName("range")
+
+    val future = new CompletableFuture[SyncGroupResponseData]()
+    when(groupCoordinator.syncGroup(
+      request.context,
+      expected,
+      RequestLocal.noCaching.bufferSupplier
+    )).thenReturn(future)
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleSyncGroupRequest(request, RequestLocal.noCaching)
+
+    future.complete(new SyncGroupResponseData())
+    verifyNoThrottling[SyncGroupResponse](request)
+    verify(groupCoordinator).syncGroup(
+      ArgumentMatchers.eq(request.context),
+      ArgumentMatchers.eq(expected),
+      ArgumentMatchers.eq(RequestLocal.noCaching.bufferSupplier))
+  }
+
+  @Test
+  def testHeartbeatTenantRewritesGroupIdToPhysical(): Unit = {
+    val data = new HeartbeatRequestData()
+      .setGroupId("orders-consumer")
+      .setMemberId("member-1")
+      .setGenerationId(0)
+    val request = buildRequest(new HeartbeatRequest.Builder(data).build(),
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    val expected = new HeartbeatRequestData()
+      .setGroupId("__tenant_acme.orders-consumer")
+      .setMemberId("member-1")
+      .setGenerationId(0)
+
+    val future = new CompletableFuture[HeartbeatResponseData]()
+    when(groupCoordinator.heartbeat(request.context, expected)).thenReturn(future)
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleHeartbeatRequest(request)
+
+    future.complete(new HeartbeatResponseData())
+    verifyNoThrottling[HeartbeatResponse](request)
+    verify(groupCoordinator).heartbeat(
+      ArgumentMatchers.eq(request.context),
+      ArgumentMatchers.eq(expected))
+  }
+
+  @Test
+  def testLeaveGroupTenantRewritesGroupIdToPhysical(): Unit = {
+    val request = buildRequest(new LeaveGroupRequest.Builder(
+      "orders-consumer",
+      List(new MemberIdentity().setMemberId("member-1")).asJava
+    ).build(),
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    val expected = new LeaveGroupRequestData()
+      .setGroupId("__tenant_acme.orders-consumer")
+      .setMembers(List(new MemberIdentity().setMemberId("member-1")).asJava)
+
+    val future = new CompletableFuture[LeaveGroupResponseData]()
+    when(groupCoordinator.leaveGroup(request.context, expected)).thenReturn(future)
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleLeaveGroupRequest(request)
+
+    future.complete(new LeaveGroupResponseData())
+    verifyNoThrottling[LeaveGroupResponse](request)
+    verify(groupCoordinator).leaveGroup(
+      ArgumentMatchers.eq(request.context),
+      ArgumentMatchers.eq(expected))
+  }
+
+  @Test
+  def testOffsetCommitTenantRewritesGroupAndTopicAndStripsTopicOnResponse(): Unit = {
+    // The full happy-path round-trip: tenant submits {group=orders-consumer,
+    // topic=orders}; the broker addresses the coordinator with the physical
+    // form {group=__tenant_acme.orders-consumer, topic=acme.orders} and
+    // returns the LOGICAL form back to the tenant on the response side.
+    addTopicToMetadataCache("acme.orders", numPartitions = 1)
+
+    val data = new OffsetCommitRequestData()
+      .setGroupId("orders-consumer")
+      .setMemberId("member-1")
+      .setTopics(List(
+        new OffsetCommitRequestData.OffsetCommitRequestTopic()
+          .setName("orders")
+          .setPartitions(List(
+            new OffsetCommitRequestData.OffsetCommitRequestPartition()
+              .setPartitionIndex(0)
+              .setCommittedOffset(42)).asJava)).asJava)
+    val request = buildRequest(new OffsetCommitRequest.Builder(data).build(),
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    val expectedCoordinatorRequest = new OffsetCommitRequestData()
+      .setGroupId("__tenant_acme.orders-consumer")
+      .setMemberId("member-1")
+      .setTopics(List(
+        new OffsetCommitRequestData.OffsetCommitRequestTopic()
+          .setName("acme.orders")
+          .setPartitions(List(
+            new OffsetCommitRequestData.OffsetCommitRequestPartition()
+              .setPartitionIndex(0)
+              .setCommittedOffset(42)).asJava)).asJava)
+
+    val future = new CompletableFuture[OffsetCommitResponseData]()
+    when(groupCoordinator.commitOffsets(
+      request.context,
+      expectedCoordinatorRequest,
+      RequestLocal.noCaching.bufferSupplier
+    )).thenReturn(future)
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleOffsetCommitRequest(request, RequestLocal.noCaching)
+
+    future.complete(new OffsetCommitResponseData()
+      .setTopics(List(
+        new OffsetCommitResponseData.OffsetCommitResponseTopic()
+          .setName("acme.orders")
+          .setPartitions(List(
+            new OffsetCommitResponseData.OffsetCommitResponsePartition()
+              .setPartitionIndex(0)
+              .setErrorCode(Errors.NONE.code)).asJava)).asJava))
+
+    val response = verifyNoThrottling[OffsetCommitResponse](request)
+    val topics = response.data.topics.asScala
+    assertEquals(1, topics.size)
+    assertEquals("orders", topics.head.name,
+      "tenant must see the LOGICAL topic name on the response, not the physical prefix")
+    verify(groupCoordinator).commitOffsets(
+      ArgumentMatchers.eq(request.context),
+      ArgumentMatchers.eq(expectedCoordinatorRequest),
+      ArgumentMatchers.eq(RequestLocal.noCaching.bufferSupplier))
+  }
+
+  @Test
+  def testOffsetCommitTenantRefusesReservedPhysicalFormTopic(): Unit = {
+    // A tenant submits a literal "acme.foo" as a logical topic name. The broker
+    // rejects it as reserved (it would round-trip to the physical form) with
+    // UNKNOWN_TOPIC_OR_PARTITION per-topic, never touches the coordinator, and
+    // echoes back the LITERAL name the tenant sent — stripping the prefix in
+    // the response would substitute "foo" for "acme.foo" and confuse the user
+    // about what they actually submitted.
+    val data = new OffsetCommitRequestData()
+      .setGroupId("orders-consumer")
+      .setMemberId("member-1")
+      .setTopics(List(
+        new OffsetCommitRequestData.OffsetCommitRequestTopic()
+          .setName("acme.foo")
+          .setPartitions(List(
+            new OffsetCommitRequestData.OffsetCommitRequestPartition()
+              .setPartitionIndex(0)
+              .setCommittedOffset(42)).asJava)).asJava)
+    val request = buildRequest(new OffsetCommitRequest.Builder(data).build(),
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleOffsetCommitRequest(request, RequestLocal.noCaching)
+
+    val response = verifyNoThrottling[OffsetCommitResponse](request)
+    val topics = response.data.topics.asScala
+    assertEquals(1, topics.size)
+    assertEquals("acme.foo", topics.head.name,
+      "rejected-form topic must echo back the LITERAL logical name the tenant sent")
+    assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION.code,
+      topics.head.partitions.asScala.head.errorCode)
+    verify(groupCoordinator, never()).commitOffsets(
+      any[RequestContext](),
+      any[OffsetCommitRequestData](),
+      any[org.apache.kafka.common.utils.BufferSupplier]())
+  }
+
+  @Test
+  def testOffsetFetchV8TenantRewritesGroupAndTopicAndDropsForeignTopicsOnResponse(): Unit = {
+    // Two-fold contract: (a) on the way in, both the group id and the topic
+    // names of a specific-topic fetch are rewritten to their physical forms
+    // before reaching the coordinator; (b) on the way out, the response's
+    // group id is restored to the logical form, the tenant's own topic gets
+    // its prefix stripped, and any FOREIGN-namespace topic the coordinator
+    // hands back (cross-tenant residue, mis-routed entry) is defensively
+    // dropped before the tenant can see it.
+    val version = ApiKeys.OFFSET_FETCH.latestVersion
+    val groups = Map(
+      "orders-consumer" -> List(new TopicPartition("orders", 0)).asJava
+    ).asJava
+    val request = buildRequest(new OffsetFetchRequest.Builder(groups, false, false).build(version),
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    val expectedCoordinatorRequest = new OffsetFetchRequestData.OffsetFetchRequestGroup()
+      .setGroupId("__tenant_acme.orders-consumer")
+      .setTopics(List(
+        new OffsetFetchRequestData.OffsetFetchRequestTopics()
+          .setName("acme.orders")
+          .setPartitionIndexes(List[Integer](0).asJava)).asJava)
+
+    val coordFuture = new CompletableFuture[OffsetFetchResponseData.OffsetFetchResponseGroup]()
+    when(groupCoordinator.fetchOffsets(
+      request.context,
+      expectedCoordinatorRequest,
+      false
+    )).thenReturn(coordFuture)
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleOffsetFetchRequest(request)
+
+    // Coordinator returns the tenant's own topic AND a foreign-namespace
+    // residue ("beta.intruder"). The defensive filter must keep only the
+    // former and strip its prefix, never letting "beta.intruder" reach the
+    // tenant.
+    coordFuture.complete(new OffsetFetchResponseData.OffsetFetchResponseGroup()
+      .setGroupId("__tenant_acme.orders-consumer")
+      .setTopics(List(
+        new OffsetFetchResponseData.OffsetFetchResponseTopics()
+          .setName("acme.orders")
+          .setPartitions(List(
+            new OffsetFetchResponseData.OffsetFetchResponsePartitions()
+              .setPartitionIndex(0)
+              .setCommittedOffset(100)).asJava),
+        new OffsetFetchResponseData.OffsetFetchResponseTopics()
+          .setName("beta.intruder")
+          .setPartitions(List(
+            new OffsetFetchResponseData.OffsetFetchResponsePartitions()
+              .setPartitionIndex(0)
+              .setCommittedOffset(999)).asJava)
+      ).asJava))
+
+    val response = verifyNoThrottling[OffsetFetchResponse](request)
+    val groupsOut = response.data.groups.asScala
+    assertEquals(1, groupsOut.size)
+    assertEquals("orders-consumer", groupsOut.head.groupId,
+      "tenant must see the LOGICAL group id on the response, not the physical prefix")
+    val topicsOut = groupsOut.head.topics.asScala.map(_.name).toSet
+    assertEquals(Set("orders"), topicsOut,
+      "foreign-namespace topic must be dropped; own-topic must be stripped of prefix")
+    verify(groupCoordinator).fetchOffsets(
+      ArgumentMatchers.eq(request.context),
+      ArgumentMatchers.eq(expectedCoordinatorRequest),
+      ArgumentMatchers.eq(false))
+  }
+
 }
