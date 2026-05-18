@@ -176,6 +176,10 @@ public class SocketServerConfigs {
     public static final int HTTP_BRIDGE_PORT_DEFAULT = 8082;
     public static final String HTTP_BRIDGE_PORT_DOC = "TCP port the HTTP bridge listener binds to when " + HTTP_BRIDGE_ENABLED_CONFIG + " is true. Defaults to 8082, the same port used by Confluent's REST Proxy so existing tooling can point at the broker directly without reconfiguration. A value of 0 binds an ephemeral port chosen by the OS — useful for tests and CI; the actually bound port is reported in the broker log.";
 
+    public static final String HTTP_BRIDGE_MAX_REQUEST_BODY_BYTES_CONFIG = "http.bridge.max.request.body.bytes";
+    public static final int HTTP_BRIDGE_MAX_REQUEST_BODY_BYTES_DEFAULT = 1024 * 1024;
+    public static final String HTTP_BRIDGE_MAX_REQUEST_BODY_BYTES_DOC = "Upper bound on the size in bytes of an HTTP request body the bridge will accept (POST /v1/topics/{topic}/records). Jetty defaults do not cap the body size and Jackson's readTree consumes the whole stream into memory before parsing, so without this cap a single oversized POST can OOM the broker process before any Kafka admission control runs. The default of 1 MiB matches the per-message-set ceiling that Kafka brokers typically enforce on the binary path (message.max.bytes default is 1 MiB) — raise it only if your producers genuinely need to send larger record batches over HTTP. Exceeded requests are rejected with HTTP 413 Payload Too Large and the standard {errorCode, errorMessage} envelope.";
+
     public static final ConfigDef CONFIG_DEF =  new ConfigDef()
             .define(LISTENERS_CONFIG, STRING, LISTENERS_DEFAULT, HIGH, LISTENERS_DOC)
             .define(ADVERTISED_LISTENERS_CONFIG, STRING, null, HIGH, ADVERTISED_LISTENERS_DOC)
@@ -195,7 +199,8 @@ public class SocketServerConfigs {
             .define(NUM_NETWORK_THREADS_CONFIG, INT, NUM_NETWORK_THREADS_DEFAULT, atLeast(1), HIGH, NUM_NETWORK_THREADS_DOC)
             .define(HTTP_BRIDGE_ENABLED_CONFIG, ConfigDef.Type.BOOLEAN, HTTP_BRIDGE_ENABLED_DEFAULT, LOW, HTTP_BRIDGE_ENABLED_DOC)
             .define(HTTP_BRIDGE_HOST_CONFIG, STRING, HTTP_BRIDGE_HOST_DEFAULT, LOW, HTTP_BRIDGE_HOST_DOC)
-            .define(HTTP_BRIDGE_PORT_CONFIG, INT, HTTP_BRIDGE_PORT_DEFAULT, atLeast(0), LOW, HTTP_BRIDGE_PORT_DOC);
+            .define(HTTP_BRIDGE_PORT_CONFIG, INT, HTTP_BRIDGE_PORT_DEFAULT, atLeast(0), LOW, HTTP_BRIDGE_PORT_DOC)
+            .define(HTTP_BRIDGE_MAX_REQUEST_BODY_BYTES_CONFIG, INT, HTTP_BRIDGE_MAX_REQUEST_BODY_BYTES_DEFAULT, atLeast(0), LOW, HTTP_BRIDGE_MAX_REQUEST_BODY_BYTES_DOC);
 
     private static final Pattern URI_PARSE_REGEXP = Pattern.compile(
         "^(.*)://\\[?([0-9a-zA-Z\\-%._:]*)\\]?:(-?[0-9]+)");

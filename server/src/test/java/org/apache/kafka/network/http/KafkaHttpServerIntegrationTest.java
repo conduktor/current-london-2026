@@ -50,6 +50,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class KafkaHttpServerIntegrationTest {
 
+    // 1 MiB matches the production default in SocketServerConfigs — plenty of headroom for the small JSON bodies in
+    // these tests, while still defending against the multi-GiB OOM scenario the cap exists to prevent.
+    private static final int DEFAULT_TEST_MAX_BODY_BYTES = 1024 * 1024;
+
     private final ObjectMapper mapper = new ObjectMapper();
     private final ControllableSubmitter submitter = new ControllableSubmitter();
     private KafkaHttpServer server;
@@ -57,7 +61,12 @@ class KafkaHttpServerIntegrationTest {
 
     @BeforeEach
     void setUp() throws Exception {
-        server = new KafkaHttpServer("127.0.0.1", 0, new KafkaHttpBridge(mapper, submitter), submitter, mapper);
+        startServer(DEFAULT_TEST_MAX_BODY_BYTES);
+    }
+
+    private void startServer(int maxRequestBodyBytes) throws Exception {
+        server = new KafkaHttpServer("127.0.0.1", 0, new KafkaHttpBridge(mapper, submitter), submitter, mapper,
+            maxRequestBodyBytes);
         server.start();
         client = new HttpClient();
         client.start();
@@ -174,6 +183,32 @@ class KafkaHttpServerIntegrationTest {
             .send();
 
         assertEquals(400, resp.getStatus());
+    }
+
+    @Test
+    void produceWithOversizedBodyReturns413() throws Exception {
+        // Restart the server with a tiny cap so the smallest plausible JSON body still trips it. The cap defends the
+        // broker JVM from an unbounded inbound POST: Jackson's readTree() consumes the whole stream into memory before
+        // it parses, so without this cap a multi-GiB upload can OOM the broker before Kafka admission control runs.
+        tearDown();
+        startServer(64);
+
+        // The body below is 100+ bytes — well past the 64-byte cap. The exact body shape doesn't matter; the cap
+        // trips before Jackson finishes building the JsonNode tree.
+        String body = "{\"records\":[{\"partition\":0,\"value\":{\"type\":\"STRING\",\"data\":\""
+            + "x".repeat(200) + "\"}}]}";
+
+        ContentResponse resp = client.newRequest(url("/v1/topics/orders/records"))
+            .method(HttpMethod.POST)
+            .body(new StringRequestContent("application/json", body))
+            .send();
+
+        assertEquals(413, resp.getStatus());
+        JsonNode envelope = asJson(resp.getContent());
+        // The envelope quotes the configured limit back to the caller so a client otherwise has no way to know how
+        // big "too large" actually is. This is what makes the 413 actionable rather than just a refusal.
+        assertTrue(envelope.get("errorMessage").asText().contains("64"),
+            "errorMessage must quote the configured byte cap, got: " + envelope.get("errorMessage").asText());
     }
 
     // ----- fetch -----

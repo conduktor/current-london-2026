@@ -52,17 +52,22 @@ public final class KafkaHttpServer {
     private final KafkaHttpBridge bridge;
     private final RequestSubmitter submitter;
     private final ObjectMapper mapper;
+    private final int maxRequestBodyBytes;
 
     private Server server;
     private int boundPort = -1;
 
     public KafkaHttpServer(String host, int port, KafkaHttpBridge bridge, RequestSubmitter submitter,
-                           ObjectMapper mapper) {
+                           ObjectMapper mapper, int maxRequestBodyBytes) {
         this.host = Objects.requireNonNull(host, "host must not be null");
         this.port = port;
         this.bridge = Objects.requireNonNull(bridge, "bridge must not be null");
         this.submitter = Objects.requireNonNull(submitter, "submitter must not be null");
         this.mapper = Objects.requireNonNull(mapper, "mapper must not be null");
+        if (maxRequestBodyBytes < 0) {
+            throw new IllegalArgumentException("maxRequestBodyBytes must be non-negative, got " + maxRequestBodyBytes);
+        }
+        this.maxRequestBodyBytes = maxRequestBodyBytes;
     }
 
     public synchronized void start() throws Exception {
@@ -78,7 +83,7 @@ public final class KafkaHttpServer {
 
         ServletContextHandler context = new ServletContextHandler();
         context.setContextPath(CONTEXT_PATH);
-        ServletHolder holder = new ServletHolder(new KafkaHttpServlet(bridge, submitter, mapper));
+        ServletHolder holder = new ServletHolder(new KafkaHttpServlet(bridge, submitter, mapper, maxRequestBodyBytes));
         holder.setAsyncSupported(true);
         context.addServlet(holder, SERVLET_PATTERN);
 

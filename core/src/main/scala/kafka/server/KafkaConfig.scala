@@ -328,6 +328,7 @@ class KafkaConfig private(doLog: Boolean, val props: util.Map[_, _])
   val httpBridgeEnabled: Boolean = getBoolean(SocketServerConfigs.HTTP_BRIDGE_ENABLED_CONFIG)
   val httpBridgeHost: String = getString(SocketServerConfigs.HTTP_BRIDGE_HOST_CONFIG)
   val httpBridgePort: Int = getInt(SocketServerConfigs.HTTP_BRIDGE_PORT_CONFIG)
+  val httpBridgeMaxRequestBodyBytes: Int = getInt(SocketServerConfigs.HTTP_BRIDGE_MAX_REQUEST_BODY_BYTES_CONFIG)
 
   /***************** rack configuration **************/
   val rack = Option(getString(ServerConfigs.BROKER_RACK_CONFIG))

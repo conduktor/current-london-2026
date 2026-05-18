@@ -58,11 +58,17 @@ public final class KafkaHttpServlet extends HttpServlet {
     private final KafkaHttpBridge bridge;
     private final RequestSubmitter submitter;
     private final ObjectMapper mapper;
+    private final int maxRequestBodyBytes;
 
-    public KafkaHttpServlet(KafkaHttpBridge bridge, RequestSubmitter submitter, ObjectMapper mapper) {
+    public KafkaHttpServlet(KafkaHttpBridge bridge, RequestSubmitter submitter, ObjectMapper mapper,
+                            int maxRequestBodyBytes) {
         this.bridge = Objects.requireNonNull(bridge, "bridge must not be null");
         this.submitter = Objects.requireNonNull(submitter, "submitter must not be null");
         this.mapper = Objects.requireNonNull(mapper, "mapper must not be null");
+        if (maxRequestBodyBytes < 0) {
+            throw new IllegalArgumentException("maxRequestBodyBytes must be non-negative, got " + maxRequestBodyBytes);
+        }
+        this.maxRequestBodyBytes = maxRequestBodyBytes;
     }
 
     @Override
@@ -74,12 +80,24 @@ public final class KafkaHttpServlet extends HttpServlet {
         }
 
         JsonNode body;
-        try {
-            body = mapper.readTree(req.getInputStream());
+        // Wrap the request InputStream in a hard byte cap BEFORE handing it to Jackson — readTree() will consume the
+        // entire stream into memory, and Jetty's default HttpConfiguration has no body-size limit of its own. Without
+        // this wrapper a single multi-GiB POST can OOM the broker JVM before any Kafka admission control runs.
+        try (BoundedRequestBody bounded = new BoundedRequestBody(req.getInputStream(), maxRequestBodyBytes)) {
+            body = mapper.readTree(bounded);
+        } catch (BodyTooLargeException e) {
+            writePayloadTooLarge(resp, e.limit());
+            return;
         } catch (JsonProcessingException e) {
             writeBadRequest(resp, "body is not valid JSON: " + e.getOriginalMessage());
             return;
         } catch (IOException e) {
+            // Jackson wraps a BodyTooLargeException as itself (IOException → unchanged), but a deeply nested cause is
+            // possible if some future Jackson revision adds buffering — check the cause chain so we still emit 413.
+            if (rootCauseIsBodyTooLarge(e)) {
+                writePayloadTooLarge(resp, maxRequestBodyBytes);
+                return;
+            }
             writeBadRequest(resp, "could not read request body: " + e.getMessage());
             return;
         }
@@ -171,6 +189,23 @@ public final class KafkaHttpServlet extends HttpServlet {
 
     private void writeBadRequest(HttpServletResponse resp, String message) throws IOException {
         writeEnvelope(resp, HttpStatusMapper.BAD_REQUEST, message);
+    }
+
+    private void writePayloadTooLarge(HttpServletResponse resp, long limit) throws IOException {
+        writeEnvelope(resp, HttpStatusMapper.PAYLOAD_TOO_LARGE,
+            "request body exceeds the configured limit of " + limit + " bytes");
+    }
+
+    private static boolean rootCauseIsBodyTooLarge(Throwable t) {
+        for (Throwable cause = t; cause != null; cause = cause.getCause()) {
+            if (cause instanceof BodyTooLargeException) {
+                return true;
+            }
+            if (cause == cause.getCause()) {
+                break;
+            }
+        }
+        return false;
     }
 
     private void writeNotFound(HttpServletResponse resp) throws IOException {
