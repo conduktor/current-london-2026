@@ -58,8 +58,15 @@ public final class CelProgram {
             Object v = root.eval(activation);
             if (v == null) return false;
             if (v instanceof Boolean) return (Boolean) v;
+            // Type-only descriptor for the offending value: the exception is
+            // logged at WARN by RuleEngine.evaluate, and activation values can
+            // carry request-derived data (header values, principal names,
+            // topic names) we should not echo to broker logs. The rule
+            // source is operator-authored and safe to include — it lets the
+            // operator find the misauthored rule without reading the payload.
             throw new CelEvaluationException(
-                "CEL expression did not evaluate to a boolean: source=" + source + " value=" + v);
+                "CEL expression did not evaluate to a boolean: source=" + source
+                    + " resultType=" + v.getClass().getSimpleName());
         } finally {
             CelLimits.resetSteps();
         }

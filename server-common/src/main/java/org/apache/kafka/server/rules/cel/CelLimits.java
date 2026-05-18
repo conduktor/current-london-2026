@@ -107,6 +107,24 @@ final class CelLimits {
     static final int MAX_EVAL_STEPS = 100_000;
 
     /**
+     * Maximum length (in {@code char} units) of the result of a runtime string
+     * concatenation ({@code "x" + "y"}). The AST node-count cap bounds how
+     * many ADD nodes a single rule can hold (≈ {@link #MAX_NODES} / 2), but
+     * with a doubling-tree shape — {@code (a+a)+(a+a)+(a+a)+(a+a)…} — and an
+     * activation that resolves {@code a} to a moderately long string (header
+     * value, principal, etc.), the per-evaluation transient allocation can
+     * still grow to many MB. This cap aborts the concatenation as soon as the
+     * cumulative result would exceed 16384 chars, matching
+     * {@link #MAX_REGEX_INPUT_LENGTH} for the same defense-in-depth reason:
+     * any string a rule produces for comparison against a Kafka identifier
+     * (topic name capped at 249, client-id under 256) is already orders of
+     * magnitude under this cap. Rules that approach it are almost certainly
+     * trying to mount a memory blow-up against the request thread and should
+     * be rewritten as a coarser filter.
+     */
+    static final int MAX_STRING_RESULT_LEN = 16384;
+
+    /**
      * Maximum length of the receiver string passed to {@code Pattern.matches}.
      * Kafka identifiers are short by spec — topic names cap at 249 chars,
      * client/group IDs are typically &lt; 256. With the RE2 engine in place

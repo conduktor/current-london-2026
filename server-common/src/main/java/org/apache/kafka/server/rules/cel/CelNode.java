@@ -154,7 +154,7 @@ abstract class CelNode {
         private static String stringArg(CelNode n, Function<String, Object> a) {
             Object v = n.eval(a);
             if (!(v instanceof String)) {
-                throw new CelEvaluationException("expected string argument, got " + v);
+                throw new CelEvaluationException("expected string argument, got " + typeOf(v));
             }
             return (String) v;
         }
@@ -457,7 +457,21 @@ abstract class CelNode {
             Object l = left.eval(a);
             Object r = right.eval(a);
             if (op == Op.ADD && l instanceof String && r instanceof String) {
-                return l + (String) r;
+                String ls = (String) l;
+                String rs = (String) r;
+                // Bound the result before allocating it. A doubling-tree
+                // {@code (a+a)+(a+a)…} with an activation that resolves
+                // {@code a} to a moderately long header/principal string can
+                // accumulate many MB of transient String per request before
+                // hitting any other safety limit. Capping the result length
+                // keeps per-request memory bounded.
+                long total = (long) ls.length() + (long) rs.length();
+                if (total > CelLimits.MAX_STRING_RESULT_LEN) {
+                    throw new CelEvaluationException(
+                        "string concatenation result exceeds "
+                            + CelLimits.MAX_STRING_RESULT_LEN + " chars");
+                }
+                return ls + rs;
             }
             if (!(l instanceof Number) || !(r instanceof Number)) {
                 throw new CelEvaluationException("arithmetic requires numbers");
@@ -528,7 +542,7 @@ abstract class CelNode {
         if (v instanceof Boolean) {
             return (Boolean) v;
         }
-        throw new CelEvaluationException("expected boolean, got " + v);
+        throw new CelEvaluationException("expected boolean, got " + typeOf(v));
     }
 
     private static int compareValues(Object l, Object r) {
@@ -538,7 +552,23 @@ abstract class CelNode {
         if (l instanceof String && r instanceof String) {
             return ((String) l).compareTo((String) r);
         }
-        throw new CelEvaluationException("incomparable values: " + l + " vs " + r);
+        throw new CelEvaluationException(
+            "incomparable values: " + typeOf(l) + " vs " + typeOf(r));
+    }
+
+    /**
+     * Type-only descriptor for an activation value, suitable for inclusion in
+     * {@link CelEvaluationException} messages. The exception's {@code toString}
+     * is logged at WARN by {@code RuleEngine.evaluate} when a rule fails open,
+     * so the message MUST NOT reproduce the runtime value — activation values
+     * can carry request-derived data (header values, principal names, topic
+     * names) which an operator scanning broker logs should not see by
+     * accident. We surface the Java class name only, which is enough to
+     * diagnose a misauthored rule (`expected string, got Long`) without
+     * leaking the offending payload.
+     */
+    private static String typeOf(Object v) {
+        return v == null ? "null" : v.getClass().getSimpleName();
     }
 
     /**

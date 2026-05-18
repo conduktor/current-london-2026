@@ -433,6 +433,45 @@ public class CelProgramTest {
     }
 
     @Test
+    public void stringConcatenationResultIsBoundedAtRuntime() {
+        // A rule that concatenates an activation-supplied string with itself
+        // would, under a doubling-tree shape, accumulate many MB of transient
+        // String per evaluation. The CelLimits.MAX_STRING_RESULT_LEN guard
+        // aborts the concat as soon as the result would exceed the cap —
+        // CelEvaluationException is failed-open by the engine, so the rule
+        // is logged and skipped without crashing the request thread.
+        StringBuilder big = new StringBuilder();
+        for (int n = 0; n < CelLimits.MAX_STRING_RESULT_LEN; n++) {
+            big.append('x');
+        }
+        Map<String, Object> env = new HashMap<>();
+        env.put("a", big.toString());
+        // a + a doubles the receiver to 2 * MAX_STRING_RESULT_LEN chars.
+        CelEvaluationException ex = assertThrows(
+            CelEvaluationException.class,
+            () -> evalBool("a + a == \"never\"", env));
+        assertTrue(ex.getMessage().contains("string concatenation"),
+            "expected string-concat error, got: " + ex.getMessage());
+    }
+
+    @Test
+    public void typeErrorMessageDoesNotLeakActivationValue() {
+        // Activation values can carry request-derived data (header values,
+        // principal names) that an operator scanning broker logs should not
+        // see. CelEvaluationException is logged at WARN by RuleEngine, so
+        // the message must include the offending value's type only — not
+        // its toString. This pins the "type-only descriptor" posture.
+        Map<String, Object> env = new HashMap<>();
+        env.put("secret", "very-sensitive-payload");
+        // `secret` is a String but `> 5` requires a number → throws.
+        CelEvaluationException ex = assertThrows(
+            CelEvaluationException.class,
+            () -> evalBool("secret > 5", env));
+        assertFalse(ex.getMessage().contains("very-sensitive-payload"),
+            "exception message must not echo activation value: " + ex.getMessage());
+    }
+
+    @Test
     public void matchesStillWorksOnNonStringReceiver() {
         // Behavioural parity with the old MethodCall-based path: a non-string
         // receiver yields false, not an exception. This matters because
