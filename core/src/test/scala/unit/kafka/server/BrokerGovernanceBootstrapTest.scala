@@ -366,6 +366,174 @@ class BrokerGovernanceBootstrapTest {
   }
 
   @Test
+  def drainStartupBoundedWaitsForLocalLogToBecomeAvailable(): Unit = {
+    // Codex deep-audit P0: drainOnce returning 0L for LocalReplica + getLog==None
+    // is the correct "fail-stale-not-empty" behaviour AFTER a successful prior
+    // install (engine.active() carries the last-known-good rules forward through
+    // a transient log-dir glitch). At FIRST STARTUP, however, engine.active() is
+    // RuleSet.EMPTY — returning 0L would let BrokerServer.enableRequestProcessing
+    // open client traffic before any DENY rules on the topic are enforced. The
+    // startup-only `drainStartup` method must bounded-wait for the log to become
+    // available, then drain. This test exercises the "log appears mid-wait" case.
+    val rm = mock(classOf[ReplicaManager])
+    val log = mock(classOf[UnifiedLog])
+    val engine = new RuleEngine()
+
+    // First two getLog() calls return None; the third returns Some(log) — the
+    // bounded-wait must keep polling and then succeed once the log appears.
+    val noneAnswer = org.mockito.Mockito.doReturn(None, Seq.empty: _*)
+      .doReturn(None, Seq.empty: _*)
+      .doReturn(Some(log), Seq.empty: _*)
+    noneAnswer.when(rm).getLog(tp)
+    when(log.logStartOffset).thenReturn(0L)
+    when(log.highWatermark).thenReturn(1L)
+    when(log.read(0L, 1024 * 1024, FetchIsolation.HIGH_WATERMARK, true)).thenReturn(
+      recordsAt(0L,
+        new SimpleRecord("r1".getBytes(StandardCharsets.UTF_8),
+          envelope("true", ApiKeys.METADATA, 7))))
+
+    val probe: () => LocalReplicaStatus = () => LocalReplicaStatus.LocalReplica
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp,
+      injectedLoader = null,
+      localReplicaStatus = probe,
+      requireLocalReplica = true)
+
+    val n = boot.drainStartup(deadlineMs = 5000L, pollIntervalMs = 1L)
+    assertEquals(1L, n, "the record must be drained once the log appears")
+    assertEquals(1, engine.active().size())
+    assertTrue(engine.evaluate(ApiKeys.METADATA, "c", false,
+      () => Collections.emptyMap()).denied)
+  }
+
+  @Test
+  def drainStartupFailsClosedIfLocalReplicaButLogNeverAppears(): Unit = {
+    // Codex deep-audit P0 fail-closed half: if the deadline elapses while we
+    // are a LocalReplica but the log is still unavailable, drainStartup MUST
+    // throw so BrokerServer aborts startup before enableRequestProcessing
+    // opens client traffic with an empty RuleSet. The error must name the
+    // partition and explain the operator's recovery path.
+    val rm = mock(classOf[ReplicaManager])
+    val engine = new RuleEngine()
+    when(rm.getLog(tp)).thenReturn(None)
+
+    val probe: () => LocalReplicaStatus = () => LocalReplicaStatus.LocalReplica
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp,
+      injectedLoader = null,
+      localReplicaStatus = probe,
+      requireLocalReplica = true)
+
+    val ex = assertThrows(classOf[IllegalStateException],
+      () => boot.drainStartup(deadlineMs = 50L, pollIntervalMs = 1L))
+    val msg = ex.getMessage
+    assertTrue(msg.contains(tp.toString),
+      s"error must name the partition, got: $msg")
+    assertTrue(msg.contains("not yet available") || msg.contains("log"),
+      s"error must mention the log unavailability, got: $msg")
+    assertEquals(0, engine.active().size())
+  }
+
+  @Test
+  def drainStartupDoesNotWaitWhenTopicIsAbsent(): Unit = {
+    // TopicAbsent at startup is not an error — there are no rules to enforce.
+    // drainStartup must return immediately (no busy-wait against a deadline)
+    // so broker startup is not artificially delayed.
+    val rm = mock(classOf[ReplicaManager])
+    val engine = new RuleEngine()
+    when(rm.getLog(tp)).thenReturn(None)
+
+    val probe: () => LocalReplicaStatus = () => LocalReplicaStatus.TopicAbsent
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp,
+      injectedLoader = null,
+      localReplicaStatus = probe,
+      requireLocalReplica = true)
+
+    val started = System.nanoTime()
+    val n = boot.drainStartup(deadlineMs = 60_000L, pollIntervalMs = 100L)
+    val elapsedMs = (System.nanoTime() - started) / 1_000_000L
+    assertEquals(0L, n)
+    assertEquals(0, engine.active().size())
+    assertTrue(elapsedMs < 5_000L,
+      s"TopicAbsent must short-circuit drainStartup, but it took ${elapsedMs}ms")
+  }
+
+  @Test
+  def drainStartupForwardsToDrainOnceForNonReplicaStrictMode(): Unit = {
+    // NonReplica + requireLocalReplica=true at startup is a hard error and
+    // drainStartup must surface it as IllegalStateException with the same
+    // operator-actionable message drainOnce produces. We deliberately do NOT
+    // duplicate the error-message text in tests — that would couple them to
+    // wording. Instead we assert the type + the named config knob.
+    val rm = mock(classOf[ReplicaManager])
+    val engine = new RuleEngine()
+    when(rm.getLog(tp)).thenReturn(None)
+
+    val probe: () => LocalReplicaStatus = () => LocalReplicaStatus.NonReplica
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp,
+      injectedLoader = null,
+      localReplicaStatus = probe,
+      requireLocalReplica = true)
+
+    val ex = assertThrows(classOf[IllegalStateException],
+      () => boot.drainStartup(deadlineMs = 50L, pollIntervalMs = 1L))
+    assertTrue(ex.getMessage.contains("governance.bootstrap.require.local.replica"),
+      s"error must name the config knob: ${ex.getMessage}")
+  }
+
+  @Test
+  def replayDefensiveEmptyReadDoesNotSilentlySkipUnreadRecords(): Unit = {
+    // Codex deep-audit P1: when log.read returns 0 bytes mid-replay (e.g. a
+    // transient pager glitch), replay() returns early. The PRE-fix caller then
+    // called loader.commit() AND set nextOffset = endOffset, which silently
+    // advanced past records we never read. This test reproduces that bug by
+    // making the FIRST read return zero bytes before any record is processed:
+    // the cursor must NOT advance past startOffset, so the next drain picks up
+    // exactly the records we missed.
+    val rm = mock(classOf[ReplicaManager])
+    val log = mock(classOf[UnifiedLog])
+    val engine = new RuleEngine()
+    when(rm.getLog(tp)).thenReturn(Some(log))
+    when(log.logStartOffset).thenReturn(0L)
+    when(log.highWatermark).thenReturn(3L)
+
+    // First call returns an empty FetchDataInfo (sizeInBytes == 0). The
+    // pre-fix code committed and jumped to endOffset; the post-fix code must
+    // leave the cursor at 0 so the next drain can re-read.
+    val empty = new FetchDataInfo(new LogOffsetMetadata(0L), MemoryRecords.EMPTY)
+    when(log.read(0L, 1024 * 1024, FetchIsolation.HIGH_WATERMARK, true))
+      .thenReturn(empty)
+      .thenReturn(recordsAt(0L,
+        new SimpleRecord("r1".getBytes(StandardCharsets.UTF_8),
+          envelope("true", ApiKeys.METADATA, 7)),
+        new SimpleRecord("r2".getBytes(StandardCharsets.UTF_8),
+          envelope("true", ApiKeys.FETCH, 11)),
+        new SimpleRecord("r3".getBytes(StandardCharsets.UTF_8),
+          envelope("true", ApiKeys.CREATE_TOPICS, 13))))
+
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp)
+
+    // First drain: no records replayed, cursor must NOT have advanced.
+    val first = boot.drainOnce()
+    assertEquals(0L, first, "no records were actually consumed")
+    assertEquals(0, engine.active().size(),
+      "empty read mid-replay must not install an empty RuleSet — it must keep " +
+        "prior active(); at startup that's RuleSet.EMPTY, but here we are " +
+        "verifying that NO new commit happened either way")
+
+    // Second drain: log now returns the full three records. They MUST all be
+    // visible — proving the cursor stayed at startOffset across the empty read.
+    val second = boot.drainOnce()
+    assertEquals(3L, second, "all three records become visible on the retry — " +
+      "if the cursor had advanced past them, this would be 0")
+    assertEquals(3, engine.active().size())
+    assertTrue(engine.evaluate(ApiKeys.METADATA, "c", false,
+      () => Collections.emptyMap()).denied)
+    assertTrue(engine.evaluate(ApiKeys.FETCH, "c", false,
+      () => Collections.emptyMap()).denied)
+    assertTrue(engine.evaluate(ApiKeys.CREATE_TOPICS, "c", false,
+      () => Collections.emptyMap()).denied)
+  }
+
+  @Test
   def drainOnceStopsAtHighWatermarkEvenWhenLogEndOffsetIsAhead(): Unit = {
     // Regression-locking test for the LOG_END → HIGH_WATERMARK change.
     //

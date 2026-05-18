@@ -78,6 +78,25 @@ object BrokerServer {
    * new records to replay).
    */
   val GovernanceDrainIntervalMs: Long = 200L
+
+  /**
+   * Bounded wait, in milliseconds, that the startup-path governance drain
+   * gives the local {@code __governance} log to become available before
+   * aborting broker startup. Codex deep-audit P0: if this broker is a replica
+   * of {@code __governance-0} per cluster metadata but [[ReplicaManager.getLog]]
+   * has not yet opened the log dir (race between metadata catch-up and
+   * LogManager finishing log recovery), [[BrokerGovernanceBootstrap.drainOnce]]
+   * returning {@code 0L} would let [[SocketServer.enableRequestProcessing]]
+   * open client traffic before the engine has any rules installed — a silent
+   * fail-empty window for every DENY rule on the topic. [[drainStartup]]
+   * bounded-waits up to this duration, then throws and broker startup aborts.
+   *
+   * <p>30 seconds is generous relative to typical log-recovery times on healthy
+   * disks (sub-second), and tight enough that an operator notices on the next
+   * restart rather than discovering it from a missed enforcement window. Tune
+   * upward if you run brokers with very large log-dir state or slow storage.
+   */
+  val GovernanceStartupDrainDeadlineMs: Long = 30_000L
 }
 
 /**
@@ -685,21 +704,31 @@ class BrokerServer(
       // without the chicken-and-egg of a KafkaConsumer needing the socket
       // open in order to fetch from this very broker.
       //
-      // Fail-closed policy: if drainOnce throws, do NOT catch it — let it
-      // propagate so broker startup aborts before SocketServer opens. The
-      // alternative (catch + WARN + continue) is silent fail-open: a broker
-      // that IS a replica of __governance but can't read its local log
+      // Fail-closed policy: if the startup drain throws, do NOT catch it —
+      // let it propagate so broker startup aborts before SocketServer opens.
+      // The alternative (catch + WARN + continue) is silent fail-open: a
+      // broker that IS a replica of __governance but can't read its local log
       // (corrupt segment, disk fault) would open client traffic with an
       // empty RuleSet while real DENY rules exist on the topic, evading
-      // enforcement. The "log does not exist locally" path is already
-      // handled inside drainOnce (returns 0L silently) and is the right
-      // state when this broker isn't a replica — that's not an error.
+      // enforcement.
+      //
+      // Unlike the scheduler's drainOnce, drainStartup bounded-waits for the
+      // local log to become available when the cluster metadata says this
+      // broker IS a replica. drainOnce's "log briefly disappeared → keep
+      // last-known-good" posture is correct AFTER a successful prior install
+      // (engine.active() carries forward), but at first startup that
+      // last-known-good IS RuleSet.EMPTY — returning 0L without ever reading
+      // the log would silently bypass every rule. drainStartup polls until
+      // the log opens, then drains; if the deadline elapses, it throws an
+      // IllegalStateException naming the partition and the operator recovery
+      // path. Codex deep-audit P0.
       //
       // What we still log: drained count on success. Hard failures crash
       // startup with the original exception in the broker log, which is
       // the visibility we want — an operator must intervene rather than
       // a security-critical event sliding by at WARN level.
-      val drained = governanceBootstrap.drainOnce()
+      val drained = governanceBootstrap.drainStartup(
+        BrokerServer.GovernanceStartupDrainDeadlineMs)
       info(s"governance bootstrap drained $drained rule record(s) from " +
         s"${GovernanceTopic.NAME} before opening request processing")
       // Schedule ongoing re-drain so rule updates published after startup

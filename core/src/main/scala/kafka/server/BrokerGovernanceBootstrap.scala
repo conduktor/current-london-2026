@@ -238,11 +238,101 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
           loader.commit()
           return 0L
         }
-        val replayed = replay(log, startOffset, endOffset)
+        val result = replay(log, startOffset, endOffset)
+        // Always commit, so the engine reflects everything we DID apply this
+        // drain. The cursor advances to where replay actually got — not to
+        // endOffset — so a defensive empty-read mid-replay does not silently
+        // skip the unread range. Codex deep-audit P1 fix: prior version did
+        // `nextOffset.set(endOffset)` which jumped past records we never read.
         loader.commit()
-        nextOffset.set(endOffset)
-        replayed
+        nextOffset.set(result.advancedTo)
+        result.replayed
     }
+  }
+
+  /**
+   * Like [[drainOnce]] but with stronger guarantees tailored to broker startup.
+   *
+   * <p>The crucial difference is the [[LocalReplicaStatus.LocalReplica]] +
+   * {@code getLog == None} branch. In [[drainOnce]] this returns {@code 0L}
+   * without committing — the "fail-stale-not-empty" posture: a transient
+   * log-dir glitch must not be allowed to overwrite the engine's last-known-good
+   * [[org.apache.kafka.server.rules.RuleSet]] with empty. That posture is the
+   * right one <em>after</em> a successful first install, but at first startup
+   * the engine's active RuleSet is [[org.apache.kafka.server.rules.RuleSet#EMPTY]],
+   * so returning {@code 0L} would let [[BrokerServer]] open the request socket
+   * with no rules enforced — exactly the fail-empty window the startup gate
+   * exists to prevent.
+   *
+   * <p>{@code drainStartup} therefore bounded-waits up to {@code deadlineMs}
+   * for the local log to become available, polling every {@code pollIntervalMs}.
+   * Once it appears, the normal drain runs. If the deadline elapses while we
+   * are still a [[LocalReplicaStatus.LocalReplica]] with no local log, the
+   * method throws [[IllegalStateException]] and [[BrokerServer]] aborts
+   * startup with no socket opened — a stale fail-closed is strictly safer than
+   * a silent fail-empty.
+   *
+   * <p>The other no-log branches ([[LocalReplicaStatus.TopicAbsent]],
+   * [[LocalReplicaStatus.NonReplica]] under either knob setting) need no
+   * bounded wait — they mean "this broker is not supposed to enforce from
+   * this topic", which is a deterministic state, not a race.
+   *
+   * @param deadlineMs maximum total time to wait for the local log to appear
+   * @param pollIntervalMs sleep between probes. Defaults to a small value so
+   *                       the startup is responsive when the log opens shortly
+   *                       after the metadata-publish wait.
+   */
+  def drainStartup(deadlineMs: Long, pollIntervalMs: Long = 50L): Long = {
+    val deadlineNanos = System.nanoTime() +
+      java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(deadlineMs)
+    val tp = topicPartition
+    var attempt = 0
+    while (true) {
+      attempt += 1
+      replicaManager.getLog(tp) match {
+        case Some(_) =>
+          // Log is open; hand off to the normal drain path.
+          return drainOnce()
+        case None =>
+          localReplicaStatus() match {
+            // TopicAbsent and NonReplica are deterministic states — no point
+            // bounded-waiting. drainOnce handles them with the right semantics
+            // (no-op for TopicAbsent; throw / warn-and-no-op for NonReplica).
+            case LocalReplicaStatus.TopicAbsent | LocalReplicaStatus.NonReplica =>
+              return drainOnce()
+
+            case LocalReplicaStatus.LocalReplica =>
+              if (System.nanoTime() >= deadlineNanos) {
+                // We are a replica per cluster metadata but the local log has
+                // not opened within the deadline. Refusing to open client
+                // traffic is the safe choice — the alternative is "broker
+                // starts with RuleSet.EMPTY while real DENY rules exist on
+                // the topic", which silently fail-opens every governance rule
+                // for any client that hits this broker. Operator recovery:
+                // resolve the log-dir state (check log4j for log-loader
+                // errors / disk-full / permission issues) and restart.
+                throw new IllegalStateException(
+                  s"governance bootstrap timed out after ${deadlineMs}ms " +
+                    s"waiting for local log of $tp to become available; this " +
+                    s"broker is a replica per cluster metadata but the log " +
+                    s"is not yet available locally. Refusing to open client " +
+                    s"traffic with an empty RuleSet while DENY rules may " +
+                    s"exist on the topic — resolve the log-dir state " +
+                    s"(check log loader / disk / permissions) and restart.")
+              }
+              if (attempt == 1 || attempt % 20 == 0) {
+                // Avoid log spam in the tight poll loop but keep visibility
+                // for slow log-dir opens — log on the first iteration and
+                // periodically thereafter.
+                info(s"governance bootstrap waiting for local log of $tp " +
+                  s"(attempt $attempt, deadline ${deadlineMs}ms)")
+              }
+              Thread.sleep(pollIntervalMs)
+          }
+      }
+    }
+    // Unreachable — the `while (true)` loop exits via `return` or `throw`.
+    throw new AssertionError("unreachable")
   }
 
   /**
@@ -262,7 +352,16 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
     scheduler.schedule("governance-rules-drain", task, intervalMs, intervalMs)
   }
 
-  private def replay(log: UnifiedLog, startOffset: Long, endOffset: Long): Long = {
+  /**
+   * Result of a single [[replay]] pass. Carries BOTH the count of records
+   * applied AND the offset we actually progressed to. The caller advances
+   * [[nextOffset]] to {@code advancedTo}, not to the requested {@code endOffset},
+   * because a mid-pass empty read must NOT silently skip records we never
+   * consumed. Codex deep-audit P1 fix.
+   */
+  private case class ReplayResult(replayed: Long, advancedTo: Long)
+
+  private def replay(log: UnifiedLog, startOffset: Long, endOffset: Long): ReplayResult = {
     var currentOffset = startOffset
     var replayed = 0L
     val readBufferBytes = 1024 * 1024
@@ -280,9 +379,15 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
       val sizeInBytes = records.sizeInBytes()
       readAtLeast = sizeInBytes > 0
       if (!readAtLeast) {
-        // Defensive: read returned no records before endOffset. Bail out to
-        // avoid a tight spin; next drainOnce() will retry.
-        return replayed
+        // Defensive: read returned no records before endOffset (transient pager
+        // glitch, tiering bookkeeping, etc.). Bail out so the caller advances
+        // nextOffset only to where we ACTUALLY reached — i.e. currentOffset,
+        // which is unchanged across this iteration and so still references the
+        // first unread record. The pre-fix version returned only `replayed`
+        // and the caller jumped nextOffset to endOffset unconditionally,
+        // silently advancing past records that were never consumed. The next
+        // drain will re-read this range.
+        return ReplayResult(replayed, currentOffset)
       }
       // The records may be FileRecords or MemoryRecords. We don't care which —
       // org.apache.kafka.common.record.Records exposes batches() for both.
@@ -320,7 +425,7 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
         currentOffset = batch.nextOffset()
       }
     }
-    replayed
+    ReplayResult(replayed, currentOffset)
   }
 
   private def bytes(buf: ByteBuffer): Array[Byte] = {
