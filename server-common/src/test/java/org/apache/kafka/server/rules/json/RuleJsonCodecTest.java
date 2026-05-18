@@ -169,6 +169,39 @@ public class RuleJsonCodecTest {
     }
 
     @Test
+    public void whitespaceInIdRejected() {
+        // Whitespace-padded rule ids are rejected at intake. The codec's
+        // reservation check uses raw startsWith/endsWith against the id, so a
+        // leading-space variant of the engine sentinel (e.g.
+        // " __activation-budget-exceeded__") would otherwise PASS the
+        // reservation check (because index 0 is a space, not '_') and land as
+        // a normal operator-authored rule. A downstream audit consumer that
+        // trims or normalises whitespace on display would then render the
+        // operator id identically to the engine sentinel — defeating the
+        // unambiguous-attribution promise that the reserved-shape exists to
+        // provide. Round-9 codec adversarial finding LOW-1.
+        //
+        // We probe all the whitespace shapes Character.isWhitespace recognises
+        // because the impersonation surface is the union, not just the space
+        // form: trim() in Java collapses every isWhitespace codepoint, so an
+        // attacker who knows the consumer trims could pick any of these.
+        String[] padded = {
+            " __activation-budget-exceeded__",        // leading space
+            "__activation-budget-exceeded__ ",        // trailing space
+            "\t__activation-budget-exceeded__",       // tab prefix
+            "\n__activation-budget-exceeded__",       // newline prefix
+            "rule with embedded space",               // operator-authored, still rejected
+        };
+        for (String id : padded) {
+            RuleEnvelopeException ex = assertThrows(RuleEnvelopeException.class,
+                () -> RuleJsonCodec.decode(id, SAMPLE.getBytes(StandardCharsets.UTF_8)),
+                "id should be rejected: '" + id + "'");
+            assertTrue(ex.getMessage().contains("whitespace"),
+                "rejection must name whitespace as the cause: " + ex.getMessage());
+        }
+    }
+
+    @Test
     public void doubleUnderscoreIdShapeReserved() {
         // The "__name__" rule id shape is reserved for engine-internal
         // synthetic decisions (today: ACTIVATION_BUDGET_RULE_ID, surfaced as

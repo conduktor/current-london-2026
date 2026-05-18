@@ -162,6 +162,29 @@ public final class RuleJsonCodec {
         if (id == null || id.isEmpty()) {
             throw new RuleEnvelopeException("rule id (record key) must be non-empty");
         }
+        // Reject any whitespace in the rule id. Rule ids are operator-authored
+        // identifiers — log keys, audit handles — and have no legitimate use
+        // for embedded whitespace. The reservation check below is anchored on
+        // startsWith/endsWith against the raw id, so a leading- or trailing-
+        // whitespace variant of the engine sentinel (e.g. " __activation-
+        // budget-exceeded__") would pass the reservation check but render
+        // identically to the sentinel in any downstream audit consumer that
+        // trims or normalises whitespace on display — defeating the unambiguous-
+        // attribution promise that the reserved-shape exists to provide.
+        // Rejecting whitespace at intake closes this trim-impersonation surface
+        // and matches the same axis as the empty-id rejection above (an id
+        // composed entirely of whitespace is functionally a non-id).
+        for (int i = 0; i < id.length(); i++) {
+            if (Character.isWhitespace(id.charAt(i))) {
+                throw new RuleEnvelopeException(
+                    "rule id '" + id + "' contains whitespace at index " + i
+                        + "; rule ids may not contain whitespace (operator-authored "
+                        + "identifiers have no legitimate use for embedded whitespace, "
+                        + "and a whitespace-padded id could be rendered identically "
+                        + "to an engine-internal sentinel in audit consumers that trim "
+                        + "on display)");
+            }
+        }
         // Reserve the "__name__" id shape for engine-internal sentinels.
         // RuleEngine.ACTIVATION_BUDGET_RULE_ID is the only one today (used as
         // RuleDecision.denyingRuleId on synthetic fail-closed DENYs from
