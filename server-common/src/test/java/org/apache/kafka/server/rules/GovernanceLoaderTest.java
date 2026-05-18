@@ -386,6 +386,52 @@ public class GovernanceLoaderTest {
     }
 
     @Test
+    public void reservedNameShapeRejectedOnUpdatePath() {
+        // Round-12 audit (tombstone/compaction sub-agent, MEDIUM-1): the codec
+        // already rejects __name__-shape ids inside decode(); reasserted here
+        // at the loader boundary so a future refactor that bypasses decode on
+        // the update path (e.g. an envelope cache) cannot regress this.
+        RuleEngine engine = new RuleEngine();
+        GovernanceLoader loader = new GovernanceLoader(engine);
+        assertFalse(loader.apply("__activation-budget-exceeded__",
+                envelope("true", ApiKeys.METADATA, 7)),
+            "update record with __name__-shape id must be rejected");
+        loader.commit();
+        assertEquals(RuleDecision.ALLOW,
+            engine.evaluate(ApiKeys.METADATA, "client", false, Collections::emptyMap),
+            "rejected update must NOT install any rule");
+    }
+
+    @Test
+    public void reservedNameShapeRejectedOnTombstonePath() {
+        // Round-12 audit (tombstone/compaction sub-agent, MEDIUM-1): the
+        // tombstone path used to bypass the codec entirely (working.remove(key)
+        // straight through). No __name__-shape rule exists in the working set
+        // today (the codec rejects them at intake), but if a future engine-
+        // internal sentinel ever populates one, an operator-published tombstone
+        // would silently delete it. Close the asymmetry: tombstones for
+        // __name__-shape ids are dropped with WARN and signal no progress.
+        RuleEngine engine = new RuleEngine();
+        GovernanceLoader loader = new GovernanceLoader(engine);
+        // Seed a real operator rule so we can observe that the rejected
+        // tombstone left the working state untouched.
+        assertTrue(loader.apply("operator-rule", envelope("true", ApiKeys.METADATA, 7)));
+        // An operator-published tombstone targeting an engine-internal sentinel.
+        assertFalse(loader.apply("__activation-budget-exceeded__", null),
+            "tombstone for __name__-shape id must be rejected");
+        // And on the symmetric reservation shape (double-underscore both ends).
+        assertFalse(loader.apply("__anything__", null),
+            "tombstone for any __name__-shape id must be rejected");
+        loader.commit();
+        // Operator's own rule survived: the spurious tombstone made no
+        // mutation to the working state.
+        RuleDecision d = engine.evaluate(
+            ApiKeys.METADATA, "client", false, Collections::emptyMap);
+        assertTrue(d.denied());
+        assertEquals("operator-rule", d.denyingRuleId());
+    }
+
+    @Test
     public void encodeDecodeViaCodecLinesUpWithLoader() {
         // Sanity: the loader and the codec must agree on what a record looks
         // like. We use the codec's own encode() to produce input — if a

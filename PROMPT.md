@@ -75,6 +75,11 @@ If a `__governance` reload batch fails to parse, validate, or compile, the engin
 **ISR catch-up gate at bootstrap:**
 The bootstrap drain waits for the local `__governance` log to reach the high-watermark of the controller's view before accepting client connections, so the broker does not accept traffic against an out-of-date rule set on first start after a partition.
 
+**`__governance` topic configuration contract — fail-closed at bootstrap:**
+The `__governance` topic MUST have an effective `cleanup.policy` that includes `compact` (i.e. either `compact` or `compact,delete`). The broker enforces this at startup: if the topic exists in cluster metadata and its effective policy does not include `compact`, broker startup aborts with an `IllegalStateException` naming the offending policy and the exact `kafka-configs.sh --alter` command to remediate. A fresh cluster where `__governance` has not yet been created is allowed to start — the operator creates the topic afterwards with the required policy.
+
+The rationale: a non-compact `__governance` ages records out by `retention.ms` (default 7 days), after which a broker restart would drain a truncated log, install `RuleSet.EMPTY`, and fail OPEN on every previously-denied request. This is a delayed, audit-invisible regression — the original posture (round-5) was WARN-and-proceed, but round-12 reversed the call: a WARN an operator can ignore is not a safety mechanism for a security-critical gate. The remediation is one operator command, executed once. Enforced in `BrokerServer.requireGovernanceTopicCompactPolicy` (audit finding a016e43dc, round-12 HIGH-1).
+
 **Activation envelope shape (`request.*`):**
 v1 exposes only `request.*` (the protocol DTO walked into a Map via reflection). The Stretch section above tracks the future shape `{request: ..., principal: ..., session: ...}`; rules MUST NOT depend on those keys today.
 

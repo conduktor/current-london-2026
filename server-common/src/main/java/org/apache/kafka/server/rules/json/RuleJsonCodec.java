@@ -270,7 +270,7 @@ public final class RuleJsonCodec {
         // independently so audit consumers can attribute any future internal
         // posture without a collision. Operator rules that respect the
         // convention are blocked here at intake.
-        if (id.startsWith("__") && id.endsWith("__")) {
+        if (isReservedNameShape(id)) {
             throw new RuleEnvelopeException(
                 "rule id '" + id + "' uses the reserved \"__name__\" shape "
                     + "(double-underscore prefix and suffix); these ids are reserved "
@@ -324,6 +324,34 @@ public final class RuleJsonCodec {
         } catch (JsonProcessingException e) {
             throw new IllegalStateException("failed to encode rule " + rule.id(), e);
         }
+    }
+
+    /**
+     * True when {@code id} uses the engine-reserved "{@code __name__}" shape:
+     * a double-underscore prefix AND suffix. These ids are reserved for
+     * engine-internal synthetic decisions (today only
+     * {@code RuleEngine.ACTIVATION_BUDGET_RULE_ID}, used as the
+     * {@code denyingRuleId} on fail-closed DENYs raised by activation-budget
+     * overflow) and may not be authored by operators.
+     *
+     * <p>Exposed (and not inlined) because the same check must be applied on
+     * both sides of the {@code __governance} record stream:
+     * <ul>
+     *   <li>Update records ({@code value != null}) — enforced inside
+     *       {@link #decode}.</li>
+     *   <li>Tombstone records ({@code value == null}) — enforced by
+     *       {@code GovernanceLoader.apply} BEFORE the working-state mutation,
+     *       so an operator-published tombstone cannot silently delete a
+     *       future engine-internal sentinel rule. Round-12 audit
+     *       (tombstone/compaction sub-agent, MEDIUM-1).</li>
+     * </ul>
+     *
+     * <p>{@code null} returns {@code false}; the caller is expected to have
+     * already rejected null ids on its own axis (the codec rejects them as
+     * empty, the loader as null-key drops).
+     */
+    public static boolean isReservedNameShape(String id) {
+        return id != null && id.startsWith("__") && id.endsWith("__");
     }
 
     /**

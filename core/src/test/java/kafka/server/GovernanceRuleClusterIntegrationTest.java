@@ -21,6 +21,7 @@ import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.config.TopicConfig;
 import org.apache.kafka.common.message.CreateTopicsRequestData;
 import org.apache.kafka.common.message.CreateTopicsRequestData.CreatableTopic;
 import org.apache.kafka.common.message.CreateTopicsRequestData.CreatableTopicCollection;
@@ -29,9 +30,11 @@ import org.apache.kafka.common.serialization.ByteArraySerializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.apache.kafka.common.test.ClusterInstance;
 import org.apache.kafka.common.test.TestUtils;
+import org.apache.kafka.common.test.api.ClusterConfigProperty;
 import org.apache.kafka.common.test.api.ClusterTest;
 import org.apache.kafka.common.test.api.ClusterTestDefaults;
 import org.apache.kafka.common.test.api.Type;
+import org.apache.kafka.server.config.ServerConfigs;
 import org.apache.kafka.server.rules.GovernanceTopic;
 import org.apache.kafka.server.rules.RuleDecision;
 import org.apache.kafka.server.rules.RuleEngine;
@@ -71,7 +74,15 @@ import static org.junit.jupiter.api.Assertions.fail;
  * want the multi-broker convergence property in isolation, so a flake in
  * the request path doesn't mask a real convergence regression.
  */
-@ClusterTestDefaults(types = {Type.KRAFT}, brokers = 3)
+@ClusterTestDefaults(types = {Type.KRAFT}, brokers = 3, serverProperties = {
+    // governance.bypass.principals MUST be non-empty at broker startup
+    // (BrokerServer.startup → ServerConfigs.GOVERNANCE_BYPASS_PRINCIPALS_CONFIG
+    // empty-check rejects). PLAINTEXT inter-broker traffic in
+    // KafkaClusterTestKit authenticates as User:ANONYMOUS, which must be on
+    // the allow-list so replica fetchers, the __governance reader, and KRaft
+    // metadata fetches are not subject to operator CEL rules.
+    @ClusterConfigProperty(key = ServerConfigs.GOVERNANCE_BYPASS_PRINCIPALS_CONFIG, value = "User:ANONYMOUS")
+})
 public class GovernanceRuleClusterIntegrationTest {
 
     private static final String RULE_ID = "rule-deny-audit-prefix";
@@ -90,8 +101,20 @@ public class GovernanceRuleClusterIntegrationTest {
             // count so every broker is a replica of partition 0 — that
             // matches PROMPT.md's "three brokers converge" shape AND keeps
             // the fail-closed startup gate satisfied for every broker.
-            admin.createTopics(List.of(
-                new NewTopic(GovernanceTopic.NAME, 1, (short) 3))).all().get();
+            //
+            // cleanup.policy=compact is REQUIRED by the operator contract
+            // documented in PROMPT.md and enforced by
+            // BrokerServer.requireGovernanceTopicCompactPolicy at every
+            // broker startup. Without it, the topic would inherit the broker
+            // default ("delete"), records would age out by retention.ms, and
+            // a broker restart would refuse to open client traffic. The gate
+            // does not fire in this test because the topic is created after
+            // all three brokers are already running — but pinning the policy
+            // here keeps the test honest to the documented contract and
+            // safe against any future variant that adds a restart step.
+            NewTopic governance = new NewTopic(GovernanceTopic.NAME, 1, (short) 3)
+                .configs(Map.of(TopicConfig.CLEANUP_POLICY_CONFIG, TopicConfig.CLEANUP_POLICY_COMPACT));
+            admin.createTopics(List.of(governance)).all().get();
             cluster.waitForTopic(GovernanceTopic.NAME, 1);
         }
 

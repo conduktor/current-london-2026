@@ -115,6 +115,26 @@ public final class GovernanceLoader {
             LOG.warn("dropping __governance record with null key (value present={})", value != null);
             return false;
         }
+        // Round-12 audit (tombstone/compaction sub-agent, MEDIUM-1): reject
+        // operator-published records whose key uses the engine-reserved
+        // "__name__" shape on BOTH the update and tombstone paths. RuleJsonCodec
+        // enforces this on update records inside decode(), but a tombstone
+        // (value == null) is not routed through the codec — the previous code
+        // path went straight to working.remove(key). No __name__-shape rule
+        // exists in the working set today (the codec rejects them at intake),
+        // so the existing behaviour was a no-op rather than a vulnerability;
+        // but if a future engine-internal sentinel ever populates a __name__
+        // rule into the working set, an operator-published tombstone would
+        // silently delete it. Closing the asymmetry here removes that future
+        // surface and keeps the rejection contract symmetric across both
+        // record shapes.
+        if (RuleJsonCodec.isReservedNameShape(key)) {
+            LOG.warn("dropping __governance record for rule id '{}' — uses the reserved \"__name__\" shape " +
+                "(double-underscore prefix and suffix); these ids are reserved for engine-internal " +
+                "synthetic decisions and may not be authored by operators (record was a {})",
+                key, value == null ? "tombstone" : "update");
+            return false;
+        }
         if (value == null) {
             // Tombstone — RuleSetBuilder.remove() is idempotent on an absent id.
             // We return true even when the id was absent: the LOG said "this
