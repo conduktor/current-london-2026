@@ -52,7 +52,7 @@ public final class KafkaHttpServlet extends HttpServlet {
 
     private static final String PATH_PREFIX_TOPICS = "/topics/";
     private static final String PATH_SUFFIX_RECORDS = "/records";
-    private static final String CONTENT_TYPE_JSON = "application/json";
+    private static final String HEADER_ACCEPT = "Accept";
     private static final String HEADER_RETRY_AFTER = "Retry-After";
 
     private final KafkaHttpBridge bridge;
@@ -82,9 +82,12 @@ public final class KafkaHttpServlet extends HttpServlet {
             return;
         }
 
+        // Resolve content-type from the Accept header BEFORE going async — req is no longer safe to read once the
+        // async dispatch hands the response off to the callback thread.
+        String contentType = ContentTypeNegotiator.resolve(req.getHeader(HEADER_ACCEPT));
         AsyncContext async = req.startAsync();
         bridge.produce(topic, body).whenComplete((response, throwable) ->
-            writeResponseAndComplete(async, response, throwable));
+            writeResponseAndComplete(async, response, throwable, contentType));
     }
 
     @Override
@@ -97,9 +100,10 @@ public final class KafkaHttpServlet extends HttpServlet {
 
         QueryParams params = QueryParams.from(req.getParameterMap());
 
+        String contentType = ContentTypeNegotiator.resolve(req.getHeader(HEADER_ACCEPT));
         AsyncContext async = req.startAsync();
         bridge.fetch(topic, params).whenComplete((response, throwable) ->
-            writeResponseAndComplete(async, response, throwable));
+            writeResponseAndComplete(async, response, throwable, contentType));
     }
 
     /**
@@ -118,14 +122,15 @@ public final class KafkaHttpServlet extends HttpServlet {
         return inner;
     }
 
-    private void writeResponseAndComplete(AsyncContext async, HttpBridgeResponse response, Throwable throwable) {
+    private void writeResponseAndComplete(AsyncContext async, HttpBridgeResponse response, Throwable throwable,
+                                          String contentType) {
         HttpServletResponse resp = (HttpServletResponse) async.getResponse();
         try {
             if (throwable != null) {
                 LOG.warn("HTTP bridge produced an unhandled exception", throwable);
                 writeInternalError(resp, throwable.getMessage());
             } else {
-                writeBridgeResponse(resp, response);
+                writeBridgeResponse(resp, response, contentType);
             }
         } catch (IOException e) {
             LOG.warn("Failed to write HTTP response", e);
@@ -134,9 +139,10 @@ public final class KafkaHttpServlet extends HttpServlet {
         }
     }
 
-    private void writeBridgeResponse(HttpServletResponse resp, HttpBridgeResponse response) throws IOException {
+    private void writeBridgeResponse(HttpServletResponse resp, HttpBridgeResponse response, String contentType)
+            throws IOException {
         resp.setStatus(response.status());
-        resp.setContentType(CONTENT_TYPE_JSON);
+        resp.setContentType(contentType);
         if (response.hasRetryAfter()) {
             resp.setHeader(HEADER_RETRY_AFTER, Integer.toString(response.retryAfterSeconds()));
         }
@@ -159,8 +165,11 @@ public final class KafkaHttpServlet extends HttpServlet {
     }
 
     private void writeEnvelope(HttpServletResponse resp, int status, String message) throws IOException {
+        // Error envelopes are plain JSON regardless of Accept: they carry no _links so the HAL+JSON media type would
+        // be misleading. Clients that strictly demanded hal+json get application/json back on errors — that's the
+        // honest answer.
         resp.setStatus(status);
-        resp.setContentType(CONTENT_TYPE_JSON);
+        resp.setContentType(ContentTypeNegotiator.APPLICATION_JSON);
         byte[] payload = mapper.writeValueAsBytes(ErrorEnvelope.forMessage(mapper, status, message));
         resp.setContentLength(payload.length);
         resp.getOutputStream().write(payload);

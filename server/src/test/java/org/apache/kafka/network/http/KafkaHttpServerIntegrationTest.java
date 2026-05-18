@@ -203,6 +203,51 @@ class KafkaHttpServerIntegrationTest {
     }
 
     @Test
+    void fetchHonoursHalJsonAcceptHeader() throws Exception {
+        // PROMPT.md FS5: a GET with Accept: application/hal+json must return application/hal+json on the wire.
+        // The body shape (with _links) is already HAL-compatible; this assertion locks the content-type plumbing in.
+        submitter.fetchResult = new RequestSubmitter.FetchResult(
+            new FetchResponseFormatter.PartitionFetch(
+                0, Errors.NONE, null, 100, 0, 300,
+                Collections.singletonList(new FetchResponseFormatter.FetchedRecord(
+                    100, null, "hi".getBytes(StandardCharsets.UTF_8), null, 1000L))),
+            0L);
+
+        ContentResponse resp = client.newRequest(url("/v1/topics/orders/records?partition=0&offset=100"))
+            .method(HttpMethod.GET)
+            .headers(h -> h.put("Accept", "application/hal+json"))
+            .send();
+
+        assertEquals(200, resp.getStatus());
+        // Jetty appends ;charset=utf-8 on text responses but not on application/* — assert the prefix to stay tolerant.
+        assertTrue(resp.getMediaType().startsWith("application/hal+json"),
+            "expected application/hal+json content-type, got: " + resp.getMediaType());
+        // The body must still carry the HAL _links — the content-type is a contract, not a body change.
+        JsonNode body = asJson(resp.getContent());
+        assertNotNull(body.get("_links").get("first"));
+        assertNotNull(body.get("_links").get("last"));
+        assertNotNull(body.get("_links").get("next"));
+    }
+
+    @Test
+    void fetchDefaultsToPlainJsonWithoutHalAccept() throws Exception {
+        // Existing clients (no Accept header, */*, or Accept: application/json) must still see application/json
+        // — backwards-compatible by default.
+        submitter.fetchResult = new RequestSubmitter.FetchResult(
+            new FetchResponseFormatter.PartitionFetch(
+                0, Errors.NONE, null, 100, 0, 300, Collections.emptyList()),
+            0L);
+
+        ContentResponse resp = client.newRequest(url("/v1/topics/orders/records?partition=0&offset=100"))
+            .method(HttpMethod.GET)
+            .send();
+
+        assertEquals(200, resp.getStatus());
+        assertTrue(resp.getMediaType().startsWith("application/json"),
+            "expected application/json content-type, got: " + resp.getMediaType());
+    }
+
+    @Test
     void fetch400OnBadQuery() throws Exception {
         ContentResponse resp = client.newRequest(url("/v1/topics/orders/records?partition=notAnInt&offset=0"))
             .method(HttpMethod.GET)
