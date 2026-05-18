@@ -16378,6 +16378,109 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testDescribeTopicPartitionsAllTopicsSilentlyDropsTenantPhysicalTopics(): Unit = {
+    // fetchAllTopics path: the handler iterates metadataCache.getAllTopics()
+    // directly and forwards every topic the caller is authorized to DESCRIBE.
+    // A non-tenant caller on the cluster-wide listener with a permissive
+    // `User:* DESCRIBE Topic:*` ACL would otherwise enumerate every tenant's
+    // physical topic names (`acme.orders`, `acme.payments`, ...) — exactly the
+    // existence-oracle / tenant-enumeration leak we close on the Metadata path.
+    // Reserved entries must be silently dropped (no error rows, no nextCursor
+    // perturbation), matching the existing per-topic ACL-deny shape on the
+    // all-topics path.
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    addTopicToMetadataCache("acme.orders", numPartitions = 1)
+    addTopicToMetadataCache("acme.payments", numPartitions = 1)
+    addTopicToMetadataCache("regular-topic", numPartitions = 1)
+
+    val req = new DescribeTopicPartitionsRequest(new DescribeTopicPartitionsRequestData())
+    val request = buildRequest(req)
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDescribeTopicPartitionsRequest(request)
+
+    val response = verifyNoThrottling[DescribeTopicPartitionsResponse](request)
+    val names = response.data.topics.asScala.map(_.name).toSet
+    assertEquals(Set("regular-topic"), names,
+      "reserved-physical-form topics must be silently dropped from the all-topics response")
+  }
+
+  @Test
+  def testDescribeTopicPartitionsExplicitListRefusesTenantPhysicalTopic(): Unit = {
+    // Explicit-list path: a non-tenant caller naming `acme.orders` directly
+    // would otherwise receive the full partition metadata (leader id, replicas,
+    // ISR, ELR) for acme's physical topic — enough to drive a targeted DoS or
+    // a replica-targeted produce attack. The guard must surface the wire shape
+    // an authz refusal already produces: TOPIC_AUTHORIZATION_FAILED, ZERO_UUID,
+    // empty partitions, isInternal=false. Sibling non-reserved topics in the
+    // same request batch must still resolve normally.
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    addTopicToMetadataCache("acme.orders", numPartitions = 1)
+    addTopicToMetadataCache("regular-topic", numPartitions = 1)
+
+    val data = new DescribeTopicPartitionsRequestData().setTopics(List(
+      new DescribeTopicPartitionsRequestData.TopicRequest().setName("acme.orders"),
+      new DescribeTopicPartitionsRequestData.TopicRequest().setName("regular-topic")
+    ).asJava)
+    val request = buildRequest(new DescribeTopicPartitionsRequest(data))
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDescribeTopicPartitionsRequest(request)
+
+    val response = verifyNoThrottling[DescribeTopicPartitionsResponse](request)
+    val byName = response.data.topics.asScala.map(t => t.name -> t).toMap
+
+    val acme = byName("acme.orders")
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED.code, acme.errorCode,
+      "reserved-physical-form topic must be refused with TOPIC_AUTHORIZATION_FAILED")
+    assertEquals(Uuid.ZERO_UUID, acme.topicId,
+      "refused topic must not leak its uuid")
+    assertTrue(acme.partitions.isEmpty,
+      "refused topic must not leak partition layout")
+    assertFalse(acme.isInternal,
+      "refused topic must not be marked internal")
+
+    val regular = byName("regular-topic")
+    assertEquals(Errors.NONE.code, regular.errorCode,
+      "sibling non-reserved topic must still succeed in the same batch")
+    assertFalse(regular.partitions.isEmpty,
+      "non-reserved topic must carry its normal partition data")
+  }
+
+  @Test
+  def testDescribeTopicPartitionsClusterWideListenerKeepsDottedNamesWhenNoTenantsConfigured(): Unit = {
+    // Without any configured tenants, `<id>.<topic>` is just a topic name with
+    // a dot — the guard must not fire, otherwise legitimate non-tenant clusters
+    // would suddenly lose the ability to describe topics with dots in their
+    // names.
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    addTopicToMetadataCache("acme.orders", numPartitions = 1)
+
+    val data = new DescribeTopicPartitionsRequestData().setTopics(List(
+      new DescribeTopicPartitionsRequestData.TopicRequest().setName("acme.orders")
+    ).asJava)
+    val request = buildRequest(new DescribeTopicPartitionsRequest(data))
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleDescribeTopicPartitionsRequest(request)
+
+    val response = verifyNoThrottling[DescribeTopicPartitionsResponse](request)
+    val topics = response.data.topics.asScala
+    assertEquals(1, topics.size)
+    assertEquals("acme.orders", topics.head.name)
+    assertEquals(Errors.NONE.code, topics.head.errorCode,
+      "with no tenants configured the dotted topic name is not reserved")
+    assertFalse(topics.head.partitions.isEmpty,
+      "dotted topic must surface its normal partition metadata when no tenants are configured")
+  }
+
+  @Test
   def testListTransactionsOutsideInFiltersTenantPrincipalNamespace(): Unit = {
     val data = new ListTransactionsRequestData()
     val request = buildRequest(new ListTransactionsRequest.Builder(data).build())

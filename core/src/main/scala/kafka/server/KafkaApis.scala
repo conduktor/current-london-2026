@@ -2100,6 +2100,39 @@ class KafkaApis(val requestChannel: RequestChannel,
     describeTopicPartitionsRequestHandler match {
       case Some(handler) => {
         val response = handler.handleDescribeTopicPartitionsRequest(request)
+
+        // Outside-in: a non-tenant caller on the cluster-wide listener must not
+        // observe tenant-prefixed physical topics. fetchAllTopics paths in the
+        // delegate handler iterate metadataCache.getAllTopics() directly (and
+        // an `ALLOW User:* DESCRIBE Topic:*` ACL — typical for cluster admin —
+        // passes every authz check), so the response leaks `acme.orders` etc.
+        // Tenant principals never reach this handler — DESCRIBE_TOPIC_PARTITIONS
+        // is outside TENANT_ALLOWED_APIS — so the guard only fires for
+        // non-tenant callers. For fetchAllTopics, silently drop reserved
+        // entries (matching the existing per-topic ACL-deny shape, which also
+        // drops silently on the all-topics path). For explicit lists, replace
+        // the entry with the same TOPIC_AUTHORIZATION_FAILED shape an authz
+        // refusal already produces, so the wire response is indistinguishable.
+        val tenantCtxFilter = tenantContextFor(request)
+        if (!tenantCtxFilter.effectiveTenant.isPresent) {
+          val req = request.body[DescribeTopicPartitionsRequest]
+          val fetchAllTopics = req.data.topics.isEmpty
+          val it = response.topics.iterator
+          while (it.hasNext) {
+            val topic = it.next()
+            if (isReservedTenantNamespace(topic.name)) {
+              if (fetchAllTopics) {
+                it.remove()
+              } else {
+                topic.setErrorCode(Errors.TOPIC_AUTHORIZATION_FAILED.code)
+                topic.setTopicId(Uuid.ZERO_UUID)
+                topic.setIsInternal(false)
+                topic.setPartitions(java.util.Collections.emptyList())
+              }
+            }
+          }
+        }
+
         trace("Sending topic partitions metadata %s for correlation id %d to client %s".format(response.topics().asScala.mkString(","),
           request.header.correlationId, request.header.clientId))
 
