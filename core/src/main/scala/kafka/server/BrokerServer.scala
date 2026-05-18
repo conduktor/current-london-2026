@@ -618,10 +618,14 @@ class BrokerServer(
 
       // Embedded HTTP bridge (off by default). Started after SocketServer so the binary protocol is ready before the
       // bridge starts accepting work. The bridge owns its own Jetty thread pool; it does not borrow
-      // KafkaRequestHandler threads. v1 attributes every HTTP request to the ANONYMOUS principal — the broker's
+      // KafkaRequestHandler threads.
+      //
+      // WARNING — security posture: v1 attributes every HTTP request to KafkaPrincipal.ANONYMOUS. The broker's
       // configured authorizer evaluates ACLs against this principal exactly as it would for a binary connection that
-      // didn't complete SASL. Authentication is a follow-up item; until then, granting read/write to ANONYMOUS is the
-      // intended way to allow HTTP traffic.
+      // didn't complete SASL. There is no per-request authentication: callers are not distinguished by identity.
+      // Operators MUST front the bridge with a TLS terminator + auth proxy, restrict the listen interface
+      // (http.bridge.host) to a trusted network, AND either deny ANONYMOUS in the authorizer or accept that every
+      // HTTP client gets ANONYMOUS's grants. Per-request authentication is a follow-up item, not a v1 deliverable.
       if (config.httpBridgeEnabled) {
         val submitter = new KafkaApiRequestSubmitter(
           requestChannel = socketServer.dataPlaneRequestChannel,
@@ -634,6 +638,9 @@ class BrokerServer(
         httpBridgeServer = new KafkaHttpServer(config.httpBridgeHost, config.httpBridgePort, bridge, new ObjectMapper())
         httpBridgeServer.start()
         info(s"HTTP bridge listening on ${config.httpBridgeHost}:${httpBridgeServer.boundPort()}")
+        warn("HTTP bridge is running every request as KafkaPrincipal.ANONYMOUS. There is no per-request " +
+          "authentication in v1. Front it with a TLS terminator + auth proxy, restrict http.bridge.host " +
+          "to a trusted interface, and review authorizer ACLs for ANONYMOUS before exposing this listener.")
       }
 
       maybeChangeStatus(STARTING, STARTED)
