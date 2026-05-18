@@ -16,7 +16,6 @@
  */
 package org.apache.kafka.network.http;
 
-import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
@@ -52,7 +51,7 @@ public final class ProduceResponseFormatter {
      * @param results one entry per partition that was attempted
      * @param throttleTimeMs broker-side throttle delay in milliseconds; non-positive means no throttle
      */
-    public Formatted format(String topic, List<PartitionResult> results, long throttleTimeMs) {
+    public HttpBridgeResponse format(String topic, List<PartitionResult> results, long throttleTimeMs) {
         Objects.requireNonNull(topic, "topic must not be null");
         Objects.requireNonNull(results, "results must not be null");
 
@@ -67,7 +66,7 @@ public final class ProduceResponseFormatter {
         int retryAfter = RetryAfterCalculator.shouldSet(throttleTimeMs)
             ? RetryAfterCalculator.seconds(throttleTimeMs)
             : 0;
-        return new Formatted(status, body, retryAfter);
+        return new HttpBridgeResponse(status, body, retryAfter);
     }
 
     /**
@@ -75,7 +74,7 @@ public final class ProduceResponseFormatter {
      * topic at the bridge layer, etc. Produces an {@link ErrorEnvelope}-shaped body rather than a partitioned results
      * array, because there is no partition state to report.
      */
-    public Formatted topLevelError(String topic, Errors error, String overrideMessage, long throttleTimeMs) {
+    public HttpBridgeResponse topLevelError(String topic, Errors error, String overrideMessage, long throttleTimeMs) {
         Objects.requireNonNull(topic, "topic must not be null");
         ObjectNode body = ErrorEnvelope.forError(mapper, error, overrideMessage);
         body.put("topic", topic);
@@ -83,7 +82,7 @@ public final class ProduceResponseFormatter {
         int retryAfter = RetryAfterCalculator.shouldSet(throttleTimeMs)
             ? RetryAfterCalculator.seconds(throttleTimeMs)
             : 0;
-        return new Formatted(status, body, retryAfter);
+        return new HttpBridgeResponse(status, body, retryAfter);
     }
 
     private ObjectNode renderEntry(PartitionResult r) {
@@ -165,32 +164,4 @@ public final class ProduceResponseFormatter {
         }
     }
 
-    /** What the bridge needs to write the HTTP response: status code, JSON body, optional Retry-After seconds. */
-    public static final class Formatted {
-        private final int status;
-        private final JsonNode body;
-        private final int retryAfterSeconds;
-
-        Formatted(int status, JsonNode body, int retryAfterSeconds) {
-            this.status = status;
-            this.body = body;
-            this.retryAfterSeconds = retryAfterSeconds;
-        }
-
-        public int status() {
-            return status;
-        }
-
-        public JsonNode body() {
-            return body;
-        }
-
-        public boolean hasRetryAfter() {
-            return retryAfterSeconds > 0;
-        }
-
-        public int retryAfterSeconds() {
-            return retryAfterSeconds;
-        }
-    }
 }

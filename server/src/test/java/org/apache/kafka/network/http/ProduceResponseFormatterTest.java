@@ -51,7 +51,7 @@ class ProduceResponseFormatterTest {
         results.add(ok(1, 200));
         results.add(ok(2, 300));
 
-        ProduceResponseFormatter.Formatted f = formatter.format("orders", results, 0);
+        HttpBridgeResponse f = formatter.format("orders", results, 0);
 
         assertEquals(200, f.status());
         assertEquals(false, f.hasRetryAfter());
@@ -63,7 +63,7 @@ class ProduceResponseFormatterTest {
         results.add(err(0, Errors.TOPIC_AUTHORIZATION_FAILED));
         results.add(err(1, Errors.TOPIC_AUTHORIZATION_FAILED));
 
-        ProduceResponseFormatter.Formatted f = formatter.format("orders", results, 0);
+        HttpBridgeResponse f = formatter.format("orders", results, 0);
 
         assertEquals(403, f.status());
     }
@@ -74,7 +74,7 @@ class ProduceResponseFormatterTest {
         results.add(err(0, Errors.UNKNOWN_TOPIC_OR_PARTITION));
         results.add(err(1, Errors.UNKNOWN_TOPIC_OR_PARTITION));
 
-        ProduceResponseFormatter.Formatted f = formatter.format("orders", results, 0);
+        HttpBridgeResponse f = formatter.format("orders", results, 0);
 
         assertEquals(404, f.status());
     }
@@ -87,7 +87,7 @@ class ProduceResponseFormatterTest {
         results.add(err(1, Errors.NOT_LEADER_OR_FOLLOWER));
         results.add(ok(2, 200));
 
-        ProduceResponseFormatter.Formatted f = formatter.format("orders", results, 0);
+        HttpBridgeResponse f = formatter.format("orders", results, 0);
 
         assertEquals(207, f.status());
     }
@@ -99,7 +99,7 @@ class ProduceResponseFormatterTest {
         results.add(err(0, Errors.NOT_LEADER_OR_FOLLOWER));
         results.add(err(1, Errors.UNKNOWN_TOPIC_OR_PARTITION));
 
-        ProduceResponseFormatter.Formatted f = formatter.format("orders", results, 0);
+        HttpBridgeResponse f = formatter.format("orders", results, 0);
 
         assertEquals(207, f.status());
     }
@@ -109,7 +109,7 @@ class ProduceResponseFormatterTest {
         List<ProduceResponseFormatter.PartitionResult> results = new ArrayList<>();
         results.add(ok(0, 100));
 
-        ProduceResponseFormatter.Formatted f = formatter.format("orders", results, 0);
+        HttpBridgeResponse f = formatter.format("orders", results, 0);
 
         assertEquals(200, f.status());
     }
@@ -119,7 +119,7 @@ class ProduceResponseFormatterTest {
         List<ProduceResponseFormatter.PartitionResult> results = new ArrayList<>();
         results.add(err(0, Errors.TOPIC_AUTHORIZATION_FAILED));
 
-        ProduceResponseFormatter.Formatted f = formatter.format("orders", results, 0);
+        HttpBridgeResponse f = formatter.format("orders", results, 0);
 
         assertEquals(403, f.status());
     }
@@ -132,7 +132,7 @@ class ProduceResponseFormatterTest {
         results.add(ok(0, 100));
         results.add(err(1, Errors.NOT_LEADER_OR_FOLLOWER));
 
-        ProduceResponseFormatter.Formatted f = formatter.format("orders", results, 0);
+        HttpBridgeResponse f = formatter.format("orders", results, 0);
         JsonNode body = f.body();
 
         assertEquals("orders", body.get("topic").asText());
@@ -145,7 +145,7 @@ class ProduceResponseFormatterTest {
         List<ProduceResponseFormatter.PartitionResult> results = new ArrayList<>();
         results.add(ok(7, 12345));
 
-        ProduceResponseFormatter.Formatted f = formatter.format("orders", results, 0);
+        HttpBridgeResponse f = formatter.format("orders", results, 0);
         JsonNode entry = f.body().get("results").get(0);
 
         assertEquals(7, entry.get("partition").asInt());
@@ -158,7 +158,7 @@ class ProduceResponseFormatterTest {
         List<ProduceResponseFormatter.PartitionResult> results = new ArrayList<>();
         results.add(err(3, Errors.NOT_LEADER_OR_FOLLOWER));
 
-        ProduceResponseFormatter.Formatted f = formatter.format("orders", results, 0);
+        HttpBridgeResponse f = formatter.format("orders", results, 0);
         JsonNode entry = f.body().get("results").get(0);
 
         assertEquals(3, entry.get("partition").asInt());
@@ -175,7 +175,7 @@ class ProduceResponseFormatterTest {
         List<ProduceResponseFormatter.PartitionResult> results = new ArrayList<>();
         results.add(ok(0, 100));
 
-        ProduceResponseFormatter.Formatted f = formatter.format("orders", results, 1500);
+        HttpBridgeResponse f = formatter.format("orders", results, 1500);
 
         assertEquals(200, f.status());
         assertTrue(f.hasRetryAfter());
@@ -187,7 +187,7 @@ class ProduceResponseFormatterTest {
         List<ProduceResponseFormatter.PartitionResult> results = new ArrayList<>();
         results.add(ok(0, 100));
 
-        ProduceResponseFormatter.Formatted f = formatter.format("orders", results, 0);
+        HttpBridgeResponse f = formatter.format("orders", results, 0);
 
         assertFalse(f.hasRetryAfter());
     }
@@ -199,7 +199,7 @@ class ProduceResponseFormatterTest {
         results.add(ok(0, 100));
         results.add(err(1, Errors.NOT_LEADER_OR_FOLLOWER));
 
-        ProduceResponseFormatter.Formatted f = formatter.format("orders", results, 999);
+        HttpBridgeResponse f = formatter.format("orders", results, 999);
 
         assertEquals(207, f.status());
         assertTrue(f.hasRetryAfter());
@@ -213,7 +213,7 @@ class ProduceResponseFormatterTest {
         // A response with no partition results is a broker bug, but the bridge must still produce a valid HTTP shape.
         List<ProduceResponseFormatter.PartitionResult> results = new ArrayList<>();
 
-        ProduceResponseFormatter.Formatted f = formatter.format("orders", results, 0);
+        HttpBridgeResponse f = formatter.format("orders", results, 0);
 
         assertEquals(500, f.status());
         assertEquals(0, f.body().get("results").size());
@@ -223,7 +223,7 @@ class ProduceResponseFormatterTest {
 
     @Test
     void topLevelErrorBypassesBody() {
-        ProduceResponseFormatter.Formatted f =
+        HttpBridgeResponse f =
             formatter.topLevelError("orders", Errors.INVALID_REQUEST, "topic must not be empty", 0);
 
         assertEquals(400, f.status());

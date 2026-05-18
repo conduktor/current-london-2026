@@ -16,7 +16,6 @@
  */
 package org.apache.kafka.network.http;
 
-import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
@@ -87,7 +86,7 @@ public final class FetchResponseFormatter {
      * @param partition the fetched partition data (success or per-partition failure)
      * @param throttleTimeMs broker-side throttle delay in milliseconds; non-positive means no throttle
      */
-    public Formatted format(String topic, PartitionFetch partition, long throttleTimeMs) {
+    public HttpBridgeResponse format(String topic, PartitionFetch partition, long throttleTimeMs) {
         Objects.requireNonNull(topic, "topic must not be null");
         Objects.requireNonNull(partition, "partition must not be null");
 
@@ -99,7 +98,7 @@ public final class FetchResponseFormatter {
             ObjectNode body = ErrorEnvelope.forError(mapper, partition.error, partition.errorMessage);
             body.put("topic", topic);
             body.put("partition", partition.partition);
-            return new Formatted(HttpStatusMapper.toHttpStatus(partition.error), body, retryAfter);
+            return new HttpBridgeResponse(HttpStatusMapper.toHttpStatus(partition.error), body, retryAfter);
         }
 
         ObjectNode body = mapper.createObjectNode();
@@ -107,14 +106,14 @@ public final class FetchResponseFormatter {
         ArrayNode partitions = body.putArray("partitions");
         partitions.add(renderPartition(topic, partition));
         body.set("_links", renderRootLinks(topic, partition));
-        return new Formatted(HttpStatusMapper.OK, body, retryAfter);
+        return new HttpBridgeResponse(HttpStatusMapper.OK, body, retryAfter);
     }
 
     /**
      * Format a top-level error — bridge-side validation failure, malformed query string, undecodable cursor, etc. —
      * before any partition state was reached.
      */
-    public Formatted topLevelError(String topic, Errors error, String overrideMessage, long throttleTimeMs) {
+    public HttpBridgeResponse topLevelError(String topic, Errors error, String overrideMessage, long throttleTimeMs) {
         Objects.requireNonNull(topic, "topic must not be null");
         ObjectNode body = ErrorEnvelope.forError(mapper, error, overrideMessage);
         body.put("topic", topic);
@@ -122,7 +121,7 @@ public final class FetchResponseFormatter {
         int retryAfter = RetryAfterCalculator.shouldSet(throttleTimeMs)
             ? RetryAfterCalculator.seconds(throttleTimeMs)
             : 0;
-        return new Formatted(status, body, retryAfter);
+        return new HttpBridgeResponse(status, body, retryAfter);
     }
 
     private ObjectNode renderPartition(String topic, PartitionFetch p) {
@@ -257,32 +256,4 @@ public final class FetchResponseFormatter {
         }
     }
 
-    /** What the bridge needs to write the HTTP response: status, JSON body, optional Retry-After seconds. */
-    public static final class Formatted {
-        private final int status;
-        private final JsonNode body;
-        private final int retryAfterSeconds;
-
-        Formatted(int status, JsonNode body, int retryAfterSeconds) {
-            this.status = status;
-            this.body = body;
-            this.retryAfterSeconds = retryAfterSeconds;
-        }
-
-        public int status() {
-            return status;
-        }
-
-        public JsonNode body() {
-            return body;
-        }
-
-        public boolean hasRetryAfter() {
-            return retryAfterSeconds > 0;
-        }
-
-        public int retryAfterSeconds() {
-            return retryAfterSeconds;
-        }
-    }
 }

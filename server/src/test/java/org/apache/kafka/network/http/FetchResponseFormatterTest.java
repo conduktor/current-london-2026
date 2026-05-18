@@ -64,7 +64,7 @@ class FetchResponseFormatterTest {
         records.add(rec(101, "second"));
 
         FetchResponseFormatter.PartitionFetch p = ok(0, 100, 0, 200, records);
-        FetchResponseFormatter.Formatted f = formatter.format("orders", p, 0);
+        HttpBridgeResponse f = formatter.format("orders", p, 0);
 
         assertEquals(200, f.status());
     }
@@ -73,7 +73,7 @@ class FetchResponseFormatterTest {
     void emptyRecordSetIsStill200() {
         // A fetch that lands at the high watermark legitimately returns zero records — still 200, not 404.
         FetchResponseFormatter.PartitionFetch p = ok(0, 200, 0, 200, Collections.emptyList());
-        FetchResponseFormatter.Formatted f = formatter.format("orders", p, 0);
+        HttpBridgeResponse f = formatter.format("orders", p, 0);
 
         assertEquals(200, f.status());
         assertEquals(0, f.body().get("partitions").get(0).get("records").size());
@@ -81,19 +81,19 @@ class FetchResponseFormatterTest {
 
     @Test
     void authFailureReturns403() {
-        FetchResponseFormatter.Formatted f = formatter.format("orders", err(0, Errors.TOPIC_AUTHORIZATION_FAILED), 0);
+        HttpBridgeResponse f = formatter.format("orders", err(0, Errors.TOPIC_AUTHORIZATION_FAILED), 0);
         assertEquals(403, f.status());
     }
 
     @Test
     void unknownTopicReturns404() {
-        FetchResponseFormatter.Formatted f = formatter.format("orders", err(0, Errors.UNKNOWN_TOPIC_OR_PARTITION), 0);
+        HttpBridgeResponse f = formatter.format("orders", err(0, Errors.UNKNOWN_TOPIC_OR_PARTITION), 0);
         assertEquals(404, f.status());
     }
 
     @Test
     void notLeaderReturns503() {
-        FetchResponseFormatter.Formatted f = formatter.format("orders", err(0, Errors.NOT_LEADER_OR_FOLLOWER), 0);
+        HttpBridgeResponse f = formatter.format("orders", err(0, Errors.NOT_LEADER_OR_FOLLOWER), 0);
         assertEquals(503, f.status());
     }
 
@@ -266,7 +266,7 @@ class FetchResponseFormatterTest {
     @Test
     void positiveThrottleSetsRetryAfter() {
         FetchResponseFormatter.PartitionFetch p = ok(0, 100, 0, 200, Collections.singletonList(rec(100, "x")));
-        FetchResponseFormatter.Formatted f = formatter.format("orders", p, 1500);
+        HttpBridgeResponse f = formatter.format("orders", p, 1500);
 
         assertEquals(200, f.status());
         assertTrue(f.hasRetryAfter());
@@ -284,7 +284,7 @@ class FetchResponseFormatterTest {
 
     @Test
     void failureBodyIsErrorEnvelope() {
-        FetchResponseFormatter.Formatted f = formatter.format("orders", err(0, Errors.TOPIC_AUTHORIZATION_FAILED), 0);
+        HttpBridgeResponse f = formatter.format("orders", err(0, Errors.TOPIC_AUTHORIZATION_FAILED), 0);
 
         assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED.code(), f.body().get("errorCode").asInt());
         assertNotNull(f.body().get("errorMessage"));
@@ -293,7 +293,7 @@ class FetchResponseFormatterTest {
 
     @Test
     void topLevelErrorBypassesPartitions() {
-        FetchResponseFormatter.Formatted f =
+        HttpBridgeResponse f =
             formatter.topLevelError("orders", Errors.INVALID_REQUEST, "offset must be non-negative", 0);
 
         assertEquals(400, f.status());
