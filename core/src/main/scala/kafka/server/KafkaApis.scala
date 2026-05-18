@@ -868,7 +868,25 @@ class KafkaApis(val requestChannel: RequestChannel,
                         viewTpId: TopicIdPartition,
                         spec: ViewSpec,
                         bufferSupplier: BufferSupplier): (TopicIdPartition, FetchPartitionData) = {
-      if (data.error != Errors.NONE) return (viewTpId, data)
+      if (data.error != Errors.NONE) {
+        // Even on a backing-side error, scrub divergingEpoch. Today no error-producing
+        // LogReadResult carries a non-empty divergingEpoch (the replica layer only computes the
+        // marker on successful reads through Partition.readRecords), but we keep the strip here
+        // so a future path that combines an error response with a divergence marker cannot leak
+        // the backing's epoch under the view name. The other fields (highWatermark/logStartOffset/
+        // abortedTransactions/preferredReadReplica) are not leader-epoch-ledger values, so they
+        // pass through unchanged.
+        return (viewTpId, new FetchPartitionData(
+          data.error,
+          data.highWatermark,
+          data.logStartOffset,
+          MemoryRecords.EMPTY,
+          Optional.empty[FetchResponseData.EpochEndOffset](),
+          data.lastStableOffset,
+          data.abortedTransactions,
+          data.preferredReadReplica,
+          data.isReassignmentFetch))
+      }
       val filtered: Either[Errors, MemoryRecords] = data.records match {
         case mr: MemoryRecords =>
           Right(ViewFilter.apply(spec.predicate(), mr, viewTpId.partition, viewMetrics, bufferSupplier))
@@ -906,6 +924,21 @@ class KafkaApis(val requestChannel: RequestChannel,
             s"which cannot be filtered in place; failing with KAFKA_STORAGE_ERROR to avoid leaking unfiltered records.")
           Left(Errors.KAFKA_STORAGE_ERROR)
       }
+      // `divergingEpoch` (KIP-320 truncation marker) is rewritten to empty on the view path. Two
+      // reasons stacked: (1) the field carries (epoch, end_offset) from the BACKING topic's
+      // leader-epoch ledger — same backing-vs-view cross-ledger hazard that wedges the consumer
+      // via partition_leader_epoch (cf. ViewFilter's strip). (2) The replica layer should not be
+      // computing a divergingEpoch in the first place: we already strip both `currentLeaderEpoch`
+      // and `lastFetchedEpoch` from the request before redirecting to the backing (cf. line 805
+      // 'val backingData = new FetchRequest.PartitionData(...)' construction), so
+      // Partition.fetchRecords cannot enter its `if (fetchEpochOpt.isPresent)` epoch-divergence
+      // branch (Partition.scala:1538). If the request-side strip ever regresses (or if some
+      // future fetch path computes divergingEpoch without consulting lastFetchedEpoch), this
+      // response-side strip ensures the backing epoch still cannot leak under the view name.
+      // Consumers don't read divergingEpoch today (only the Raft client and the broker-internal
+      // AbstractFetcherThread follower-replication path do), but defense-in-depth keeps the view
+      // contract intact if a future consumer KIP starts consuming the field.
+      val safeDivergingEpoch = Optional.empty[FetchResponseData.EpochEndOffset]()
       filtered match {
         case Right(records) =>
           (viewTpId, new FetchPartitionData(
@@ -913,7 +946,7 @@ class KafkaApis(val requestChannel: RequestChannel,
             data.highWatermark,
             data.logStartOffset,
             records,
-            data.divergingEpoch,
+            safeDivergingEpoch,
             data.lastStableOffset,
             data.abortedTransactions,
             data.preferredReadReplica,
@@ -924,7 +957,7 @@ class KafkaApis(val requestChannel: RequestChannel,
             data.highWatermark,
             data.logStartOffset,
             MemoryRecords.EMPTY,
-            data.divergingEpoch,
+            safeDivergingEpoch,
             data.lastStableOffset,
             data.abortedTransactions,
             data.preferredReadReplica,
@@ -1662,6 +1695,31 @@ class KafkaApis(val requestChannel: RequestChannel,
     CompletableFuture.allOf(futures.toArray: _*).handle[Unit] { (_, _) =>
       val groupResponses = new ArrayBuffer[OffsetFetchResponseData.OffsetFetchResponseGroup](futures.size)
       futures.foreach(future => groupResponses += future.get())
+      // Strip any backing-topic leader_epoch that was previously committed under a view topic name.
+      // The view fetch path now scrubs partition_leader_epoch from records (see ViewFilter), but
+      // consumers that committed offsets BEFORE that fix landed have backing-derived leader_epoch
+      // values sitting in __consumer_offsets under view-topic names. On the next session start,
+      // OffsetFetch would replay those epochs into SubscriptionState.position.offsetEpoch ->
+      // AWAIT_VALIDATION on the view partition -> OFLE request to validate -> our INVALID_REQUEST
+      // rejection (view topics have no epoch ledger queryable by a backing-derived epoch) ->
+      // partition stays in partitionsToRetry forever, non-fetchable. Normalizing the field to
+      // CommittedLeaderEpoch=-1 (the protocol's "no epoch known" sentinel, also the field's
+      // default value per OffsetFetchResponse.json) makes the consumer skip validation entirely
+      // on view partitions, which matches the design of views: they have no client-validatable
+      // epoch ledger. This is response-side cleanse only — it handles pre-fix poisoned commits
+      // AND any future consumer that somehow submits a non-(-1) epoch on OffsetCommit for a view.
+      groupResponses.foreach { groupResponse =>
+        val topics = groupResponse.topics
+        if (topics != null) {
+          topics.forEach { topicResponse =>
+            if (topicResponse.name != null && isViewTopic(topicResponse.name)) {
+              topicResponse.partitions.forEach { partitionResponse =>
+                partitionResponse.setCommittedLeaderEpoch(-1)
+              }
+            }
+          }
+        }
+      }
       requestHelper.sendMaybeThrottle(request, new OffsetFetchResponse(groupResponses.asJava, request.context.apiVersion))
     }
   }
