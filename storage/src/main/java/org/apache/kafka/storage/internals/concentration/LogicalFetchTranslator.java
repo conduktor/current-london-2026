@@ -34,15 +34,22 @@ import java.util.Objects;
 /**
  * Demultiplex-and-rewrite pass on a {@link MemoryRecords} fetched from a backing partition.
  * Keeps only the records whose {@link ConcentrationHeaders#LOGICAL_TOPIC_HEADER} matches
- * {@code targetLogicalTopic}, and rewrites each kept record's offset to the value carried by its
- * {@link ConcentrationHeaders#LOGICAL_OFFSET_HEADER}. The three concentration headers
- * (topic / partition / offset) are stripped from the output; user-supplied headers, key, value,
- * and timestamp survive verbatim.
+ * {@code targetLogicalTopic} AND whose {@link ConcentrationHeaders#LOGICAL_PARTITION_HEADER}
+ * matches {@code targetLogicalPartition}, and rewrites each kept record's offset to the value
+ * carried by its {@link ConcentrationHeaders#LOGICAL_OFFSET_HEADER}. The three concentration
+ * headers (topic / partition / offset) are stripped from the output; user-supplied headers, key,
+ * value, and timestamp survive verbatim.
  *
  * <p>This is the consume-side mirror of {@link LogicalProduceStamper}: where the stamper adds
- * the two headers so a backing record can be identified by logical topic, this translator removes
- * them after using them to filter and rewrite offsets. A stock consumer of the logical topic must
- * never see them — they are internal metadata.
+ * the headers so a backing record can be identified by its logical (topic, partition), this
+ * translator removes them after using them to filter and rewrite offsets. A stock consumer of the
+ * logical topic must never see them — they are internal metadata.
+ *
+ * <p>Why filtering by topic alone is insufficient: PROMPT.md's premise is N&gt;&gt;M, so multiple
+ * logical partitions of the same topic regularly share a backing partition. Two partitions of
+ * {@code orders} mapped to {@code shared-0} would cross-leak records to each other if the
+ * translator only checked the topic header — exactly the kind of correctness regression that
+ * makes per-partition offsets and ordering meaningless to the stock consumer.
  *
  * <p>Output baseOffset is the first surviving record's logical offset.
  *
@@ -56,25 +63,29 @@ public final class LogicalFetchTranslator {
 
     /**
      * Demultiplex {@code source} and return a {@link MemoryRecords} that contains only the
-     * records belonging to {@code targetLogicalTopic}, with offsets rewritten from each record's
-     * {@link ConcentrationHeaders#LOGICAL_OFFSET_HEADER}.
+     * records belonging to {@code (targetLogicalTopic, targetLogicalPartition)}, with offsets
+     * rewritten from each record's {@link ConcentrationHeaders#LOGICAL_OFFSET_HEADER}.
      *
      * <p>If no records match, returns {@link MemoryRecords#EMPTY}.
      *
-     * @throws NullPointerException if any argument is null
+     * @throws NullPointerException if {@code source} or {@code targetLogicalTopic} is null
+     * @throws IllegalArgumentException if {@code targetLogicalPartition} is negative
      */
-    public static MemoryRecords translate(Records source, String targetLogicalTopic) {
+    public static MemoryRecords translate(Records source, String targetLogicalTopic, int targetLogicalPartition) {
         Objects.requireNonNull(source, "source");
         Objects.requireNonNull(targetLogicalTopic, "targetLogicalTopic");
+        if (targetLogicalPartition < 0) {
+            throw new IllegalArgumentException("targetLogicalPartition must be non-negative: " + targetLogicalPartition);
+        }
 
-        FilterResult filtered = collectSurvivors(source, targetLogicalTopic);
+        FilterResult filtered = collectSurvivors(source, targetLogicalTopic, targetLogicalPartition);
         if (filtered.survivors.isEmpty()) {
             return MemoryRecords.EMPTY;
         }
         return rebuildBatch(filtered);
     }
 
-    private static FilterResult collectSurvivors(Records source, String targetLogicalTopic) {
+    private static FilterResult collectSurvivors(Records source, String targetLogicalTopic, int targetLogicalPartition) {
         List<SurvivingRecord> survivors = new ArrayList<>();
         byte magic = RecordBatch.CURRENT_MAGIC_VALUE;
         TimestampType timestampType = TimestampType.CREATE_TIME;
@@ -85,17 +96,25 @@ public final class LogicalFetchTranslator {
             magic = batch.magic();
             timestampType = batch.timestampType();
             for (Record record : batch) {
-                SurvivingRecord s = maybeKeepRecord(record, targetLogicalTopic);
+                SurvivingRecord s = maybeKeepRecord(record, targetLogicalTopic, targetLogicalPartition);
                 if (s != null) survivors.add(s);
             }
         }
         return new FilterResult(survivors, magic, timestampType);
     }
 
-    private static SurvivingRecord maybeKeepRecord(Record record, String targetLogicalTopic) {
+    private static SurvivingRecord maybeKeepRecord(Record record, String targetLogicalTopic, int targetLogicalPartition) {
         if (record == null) return null;
         ConcentrationMarkers markers = readMarkers(record.headers());
         if (!targetLogicalTopic.equals(markers.logicalTopic)) return null;
+        // Drop records whose logicalPartition header doesn't match. A null partition header
+        // here means the stamper that wrote this record predates the partition-header rollout
+        // (or the record was produced by an unrelated path). Either way we cannot prove the
+        // record belongs to the caller's logical partition, so drop it — the alternative is
+        // leaking cross-partition records, which corrupts per-partition ordering and offsets.
+        if (markers.logicalPartition == null || markers.logicalPartition != targetLogicalPartition) {
+            return null;
+        }
         if (markers.logicalOffset == null) return null; // corrupt — skip rather than fail
         return new SurvivingRecord(
             markers.logicalOffset,
@@ -107,11 +126,18 @@ public final class LogicalFetchTranslator {
 
     private static ConcentrationMarkers readMarkers(Header[] headers) {
         String logicalTopic = null;
+        Integer logicalPartition = null;
         Long logicalOffset = null;
         for (Header h : headers) {
             if (logicalTopic == null
                 && ConcentrationHeaders.LOGICAL_TOPIC_HEADER.equals(h.key())) {
                 logicalTopic = new String(h.value(), StandardCharsets.UTF_8);
+            } else if (logicalPartition == null
+                && ConcentrationHeaders.LOGICAL_PARTITION_HEADER.equals(h.key())) {
+                byte[] v = h.value();
+                if (v != null && v.length == Integer.BYTES) {
+                    logicalPartition = ByteBuffer.wrap(v).getInt();
+                }
             } else if (logicalOffset == null
                 && ConcentrationHeaders.LOGICAL_OFFSET_HEADER.equals(h.key())) {
                 byte[] v = h.value();
@@ -119,9 +145,9 @@ public final class LogicalFetchTranslator {
                     logicalOffset = ByteBuffer.wrap(v).getLong();
                 }
             }
-            if (logicalTopic != null && logicalOffset != null) break;
+            if (logicalTopic != null && logicalPartition != null && logicalOffset != null) break;
         }
-        return new ConcentrationMarkers(logicalTopic, logicalOffset);
+        return new ConcentrationMarkers(logicalTopic, logicalPartition, logicalOffset);
     }
 
     private static MemoryRecords rebuildBatch(FilterResult filtered) {
@@ -229,10 +255,12 @@ public final class LogicalFetchTranslator {
 
     private static final class ConcentrationMarkers {
         final String logicalTopic;
+        final Integer logicalPartition;
         final Long logicalOffset;
 
-        ConcentrationMarkers(String logicalTopic, Long logicalOffset) {
+        ConcentrationMarkers(String logicalTopic, Integer logicalPartition, Long logicalOffset) {
             this.logicalTopic = logicalTopic;
+            this.logicalPartition = logicalPartition;
             this.logicalOffset = logicalOffset;
         }
     }

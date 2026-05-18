@@ -921,7 +921,7 @@ class KafkaApis(val requestChannel: RequestChannel,
                 // topic+partition they actually asked for.
                 logicalTp -> data
               } else {
-                val translated = LogicalFetchTranslator.translate(data.records, logicalTopic)
+                val translated = LogicalFetchTranslator.translate(data.records, logicalTopic, logicalPartition)
                 val logicalHW = concentrationKernel.nextLogicalOffset(logicalTopic, logicalPartition)
                 val logicalStart = concentrationKernel.startLogicalOffset(logicalTopic, logicalPartition)
                 // v1 is non-transactional: LSO equals HW (no aborted writes outstanding).

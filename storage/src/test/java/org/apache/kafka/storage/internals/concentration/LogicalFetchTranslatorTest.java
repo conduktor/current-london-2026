@@ -70,7 +70,7 @@ public class LogicalFetchTranslatorTest {
             new InterleavedRecord("events", 6L,  "k3", "event-1"),
             new InterleavedRecord("orders", 12L, "k4", "order-2"));
 
-        MemoryRecords ordersView = LogicalFetchTranslator.translate(mixed, "orders");
+        MemoryRecords ordersView = LogicalFetchTranslator.translate(mixed, "orders", 0);
 
         List<Record> records = collectRecords(ordersView);
         assertEquals(3, records.size(), "consumer of 'orders' must see only orders' records");
@@ -96,7 +96,7 @@ public class LogicalFetchTranslatorTest {
             new InterleavedRecord("orders", 101L, "k2", "v1"),
             new InterleavedRecord("orders", 102L, "k3", "v2"));
 
-        MemoryRecords ordersView = LogicalFetchTranslator.translate(mixed, "orders");
+        MemoryRecords ordersView = LogicalFetchTranslator.translate(mixed, "orders", 0);
 
         List<Record> records = collectRecords(ordersView);
         assertEquals(3, records.size());
@@ -116,7 +116,7 @@ public class LogicalFetchTranslatorTest {
         MemoryRecords mixed = backingRecordsFromInterleaved(
             new InterleavedRecord("orders", 0L, "k", "payload", new Header[] {userHeader}));
 
-        MemoryRecords ordersView = LogicalFetchTranslator.translate(mixed, "orders");
+        MemoryRecords ordersView = LogicalFetchTranslator.translate(mixed, "orders", 0);
 
         Record r = collectRecords(ordersView).get(0);
         Header[] hs = r.headers();
@@ -140,7 +140,7 @@ public class LogicalFetchTranslatorTest {
         MemoryRecords mixed = backingRecordsFromInterleaved(
             new InterleavedRecord("orders", 42L, "the-key", "the-value", ts));
 
-        MemoryRecords ordersView = LogicalFetchTranslator.translate(mixed, "orders");
+        MemoryRecords ordersView = LogicalFetchTranslator.translate(mixed, "orders", 0);
 
         Record r = collectRecords(ordersView).get(0);
         assertEquals(ts, r.timestamp());
@@ -150,7 +150,7 @@ public class LogicalFetchTranslatorTest {
 
     @Test
     public void translateOnEmptyInputReturnsEmpty() {
-        MemoryRecords out = LogicalFetchTranslator.translate(MemoryRecords.EMPTY, "orders");
+        MemoryRecords out = LogicalFetchTranslator.translate(MemoryRecords.EMPTY, "orders", 0);
         assertEquals(0, out.sizeInBytes());
         assertFalse(out.batches().iterator().hasNext());
     }
@@ -161,7 +161,7 @@ public class LogicalFetchTranslatorTest {
             new InterleavedRecord("events", 0L, "k0", "v0"),
             new InterleavedRecord("events", 1L, "k1", "v1"));
 
-        MemoryRecords out = LogicalFetchTranslator.translate(mixed, "orders");
+        MemoryRecords out = LogicalFetchTranslator.translate(mixed, "orders", 0);
         assertEquals(0, collectRecords(out).size());
     }
 
@@ -188,7 +188,7 @@ public class LogicalFetchTranslatorTest {
         joined.flip();
         MemoryRecords mixed = MemoryRecords.readableRecords(joined);
 
-        MemoryRecords out = LogicalFetchTranslator.translate(mixed, "orders");
+        MemoryRecords out = LogicalFetchTranslator.translate(mixed, "orders", 0);
 
         List<Record> records = collectRecords(out);
         assertEquals(1, records.size(), "only the well-formed orders record should survive");
@@ -204,7 +204,7 @@ public class LogicalFetchTranslatorTest {
             new InterleavedRecord("orders", 0L, null, "value-only"),
             new InterleavedRecord("orders", 1L, "key-only", null));
 
-        MemoryRecords out = LogicalFetchTranslator.translate(mixed, "orders");
+        MemoryRecords out = LogicalFetchTranslator.translate(mixed, "orders", 0);
 
         List<Record> records = collectRecords(out);
         assertEquals(2, records.size());
@@ -218,9 +218,12 @@ public class LogicalFetchTranslatorTest {
     public void translateRejectsNullArguments() {
         MemoryRecords mr = MemoryRecords.withRecords(Compression.NONE, new SimpleRecord("a".getBytes()));
         assertThrows(NullPointerException.class,
-            () -> LogicalFetchTranslator.translate(null, "orders"));
+            () -> LogicalFetchTranslator.translate(null, "orders", 0));
         assertThrows(NullPointerException.class,
-            () -> LogicalFetchTranslator.translate(mr, null));
+            () -> LogicalFetchTranslator.translate(mr, null, 0));
+        assertThrows(IllegalArgumentException.class,
+            () -> LogicalFetchTranslator.translate(mr, "orders", -1),
+            "negative logical partition must be rejected — the partition header is a non-negative int");
     }
 
     @Test
@@ -236,7 +239,7 @@ public class LogicalFetchTranslatorTest {
 
         MemoryRecords stamped = LogicalProduceStamper.stamp(original, "orders", 0,
             new long[] {100L, 101L, 102L});
-        MemoryRecords translated = LogicalFetchTranslator.translate(stamped, "orders");
+        MemoryRecords translated = LogicalFetchTranslator.translate(stamped, "orders", 0);
 
         List<Record> records = collectRecords(translated);
         assertEquals(3, records.size());
@@ -261,9 +264,9 @@ public class LogicalFetchTranslatorTest {
             new InterleavedRecord("A", 2L, "ka2", "a-2"),
             new InterleavedRecord("C", 1L, "kc1", "c-1"));
 
-        MemoryRecords viewA = LogicalFetchTranslator.translate(mixed, "A");
-        MemoryRecords viewB = LogicalFetchTranslator.translate(mixed, "B");
-        MemoryRecords viewC = LogicalFetchTranslator.translate(mixed, "C");
+        MemoryRecords viewA = LogicalFetchTranslator.translate(mixed, "A", 0);
+        MemoryRecords viewB = LogicalFetchTranslator.translate(mixed, "B", 0);
+        MemoryRecords viewC = LogicalFetchTranslator.translate(mixed, "C", 0);
 
         List<Record> recordsA = collectRecords(viewA);
         List<Record> recordsB = collectRecords(viewB);
@@ -284,10 +287,82 @@ public class LogicalFetchTranslatorTest {
         for (Record r : recordsC) assertTrue(new String(bytes(r.value())).startsWith("c-"));
     }
 
+    @Test
+    public void translateIsolatesPartitionsSharingOneBackingPartition() {
+        // PROMPT premise: N >> M. Multiple logical partitions of the SAME topic regularly share
+        // one backing partition. If the fetch demux keys on logicalTopic alone, partition 0's
+        // consumer sees partition 4's records — per-partition ordering and offsets become
+        // meaningless. This is Codex review finding #1 and the worst correctness regression
+        // possible. Pin it.
+        MemoryRecords mixed = backingRecordsFromInterleaved(
+            new InterleavedRecord("orders", 0, 0L, "k-p0-0", "p0-record-0"),
+            new InterleavedRecord("orders", 4, 0L, "k-p4-0", "p4-record-0"),
+            new InterleavedRecord("orders", 0, 1L, "k-p0-1", "p0-record-1"),
+            new InterleavedRecord("orders", 4, 1L, "k-p4-1", "p4-record-1"),
+            new InterleavedRecord("orders", 0, 2L, "k-p0-2", "p0-record-2"),
+            new InterleavedRecord("orders", 4, 2L, "k-p4-2", "p4-record-2"));
+
+        MemoryRecords viewP0 = LogicalFetchTranslator.translate(mixed, "orders", 0);
+        MemoryRecords viewP4 = LogicalFetchTranslator.translate(mixed, "orders", 4);
+
+        List<Record> p0 = collectRecords(viewP0);
+        List<Record> p4 = collectRecords(viewP4);
+
+        assertEquals(3, p0.size(), "consumer of orders-0 must see only partition-0 records");
+        assertEquals(3, p4.size(), "consumer of orders-4 must see only partition-4 records");
+        for (int i = 0; i < 3; i++) {
+            assertEquals((long) i, p0.get(i).offset());
+            assertEquals((long) i, p4.get(i).offset());
+            assertArrayEquals(("p0-record-" + i).getBytes(), bytes(p0.get(i).value()));
+            assertArrayEquals(("p4-record-" + i).getBytes(), bytes(p4.get(i).value()));
+        }
+        // Explicit no-leak guard: partition-0 view must never contain a partition-4 payload,
+        // and vice-versa. This is the assertion that would have caught the original bug.
+        for (Record r : p0) {
+            assertFalse(new String(bytes(r.value()), StandardCharsets.UTF_8).startsWith("p4-"),
+                "partition-4 records must not leak into the orders-0 view");
+        }
+        for (Record r : p4) {
+            assertFalse(new String(bytes(r.value()), StandardCharsets.UTF_8).startsWith("p0-"),
+                "partition-0 records must not leak into the orders-4 view");
+        }
+    }
+
+    @Test
+    public void translateSkipsRecordsWithMissingLogicalPartitionHeader() {
+        // Defensive: a record carrying the topic header but no partition header cannot be proven
+        // to belong to the caller's logical partition. Drop it rather than guessing — leaking a
+        // cross-partition record would corrupt per-partition ordering.
+        MemoryRecords good = backingRecordsFromInterleaved(
+            new InterleavedRecord("orders", 0, 7L, "k", "good"));
+        MemoryRecords corrupt = MemoryRecords.withRecords(Compression.NONE,
+            new SimpleRecord(RecordBatch.NO_TIMESTAMP, "k".getBytes(), "no-partition-header".getBytes(),
+                new Header[] {
+                    new RecordHeader(ConcentrationHeaders.LOGICAL_TOPIC_HEADER,
+                        "orders".getBytes(StandardCharsets.UTF_8)),
+                    new RecordHeader(ConcentrationHeaders.LOGICAL_OFFSET_HEADER,
+                        ByteBuffer.allocate(Long.BYTES).putLong(99L).array())
+                    // intentionally: NO logical-partition header
+                }));
+
+        ByteBuffer joined = ByteBuffer.allocate(good.sizeInBytes() + corrupt.sizeInBytes());
+        joined.put(good.buffer().duplicate());
+        joined.put(corrupt.buffer().duplicate());
+        joined.flip();
+        MemoryRecords mixed = MemoryRecords.readableRecords(joined);
+
+        MemoryRecords out = LogicalFetchTranslator.translate(mixed, "orders", 0);
+
+        List<Record> records = collectRecords(out);
+        assertEquals(1, records.size(), "record without partition header must be skipped");
+        assertArrayEquals("good".getBytes(), bytes(records.get(0).value()));
+    }
+
     // ---- helpers ----
 
     private static class InterleavedRecord {
         final String logicalTopic;
+        final int logicalPartition;
         final long logicalOffset;
         final byte[] key;
         final byte[] value;
@@ -295,21 +370,27 @@ public class LogicalFetchTranslatorTest {
         final Header[] userHeaders;
 
         InterleavedRecord(String logicalTopic, long logicalOffset, String key, String value) {
-            this(logicalTopic, logicalOffset, key, value, RecordBatch.NO_TIMESTAMP, new Header[0]);
+            this(logicalTopic, 0, logicalOffset, key, value, RecordBatch.NO_TIMESTAMP, new Header[0]);
         }
 
         InterleavedRecord(String logicalTopic, long logicalOffset, String key, String value, long timestamp) {
-            this(logicalTopic, logicalOffset, key, value, timestamp, new Header[0]);
+            this(logicalTopic, 0, logicalOffset, key, value, timestamp, new Header[0]);
         }
 
         InterleavedRecord(String logicalTopic, long logicalOffset, String key, String value,
                           Header[] userHeaders) {
-            this(logicalTopic, logicalOffset, key, value, RecordBatch.NO_TIMESTAMP, userHeaders);
+            this(logicalTopic, 0, logicalOffset, key, value, RecordBatch.NO_TIMESTAMP, userHeaders);
         }
 
-        InterleavedRecord(String logicalTopic, long logicalOffset, String key, String value,
-                          long timestamp, Header[] userHeaders) {
+        InterleavedRecord(String logicalTopic, int logicalPartition, long logicalOffset,
+                          String key, String value) {
+            this(logicalTopic, logicalPartition, logicalOffset, key, value, RecordBatch.NO_TIMESTAMP, new Header[0]);
+        }
+
+        InterleavedRecord(String logicalTopic, int logicalPartition, long logicalOffset,
+                          String key, String value, long timestamp, Header[] userHeaders) {
             this.logicalTopic = logicalTopic;
+            this.logicalPartition = logicalPartition;
             this.logicalOffset = logicalOffset;
             this.key = key == null ? null : key.getBytes(StandardCharsets.UTF_8);
             this.value = value == null ? null : value.getBytes(StandardCharsets.UTF_8);
@@ -330,7 +411,7 @@ public class LogicalFetchTranslatorTest {
         for (InterleavedRecord ir : records) {
             MemoryRecords single = MemoryRecords.withRecords(Compression.NONE,
                 new SimpleRecord(ir.timestamp, ir.key, ir.value, ir.userHeaders));
-            MemoryRecords stamped = LogicalProduceStamper.stamp(single, ir.logicalTopic, 0, new long[] {ir.logicalOffset});
+            MemoryRecords stamped = LogicalProduceStamper.stamp(single, ir.logicalTopic, ir.logicalPartition, new long[] {ir.logicalOffset});
             stampedBatches.add(stamped);
             total += stamped.sizeInBytes();
         }
