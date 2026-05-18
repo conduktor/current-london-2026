@@ -500,17 +500,38 @@ class BrokerServer(
       // Requiring the peer principal to also match super.users closes that
       // gap. Empty super.users means legacy behaviour (listener-only) and a
       // WARN at construction time — see RuleEngine constructor for details.
+      // Parse super.users with the same validation Kafka's own authorizer
+      // uses (semicolon-separated, each entry SecurityUtils.parseKafkaPrincipal
+      // for type:name validation). Codex final-audit P1#3: the prior raw split
+      // accepted any non-empty string, so malformed entries silently never
+      // matched any canonical principal — leaving the operator's intent
+      // partially unenforced with no log signal. The new path stores entries
+      // in canonical form (type:name as produced by KafkaPrincipal) and
+      // surfaces each unparseable entry with a single WARN at startup so the
+      // operator notices the typo before relying on the bypass.
       val superUserSet: java.util.Set[String] = {
         val raw = config.originals().get("super.users")
-        if (raw == null) java.util.Collections.emptySet[String]()
-        else {
-          val out = new java.util.HashSet[String]()
+        val out = new java.util.HashSet[String]()
+        if (raw != null) {
           raw.toString.split(";").foreach { v =>
             val trimmed = v.trim
-            if (trimmed.nonEmpty) out.add(trimmed)
+            if (trimmed.nonEmpty) {
+              try {
+                val principal = org.apache.kafka.common.utils.SecurityUtils
+                  .parseKafkaPrincipal(trimmed)
+                out.add(principal.getPrincipalType + ":" + principal.getName)
+              } catch {
+                case _: IllegalArgumentException =>
+                  warn(s"ignoring malformed super.users entry '$trimmed' — " +
+                    s"expected 'type:name' (e.g. 'User:broker'); this entry " +
+                    s"will not be granted the privileged-listener rule-engine " +
+                    s"bypass. Fix the super.users config and restart to " +
+                    s"include it.")
+              }
+            }
           }
-          out
         }
+        out
       }
       ruleEngine = new RuleEngine(superUserSet)
 
