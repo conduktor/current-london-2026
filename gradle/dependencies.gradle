@@ -82,6 +82,9 @@ versions += [
   jfreechart: "1.0.0",
   jopt: "5.0.4",
   jose4j: "0.9.6",
+  // Experimental io_uring networking backend for the broker (Linux PLAINTEXT only). See PROMPT.md.
+  // The classes artifact is portable; the native artifact is classifier-bound to linux-x86_64.
+  nettyIoUring: "4.2.12.Final",
   junit: "5.10.2",
   jqwik: "1.8.3",
   kafka_0110: "0.11.0.3",
@@ -178,6 +181,9 @@ libs += [
   jmhGeneratorAnnProcess: "org.openjdk.jmh:jmh-generator-annprocess:$versions.jmh",
   joptSimple: "net.sf.jopt-simple:jopt-simple:$versions.jopt",
   jose4j: "org.bitbucket.b_c:jose4j:$versions.jose4j",
+  // Netty io_uring transport — Linux-only experimental broker networking backend.
+  nettyIoUringClasses: "io.netty:netty-transport-classes-io_uring:$versions.nettyIoUring",
+  nettyIoUringNativeLinuxX86_64: "io.netty:netty-transport-native-io_uring:$versions.nettyIoUring:linux-x86_64",
   junitJupiter: "org.junit.jupiter:junit-jupiter:$versions.junit",
   junitJupiterApi: "org.junit.jupiter:junit-jupiter-api:$versions.junit",
   junitPlatformSuiteEngine: "org.junit.platform:junit-platform-suite-engine:$versions.junitPlatform",
