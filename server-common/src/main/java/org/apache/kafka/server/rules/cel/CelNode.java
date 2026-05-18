@@ -74,6 +74,13 @@ abstract class CelNode {
 
         @Override
         Object eval(Function<String, Object> a) {
+            // Audit round-7 F1 (MEDIUM): charge one step per Field access
+            // so a chain of MAX_NODES/2 field accesses on a deeply nested
+            // activation map (e.g. `request.a.b.c.d.e.f.g.h.i.j.k`) is
+            // accounted for against MAX_EVAL_STEPS the same way
+            // comprehensions and string ops are. Bounded by MAX_NODES
+            // (1024) so the effect on legitimate rules is negligible.
+            CelLimits.bumpStep();
             Object r = receiver.eval(a);
             if (r == null) {
                 return null;
@@ -96,6 +103,10 @@ abstract class CelNode {
 
         @Override
         Object eval(Function<String, Object> a) {
+            // Audit round-7 F1 (MEDIUM): charge one step per Index access,
+            // mirroring Field.eval. Defence-in-depth against a chain of
+            // index ops on a deeply nested activation list/map.
+            CelLimits.bumpStep();
             Object r = receiver.eval(a);
             if (r == null) {
                 return null;
