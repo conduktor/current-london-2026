@@ -38,6 +38,7 @@ import org.apache.kafka.coordinator.group.GroupCoordinator;
 import org.apache.kafka.coordinator.share.ShareCoordinator;
 import org.apache.kafka.server.ClientMetricsManager;
 import org.apache.kafka.server.authorizer.Authorizer;
+import org.apache.kafka.server.tenant.TenantConfig;
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats;
 
 import java.util.Collections;
@@ -68,6 +69,7 @@ public class KafkaApisBuilder {
     private ApiVersionManager apiVersionManager = null;
     private ClientMetricsManager clientMetricsManager = null;
     private Optional<ShareCoordinator> shareCoordinator = Optional.empty();
+    private TenantConfig tenantConfig = TenantConfig.empty();
 
     public KafkaApisBuilder setRequestChannel(RequestChannel requestChannel) {
         this.requestChannel = requestChannel;
@@ -179,6 +181,11 @@ public class KafkaApisBuilder {
         return this;
     }
 
+    public KafkaApisBuilder setTenantConfig(TenantConfig tenantConfig) {
+        this.tenantConfig = tenantConfig;
+        return this;
+    }
+
     @SuppressWarnings({"CyclomaticComplexity"})
     public KafkaApis build() {
         if (requestChannel == null) throw new RuntimeException("you must set requestChannel");
@@ -220,6 +227,7 @@ public class KafkaApisBuilder {
                              time,
                              tokenManager,
                              apiVersionManager,
-                             clientMetricsManager);
+                             clientMetricsManager,
+                             tenantConfig);
     }
 }

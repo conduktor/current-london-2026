@@ -92,6 +92,7 @@ import org.apache.kafka.server.share.acknowledge.ShareAcknowledgementBatch
 import org.apache.kafka.server.share.context.{FinalContext, ShareSessionContext}
 import org.apache.kafka.server.share.session.{ShareSession, ShareSessionKey}
 import org.apache.kafka.server.storage.log.{FetchParams, FetchPartitionData}
+import org.apache.kafka.server.tenant.TenantConfig
 import org.apache.kafka.server.util.{FutureUtils, MockTime}
 import org.apache.kafka.storage.internals.log.{AppendOrigin, LogConfig}
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats
@@ -161,7 +162,8 @@ class KafkaApisTest extends Logging {
     authorizer: Option[Authorizer] = None,
     configRepository: ConfigRepository = new MockConfigRepository(),
     overrideProperties: Map[String, String] = Map.empty,
-    featureVersions: Seq[FeatureVersion] = Seq.empty
+    featureVersions: Seq[FeatureVersion] = Seq.empty,
+    tenantConfig: TenantConfig = TenantConfig.empty()
   ): KafkaApis = {
 
     val properties = TestUtils.createBrokerConfig(brokerId)
@@ -208,7 +210,8 @@ class KafkaApisTest extends Logging {
       time = time,
       tokenManager = null,
       apiVersionManager = apiVersionManager,
-      clientMetricsManager = clientMetricsManager)
+      clientMetricsManager = clientMetricsManager,
+      tenantConfig = tenantConfig)
   }
 
   private def setupFeatures(featureVersions: Seq[FeatureVersion]): Unit = {
@@ -9186,7 +9189,8 @@ class KafkaApisTest extends Logging {
                            listenerName: ListenerName = ListenerName.forSecurityProtocol(SecurityProtocol.PLAINTEXT),
                            fromPrivilegedListener: Boolean = false,
                            requestHeader: Option[RequestHeader] = None,
-                           requestMetrics: RequestChannelMetrics = requestChannelMetrics): RequestChannel.Request = {
+                           requestMetrics: RequestChannelMetrics = requestChannelMetrics,
+                           principal: KafkaPrincipal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "Alice")): RequestChannel.Request = {
     val buffer = request.serializeWithHeader(
       requestHeader.getOrElse(new RequestHeader(request.apiKey, request.version, clientId, 0)))
 
@@ -9197,7 +9201,7 @@ class KafkaApisTest extends Logging {
     // for forwarding because after forwarding the context will have a different context.
     // We validate the context authenticated failure case in other integration tests.
     val context = new RequestContext(header, "1", InetAddress.getLocalHost, Optional.empty(),
-      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "Alice"), listenerName, SecurityProtocol.SSL,
+      principal, listenerName, SecurityProtocol.SSL,
       ClientInformation.EMPTY, fromPrivilegedListener, Optional.of(kafkaPrincipalSerde))
     new RequestChannel.Request(processor = 1, context = context, startTimeNanos = 0, MemoryPool.NONE, buffer,
       requestMetrics, envelope = None)
@@ -10729,5 +10733,141 @@ class KafkaApisTest extends Logging {
       assertEquals(expectedWriteShareGroupStateResponseData, response.data)
     }
     response
+  }
+
+  // ---------------------------------------------------------------------------
+  // Multi-tenancy — Metadata / ListTopics
+  //
+  // These tests pin down the contract described in PROMPT.md for the Metadata
+  // path: a tenant client sees a pristine cluster scoped to its own namespace;
+  // physical names never leak out (including in errors); a privileged caller on
+  // a tenant-bound listener without a tenant principal is refused rather than
+  // silently rewritten into the tenant's namespace.
+  // ---------------------------------------------------------------------------
+
+  private val TENANT_LISTENER = new ListenerName("TENANT_ACME")
+
+  private def tenantConfigBinding(tenantId: String, listener: ListenerName): TenantConfig = {
+    val props = new util.HashMap[String, Object]()
+    props.put(s"listener.name.${listener.value.toLowerCase}.tenant.id", tenantId)
+    TenantConfig.from(props)
+  }
+
+  private def tenantPrincipal(tenantId: String, user: String): KafkaPrincipal =
+    new KafkaPrincipal(KafkaPrincipal.USER_TYPE, s"__tenant_$tenantId.$user")
+
+  @Test
+  def testMetadataTenantRequestRewritesLogicalNameToPhysicalForCacheLookup(): Unit = {
+    // Tenant requests "orders"; broker must find the topic stored as "acme.orders".
+    addTopicToMetadataCache("acme.orders", numPartitions = 1)
+
+    val metadataRequest = new MetadataRequest.Builder(List("orders").asJava, false).build()
+    val request = buildRequest(
+      metadataRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    addTopicToMetadataCache("acme.orders", numPartitions = 1)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleTopicMetadataRequest(request)
+
+    val response = verifyNoThrottling[MetadataResponse](request)
+    val topics = response.topicMetadata().asScala.map(_.topic).toSet
+    assertEquals(Set("orders"), topics, "client must see the logical name, not the physical one")
+    assertTrue(response.errors.asScala.values.forall(_ == Errors.NONE),
+      s"unexpected errors in response: ${response.errors}")
+  }
+
+  @Test
+  def testMetadataTenantResponseStripsPhysicalPrefixFromErrorResponses(): Unit = {
+    // Topic does not exist; broker returns UNKNOWN_TOPIC_OR_PARTITION. The
+    // error response must reference "orders", not "acme.orders" — otherwise
+    // the physical prefix leaks via the error path.
+    val metadataRequest = new MetadataRequest.Builder(List("orders").asJava, false).build()
+    val request = buildRequest(
+      metadataRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleTopicMetadataRequest(request)
+
+    val response = verifyNoThrottling[MetadataResponse](request)
+    val errored = response.topicMetadata().asScala.toSeq
+    assertEquals(1, errored.size)
+    assertEquals("orders", errored.head.topic, "error response must carry the logical name")
+    assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION, errored.head.error)
+  }
+
+  @Test
+  def testMetadataTenantIsAllTopicsScopesToTenantNamespace(): Unit = {
+    // Tenant lists all topics; broker must hide other tenants' physical topics
+    // and strip the prefix from its own. Internal topics (consumer offsets) are
+    // not tenant-scoped and pass through unchanged.
+    val metadataRequest = MetadataRequest.Builder.allTopics().build()
+    val request = buildRequest(
+      metadataRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    addTopicToMetadataCache("acme.orders", numPartitions = 1)
+    addTopicToMetadataCache("acme.payments", numPartitions = 1)
+    addTopicToMetadataCache("beta.orders", numPartitions = 1)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleTopicMetadataRequest(request)
+
+    val response = verifyNoThrottling[MetadataResponse](request)
+    val visible = response.topicMetadata().asScala.map(_.topic).toSet
+    assertEquals(Set("orders", "payments"), visible,
+      "tenant must see only its own topics with the prefix stripped")
+  }
+
+  @Test
+  def testMetadataPrivilegedCallerOnTenantBoundListenerIsRejected(): Unit = {
+    // Super-user without a `__tenant_` prefix hitting a tenant-bound listener:
+    // the broker MUST NOT silently rewrite "orders" into "acme.orders" — that
+    // would let the privileged caller pollute the tenant namespace.
+    addTopicToMetadataCache("acme.orders", numPartitions = 1)
+
+    val metadataRequest = new MetadataRequest.Builder(List("orders").asJava, false).build()
+    val request = buildRequest(
+      metadataRequest,
+      listenerName = TENANT_LISTENER,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "Alice")) // no tenant prefix
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    addTopicToMetadataCache("acme.orders", numPartitions = 1)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleTopicMetadataRequest(request)
+
+    val response = verifyNoThrottling[MetadataResponse](request)
+    val errored = response.topicMetadata().asScala.toSeq
+    assertEquals(1, errored.size)
+    assertEquals("orders", errored.head.topic,
+      "rejection error must reference the logical name the caller used")
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED, errored.head.error,
+      "privileged caller on tenant listener without tenant prefix must be refused")
+  }
+
+  @Test
+  def testMetadataNonTenantRequestUnchangedWhenNoBinding(): Unit = {
+    // Existing single-tenant behaviour is unchanged when no tenant binding
+    // exists for the listener and the principal carries no `__tenant_` prefix.
+    addTopicToMetadataCache("plain-topic", numPartitions = 1)
+
+    val metadataRequest = new MetadataRequest.Builder(List("plain-topic").asJava, false).build()
+    val request = buildRequest(metadataRequest)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    addTopicToMetadataCache("plain-topic", numPartitions = 1)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleTopicMetadataRequest(request)
+
+    val response = verifyNoThrottling[MetadataResponse](request)
+    val topics = response.topicMetadata().asScala.map(_.topic).toSet
+    assertEquals(Set("plain-topic"), topics)
   }
 }

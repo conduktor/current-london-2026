@@ -66,6 +66,7 @@ import org.apache.kafka.server.share.context.ShareFetchContext
 import org.apache.kafka.server.share.{ErroneousAndValidPartitionData, SharePartitionKey}
 import org.apache.kafka.server.share.acknowledge.ShareAcknowledgementBatch
 import org.apache.kafka.server.storage.log.{FetchIsolation, FetchParams, FetchPartitionData}
+import org.apache.kafka.server.tenant.{TenantConfig, TenantContext}
 import org.apache.kafka.storage.internals.log.AppendOrigin
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats
 
@@ -104,7 +105,8 @@ class KafkaApis(val requestChannel: RequestChannel,
                 time: Time,
                 val tokenManager: DelegationTokenManager,
                 val apiVersionManager: ApiVersionManager,
-                val clientMetricsManager: ClientMetricsManager
+                val clientMetricsManager: ClientMetricsManager,
+                val tenantConfig: TenantConfig = TenantConfig.empty()
 ) extends ApiRequestHandler with Logging {
 
   type FetchResponseStats = Map[TopicPartition, RecordValidationStats]
@@ -123,6 +125,14 @@ class KafkaApis(val requestChannel: RequestChannel,
   def close(): Unit = {
     aclApis.close()
     info("Shutdown complete.")
+  }
+
+  // Build the per-request tenant view from the principal (carries `__tenant_<id>.`
+  // from SASL handshake) and the listener's configured binding. Returns
+  // TenantContext.none() when neither side declares a tenant, so the rewrite
+  // paths in the handlers below short-circuit to identity.
+  private[server] def tenantContextFor(request: RequestChannel.Request): TenantContext = {
+    TenantContext.of(request.context.principal, tenantConfig.boundTenantFor(request.context.listenerName))
   }
 
   private def forwardToController(request: RequestChannel.Request): Unit = {
@@ -857,6 +867,18 @@ class KafkaApis(val requestChannel: RequestChannel,
       }
     }
 
+    val tenantCtx = tenantContextFor(request)
+    // A privileged caller on a tenant-bound listener WITHOUT a tenant principal
+    // would otherwise have its names silently rewritten into the tenant's
+    // namespace — PROMPT.md flags this as data corruption. Refuse the request
+    // by returning TOPIC_AUTHORIZATION_FAILED per requested topic; for
+    // isAllTopics, an empty response — the caller is not allowed to see the
+    // tenant's namespace at all.
+    if (tenantCtx.isPrivilegedOnTenantListener) {
+      sendMetadataAuthorizationFailure(request, metadataRequest, requestVersion)
+      return
+    }
+
     // Check if topicId is presented firstly.
     val topicIds = metadataRequest.topicIds.asScala.toSet.filterNot(_ == Uuid.ZERO_UUID)
     val useTopicId = topicIds.nonEmpty
@@ -868,12 +890,25 @@ class KafkaApis(val requestChannel: RequestChannel,
     val unknownTopicIdsTopicMetadata = unknownTopicIds.map(topicId =>
         metadataResponseTopic(Errors.UNKNOWN_TOPIC_ID, null, topicId, isInternal = false, util.Collections.emptyList())).toSeq
 
-    val topics = if (metadataRequest.isAllTopics)
-      metadataCache.getAllTopics()
-    else if (useTopicId)
-      knownTopicNames
-    else
-      metadataRequest.topics.asScala.toSet
+    // IN rewrite — the request carries logical names; downstream metadataCache /
+    // authorization / auto-topic-creation all operate on physical names.
+    //   - isAllTopics: scope the visible cluster down to topics owned by this
+    //     tenant (their physical prefix matches), plus pristine internal topics
+    //     that pass through untouched.
+    //   - useTopicId: lookup by id is already physical; just scope it to topics
+    //     belonging to this tenant.
+    //   - explicit logical names: map each through toPhysical(...).
+    // For non-tenant requests, tenantCtx is none() and these all reduce to
+    // identity, so existing single-tenant behaviour is unchanged.
+    val tenantScoped = tenantCtx.effectiveTenant.isPresent
+    val topics = if (metadataRequest.isAllTopics) {
+      val all = metadataCache.getAllTopics()
+      if (tenantScoped) all.filter(t => tenantCtx.belongsToTenant(t) || isInternal(t)) else all
+    } else if (useTopicId) {
+      if (tenantScoped) knownTopicNames.filter(t => tenantCtx.belongsToTenant(t) || isInternal(t)) else knownTopicNames
+    } else {
+      metadataRequest.topics.asScala.toSet.map(tenantCtx.toPhysical)
+    }
 
     val authorizedForDescribeTopics = authHelper.filterByAuthorized(request.context, DESCRIBE, TOPIC,
       topics, logIfDenied = !metadataRequest.isAllTopics)(identity)
@@ -948,6 +983,17 @@ class KafkaApis(val requestChannel: RequestChannel,
     val completeTopicMetadata =  unknownTopicIdsTopicMetadata ++
       topicMetadata ++ unauthorizedForCreateTopicMetadata ++ unauthorizedForDescribeTopicMetadata
 
+    // OUT rewrite — at this point every MetadataResponseTopic carries the
+    // physical name (from metadataCache / auth lookups / autocreate errors).
+    // Strip the prefix so the client sees the logical name it asked for,
+    // including in error paths (TOPIC_AUTHORIZATION_FAILED, UNKNOWN_TOPIC,
+    // INVALID_TOPIC_EXCEPTION). For non-tenant requests this is a no-op.
+    if (tenantScoped) {
+      completeTopicMetadata.foreach { t =>
+        if (t.name != null) t.setName(tenantCtx.toLogical(t.name))
+      }
+    }
+
     val brokers = metadataCache.getAliveBrokerNodes(request.context.listenerName)
 
     trace("Sending topic metadata %s and brokers %s for correlation id %d to client %s".format(completeTopicMetadata.mkString(","),
@@ -969,6 +1015,35 @@ class KafkaApis(val requestChannel: RequestChannel,
          completeTopicMetadata.asJava,
          clusterAuthorizedOperations
       ))
+  }
+
+  // Refuse to honour a Metadata request whose listener binds it into a tenant
+  // namespace but whose principal has no tenant prefix — without this guard the
+  // broker would silently rewrite the request into the tenant's namespace and
+  // a super-user could pollute it. For explicit-topic requests we mark each
+  // topic TOPIC_AUTHORIZATION_FAILED; for isAllTopics we return an empty
+  // topic list (the caller does not get to enumerate the tenant's namespace).
+  private def sendMetadataAuthorizationFailure(request: RequestChannel.Request,
+                                                metadataRequest: MetadataRequest,
+                                                requestVersion: Short): Unit = {
+    val refused: Seq[MetadataResponseTopic] =
+      if (metadataRequest.isAllTopics) Seq.empty
+      else metadataRequest.topics.asScala.toSeq.map(name =>
+        metadataResponseTopic(Errors.TOPIC_AUTHORIZATION_FAILED, name, Uuid.ZERO_UUID, isInternal(name), util.Collections.emptyList()))
+    val brokers = metadataCache.getAliveBrokerNodes(request.context.listenerName)
+    val controllerId = metadataCache.getControllerId.flatMap {
+      case ZkCachedControllerId(id) => Some(id)
+      case KRaftCachedControllerId(_) => metadataCache.getRandomAliveBrokerId
+    }
+    requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
+      MetadataResponse.prepareResponse(
+        requestVersion,
+        requestThrottleMs,
+        brokers.toList.asJava,
+        clusterId,
+        controllerId.getOrElse(MetadataResponse.NO_CONTROLLER_ID),
+        refused.asJava,
+        Int.MinValue))
   }
 
   def handleDescribeTopicPartitionsRequest(request: RequestChannel.Request): Unit = {
