@@ -45,6 +45,7 @@ import org.apache.kafka.common.security.auth.SecurityProtocol
 import org.apache.kafka.common.utils.{KafkaThread, LogContext, Time, Utils}
 import org.apache.kafka.common.{Endpoint, KafkaException, MetricName, Reconfigurable}
 import org.apache.kafka.network.{ConnectionQuotaEntity, ConnectionThrottledException, SocketServerConfigs, TooManyConnectionsException}
+import org.apache.kafka.network.iouring.{BrokerSelector, NioBrokerSelector}
 import org.apache.kafka.security.CredentialProvider
 import org.apache.kafka.server.ServerSocketFactory
 import org.apache.kafka.server.config.QuotaConfig
@@ -870,7 +871,11 @@ private[kafka] class Processor(
   private val expiredConnectionsKilledCountMetricName = metrics.metricName("expired-connections-killed-count", MetricsGroup, metricTags)
   metrics.addMetric(expiredConnectionsKilledCountMetricName, expiredConnectionsKilledCount)
 
-  private[network] val selector = createSelector(
+  // The selector is a BrokerSelector so an alternative I/O backend (e.g. Netty io_uring)
+  // can be swapped in without modifying clients/. The default path keeps using the Java-NIO
+  // KSelector — we just wrap it in a thin NioBrokerSelector adapter so Processor talks to a
+  // single broker-side type.
+  private[network] val selector: BrokerSelector = new NioBrokerSelector(createSelector(
     ChannelBuilders.serverChannelBuilder(
       listenerName,
       listenerName == config.interBrokerListenerName,
@@ -882,9 +887,10 @@ private[kafka] class Processor(
       logContext,
       version => apiVersionManager.apiVersionResponse(throttleTimeMs = 0, version < 4)
     )
-  )
+  ))
 
-  // Visible to override for testing
+  // Visible to override for testing. Returns the underlying Java-NIO KSelector so existing
+  // TestableSelector overrides keep working unchanged — the Processor wraps it above.
   protected[network] def createSelector(channelBuilder: ChannelBuilder): KSelector = {
     channelBuilder match {
       case reconfigurable: Reconfigurable => config.addReconfigurable(reconfigurable)

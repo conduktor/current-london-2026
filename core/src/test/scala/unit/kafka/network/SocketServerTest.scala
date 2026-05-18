@@ -37,6 +37,7 @@ import org.apache.kafka.common.security.scram.internals.ScramMechanism
 import org.apache.kafka.common.utils._
 import org.apache.kafka.network.RequestConvertToJson
 import org.apache.kafka.network.SocketServerConfigs
+import org.apache.kafka.network.iouring.NioBrokerSelector
 import org.apache.kafka.security.CredentialProvider
 import org.apache.kafka.server.common.{FinalizedFeatures, MetadataVersion}
 import org.apache.kafka.server.config.QuotaConfig
@@ -2102,7 +2103,7 @@ class SocketServerTest {
     }
 
     def testableSelector: TestableSelector =
-      testableProcessor.selector.asInstanceOf[TestableSelector]
+      testableProcessor.selector.asInstanceOf[NioBrokerSelector].unwrap().asInstanceOf[TestableSelector]
 
     def testableProcessor: TestableProcessor =
       testableAcceptor.processors(0).asInstanceOf[TestableProcessor]
