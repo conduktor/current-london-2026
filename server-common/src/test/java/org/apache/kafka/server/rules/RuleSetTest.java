@@ -157,13 +157,18 @@ public class RuleSetTest {
         // (cap+1)'th distinct id is rejected. The cap exists so per-request
         // CEL evaluation cost is bounded regardless of how many rules the
         // operator publishes to __governance.
+        //
+        // Spread rules across every api key (1024 rules / 88 keys ≈ 12 per
+        // key) so this test exercises the global MAX_RULES cap WITHOUT
+        // accidentally tripping the per-api-key cap first.
+        ApiKeys[] keys = ApiKeys.values();
         RuleSetBuilder b = new RuleSetBuilder();
         for (int i = 0; i < RuleSetBuilder.MAX_RULES; i++) {
-            b.put(rule("rule-" + i, ApiKeys.FETCH));
+            b.put(rule("rule-" + i, keys[i % keys.length]));
         }
         assertEquals(RuleSetBuilder.MAX_RULES, b.size());
         IllegalStateException ex = assertThrows(IllegalStateException.class,
-            () -> b.put(rule("rule-overflow", ApiKeys.FETCH)));
+            () -> b.put(rule("rule-overflow", keys[0])));
         assertTrue(ex.getMessage().contains("rule-overflow"),
             "exception must name the rejected rule id: " + ex.getMessage());
         assertTrue(ex.getMessage().contains(String.valueOf(RuleSetBuilder.MAX_RULES)),
@@ -176,21 +181,115 @@ public class RuleSetTest {
         // must succeed even at the cap. Otherwise the only way to ever fix
         // or tombstone a rule once the cap is full would be to drop the
         // entire RuleSet — a brittle operational property.
+        //
+        // Spread across all api keys (see putRejectsNewIdsPastMaxRulesCap)
+        // so we are testing replacement-at-global-cap rather than tripping
+        // the per-api-key cap on the way up.
+        ApiKeys[] keys = ApiKeys.values();
         RuleSetBuilder b = new RuleSetBuilder();
         for (int i = 0; i < RuleSetBuilder.MAX_RULES; i++) {
-            b.put(rule("rule-" + i, ApiKeys.FETCH));
+            b.put(rule("rule-" + i, keys[i % keys.length]));
         }
-        // Same id, different content: must replace in place.
-        Rule replacement = new Rule("rule-0", Collections.singletonList(ApiKeys.METADATA),
+        // Same id, different content: must replace in place. Move rule-0 to
+        // a different key (the one that originally backed rule-1, so we
+        // know the bitset assertion below is meaningful regardless of
+        // ApiKeys.values() order).
+        ApiKeys movedTo = keys[1 % keys.length];
+        Rule replacement = new Rule("rule-0", Collections.singletonList(movedTo),
             RuleAction.DENY, "false", 99, FALSE_PROGRAM);
         b.put(replacement);
         RuleSet rs = b.build();
         assertEquals(RuleSetBuilder.MAX_RULES, rs.size(),
             "replacement must not grow the set");
-        // The replacement now targets METADATA, not FETCH — verify it
-        // actually landed by checking the per-key list rather than relying
-        // on size alone.
-        assertTrue(rs.hasDenyRuleFor((short) ApiKeys.METADATA.id),
+        assertTrue(rs.hasDenyRuleFor((short) movedTo.id),
             "replacement rule's new apiKey must be reflected in the bitset");
+    }
+
+    @Test
+    public void putRejectsRuleThatWouldExceedPerApiKeyCap() {
+        // The per-api-key cap (MAX_RULES_PER_API_KEY) bounds the number of
+        // DENY rules that can target any single api id. Without it, an
+        // operator who points all 1024 globally-allowed rules at one hot
+        // api (say FETCH) would force the request path to evaluate 1024
+        // CEL programs per FETCH request — exactly the worst-case the
+        // global cap was supposed to prevent.
+        RuleSetBuilder b = new RuleSetBuilder();
+        for (int i = 0; i < RuleSetBuilder.MAX_RULES_PER_API_KEY; i++) {
+            b.put(rule("rule-" + i, ApiKeys.FETCH));
+        }
+        IllegalStateException ex = assertThrows(IllegalStateException.class,
+            () -> b.put(rule("rule-overflow", ApiKeys.FETCH)));
+        assertTrue(ex.getMessage().contains("rule-overflow"),
+            "exception must name the rejected rule id: " + ex.getMessage());
+        assertTrue(ex.getMessage().contains(String.valueOf(ApiKeys.FETCH.id)),
+            "exception must name the offending api id: " + ex.getMessage());
+        assertTrue(ex.getMessage().contains(String.valueOf(RuleSetBuilder.MAX_RULES_PER_API_KEY)),
+            "exception must name the cap value: " + ex.getMessage());
+
+        // Distinct api keys are independent: filling FETCH to the cap must
+        // not block rules from targeting other keys.
+        b.put(rule("rule-other", ApiKeys.METADATA));
+    }
+
+    @Test
+    public void putAcceptsReplacementThatStaysWithinPerApiKeyCap() {
+        // Replacement of an existing rule with the same api keys never moves
+        // the per-key counter, so it must succeed even when the targeted key
+        // is already at the per-api-key cap. (This is the per-key analogue
+        // of putAllowsReplacementAtMaxRulesCap.)
+        RuleSetBuilder b = new RuleSetBuilder();
+        for (int i = 0; i < RuleSetBuilder.MAX_RULES_PER_API_KEY; i++) {
+            b.put(rule("rule-" + i, ApiKeys.FETCH));
+        }
+        Rule replacement = new Rule("rule-0", Collections.singletonList(ApiKeys.FETCH),
+            RuleAction.DENY, "false", 7, FALSE_PROGRAM);
+        b.put(replacement);
+        RuleSet rs = b.build();
+        assertEquals(RuleSetBuilder.MAX_RULES_PER_API_KEY,
+            rs.rulesFor((short) ApiKeys.FETCH.id).size(),
+            "replacement at the per-key cap must not grow the per-key list");
+        assertEquals(7, rs.rulesFor((short) ApiKeys.FETCH.id).get(0).errorCode(),
+            "replacement must take effect in place");
+    }
+
+    @Test
+    public void putRejectsApiKeySwapThatWouldExceedPerKeyCap() {
+        // A replacement that swaps api keys is *not* a no-op for the per-key
+        // counter: the new keys can each push their counter over the cap.
+        // Specifically: if FETCH already holds the cap with rules other than
+        // "swap", moving "swap" onto FETCH must push FETCH to cap+1 — and
+        // must be rejected.
+        RuleSetBuilder b = new RuleSetBuilder();
+        for (int i = 0; i < RuleSetBuilder.MAX_RULES_PER_API_KEY; i++) {
+            b.put(rule("fetch-" + i, ApiKeys.FETCH));
+        }
+        b.put(rule("swap", ApiKeys.METADATA));
+        Rule swapToFetch = new Rule("swap", Collections.singletonList(ApiKeys.FETCH),
+            RuleAction.DENY, "true", 1, TRUE_PROGRAM);
+        IllegalStateException ex = assertThrows(IllegalStateException.class,
+            () -> b.put(swapToFetch));
+        assertTrue(ex.getMessage().contains(String.valueOf(ApiKeys.FETCH.id)),
+            "exception must name the offending api id: " + ex.getMessage());
+    }
+
+    @Test
+    public void removeFreesPerApiKeyCapacity() {
+        // remove() must decrement the per-key counter so cap'd keys can
+        // accept fresh rules after a tombstone. Otherwise the operational
+        // workflow "delete a stale rule, install its replacement" would
+        // fail when the targeted key is at the cap.
+        RuleSetBuilder b = new RuleSetBuilder();
+        for (int i = 0; i < RuleSetBuilder.MAX_RULES_PER_API_KEY; i++) {
+            b.put(rule("rule-" + i, ApiKeys.FETCH));
+        }
+        // At the cap — no new ids allowed.
+        assertThrows(IllegalStateException.class,
+            () -> b.put(rule("fresh", ApiKeys.FETCH)));
+        // Tombstone one and try again — must succeed now.
+        b.remove("rule-0");
+        b.put(rule("fresh", ApiKeys.FETCH));
+        RuleSet rs = b.build();
+        assertEquals(RuleSetBuilder.MAX_RULES_PER_API_KEY,
+            rs.rulesFor((short) ApiKeys.FETCH.id).size());
     }
 }

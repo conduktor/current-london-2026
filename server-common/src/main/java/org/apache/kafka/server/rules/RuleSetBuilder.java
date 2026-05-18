@@ -20,6 +20,7 @@ import org.apache.kafka.common.protocol.ApiKeys;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -34,17 +35,33 @@ import java.util.Objects;
  * the original insertion order so the first matching DENY in declared order
  * short-circuits subsequent evaluations.
  *
- * <p>The builder caps the total number of distinct rules at {@link #MAX_RULES}.
- * The cap is defense-in-depth against an operator (or a compromised authoring
- * pipeline) publishing tens of thousands of distinct rule envelopes to the
- * {@code __governance} topic: every distinct rule lands in the per-API-key
- * evaluation list of every API it targets, so worst-case per-request CEL
- * evaluation cost is O(rules-targeting-this-api). The bitset short-circuit
- * keeps the no-rule fast path free, but once a rule targets the api a
- * pathological rule count translates directly into per-request latency.
- * 1024 is large enough that no realistic operator will hit it (compression
- * policy alone is one rule per cluster) and small enough that worst-case
- * evaluation cost is bounded.
+ * <h3>Cap policy</h3>
+ *
+ * <p>The builder enforces TWO complementary caps, both defense in depth
+ * against operator (or compromised-authoring-pipeline) configurations that
+ * would translate directly into per-request CEL evaluation latency:
+ *
+ * <ul>
+ *   <li>{@link #MAX_RULES} (1024): the total number of distinct rules in
+ *       the working set. Bounds the worst-case memory footprint of a single
+ *       RuleSet snapshot.</li>
+ *   <li>{@link #MAX_RULES_PER_API_KEY} (128): the number of DENY rules that
+ *       may target any single API key. The 1024 global cap alone is not
+ *       enough — the audit (CEL DoS HIGH-1) noted that an operator could
+ *       point all 1024 rules at a single hot API (e.g. FETCH) and force the
+ *       engine to evaluate 1024 CEL programs per Fetch request, since the
+ *       per-request walk is over the rules targeting that one API. The
+ *       per-key cap fences that off at a level realistic operator policies
+ *       cluster well below.</li>
+ * </ul>
+ *
+ * <p>A new id that would breach EITHER cap is rejected; the loader catches
+ * the exception and preserves the previously installed snapshot. Replacement
+ * (same id) is always accepted as long as the post-replacement state stays
+ * within the per-key cap — the same id keeping the same apiKeys never moves
+ * any counter and so always passes; an id-replacement that adds apiKeys is
+ * checked against the cap for each newly-added key. Removals always succeed
+ * and uncount.
  */
 public final class RuleSetBuilder {
 
@@ -54,35 +71,115 @@ public final class RuleSetBuilder {
      */
     public static final int MAX_RULES = 1024;
 
+    /**
+     * Maximum number of DENY rules that may target any single API key.
+     * See class doc. Only DENY rules count: non-DENY actions do not enter
+     * the per-API-key evaluation list and therefore do not contribute to
+     * per-request latency. Today the codec accepts only DENY, but counting
+     * is action-aware so ALLOW / FILTER can be added later without
+     * over-charging the cap.
+     */
+    public static final int MAX_RULES_PER_API_KEY = 128;
+
     /** id -> Rule, insertion-ordered. */
     private final LinkedHashMap<String, Rule> rulesById = new LinkedHashMap<>();
+
+    /**
+     * Per-API-key count of DENY rules currently in {@link #rulesById}. Kept
+     * in sync with {@link #put} / {@link #remove} / {@link #from} so the
+     * per-key cap check on a new rule is O(rule.apiKeys().size()) rather
+     * than O(|rulesById|). An absent entry is implicitly zero (we drop
+     * entries that decrement to zero, which keeps the map's footprint
+     * proportional to the active keys rather than to the API surface area).
+     */
+    private final Map<Short, Integer> apiKeyCounts = new HashMap<>();
 
     public RuleSetBuilder from(RuleSet base) {
         Objects.requireNonNull(base, "base");
         rulesById.clear();
+        apiKeyCounts.clear();
         rulesById.putAll(base.rulesById);
+        for (Rule r : base.rulesById.values()) {
+            if (r.action() == RuleAction.DENY) {
+                for (ApiKeys k : r.apiKeys()) {
+                    apiKeyCounts.merge(k.id, 1, Integer::sum);
+                }
+            }
+        }
         return this;
     }
 
     /**
      * Add a new rule or replace an existing one with the same id. Throws
      * {@link IllegalStateException} when adding a <em>new</em> id would push
-     * the working set over {@link #MAX_RULES}; the loader catches this and
-     * preserves the previously installed snapshot so the engine never
-     * silently drops the cap'th rule while accepting the (cap+1)'th. Updates
-     * to an existing id are always accepted (they do not grow the set).
+     * the working set over {@link #MAX_RULES}, or when ANY of the rule's
+     * targeted API keys would exceed {@link #MAX_RULES_PER_API_KEY}; the
+     * loader catches this and preserves the previously installed snapshot
+     * so the engine never silently drops the cap'th rule while accepting
+     * the (cap+1)'th. Updates to an existing id are always accepted as long
+     * as the post-replacement per-key counts stay within the cap (an
+     * apiKeys-preserving update never moves any counter, so updates to the
+     * predicate / errorCode of an existing rule trivially pass).
      */
     public RuleSetBuilder put(Rule rule) {
         Objects.requireNonNull(rule, "rule");
-        if (rulesById.size() >= MAX_RULES && !rulesById.containsKey(rule.id())) {
+        Rule existing = rulesById.get(rule.id());
+        // Compute the per-API-key delta this put would apply. A replacement
+        // that targets the same keys nets to zero on those keys; one that
+        // swaps key sets cancels exact-matches and only deltas the differing
+        // keys. Only DENY rules contribute — non-DENY actions never enter
+        // the per-key evaluation list.
+        Map<Short, Integer> delta = new HashMap<>();
+        if (existing != null && existing.action() == RuleAction.DENY) {
+            for (ApiKeys k : existing.apiKeys()) {
+                delta.merge(k.id, -1, Integer::sum);
+            }
+        }
+        if (rule.action() == RuleAction.DENY) {
+            for (ApiKeys k : rule.apiKeys()) {
+                delta.merge(k.id, 1, Integer::sum);
+            }
+        }
+        // Per-key cap: reject if ANY targeted key would exceed the cap
+        // after this put. We only need to check positive deltas — a key
+        // that is decrementing (apiKey was on the existing rule but not on
+        // the replacement) can only shrink its count.
+        for (Map.Entry<Short, Integer> e : delta.entrySet()) {
+            if (e.getValue() <= 0) {
+                continue;
+            }
+            int post = apiKeyCounts.getOrDefault(e.getKey(), 0) + e.getValue();
+            if (post > MAX_RULES_PER_API_KEY) {
+                throw new IllegalStateException(
+                    "per-API-key rule cap reached for api id " + e.getKey()
+                        + " (" + MAX_RULES_PER_API_KEY + "); rejecting rule '"
+                        + rule.id() + "' to bound per-request CEL evaluation cost "
+                        + "for that api");
+            }
+        }
+        // Global cap on distinct ids. Only fires for genuinely new ids;
+        // replacement keeps the same id and so cannot grow the set.
+        if (existing == null && rulesById.size() >= MAX_RULES) {
             throw new IllegalStateException(
                 "rule count cap reached (" + MAX_RULES + "); rejecting new rule '"
                     + rule.id() + "' to bound per-request CEL evaluation cost");
         }
-        // Use put-and-restore semantics so replacement preserves the original
-        // insertion position. LinkedHashMap.put(k, v) when k exists updates
-        // the value in place without reordering — exactly what we need.
+        // Commit: write the new rule first, then settle the per-key counts.
+        // LinkedHashMap.put(k, v) when k exists updates the value in place
+        // without reordering — exactly what we need to preserve declared
+        // order across replacement.
         rulesById.put(rule.id(), rule);
+        for (Map.Entry<Short, Integer> e : delta.entrySet()) {
+            if (e.getValue() == 0) {
+                continue;
+            }
+            int post = apiKeyCounts.getOrDefault(e.getKey(), 0) + e.getValue();
+            if (post == 0) {
+                apiKeyCounts.remove(e.getKey());
+            } else {
+                apiKeyCounts.put(e.getKey(), post);
+            }
+        }
         return this;
     }
 
@@ -93,7 +190,17 @@ public final class RuleSetBuilder {
 
     public RuleSetBuilder remove(String ruleId) {
         Objects.requireNonNull(ruleId, "ruleId");
-        rulesById.remove(ruleId);
+        Rule removed = rulesById.remove(ruleId);
+        if (removed != null && removed.action() == RuleAction.DENY) {
+            for (ApiKeys k : removed.apiKeys()) {
+                int post = apiKeyCounts.getOrDefault(k.id, 0) - 1;
+                if (post <= 0) {
+                    apiKeyCounts.remove(k.id);
+                } else {
+                    apiKeyCounts.put(k.id, post);
+                }
+            }
+        }
         return this;
     }
 

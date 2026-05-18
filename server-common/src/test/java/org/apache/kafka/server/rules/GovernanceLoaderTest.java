@@ -256,29 +256,36 @@ public class GovernanceLoaderTest {
         // installed RuleSet), not abort the drain or corrupt state. This
         // pins the loader's catch of the IllegalStateException thrown by
         // RuleSetBuilder.put.
+        //
+        // Spread rules across every api key (1024 rules / 88 keys ≈ 12 per
+        // key) so we trip the GLOBAL MAX_RULES cap, not the per-api-key
+        // cap (MAX_RULES_PER_API_KEY=128).
         RuleEngine engine = new RuleEngine();
         GovernanceLoader loader = new GovernanceLoader(engine);
-        // Fill the working set to the cap with distinct rules, committing
-        // once so the engine has a valid pre-overflow snapshot.
+        ApiKeys[] keys = ApiKeys.values();
         for (int i = 0; i < RuleSetBuilder.MAX_RULES; i++) {
-            loader.apply("r-" + i, envelope("true", ApiKeys.METADATA, 1 + (i % 100)));
+            loader.apply("r-" + i, envelope("true", keys[i % keys.length], 1 + (i % 100)));
         }
         loader.commit();
         RuleSet capSnapshot = engine.active();
         assertEquals(RuleSetBuilder.MAX_RULES, capSnapshot.size());
         // The (cap+1)'th new rule must be rejected, but the drain must keep
         // flowing — a subsequent good update to an existing id must still
-        // land and a commit must publish a coherent RuleSet.
-        loader.apply("r-overflow", envelope("true", ApiKeys.METADATA, 42));
-        loader.apply("r-0", envelope("true", ApiKeys.METADATA, 999));
+        // land and a commit must publish a coherent RuleSet. Use keys[0]
+        // for the overflow attempt and the r-0 update so the in-place
+        // update lands on the same api key where r-0 originally lived.
+        ApiKeys k0 = keys[0];
+        loader.apply("r-overflow", envelope("true", k0, 42));
+        loader.apply("r-0", envelope("true", k0, 999));
         loader.commit();
         RuleSet afterOverflow = engine.active();
         assertEquals(RuleSetBuilder.MAX_RULES, afterOverflow.size(),
             "overflow record must not have landed");
         // 'r-0' was updated to errorCode 999; verify the in-place update
-        // still works at the cap.
+        // still works at the cap (evaluate against the api key where r-0
+        // lives — keys[0]).
         RuleDecision d = engine.evaluate(
-            ApiKeys.METADATA, "client", false, Collections::emptyMap);
+            k0, "client", false, Collections::emptyMap);
         assertTrue(d.denied(), "engine must still be denying via the cap'd set");
         assertEquals("r-0", d.denyingRuleId(),
             "updated r-0 must still be first in declared order");
@@ -327,14 +334,16 @@ public class GovernanceLoaderTest {
 
         // Builder cap exceeded → false. Fill to the cap, then push one over.
         // (Reuse the same loader — putting good rules in does count, the cap
-        // overflow at the end is the only rejection.)
+        // overflow at the end is the only rejection.) Spread across every api
+        // key so we trip the GLOBAL MAX_RULES cap (not the per-api-key cap).
+        ApiKeys[] keys = ApiKeys.values();
         for (int i = 0; i < RuleSetBuilder.MAX_RULES; i++) {
             assertTrue(
-                loader.apply("cap-" + i, envelope("true", ApiKeys.METADATA, 1 + (i % 100))),
+                loader.apply("cap-" + i, envelope("true", keys[i % keys.length], 1 + (i % 100))),
                 "puts up to the cap must all signal progress");
         }
         assertFalse(
-            loader.apply("cap-overflow", envelope("true", ApiKeys.METADATA, 1)),
+            loader.apply("cap-overflow", envelope("true", keys[0], 1)),
             "cap-overflow update must signal no progress (previously-good state preserved)");
     }
 
