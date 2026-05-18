@@ -18,7 +18,9 @@ package org.apache.kafka.network.http;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 
+import org.eclipse.jetty.ee10.servlet.ErrorHandler;
 import org.eclipse.jetty.ee10.servlet.ServletContextHandler;
+import org.eclipse.jetty.ee10.servlet.ServletContextRequest;
 import org.eclipse.jetty.ee10.servlet.ServletHolder;
 import org.eclipse.jetty.ee10.websocket.server.config.JettyWebSocketServletContainerInitializer;
 import org.eclipse.jetty.server.Server;
@@ -26,7 +28,11 @@ import org.eclipse.jetty.server.ServerConnector;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
 import java.util.Objects;
+
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
 
 /**
  * Wraps a Jetty {@link Server} hosting {@link KafkaHttpServlet} at {@code /v1/topics/*}. The broker constructs one of
@@ -113,6 +119,14 @@ public final class KafkaHttpServer {
 
         ServletContextHandler context = new ServletContextHandler();
         context.setContextPath(CONTEXT_PATH);
+        // Render any container-level sendError(code, msg) as the bridge's {errorCode, errorMessage} JSON envelope —
+        // matching the shape KafkaHttpServlet.writeEnvelope produces. The load-bearing case is the WebSocket upgrade
+        // path below: JettyServerUpgradeResponse.sendError delegates to HttpServletResponse.sendError, which without
+        // this handler renders Jetty's stock HTML error page. A client following the bridge's documented contract
+        // ({errorCode, errorMessage} on every error) would have to special-case WS upgrade rejections — and a strict
+        // JSON parser would crash on the HTML. The handler also covers any future code path that calls sendError
+        // through the servlet context, so the envelope stays consistent without per-call-site discipline.
+        context.setErrorHandler(new JsonErrorHandler(mapper));
         // jetty.getThreadPool() returns the bound ThreadPool (Executor) — pass it to the servlet so async-completion
         // writes happen on Jetty I/O threads rather than the broker request-handler thread that completes the
         // submitter future. Without this, a slow HTTP client can pin a broker handler thread on a socket write.
@@ -138,6 +152,8 @@ public final class KafkaHttpServer {
                     // The path-spec was already matched by the WS filter, so this branch should be unreachable
                     // in practice — but defending against future spec changes (e.g. trailing slashes) by
                     // returning a sane error is cheap insurance.
+                    // sendError → HttpServletResponse.sendError → JsonErrorHandler renders the bridge's
+                    // {errorCode, errorMessage} envelope. See setErrorHandler() above.
                     resp.sendError(404, "topic path did not match /v1/topics/{topic}/subscribe");
                     return null;
                 }
@@ -147,6 +163,8 @@ public final class KafkaHttpServer {
                     // 503 + Retry-After is the right shape for a transient-capacity error at upgrade time;
                     // distinct from the SSE 429 because 429 means "you are rate-limited" while 503 means
                     // "this listener is full right now". Operator alerting reads them differently.
+                    // Retry-After must be set BEFORE sendError — sendError commits the response headers when
+                    // the configured ErrorHandler runs, and headers added after commit are dropped.
                     resp.setHeader("Retry-After", "5");
                     resp.sendError(503, "WebSocket subscription cap reached; try again shortly");
                     return null;
@@ -222,5 +240,42 @@ public final class KafkaHttpServer {
             return null;
         }
         return topic;
+    }
+
+    /**
+     * ErrorHandler that emits the bridge's canonical {@code {errorCode, errorMessage}} JSON envelope for any
+     * {@code sendError(code, message)} that reaches the servlet context. Mirrors
+     * {@link KafkaHttpServlet}'s {@code writeEnvelope} so a client that consumes the bridge's HTTP API sees a single
+     * error shape regardless of whether the failure originated in the servlet, the WebSocket upgrade gate, or a
+     * future code path that hits the container's error path.
+     *
+     * <p>The handler overrides {@code generateAcceptableResponse} rather than the public {@code handle} so it picks
+     * up any future Jetty plumbing improvements around error dispatch (forwarding, error-page semantics) for free.
+     */
+    static final class JsonErrorHandler extends ErrorHandler {
+
+        private final ObjectMapper mapper;
+
+        JsonErrorHandler(ObjectMapper mapper) {
+            this.mapper = mapper;
+        }
+
+        @Override
+        protected void generateAcceptableResponse(ServletContextRequest request,
+                                                  HttpServletRequest req,
+                                                  HttpServletResponse resp,
+                                                  int code,
+                                                  String message) throws IOException {
+            // Defensive: if some upstream filter already committed the response, all we can do is stop. Writing
+            // again would corrupt the stream (HTTP/1.1) or throw (HTTP/2). The status code is preserved.
+            if (resp.isCommitted()) {
+                return;
+            }
+            resp.setStatus(code);
+            resp.setContentType(ContentTypeNegotiator.APPLICATION_JSON);
+            byte[] payload = mapper.writeValueAsBytes(ErrorEnvelope.forMessage(mapper, code, message));
+            resp.setContentLength(payload.length);
+            resp.getOutputStream().write(payload);
+        }
     }
 }
