@@ -371,6 +371,59 @@ class WsStreamerTest {
         }
     }
 
+    @Test
+    void concurrentGrantsAcrossFetchBoundariesDoNotDuplicateDelivery() throws InterruptedException {
+        // Race window we are pinning: in handleFetchResult, the streamer used to clear fetchInFlight BEFORE
+        // staging records into the buffer. A credit-grant arriving in that window would run drainAndMaybeFetch
+        // → maybeKickFetch, observe (buffer empty, fetchInFlight false, currentOffset unchanged), win the CAS,
+        // and submit a fresh fetch at the SAME offset the just-completed fetch covered. The duplicate fetch
+        // then returns the same records, both batches drain through the buffer, and the client sees every
+        // offset twice.
+        //
+        // We can't deterministically force the race, so we maximise the probability instead: many small
+        // fetches (50 batches × 5 records = 50 race points), four pool threads to ensure handleFetchResult
+        // and drainAndMaybeFetch can genuinely overlap, and one credit-grant per record fired in parallel
+        // so a fresh grant is always racing each fetch completion.
+        //
+        // With the bug, this reliably observed duplicates within a handful of runs. With the fix (stage
+        // records and stamp throttle BEFORE clearing fetchInFlight) it must deliver every offset exactly once.
+        final int batches = 50;
+        final int batchSize = 5;
+        for (int b = 0; b < batches; b++) {
+            submitter.queueFetch(records((long) b * batchSize, batchSize));
+        }
+
+        ExecutorService pool = Executors.newFixedThreadPool(4);
+        try {
+            WsStreamer streamer = WsStreamer.start(sink, submitter, MAPPER, "t", 0, 0L,
+                OptionalInt.empty(), 0, token, pool);
+            List<CompletableFuture<Void>> futures = new ArrayList<>();
+            for (int i = 0; i < batches * batchSize; i++) {
+                futures.add(CompletableFuture.runAsync(() -> streamer.grantCredits(1), pool));
+            }
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            while (sink.recordCount() < batches * batchSize && System.nanoTime() < deadline) {
+                Thread.sleep(10);
+            }
+            assertEquals(batches * batchSize, sink.recordCount(),
+                "every queued record must be delivered exactly once across all fetch boundaries");
+
+            // Stronger invariant: every delivered offset must be unique. A duplicate delivery would show up
+            // here as the same offset appearing twice. This is the load-bearing assertion — a count-only
+            // check can pass even when the streamer over-delivers if some grants get parked.
+            java.util.Set<Long> seen = new java.util.HashSet<>();
+            for (int i = 0; i < sink.recordCount(); i++) {
+                long off = sink.recordOffsetAt(i);
+                assertTrue(seen.add(off),
+                    "offset " + off + " was delivered more than once — fetch-boundary race re-opened");
+            }
+        } finally {
+            pool.shutdownNow();
+            assertTrue(pool.awaitTermination(2, TimeUnit.SECONDS));
+        }
+    }
+
     // ----- helpers -----
 
     private static List<FetchResponseFormatter.FetchedRecord> records(long startOffset, int count) {

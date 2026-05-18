@@ -324,31 +324,60 @@ public final class WsStreamer {
     }
 
     private void handleFetchResult(RequestSubmitter.FetchResult result, Throwable throwable) {
-        fetchInFlight.set(false);
+        // Note: fetchInFlight is cleared LATE — only after records are staged and throttleUntilNanos is stamped.
+        // The window between "previous fetch resolved" and "buffer/throttle visible to a concurrent drain"
+        // used to admit a duplicate fetch at the unchanged currentOffset, delivering the same offsets twice.
+        // See the long comment before fetchInFlight.set(false) below for the full race analysis.
         if (closed.get()) {
+            fetchInFlight.set(false);
             return;
         }
         if (throwable != null) {
+            // close() runs inside failFetch; once closed=true, drainAndMaybeFetch and maybeKickFetch are both
+            // gated. Clearing fetchInFlight is defensive — irrelevant after close, but cheap and tidy.
+            fetchInFlight.set(false);
             failFetch(throwable);
             return;
         }
         FetchResponseFormatter.PartitionFetch view = result.partition();
         if (view.error() != Errors.NONE) {
+            fetchInFlight.set(false);
             String msg = view.errorMessage() != null ? view.errorMessage() : view.error().message();
             trySendErrorFrame(view.error().name(), msg);
             close();
             return;
         }
-        // Stage records into the buffer first; the drain pass will deliver them subject to credit.
+        // Stage records BEFORE clearing fetchInFlight. handleFetchResult runs on the httpExecutor (a
+        // multi-threaded Jetty thread pool in production), outside the draining mutex. A concurrent
+        // grantCredits → scheduleDrain → drainAndMaybeFetch → maybeKickFetch can race us. The race window
+        // we close here:
+        //   1. We clear fetchInFlight (OLD ordering).
+        //   2. Concurrent maybeKickFetch on another thread reads: buffer empty (records not yet offered),
+        //      credits > 0 (grant just landed), throttleUntilNanos = 0 (not yet stamped), fetchInFlight = false.
+        //   3. CAS fetchInFlight false→true succeeds, builds a FetchCommand at currentOffset = X (currentOffset
+        //      is only advanced in drainBufferWhileCredited as records are *delivered*, not when staged), and
+        //      submits a fresh fetch at X.
+        //   4. We finally offer records (offsets X, X+1, ...) into the buffer.
+        //   5. The duplicate fetch returns records at X, X+1, ... and offers them too.
+        //   6. drainBufferWhileCredited drains the buffer in order — same offsets twice.
+        // With the new ordering (stage records, stamp throttle, THEN clear fetchInFlight) a racing maybeKickFetch
+        // sees one of: fetchInFlight=true (CAS refuses), buffer non-empty (early-return at the first guard),
+        // or throttleUntilNanos > nanoTime() (deferred fetch). The AtomicBoolean write provides the necessary
+        // happens-before so the buffer and throttle writes are visible to any thread that observes fetchInFlight=false.
         for (FetchResponseFormatter.FetchedRecord r : view.records()) {
             buffer.offer(r);
         }
         long throttleMs = result.throttleTimeMs();
         if (throttleMs > 0) {
-            // Broker says back off. Stamp the deadline so maybeKickFetch (this drain pass and any credit-grant
-            // racing in during the window) skips the next fetch until we cross it. We still scheduleDrain so the
-            // staged records (if any) drain now — only the *next fetch* is gated.
+            // Stamp the deadline BEFORE clearing fetchInFlight for the same reason. An empty-but-throttled fetch
+            // would otherwise leave the deadline invisible to a concurrent maybeKickFetch, which would skip the
+            // back-off and tight-loop the broker.
             throttleUntilNanos.set(System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(throttleMs));
+        }
+        // All state visible. Release the in-flight latch; subsequent drains will pick up the staged records
+        // subject to credit, and a fresh fetch is gated on the buffer draining + throttle deadline passing.
+        fetchInFlight.set(false);
+        if (throttleMs > 0) {
             // Arm a wake-up at the deadline so the fetch resumes even if no client grant arrives.
             scheduleDrainAfter(throttleMs);
         }
