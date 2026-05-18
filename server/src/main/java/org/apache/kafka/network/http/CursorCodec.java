@@ -58,6 +58,16 @@ public final class CursorCodec {
         try {
             int partition = Integer.parseInt(raw.substring(firstSep + 1, lastSep));
             long offset = Long.parseLong(raw.substring(lastSep + 1));
+            // The explicit ?partition=&offset= path rejects negatives with a 400. A tampered or
+            // hand-rolled cursor that decodes to negative values must take the same path — otherwise
+            // negative partition / offset would leak into the broker's FetchRequest construction
+            // and surface as an opaque server-side error rather than a clean client-facing 400.
+            if (partition < 0) {
+                throw new IllegalArgumentException("Cursor partition must be non-negative");
+            }
+            if (offset < 0L) {
+                throw new IllegalArgumentException("Cursor offset must be non-negative");
+            }
             return new Cursor(topic, partition, offset);
         } catch (NumberFormatException e) {
             throw new IllegalArgumentException("Cursor numeric fields are malformed", e);

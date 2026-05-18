@@ -88,7 +88,10 @@ public final class WsSubscribeMessageParser {
         if (maxBytesNode == null || maxBytesNode.isNull()) {
             maxBytes = OptionalInt.empty();
         } else {
-            if (!maxBytesNode.canConvertToInt()) {
+            // canConvertToInt alone would accept fractional doubles like 1.9 and silently truncate
+            // via asInt(). For a wire protocol where integers carry semantic weight (credits,
+            // byte budgets) we require the JSON value to actually be an integer.
+            if (!maxBytesNode.isIntegralNumber() || !maxBytesNode.canConvertToInt()) {
                 throw new BadMessageException("field 'maxBytes' must be a positive integer");
             }
             int v = maxBytesNode.asInt();
@@ -105,7 +108,7 @@ public final class WsSubscribeMessageParser {
         if (creditsNode == null || creditsNode.isNull()) {
             throw new BadMessageException("missing field: credits");
         }
-        if (!creditsNode.canConvertToInt()) {
+        if (!creditsNode.isIntegralNumber() || !creditsNode.canConvertToInt()) {
             throw new BadMessageException("field 'credits' must be a positive integer");
         }
         int credits = creditsNode.asInt();
@@ -121,7 +124,7 @@ public final class WsSubscribeMessageParser {
         if (node == null || node.isNull()) {
             throw new BadMessageException("missing field: " + field);
         }
-        if (!node.canConvertToInt()) {
+        if (!node.isIntegralNumber() || !node.canConvertToInt()) {
             throw new BadMessageException("field '" + field + "' must be a non-negative integer");
         }
         int v = node.asInt();
@@ -136,7 +139,7 @@ public final class WsSubscribeMessageParser {
         if (node == null || node.isNull()) {
             throw new BadMessageException("missing field: " + field);
         }
-        if (!node.canConvertToLong()) {
+        if (!node.isIntegralNumber() || !node.canConvertToLong()) {
             throw new BadMessageException("field '" + field + "' must be a non-negative integer");
         }
         long v = node.asLong();

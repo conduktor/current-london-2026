@@ -79,4 +79,26 @@ class CursorCodecTest {
         CursorCodec.Cursor c = CursorCodec.decode(CursorCodec.encode("topic", 42, huge));
         assertEquals(huge, c.offset());
     }
+
+    @Test
+    void decodeRejectsNegativePartition() {
+        // A tampered cursor must take the same validation path as ?partition=-1 (rejected with 400).
+        // The encoder is permissive — a hand-rolled "topic|-1|0" base64url cursor exercises decode.
+        String tampered = java.util.Base64.getUrlEncoder().withoutPadding()
+            .encodeToString("topic|-1|0".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+            () -> CursorCodec.decode(tampered));
+        assertTrue(e.getMessage().contains("partition"),
+            "expected partition validation error, got: " + e.getMessage());
+    }
+
+    @Test
+    void decodeRejectsNegativeOffset() {
+        String tampered = java.util.Base64.getUrlEncoder().withoutPadding()
+            .encodeToString("topic|0|-1".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+            () -> CursorCodec.decode(tampered));
+        assertTrue(e.getMessage().contains("offset"),
+            "expected offset validation error, got: " + e.getMessage());
+    }
 }

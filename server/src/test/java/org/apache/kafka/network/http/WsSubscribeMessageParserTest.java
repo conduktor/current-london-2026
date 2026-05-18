@@ -244,4 +244,34 @@ class WsSubscribeMessageParserTest {
         assertThrows(WsSubscribeMessageParser.BadMessageException.class,
             () -> WsSubscribeMessageParser.parse("{\"type\":\"flow\",\"credits\":\"more\"}"));
     }
+
+    @Test
+    void rejectsFractionalCreditsInFlow() {
+        // Jackson's canConvertToInt accepts 1.9 and asInt() silently truncates to 1. For a wire
+        // protocol where integers carry semantic weight, fractional inputs are a client bug —
+        // reject loudly rather than silently round.
+        assertThrows(WsSubscribeMessageParser.BadMessageException.class,
+            () -> WsSubscribeMessageParser.parse("{\"type\":\"flow\",\"credits\":1.9}"));
+    }
+
+    @Test
+    void rejectsFractionalInitialCreditsInSubscribe() {
+        assertThrows(WsSubscribeMessageParser.BadMessageException.class,
+            () -> WsSubscribeMessageParser.parse(
+                "{\"type\":\"subscribe\",\"partition\":0,\"offset\":0,\"initialCredits\":2.5}"));
+    }
+
+    @Test
+    void rejectsFractionalOffsetInSubscribe() {
+        assertThrows(WsSubscribeMessageParser.BadMessageException.class,
+            () -> WsSubscribeMessageParser.parse(
+                "{\"type\":\"subscribe\",\"partition\":0,\"offset\":1.5,\"initialCredits\":5}"));
+    }
+
+    @Test
+    void rejectsFractionalMaxBytesInSubscribe() {
+        assertThrows(WsSubscribeMessageParser.BadMessageException.class,
+            () -> WsSubscribeMessageParser.parse(
+                "{\"type\":\"subscribe\",\"partition\":0,\"offset\":0,\"initialCredits\":5,\"maxBytes\":1024.5}"));
+    }
 }

@@ -75,6 +75,19 @@ public final class KafkaWebSocketEndpoint implements Session.Listener.AutoDemand
      */
     private static final Duration IDLE_TIMEOUT = Duration.ofMinutes(5);
 
+    /**
+     * Hard cap on queued outgoing frames per session. The credit-gated subscribe protocol is the
+     * primary backpressure mechanism — but it relies on the client granting credit only when it's
+     * ready to consume. A misbehaving client that grants a huge credit budget then stops reading
+     * from its socket would otherwise let Jetty's default-unbounded outbound queue grow without
+     * limit (Jetty 12's {@code MaxOutgoingFrames} defaults to {@code -1}). With this cap, the
+     * underlying writer surfaces a send failure once the queue is full, the streamer treats that
+     * as a fatal stream error, and the subscription is torn down — bounding per-session memory
+     * regardless of client misuse. 1024 frames leaves plenty of headroom for normal bursty
+     * delivery without ever growing unboundedly.
+     */
+    private static final int MAX_OUTGOING_FRAMES = 1024;
+
     private final String topic;
     private final RequestSubmitter submitter;
     private final ObjectMapper mapper;
@@ -108,6 +121,10 @@ public final class KafkaWebSocketEndpoint implements Session.Listener.AutoDemand
         // Cap the inbound text size so a hostile client cannot stream a multi-megabyte subscribe
         // frame into our heap. Subscribe/flow JSONs are tens of bytes; 8 KiB is loose but cheap.
         session.setMaxTextMessageSize(8 * 1024);
+        // Defence-in-depth backstop for the credit protocol. See MAX_OUTGOING_FRAMES javadoc — this
+        // is what stops a slow-reader-with-large-credit-grant from accumulating an unbounded outbound
+        // queue inside Jetty.
+        session.setMaxOutgoingFrames(MAX_OUTGOING_FRAMES);
     }
 
     @Override
@@ -260,8 +277,10 @@ public final class KafkaWebSocketEndpoint implements Session.Listener.AutoDemand
     /**
      * Adapter that lets the streamer write to the Jetty Session without depending on Jetty types.
      * sendText uses {@code Callback.NOOP} — fire-and-forget — because the streamer's credit gating
-     * already bounds the in-flight queue per subscription, and Jetty's own outgoing-frame queue
-     * (capped by {@code setMaxOutgoingFrames}) backstops any pathology.
+     * already bounds the in-flight delivery rate per subscription, and Jetty's outgoing-frame queue
+     * is explicitly capped via {@link #MAX_OUTGOING_FRAMES} in {@link #onWebSocketOpen}. Beyond that
+     * cap the underlying writer surfaces a send failure (Jetty 12 defaults to {@code -1} /
+     * unlimited, so the explicit cap above is what makes this code path bounded).
      */
     private final class SessionFrameSink implements WsStreamer.FrameSink {
         @Override
