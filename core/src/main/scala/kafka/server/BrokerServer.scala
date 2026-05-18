@@ -54,7 +54,8 @@ import org.apache.kafka.server.share.session.ShareSessionCache
 import org.apache.kafka.server.util.timer.{SystemTimer, SystemTimerReaper}
 import org.apache.kafka.server.util.{Deadline, FutureUtils, KafkaScheduler}
 import org.apache.kafka.server.{AssignmentsManager, BrokerFeatures, ClientMetricsManager, DelayedActionQueue}
-import org.apache.kafka.storage.internals.concentration.ConcentrationKernel
+import org.apache.kafka.server.config.ServerConfigs
+import org.apache.kafka.storage.internals.concentration.{ConcentrationKernel, LogicalTopicConfigParser}
 import org.apache.kafka.storage.internals.log.LogDirFailureChannel
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats
 
@@ -455,6 +456,15 @@ class BrokerServer(
       // its sidecar files. See storage/.../concentration/ConcentrationKernel for the API.
       concentrationKernel = new ConcentrationKernel(
         new File(logManager.liveLogDirs.head, "_concentration_sidecars"))
+
+      // Hook #6 (minimal): broker-config shortcut for declaring logical topics. The long-term
+      // path is a KRaft metadata record; until then, operators put their declarations in
+      // server.properties under concentration.logical.topics, e.g. "orders:100:shared:4". A
+      // malformed entry surfaces here as a ConfigException that fails broker startup — the
+      // right semantic, because we cannot serve a logical topic we cannot construct.
+      LogicalTopicConfigParser.parse(
+        config.getString(ServerConfigs.CONCENTRATION_LOGICAL_TOPICS_CONFIG)
+      ).forEach(concentrationKernel.declare(_))
 
       dataPlaneRequestProcessor = new KafkaApis(
         requestChannel = socketServer.dataPlaneRequestChannel,

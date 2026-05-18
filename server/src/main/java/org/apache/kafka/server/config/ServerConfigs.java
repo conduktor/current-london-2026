@@ -120,6 +120,18 @@ public class ServerConfigs {
             "initialization. This is useful when the authorizer is dependent on the cluster itself for bootstrapping, as is the case for " +
             "the StandardAuthorizer (which stores ACLs in the metadata log.) By default, all listeners included in controller.listener.names " +
             "will also be early start listeners. A listener should not appear in this list if it accepts external traffic.";
+
+    /************* Concentration (Infinite Partitions) Configuration ***********/
+    public static final String CONCENTRATION_LOGICAL_TOPICS_CONFIG = "concentration.logical.topics";
+    public static final String CONCENTRATION_LOGICAL_TOPICS_DEFAULT = "";
+    public static final String CONCENTRATION_LOGICAL_TOPICS_DOC =
+        "Comma-separated list of logical-topic declarations of the form logical:N:backing:M, where " +
+        "N is the number of logical partitions and M is the number of backing partitions (N >= M). " +
+        "Multiple logical topics may share a backing topic provided they agree on M. Empty (the default) " +
+        "means no logical topics are declared. This is a temporary broker-config shortcut for the " +
+        "Concentration / Infinite Partitions feature; the long-term path is a KRaft metadata record so " +
+        "declarations survive controller restarts and are replicated to followers. Malformed entries " +
+        "fail broker startup with a quoted offending entry and its 1-based index in the list.";
     public static final ConfigDef CONFIG_DEF =  new ConfigDef()
             .define(BROKER_ID_CONFIG, INT, BROKER_ID_DEFAULT, HIGH, BROKER_ID_DOC)
             .define(MESSAGE_MAX_BYTES_CONFIG, INT, LogConfig.DEFAULT_MAX_MESSAGE_BYTES, atLeast(0), HIGH, MESSAGE_MAX_BYTES_DOC)
@@ -132,6 +144,8 @@ public class ServerConfigs {
             /************* Authorizer Configuration ***********/
             .define(AUTHORIZER_CLASS_NAME_CONFIG, STRING, AUTHORIZER_CLASS_NAME_DEFAULT, new ConfigDef.NonNullValidator(), LOW, AUTHORIZER_CLASS_NAME_DOC)
             .define(EARLY_START_LISTENERS_CONFIG, STRING, null,  HIGH, EARLY_START_LISTENERS_DOC)
+            /************* Concentration (Infinite Partitions) Configuration ***********/
+            .define(CONCENTRATION_LOGICAL_TOPICS_CONFIG, STRING, CONCENTRATION_LOGICAL_TOPICS_DEFAULT, LOW, CONCENTRATION_LOGICAL_TOPICS_DOC)
             /************ Rack Configuration ******************/
             .define(BROKER_RACK_CONFIG, STRING, null, MEDIUM, BROKER_RACK_DOC)
             /** ********* Controlled shutdown configuration ***********/
