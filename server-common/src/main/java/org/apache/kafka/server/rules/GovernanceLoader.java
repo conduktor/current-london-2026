@@ -129,10 +129,13 @@ public final class GovernanceLoader {
         // surface and keeps the rejection contract symmetric across both
         // record shapes.
         if (RuleJsonCodec.isReservedNameShape(key)) {
+            // Round-13 BLOCKER-1: the rule id is wire-derived bytes; pipe
+            // through LogSafe so an attacker cannot inject ANSI escape
+            // sequences or forged log lines via the record key.
             LOG.warn("dropping __governance record for rule id '{}' — uses the reserved \"__name__\" shape " +
                 "(double-underscore prefix and suffix); these ids are reserved for engine-internal " +
                 "synthetic decisions and may not be authored by operators (record was a {})",
-                key, value == null ? "tombstone" : "update");
+                LogSafe.sanitize(key), value == null ? "tombstone" : "update");
             return false;
         }
         if (value == null) {
@@ -152,8 +155,12 @@ public final class GovernanceLoader {
         try {
             rule = RuleJsonCodec.decode(key, value);
         } catch (RuleEnvelopeException e) {
+            // Round-13 BLOCKER-1: both `key` and `e.getMessage()` carry
+            // attacker-controlled bytes (codec exceptions re-embed the bad
+            // id). Sanitise both.
             LOG.warn("rejecting bad __governance envelope for rule '{}': {} — " +
-                "previously installed version of this rule (if any) is preserved", key, e.getMessage());
+                "previously installed version of this rule (if any) is preserved",
+                LogSafe.sanitize(key), LogSafe.sanitize(e.getMessage()));
             return false;
         }
         // RuleSetBuilder.put rejects new ids past its MAX_RULES cap. Treat
@@ -164,8 +171,13 @@ public final class GovernanceLoader {
             working.put(rule);
             return true;
         } catch (IllegalStateException e) {
+            // Round-13 BLOCKER-1: cap-exceeded WARN is reachable in steady
+            // state (operator adds rule #1025); the message comes from
+            // RuleSetBuilder which is operator-trusted, but the `key` is
+            // still wire-derived and must be sanitised.
             LOG.warn("rejecting __governance update for rule '{}': {} — " +
-                "previously installed RuleSet is preserved", key, e.getMessage());
+                "previously installed RuleSet is preserved",
+                LogSafe.sanitize(key), LogSafe.sanitize(e.getMessage()));
             return false;
         }
     }

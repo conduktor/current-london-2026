@@ -18,6 +18,7 @@ package org.apache.kafka.server.rules.json;
 
 import org.apache.kafka.common.protocol.ApiKeys;
 import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.server.rules.LogSafe;
 import org.apache.kafka.server.rules.Rule;
 import org.apache.kafka.server.rules.RuleAction;
 import org.apache.kafka.server.rules.cel.CelCompilationException;
@@ -251,8 +252,13 @@ public final class RuleJsonCodec {
         for (int i = 0; i < id.length(); i++) {
             char c = id.charAt(i);
             if (isForbiddenIdCodepoint(c)) {
+                // Round-13 BLOCKER-1: the id is wire-derived and may itself
+                // contain the very codepoint we're rejecting. Sanitise it
+                // before embedding in the exception message so the WARN
+                // slot in GovernanceLoader (which logs e.getMessage()) does
+                // not re-introduce control characters into the broker log.
                 throw new RuleEnvelopeException(
-                    "rule id '" + id + "' contains forbidden codepoint U+"
+                    "rule id '" + LogSafe.sanitize(id) + "' contains forbidden codepoint U+"
                         + String.format("%04X", (int) c) + " at index " + i
                         + "; rule ids may not contain whitespace, zero-width, or BOM "
                         + "characters (operator-authored identifiers have no legitimate "
@@ -271,8 +277,11 @@ public final class RuleJsonCodec {
         // posture without a collision. Operator rules that respect the
         // convention are blocked here at intake.
         if (isReservedNameShape(id)) {
+            // Round-13 BLOCKER-1: same as the forbidden-codepoint branch
+            // — sanitise the id before embedding, since the loader's
+            // rejection WARN logs e.getMessage().
             throw new RuleEnvelopeException(
-                "rule id '" + id + "' uses the reserved \"__name__\" shape "
+                "rule id '" + LogSafe.sanitize(id) + "' uses the reserved \"__name__\" shape "
                     + "(double-underscore prefix and suffix); these ids are reserved "
                     + "for engine-internal synthetic decisions and may not be authored "
                     + "by operators");

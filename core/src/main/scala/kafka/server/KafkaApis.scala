@@ -62,6 +62,7 @@ import org.apache.kafka.coordinator.share.ShareCoordinator
 import org.apache.kafka.server.ClientMetricsManager
 import org.apache.kafka.server.authorizer._
 import org.apache.kafka.server.common.{GroupVersion, RequestLocal, TransactionVersion}
+import org.apache.kafka.server.rules.LogSafe
 import org.apache.kafka.server.rules.RuleEngine
 import org.apache.kafka.server.rules.extract.ApiMessageActivation
 import org.apache.kafka.server.share.context.ShareFetchContext
@@ -246,7 +247,7 @@ class KafkaApis(val requestChannel: RequestChannel,
           val authored = Errors.forCode(ruleDecision.errorCode.toShort)
           val denyError =
             if (authored == Errors.NONE || authored.exception == null) {
-              error(s"CEL rule '${ruleDecision.denyingRuleId}' produced an invalid " +
+              error(s"CEL rule '${LogSafe.sanitize(ruleDecision.denyingRuleId)}' produced an invalid " +
                 s"errorCode=${ruleDecision.errorCode} (resolved to ${authored.name} with " +
                 s"exception=${authored.exception}). This is a bug — the codec should have " +
                 s"rejected this at intake. Substituting POLICY_VIOLATION to honour the " +
@@ -255,8 +256,15 @@ class KafkaApis(val requestChannel: RequestChannel,
             } else {
               authored
             }
-          info(s"CEL rule '${ruleDecision.denyingRuleId}' denied ${request.header.apiKey} from " +
-            s"clientId='${request.header.clientId}' with ${denyError.name}")
+          // Round-13 BLOCKER-1/HIGH-1: both denyingRuleId (wire-derived; the
+          // codec already control-rejects on intake but defence-in-depth is
+          // cheap) and clientId (wire-derived; the request-header parser does
+          // NOT control-reject) are routed through LogSafe before landing in
+          // an operator-visible INFO log line. Without this, an attacker can
+          // either neutralise terminal output via ESC sequences or forge a
+          // new log line via CR+LF.
+          info(s"CEL rule '${LogSafe.sanitize(ruleDecision.denyingRuleId)}' denied ${request.header.apiKey} from " +
+            s"clientId='${LogSafe.sanitize(request.header.clientId)}' with ${denyError.name}")
           // sendErrorResponseMaybeThrottle still calls
           // maybeRecordAndGetThrottleTimeMs first — a CEL-denied request
           // DOES consume quota. This is the safe operator posture: an
