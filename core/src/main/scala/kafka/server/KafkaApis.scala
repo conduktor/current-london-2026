@@ -891,6 +891,16 @@ class KafkaApis(val requestChannel: RequestChannel,
             } else {
               val backingPartition = concentrationKernel.backingPartitionFor(logicalTopic, logicalPartition)
               val backingTp = new TopicIdPartition(backingTopicId, new TopicPartition(backingTopicName, backingPartition))
+              if (!concentrationKernel.isBackingReady(backingTp.topicPartition)) {
+                // Readiness gate closed for this backing partition. The local sidecar / tracker
+                // for this backing TP is being rebuilt after a leader-loss / leader-acquisition
+                // transition. Serving a fetch now would translate against stale physical→logical
+                // mappings and either mis-position the consumer or hand back records from a
+                // sibling logical topic. NOT_LEADER_OR_FOLLOWER tells the stock consumer to
+                // refresh metadata and retry — by the time the retry lands the recoverer will
+                // have either reopened the gate or actual leadership will have moved.
+                erroneous += topicIdPartition -> FetchResponse.partitionResponse(topicIdPartition, Errors.NOT_LEADER_OR_FOLLOWER)
+              } else {
               val nextLogical = concentrationKernel.nextLogicalOffset(logicalTopic, logicalPartition)
               val startLogical = concentrationKernel.startLogicalOffset(logicalTopic, logicalPartition)
               val logicalFetchOffset = data.fetchOffset
@@ -961,6 +971,7 @@ class KafkaApis(val requestChannel: RequestChannel,
                     // re-throw the precondition; otherwise OFFSET_OUT_OF_RANGE is correct.
                     erroneous += topicIdPartition -> FetchResponse.partitionResponse(topicIdPartition, Errors.OFFSET_OUT_OF_RANGE)
                 }
+              }
               }
             }
           }
@@ -1235,6 +1246,15 @@ class KafkaApis(val requestChannel: RequestChannel,
           val descriptor = descriptorOpt.get
           if (part.partitionIndex < 0 || part.partitionIndex >= descriptor.numLogicalPartitions) {
             buildErrorResponse(Errors.UNKNOWN_TOPIC_OR_PARTITION, part)
+          } else if (!concentrationKernel.isBackingReady(
+              new TopicPartition(descriptor.backingTopic,
+                concentrationKernel.backingPartitionFor(topic.name, part.partitionIndex)))) {
+            // Same readiness gate as Produce / Fetch: when the backing-TP tracker is mid-rebuild
+            // (leader-loss or first leader-acquisition before the recoverer publishes), the
+            // start/next offsets in the tracker are not trustworthy. Returning them would mis-seek
+            // the consumer. NOT_LEADER_OR_FOLLOWER routes the client into a metadata-refresh-retry
+            // loop that converges once the recoverer reopens the gate.
+            buildErrorResponse(Errors.NOT_LEADER_OR_FOLLOWER, part)
           } else {
             val kernelOffset: Option[Long] = part.timestamp match {
               case ListOffsetsRequest.EARLIEST_TIMESTAMP | ListOffsetsRequest.EARLIEST_LOCAL_TIMESTAMP =>
@@ -2006,6 +2026,17 @@ class KafkaApis(val requestChannel: RequestChannel,
           logicalTopicResponses += topicPartition -> new DeleteRecordsPartitionResult()
             .setLowWatermark(DeleteRecordsResponse.INVALID_LOW_WATERMARK)
             .setErrorCode(Errors.UNKNOWN_TOPIC_OR_PARTITION.code)
+        } else if (!concentrationKernel.isBackingReady(
+            new TopicPartition(descriptor.backingTopic,
+              concentrationKernel.backingPartitionFor(topicPartition.topic, topicPartition.partition)))) {
+          // Backing tracker is being rebuilt — advancing the logical start offset against a
+          // half-rebuilt tracker would either over-truncate (silently dropping records the new
+          // leader hasn't yet recovered into the in-memory state) or under-truncate (advance to
+          // a stale tail). NOT_LEADER_OR_FOLLOWER tells admin clients to retry against the same
+          // broker after metadata refresh; the recoverer reopens the gate once the rebuild lands.
+          logicalTopicResponses += topicPartition -> new DeleteRecordsPartitionResult()
+            .setLowWatermark(DeleteRecordsResponse.INVALID_LOW_WATERMARK)
+            .setErrorCode(Errors.NOT_LEADER_OR_FOLLOWER.code)
         } else {
           // Sentinel -1 (DeleteRecordsRequest.HIGH_WATERMARK) means "delete up to the high
           // watermark" — for a logical topic that is the kernel's nextLogicalOffset.
