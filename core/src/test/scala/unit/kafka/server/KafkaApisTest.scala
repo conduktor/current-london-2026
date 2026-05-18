@@ -14872,4 +14872,146 @@ class KafkaApisTest extends Logging {
     assertEquals(Errors.GROUP_AUTHORIZATION_FAILED.code, groupResult.errorCode)
   }
 
+  @Test
+  def testProduceTenantRewritesTransactionalIdToPhysicalForReplicaManager(): Unit = {
+    // Tenant produces transactional records with txnId="my-txn". The wire id
+    // hashes to a __transaction_state partition different from the one
+    // InitProducerId stored state under (`__tenant_acme.my-txn`), so without
+    // rewrite the verification call would miss state AND two tenants reusing
+    // the same external id would collide on the coordinator's verification
+    // cache key. Assert: replicaManager.handleProduceAppend receives the
+    // physical txnId.
+    val physicalTopic = "acme.orders"
+    addTopicToMetadataCache(physicalTopic, numPartitions = 1)
+
+    val produceRequest = ProduceRequest.builder(new ProduceRequestData()
+      .setTopicData(new ProduceRequestData.TopicProduceDataCollection(
+        Collections.singletonList(new ProduceRequestData.TopicProduceData()
+          .setName("orders").setPartitionData(Collections.singletonList(
+            new ProduceRequestData.PartitionProduceData()
+              .setIndex(0)
+              .setRecords(MemoryRecords.withTransactionalRecords(
+                Compression.NONE, 0, 0, 0, new SimpleRecord("test".getBytes))))))
+          .iterator))
+      .setAcks(1.toShort)
+      .setTransactionalId("my-txn")
+      .setTimeoutMs(5000))
+      .build(ApiKeys.PRODUCE.latestVersion)
+    val request = buildRequest(
+      produceRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), any[Long])).thenReturn(0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    kafkaApis = createKafkaApis(
+      authorizer = None,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    verify(replicaManager).handleProduceAppend(
+      anyLong,
+      anyShort,
+      ArgumentMatchers.eq(false),
+      ArgumentMatchers.eq("__tenant_acme.my-txn"),
+      any(),
+      any(),
+      any(),
+      any(),
+      any(),
+      any())
+  }
+
+  @Test
+  def testProduceTenantRefusesCrossTenantTransactionalId(): Unit = {
+    // Tenant `acme` sets transactionalId="__tenant_other.foo". toPhysicalTxnId
+    // would attempt to double-prefix and throw IllegalArgumentException; the
+    // handler must surface TRANSACTIONAL_ID_AUTHORIZATION_FAILED so the wire
+    // shape doesn't hint that "other" exists or has an outstanding producer.
+    val physicalTopic = "acme.orders"
+    addTopicToMetadataCache(physicalTopic, numPartitions = 1)
+
+    val produceRequest = ProduceRequest.builder(new ProduceRequestData()
+      .setTopicData(new ProduceRequestData.TopicProduceDataCollection(
+        Collections.singletonList(new ProduceRequestData.TopicProduceData()
+          .setName("orders").setPartitionData(Collections.singletonList(
+            new ProduceRequestData.PartitionProduceData()
+              .setIndex(0)
+              .setRecords(MemoryRecords.withTransactionalRecords(
+                Compression.NONE, 0, 0, 0, new SimpleRecord("test".getBytes))))))
+          .iterator))
+      .setAcks(1.toShort)
+      .setTransactionalId("__tenant_other.foo")
+      .setTimeoutMs(5000))
+      .build(ApiKeys.PRODUCE.latestVersion)
+    val request = buildRequest(
+      produceRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), any[Long])).thenReturn(0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    kafkaApis = createKafkaApis(
+      authorizer = None,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[ProduceResponse](request)
+    assertEquals(1, response.data.responses.size)
+    val partitionResponse = response.data.responses.asScala.head.partitionResponses.asScala.head
+    assertEquals(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.code, partitionResponse.errorCode)
+    verify(replicaManager, never()).handleProduceAppend(
+      anyLong, anyShort, any[Boolean](), any[String](),
+      any(), any(), any(), any(), any(), any())
+  }
+
+  @Test
+  def testProduceOutsideInRefusesTenantPrincipalNamespaceTxnId(): Unit = {
+    // Non-tenant super-user on the cluster-wide listener submits
+    // transactionalId="__tenant_acme.tx". Without rewrite, toPhysicalTxnId is
+    // identity, the auth check passes for a super-user, and the produce
+    // verification call would fence acme's producer slot. Refuse outside-in
+    // with TRANSACTIONAL_ID_AUTHORIZATION_FAILED before the request reaches
+    // replicaManager.
+    val produceRequest = ProduceRequest.builder(new ProduceRequestData()
+      .setTopicData(new ProduceRequestData.TopicProduceDataCollection(
+        Collections.singletonList(new ProduceRequestData.TopicProduceData()
+          .setName("topic").setPartitionData(Collections.singletonList(
+            new ProduceRequestData.PartitionProduceData()
+              .setIndex(0)
+              .setRecords(MemoryRecords.withTransactionalRecords(
+                Compression.NONE, 0, 0, 0, new SimpleRecord("test".getBytes))))))
+          .iterator))
+      .setAcks(1.toShort)
+      .setTransactionalId("__tenant_acme.tx")
+      .setTimeoutMs(5000))
+      .build(ApiKeys.PRODUCE.latestVersion)
+    val request = buildRequest(produceRequest) // default: cluster-wide listener, "Alice"
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), any[Long])).thenReturn(0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    kafkaApis = createKafkaApis(
+      authorizer = None,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[ProduceResponse](request)
+    assertEquals(1, response.data.responses.size)
+    val partitionResponse = response.data.responses.asScala.head.partitionResponses.asScala.head
+    assertEquals(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.code, partitionResponse.errorCode,
+      "non-tenant caller naming `__tenant_<known>.X` must be refused before reaching the coordinator")
+    verify(replicaManager, never()).handleProduceAppend(
+      anyLong, anyShort, any[Boolean](), any[String](),
+      any(), any(), any(), any(), any(), any())
+  }
+
 }

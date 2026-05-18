@@ -962,15 +962,6 @@ class KafkaApis(val requestChannel: RequestChannel,
   def handleProduceRequest(request: RequestChannel.Request, requestLocal: RequestLocal): Unit = {
     val produceRequest = request.body[ProduceRequest]
 
-    if (RequestUtils.hasTransactionalRecords(produceRequest)) {
-      val isAuthorizedTransactional = produceRequest.transactionalId != null &&
-        authHelper.authorize(request.context, WRITE, TRANSACTIONAL_ID, produceRequest.transactionalId)
-      if (!isAuthorizedTransactional) {
-        requestHelper.sendErrorResponseMaybeThrottle(request, Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.exception)
-        return
-      }
-    }
-
     val tenantCtx = tenantContextFor(request)
     val tenantScoped = tenantCtx.effectiveTenant.isPresent
     // Refuse any unsafe request — see TenantContext.isUnsafe. Each requested
@@ -978,7 +969,10 @@ class KafkaApis(val requestChannel: RequestChannel,
     // (logical from the caller's POV); the request reaches neither
     // authorization nor replicaManager. For acks=0 there is no response on
     // the wire — mirror the standard ack=0 error path and close the
-    // connection so the client refreshes its metadata.
+    // connection so the client refreshes its metadata. Runs BEFORE the
+    // transactional-id rewrite/auth below so its wire shape (per-partition
+    // TOPIC_AUTHORIZATION_FAILED, acks=0 close) is preserved and cannot be
+    // probed via the txn auth path.
     if (tenantCtx.isUnsafe) {
       val refused = mutable.Map[TopicPartition, PartitionResponse]()
       produceRequest.data.topicData.forEach(t => t.partitionData.forEach(p =>
@@ -992,6 +986,43 @@ class KafkaApis(val requestChannel: RequestChannel,
         requestChannel.sendResponse(request, refusedResponse, None)
       }
       return
+    }
+
+    // Transactional-id rewrite. AddPartitionsToTxnManager.partitionFor hashes
+    // the wire transactionalId to pick a `__transaction_state` partition, and
+    // ReplicaManager.handleProduceAppend forwards it to the coordinator for
+    // verification. Routing on the LOGICAL id would miss the state
+    // InitProducerId stored under `__tenant_<id>.<name>` AND let two tenants
+    // reusing the same external txn id collide on the verification cache key.
+    // Mirror every other tenant-aware transactional handler: rewrite first,
+    // then authorise on the physical name (so an ACL granted against the
+    // resolved id applies consistently with InitProducerId / EndTxn /
+    // AddOffsetsToTxn / TxnOffsetCommit).
+    val logicalTransactionalId = produceRequest.transactionalId
+    if (!tenantScoped && isReservedTenantPrincipalNamespace(logicalTransactionalId)) {
+      // Outside-in: non-tenant caller naming `__tenant_<known>.foo` would
+      // fence the tenant's producer slot. Refuse with the auth-failed wire
+      // shape so the response cannot be used as a probe for tenant existence.
+      requestHelper.sendErrorResponseMaybeThrottle(request, Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.exception)
+      return
+    }
+    val physicalTransactionalId: String =
+      try tenantCtx.toPhysicalTxnId(logicalTransactionalId)
+      catch {
+        // A tenant addressing `__tenant_other.foo` — same wire shape an auth
+        // failure would produce.
+        case _: IllegalArgumentException =>
+          requestHelper.sendErrorResponseMaybeThrottle(request, Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.exception)
+          return
+      }
+
+    if (RequestUtils.hasTransactionalRecords(produceRequest)) {
+      val isAuthorizedTransactional = physicalTransactionalId != null &&
+        authHelper.authorize(request.context, WRITE, TRANSACTIONAL_ID, physicalTransactionalId)
+      if (!isAuthorizedTransactional) {
+        requestHelper.sendErrorResponseMaybeThrottle(request, Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.exception)
+        return
+      }
     }
 
     // Reserved-physical-form guard. A tenant submitting `acme.orders` is
@@ -1202,7 +1233,7 @@ class KafkaApis(val requestChannel: RequestChannel,
         timeout = produceRequest.timeout.toLong,
         requiredAcks = produceRequest.acks,
         internalTopicsAllowed = internalTopicsAllowed,
-        transactionalId = produceRequest.transactionalId,
+        transactionalId = physicalTransactionalId,
         entriesPerPartition = authorizedRequestInfo,
         responseCallback = sendResponseCallback,
         recordValidationStatsCallback = processingStatsCallback,
