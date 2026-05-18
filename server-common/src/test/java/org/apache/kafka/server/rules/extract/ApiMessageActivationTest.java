@@ -724,6 +724,100 @@ public class ApiMessageActivationTest {
     }
 
     @Test
+    public void sslKeystoreCertificateChainIsRedacted() {
+        // Codex round-3 P2: ssl.keystore.certificate.chain is declared
+        // ConfigDef.Type.PASSWORD in SslConfigs alongside ssl.keystore.key.
+        // Upstream broker config logging redacts it; the rule engine MUST
+        // not surface it via the activation map either, or a CEL rule
+        // could read PEM material that upstream redaction explicitly hides.
+        AlterableConfigCollection configs = new AlterableConfigCollection();
+        configs.add(new AlterableConfig()
+            .setName("ssl.keystore.certificate.chain")
+            .setValue("-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----"));
+        AlterConfigsResource resource = new AlterConfigsResource()
+            .setResourceType((byte) 2)
+            .setResourceName("audit-events")
+            .setConfigs(configs);
+        AlterConfigsResourceCollection resources = new AlterConfigsResourceCollection();
+        resources.add(resource);
+        AlterConfigsRequestData req = new AlterConfigsRequestData().setResources(resources);
+
+        Map<String, Object> m = ApiMessageActivation.from(req);
+        Map<?, ?> cfg = (Map<?, ?>) ((List<?>) ((Map<?, ?>) ((List<?>) m.get("resources")).get(0)).get("configs")).get(0);
+        assertEquals("ssl.keystore.certificate.chain", cfg.get("name"));
+        assertNull(cfg.get("value"),
+            "ssl.keystore.certificate.chain is PASSWORD-typed in SslConfigs and must be redacted");
+    }
+
+    @Test
+    public void listenerPrefixedSslKeystoreCertificateChainIsRedacted() {
+        // Codex round-3 P2: per-listener override of the keystore PEM chain
+        // (eg. `listener.name.internal.ssl.keystore.certificate.chain`)
+        // holds the same PEM material as the bare key and must redact the
+        // same way. Pin the endsWith match against a regression.
+        AlterableConfigCollection configs = new AlterableConfigCollection();
+        configs.add(new AlterableConfig()
+            .setName("listener.name.internal.ssl.keystore.certificate.chain")
+            .setValue("-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----"));
+        AlterConfigsResource resource = new AlterConfigsResource()
+            .setResourceType((byte) 2)
+            .setResourceName("audit-events")
+            .setConfigs(configs);
+        AlterConfigsResourceCollection resources = new AlterConfigsResourceCollection();
+        resources.add(resource);
+        AlterConfigsRequestData req = new AlterConfigsRequestData().setResources(resources);
+
+        Map<String, Object> m = ApiMessageActivation.from(req);
+        Map<?, ?> cfg = (Map<?, ?>) ((List<?>) ((Map<?, ?>) ((List<?>) m.get("resources")).get(0)).get("configs")).get(0);
+        assertNull(cfg.get("value"),
+            "listener-prefixed ssl.keystore.certificate.chain must redact via the endsWith match");
+    }
+
+    @Test
+    public void sslTruststoreCertificatesIsRedacted() {
+        // Codex round-3 P2: ssl.truststore.certificates is also
+        // ConfigDef.Type.PASSWORD in SslConfigs. Same reasoning as the
+        // keystore chain: upstream treats it opaquely, so CEL must too.
+        AlterableConfigCollection configs = new AlterableConfigCollection();
+        configs.add(new AlterableConfig()
+            .setName("ssl.truststore.certificates")
+            .setValue("-----BEGIN CERTIFICATE-----\nMIIC...\n-----END CERTIFICATE-----"));
+        AlterConfigsResource resource = new AlterConfigsResource()
+            .setResourceType((byte) 2)
+            .setResourceName("audit-events")
+            .setConfigs(configs);
+        AlterConfigsResourceCollection resources = new AlterConfigsResourceCollection();
+        resources.add(resource);
+        AlterConfigsRequestData req = new AlterConfigsRequestData().setResources(resources);
+
+        Map<String, Object> m = ApiMessageActivation.from(req);
+        Map<?, ?> cfg = (Map<?, ?>) ((List<?>) ((Map<?, ?>) ((List<?>) m.get("resources")).get(0)).get("configs")).get(0);
+        assertNull(cfg.get("value"),
+            "ssl.truststore.certificates is PASSWORD-typed in SslConfigs and must be redacted");
+    }
+
+    @Test
+    public void listenerPrefixedSslTruststoreCertificatesIsRedacted() {
+        // Codex round-3 P2: same listener-prefixed pattern for truststore PEM.
+        AlterableConfigCollection configs = new AlterableConfigCollection();
+        configs.add(new AlterableConfig()
+            .setName("listener.name.external.ssl.truststore.certificates")
+            .setValue("-----BEGIN CERTIFICATE-----\nMIIC...\n-----END CERTIFICATE-----"));
+        AlterConfigsResource resource = new AlterConfigsResource()
+            .setResourceType((byte) 2)
+            .setResourceName("audit-events")
+            .setConfigs(configs);
+        AlterConfigsResourceCollection resources = new AlterConfigsResourceCollection();
+        resources.add(resource);
+        AlterConfigsRequestData req = new AlterConfigsRequestData().setResources(resources);
+
+        Map<String, Object> m = ApiMessageActivation.from(req);
+        Map<?, ?> cfg = (Map<?, ?>) ((List<?>) ((Map<?, ?>) ((List<?>) m.get("resources")).get(0)).get("configs")).get(0);
+        assertNull(cfg.get("value"),
+            "listener-prefixed ssl.truststore.certificates must redact via the endsWith match");
+    }
+
+    @Test
     public void sensitiveValueRedactionIsCaseInsensitive() {
         // The pattern matches lowercased input. A protocol that arrived with
         // unusual casing (`SSL.Keystore.Password`) MUST still trigger

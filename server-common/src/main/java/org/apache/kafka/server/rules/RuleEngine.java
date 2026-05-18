@@ -17,6 +17,7 @@
 package org.apache.kafka.server.rules;
 
 import org.apache.kafka.common.protocol.ApiKeys;
+import org.apache.kafka.common.security.auth.KafkaPrincipal;
 import org.apache.kafka.common.utils.SecurityUtils;
 
 import org.slf4j.Logger;
@@ -176,6 +177,16 @@ public final class RuleEngine {
      * runtime. This matches upstream {@code StandardAuthorizer}'s
      * super.users parsing, which also throws on malformed entries.
      *
+     * <p>Codex round-3 P1: {@link SecurityUtils#parseKafkaPrincipal(String)}
+     * only requires the string to contain a single {@code ':'} — it does NOT
+     * reject empty {@code principalType} or empty {@code name}. So
+     * {@code ":broker"} parses to a principal with empty type, and
+     * {@code "User:"} parses to a principal with empty name. Both forms
+     * would almost certainly silently under-grant the bypass (the runtime
+     * peer principal is never reported with an empty component). We reject
+     * them here so an operator typo fails startup instead of producing an
+     * unreachable allow-list entry.
+     *
      * <p>Returns the canonical string form of each parsed principal
      * (mirroring how the network layer reports the authenticated peer
      * principal at request time) so that {@link #bypassIsAuthorisedFor(String)}
@@ -185,7 +196,7 @@ public final class RuleEngine {
      *            return an empty set, granting no bypass)
      * @return canonical principal strings; never {@code null}
      * @throws IllegalArgumentException if any non-empty segment fails to
-     *         parse as a Kafka principal
+     *         parse as a Kafka principal, or has blank principal type / name
      */
     public static Set<String> parseBypassPrincipals(String raw) {
         if (raw == null) {
@@ -198,10 +209,26 @@ public final class RuleEngine {
                 continue;
             }
             // SecurityUtils.parseKafkaPrincipal throws IllegalArgumentException
-            // on a malformed entry (no ':' separator, empty type, etc.). We let
-            // that propagate so broker startup fails loudly.
-            String canonical = SecurityUtils.parseKafkaPrincipal(trimmed).toString();
-            out.add(canonical);
+            // on a missing ':' separator. We let that propagate so broker
+            // startup fails loudly.
+            KafkaPrincipal principal = SecurityUtils.parseKafkaPrincipal(trimmed);
+            // Codex round-3 P1: SecurityUtils does not validate that the type
+            // and name are non-empty. Reject blank components here — the
+            // runtime peer principal never carries an empty type or name, so
+            // such an entry is silently unreachable allow-listing.
+            if (principal.getPrincipalType().trim().isEmpty()) {
+                throw new IllegalArgumentException(
+                    "governance.bypass.principals entry has blank principal type: '"
+                    + trimmed + "'. Format is `type:name` (eg. `User:broker`); "
+                    + "both components must be non-blank.");
+            }
+            if (principal.getName().trim().isEmpty()) {
+                throw new IllegalArgumentException(
+                    "governance.bypass.principals entry has blank principal name: '"
+                    + trimmed + "'. Format is `type:name` (eg. `User:broker`); "
+                    + "both components must be non-blank.");
+            }
+            out.add(principal.toString());
         }
         return Collections.unmodifiableSet(out);
     }
@@ -310,13 +337,14 @@ public final class RuleEngine {
 
     /**
      * Backwards-compatible 4-argument form: passes {@code null} as the
-     * principal name. Equivalent to legacy behaviour iff the engine was
-     * constructed without a trusted-bypass principal set — in that case the
-     * principal is ignored anyway. When a trusted set IS configured this
-     * form will never grant the bypass (null principal cannot match), so
-     * callers that want the principal narrowing to actually take effect
-     * must use the 5-argument form. Provided so existing governance unit
-     * tests need not change in lockstep with the engine surface change.
+     * principal name. Codex round-3 P0: production deployments always
+     * configure a non-empty {@code governance.bypass.principals} (broker
+     * startup refuses an empty list), so this overload never grants the
+     * bypass at run-time — a {@code null} principal cannot match any entry
+     * in the allow-list. Callers that need the principal narrowing to
+     * actually take effect MUST use the 5-argument form. Retained so
+     * existing governance unit tests (which test rule semantics, not the
+     * bypass) need not change in lockstep with the engine surface change.
      */
     public RuleDecision evaluate(ApiKeys apiKey,
                                  String clientId,

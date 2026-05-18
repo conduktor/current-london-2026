@@ -172,24 +172,27 @@ class KafkaApis(val requestChannel: RequestChannel,
       // activation supplier closure is constructed only when mayDeny returns true.
       //
       // The privileged-listener bypass is necessary but not sufficient: the engine ALSO
-      // requires the peer principal to be in a trusted-bypass allow-list (typically
-      // super.users). The listener flag is forged-resistant — set by the network layer
-      // based on the accepting listener — but on its own it cannot defend against an
-      // operator misconfiguration where the inter-broker listener is shared with client
-      // traffic. The principal check closes that gap. When no allow-list is configured
-      // the engine logs a WARN at startup and falls back to listener-only semantics.
+      // requires the peer principal to be in the dedicated bypass allow-list
+      // (`governance.bypass.principals`, decoupled from `super.users`). The listener
+      // flag is forged-resistant — set by the network layer based on the accepting
+      // listener — but on its own it cannot defend against an operator misconfiguration
+      // where the inter-broker listener is shared with client traffic. The principal
+      // check closes that gap. Codex round-3 P0: an empty `governance.bypass.principals`
+      // is rejected at broker startup (see BrokerServer.scala), so by the time control
+      // reaches here the allow-list is guaranteed non-empty — there is no listener-only
+      // fallback, no fail-open, and the inter-broker traffic exemption is explicit.
       val fromPrivilegedListener = request.context.fromPrivilegedListener
       if (ruleEngine.mayDeny(request.header.apiKey, fromPrivilegedListener)) {
         // Build the canonical "type:name" form rather than calling toString.
         // For the default org.apache.kafka.common.security.auth.KafkaPrincipal
         // the two are identical, but custom KafkaPrincipal subclasses
         // sometimes override toString to append role/group metadata.
-        // super.users entries are stored canonically (type:name) and parsed
-        // back by KafkaPrincipal.fromString, so a toString-augmented
-        // principal would fail the rule-engine bypass check even when the
-        // operator listed it in super.users. Codex deep-audit P1c — match
-        // the way Kafka's own authorizer canonicalises super-user
-        // comparisons, not the toString contract.
+        // governance.bypass.principals entries are stored canonically
+        // (type:name) via RuleEngine.parseBypassPrincipals → KafkaPrincipal,
+        // so a toString-augmented principal would fail the rule-engine
+        // bypass check even when the operator listed it. Codex deep-audit
+        // P1c — match the canonical "type:name" form the engine compares
+        // against, not the toString contract.
         val principalName = Option(request.context.principal)
           .map(p => p.getPrincipalType + ":" + p.getName).orNull
         val ruleDecision = ruleEngine.evaluate(

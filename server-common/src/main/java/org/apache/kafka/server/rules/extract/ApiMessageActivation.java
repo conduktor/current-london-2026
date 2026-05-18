@@ -327,6 +327,21 @@ public final class ApiMessageActivation {
      *   <li>contains {@code .keystore.key} — PEM-form private key material
      *       (eg. {@code ssl.keystore.key}, the PEM variant of the keystore,
      *       and its listener-prefixed counterparts).</li>
+     *   <li>ends with {@code ssl.keystore.certificate.chain} — the PEM
+     *       certificate chain that accompanies {@code ssl.keystore.key}.
+     *       Although a public certificate chain is not strictly secret,
+     *       {@code SslConfigs} classifies it as {@code ConfigDef.Type.PASSWORD}
+     *       so that AlterConfigs/IncrementalAlterConfigs round-trip handling
+     *       (and broker log output) treats it as opaque. Surfacing it via
+     *       the activation map would let CEL rules read material that
+     *       upstream redaction explicitly hides. Listener-prefixed forms
+     *       (eg. {@code listener.name.internal.ssl.keystore.certificate.chain})
+     *       are covered by {@code endsWith}. Codex round-3 P2 finding.</li>
+     *   <li>ends with {@code ssl.truststore.certificates} — same reasoning
+     *       as the certificate chain: {@code SslConfigs} declares it
+     *       PASSWORD-typed; matching here keeps the rule engine consistent
+     *       with broker config redaction. Listener-prefixed forms covered
+     *       by {@code endsWith}. Codex round-3 P2 finding.</li>
      *   <li>contains {@code secret} — defensive catch-all for any operator
      *       config whose name advertises that it carries a shared secret.</li>
      * </ul>
@@ -339,11 +354,32 @@ public final class ApiMessageActivation {
      */
     private static boolean isSensitiveConfigName(String name) {
         String lc = name.toLowerCase(Locale.ROOT);
-        return lc.endsWith(".password")
-            || lc.equals("sasl.jaas.config")
-            || lc.endsWith(".sasl.jaas.config")
-            || lc.contains(".keystore.key")
-            || lc.contains("secret");
+        if (lc.endsWith(".password")) {
+            return true;
+        }
+        if (lc.equals("sasl.jaas.config") || lc.endsWith(".sasl.jaas.config")) {
+            return true;
+        }
+        if (lc.contains(".keystore.key")) {
+            return true;
+        }
+        if (isExactOrListenerPrefixed(lc, "ssl.keystore.certificate.chain")) {
+            return true;
+        }
+        if (isExactOrListenerPrefixed(lc, "ssl.truststore.certificates")) {
+            return true;
+        }
+        return lc.contains("secret");
+    }
+
+    /**
+     * True iff {@code lc} equals {@code key} (bare form) or ends with
+     * {@code "." + key} (listener-prefixed form, eg.
+     * {@code listener.name.internal.ssl.keystore.certificate.chain}). Both
+     * arguments are expected lower-cased.
+     */
+    private static boolean isExactOrListenerPrefixed(String lc, String key) {
+        return lc.equals(key) || lc.endsWith("." + key);
     }
 
     private static Object convert(Object v, int depth, int[] invocations) {

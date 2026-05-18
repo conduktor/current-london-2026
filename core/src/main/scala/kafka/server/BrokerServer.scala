@@ -507,17 +507,35 @@ class BrokerServer(
       // ride the broker-internal traffic bypass) decoupled from the broad
       // authorization concept that super.users represents. Malformed entries
       // fail broker startup loudly inside parseBypassPrincipals — no silent
-      // drop, no fail-open. An empty list means NO principal can ride the
-      // bypass; ALL traffic — including inter-broker — is then subject to
-      // CEL rule evaluation. Operators are documented in ServerConfigs as
-      // required to enroll the broker's own principal for steady-state
-      // safety.
+      // drop, no fail-open.
+      //
+      // Codex round-3 P0: an EMPTY parsed set must also fail broker startup,
+      // not silently produce a broker mode where a DENY-all/FETCH rule can
+      // block broker-internal traffic (replica fetchers, the __governance
+      // log consumer, KRaft metadata fetches). The fix is unambiguous and
+      // operator-facing: the broker refuses to start until at least one
+      // principal is enrolled. Operators must explicitly list the broker's
+      // own authenticated principal (eg. `User:ANONYMOUS` for PLAINTEXT
+      // inter-broker, or the SSL/SASL-derived principal otherwise).
       val bypassPrincipals: java.util.Set[String] =
         RuleEngine.parseBypassPrincipals(
           config.originals().get(ServerConfigs.GOVERNANCE_BYPASS_PRINCIPALS_CONFIG) match {
             case null => null
             case v    => v.toString
           })
+      if (bypassPrincipals.isEmpty) {
+        throw new ConfigException(
+          ServerConfigs.GOVERNANCE_BYPASS_PRINCIPALS_CONFIG,
+          "",
+          "must be a non-empty semicolon-separated list of Kafka principals. " +
+            "At least one entry MUST be the broker's own authenticated principal " +
+            "(eg. `User:ANONYMOUS` for PLAINTEXT inter-broker; the SSL/SASL-derived " +
+            "principal otherwise) so that broker-internal traffic — replica fetchers, " +
+            "the __governance log consumer, KRaft metadata fetches — cannot be blocked " +
+            "by a DENY-all CEL rule. An empty list would leave inter-broker traffic " +
+            "subject to rule evaluation and is rejected at startup."
+        )
+      }
       ruleEngine = new RuleEngine(bypassPrincipals)
 
       // Authoritative probe for "is this broker a replica of __governance-0?".

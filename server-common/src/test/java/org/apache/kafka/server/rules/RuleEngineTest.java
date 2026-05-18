@@ -571,4 +571,61 @@ public class RuleEngineTest {
             IllegalArgumentException.class,
             () -> RuleEngine.parseBypassPrincipals("User:ok;noseparator"));
     }
+
+    @Test
+    public void parseBypassPrincipalsThrowsOnBlankPrincipalType() {
+        // Codex round-3 P1: SecurityUtils.parseKafkaPrincipal only requires
+        // one ':' — it does NOT validate that the type or name is non-empty.
+        // ':broker' parses successfully into a principal with empty type,
+        // which can never match a runtime peer principal (always reports a
+        // non-empty type, eg. "User"). We reject such entries here so an
+        // operator typo fails startup instead of producing silent under-
+        // grants.
+        IllegalArgumentException ex1 = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals(":broker"));
+        assertTrue(ex1.getMessage().contains("blank principal type"),
+            "exception should name the blank-type failure mode; got: " + ex1.getMessage());
+
+        // Whitespace-only type is the same failure mode.
+        IllegalArgumentException ex2 = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals("   :broker"));
+        assertTrue(ex2.getMessage().contains("blank principal type"),
+            "whitespace-only type must also be rejected; got: " + ex2.getMessage());
+    }
+
+    @Test
+    public void parseBypassPrincipalsThrowsOnBlankPrincipalName() {
+        // Codex round-3 P1: same failure mode on the name side. 'User:'
+        // parses to a KafkaPrincipal with empty name; we reject it so the
+        // operator's intended grant is never silently a no-op.
+        IllegalArgumentException ex1 = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals("User:"));
+        assertTrue(ex1.getMessage().contains("blank principal name"),
+            "exception should name the blank-name failure mode; got: " + ex1.getMessage());
+
+        // Whitespace-only name is the same failure mode. Note: SecurityUtils
+        // splits on the FIRST ':' only, so "User:   " yields name="   ".
+        IllegalArgumentException ex2 = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals("User:   "));
+        assertTrue(ex2.getMessage().contains("blank principal name"),
+            "whitespace-only name must also be rejected; got: " + ex2.getMessage());
+    }
+
+    @Test
+    public void parseBypassPrincipalsThrowsOnBothComponentsBlank() {
+        // Pure ':' — neither type nor name has any content. The blank-type
+        // check fires first, but the important property is that this entry
+        // is rejected, not which message wins.
+        org.junit.jupiter.api.Assertions.assertThrows(
+            IllegalArgumentException.class,
+            () -> RuleEngine.parseBypassPrincipals(":"));
+        // Whitespace-around-colon is the same.
+        org.junit.jupiter.api.Assertions.assertThrows(
+            IllegalArgumentException.class,
+            () -> RuleEngine.parseBypassPrincipals("  :  "));
+    }
 }

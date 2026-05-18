@@ -123,7 +123,19 @@ public class ServerConfigs {
 
     /************ Governance (CEL rule engine) Configuration ************/
     public static final String GOVERNANCE_BYPASS_PRINCIPALS_CONFIG = "governance.bypass.principals";
-    public static final String GOVERNANCE_BYPASS_PRINCIPALS_DEFAULT = "";
+    // Codex round-3 P0: the default matches Kafka's default inter-broker
+    // security model (PLAINTEXT inter-broker → authenticated peer principal
+    // is User:ANONYMOUS). This guarantees that an out-of-box broker can
+    // always replicate its own __governance log and KRaft metadata even if
+    // an operator forgets to set this config. Production deployments running
+    // SSL or SASL on the inter-broker listener MUST override this with the
+    // actual broker principal (eg. the SSL certificate's DN or the SASL
+    // username), or the rule engine will subject replica fetcher traffic to
+    // CEL evaluation. The broker refuses to start if the parsed list is
+    // empty (see BrokerServer), so an operator typo `=` (clearing the
+    // default) is rejected at startup rather than silently producing a
+    // self-blockable broker.
+    public static final String GOVERNANCE_BYPASS_PRINCIPALS_DEFAULT = "User:ANONYMOUS";
     public static final String GOVERNANCE_BYPASS_PRINCIPALS_DOC =
             "Semicolon-separated list of Kafka principals (e.g. " +
             "<code>User:broker;User:kafka-controller</code>) that are granted " +
@@ -141,11 +153,17 @@ public class ServerConfigs {
             "would (a) break deployments where the broker is ACL-authorized " +
             "but not in <code>super.users</code> and (b) over-grant the " +
             "bypass to non-broker super-users that can reach a privileged " +
-            "listener.<br/>Operators MUST enroll the broker's own principal " +
-            "here for steady-state safety; an empty list means no principal " +
-            "can exercise the bypass and ALL traffic — including inter-broker " +
-            "— is subject to rule evaluation. Malformed entries fail broker " +
-            "startup at config load (no silent drop).";
+            "listener.<br/>The default <code>User:ANONYMOUS</code> matches " +
+            "Kafka's default PLAINTEXT inter-broker protocol — every peer " +
+            "broker presents the same anonymous identity. Production " +
+            "deployments running SSL or SASL on the inter-broker listener " +
+            "MUST override this with the broker's actual authenticated " +
+            "principal (the certificate DN or SASL username). An empty list " +
+            "is REJECTED at broker startup: the broker refuses to run in a " +
+            "state where a DENY-all rule could block its own replica fetchers " +
+            "or KRaft metadata reads. Malformed entries (no <code>:</code> " +
+            "separator, blank principal type, or blank name) also fail " +
+            "startup loudly — no silent drop.";
     public static final ConfigDef CONFIG_DEF =  new ConfigDef()
             .define(BROKER_ID_CONFIG, INT, BROKER_ID_DEFAULT, HIGH, BROKER_ID_DOC)
             .define(MESSAGE_MAX_BYTES_CONFIG, INT, LogConfig.DEFAULT_MAX_MESSAGE_BYTES, atLeast(0), HIGH, MESSAGE_MAX_BYTES_DOC)

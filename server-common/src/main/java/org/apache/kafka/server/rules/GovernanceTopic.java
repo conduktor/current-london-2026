@@ -27,12 +27,17 @@ package org.apache.kafka.server.rules;
  * tombstones (null values) delete a rule.
  *
  * <p><b>The broker's own consumer is exempt from rules because it arrives on a
- * privileged (inter-broker) listener — not because of its client-id.</b> The
- * client-id prefix is purely diagnostic, used in request-log output. The
- * authoritative bypass is the {@code fromPrivilegedListener} flag the network
- * layer attaches to every request based on which TCP listener accepted the
- * connection; external clients cannot forge it. See
- * {@link RuleEngine#evaluate(org.apache.kafka.common.protocol.ApiKeys, String, boolean, java.util.function.Supplier)}
+ * privileged (inter-broker) listener AND its authenticated peer principal is
+ * enrolled in {@code governance.bypass.principals} — not because of its
+ * client-id.</b> The client-id prefix is purely diagnostic, used in request-log
+ * output. The authoritative bypass requires BOTH: (a) the
+ * {@code fromPrivilegedListener} flag the network layer attaches to every
+ * request based on which TCP listener accepted the connection (external clients
+ * cannot forge it), AND (b) the peer principal matching the dedicated
+ * {@code governance.bypass.principals} allow-list. The broker refuses to start
+ * with an empty allow-list (Codex round-3 P0), so by run-time the second
+ * condition is always meaningfully enforced. See
+ * {@link RuleEngine#evaluate(org.apache.kafka.common.protocol.ApiKeys, String, String, boolean, java.util.function.Supplier)}
  * for the bypass contract.
  */
 public final class GovernanceTopic {
