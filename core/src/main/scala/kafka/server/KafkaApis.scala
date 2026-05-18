@@ -618,12 +618,21 @@ class KafkaApis(val requestChannel: RequestChannel,
     // Refuse any unsafe request — see TenantContext.isUnsafe. Each requested
     // topic-partition gets TOPIC_AUTHORIZATION_FAILED carrying the wire name
     // (logical from the caller's POV); the request reaches neither
-    // authorization nor replicaManager.
+    // authorization nor replicaManager. For acks=0 there is no response on
+    // the wire — mirror the standard ack=0 error path and close the
+    // connection so the client refreshes its metadata.
     if (tenantCtx.isUnsafe) {
       val refused = mutable.Map[TopicPartition, PartitionResponse]()
       produceRequest.data.topicData.forEach(t => t.partitionData.forEach(p =>
         refused += new TopicPartition(t.name, p.index) -> new PartitionResponse(Errors.TOPIC_AUTHORIZATION_FAILED)))
-      requestChannel.sendResponse(request, new ProduceResponse(refused.asJava), None)
+      val refusedResponse = new ProduceResponse(refused.asJava)
+      if (produceRequest.acks == 0) {
+        info(s"Closing connection due to unsafe tenant context on acks=0 produce " +
+          s"(correlation id ${request.header.correlationId}, client id ${request.header.clientId})")
+        requestChannel.closeConnection(request, refusedResponse.errorCounts)
+      } else {
+        requestChannel.sendResponse(request, refusedResponse, None)
+      }
       return
     }
 

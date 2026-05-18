@@ -10881,7 +10881,7 @@ class KafkaApisTest extends Logging {
   // rewrite its writes into the tenant namespace.
   // ---------------------------------------------------------------------------
 
-  private def buildSingleTopicProduceRequest(topic: String, partition: Int = 0): ProduceRequest = {
+  private def buildSingleTopicProduceRequest(topic: String, partition: Int = 0, acks: Short = 1): ProduceRequest = {
     ProduceRequest.builder(new ProduceRequestData()
       .setTopicData(new ProduceRequestData.TopicProduceDataCollection(
         Collections.singletonList(new ProduceRequestData.TopicProduceData()
@@ -10890,7 +10890,7 @@ class KafkaApisTest extends Logging {
               .setIndex(partition)
               .setRecords(MemoryRecords.withRecords(Compression.NONE, new SimpleRecord("test".getBytes))))))
           .iterator))
-      .setAcks(1.toShort)
+      .setAcks(acks)
       .setTimeoutMs(5000))
       .build(ApiKeys.PRODUCE.latestVersion)
   }
@@ -11011,6 +11011,35 @@ class KafkaApisTest extends Logging {
     // replicaManager MUST NOT be invoked: the request never reaches the append path.
     verify(replicaManager, never()).handleProduceAppend(
       anyLong, anyShort, anyBoolean, any(), any(), any(), any(), any(), any(), any())
+  }
+
+  @Test
+  def testProduceUnsafeWithAcksZeroClosesConnection(): Unit = {
+    // acks=0: the producer does not expect a response. Sending a regular
+    // ProduceResponse would leave the client waiting on a frame the wire
+    // contract says the server will not send. The standard ack=0 error path
+    // closes the connection so the client refreshes its metadata; the unsafe
+    // refusal path MUST mirror that — anything else degrades into a wire
+    // protocol mismatch on every refused fire-and-forget produce.
+    addTopicToMetadataCache("acme.orders", numPartitions = 1)
+
+    val produceRequest = buildSingleTopicProduceRequest("orders", acks = 0.toShort)
+    val request = buildRequest(
+      produceRequest,
+      listenerName = TENANT_LISTENER,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "Alice")) // no tenant prefix
+
+    kafkaApis = createKafkaApis(
+      authorizer = None,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    verify(requestChannel).closeConnection(
+      ArgumentMatchers.eq(request),
+      any[java.util.Map[Errors, Integer]]())
+    verify(requestChannel, never()).sendResponse(any(), any(), any())
+    verify(replicaManager, never()).handleProduceAppend(
+      anyLong, anyShort, anyBoolean(), any(), any(), any(), any(), any(), any(), any())
   }
 
   @Test
