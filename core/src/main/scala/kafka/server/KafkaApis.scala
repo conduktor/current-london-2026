@@ -164,6 +164,22 @@ class KafkaApis(val requestChannel: RequestChannel,
     }
   }
 
+  // The FetchResponse Topic string field is serialized only in v0-12. After we
+  // generate the response the topic name on each FetchableTopicResponse mirrors
+  // the physical TopicIdPartition key, which would leak `<tenantId>.<topic>` to
+  // a v0-12 caller that asked for plain `<topic>`. Rewrite physical → logical
+  // here, after recordBytesOutMetric has used the physical name for stats.
+  private def rewriteFetchResponseToLogical(resp: FetchResponse, ctx: TenantContext): Unit = {
+    if (!ctx.effectiveTenant.isPresent) return
+    resp.data.responses.forEach { topicResp =>
+      val name = topicResp.topic
+      if (name != null && !name.isEmpty) {
+        val logical = ctx.toLogical(name)
+        if (logical != name) topicResp.setTopic(logical)
+      }
+    }
+  }
+
   private def forwardToController(request: RequestChannel.Request): Unit = {
     def responseCallback(responseOpt: Option[AbstractResponse]): Unit = {
       responseOpt match {
@@ -222,7 +238,9 @@ class KafkaApis(val requestChannel: RequestChannel,
         val rewritten = new CreateTopicsResponseData.CreatableTopicResultCollection(resp.data.topics.size)
         resp.data.topics.forEach { r =>
           val logical = Option(r.name).map(p => physicalToLogical.getOrElse(p, ctx.toLogical(p))).orNull
-          rewritten.add(r.duplicate().setName(logical))
+          rewritten.add(r.duplicate()
+            .setName(logical)
+            .setErrorMessage(scrubMessage(r.errorMessage, ctx)))
         }
         resp.data.setTopics(rewritten)
         requestHelper.sendForwardedResponse(request, resp)
@@ -232,12 +250,24 @@ class KafkaApis(val requestChannel: RequestChannel,
     })
   }
 
+  // The controller may embed a physical topic name in an `errorMessage`
+  // string (e.g. "Topic 'acme.orders' already exists"). Strip every physical
+  // occurrence so tenants never see the prefix in human-readable text.
+  private def scrubMessage(msg: String, ctx: TenantContext): String = {
+    if (msg == null) return null
+    if (!ctx.effectiveTenant.isPresent) return msg
+    val tenantId = ctx.effectiveTenant.get
+    val prefix = tenantId + "."
+    if (!msg.contains(prefix)) msg else msg.replace(prefix, "")
+  }
+
   // DELETE_TOPICS — Forwarded to the controller. v0-5 carries a list of topic
   // names; v6+ carries DeleteTopicState entries that may name OR id the topic.
   // For each entry with a name we translate logical → physical; for delete-by-id
-  // we forward the id as-is and post-validate the controller's response — if the
-  // returned physical name does not belong to the tenant, the response is
-  // redacted to UNKNOWN_TOPIC_ID rather than leaking the foreign name.
+  // we PRE-RESOLVE the id through metadataCache before forwarding — any id that
+  // resolves to a topic outside the tenant's namespace (or that the broker has
+  // never heard of) is rejected with UNKNOWN_TOPIC_ID at the broker, and never
+  // reaches the controller. Internal topics ids are treated as foreign.
   // Privileged caller on a tenant-bound listener is refused outright.
   def handleDeleteTopicsRequest(request: RequestChannel.Request): Unit = {
     val ctx = tenantContextFor(request)
@@ -261,21 +291,41 @@ class KafkaApis(val requestChannel: RequestChannel,
       return
     }
     val physicalToLogical = mutable.Map[String, String]()
+    val preRejected = new util.ArrayList[DeleteTopicsResponseData.DeletableTopicResult]()
     if (version >= 6) {
-      val rewritten = new util.ArrayList[DeleteTopicsRequestData.DeleteTopicState](delReq.data.topics.size)
+      val topicIdToName = metadataCache.topicIdsToNames()
+      val forwardable = new util.ArrayList[DeleteTopicsRequestData.DeleteTopicState](delReq.data.topics.size)
       delReq.data.topics.forEach { t =>
         if (t.name != null) {
           val logical = t.name
           val physical = ctx.toPhysical(logical)
           physicalToLogical(physical) = logical
-          rewritten.add(t.duplicate().setName(physical))
+          forwardable.add(t.duplicate().setName(physical))
         } else {
-          // delete-by-id: pass through; response phase will validate the
-          // resolved name belongs to the tenant before exposing it.
-          rewritten.add(t.duplicate())
+          // delete-by-id: pre-resolve and authorise BEFORE forwarding so a
+          // foreign UUID cannot cause a foreign topic to be deleted. Unknown
+          // UUIDs and foreign UUIDs are indistinguishable in the response —
+          // both surface as UNKNOWN_TOPIC_ID with name=null.
+          val resolved = Option(topicIdToName.get(t.topicId))
+          if (resolved.exists(name => ctx.belongsToTenant(name))) {
+            forwardable.add(t.duplicate())
+          } else {
+            preRejected.add(new DeleteTopicsResponseData.DeletableTopicResult()
+              .setName(null)
+              .setTopicId(t.topicId)
+              .setErrorCode(Errors.UNKNOWN_TOPIC_ID.code))
+          }
         }
       }
-      delReq.data.setTopics(rewritten)
+      delReq.data.setTopics(forwardable)
+      // If every entry was rejected at the broker, do not forward at all.
+      if (forwardable.isEmpty) {
+        val responses = new DeleteTopicsResponseData.DeletableTopicResultCollection(preRejected.size)
+        preRejected.forEach(r => responses.add(r))
+        requestChannel.sendResponse(request,
+          new DeleteTopicsResponse(new DeleteTopicsResponseData().setResponses(responses)), None)
+        return
+      }
     } else {
       val rewritten = new util.ArrayList[String](delReq.data.topicNames.size)
       delReq.data.topicNames.forEach { name =>
@@ -287,18 +337,21 @@ class KafkaApis(val requestChannel: RequestChannel,
     }
     forwardingManager.forwardRequest(request, delReq, {
       case Some(resp: DeleteTopicsResponse) =>
-        val rewritten = new DeleteTopicsResponseData.DeletableTopicResultCollection(resp.data.responses.size)
+        val rewritten = new DeleteTopicsResponseData.DeletableTopicResultCollection(
+          resp.data.responses.size + preRejected.size)
+        preRejected.forEach(r => rewritten.add(r))
         resp.data.responses.forEach { r =>
           val physical = r.name
           val rebuilt = if (physical == null) {
             // controller could not resolve the id (UNKNOWN_TOPIC_ID etc); pass through.
             r.duplicate()
-          } else if (ctx.belongsToTenant(physical) || Topic.isInternal(physical)) {
+          } else if (ctx.belongsToTenant(physical)) {
             val logical = physicalToLogical.getOrElse(physical, ctx.toLogical(physical))
-            r.duplicate().setName(logical)
+            r.duplicate().setName(logical).setErrorMessage(scrubMessage(r.errorMessage, ctx))
           } else {
-            // id-based delete that resolved to a topic outside the tenant's
-            // namespace — redact the name and surface UNKNOWN_TOPIC_ID.
+            // Defence-in-depth: if the controller surfaced a physical name we
+            // did not pre-authorise (shouldn't happen now), redact rather than
+            // leak the foreign name.
             new DeleteTopicsResponseData.DeletableTopicResult()
               .setName(null)
               .setTopicId(r.topicId)
@@ -753,15 +806,52 @@ class KafkaApis(val requestChannel: RequestChannel,
       fetchRequest.fetchData(topicNames).forEach { (tip, _) =>
         refused.put(tip, FetchResponse.partitionResponse(tip, Errors.TOPIC_AUTHORIZATION_FAILED))
       }
-      requestChannel.sendResponse(
-        request,
-        FetchResponse.of(Errors.NONE, 0, FetchMetadata.INVALID_SESSION_ID, refused, Collections.emptyList()),
-        None)
+      val refusedResponse =
+        FetchResponse.of(Errors.NONE, 0, FetchMetadata.INVALID_SESSION_ID, refused, Collections.emptyList())
+      // The TopicIdPartition keys may carry physical names (v13+ resolved via
+      // metadataCache); strip the tenant prefix before we ship the refusal so
+      // a privileged caller never observes the physical namespace.
+      rewriteFetchResponseToLogical(refusedResponse, tenantCtx)
+      requestChannel.sendResponse(request, refusedResponse, None)
       return
     }
 
-    val fetchData = fetchRequest.fetchData(topicNames)
-    val forgottenTopics = fetchRequest.forgottenTopics(topicNames)
+    val rawFetchData = fetchRequest.fetchData(topicNames)
+    val rawForgottenTopics = fetchRequest.forgottenTopics(topicNames)
+
+    // Tenant IN rewrite (logical → physical) happens BEFORE the fetch context
+    // is built so session tracking, replicaManager, updateAndGenerateResponseData
+    // and recordBytesOutMetric all run in physical space end-to-end. For v13+
+    // the TIPs are already physical (resolved from metadataCache.topicIdsToNames);
+    // for v0-12 they carry the logical name from the wire. Foreign topics
+    // (outside the tenant namespace) are kept in fetchContext.fetchData under
+    // their original wire name so updateAndGenerateResponseData can still look
+    // up reqData for the erroneous bucket — they are surfaced as
+    // UNKNOWN_TOPIC_OR_PARTITION below so the response never reveals whether
+    // the foreign topic exists.
+    val foreignTipForTenant = new mutable.HashSet[TopicIdPartition]
+    val fetchData = if (tenantScoped) {
+      val rewritten = new util.LinkedHashMap[TopicIdPartition, FetchRequest.PartitionData](rawFetchData.size)
+      rawFetchData.forEach { (tip, data) =>
+        normaliseTenantTopicForFetch(tip, tenantCtx, versionId) match {
+          case Some(physicalTip) => rewritten.put(physicalTip, data)
+          case None =>
+            rewritten.put(tip, data)
+            foreignTipForTenant += tip
+        }
+      }
+      rewritten
+    } else rawFetchData
+    val forgottenTopics = if (tenantScoped) {
+      val rewritten = new util.ArrayList[TopicIdPartition](rawForgottenTopics.size)
+      rawForgottenTopics.forEach { tip =>
+        normaliseTenantTopicForFetch(tip, tenantCtx, versionId) match {
+          case Some(physicalTip) => rewritten.add(physicalTip)
+          case None => () // foreign topics are dropped from the forgotten set entirely
+        }
+      }
+      rewritten
+    } else rawForgottenTopics
 
     val fetchContext = fetchManager.newContext(
       fetchRequest.version,
@@ -779,6 +869,8 @@ class KafkaApis(val requestChannel: RequestChannel,
         fetchContext.foreachPartition { (topicIdPartition, data) =>
           if (topicIdPartition.topic == null)
             erroneous += topicIdPartition -> FetchResponse.partitionResponse(topicIdPartition, Errors.UNKNOWN_TOPIC_ID)
+          else if (foreignTipForTenant.contains(topicIdPartition))
+            erroneous += topicIdPartition -> FetchResponse.partitionResponse(topicIdPartition, Errors.UNKNOWN_TOPIC_OR_PARTITION)
           else if (!metadataCache.contains(topicIdPartition.topicPartition))
             erroneous += topicIdPartition -> FetchResponse.partitionResponse(topicIdPartition, Errors.UNKNOWN_TOPIC_OR_PARTITION)
           else
@@ -795,32 +887,13 @@ class KafkaApis(val requestChannel: RequestChannel,
       fetchContext.foreachPartition { (topicIdPartition, partitionData) =>
         if (topicIdPartition.topic == null)
           erroneous += topicIdPartition -> FetchResponse.partitionResponse(topicIdPartition, Errors.UNKNOWN_TOPIC_ID)
+        else if (foreignTipForTenant.contains(topicIdPartition))
+          erroneous += topicIdPartition -> FetchResponse.partitionResponse(topicIdPartition, Errors.UNKNOWN_TOPIC_OR_PARTITION)
         else
           partitionDatas += topicIdPartition -> partitionData
       }
-      // IN rewrite + tenant boundary check. For v13+ Fetch the topic name on
-      // each TopicIdPartition was resolved from metadataCache.topicIdsToNames
-      // so it is already PHYSICAL; for v0-12 the name is what the client put
-      // on the wire (LOGICAL). We normalise everything to physical here:
-      //   - if the name already belongs to the tenant or is internal, leave it
-      //   - otherwise try toPhysical(name) — if THAT belongs to the tenant,
-      //     adopt it (v0-12 path)
-      //   - otherwise the topic is outside the tenant's namespace; surface
-      //     UNKNOWN_TOPIC_OR_PARTITION rather than reveal whether it exists.
-      // After this pass all interesting/authorized entries have physical names.
-      val normalisedPartitionDatas =
-        if (tenantScoped) {
-          partitionDatas.flatMap { case (tip, data) =>
-            normaliseTenantTopicForFetch(tip, tenantCtx, versionId) match {
-              case Some(physicalTip) => Some(physicalTip -> data)
-              case None =>
-                erroneous += tip -> FetchResponse.partitionResponse(tip, Errors.UNKNOWN_TOPIC_OR_PARTITION)
-                None
-            }
-          }
-        } else partitionDatas
-      val authorizedTopics = authHelper.filterByAuthorized(request.context, READ, TOPIC, normalisedPartitionDatas)(_._1.topicPartition.topic)
-      normalisedPartitionDatas.foreach { case (topicIdPartition, data) =>
+      val authorizedTopics = authHelper.filterByAuthorized(request.context, READ, TOPIC, partitionDatas)(_._1.topicPartition.topic)
+      partitionDatas.foreach { case (topicIdPartition, data) =>
         if (!authorizedTopics.contains(topicIdPartition.topic))
           erroneous += topicIdPartition -> FetchResponse.partitionResponse(topicIdPartition, Errors.TOPIC_AUTHORIZATION_FAILED)
         else if (!metadataCache.contains(topicIdPartition.topicPartition))
@@ -902,6 +975,7 @@ class KafkaApis(val requestChannel: RequestChannel,
         trace(s"Sending Fetch response with partitions.size=$responsePartitionsSize, " +
           s"metadata=${fetchResponse.sessionId}")
         recordBytesOutMetric(fetchResponse)
+        rewriteFetchResponseToLogical(fetchResponse, tenantCtx)
         requestHelper.sendResponseExemptThrottle(request, fetchResponse)
       } else {
         // Record both bandwidth and request quota-specific values and throttle by muting the channel if any of the
@@ -935,6 +1009,7 @@ class KafkaApis(val requestChannel: RequestChannel,
         }
 
         recordBytesOutMetric(fetchResponse)
+        rewriteFetchResponseToLogical(fetchResponse, tenantCtx)
         // Send the response immediately.
         requestChannel.sendResponse(request, fetchResponse, None)
       }

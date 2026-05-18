@@ -11202,6 +11202,75 @@ class KafkaApisTest extends Logging {
     verify(replicaManager, never()).fetchMessages(any(), any(), any(), any())
   }
 
+  @Test
+  def testFetchV12TenantResponseTopicFieldIsLogical(): Unit = {
+    // Pre-id-fetch (v0-12) carries the Topic string on the wire. The broker
+    // must rewrite logical -> physical end-to-end (so sessions, replicaManager
+    // and response generation all run on physical names) AND rewrite the
+    // response's Topic field back to logical, or it would leak `acme.orders`
+    // to a tenant that asked for `orders`.
+    val topicId = Uuid.randomUuid()
+    val logicalTp = new TopicPartition("orders", 0)
+    val physicalTp = new TopicPartition("acme.orders", 0)
+    val physicalTidp = new TopicIdPartition(Uuid.ZERO_UUID, physicalTp)
+    addTopicToMetadataCache(physicalTp.topic, numPartitions = 1, numBrokers = 1, topicId)
+
+    when(replicaManager.fetchMessages(
+      any[FetchParams],
+      any[Seq[(TopicIdPartition, FetchRequest.PartitionData)]],
+      any[ReplicaQuota],
+      any[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]()
+    )).thenAnswer(invocation => {
+      val interesting = invocation.getArgument(1).asInstanceOf[Seq[(TopicIdPartition, FetchRequest.PartitionData)]]
+      assertEquals(Set("acme.orders"), interesting.map(_._1.topic).toSet,
+        "replicaManager must be fetched against the physical name")
+      val callback = invocation.getArgument(3).asInstanceOf[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]
+      callback(Seq(physicalTidp -> new FetchPartitionData(Errors.NONE, 100, 0, MemoryRecords.EMPTY,
+        Optional.empty(), OptionalLong.empty(), Optional.empty(), OptionalInt.empty(), false)))
+    })
+
+    // Build a v12 request that carries the LOGICAL topic name on the wire.
+    // After the handler's IN rewrite the fetchContext is built around the
+    // PHYSICAL TopicIdPartition, so the test's fake fetchContext is keyed by
+    // the physical TIP — anything else would diverge from production state.
+    val fetchData = Map(physicalTidp -> new FetchRequest.PartitionData(Uuid.ZERO_UUID, 0, 0, 1000,
+      Optional.empty())).asJava
+    val fetchDataBuilder = Map(logicalTp -> new FetchRequest.PartitionData(Uuid.ZERO_UUID, 0, 0, 1000,
+      Optional.empty())).asJava
+    val fetchMetadata = new JFetchMetadata(0, 0)
+    val fetchContext = new FullFetchContext(time, new FetchSessionCacheShard(1000, 100),
+      fetchMetadata, fetchData, true, false)
+    val newContextFetchDataCaptor = ArgumentCaptor.forClass(classOf[util.Map[TopicIdPartition, FetchRequest.PartitionData]])
+    when(fetchManager.newContext(
+      any[Short], any[JFetchMetadata], any[Boolean],
+      newContextFetchDataCaptor.capture(),
+      any[util.List[TopicIdPartition]],
+      any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val fetchRequest = new FetchRequest.Builder(12, 12, -1, -1, 100, 0, fetchDataBuilder).build()
+    val request = buildRequest(
+      fetchRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(
+      authorizer = None,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleFetchRequest(request)
+
+    // IN rewrite happened before the fetch context was built.
+    assertEquals(Set("acme.orders"), newContextFetchDataCaptor.getValue.keySet.asScala.map(_.topic).toSet,
+      "fetchManager.newContext must be called with physical names so session tracking is symmetric end-to-end")
+
+    val response = verifyNoThrottling[FetchResponse](request)
+    val topicResponses = response.data.responses.asScala.toSeq
+    assertEquals(1, topicResponses.size)
+    assertEquals("orders", topicResponses.head.topic,
+      "v0-12 response topic field must be the logical name, never the physical prefix")
+  }
+
   // ---------------------------------------------------------------------------
   // CreateTopics — multi-tenancy
   //
