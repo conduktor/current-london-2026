@@ -196,8 +196,52 @@ public class RuleJsonCodecTest {
             RuleEnvelopeException ex = assertThrows(RuleEnvelopeException.class,
                 () -> RuleJsonCodec.decode(id, SAMPLE.getBytes(StandardCharsets.UTF_8)),
                 "id should be rejected: '" + id + "'");
-            assertTrue(ex.getMessage().contains("whitespace"),
-                "rejection must name whitespace as the cause: " + ex.getMessage());
+            assertTrue(ex.getMessage().contains("forbidden codepoint")
+                    || ex.getMessage().contains("whitespace"),
+                "rejection must name whitespace/forbidden-codepoint as the cause: " + ex.getMessage());
+        }
+    }
+
+    @Test
+    public void unicodeInvisibleCodepointsInIdRejected() {
+        // Round-10 audit (regression-axis sub-agent, MEDIUM): the round-9
+        // whitespace check used Character.isWhitespace, which by Java
+        // semantics is FALSE for U+00A0 NBSP, U+200B ZWSP, U+FEFF BOM,
+        // U+202F NNBSP and others. The round-9 commit claimed to close
+        // "any downstream audit consumer that trims, normalises, or
+        // renders" — but Python's str.strip() DOES strip NBSP, CSS
+        // collapses NBSP on render, Elasticsearch's default analyzer
+        // normalises NBSP to ASCII space, and regex \s under
+        // UNICODE_CHARACTER_CLASS matches ZWSP/NNBSP/figure-space. An
+        // NBSP-prefixed id " __activation-budget-exceeded__" would
+        // pass both the old whitespace check AND the __name__
+        // reservation (startsWith("__") is false because index 0 is
+        // NBSP), then render in those consumers as the engine sentinel.
+        // Round-10 widens to Character.isSpaceChar + the explicit
+        // zero-width / BOM / bidi-format codepoints below.
+        String[] invisible = {
+            " __activation-budget-exceeded__",  // NBSP prefix
+            "__activation budget-exceeded__",   // NBSP embedded
+            " __activation-budget-exceeded__",  // NNBSP prefix
+            " __activation-budget-exceeded__",  // FIGURE SPACE prefix
+            "​__activation-budget-exceeded__",  // ZWSP prefix
+            "‌__activation-budget-exceeded__",  // ZWNJ prefix
+            "‍__activation-budget-exceeded__",  // ZWJ prefix
+            "﻿__activation-budget-exceeded__",  // BOM prefix
+            " __activation-budget-exceeded__",  // LINE SEPARATOR
+            " __activation-budget-exceeded__",  // PARAGRAPH SEPARATOR
+            "⁠__activation-budget-exceeded__",  // WORD JOINER
+            "᠎__activation-budget-exceeded__",  // MONGOLIAN VOWEL SEPARATOR
+            "‪__activation-budget-exceeded__",  // LRE (bidi format)
+            "‮__activation-budget-exceeded__",  // RLO (bidi format)
+            "rule with nbsp",              // embedded NBSP, plain operator id
+        };
+        for (String id : invisible) {
+            RuleEnvelopeException ex = assertThrows(RuleEnvelopeException.class,
+                () -> RuleJsonCodec.decode(id, SAMPLE.getBytes(StandardCharsets.UTF_8)),
+                "id should be rejected: '" + id + "'");
+            assertTrue(ex.getMessage().contains("forbidden codepoint"),
+                "rejection must name the forbidden codepoint: " + ex.getMessage());
         }
     }
 

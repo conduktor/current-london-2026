@@ -174,15 +174,47 @@ public final class RuleJsonCodec {
         // Rejecting whitespace at intake closes this trim-impersonation surface
         // and matches the same axis as the empty-id rejection above (an id
         // composed entirely of whitespace is functionally a non-id).
+        // Round-10 audit (regression-axis sub-agent, MEDIUM): the earlier
+        // `Character.isWhitespace` check matched Java's strip()/trim()
+        // semantics but missed several Unicode codepoints that DOWNSTREAM
+        // audit consumers DO collapse — most notably:
+        //   - U+00A0  NO-BREAK SPACE             (Python's str.strip(), CSS render)
+        //   - U+202F  NARROW NO-BREAK SPACE      (CSS render, many normalisers)
+        //   - U+2007  FIGURE SPACE               (CSS render)
+        //   - U+200B  ZERO-WIDTH SPACE           (regex \s under UNICODE flag, ES analyzer)
+        //   - U+200C  ZERO-WIDTH NON-JOINER      (regex \s under UNICODE flag)
+        //   - U+200D  ZERO-WIDTH JOINER          (regex \s under UNICODE flag)
+        //   - U+FEFF  ZERO-WIDTH NO-BREAK SPACE / BOM (most normalisers)
+        //   - U+180E  MONGOLIAN VOWEL SEPARATOR  (legacy whitespace in some tooling)
+        // An id like " __activation-budget-exceeded__" would pass both
+        // the old whitespace check (NBSP isWhitespace = false) AND the
+        // __name__ reservation check (startsWith("__") is false because
+        // index 0 is NBSP), then render in a non-Java audit UI as the
+        // engine sentinel — defeating the unambiguous-attribution promise.
+        //
+        // Two layers of defence:
+        //   (a) Reject Character.isWhitespace (ASCII whitespace).
+        //   (b) Reject Character.isSpaceChar (Unicode Space_Separator class:
+        //       NBSP, NNBSP, EM/EN SPACE, MEDIUM MATH SPACE, IDEOGRAPHIC
+        //       SPACE, …).
+        //   (c) Reject explicit zero-width / format / BOM codepoints that
+        //       no normalisation step preserves but the JVM's
+        //       isSpaceChar/isWhitespace do not flag.
+        // Operator ids have no legitimate need for ANY of these — they are
+        // log keys, not display strings.
         for (int i = 0; i < id.length(); i++) {
-            if (Character.isWhitespace(id.charAt(i))) {
+            char c = id.charAt(i);
+            if (isForbiddenIdCodepoint(c)) {
                 throw new RuleEnvelopeException(
-                    "rule id '" + id + "' contains whitespace at index " + i
-                        + "; rule ids may not contain whitespace (operator-authored "
-                        + "identifiers have no legitimate use for embedded whitespace, "
-                        + "and a whitespace-padded id could be rendered identically "
-                        + "to an engine-internal sentinel in audit consumers that trim "
-                        + "on display)");
+                    "rule id '" + id + "' contains forbidden codepoint U+"
+                        + String.format("%04X", (int) c) + " at index " + i
+                        + "; rule ids may not contain whitespace, zero-width, or BOM "
+                        + "characters (operator-authored identifiers have no legitimate "
+                        + "use for these, and a Unicode-padded id could be rendered "
+                        + "identically to an engine-internal sentinel in audit consumers "
+                        + "that normalise on display — Python's str.strip(), CSS rendering, "
+                        + "Elasticsearch's default analyzer, and regex \\s under UNICODE "
+                        + "flag all collapse these)");
             }
         }
         // Reserve the "__name__" id shape for engine-internal sentinels.
@@ -245,6 +277,43 @@ public final class RuleJsonCodec {
             return MAPPER.writeValueAsBytes(root);
         } catch (JsonProcessingException e) {
             throw new IllegalStateException("failed to encode rule " + rule.id(), e);
+        }
+    }
+
+    /**
+     * True when {@code c} is a codepoint forbidden in operator-authored rule
+     * ids: ASCII whitespace ({@link Character#isWhitespace}), the broader
+     * Unicode Space_Separator class ({@link Character#isSpaceChar} —
+     * {@code U+00A0} NBSP, {@code U+202F} NNBSP, {@code U+2007} FIGURE SPACE,
+     * and friends), plus explicit zero-width / BOM / line-separator
+     * codepoints that downstream normalisers collapse but the JVM's
+     * isWhitespace/isSpaceChar do not flag.
+     *
+     * <p>Centralising the list keeps the codec-intake check and any future
+     * audit-log emitter in sync. Adding a codepoint here is a strictly
+     * additive constraint — operator ids never contain these.
+     */
+    private static boolean isForbiddenIdCodepoint(char c) {
+        if (Character.isWhitespace(c) || Character.isSpaceChar(c)) {
+            return true;
+        }
+        switch (c) {
+            case '​': // ZERO-WIDTH SPACE
+            case '‌': // ZERO-WIDTH NON-JOINER
+            case '‍': // ZERO-WIDTH JOINER
+            case ' ': // LINE SEPARATOR
+            case ' ': // PARAGRAPH SEPARATOR
+            case '‪': // LEFT-TO-RIGHT EMBEDDING
+            case '‫': // RIGHT-TO-LEFT EMBEDDING
+            case '‬': // POP DIRECTIONAL FORMATTING
+            case '‭': // LEFT-TO-RIGHT OVERRIDE
+            case '‮': // RIGHT-TO-LEFT OVERRIDE
+            case '⁠': // WORD JOINER
+            case '﻿': // ZERO-WIDTH NO-BREAK SPACE / BOM
+            case '᠎': // MONGOLIAN VOWEL SEPARATOR
+                return true;
+            default:
+                return false;
         }
     }
 
