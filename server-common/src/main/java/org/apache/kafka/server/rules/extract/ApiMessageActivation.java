@@ -557,6 +557,30 @@ public final class ApiMessageActivation {
     }
 
     private static List<Object> convertIterable(Iterable<?> it, int depth, int[] invocations) {
+        // Round-15 Walker HIGH H1: depth bound must apply to iterable chains
+        // too. Before this guard, depth only incremented when toMap descended
+        // into a Message (convert -> toMap(v, depth + 1)). An attacker-shaped
+        // value of type Iterable<Iterable<Iterable<...>>> with no Message at
+        // the leaves walked convert -> convertIterable -> convert ->
+        // convertIterable -> ... at constant depth = 0 forever. The
+        // per-element accessor-budget bump bounds aggregate work but does
+        // not bound stack depth — a single-element chain N deep blows the
+        // JVM stack around N ~= 5..10k well before MAX_ACCESSOR_INVOCATIONS
+        // = 10_000 fires (each frame ~100B, default 512KB stack). Bumping
+        // depth on each iterable layer aligns stack depth with the depth
+        // counter, and the explicit depth check at the top of this method
+        // raises a typed ActivationBudgetExceededException — same fail-CLOSED
+        // signal RuleEngine catches separately from the generic Throwable
+        // branch — instead of letting recursion run until the JVM dies.
+        //
+        // The check fires BEFORE constructing the result list so a
+        // pathological deep chain costs O(MAX_DEPTH) frames and one
+        // exception, not O(N) heap allocations.
+        if (depth >= MAX_DEPTH) {
+            throw new ActivationBudgetExceededException(
+                "activation walk exceeded depth limit of " + MAX_DEPTH
+                    + " while walking iterable of " + it.getClass().getName());
+        }
         // Codex deep-audit P1d: the per-iteration bump is what bounds a wide
         // flat scalar list. Without it, an attacker who can fit a giant
         // repeated scalar field (e.g. millions of partition ids or topic
@@ -575,7 +599,12 @@ public final class ApiMessageActivation {
                         + " while walking iterable of "
                         + it.getClass().getName());
             }
-            list.add(convert(item, depth, invocations));
+            // Round-15 Walker HIGH H1: bump depth on each iterable layer so
+            // the MAX_DEPTH guard at the top is meaningful. A pure Iterable
+            // chain (no Messages at the leaves) without this bump descends
+            // at constant depth = caller's depth and can stack-blow before
+            // the accessor budget fires.
+            list.add(convert(item, depth + 1, invocations));
         }
         return list;
     }

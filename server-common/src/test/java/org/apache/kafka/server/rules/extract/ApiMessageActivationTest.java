@@ -539,6 +539,123 @@ public class ApiMessageActivationTest {
     }
 
     @Test
+    public void chainedNestedIterablesAreCappedAtMaxDepth() {
+        // Round-15 Walker HIGH H1: depth bound must apply to iterable chains.
+        // Before the fix, convertIterable recursed back through convert() at
+        // the SAME depth (because depth only incremented in toMap's Message
+        // descent). A pure Iterable<Iterable<Iterable<...>>> chain with no
+        // Messages at the leaves bypassed MAX_DEPTH entirely. The
+        // per-element accessor-budget bump bounds aggregate work but does
+        // NOT bound stack depth — a single-element chain N deep blows the
+        // JVM stack (each frame ~100B, default 512KB stack ~ 5..10k frames)
+        // well before MAX_ACCESSOR_INVOCATIONS=10_000 fires, since the
+        // budget only ticks ONCE per single-element iterable.
+        //
+        // This test builds a single-element nested-iterable chain N levels
+        // deep where N is well past MAX_DEPTH but well below the accessor
+        // budget. The walk must terminate with a typed
+        // ActivationBudgetExceededException (fail-CLOSED) — the same signal
+        // RuleEngine catches separately from the generic Throwable branch —
+        // rather than recurse until the JVM stack dies.
+        int chainDepth = ApiMessageActivation.MAX_DEPTH * 4;
+        IterableChainNode root = new IterableChainNode(chainDepth);
+        ActivationBudgetExceededException ex = assertThrows(
+            ActivationBudgetExceededException.class,
+            () -> ApiMessageActivation.from(root));
+        assertTrue(ex.getMessage().contains("depth limit of " + ApiMessageActivation.MAX_DEPTH),
+            "expected depth-limit error from convertIterable, got: " + ex.getMessage());
+        assertTrue(ex.getMessage().contains("walking iterable"),
+            "message must localise the failure to the iterable path, got: " + ex.getMessage());
+    }
+
+    /**
+     * Fixture for {@link #chainedNestedIterablesAreCappedAtMaxDepth}. The
+     * single accessor {@code chain()} returns a {@code List<Object>} where
+     * the sole element is either another {@code List<Object>} (deeper
+     * nesting) or the empty list (leaf). With {@code depth} far above
+     * {@link ApiMessageActivation#MAX_DEPTH}, the walker must throw on the
+     * iterable-depth guard before recursing into the deepest leaf.
+     */
+    @SuppressWarnings("unused")
+    public static final class IterableChainNode implements org.apache.kafka.common.protocol.ApiMessage {
+        private final int chainDepth;
+        public IterableChainNode(int chainDepth) {
+            this.chainDepth = chainDepth;
+        }
+        public java.util.List<Object> chain() {
+            return buildChain(chainDepth);
+        }
+        private static java.util.List<Object> buildChain(int remaining) {
+            if (remaining <= 0) {
+                return java.util.Collections.emptyList();
+            }
+            java.util.List<Object> outer = new java.util.ArrayList<>(1);
+            outer.add(buildChain(remaining - 1));
+            return outer;
+        }
+        @Override public short apiKey() {
+            return -1;
+        }
+        @Override public short lowestSupportedVersion() {
+            return 0;
+        }
+        @Override public short highestSupportedVersion() {
+            return 0;
+        }
+        @Override public org.apache.kafka.common.protocol.Message duplicate() {
+            return new IterableChainNode(chainDepth);
+        }
+        @Override public java.util.List<org.apache.kafka.common.protocol.types.RawTaggedField> unknownTaggedFields() {
+            return java.util.Collections.emptyList();
+        }
+        @Override public void read(org.apache.kafka.common.protocol.Readable readable, short version) {
+        }
+        @Override public void write(org.apache.kafka.common.protocol.Writable writable,
+                                    org.apache.kafka.common.protocol.ObjectSerializationCache cache,
+                                    short version) {
+        }
+        @Override public int size(org.apache.kafka.common.protocol.ObjectSerializationCache cache,
+                                  short version) {
+            return 0;
+        }
+        @Override public void addSize(org.apache.kafka.common.protocol.MessageSizeAccumulator size,
+                                      org.apache.kafka.common.protocol.ObjectSerializationCache cache,
+                                      short version) {
+        }
+    }
+
+    @Test
+    public void shallowNestedIterableOfMessagesStillWalksCleanly() {
+        // Round-15 Walker HIGH H1: the depth-on-iterable bump must not
+        // regress legitimate request shapes. The deepest production walk
+        // observed across the Kafka request surface is roughly:
+        //   Request -> Iterable -> Message -> Iterable -> Message -> scalar
+        // i.e. <= 2 iterable layers. The bump consumes one depth slot per
+        // iterable layer (was zero), but MAX_DEPTH=32 leaves ample headroom.
+        // This test pins that the canonical CreateTopics shape (2 iterable
+        // layers + 2 message layers) walks to completion without raising
+        // any budget exception.
+        CreatableTopic topic = new CreatableTopic()
+            .setName("legit-topic")
+            .setNumPartitions(4);
+        CreatableTopicConfigCollection configs = new CreatableTopicConfigCollection();
+        configs.add(new CreatableTopicConfig().setName("cleanup.policy").setValue("compact"));
+        topic.setConfigs(configs);
+        CreatableTopicCollection topics = new CreatableTopicCollection();
+        topics.add(topic);
+        CreateTopicsRequestData req = new CreateTopicsRequestData().setTopics(topics);
+
+        Map<String, Object> m = ApiMessageActivation.from(req);
+        List<?> topicList = (List<?>) m.get("topics");
+        Map<?, ?> topicMap = (Map<?, ?>) topicList.get(0);
+        assertEquals("legit-topic", topicMap.get("name"));
+        List<?> configList = (List<?>) topicMap.get("configs");
+        Map<?, ?> configMap = (Map<?, ?>) configList.get(0);
+        assertEquals("cleanup.policy", configMap.get("name"));
+        assertEquals("compact", configMap.get("value"));
+    }
+
+    @Test
     public void sensitiveAlterConfigsValueIsRedactedWhenNameMatchesPasswordPattern() {
         // Codex/Gemini final-audit P1#6: the SENSITIVE_NAMES flat denylist cannot
         // redact AlterableConfig.value — the getter is just called `value`, and
