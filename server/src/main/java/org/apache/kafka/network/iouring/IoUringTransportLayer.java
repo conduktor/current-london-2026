@@ -77,6 +77,23 @@ final class IoUringTransportLayer implements TransportLayer {
      * bytes have actually been handed off to the kernel by Netty, not just queued.
      */
     private final AtomicLong pendingWriteBytes = new AtomicLong(0);
+    /**
+     * Async write failure surfaced by Netty's writeAndFlush promise. If the kernel rejected
+     * the write (peer RST mid-response, kernel buffer pressure, channel closed under us),
+     * Netty calls our listener with {@code !future.isSuccess()}; we cannot route the failure
+     * back to the Processor inline because the listener runs on the event loop. Instead we
+     * stash the cause here and re-throw it from the next {@link #write(ByteBuffer)} call.
+     * That converts the silent async failure into a synchronous {@link IOException} that
+     * {@link IoUringSelector#poll(long)}'s write step catches and routes through
+     * {@code ChannelState.FAILED_SEND} — matching how NIO surfaces a peer-RST'd write
+     * through its {@code Selector.poll} loop.
+     *
+     * <p>Volatile so the Processor sees the latest cause without an explicit memory barrier:
+     * the only writer is the event-loop listener thread, the only reader is the Processor
+     * thread, and a {@code happens-before} relationship is not strictly required (we re-check
+     * each call), but volatile keeps reasoning simple.
+     */
+    private volatile Throwable asyncWriteFailure;
 
     IoUringTransportLayer(Channel nettyChannel, InetSocketAddress remote, InetSocketAddress local) {
         this.nettyChannel = nettyChannel;
@@ -253,6 +270,14 @@ final class IoUringTransportLayer implements TransportLayer {
     @Override
     public int write(ByteBuffer src) throws IOException {
         if (closed) throw new IOException("transport layer is closed");
+        // If a prior async write already failed, surface it now so the Processor's write
+        // step routes the channel through FAILED_SEND rather than reporting completedSend
+        // for bytes the kernel never delivered.
+        Throwable failure = asyncWriteFailure;
+        if (failure != null) {
+            asyncWriteFailure = null;
+            throw new IOException("async write failed", failure);
+        }
         int remaining = src.remaining();
         if (remaining == 0) return 0;
         // Use a pooled direct buffer so io_uring can submit the bytes without a heap-to-
@@ -273,7 +298,18 @@ final class IoUringTransportLayer implements TransportLayer {
             // so the only leak we have to defend against here is the counter.
             io.netty.channel.ChannelFuture future = nettyChannel.writeAndFlush(buf);
             handedOff = true;
-            future.addListener(f -> pendingWriteBytes.addAndGet(-remaining));
+            future.addListener(f -> {
+                pendingWriteBytes.addAndGet(-remaining);
+                if (!f.isSuccess()) {
+                    // Record the cause so the next Processor write step can throw it
+                    // synchronously and route the channel through FAILED_SEND. Without
+                    // this, a peer RST mid-response leaves the broker thinking the send
+                    // completed normally — completedSends fires, RESPONSE_SENT mute event
+                    // succeeds, and the request handling pipeline silently advances on a
+                    // request the client never saw.
+                    asyncWriteFailure = f.cause();
+                }
+            });
             pendingWriteBytes.addAndGet(remaining);
         } finally {
             if (!handedOff) {
@@ -285,6 +321,18 @@ final class IoUringTransportLayer implements TransportLayer {
 
     @Override
     public long write(ByteBuffer[] srcs, int offset, int length) throws IOException {
+        // Check the async failure FIRST, before scanning for buffers with bytes — a
+        // failed prior write must surface even when the Send has fully drained its
+        // ByteBuffers and the inner write(ByteBuffer) call would otherwise be skipped.
+        // ByteBufferSend.writeTo calls into this overload, so this is the actual fault
+        // path that converts the volatile failure into the synchronous IOException the
+        // Selector's write step needs to route the channel through FAILED_SEND.
+        if (closed) throw new IOException("transport layer is closed");
+        Throwable failure = asyncWriteFailure;
+        if (failure != null) {
+            asyncWriteFailure = null;
+            throw new IOException("async write failed", failure);
+        }
         long total = 0;
         for (int i = 0; i < length; i++) {
             ByteBuffer src = srcs[offset + i];
@@ -305,7 +353,14 @@ final class IoUringTransportLayer implements TransportLayer {
         // the outbound queue crosses Netty's high water mark, so any send below the mark
         // would otherwise report "fully drained" the instant write() returned — even though
         // the bytes are still sitting in Netty's queue waiting for the event loop to flush.
-        return pendingWriteBytes.get() > 0;
+        //
+        // Also report pending when a prior write failed asynchronously: ByteBufferSend
+        // calls hasPendingWrites() inside writeTo() to decide if the Send is completed,
+        // and a synchronous-listener failure could otherwise zero the counter before the
+        // next Processor write call surfaces the throw. Holding "pending" until the next
+        // write() throws keeps {@code Send.completed} false in that interleaving, so
+        // {@code KafkaChannel.maybeCompleteSend} does NOT fire on the failed bytes.
+        return pendingWriteBytes.get() > 0 || asyncWriteFailure != null;
     }
 
     @Override

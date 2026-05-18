@@ -33,6 +33,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -278,6 +279,97 @@ class IoUringTransportLayerTest {
         assertEquals(0, buf.refCnt(),
             "offer-after-close must release — otherwise pooled direct memory bleeds on every disconnect");
         assertFalse(l.hasBytesBuffered(), "the buf must not have landed in the queue");
+    }
+
+    @Test
+    void asyncWriteFailureSurfacesAsIoExceptionOnNextWrite() throws Exception {
+        // Codex v4 BLOCKER: a Netty writeAndFlush whose promise fires with !isSuccess()
+        // (peer RST mid-response, kernel buffer pressure, channel closed under us) must
+        // surface to the Processor as an IOException on the next write() call — that is
+        // what routes the channel through ChannelState.FAILED_SEND in the Selector poll
+        // loop. Without this, completedSends fires for bytes the kernel never delivered
+        // and the request handling pipeline silently acks responses the client never saw.
+        EmbeddedChannel netty = new EmbeddedChannel();
+        IoUringTransportLayer l = new IoUringTransportLayer(netty, REMOTE, LOCAL);
+
+        // Close the channel BEFORE the write — Netty's writeAndFlush completes the
+        // promise with a ClosedChannelException synchronously on the calling thread,
+        // exercising the listener path that stashes asyncWriteFailure.
+        netty.close().syncUninterruptibly();
+        assertFalse(netty.isOpen());
+
+        // First write: bytes get queued, the listener fires synchronously with the
+        // closed-channel failure, asyncWriteFailure is set. Return value here is the
+        // number of bytes Netty accepted into the outbound queue — Netty's contract
+        // doesn't reject a closed-channel write synchronously; the failure surfaces
+        // through the promise.
+        ByteBuffer src = ByteBuffer.wrap("late".getBytes());
+        try {
+            l.write(src);
+        } catch (java.io.IOException firstThrow) {
+            // Some platforms have the listener fire synchronously from writeAndFlush()
+            // itself; that's fine — the first write already surfaced the failure.
+            assertTrue(firstThrow.getMessage().contains("async write failed"));
+            return;
+        }
+
+        // Listener may have fired synchronously inside writeAndFlush — pendingWriteBytes
+        // is back to 0 but asyncWriteFailure must keep hasPendingWrites() true so
+        // ByteBufferSend.completed() does NOT report success in the gap before the next
+        // write() throws.
+        assertTrue(l.hasPendingWrites(),
+            "hasPendingWrites must stay true while asyncWriteFailure is pending, so " +
+            "ByteBufferSend.completed returns false until the next write() throws");
+
+        // Second write: the stashed failure must surface here, *before* we touch the
+        // bytes — that's the synchronous throw the Selector's write step catches and
+        // routes through enqueueClose(FAILED_SEND).
+        ByteBuffer src2 = ByteBuffer.wrap("next".getBytes());
+        java.io.IOException thrown = assertThrows(java.io.IOException.class, () -> l.write(src2));
+        assertTrue(thrown.getMessage().contains("async write failed"),
+            "the throw must clearly identify itself as an async failure relay");
+        assertNotNull(thrown.getCause(),
+            "the original Netty failure cause must be attached for diagnostics");
+
+        // Once consumed, the failure must NOT re-fire on a third write — the field is
+        // cleared after the throw so a subsequent recovered write (theoretical) wouldn't
+        // throw forever. In practice the channel is doomed at this point.
+        assertFalse(l.hasPendingWrites(),
+            "after the throw, asyncWriteFailure is cleared and hasPendingWrites returns to false");
+    }
+
+    @Test
+    void asyncWriteFailureSurfacesThroughVectoredWriteEvenWhenAllBuffersEmpty() throws Exception {
+        // Critical edge case: ByteBufferSend.writeTo iterates a vectored write[] until
+        // every ByteBuffer is fully drained. The LAST writeTo call passes an array of
+        // already-empty buffers and the inner write(ByteBuffer) calls are all skipped
+        // (no `if (!hasRemaining()) continue` lands in a real write). Without checking
+        // asyncWriteFailure at the top of write(ByteBuffer[]), the failure from the
+        // previous chunk would be silently swallowed and Send.completed() would falsely
+        // report success.
+        EmbeddedChannel netty = new EmbeddedChannel();
+        IoUringTransportLayer l = new IoUringTransportLayer(netty, REMOTE, LOCAL);
+
+        netty.close().syncUninterruptibly();
+
+        // First vectored write: queues bytes, listener fires with closed-channel failure.
+        ByteBuffer chunk = ByteBuffer.wrap("first".getBytes());
+        try {
+            l.write(new ByteBuffer[]{chunk});
+        } catch (java.io.IOException firstThrow) {
+            // First write already surfaced — same as the single-buffer test above.
+            assertTrue(firstThrow.getMessage().contains("async write failed"));
+            return;
+        }
+
+        // Second vectored write with ALL EMPTY buffers — the inner write loop has nothing
+        // to do, so the failure MUST surface from the top-level guard in write(ByteBuffer[]).
+        ByteBuffer empty1 = ByteBuffer.allocate(0);
+        ByteBuffer empty2 = ByteBuffer.allocate(8);
+        empty2.position(8); // hasRemaining()=false
+        java.io.IOException thrown = assertThrows(java.io.IOException.class,
+            () -> l.write(new ByteBuffer[]{empty1, empty2}));
+        assertTrue(thrown.getMessage().contains("async write failed"));
     }
 
     @Test

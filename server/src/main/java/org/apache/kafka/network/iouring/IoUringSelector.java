@@ -20,6 +20,7 @@ import org.apache.kafka.common.memory.MemoryPool;
 import org.apache.kafka.common.network.Authenticator;
 import org.apache.kafka.common.network.ChannelState;
 import org.apache.kafka.common.network.KafkaChannel;
+import org.apache.kafka.common.network.KafkaChannelMuteBridge;
 import org.apache.kafka.common.network.ListenerName;
 import org.apache.kafka.common.network.NetworkReceive;
 import org.apache.kafka.common.network.NetworkSend;
@@ -150,13 +151,6 @@ public final class IoUringSelector implements BrokerSelector {
     /** Crossed by both threads: event loop puts on accept, Processor reads on mute/unmute/close. */
     private final Map<String, Channel> nettyChannels = new ConcurrentHashMap<>();
     private final Map<String, Long> lastActiveNanos = new HashMap<>();
-    /**
-     * Channel ids the operator has muted. {@link KafkaChannel#mute()} is package-private in
-     * {@code clients/}, so we track mute state here ourselves; {@link #poll(long)} gates
-     * reads on this set, and the corresponding {@code setAutoRead(false)} call on the
-     * Netty channel stops the kernel feeding more bytes.
-     */
-    private final Set<String> mutedChannelIds = new HashSet<>();
 
     // Cross-thread queues (event loop pushes, Processor pulls).
     private final Queue<KafkaChannel> pendingAccepts = new ConcurrentLinkedQueue<>();
@@ -313,27 +307,19 @@ public final class IoUringSelector implements BrokerSelector {
     public void poll(long timeoutMs) throws IOException {
         if (closed) throw new IOException("selector is closed");
 
-        // Evict the previous poll's closing channels. The Processor has had its chance to
-        // resolve any final completedReceives via closingChannel(id); now we can release
-        // the KafkaChannel for real. This mirrors NIO's KSelector.closingChannels lifecycle.
-        // While evicting, drop any failedSends entry for the same id: the disconnect for
-        // those ids was already surfaced in the previous poll, so a duplicate FAILED_SEND
-        // notification this poll would tell processDisconnected to dec the quota twice.
-        if (!closingChannels.isEmpty()) {
-            for (Map.Entry<String, KafkaChannel> entry : closingChannels.entrySet()) {
-                Utils.closeQuietly(entry.getValue(), "closing channel after Processor drained");
-                failedSends.remove(entry.getKey());
-            }
-            closingChannels.clear();
-        }
-
-        // Reset per-poll outputs.
+        // Reset per-poll outputs BEFORE evicting closingChannels: the eviction populates
+        // disconnected with LOCAL_CLOSE for each evicted id, mirroring NIO's
+        // {@code Selector.clear} which calls {@code addToDisconnected} during eviction.
         completedReceives.clear();
         completedSends.clear();
         disconnected.clear();
         connected.clear();
         justAccepted.clear();
         receivesThisPoll.clear();
+
+        // Drain closingChannels left over from the previous poll. Helper extracted for
+        // both readability and to keep poll() under checkstyle's MethodLength limit.
+        drainClosingChannels();
 
         // Any failedSends not absorbed by the closingChannels eviction above are NEW
         // failures (e.g. setSend threw on a healthy channel) — surface them as the
@@ -374,8 +360,13 @@ public final class IoUringSelector implements BrokerSelector {
             if (!channel.ready()) continue;
             if (justAccepted.contains(channel.id())) continue;
 
-            // Read step.
-            if (!mutedChannelIds.contains(channel.id())) {
+            // Read step. KafkaChannel.isMuted() is the source of truth: mute(id) above calls
+            // through to KafkaChannel.mute() via KafkaChannelMuteBridge, which sets muteState
+            // and removes OP_READ; the transport layer translates the OP_READ removal into
+            // Netty autoRead=false. So a muted channel here has both kernel-level backpressure
+            // (no more inbound from Netty) and a state-machine gate (so we never produce a
+            // completedReceive while the Processor expects MUTED or MUTED_AND_RESPONSE_PENDING).
+            if (!channel.isMuted()) {
                 try {
                     long read = channel.read();
                     if (read > 0) {
@@ -436,7 +427,6 @@ public final class IoUringSelector implements BrokerSelector {
                 if (nowNanos - entry.getValue() > connectionsMaxIdleNanos) {
                     KafkaChannel channel = channels.remove(entry.getKey());
                     nettyChannels.remove(entry.getKey());
-                    mutedChannelIds.remove(entry.getKey());
                     if (channel != null) {
                         disconnected.put(entry.getKey(), ChannelState.EXPIRED);
                         Utils.closeQuietly(channel, "expired channel");
@@ -475,12 +465,78 @@ public final class IoUringSelector implements BrokerSelector {
      *       skipped if step 2 already produced a receive for this id. Remaining buffered
      *       bytes stay readable through {@code closingChannel(id)} for one more poll —
      *       same as NIO's {@code Selector.clear()}.
+     *   <li><b>muted channels do not produce a final receive:</b> a channel that was
+     *       muted (operator or MemoryPool) at FIN time must not have its inbound queue
+     *       drained here. The Processor explicitly relies on the invariant that the
+     *       request flow stays paused until {@code unmute()} is called, and muting
+     *       only blocks new kernel pushes, not bytes already in the transport queue. NIO
+     *       enforces this via {@code maybeReadFromClosingChannel} skipping muted channels
+     *       at {@code Selector.java#698}. We defer the buffered bytes to the next poll's
+     *       {@code closingChannel(id)} resolution path, where the channel will be
+     *       drained only after the operator unmutes — matching NIO precisely.
      * </ul>
      *
      * @return {@code true} if any channel transitioned to disconnected (or any silent
      *         drop happened), so the caller can mark progress and skip the wait at the
      *         end of {@link #poll(long)}.
      */
+    /**
+     * Drain {@link #closingChannels} left over from the previous poll. NIO's
+     * {@code Selector.clear} at {@code clients/.../Selector.java#842-863} is the model:
+     * a channel stays in {@code closingChannels} as long as
+     * <ul>
+     *   <li>{@link #failedSends} did not fire for it this poll (the FAILED_SEND
+     *       notification is the terminal signal — no further reads should be attempted),
+     *       AND</li>
+     *   <li>there is more buffered work we can still deliver: either the channel is
+     *       muted (the Processor will read it after explicit unmute) OR one more read
+     *       can produce a completedReceive.</li>
+     * </ul>
+     * <p>Evict only when nothing more is forthcoming, and at *that* point emit the
+     * disconnect notification. This is what defers {@code disconnected} from the FIN
+     * poll (where the channel still has buffered work) to the eviction poll, matching
+     * NIO and closing the same-poll double-dec window
+     * ({@code processDisconnected} + {@code closeExcessConnections}-&gt;{@code close}).
+     * For pipelined requests followed by FIN this drain is what surfaces R2, R3, …
+     * across successive polls — without it, only R1 reaches the request queue.
+     */
+    private void drainClosingChannels() {
+        if (closingChannels.isEmpty()) return;
+        Iterator<Map.Entry<String, KafkaChannel>> it = closingChannels.entrySet().iterator();
+        while (it.hasNext()) {
+            Map.Entry<String, KafkaChannel> entry = it.next();
+            String id = entry.getKey();
+            KafkaChannel channel = entry.getValue();
+            boolean sendFailed = failedSends.remove(id);
+            boolean keepClosing = false;
+            if (!sendFailed && channel.ready()) {
+                if (channel.isMuted()) {
+                    // Muted closing channel: leave for next poll. The Processor must
+                    // unmute it explicitly before the final buffered receives surface,
+                    // exactly as NIO does at {@code Selector.java#702}.
+                    keepClosing = true;
+                } else {
+                    try {
+                        channel.read();
+                        NetworkReceive completed = channel.maybeCompleteReceive();
+                        if (completed != null) {
+                            completedReceives.add(completed);
+                            receivesThisPoll.add(id);
+                            keepClosing = true;
+                        }
+                    } catch (IOException e) {
+                        log.trace("Read from closing channel {} failed, evicting", id, e);
+                    }
+                }
+            }
+            if (!keepClosing) {
+                disconnected.put(id, ChannelState.LOCAL_CLOSE);
+                Utils.closeQuietly(channel, "closing channel evicted");
+                it.remove();
+            }
+        }
+    }
+
     private boolean drainPendingDisconnects() {
         boolean madeProgress = false;
         String disconnectId;
@@ -488,7 +544,6 @@ public final class IoUringSelector implements BrokerSelector {
             KafkaChannel channel = channels.remove(disconnectId);
             nettyChannels.remove(disconnectId);
             lastActiveNanos.remove(disconnectId);
-            mutedChannelIds.remove(disconnectId);
             if (channel == null) continue;
             if (justAccepted.contains(disconnectId)) {
                 connected.remove(disconnectId);
@@ -496,7 +551,7 @@ public final class IoUringSelector implements BrokerSelector {
                 madeProgress = true;
                 continue;
             }
-            if (!receivesThisPoll.contains(disconnectId)) {
+            if (!receivesThisPoll.contains(disconnectId) && !channel.isMuted()) {
                 try {
                     while (channel.ready()) {
                         long read = channel.read();
@@ -514,7 +569,6 @@ public final class IoUringSelector implements BrokerSelector {
                 }
             }
             closingChannels.put(disconnectId, channel);
-            disconnected.put(disconnectId, ChannelState.LOCAL_CLOSE);
             madeProgress = true;
         }
         return madeProgress;
@@ -534,7 +588,6 @@ public final class IoUringSelector implements BrokerSelector {
         KafkaChannel channel = channels.get(id);
         if (channel != null) {
             nettyChannels.remove(id);
-            mutedChannelIds.remove(id);
             disconnected.put(id, state);
             Utils.closeQuietly(channel, "channel after I/O error");
         }
@@ -581,7 +634,6 @@ public final class IoUringSelector implements BrokerSelector {
             // close(id) branch is skipped — no double dec.
             log.error("Unexpected exception during setSend, closing connection {} and rethrowing", destinationId, e);
             nettyChannels.remove(destinationId);
-            mutedChannelIds.remove(destinationId);
             lastActiveNanos.remove(destinationId);
             channels.remove(destinationId);
             failedSends.add(destinationId);
@@ -592,40 +644,44 @@ public final class IoUringSelector implements BrokerSelector {
 
     @Override
     public void mute(String id) {
-        if (!channels.containsKey(id)) return;
-        if (mutedChannelIds.add(id)) {
-            Channel netty = nettyChannels.get(id);
-            if (netty != null) netty.config().setAutoRead(false);
-        }
+        // Route through the same-package bridge so KafkaChannel's state machine actually
+        // transitions to MUTED. SocketServer.scala calls selector.mute(id) immediately
+        // followed by channel.handleChannelMuteEvent(REQUEST_RECEIVED), which transitions
+        // MUTED → MUTED_AND_RESPONSE_PENDING — if we don't put the channel into MUTED
+        // here, that handleChannelMuteEvent call throws IllegalStateException and the
+        // first valid request on every connection crashes. KafkaChannel.mute() also
+        // calls transport.removeInterestOps(OP_READ), which our IoUringTransportLayer
+        // override translates into Netty autoRead=false, so kernel-level backpressure
+        // happens atomically with the state transition.
+        KafkaChannel channel = channels.get(id);
+        if (channel == null) channel = closingChannels.get(id);
+        if (channel == null) return;
+        KafkaChannelMuteBridge.mute(channel);
     }
 
     @Override
     public void unmute(String id) {
-        if (!channels.containsKey(id)) return;
-        if (mutedChannelIds.remove(id)) {
-            Channel netty = nettyChannels.get(id);
-            if (netty != null) netty.config().setAutoRead(true);
-            wakeup.release(); // buffered bytes may now be drained
+        KafkaChannel channel = channels.get(id);
+        if (channel == null) channel = closingChannels.get(id);
+        if (channel == null) return;
+        if (KafkaChannelMuteBridge.maybeUnmute(channel)) {
+            // unmute may have flipped autoRead on; bytes may now flow into the transport
+            // queue and the next read step needs to drain them, so wake any blocking poll.
+            wakeup.release();
         }
     }
 
     @Override
     public void muteAll() {
-        for (String id : channels.keySet()) {
-            if (mutedChannelIds.add(id)) {
-                Channel netty = nettyChannels.get(id);
-                if (netty != null) netty.config().setAutoRead(false);
-            }
+        for (KafkaChannel channel : channels.values()) {
+            KafkaChannelMuteBridge.mute(channel);
         }
     }
 
     @Override
     public void unmuteAll() {
-        for (String id : channels.keySet()) {
-            if (mutedChannelIds.remove(id)) {
-                Channel netty = nettyChannels.get(id);
-                if (netty != null) netty.config().setAutoRead(true);
-            }
+        for (KafkaChannel channel : channels.values()) {
+            KafkaChannelMuteBridge.maybeUnmute(channel);
         }
         wakeup.release();
     }
@@ -746,7 +802,6 @@ public final class IoUringSelector implements BrokerSelector {
         closingChannels.clear();
         nettyChannels.clear();
         lastActiveNanos.clear();
-        mutedChannelIds.clear();
         // Drain queues so any in-flight ByteBufs are released.
         KafkaChannel pending;
         while ((pending = pendingAccepts.poll()) != null) {
@@ -761,7 +816,6 @@ public final class IoUringSelector implements BrokerSelector {
         KafkaChannel channel = channels.remove(id);
         nettyChannels.remove(id);
         lastActiveNanos.remove(id);
-        mutedChannelIds.remove(id);
         if (channel != null) {
             Utils.closeQuietly(channel, "channel close(" + id + ")");
             return;

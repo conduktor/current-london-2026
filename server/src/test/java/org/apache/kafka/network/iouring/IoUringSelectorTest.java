@@ -314,8 +314,13 @@ class IoUringSelectorTest {
     @Test
     void disconnectFromEventLoopSurfacesAsLocalCloseAfterDrainingFinalBytes() throws Exception {
         // A peer-closed connection with bytes still in the queue must deliver those bytes
-        // BEFORE we declare the channel disconnected. Mirrors NIO Selector's closingChannels
-        // semantics — otherwise short-lived clients lose their final request.
+        // BEFORE we declare the channel disconnected. Mirrors NIO Selector.clear() at
+        // clients/.../Selector.java:842-865 — the channel stays in closingChannels while
+        // there's pending work; only when nothing more is forthcoming does doClose
+        // (notifyDisconnect=true) emit the LOCAL_CLOSE into `disconnected`. Deferring
+        // the disconnect notification to the eviction poll closes the double-dec window
+        // where the Processor would otherwise see `disconnected` for an id in the same
+        // poll that closeExcessConnections could also call selector.close(id) on.
         IoUringSelector s = newSelector(IDLE_NANOS_NEVER);
         EmbeddedChannel netty = acceptNew(s, REMOTE_A);
         s.poll(0);
@@ -323,23 +328,38 @@ class IoUringSelectorTest {
 
         s.onRead(netty, framed("final-frame"));
         s.onDisconnect(netty);
+
+        // Poll 1: FIN poll. The buffered receive surfaces, the channel goes into
+        // closingChannels for one more poll, but `disconnected` stays empty. The
+        // Processor's processCompletedReceives resolves the receive via
+        // closingChannel(id), then on the NEXT poll the eviction emits the disconnect.
         s.poll(0);
 
         assertEquals(1, s.completedReceives().size(),
-            "buffered bytes must be delivered before the disconnect is reported");
-        assertTrue(s.disconnected().containsKey(id), "disconnect surfaces on the same poll");
-        assertNull(s.channel(id), "channel is gone from the active map");
+            "buffered bytes must be delivered on the FIN poll, before the disconnect notification");
+        assertFalse(s.disconnected().containsKey(id),
+            "disconnect notification is deferred to the eviction poll, matching NIO Selector.clear: "
+            + "emitting on the FIN poll would race processDisconnected against closeExcessConnections "
+            + "for the same id in the same Processor turn, double-dec'ing the per-IP quota");
+        assertNull(s.channel(id), "channel is gone from the active map on the FIN poll");
         // Processor.processCompletedReceives resolves the receive's source via either
         // channel(id) or closingChannel(id). channel(id) is null after disconnect, so
-        // closingChannel(id) MUST keep the channel reachable for one extra poll — otherwise
-        // the final completedReceive lands on a null KafkaChannel and gets silently dropped.
+        // closingChannel(id) MUST keep the channel reachable so the final completedReceive
+        // can be resolved — otherwise it lands on a null KafkaChannel and gets silently dropped.
         assertNotNull(s.closingChannel(id),
             "closingChannel must surface the disconnected channel so the Processor can resolve the final receive");
 
-        // The next poll evicts the closing channel for real.
+        // Poll 2: eviction poll. Nothing more is forthcoming (read returned nothing,
+        // !muted, !sendFailed) so drainClosingChannels evicts and emits LOCAL_CLOSE.
         s.poll(0);
+        assertTrue(s.disconnected().containsKey(id),
+            "eviction poll must emit LOCAL_CLOSE — this is the SINGLE disconnect notification for the channel");
+        assertEquals(ChannelState.LOCAL_CLOSE, s.disconnected().get(id),
+            "evicted closing channel surfaces as LOCAL_CLOSE per NIO doClose(channel, true)");
         assertNull(s.closingChannel(id),
             "closingChannel must be evicted on the next poll; only one extra poll of grace");
+        assertTrue(s.completedReceives().isEmpty(),
+            "no extra receive on the eviction poll — the channel had only one buffered frame");
     }
 
     @Test
@@ -484,11 +504,10 @@ class IoUringSelectorTest {
     void sendOnClosingChannelRoutesToFailedSendsNotThrow() throws Exception {
         // Mirror NIO Selector.send (clients/.../Selector.java:391-413): when send arrives
         // for a channel that has just disconnected, the send is recorded as a failedSend
-        // and surfaces as FAILED_SEND on the next poll — it must NOT throw, because
-        // Processor.sendResponse synchronously calls selector.send for any response in
-        // flight and an exception here would propagate up to Processor.processChannelException
-        // → Processor.close, double-dec'ing a quota that was already dec'd when the
-        // original disconnect surfaced.
+        // and surfaces on the NEXT poll — it must NOT throw, because Processor.sendResponse
+        // synchronously calls selector.send for any response in flight and an exception here
+        // would propagate up to Processor.processChannelException → Processor.close,
+        // dec'ing a quota that another path is also dec'ing for the same disconnect.
         IoUringSelector s = newSelector(IDLE_NANOS_NEVER);
         EmbeddedChannel netty = acceptNew(s, REMOTE_A);
         s.poll(0);
@@ -501,21 +520,36 @@ class IoUringSelectorTest {
         s.onDisconnect(netty);
         s.poll(0);
         assertNotNull(s.closingChannel(id), "preconditions: must be in closingChannels");
-        // The Processor consumed the initial disconnect notification — clear our own view.
-        // (In the real code, processDisconnected has already run by now and dec'd the quota.)
+        assertFalse(s.disconnected().containsKey(id),
+            "preconditions: disconnect is deferred to the eviction poll, not emitted on FIN");
 
-        // Send for the closing channel MUST NOT throw.
+        // Send for the closing channel MUST NOT throw — must route to failedSends and
+        // surface on the next poll as a single disconnect notification.
         ByteBuffer body = ByteBuffer.wrap("late-response".getBytes());
         s.send(new NetworkSend(id, ByteBufferSend.sizePrefixed(body)));
 
-        // Next poll: surfaces as FAILED_SEND in disconnected.
+        // Poll 2 is the eviction poll: failedSends.remove(id) inside drainClosingChannels
+        // makes sendFailed=true, the read attempt is skipped, the channel is evicted, and
+        // exactly one entry lands in disconnected — LOCAL_CLOSE, matching NIO's
+        // doClose(channel, notifyDisconnect=true) at clients/.../Selector.java:856-857
+        // which writes channel.state() (the original close cause). The subsequent
+        // `for (String id : failedSends)` loop sees nothing for this id because the
+        // closingChannels drain already consumed it — that suppression is what prevents
+        // the duplicate FAILED_SEND that would double-notify processDisconnected.
         s.poll(0);
-        // Note: the closingChannel was evicted at top of this poll, so the FAILED_SEND
-        // suppresses through that path. There must NOT be a duplicate disconnect for id.
-        assertFalse(s.disconnected().containsKey(id),
-            "the closing channel's original LOCAL_CLOSE already fired; the eviction-time " +
-            "failedSends.remove must suppress the duplicate FAILED_SEND notification — otherwise " +
-            "processDisconnected runs dec() twice for the same connection");
+        assertTrue(s.disconnected().containsKey(id),
+            "eviction poll must emit exactly one disconnect for the channel");
+        assertEquals(ChannelState.LOCAL_CLOSE, s.disconnected().get(id),
+            "evicted closing channel surfaces as LOCAL_CLOSE (the original close cause); " +
+            "the duplicate FAILED_SEND notification must be suppressed by failedSends.remove");
+        assertNull(s.closingChannel(id),
+            "the channel must be fully evicted on the eviction poll");
+
+        // Poll 3: nothing left. Asserts there is no lingering failedSends entry that
+        // could surface a phantom disconnect for an already-evicted id.
+        s.poll(0);
+        assertTrue(s.disconnected().isEmpty(),
+            "no phantom disconnect on subsequent polls — the channel state is fully drained");
     }
 
     @Test
@@ -611,6 +645,137 @@ class IoUringSelectorTest {
         s.onWritabilityChanged(netty);
         t.join(TimeUnit.SECONDS.toMillis(5));
         assertTrue(returned.get(), "onWritabilityChanged must wake a blocking poll");
+    }
+
+    @Test
+    void pipelinedFramesSurfaceAcrossClosingChannelPolls() throws Exception {
+        // Codex v4 BLOCKER: closingChannels must support pipelined final-read across polls.
+        // A peer that pipelines three requests and then FINs must have all three surface
+        // as completedReceives across successive polls — one per poll (the "one receive per
+        // channel per poll" cap continues to apply across the FIN poll + eviction polls).
+        // Without drainClosingChannels iterating across polls, R2 and R3 would be silently
+        // dropped when the channel hits FIN — the broker would acknowledge the connection
+        // as cleanly closed despite never serving the pipelined requests.
+        IoUringSelector s = newSelector(IDLE_NANOS_NEVER);
+        EmbeddedChannel netty = acceptNew(s, REMOTE_A);
+        s.poll(0);
+        String id = s.connected().get(0);
+
+        s.onRead(netty, framed("r1"));
+        s.onRead(netty, framed("r2"));
+        s.onRead(netty, framed("r3"));
+        s.onDisconnect(netty);
+
+        // Poll 1 (FIN poll): step 2 read pass delivers R1. Step 3 sees a receive already
+        // surfaced this poll, so it does NOT redrain. Channel goes into closingChannels.
+        s.poll(0);
+        assertEquals(1, s.completedReceives().size(), "FIN poll: step 2 delivers R1");
+        assertContains(s.completedReceives(), "r1");
+        assertFalse(s.disconnected().containsKey(id), "no disconnect on FIN poll");
+        assertNotNull(s.closingChannel(id), "channel remains in closingChannels for pipelined drain");
+
+        // Poll 2: drainClosingChannels reads from the closing channel, surfaces R2,
+        // keeps the channel because more bytes are still readable.
+        s.poll(0);
+        assertEquals(1, s.completedReceives().size(), "drain poll 1: R2 surfaces");
+        assertContains(s.completedReceives(), "r2");
+        assertFalse(s.disconnected().containsKey(id), "channel still has work; no disconnect yet");
+        assertNotNull(s.closingChannel(id), "still buffered work; closingChannel must persist");
+
+        // Poll 3: surfaces R3, channel still has bytes? No — exhausted, but next poll's
+        // drainClosingChannels will re-attempt the read and discover nothing else, then evict.
+        s.poll(0);
+        assertEquals(1, s.completedReceives().size(), "drain poll 2: R3 surfaces");
+        assertContains(s.completedReceives(), "r3");
+
+        // Poll 4: eviction — read produces no more bytes, channel is evicted with LOCAL_CLOSE.
+        s.poll(0);
+        assertTrue(s.disconnected().containsKey(id),
+            "eviction poll: all pipelined work drained, channel evicted with LOCAL_CLOSE");
+        assertEquals(ChannelState.LOCAL_CLOSE, s.disconnected().get(id));
+        assertNull(s.closingChannel(id), "fully evicted");
+    }
+
+    @Test
+    void muteDrivesTheKafkaChannelStateMachineNotJustAutoRead() throws Exception {
+        // Codex v4 BLOCKER: selector.mute(id) must transition the KafkaChannel mute state
+        // to MUTED so SocketServer.scala's subsequent handleChannelMuteEvent(REQUEST_RECEIVED)
+        // can advance MUTED → MUTED_AND_RESPONSE_PENDING. KafkaChannel.handleChannelMuteEvent
+        // (clients/.../KafkaChannel.java:274-312) throws IllegalStateException if the source
+        // state is wrong — so if mute() only flipped autoRead without driving the state
+        // machine, every first valid request on every connection would crash the Processor.
+        IoUringSelector s = newSelector(IDLE_NANOS_NEVER);
+        EmbeddedChannel netty = acceptNew(s, REMOTE_A);
+        s.poll(0);
+        String id = s.connected().get(0);
+        KafkaChannel channel = s.channel(id);
+        assertNotNull(channel);
+
+        assertFalse(channel.isMuted(), "freshly accepted channel: NOT_MUTED");
+
+        s.mute(id);
+        assertTrue(channel.isMuted(),
+            "selector.mute must transition KafkaChannel state to MUTED — otherwise the broker's " +
+            "handleChannelMuteEvent(REQUEST_RECEIVED) throws and the first request crashes");
+        assertFalse(netty.config().isAutoRead(),
+            "mute must also flip Netty autoRead off (kernel-level backpressure) in addition to the state transition");
+
+        // Verify the state is actually MUTED (not some other muted variant) — handleChannelMuteEvent
+        // for REQUEST_RECEIVED expects the source state to be MUTED specifically. We exercise it
+        // here: a successful call proves the state transition is correct.
+        channel.handleChannelMuteEvent(KafkaChannel.ChannelMuteEvent.REQUEST_RECEIVED);
+        // The transition succeeded if no IllegalStateException was thrown above.
+
+        s.unmute(id);
+        // After REQUEST_RECEIVED, the channel is MUTED_AND_RESPONSE_PENDING. maybeUnmute
+        // requires RESPONSE_SENT first, so the channel stays muted.
+        assertTrue(channel.isMuted(),
+            "unmute on MUTED_AND_RESPONSE_PENDING: stays muted until RESPONSE_SENT — matches NIO");
+
+        channel.handleChannelMuteEvent(KafkaChannel.ChannelMuteEvent.RESPONSE_SENT);
+        s.unmute(id);
+        assertFalse(channel.isMuted(),
+            "after RESPONSE_SENT + unmute: channel returns to NOT_MUTED");
+        assertTrue(netty.config().isAutoRead(),
+            "unmute flips Netty autoRead back on — bytes flow again");
+    }
+
+    @Test
+    void muteAllAndUnmuteAllAlsoDriveTheStateMachine() throws Exception {
+        // Same invariant as the per-channel test but for the muteAll/unmuteAll path
+        // (SocketServer uses these for back-pressure across all connections on a Processor).
+        IoUringSelector s = newSelector(IDLE_NANOS_NEVER);
+        EmbeddedChannel a = acceptNew(s, REMOTE_A);
+        EmbeddedChannel b = acceptNew(s, REMOTE_B);
+        s.poll(0);
+        KafkaChannel ka = s.channel(s.connected().get(0));
+        KafkaChannel kb = s.channel(s.connected().get(1));
+        assertNotNull(ka);
+        assertNotNull(kb);
+        assertFalse(ka.isMuted());
+        assertFalse(kb.isMuted());
+
+        s.muteAll();
+        assertTrue(ka.isMuted(), "muteAll must transition every channel to MUTED, not just autoRead");
+        assertTrue(kb.isMuted());
+        assertFalse(a.config().isAutoRead());
+        assertFalse(b.config().isAutoRead());
+
+        s.unmuteAll();
+        assertFalse(ka.isMuted());
+        assertFalse(kb.isMuted());
+        assertTrue(a.config().isAutoRead());
+        assertTrue(b.config().isAutoRead());
+    }
+
+    private static void assertContains(Iterable<NetworkReceive> receives, String expected) {
+        for (NetworkReceive r : receives) {
+            ByteBuffer payload = r.payload().duplicate();
+            byte[] body = new byte[payload.remaining()];
+            payload.get(body);
+            if (new String(body).equals(expected)) return;
+        }
+        throw new AssertionError("did not find a NetworkReceive with payload '" + expected + "'");
     }
 
     private static ByteBuf collectAllOutbound(EmbeddedChannel ch) {
