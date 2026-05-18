@@ -222,6 +222,7 @@ public final class RuleSetBuilder {
         for (Map.Entry<Short, List<Rule>> e : byKey.entrySet()) {
             frozen.put(e.getKey(), Collections.unmodifiableList(e.getValue()));
         }
-        return new RuleSet(bitset, frozen, Collections.unmodifiableMap(new LinkedHashMap<>(rulesById)));
+        return new RuleSet(bitset, Collections.unmodifiableMap(frozen),
+            Collections.unmodifiableMap(new LinkedHashMap<>(rulesById)));
     }
 }
