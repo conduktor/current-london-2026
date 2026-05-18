@@ -188,21 +188,16 @@ public final class WsStreamer {
     private void drainAndMaybeFetch() {
         if (!draining.compareAndSet(false, true)) {
             // Another worker is already inside the drain body. drainScheduled was just CAS'd to
-            // true by the scheduleDrain that queued *this* invocation; the running drain will see
-            // it at its next do-while check and re-iterate, so any state changes we were about to
-            // process WILL be picked up. Returning here without clearing drainScheduled is what
-            // makes that handoff race-free: the running drain's `while (drainScheduled.get())`
-            // observes our set and loops. There is at most one extra executor task queued per
-            // burst of grants and it short-circuits here, so this is bounded.
+            // true by the scheduleDrain that queued *this* invocation; whether the running drain
+            // re-iterates and picks our work up OR misses it depends on the timing. The
+            // post-finally recovery in the running drain (below) is what makes the lost-wakeup
+            // window safe — we can return silently here.
             return;
         }
         try {
             // Loop until no new drain requests are pending. Clearing drainScheduled INSIDE the
-            // loop (and re-checking it at the bottom) creates a see-and-act handoff with
-            // scheduleDrain: a scheduleDrain that arrives between our `set(false)` and the next
-            // `get()` re-arms us and we loop; one that arrives after the `get() == false` exit
-            // queues a fresh executor task which will succeed on the `draining` CAS and pick up
-            // the state we just released.
+            // loop (and re-checking it at the bottom) lets a scheduleDrain that arrives during
+            // the work re-arm us via the while-check.
             do {
                 drainScheduled.set(false);
                 if (closed.get()) {
@@ -218,7 +213,30 @@ public final class WsStreamer {
                 maybeKickFetch();
             } while (drainScheduled.get());
         } finally {
+            // Release the mutex, then close the lost-wakeup window. Sequence to defend against:
+            //   1. We observe drainScheduled=false in the while-check above and exit the loop.
+            //   2. A scheduleDrain races in here: CAS drainScheduled false→true succeeds and
+            //      queues Drain B onto the executor.
+            //   3. Drain B's thread runs before we reach this finally, fails its draining CAS,
+            //      and returns silently.
+            //   4. We now reach this finally and clear draining. Final state: drainScheduled=true,
+            //      draining=false, NO task queued — future scheduleDrain calls would no-op on
+            //      their CAS (already true) and the subscription stalls despite available work.
+            // Recovery: after releasing draining, re-check drainScheduled. If it's still true,
+            // a grant landed in the race window — directly dispatch a fresh task. We bypass
+            // scheduleDrain because its CAS would refuse (flag is true). The newly-dispatched
+            // task is guaranteed to win the draining CAS because we just released it; any other
+            // racing task that loses the CAS is harmless because it leaves drainScheduled set
+            // and our recovery (or a later one) will pick the work up.
             draining.set(false);
+            if (drainScheduled.get() && !closed.get()) {
+                try {
+                    httpExecutor.execute(this::drainAndMaybeFetch);
+                } catch (RuntimeException e) {
+                    LOG.warn("WS executor rejected drain recovery for {}/{}", topic, partition, e);
+                    close();
+                }
+            }
         }
     }
 
