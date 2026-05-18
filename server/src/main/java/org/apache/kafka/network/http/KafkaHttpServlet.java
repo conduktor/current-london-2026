@@ -136,9 +136,19 @@ public final class KafkaHttpServlet extends HttpServlet {
         // submitter future. That thread is the broker's request-handler thread (RequestChannel callback) — running
         // a socket write there pins a Kafka API handler on slow-client I/O, which can starve the binary protocol.
         // Move the write onto Jetty's server thread pool instead.
+        // .exceptionally catches the executor-handoff failure mode the surrounding code cannot see: if
+        // httpExecutor rejects the dispatch (saturated/shutdown Jetty pool), the JDK routes that
+        // RejectedExecutionException to the dependent future, NOT this thread — writeResponseAndComplete
+        // never runs, async.complete() is never called, and metrics.recordRequest is never recorded. The
+        // request would sit until Jetty's default async timeout (~30s) abandons it. Mirrors the streamer
+        // pattern landed in commit 2e6fc859fa.
         bridge.produce(topic, body).whenCompleteAsync((response, throwable) ->
             writeResponseAndComplete(async, response, throwable, contentType,
-                HttpBridgeMetrics.Operation.PRODUCE, startNanos), httpExecutor);
+                HttpBridgeMetrics.Operation.PRODUCE, startNanos), httpExecutor)
+            .exceptionally(t -> {
+                handleDispatchFailure(async, t, HttpBridgeMetrics.Operation.PRODUCE, startNanos);
+                return null;
+            });
     }
 
     @Override
@@ -194,11 +204,17 @@ public final class KafkaHttpServlet extends HttpServlet {
         }
 
         AsyncContext async = req.startAsync();
-        // See doPost for why this is whenCompleteAsync: the broker handler thread that completes the future must
-        // not be the thread that performs the HTTP socket write — dispatch to Jetty's server thread pool.
+        // See doPost for why this is whenCompleteAsync, and why we attach a terminal .exceptionally:
+        // the broker handler thread that completes the future must not be the thread that performs the
+        // HTTP socket write, but executor rejection at the handoff completes the dependent future and
+        // would otherwise leak the AsyncContext + metric.
         bridge.fetch(topic, params).whenCompleteAsync((response, throwable) ->
             writeResponseAndComplete(async, response, throwable, contentType,
-                HttpBridgeMetrics.Operation.FETCH, startNanos), httpExecutor);
+                HttpBridgeMetrics.Operation.FETCH, startNanos), httpExecutor)
+            .exceptionally(t -> {
+                handleDispatchFailure(async, t, HttpBridgeMetrics.Operation.FETCH, startNanos);
+                return null;
+            });
     }
 
     /**
@@ -236,6 +252,41 @@ public final class KafkaHttpServlet extends HttpServlet {
             // we wrote on `throwable != null` as well as anything writeBridgeResponse set.
             metrics.recordRequest(operation, elapsedMs(startNanos), resp.getStatus());
             async.complete();
+        }
+    }
+
+    /**
+     * Terminal handler for failures the {@code whenCompleteAsync} dispatch cannot deliver into
+     * {@link #writeResponseAndComplete}. The only way to reach here in normal operation is a
+     * {@code RejectedExecutionException} from {@code httpExecutor} (saturated or shut-down Jetty
+     * thread pool), but the handler also defends against unexpected throwables thrown by the
+     * dependent stage itself. The response has not been committed in either case, so we can
+     * still emit a sanitised 500 envelope; throwable.getMessage() is never propagated to the
+     * client (same discipline as the {@link #writeResponseAndComplete} 500 path).
+     */
+    private void handleDispatchFailure(AsyncContext async, Throwable throwable,
+                                       HttpBridgeMetrics.Operation operation, long startNanos) {
+        HttpServletResponse resp = (HttpServletResponse) async.getResponse();
+        try {
+            LOG.warn("HTTP bridge dispatch failed for {}", operation, throwable);
+            if (!resp.isCommitted()) {
+                writeInternalError(resp, "internal server error");
+            }
+        } catch (IOException e) {
+            LOG.warn("Failed to write HTTP dispatch-failure response", e);
+        } catch (RuntimeException e) {
+            LOG.warn("Unexpected error while writing HTTP dispatch-failure response", e);
+        } finally {
+            try {
+                metrics.recordRequest(operation, elapsedMs(startNanos), resp.getStatus());
+            } catch (RuntimeException e) {
+                LOG.debug("metrics.recordRequest failed on dispatch failure: {}", e.toString());
+            }
+            try {
+                async.complete();
+            } catch (RuntimeException e) {
+                LOG.debug("AsyncContext.complete() failed on dispatch failure: {}", e.toString());
+            }
         }
     }
 
