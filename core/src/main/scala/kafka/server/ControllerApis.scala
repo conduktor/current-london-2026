@@ -304,40 +304,6 @@ class ControllerApis(
       new ApiError(INVALID_REQUEST, "Duplicate topic name.")))
     duplicateProvidedIds.forEach(id => appendResponse(null, id,
       new ApiError(INVALID_REQUEST, "Duplicate topic id.")))
-    // r17 BLOCKER #127 — Reject DeleteTopics on declared logical topic names.
-    //
-    // Without this guard, a name that exists ONLY as a logical declaration (in
-    // concentration.logical.topics, with no physical topic of the same name) flows into
-    // controller.findTopicIds → ReplicationControlManager.findTopicIds → UNKNOWN_TOPIC_OR_PARTITION
-    // because logical topics live in the controller config, not in the KRaft metadata image.
-    // That breaks the standard tooling round-trip: listTopics surfaces logical names via the
-    // broker-side DescribeTopicPartitions synthesis, then deleteTopics fails with UNKNOWN.
-    //
-    // Symmetric to CreateTopics' shadow rejection (TOPIC_ALREADY_EXISTS with explanatory
-    // message — see handleCreateTopics around line 446), reject with INVALID_REQUEST and tell
-    // the operator the correct action. The alternative we rejected was silent no-op success:
-    // it would confirm a wrong mental model (operator thinks the topic and its data are gone,
-    // but the kernel will re-surface the logical topic at the next produce).
-    //
-    // We reject ALL declared names — including currently-shadowed ones (physical exists). For
-    // a shadowed name, deleting the physical would unmask the logical declaration at the next
-    // metadata image; the operator must remove the config entry first. After removal +
-    // restart, the name is no longer in declaredLogicalTopicNames and deleteTopics on it
-    // follows the stock path.
-    if (declaredLogicalTopicNames.nonEmpty) {
-      val logicalRejected = new util.ArrayList[String]()
-      providedNames.forEach { name =>
-        if (declaredLogicalTopicNames.contains(name)) logicalRejected.add(name)
-      }
-      logicalRejected.forEach { name =>
-        providedNames.remove(name)
-        appendResponse(name, ZERO_UUID, new ApiError(INVALID_REQUEST,
-          s"Topic '$name' is a declared logical topic in concentration.logical.topics on " +
-            "this controller. Logical topics cannot be deleted via DeleteTopics; remove the " +
-            "declaration from the controller's broker config and restart, then any physical " +
-            "topic of the same name can be deleted via the normal path."))
-      }
-    }
     // At this point we have all the valid names and IDs that have been provided.
     // However, the Authorizer needs topic names as inputs, not topic IDs.  So
     // we need to resolve all IDs to names.
@@ -382,7 +348,30 @@ class ControllerApis(
       controller.findTopicIds(context, providedNames).thenCompose { topicIds =>
         topicIds.forEach { (name, idOrError) =>
           if (!describable.contains(name)) {
+            // r17 ADV-A1 BLOCKER — Auth precedence first. A logical-only name (declared in
+            // concentration.logical.topics but no physical) that an unauthorized principal sends
+            // MUST surface TOPIC_AUTHORIZATION_FAILED, identical to any other unauthorized name.
+            // The old pre-authz shadow check leaked the declared logical-topic set as an oracle:
+            // INVALID_REQUEST with the operator message for logical names, AUTHORIZATION_FAILED
+            // for everything else. Same auth-first invariant as #113 / N1 for CreateTopics.
             appendResponse(name, ZERO_UUID, new ApiError(TOPIC_AUTHORIZATION_FAILED))
+          } else if (declaredLogicalTopicNames.contains(name)) {
+            // Logical name visible to a describable principal. Disclosure of the operator
+            // remediation message (INVALID_REQUEST) is safe ONLY when the principal also has
+            // DELETE on the name — they could enumerate declared logical topics through
+            // DescribeTopicPartitions synthesis anyway. For a describe-only principal we must
+            // mirror the response shape used for a real topic without delete authz — namely
+            // TOPIC_AUTHORIZATION_FAILED in the `else` branch below — so the declared logical
+            // set cannot be probed by anyone holding only READ/DESCRIBE.
+            if (deletable.contains(name)) {
+              appendResponse(name, ZERO_UUID, new ApiError(INVALID_REQUEST,
+                s"Topic '$name' is a declared logical topic in concentration.logical.topics on " +
+                  "this controller. Logical topics cannot be deleted via DeleteTopics; remove the " +
+                  "declaration from the controller's broker config and restart, then any physical " +
+                  "topic of the same name can be deleted via the normal path."))
+            } else {
+              appendResponse(name, ZERO_UUID, new ApiError(TOPIC_AUTHORIZATION_FAILED))
+            }
           } else if (idOrError.isError) {
             appendResponse(name, ZERO_UUID, idOrError.error)
           } else if (deletable.contains(name)) {

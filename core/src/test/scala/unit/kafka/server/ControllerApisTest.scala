@@ -1212,6 +1212,72 @@ class ControllerApisTest {
       _ => Set.empty).get().asScala.toSet)
   }
 
+  /**
+   * r17 ADV-A1 BLOCKER — DeleteTopics shadow guard must NOT run before authorization.
+   *
+   * Before the fix, the shadow rejection at the top of deleteTopics() leaked which names
+   * were declared logical topics to ANY caller, regardless of authz: an unauthorized
+   * client would see INVALID_REQUEST with the operator message for declared logical names,
+   * and TOPIC_AUTHORIZATION_FAILED for everything else. That's an enumeration oracle on
+   * the broker's logical-topic config — same auth-precedence flaw the #113 fix closed on
+   * CreateTopics. The required behaviour: every name the principal cannot describe must
+   * surface TOPIC_AUTHORIZATION_FAILED, identical to non-existent unauthorized names.
+   */
+  @Test
+  def testDeleteTopicsLogicalRejectionDoesNotLeakToUnauthorized(): Unit = {
+    val controller = new MockController.Builder().build()
+    val props = new Properties()
+    props.put(ServerConfigs.CONCENTRATION_LOGICAL_TOPICS_CONFIG, "orders:100:shared:4,payments:50:shared:4")
+    controllerApis = createControllerApis(None, controller, props)
+    val request = new DeleteTopicsRequestData().setTopicNames(
+      util.Arrays.asList("orders", "payments", "innocent"))
+
+    // Unauthorized principal: hasClusterAuth=false AND empty describable/deletable
+    // simulates a client with zero ACLs. Every name should look identical from the
+    // outside — TOPIC_AUTHORIZATION_FAILED across the board, no logical-topic leak.
+    val expectedResponse = Set(
+      new DeletableTopicResult().setName("orders").setErrorCode(TOPIC_AUTHORIZATION_FAILED.code())
+        .setErrorMessage("Topic authorization failed."),
+      new DeletableTopicResult().setName("payments").setErrorCode(TOPIC_AUTHORIZATION_FAILED.code())
+        .setErrorMessage("Topic authorization failed."),
+      new DeletableTopicResult().setName("innocent").setErrorCode(TOPIC_AUTHORIZATION_FAILED.code())
+        .setErrorMessage("Topic authorization failed."))
+    assertEquals(expectedResponse, controllerApis.deleteTopics(ANONYMOUS_CONTEXT, request,
+      ApiKeys.DELETE_TOPICS.latestVersion().toInt,
+      hasClusterAuth = false,
+      _ => Set.empty, // not describable
+      _ => Set.empty  // not deletable
+    ).get().asScala.toSet)
+  }
+
+  /**
+   * r17 ADV-A1 BLOCKER follow-up — A principal with DESCRIBE on a logical name but not
+   * DELETE must still see TOPIC_AUTHORIZATION_FAILED, not INVALID_REQUEST. The shadow
+   * rejection only fires once the principal has BOTH describe and delete authz.
+   */
+  @Test
+  def testDeleteTopicsLogicalRejectionRequiresDeletePermission(): Unit = {
+    val controller = new MockController.Builder().build()
+    val props = new Properties()
+    props.put(ServerConfigs.CONCENTRATION_LOGICAL_TOPICS_CONFIG, "orders:100:shared:4")
+    controllerApis = createControllerApis(None, controller, props)
+    val request = new DeleteTopicsRequestData().setTopicNames(
+      util.Arrays.asList("orders"))
+
+    // Describable but NOT deletable: the principal can list the topic but cannot delete
+    // it. The shadow disclosure must wait for DELETE authz too — otherwise a read-only
+    // principal could enumerate the declared logical-topic set.
+    val expectedResponse = Set(
+      new DeletableTopicResult().setName("orders").setErrorCode(TOPIC_AUTHORIZATION_FAILED.code())
+        .setErrorMessage("Topic authorization failed."))
+    assertEquals(expectedResponse, controllerApis.deleteTopics(ANONYMOUS_CONTEXT, request,
+      ApiKeys.DELETE_TOPICS.latestVersion().toInt,
+      hasClusterAuth = false,
+      _ => Set("orders"), // describable
+      _ => Set.empty       // not deletable
+    ).get().asScala.toSet)
+  }
+
   @ParameterizedTest
   @ValueSource(booleans = Array(true, false))
   def testCreatePartitionsRequest(validateOnly: Boolean): Unit = {
