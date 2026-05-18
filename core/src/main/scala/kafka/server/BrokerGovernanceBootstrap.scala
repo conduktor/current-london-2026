@@ -92,6 +92,21 @@ object LocalReplicaStatus {
  * [[org.apache.kafka.clients.consumer.Consumer]]-driven path
  * ([[org.apache.kafka.server.rules.GovernanceTopicReader]]); the direct-log
  * path used here never enters [[RuleEngine#evaluate]] at all.
+ *
+ * <h3>Operator-visible posture: "fail-stale-not-empty"</h3>
+ *
+ * <p>Once this broker has successfully installed a non-empty [[RuleSet]],
+ * every subsequent no-log drain branch ([[LocalReplicaStatus#TopicAbsent]],
+ * [[LocalReplicaStatus#NonReplica]] under opt-out, and the
+ * [[LocalReplicaStatus#LocalReplica]] "log object briefly disappeared" race)
+ * KEEPS the previously-active [[RuleSet]] and does NOT commit empty. This
+ * is the safer choice for a security-critical surface, but it changes one
+ * operational assumption: deleting the {@code __governance} topic does NOT
+ * disable governance on already-running brokers — they will continue to
+ * enforce the last-known rules until the topic is re-created and each rule
+ * is either tombstoned or explicitly replaced. To deactivate a rule
+ * cluster-wide, publish a tombstone (key = rule-id, value = null) and wait
+ * for convergence; do not rely on topic deletion.
  */
 class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
                                 ruleEngine: RuleEngine,
