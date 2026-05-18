@@ -47,7 +47,7 @@ import org.junit.jupiter.api.Assertions.{assertEquals, assertNotNull, assertTrue
 import org.junit.jupiter.api.{AfterEach, BeforeEach, Test}
 import org.mockito.ArgumentMatchers.any
 import org.mockito.Mockito
-import org.mockito.Mockito.{doThrow, mock, verify}
+import org.mockito.Mockito.{doThrow, inOrder, mock, verify}
 import org.mockito.invocation.InvocationOnMock
 import org.mockito.stubbing.Answer
 
@@ -290,5 +290,57 @@ class BrokerMetadataPublisherTest {
         .build())
 
     verify(groupCoordinator).onNewMetadataImage(image, delta)
+  }
+
+  @Test
+  def testShadowOverlayRefreshedBeforeMetadataCacheImagePublish(): Unit = {
+    // r15 BLOCKER N2: applyShadowOverlay must run BEFORE metadataCache.setImage. Otherwise a
+    // produce/fetch on a logical name that just gained a physical namesake (via a CreateTopics
+    // on this or another broker that propagated through KRaft) races the publisher: the cache
+    // shows the physical topic while the kernel still claims the name as logical, and the
+    // request routes to the kernel's backing storage instead of the physical topic. The
+    // failure mode is silent cross-topic data leakage. Verifying the order pins the invariant.
+    val config = KafkaConfig.fromProps(TestUtils.createBrokerConfig(0))
+    val metadataCache = mock(classOf[KRaftMetadataCache])
+    val logManager = mock(classOf[LogManager])
+    val replicaManager = mock(classOf[ReplicaManager])
+    val groupCoordinator = mock(classOf[GroupCoordinator])
+    val faultHandler = mock(classOf[FaultHandler])
+    val concentrationKernel = mock(classOf[ConcentrationKernel])
+
+    val metadataPublisher = new BrokerMetadataPublisher(
+      config,
+      metadataCache,
+      logManager,
+      replicaManager,
+      groupCoordinator,
+      mock(classOf[TransactionCoordinator]),
+      Some(mock(classOf[ShareCoordinator])),
+      mock(classOf[DynamicConfigPublisher]),
+      mock(classOf[DynamicClientQuotaPublisher]),
+      mock(classOf[DynamicTopicClusterQuotaPublisher]),
+      mock(classOf[ScramPublisher]),
+      mock(classOf[DelegationTokenPublisher]),
+      mock(classOf[AclPublisher]),
+      faultHandler,
+      faultHandler,
+      concentrationKernel
+    )
+
+    val image = MetadataImage.EMPTY
+    val delta = new MetadataDelta.Builder().setImage(image).build()
+
+    metadataPublisher.onMetadataUpdate(delta, image,
+      LogDeltaManifest.newBuilder()
+        .provenance(MetadataProvenance.EMPTY)
+        .leaderAndEpoch(LeaderAndEpoch.UNKNOWN)
+        .numBatches(1)
+        .elapsedNs(100)
+        .numBytes(42)
+        .build())
+
+    val order = inOrder(concentrationKernel, metadataCache)
+    order.verify(concentrationKernel).applyShadowOverlay(any())
+    order.verify(metadataCache).setImage(any())
   }
 }

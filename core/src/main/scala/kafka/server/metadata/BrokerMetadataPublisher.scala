@@ -118,21 +118,37 @@ class BrokerMetadataPublisher(
         trace(s"Publishing delta $delta with highest offset $highestOffsetAndEpoch")
       }
 
-      // Publish the new metadata image to the metadata cache.
-      metadataCache.setImage(newImage)
-
-      // Recompute the kernel's shadow set against the freshly-published topic image. Any logical
-      // topic name that now collides with a real physical topic (operator declared "orders" but a
-      // physical "orders" exists, or someone created "orders" on another broker and KRaft just
-      // propagated it) gets shadowed — isLogicalTopic returns false for the name and traffic
-      // falls through to stock physical handling. Without this, every produce/fetch to "orders"
-      // routes through the logical kernel and the physical topic becomes invisible.
+      // Refresh the kernel's shadow set BEFORE publishing the new metadata image (r15 BLOCKER N2).
+      // Any logical topic name that now collides with a real physical topic (operator declared
+      // "orders" but a physical "orders" exists, or someone created "orders" on another broker
+      // and KRaft just propagated it) gets shadowed — isLogicalTopic returns false for the name
+      // and traffic falls through to stock physical handling.
+      //
+      // Order matters. If we set the image first, there is a window between the cache publish
+      // and the shadow flip where:
+      //   * isLogicalTopic("orders") still returns true (shadow flag not yet set), AND
+      //   * the cache shows a physical "orders".
+      // A produce/fetch that lands in that window routes to the logical kernel and stamps the
+      // backing log with the logical namespace — data loss for the physical "orders" that the
+      // client believed they were writing to.
+      //
+      // Flipping the shadow first inverts the failure mode: the window becomes "isLogicalTopic
+      // is false AND the cache hasn't seen the physical topic yet" — the request resolves to a
+      // retriable UNKNOWN_TOPIC_OR_PARTITION, which the client refreshes through and re-sends
+      // against the now-correct routing. Retriable >> silent data corruption.
+      //
+      // The symmetric case (physical "orders" removed) is also fine under the new ordering: we
+      // clear the shadow first, so produces that race the removal succeed against the logical
+      // kernel (no error visible to the client) rather than seeing transient UNKNOWN.
       try {
         concentrationKernel.applyShadowOverlay(newImage.topics().topicsByName().keySet())
       } catch {
         case t: Throwable => metadataPublishingFaultHandler.handleFault(
           s"Error refreshing concentration shadow overlay in $deltaName", t)
       }
+
+      // Publish the new metadata image to the metadata cache.
+      metadataCache.setImage(newImage)
 
       def metadataVersionLogMsg = s"metadata.version ${newImage.features().metadataVersion()}"
 
