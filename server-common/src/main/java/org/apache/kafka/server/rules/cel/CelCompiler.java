@@ -20,6 +20,8 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Pattern;
+import java.util.regex.PatternSyntaxException;
 
 /**
  * Lexer + recursive-descent parser for the CEL subset supported by the
@@ -267,10 +269,14 @@ public final class CelCompiler {
 
         private final List<Token> toks;
         private int i;
+        private int depth;
+        private int nodes;
 
         Parser(List<Token> toks) {
             this.toks = toks;
             this.i = 0;
+            this.depth = 0;
+            this.nodes = 0;
         }
 
         void expectEof() {
@@ -302,14 +308,56 @@ public final class CelCompiler {
             return consume();
         }
 
+        /**
+         * Account for a freshly-allocated node. Every {@code new CelNode.X(...)}
+         * inside the parser is wrapped in {@code account(...)} so the parser
+         * enforces {@link CelLimits#MAX_NODES} regardless of which production
+         * is allocating. Crossing the limit raises {@link CelCompilationException}
+         * with the offending source — the operator sees the error at rule
+         * load, not in production.
+         */
+        private <T extends CelNode> T account(T node) {
+            nodes++;
+            if (nodes > CelLimits.MAX_NODES) {
+                throw new CelCompilationException(
+                    "CEL expression exceeds node budget of " + CelLimits.MAX_NODES);
+            }
+            return node;
+        }
+
+        /**
+         * Pre-increment the parse-call depth counter and throw if it would
+         * exceed {@link CelLimits#MAX_PARSE_DEPTH}. Callers MUST pair this
+         * with {@link #exitDepth()} in a try/finally so an exception during
+         * sub-parsing does not leave the counter elevated for the next call
+         * on the same parser instance. (In practice the parser is one-shot
+         * per source, but defensive symmetry is cheap.)
+         */
+        private void enterDepth() {
+            depth++;
+            if (depth > CelLimits.MAX_PARSE_DEPTH) {
+                throw new CelCompilationException(
+                    "CEL expression exceeds parse depth budget of " + CelLimits.MAX_PARSE_DEPTH);
+            }
+        }
+
+        private void exitDepth() {
+            depth--;
+        }
+
         CelNode parseExpr() {
-            return parseOr();
+            enterDepth();
+            try {
+                return parseOr();
+            } finally {
+                exitDepth();
+            }
         }
 
         private CelNode parseOr() {
             CelNode left = parseAnd();
             while (match(TokKind.OR)) {
-                left = new CelNode.Or(left, parseAnd());
+                left = account(new CelNode.Or(left, parseAnd()));
             }
             return left;
         }
@@ -317,16 +365,23 @@ public final class CelCompiler {
         private CelNode parseAnd() {
             CelNode left = parseNot();
             while (match(TokKind.AND)) {
-                left = new CelNode.And(left, parseNot());
+                left = account(new CelNode.And(left, parseNot()));
             }
             return left;
         }
 
         private CelNode parseNot() {
-            if (match(TokKind.NOT)) {
-                return new CelNode.Not(parseNot());
+            // parseNot recurses into itself for every leading `!`, so an input
+            // like "!!!!...x" can blow the JVM stack at parse time. Bound it.
+            enterDepth();
+            try {
+                if (match(TokKind.NOT)) {
+                    return account(new CelNode.Not(parseNot()));
+                }
+                return parseRel();
+            } finally {
+                exitDepth();
             }
-            return parseRel();
         }
 
         private CelNode parseRel() {
@@ -334,10 +389,10 @@ public final class CelCompiler {
             CelNode.Compare.Op op = COMPARE_OPS.get(peek().kind);
             if (op != null) {
                 consume();
-                return new CelNode.Compare(left, op, parseAdd());
+                return account(new CelNode.Compare(left, op, parseAdd()));
             }
             if (match(TokKind.IN)) {
-                return new CelNode.InList(left, parseAdd());
+                return account(new CelNode.InList(left, parseAdd()));
             }
             return left;
         }
@@ -346,9 +401,9 @@ public final class CelCompiler {
             CelNode left = parseMul();
             while (true) {
                 if (match(TokKind.PLUS)) {
-                    left = new CelNode.Arith(left, CelNode.Arith.Op.ADD, parseMul());
+                    left = account(new CelNode.Arith(left, CelNode.Arith.Op.ADD, parseMul()));
                 } else if (match(TokKind.MINUS)) {
-                    left = new CelNode.Arith(left, CelNode.Arith.Op.SUB, parseMul());
+                    left = account(new CelNode.Arith(left, CelNode.Arith.Op.SUB, parseMul()));
                 } else {
                     return left;
                 }
@@ -359,11 +414,11 @@ public final class CelCompiler {
             CelNode left = parseUnary();
             while (true) {
                 if (match(TokKind.STAR)) {
-                    left = new CelNode.Arith(left, CelNode.Arith.Op.MUL, parseUnary());
+                    left = account(new CelNode.Arith(left, CelNode.Arith.Op.MUL, parseUnary()));
                 } else if (match(TokKind.SLASH)) {
-                    left = new CelNode.Arith(left, CelNode.Arith.Op.DIV, parseUnary());
+                    left = account(new CelNode.Arith(left, CelNode.Arith.Op.DIV, parseUnary()));
                 } else if (match(TokKind.PERCENT)) {
-                    left = new CelNode.Arith(left, CelNode.Arith.Op.MOD, parseUnary());
+                    left = account(new CelNode.Arith(left, CelNode.Arith.Op.MOD, parseUnary()));
                 } else {
                     return left;
                 }
@@ -371,10 +426,17 @@ public final class CelCompiler {
         }
 
         private CelNode parseUnary() {
-            if (match(TokKind.MINUS)) {
-                return new CelNode.Negate(parseUnary());
+            // Same rationale as parseNot — unbounded leading `-` would
+            // overflow the parse stack.
+            enterDepth();
+            try {
+                if (match(TokKind.MINUS)) {
+                    return account(new CelNode.Negate(parseUnary()));
+                }
+                return parsePostfix();
+            } finally {
+                exitDepth();
             }
-            return parsePostfix();
         }
 
         private CelNode parsePostfix() {
@@ -385,7 +447,7 @@ public final class CelCompiler {
                 } else if (match(TokKind.LBRACK)) {
                     CelNode idx = parseExpr();
                     expect(TokKind.RBRACK);
-                    node = new CelNode.Index(node, idx);
+                    node = account(new CelNode.Index(node, idx));
                 } else {
                     return node;
                 }
@@ -395,13 +457,54 @@ public final class CelCompiler {
         private CelNode parseDotSuffix(CelNode receiver) {
             Token name = expect(TokKind.IDENT);
             if (peek().kind != TokKind.LPAREN) {
-                return new CelNode.Field(receiver, name.text);
+                return account(new CelNode.Field(receiver, name.text));
             }
             consume();
             if ("exists".equals(name.text) || "all".equals(name.text)) {
                 return parseComprehension(receiver, name.text);
             }
-            return new CelNode.MethodCall(receiver, name.text, parseArgList());
+            List<CelNode> args = parseArgList();
+            if ("matches".equals(name.text)) {
+                return buildRegexMatch(receiver, args);
+            }
+            return account(new CelNode.MethodCall(receiver, name.text, args));
+        }
+
+        /**
+         * Lower {@code receiver.matches(<literal>)} to a {@link CelNode.RegexMatch}
+         * with a pre-compiled {@link Pattern}. We require exactly one string
+         * literal argument: a dynamic pattern would have to be compiled per
+         * request, which both costs CPU and defeats compile-time validation
+         * of the regex syntax. Operators who want pattern variation should
+         * supply multiple literal-pattern rules.
+         *
+         * <p>The compile happens here, at rule load. A malformed regex
+         * surfaces as {@link CelCompilationException} to the rule submitter,
+         * not as a runtime exception on the broker request path.
+         */
+        private CelNode buildRegexMatch(CelNode receiver, List<CelNode> args) {
+            if (args.size() != 1) {
+                throw new CelCompilationException(
+                    "matches() requires exactly one argument, got " + args.size());
+            }
+            CelNode argNode = args.get(0);
+            if (!(argNode instanceof CelNode.Literal)) {
+                throw new CelCompilationException(
+                    "matches() requires a string literal pattern; dynamic patterns "
+                        + "are not supported because they cannot be pre-compiled");
+            }
+            Object literal = ((CelNode.Literal) argNode).value;
+            if (!(literal instanceof String)) {
+                throw new CelCompilationException(
+                    "matches() requires a string literal pattern, got " + literal);
+            }
+            String patternSrc = (String) literal;
+            try {
+                Pattern compiled = Pattern.compile(patternSrc);
+                return account(new CelNode.RegexMatch(receiver, compiled, patternSrc));
+            } catch (PatternSyntaxException e) {
+                throw new CelCompilationException("invalid regex: " + patternSrc, e);
+            }
         }
 
         private CelNode parseComprehension(CelNode receiver, String macroName) {
@@ -412,7 +515,7 @@ public final class CelCompiler {
             CelNode.Comprehension.Kind kind = "exists".equals(macroName)
                 ? CelNode.Comprehension.Kind.EXISTS
                 : CelNode.Comprehension.Kind.ALL;
-            return new CelNode.Comprehension(receiver, kind, var.text, pred);
+            return account(new CelNode.Comprehension(receiver, kind, var.text, pred));
         }
 
         private List<CelNode> parseArgList() {
@@ -449,16 +552,16 @@ public final class CelCompiler {
                 case NUM:
                 case STR:
                     consume();
-                    return new CelNode.Literal(t.literal);
+                    return account(new CelNode.Literal(t.literal));
                 case TRUE:
                     consume();
-                    return new CelNode.Literal(Boolean.TRUE);
+                    return account(new CelNode.Literal(Boolean.TRUE));
                 case FALSE:
                     consume();
-                    return new CelNode.Literal(Boolean.FALSE);
+                    return account(new CelNode.Literal(Boolean.FALSE));
                 case NULL:
                     consume();
-                    return new CelNode.Literal(null);
+                    return account(new CelNode.Literal(null));
                 default:
                     return null;
             }
@@ -467,12 +570,12 @@ public final class CelCompiler {
         private CelNode parseIdentOrCall() {
             Token t = consume();
             if (peek().kind != TokKind.LPAREN) {
-                return new CelNode.Identifier(t.text);
+                return account(new CelNode.Identifier(t.text));
             }
             consume();
             List<CelNode> args = parseArgList();
             if ("size".equals(t.text) && args.size() == 1) {
-                return new CelNode.SizeCall(args.get(0));
+                return account(new CelNode.SizeCall(args.get(0)));
             }
             throw new CelCompilationException("unknown function: " + t.text);
         }
@@ -494,7 +597,7 @@ public final class CelCompiler {
                 }
             }
             expect(TokKind.RBRACK);
-            return new CelNode.ListLiteral(items);
+            return account(new CelNode.ListLiteral(items));
         }
 
         private CelNode parseMapLiteral() {
@@ -508,7 +611,7 @@ public final class CelCompiler {
                 }
             }
             expect(TokKind.RBRACE);
-            return new CelNode.MapLiteral(keys, vals);
+            return account(new CelNode.MapLiteral(keys, vals));
         }
 
         private void parseMapEntry(List<CelNode> keys, List<CelNode> vals) {

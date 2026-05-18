@@ -23,7 +23,6 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.function.Function;
 import java.util.regex.Pattern;
-import java.util.regex.PatternSyntaxException;
 
 /**
  * AST for the CEL-subset interpreter. Each subclass implements
@@ -141,21 +140,13 @@ abstract class CelNode {
                     return r instanceof String && arg0 != null && ((String) r).endsWith(arg0);
                 case "contains":
                     return r instanceof String && arg0 != null && ((String) r).contains(arg0);
-                case "matches":
-                    return matchesRegex(r, arg0);
                 default:
+                    // matches() is not handled here — the parser lowers
+                    // `.matches(<literal>)` into a RegexMatch node so the
+                    // pattern is pre-compiled at rule load time. Reaching
+                    // this branch means the parser failed to enforce that
+                    // contract.
                     throw new CelEvaluationException("unknown method: " + method);
-            }
-        }
-
-        private static boolean matchesRegex(Object receiver, String pattern) {
-            if (!(receiver instanceof String) || pattern == null) {
-                return false;
-            }
-            try {
-                return Pattern.compile(pattern).matcher((String) receiver).matches();
-            } catch (PatternSyntaxException e) {
-                throw new CelEvaluationException("invalid regex: " + pattern);
             }
         }
 
@@ -165,6 +156,55 @@ abstract class CelNode {
                 throw new CelEvaluationException("expected string argument, got " + v);
             }
             return (String) v;
+        }
+    }
+
+    /**
+     * Specialised method-call node for {@code receiver.matches(<literal>)}.
+     * The pattern is compiled exactly once at parse time and stored on the
+     * node; runtime evaluation only invokes the matcher. This serves two
+     * goals at once:
+     *
+     * <ol>
+     *   <li><b>Bad regex caught early.</b> A {@link java.util.regex.PatternSyntaxException}
+     *       on a malformed literal raises {@link CelCompilationException} at
+     *       rule load time, not on the request hot path.</li>
+     *   <li><b>ReDoS surface reduced.</b> The receiver string is bounded by
+     *       {@link CelLimits#MAX_REGEX_INPUT_LENGTH}; longer inputs raise
+     *       {@link CelEvaluationException} (which the engine fails open on),
+     *       so a request crafted to feed a megabyte-long field to a
+     *       backtracking regex cannot stall the request thread.</li>
+     * </ol>
+     *
+     * <p>The parser only emits this node when the argument is a string
+     * literal — dynamic patterns are rejected at compile time. Operators who
+     * need pattern variation can compose {@code startsWith} / {@code endsWith}
+     * / {@code contains} or supply multiple literal-pattern rules.
+     */
+    static final class RegexMatch extends CelNode {
+        final CelNode receiver;
+        final Pattern pattern;
+        final String source;
+
+        RegexMatch(CelNode receiver, Pattern pattern, String source) {
+            this.receiver = receiver;
+            this.pattern = pattern;
+            this.source = source;
+        }
+
+        @Override
+        Object eval(Function<String, Object> a) {
+            Object r = receiver.eval(a);
+            if (!(r instanceof String)) {
+                return false;
+            }
+            String s = (String) r;
+            if (s.length() > CelLimits.MAX_REGEX_INPUT_LENGTH) {
+                throw new CelEvaluationException(
+                    "matches(): receiver length " + s.length() + " exceeds "
+                        + CelLimits.MAX_REGEX_INPUT_LENGTH);
+            }
+            return pattern.matcher(s).matches();
         }
     }
 
@@ -192,6 +232,14 @@ abstract class CelNode {
                 return kind == Kind.ALL;
             }
             for (Object item : (List<?>) r) {
+                // Per-iteration step budget. The motivation is nested
+                // comprehensions over attacker-controlled list sizes:
+                // request.x.exists(a, request.y.exists(b, ...)) is O(|x|·|y|)
+                // and trivially escalates to seconds of CPU on the request
+                // thread for any concrete list pair the engine considers
+                // "normal". Bump before doing per-element work so a runaway
+                // loop is killed at the budget, not after.
+                CelLimits.bumpStep();
                 Function<String, Object> scoped = name -> name.equals(varName) ? item : a.apply(name);
                 Object v = predicate.eval(scoped);
                 boolean b = v instanceof Boolean && (Boolean) v;

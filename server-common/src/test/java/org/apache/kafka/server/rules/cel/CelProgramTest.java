@@ -215,4 +215,154 @@ public class CelProgramTest {
         CelProgram p = CelCompiler.compile("request.name == \"x\"");
         assertEquals("request.name == \"x\"", p.source());
     }
+
+    @Test
+    public void parseDepthIsBoundedAgainstChainedNotOperators() {
+        // A hand-rolled recursive descent compiler will overflow the JVM
+        // stack on a deeply-chained unary `!`. The parser must refuse the
+        // input at compile time with a CelCompilationException rather than
+        // crash the rule-loader thread.
+        StringBuilder sb = new StringBuilder();
+        for (int n = 0; n < CelLimits.MAX_PARSE_DEPTH + 16; n++) {
+            sb.append('!');
+        }
+        sb.append("x");
+        CelCompilationException ex = assertThrows(
+            CelCompilationException.class,
+            () -> CelCompiler.compile(sb.toString()));
+        assertTrue(ex.getMessage().contains("parse depth"),
+            "expected parse-depth error, got: " + ex.getMessage());
+    }
+
+    @Test
+    public void parseDepthIsBoundedAgainstChainedParentheses() {
+        // Same defence, different vector: deeply-nested grouping descends
+        // through parseExpr on every layer of parens. Bound it.
+        StringBuilder open = new StringBuilder();
+        StringBuilder close = new StringBuilder();
+        for (int n = 0; n < CelLimits.MAX_PARSE_DEPTH + 16; n++) {
+            open.append('(');
+            close.append(')');
+        }
+        String src = open + "x" + close;
+        assertThrows(CelCompilationException.class, () -> CelCompiler.compile(src));
+    }
+
+    @Test
+    public void nodeBudgetIsEnforcedForLargeListLiterals() {
+        // A long-but-shallow source like `[1,1,1,...]` does not blow the
+        // parse stack but does allocate one Literal node per element. The
+        // node budget catches it at compile time so an attacker-crafted
+        // rule cannot exhaust broker heap during parsing.
+        StringBuilder sb = new StringBuilder("[");
+        int items = CelLimits.MAX_NODES + 16;
+        for (int n = 0; n < items; n++) {
+            if (n > 0) sb.append(',');
+            sb.append('1');
+        }
+        sb.append(']');
+        CelCompilationException ex = assertThrows(
+            CelCompilationException.class,
+            () -> CelCompiler.compile(sb.toString()));
+        assertTrue(ex.getMessage().contains("node budget"),
+            "expected node-budget error, got: " + ex.getMessage());
+    }
+
+    @Test
+    public void matchesPatternIsCompiledAtRuleLoadTime() {
+        // A malformed regex must surface to the operator at rule load, not
+        // as a runtime exception on the request thread. Pre-compilation in
+        // the parser is what enforces this.
+        CelCompilationException ex = assertThrows(
+            CelCompilationException.class,
+            () -> CelCompiler.compile("name.matches(\"[\")"));
+        assertTrue(ex.getMessage().contains("invalid regex"),
+            "expected invalid-regex error, got: " + ex.getMessage());
+    }
+
+    @Test
+    public void matchesRejectsDynamicPatternAtCompileTime() {
+        // Dynamic regex patterns defeat pre-compilation, defeat compile-time
+        // validation, and would require per-request Pattern.compile on the
+        // hot path. The parser refuses them — operators who need pattern
+        // variation should supply multiple literal-pattern rules.
+        CelCompilationException ex = assertThrows(
+            CelCompilationException.class,
+            () -> CelCompiler.compile("name.matches(other)"));
+        assertTrue(ex.getMessage().contains("literal"),
+            "expected literal-pattern error, got: " + ex.getMessage());
+    }
+
+    @Test
+    public void matchesRejectsOversizedReceiverInputAtRuntime() {
+        // Even with a pre-compiled regex, catastrophic backtracking on a
+        // megabyte-long input can stall the request thread. Cap the receiver
+        // length; a request crafted with an extremely long string field
+        // raises CelEvaluationException, which the engine fails open on.
+        Map<String, Object> env = new HashMap<>();
+        StringBuilder huge = new StringBuilder();
+        for (int n = 0; n < CelLimits.MAX_REGEX_INPUT_LENGTH + 16; n++) {
+            huge.append('a');
+        }
+        env.put("name", huge.toString());
+        CelEvaluationException ex = assertThrows(
+            CelEvaluationException.class,
+            () -> evalBool("name.matches(\"a+\")", env));
+        assertTrue(ex.getMessage().contains("receiver length"),
+            "expected receiver-length error, got: " + ex.getMessage());
+    }
+
+    @Test
+    public void evalStepBudgetKillsNestedComprehensionBlowup() {
+        // Nested exists/all over attacker-controlled lists is O(N^depth).
+        // The runtime step budget bounds it: a request that would otherwise
+        // execute billions of iterations is killed at MAX_EVAL_STEPS and the
+        // engine fails the rule open (logged and skipped).
+        //
+        // We need a predicate that does NOT short-circuit. Two nested
+        // .exists with an always-false predicate: outer iterates all N,
+        // inner exhausts all N before returning false, total N*N steps.
+        int side = 400; // 400 * 400 = 160_000 > MAX_EVAL_STEPS=100_000
+        java.util.List<Integer> outer = new java.util.ArrayList<>(side);
+        for (int n = 0; n < side; n++) {
+            outer.add(n);
+        }
+        Map<String, Object> env = new HashMap<>();
+        env.put("xs", outer);
+        assertThrows(
+            CelEvaluationException.class,
+            () -> evalBool("xs.exists(a, xs.exists(b, a == -1 && b == -1))", env));
+    }
+
+    @Test
+    public void evalStepCounterIsResetBetweenInvocations() {
+        // The counter is a ThreadLocal; without explicit reset it would
+        // accumulate across requests on the same broker thread and trip
+        // arbitrarily early for the second request. The reset must happen
+        // both before and after evaluation so a throwing evaluation does
+        // not poison the next one.
+        java.util.List<Integer> items = new java.util.ArrayList<>();
+        for (int n = 0; n < 1000; n++) {
+            items.add(n);
+        }
+        Map<String, Object> env = new HashMap<>();
+        env.put("xs", items);
+        // 1000 iterations per call; well under the budget. Run it many
+        // times — should never trip.
+        CelProgram p = CelCompiler.compile("xs.exists(a, a == -1)");
+        for (int n = 0; n < 200; n++) {
+            assertFalse(p.evalBoolean(env::get));
+        }
+    }
+
+    @Test
+    public void matchesStillWorksOnNonStringReceiver() {
+        // Behavioural parity with the old MethodCall-based path: a non-string
+        // receiver yields false, not an exception. This matters because
+        // rules running over heterogeneous Kafka APIs may encounter fields
+        // that are absent or numeric on some request shapes.
+        Map<String, Object> env = new HashMap<>();
+        env.put("name", 42L);
+        assertFalse(evalBool("name.matches(\"[a-z]+\")", env));
+    }
 }

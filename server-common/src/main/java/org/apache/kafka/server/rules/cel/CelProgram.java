@@ -44,13 +44,25 @@ public final class CelProgram {
      * Evaluate as a boolean. Null and missing identifiers are coerced to false
      * so that rule predicates cannot crash the request path on heterogeneous
      * Kafka APIs. Non-boolean, non-null values throw.
+     *
+     * <p>The per-thread eval-step counter (see {@link CelLimits#bumpStep})
+     * is reset on entry and on exit so this evaluation neither inherits a
+     * partial count from a previous call nor leaks a count to the next one.
+     * The reset is in a {@code finally} block so even an evaluation that
+     * throws cannot leave a poisoned counter for the next request on the
+     * same broker thread.
      */
     public boolean evalBoolean(Function<String, Object> activation) {
-        Object v = root.eval(activation);
-        if (v == null) return false;
-        if (v instanceof Boolean) return (Boolean) v;
-        throw new CelEvaluationException(
-            "CEL expression did not evaluate to a boolean: source=" + source + " value=" + v);
+        CelLimits.resetSteps();
+        try {
+            Object v = root.eval(activation);
+            if (v == null) return false;
+            if (v instanceof Boolean) return (Boolean) v;
+            throw new CelEvaluationException(
+                "CEL expression did not evaluate to a boolean: source=" + source + " value=" + v);
+        } finally {
+            CelLimits.resetSteps();
+        }
     }
 
     public String source() {
