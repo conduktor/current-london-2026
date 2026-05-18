@@ -1636,9 +1636,16 @@ class KafkaApis(val requestChannel: RequestChannel,
       if ((requestVersion == 0 && (metadataRequest.topics == null || metadataRequest.topics.isEmpty)) || metadataRequest.isAllTopics)
         Set.empty[MetadataResponseTopic]
       else if (useTopicId) {
-        // Topic IDs are not considered sensitive information, so returning TOPIC_AUTHORIZATION_FAILED is OK
-        unauthorizedForDescribeTopics.map(topic =>
-          metadataResponseTopic(Errors.TOPIC_AUTHORIZATION_FAILED, null, metadataCache.getTopicId(topic), isInternal = false, util.Collections.emptyList()))
+        // Topic IDs are not considered sensitive information, so returning TOPIC_AUTHORIZATION_FAILED is OK.
+        // Logical-topic IDs live outside the KRaft metadata cache, so when a v12+ client refreshes by
+        // topic-id and auth fails, falling back to metadataCache.getTopicId would hand back ZERO_UUID
+        // and break response correlation. Ask the kernel first for logical names.
+        unauthorizedForDescribeTopics.map { topic =>
+          val resolvedId =
+            if (concentrationKernel.isLogicalTopic(topic)) concentrationKernel.logicalTopicId(topic)
+            else metadataCache.getTopicId(topic)
+          metadataResponseTopic(Errors.TOPIC_AUTHORIZATION_FAILED, null, resolvedId, isInternal = false, util.Collections.emptyList())
+        }
       } else {
         // We should not return topicId when on unauthorized error, so we return zero uuid.
         unauthorizedForDescribeTopics.map(topic =>

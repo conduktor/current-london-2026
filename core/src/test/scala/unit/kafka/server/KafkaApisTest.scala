@@ -5517,6 +5517,58 @@ class KafkaApisTest extends Logging {
     }
   }
 
+  @Test
+  def testUnauthorizedLogicalTopicMetadataByTopicIdReturnsLogicalUuid(): Unit = {
+    // Regression: v12+ METADATA by topic-id for an unauthorized logical topic must surface the
+    // kernel's deterministic logical UUID (not Uuid.ZERO_UUID from metadataCache.getTopicId).
+    // Otherwise stock clients caching by topic-id cannot correlate the auth-failure response back
+    // to the request and either loop forever or surface a misleading error.
+    val plaintextListener = ListenerName.forSecurityProtocol(SecurityProtocol.PLAINTEXT)
+    val endpoints = new BrokerEndpointCollection()
+    endpoints.add(
+      new BrokerEndpoint()
+        .setHost("broker0")
+        .setPort(9092)
+        .setSecurityProtocol(SecurityProtocol.PLAINTEXT.id)
+        .setName(plaintextListener.value)
+    )
+    MetadataCacheTest.updateCache(metadataCache,
+      Seq(new RegisterBrokerRecord().setBrokerId(0).setRack("rack").setFenced(false).setEndPoints(endpoints))
+    )
+
+    val logicalTopic = "logical-unauth"
+    val logicalTopicId = Uuid.randomUuid()
+    when(concentrationKernel.logicalTopicByTopicId(logicalTopicId)).thenReturn(Optional.of(logicalTopic))
+    when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
+    when(concentrationKernel.logicalTopicId(logicalTopic)).thenReturn(logicalTopicId)
+    when(concentrationKernel.allLogicalTopicNames()).thenReturn(java.util.Collections.emptySet())
+
+    val authorizer: Authorizer = mock(classOf[Authorizer])
+    when(authorizer.authorize(any[RequestContext], any[util.List[Action]]))
+      .thenAnswer { invocation =>
+        invocation.getArgument(1).asInstanceOf[util.List[Action]].asScala.map { action =>
+          if (action.resourcePattern().name() == logicalTopic) AuthorizationResult.DENIED
+          else AuthorizationResult.ALLOWED
+        }.asJava
+      }
+
+    val metadataReq = new MetadataRequest.Builder(util.Arrays.asList(logicalTopicId)).build()
+    val req = buildRequest(metadataReq, plaintextListener)
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+    kafkaApis = createKafkaApis(authorizer = Some(authorizer))
+    kafkaApis.handleTopicMetadataRequest(req)
+    val resp = verifyNoThrottling[MetadataResponse](req)
+
+    val responseTopics = resp.data().topics().asScala
+    assertEquals(1, responseTopics.size, s"Expected exactly one topic in response, got: $responseTopics")
+    val rt = responseTopics.head
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED.code(), rt.errorCode())
+    assertNull(rt.name(), "topic name must not leak on auth failure")
+    assertEquals(logicalTopicId, rt.topicId(),
+      "unauthorized logical topic must echo back the kernel's logical UUID so the client can correlate")
+  }
+
     /**
    * Verifies that sending a fetch request with version 9 works correctly when
    * ReplicaManager.getLogConfig returns None.
