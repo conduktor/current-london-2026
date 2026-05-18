@@ -595,6 +595,23 @@ class KafkaApis(val requestChannel: RequestChannel,
                 invalidRequestResponses += topicPartition -> new PartitionResponse(
                   Errors.INVALID_TXN_STATE,
                   "concentration v1 does not support transactional produce to logical topics")
+              } else if (firstBatch != null && firstBatch.hasProducerId && firstBatch.baseSequence >= 0) {
+                // r14 BLOCKER B2 (#95): idempotent produce is refused on logical topics in v1.
+                // Two logical topics sharing a backing partition emit records with the SAME
+                // (producerId, baseSequence) but different backing offsets — the backing
+                // partition's ProducerStateManager would then reject the second produce as
+                // DUPLICATE_SEQUENCE_NUMBER even though it actually succeeded the FIRST time
+                // to a DIFFERENT logical topic. Disambiguating requires per-logical-topic
+                // producer state on the backing replica, which v1 does not implement.
+                // INVALID_PRODUCER_EPOCH forces the client into the same fatal path as a
+                // genuine fencing event — non-retriable, surfaced as InvalidProducerEpochException
+                // — so producers fail loudly rather than silently corrupting state. Mirrors
+                // the transactional refusal directly above. The kernel's per-logical-topic
+                // idempotent batch cache (lookupIdempotentBatch) is retained for v2 once
+                // per-logical PSM lands; it is unreachable while this gate is in place.
+                invalidRequestResponses += topicPartition -> new PartitionResponse(
+                  Errors.INVALID_PRODUCER_EPOCH,
+                  "concentration v1 does not support idempotent produce to logical topics")
               } else {
                 // Idempotent-retry pre-check (PROMPT scenario 6). If this batch carries a
                 // producerId and a non-negative baseSequence, it's an idempotent batch and may be

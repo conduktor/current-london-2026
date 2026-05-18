@@ -95,7 +95,7 @@ import org.apache.kafka.server.share.context.{FinalContext, ShareSessionContext}
 import org.apache.kafka.server.share.session.{ShareSession, ShareSessionKey}
 import org.apache.kafka.server.storage.log.{FetchParams, FetchPartitionData}
 import org.apache.kafka.server.util.{FutureUtils, MockTime}
-import org.apache.kafka.storage.internals.concentration.{ConcentrationHeaders, ConcentrationKernel, IdempotentBatchKey, IdempotentBatchResult, LogicalProduceStamper, LogicalTopicDescriptor, Reservation}
+import org.apache.kafka.storage.internals.concentration.{ConcentrationHeaders, ConcentrationKernel, IdempotentBatchKey, LogicalProduceStamper, LogicalTopicDescriptor, Reservation}
 import org.apache.kafka.storage.internals.log.{AppendOrigin, LogConfig}
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats
 import org.junit.jupiter.api.Assertions._
@@ -3031,23 +3031,22 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
-  def testProduceToLogicalTopicIdempotentRetryReturnsCachedLogicalOffsets(): Unit = {
-    // PROMPT.md scenario 6: "An idempotent producer experiences a transient network failure and
-    // retries a batch; the logical topic does not receive duplicate records, and the logical
-    // offset sequence remains contiguous."
+  def testProduceIdempotentToLogicalTopicIsRefusedWithInvalidProducerEpoch(): Unit = {
+    // r14 BLOCKER B2 (#95). Two logical topics that share a backing partition can drive the
+    // SAME producerId+baseSequence into the backing partition's ProducerStateManager from
+    // different produce calls — the stamper preserves producer state on the rewritten batch,
+    // so the backing PSM sees (producerId, seq=0) twice and rejects the second produce as a
+    // duplicate, despite it succeeding to a different logical topic. v1 doesn't add
+    // per-logical-topic PSM; the safe stance is to refuse idempotent produce on logical
+    // topics with INVALID_PRODUCER_EPOCH (mirroring the existing transactional refusal),
+    // forcing the producer onto the non-retriable fatal path so it surfaces loudly rather
+    // than corrupting producer state.
     //
-    // Without the kernel idempotent cache, a retry would: (a) reserve fresh logical offsets,
-    // (b) burn them on the in-memory tracker, (c) stamp the records with the NEW offsets, (d)
-    // forward to the backing log, where ProducerStateManager would dedup and return the ORIGINAL
-    // backing offset. The result: nextLogicalOffset has advanced (gap in the logical sequence)
-    // and the sidecar has a phantom entry mapping new logical offsets to the old backing offset.
-    // The fix is to short-circuit retries BEFORE reservation, returning the original logical
-    // offsets straight from a kernel cache populated on the first successful commit.
-    //
-    // This test pins that contract end-to-end at the KafkaApis seam:
-    //   - On a cache HIT, reserveProduceBatch and handleProduceAppend MUST NOT run.
-    //   - The producer-visible response carries the ORIGINAL cached logical baseOffset and
-    //     logStartOffset, not freshly-allocated values.
+    // This test pins the v1 contract at the KafkaApis seam:
+    //   - The response carries INVALID_PRODUCER_EPOCH; the kernel's reservation / cache /
+    //     idempotent-batch surface is NEVER touched; ReplicaManager.handleProduceAppend is
+    //     NEVER called. Any of these firing would mean the gate above the cache lookup did
+    //     not fire — that is the exact regression this test guards against.
     val logicalTopic = "orders"
     val backingTopic = "concentrated"
     val descriptor = new LogicalTopicDescriptor(logicalTopic, 1024, backingTopic, 4)
@@ -3058,29 +3057,9 @@ class KafkaApisTest extends Logging {
     when(concentrationKernel.backingPartitionFor(logicalTopic, 0)).thenReturn(2)
     when(concentrationKernel.isBackingReady(any[TopicPartition])).thenReturn(true)
 
-    // Mock a cache HIT: the kernel claims it already committed this exact (producerId, epoch,
-    // baseSeq, lastSeq) tuple at logical offsets [500..502], with logStartOffset=42 and a
-    // recognisable logAppendTime. The KafkaApis hook must return these values verbatim, NOT
-    // call reserveProduceBatch, and NOT route to ReplicaManager.
     val producerId = 4242L
     val producerEpoch: Short = 0
     val baseSeq = 0
-    val lastSeq = 2
-    val cachedKey = new IdempotentBatchKey(producerId, producerEpoch, baseSeq, lastSeq)
-    // Scope the cached entry to a concrete backing-partition leader epoch (HIGH #7). The kernel
-    // resolves currentLeaderEpoch via ReplicaManager.onlinePartition(backingTp).getLeaderEpoch,
-    // so we mock the backing Partition to return the same epoch the cache was recorded at —
-    // matching epochs ⇒ cache HIT. The mismatched-epoch eviction path is covered by the kernel
-    // unit tests (lookupAtNewerLeaderEpochEvictsStaleEntryAndMisses); here we only need the
-    // happy path so the existing retry contract still passes through.
-    val cachedLeaderEpoch = 5
-    val backingPartition = mock(classOf[Partition])
-    when(backingPartition.getLeaderEpoch).thenReturn(cachedLeaderEpoch)
-    when(replicaManager.onlinePartition(any[TopicPartition])).thenReturn(Some(backingPartition))
-    val cachedResult = new IdempotentBatchResult(500L, 502L, 42L, 1234567890L, cachedLeaderEpoch)
-    when(concentrationKernel.lookupIdempotentBatch(logicalTopic, 0, cachedKey, cachedLeaderEpoch))
-      .thenReturn(Optional.of(cachedResult))
-
     val tp = new TopicPartition(logicalTopic, 0)
     val idempotentRecords = MemoryRecords.withIdempotentRecords(Compression.NONE,
       producerId, producerEpoch, baseSeq,
@@ -3110,27 +3089,18 @@ class KafkaApisTest extends Logging {
 
     val response = verifyNoThrottling[ProduceResponse](request)
     val partitionProduceResponse = response.data.responses.asScala.head.partitionResponses.asScala.head
-    assertEquals(Errors.NONE, Errors.forCode(partitionProduceResponse.errorCode))
-    assertEquals(500L, partitionProduceResponse.baseOffset,
-      "baseOffset must come from the cached IdempotentBatchResult, not a fresh reservation — " +
-      "freshly-allocated offsets would advance nextLogicalOffset and break the contiguity invariant " +
-      "in PROMPT scenario 6")
-    assertEquals(42L, partitionProduceResponse.logStartOffset,
-      "logStartOffset must come from the cached IdempotentBatchResult; this is what the producer " +
-      "needs to detect log truncation, and using a different value across the original/retry pair " +
-      "would create spurious truncation signals")
+    assertEquals(Errors.INVALID_PRODUCER_EPOCH, Errors.forCode(partitionProduceResponse.errorCode),
+      "idempotent produce on logical topics must be refused with INVALID_PRODUCER_EPOCH " +
+      "(non-retriable fatal for the client) in v1 — a retriable code would let the producer " +
+      "loop until it eventually corrupts backing PSM state across logical topics")
 
-    // The contract is that the retry path NEVER touches the reservation tracker or the backing
-    // log. Verifying these "never" calls is the load-bearing assertion: if either fires, the
-    // logical sequence has either advanced (reserveProduceBatch) or we've sent stamped records
-    // to be deduped by the backing's ProducerStateManager (handleProduceAppend), both of which
-    // are the bugs this cache is here to prevent.
-    verify(concentrationKernel).lookupIdempotentBatch(logicalTopic, 0, cachedKey, cachedLeaderEpoch)
+    // The gate is meant to fire BEFORE any kernel state is touched. If the gate regressed, the
+    // cache lookup or reservation would run — either of which would let r14 B2 bite again.
+    verify(concentrationKernel, never()).lookupIdempotentBatch(
+      any[String], anyInt, any[IdempotentBatchKey], anyInt)
     verify(concentrationKernel, never()).reserveProduceBatch(any[String], anyInt, anyInt)
     verify(concentrationKernel, never()).commitProduceBatch(any(), anyLong)
     verify(concentrationKernel, never()).rollbackProduceBatch(any())
-    // recordIdempotentBatch is only called on the FIRST commit; a cache-hit retry must not
-    // re-record (it's already there) or it'd hide eviction-related bugs.
     verify(concentrationKernel, never()).recordIdempotentBatch(
       any[String], anyInt, any(), any())
     verify(replicaManager, never()).handleProduceAppend(anyLong, anyShort, ArgumentMatchers.eq(false),
