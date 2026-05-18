@@ -180,6 +180,10 @@ public class SocketServerConfigs {
     public static final int HTTP_BRIDGE_MAX_REQUEST_BODY_BYTES_DEFAULT = 1024 * 1024;
     public static final String HTTP_BRIDGE_MAX_REQUEST_BODY_BYTES_DOC = "Upper bound on the size in bytes of an HTTP request body the bridge will accept (POST /v1/topics/{topic}/records). Jetty defaults do not cap the body size and Jackson's readTree consumes the whole stream into memory before parsing, so without this cap a single oversized POST can OOM the broker process before any Kafka admission control runs. The default of 1 MiB matches the per-message-set ceiling that Kafka brokers typically enforce on the binary path (message.max.bytes default is 1 MiB) — raise it only if your producers genuinely need to send larger record batches over HTTP. Exceeded requests are rejected with HTTP 413 Payload Too Large and the standard {errorCode, errorMessage} envelope.";
 
+    public static final String HTTP_BRIDGE_REQUEST_TIMEOUT_MS_CONFIG = "http.bridge.request.timeout.ms";
+    public static final int HTTP_BRIDGE_REQUEST_TIMEOUT_MS_DEFAULT = 30_000;
+    public static final String HTTP_BRIDGE_REQUEST_TIMEOUT_MS_DOC = "Upper bound in milliseconds on how long the HTTP bridge will wait for a one-shot produce or fetch request to complete before short-circuiting it with HTTP 504 Gateway Timeout. This is a safety net for the case where a response from the broker's request pipeline never lands on the bridge's completion hook — for example, if a downstream code path completes via a code path that does not invoke the hook. Without this cap the HTTP connection would hang indefinitely. Does not apply to SSE streams (Accept: text/event-stream), which intentionally long-poll and whose lifetime is bounded by the client closing. Set to a value larger than your highest expected end-to-end broker latency; the default of 30s is comfortably above Kafka's own request.timeout.ms default while still bounding the wait at a recognisable HTTP-friendly value.";
+
     public static final ConfigDef CONFIG_DEF =  new ConfigDef()
             .define(LISTENERS_CONFIG, STRING, LISTENERS_DEFAULT, HIGH, LISTENERS_DOC)
             .define(ADVERTISED_LISTENERS_CONFIG, STRING, null, HIGH, ADVERTISED_LISTENERS_DOC)
@@ -200,7 +204,8 @@ public class SocketServerConfigs {
             .define(HTTP_BRIDGE_ENABLED_CONFIG, ConfigDef.Type.BOOLEAN, HTTP_BRIDGE_ENABLED_DEFAULT, LOW, HTTP_BRIDGE_ENABLED_DOC)
             .define(HTTP_BRIDGE_HOST_CONFIG, STRING, HTTP_BRIDGE_HOST_DEFAULT, LOW, HTTP_BRIDGE_HOST_DOC)
             .define(HTTP_BRIDGE_PORT_CONFIG, INT, HTTP_BRIDGE_PORT_DEFAULT, atLeast(0), LOW, HTTP_BRIDGE_PORT_DOC)
-            .define(HTTP_BRIDGE_MAX_REQUEST_BODY_BYTES_CONFIG, INT, HTTP_BRIDGE_MAX_REQUEST_BODY_BYTES_DEFAULT, atLeast(0), LOW, HTTP_BRIDGE_MAX_REQUEST_BODY_BYTES_DOC);
+            .define(HTTP_BRIDGE_MAX_REQUEST_BODY_BYTES_CONFIG, INT, HTTP_BRIDGE_MAX_REQUEST_BODY_BYTES_DEFAULT, atLeast(0), LOW, HTTP_BRIDGE_MAX_REQUEST_BODY_BYTES_DOC)
+            .define(HTTP_BRIDGE_REQUEST_TIMEOUT_MS_CONFIG, INT, HTTP_BRIDGE_REQUEST_TIMEOUT_MS_DEFAULT, atLeast(1), LOW, HTTP_BRIDGE_REQUEST_TIMEOUT_MS_DOC);
 
     private static final Pattern URI_PARSE_REGEXP = Pattern.compile(
         "^(.*)://\\[?([0-9a-zA-Z\\-%._:]*)\\]?:(-?[0-9]+)");

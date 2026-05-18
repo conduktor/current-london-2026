@@ -363,6 +363,103 @@ class KafkaHttpBridgeTest {
         assertFalse(r.hasRetryAfter());
     }
 
+    // ----- request-timeout safety net -----
+
+    @Test
+    void produceTimesOutWith504WhenSubmitterNeverCompletes() throws Exception {
+        // The RequestChannel completion hook only short-circuits the 3-arg sendResponse path. If a future broker
+        // change ever routes a produce response through a code path that doesn't invoke the hook, the submitter's
+        // future would never complete — orphaning the HTTP connection. The safety net ensures we emit 504 instead.
+        RequestSubmitter never = new RequestSubmitter() {
+            @Override
+            public CompletableFuture<ProduceResult> submitProduce(ProduceRequestParser.ProduceCommand c) {
+                return new CompletableFuture<>();
+            }
+            @Override
+            public CompletableFuture<FetchResult> submitFetch(FetchRequestParser.FetchCommand c) {
+                return new CompletableFuture<>();
+            }
+        };
+
+        KafkaHttpBridge bridge = new KafkaHttpBridge(mapper, never, 50L);
+        HttpBridgeResponse r = bridge.produce("orders",
+            json("{\"records\":[{\"value\":{\"type\":\"STRING\",\"data\":\"x\"}}]}")).get();
+
+        assertEquals(504, r.status());
+        assertEquals(Errors.REQUEST_TIMED_OUT.code(), r.body().get("errorCode").asInt());
+        // The error message quotes the configured timeout so a client can reason about what happened.
+        assertTrue(r.body().get("errorMessage").asText().contains("50"),
+            "errorMessage should quote the configured timeout, got: " + r.body().get("errorMessage").asText());
+    }
+
+    @Test
+    void fetchTimesOutWith504WhenSubmitterNeverCompletes() throws Exception {
+        RequestSubmitter never = new RequestSubmitter() {
+            @Override
+            public CompletableFuture<ProduceResult> submitProduce(ProduceRequestParser.ProduceCommand c) {
+                return new CompletableFuture<>();
+            }
+            @Override
+            public CompletableFuture<FetchResult> submitFetch(FetchRequestParser.FetchCommand c) {
+                return new CompletableFuture<>();
+            }
+        };
+
+        KafkaHttpBridge bridge = new KafkaHttpBridge(mapper, never, 50L);
+        HttpBridgeResponse r = bridge.fetch("orders", QueryParams.of("partition", "0", "offset", "0")).get();
+
+        assertEquals(504, r.status());
+        assertEquals(Errors.REQUEST_TIMED_OUT.code(), r.body().get("errorCode").asInt());
+    }
+
+    @Test
+    void timeoutDoesNotFireOnFastSubmitterResponse() throws Exception {
+        // The safety net must be a true fall-back: a normal-latency completion well under the cap should never see
+        // the 504. We use a generous 5s cap and complete synchronously — the response must surface unchanged.
+        FakeSubmitter submitter = new FakeSubmitter();
+        submitter.produceResult = new RequestSubmitter.ProduceResult(
+            Collections.singletonList(
+                new ProduceResponseFormatter.PartitionResult(0, 1L, Errors.NONE, null)),
+            0L);
+
+        KafkaHttpBridge bridge = new KafkaHttpBridge(mapper, submitter, 5_000L);
+        HttpBridgeResponse r = bridge.produce("orders",
+            json("{\"records\":[{\"value\":{\"type\":\"STRING\",\"data\":\"x\"}}]}")).get();
+
+        assertEquals(200, r.status());
+    }
+
+    @Test
+    void noTimeoutSentinelDisablesSafetyNet() {
+        // The two-arg constructor passes NO_TIMEOUT, leaving the future un-bounded. Tests that need to assert exact
+        // ordering against a never-completing submitter would otherwise race the safety net.
+        CompletableFuture<RequestSubmitter.ProduceResult> deferred = new CompletableFuture<>();
+        RequestSubmitter never = new RequestSubmitter() {
+            @Override
+            public CompletableFuture<ProduceResult> submitProduce(ProduceRequestParser.ProduceCommand c) {
+                return deferred;
+            }
+            @Override
+            public CompletableFuture<FetchResult> submitFetch(FetchRequestParser.FetchCommand c) {
+                return new CompletableFuture<>();
+            }
+        };
+
+        KafkaHttpBridge bridge = new KafkaHttpBridge(mapper, never);
+        CompletableFuture<HttpBridgeResponse> response = bridge.produce("orders",
+            json("{\"records\":[{\"value\":{\"type\":\"STRING\",\"data\":\"x\"}}]}"));
+
+        assertFalse(response.isDone(), "with NO_TIMEOUT the future should remain pending indefinitely");
+    }
+
+    @Test
+    void rejectsNegativeTimeout() {
+        // A negative cap is a programming error in the wiring layer — fail fast at construction.
+        FakeSubmitter submitter = new FakeSubmitter();
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class,
+            () -> new KafkaHttpBridge(mapper, submitter, -1L));
+    }
+
     @Test
     void completedExceptionallyFuturePropagatesAsBridge500() {
         FakeSubmitter submitter = new FakeSubmitter();

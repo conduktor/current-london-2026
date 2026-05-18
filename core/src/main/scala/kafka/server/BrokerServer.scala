@@ -648,7 +648,7 @@ class BrokerServer(
           listenerName = config.interBrokerListenerName,
           topicIdLookup = name => metadataCache.getTopicId(name)
         )
-        val bridge = new KafkaHttpBridge(new ObjectMapper(), submitter)
+        val bridge = new KafkaHttpBridge(new ObjectMapper(), submitter, config.httpBridgeRequestTimeoutMs.toLong)
         httpBridgeServer = new KafkaHttpServer(
           config.httpBridgeHost, config.httpBridgePort, bridge, submitter, new ObjectMapper(),
           config.httpBridgeMaxRequestBodyBytes)
