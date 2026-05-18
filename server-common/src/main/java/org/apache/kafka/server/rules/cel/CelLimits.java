@@ -150,9 +150,33 @@ final class CelLimits {
 
     /**
      * Reset the per-thread step counter. Called by
-     * {@link CelProgram#evalBoolean} at the start and end of every
-     * evaluation so successive requests don't share state, even if one
-     * threw mid-evaluation.
+     * {@link org.apache.kafka.server.rules.RuleEngine#evaluate} once at the
+     * start of evaluating an api-key's rule list and once on the way out so
+     * successive requests don't share state, even if one threw mid-evaluation.
+     *
+     * <p>Round-8 audit HIGH (concurrency): the reset is deliberately NOT on
+     * {@link CelProgram#evalBoolean} any more. The previous per-evalBoolean
+     * reset gave every rule in a request's list a fresh {@code MAX_EVAL_STEPS}
+     * budget — with the {@code MAX_RULES_PER_API_KEY = 128} cap, a single
+     * request could legitimately consume up to {@code 128 * MAX_EVAL_STEPS}
+     * (12.8M) steps in the worst case, multiplying the engine's per-request
+     * step ceiling by the number of rules an operator happens to have
+     * published. The budget is now per-request: all rules targeting one
+     * api-key share one {@code MAX_EVAL_STEPS} ceiling. A rule whose
+     * predicate exhausts the budget trips {@link CelEvaluationException};
+     * subsequent rules in the same request immediately retrip on entry and
+     * are also fail-open by the engine's per-rule {@code catch (Throwable)}
+     * — observable behaviour is "the request is unguarded by the over-budget
+     * rule and everything after it, until the next request resets the
+     * counter". This is the right tradeoff: capping the per-request CEL
+     * work is the actual DoS-defence the cap exists to provide, while a
+     * malformed expensive rule still does not crash the request path.
+     *
+     * <p>Direct callers of {@link CelProgram#evalBoolean} outside the engine
+     * (unit tests, future tooling) MUST call this themselves before each
+     * evaluation if they want a fresh budget; package-private access is
+     * preserved on this method specifically so the cel package's own tests
+     * can manage that.
      */
     static void resetSteps() {
         STEPS.get()[0] = 0;

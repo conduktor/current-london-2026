@@ -16,6 +16,8 @@
  */
 package org.apache.kafka.server.rules.cel;
 
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.util.Arrays;
@@ -29,6 +31,33 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class CelProgramTest {
+
+    /**
+     * Round-8 audit HIGH (concurrency): the per-thread CEL step counter is no
+     * longer reset by {@link CelProgram#evalBoolean}. With JUnit running
+     * tests on a shared thread, a test that exhausts most of the budget
+     * could otherwise poison the counter for a subsequent test on the same
+     * thread, causing arbitrary unrelated failures depending on test order.
+     * The engine resets the counter once per request; we mirror that here
+     * once per test method.
+     */
+    @BeforeEach
+    public void resetStepBudget() {
+        CelProgram.resetEvalStepBudget();
+    }
+
+    /**
+     * Leave a clean counter for any test class JUnit schedules next on the
+     * same worker thread. This class contains several tests that
+     * deliberately exhaust the budget; without this reset, the
+     * MAX_EVAL_STEPS-poisoned counter would cause arbitrary unrelated
+     * failures in {@code ApiMessageActivation*Test} classes that share the
+     * thread pool.
+     */
+    @AfterEach
+    public void leaveCounterClean() {
+        CelProgram.resetEvalStepBudget();
+    }
 
     private static boolean evalBool(String expr, Map<String, Object> env) {
         return CelCompiler.compile(expr).evalBoolean(env::get);
@@ -355,12 +384,20 @@ public class CelProgramTest {
     }
 
     @Test
-    public void evalStepCounterIsResetBetweenInvocations() {
+    public void evalStepCounterIsResetBetweenInvocationsWhenCallerResets() {
+        // Round-8 audit HIGH (concurrency): the per-thread step counter is
+        // now reset by RuleEngine.evaluate once per REQUEST, not by
+        // CelProgram.evalBoolean once per rule. Direct callers (this test,
+        // future tooling) MUST therefore call resetEvalStepBudget() between
+        // evaluations if they want a fresh budget — without it, the budget
+        // legitimately accumulates across calls within the same logical
+        // request, which is the intended DoS-defence semantics (an attacker
+        // cannot multiply the cap by N rules).
+        //
         // The counter is a ThreadLocal; without explicit reset it would
         // accumulate across requests on the same broker thread and trip
-        // arbitrarily early for the second request. The reset must happen
-        // both before and after evaluation so a throwing evaluation does
-        // not poison the next one.
+        // arbitrarily early for the second request. This test exercises the
+        // reset itself, mirroring the reset RuleEngine.evaluate now performs.
         java.util.List<Integer> items = new java.util.ArrayList<>();
         for (int n = 0; n < 1000; n++) {
             items.add(n);
@@ -368,11 +405,51 @@ public class CelProgramTest {
         Map<String, Object> env = new HashMap<>();
         env.put("xs", items);
         // 1000 iterations per call; well under the budget. Run it many
-        // times — should never trip.
+        // times — should never trip, because we reset between each call
+        // the way the engine does between requests.
         CelProgram p = CelCompiler.compile("xs.exists(a, a == -1)");
         for (int n = 0; n < 200; n++) {
+            CelProgram.resetEvalStepBudget();
             assertFalse(p.evalBoolean(env::get));
         }
+    }
+
+    @Test
+    public void evalStepCounterAccumulatesWithoutCallerReset() {
+        // Round-8 audit HIGH (concurrency) pin: prove that without an explicit
+        // reset, the step counter accumulates across evalBoolean calls. This
+        // is the budget contract: a single RuleEngine.evaluate iterates many
+        // rules under one budget, and the engine relies on this accumulation
+        // to cap per-request CEL work at MAX_EVAL_STEPS regardless of how
+        // many rules an operator has authored. Anyone who deletes the reset
+        // in RuleEngine.evaluate must break this test, surfacing the change
+        // as a visible regression rather than a silent re-amplification.
+        //
+        // Start fresh so this test doesn't depend on accumulated state from
+        // prior tests on the same thread.
+        CelProgram.resetEvalStepBudget();
+        java.util.List<Integer> items = new java.util.ArrayList<>();
+        // Just over half the budget per call, so two consecutive calls
+        // without a reset must trip the second one.
+        int half = CelLimits.MAX_EVAL_STEPS / 2 + 16;
+        for (int n = 0; n < half; n++) {
+            items.add(n);
+        }
+        Map<String, Object> env = new HashMap<>();
+        env.put("xs", items);
+        env.put("needle", -1); // never matches → full scan each call
+        CelProgram p = CelCompiler.compile("needle in xs");
+        // First call: ~half the budget consumed, succeeds.
+        assertFalse(p.evalBoolean(env::get));
+        // Second call without reset: combined ~half+half = full budget +
+        // overhead → must trip.
+        assertThrows(
+            CelEvaluationException.class,
+            () -> p.evalBoolean(env::get),
+            "without resetEvalStepBudget between calls, the per-thread step "
+                + "counter must accumulate and trip the second call");
+        // Restore the per-test invariant.
+        CelProgram.resetEvalStepBudget();
     }
 
     @Test

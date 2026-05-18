@@ -644,6 +644,116 @@ public class RuleEngineTest {
     }
 
     @Test
+    public void perRequestStepBudgetIsNotMultipliedByNumberOfRules() {
+        // Round-8 audit HIGH (concurrency). Before the fix, CelProgram.evalBoolean
+        // reset the per-thread step counter on every call, giving each rule in
+        // a request's list a fresh MAX_EVAL_STEPS (100_000) budget. With the
+        // per-api-key cap of 128 rules, a single request could legitimately
+        // consume up to 128 * 100_000 = 12.8M CEL steps — a published-rule-
+        // shaped DoS amplifier that turns rules-with-large-list-scans into
+        // worst-case request-thread CPU burns proportional to the operator's
+        // rule count.
+        //
+        // The fix moves the reset to RuleEngine.evaluate, scoped to one reset
+        // per request. This test pins that contract with the smallest shape
+        // that distinguishes per-rule from per-request budgets:
+        //
+        //   - Rule "a": exists-scan over a 90k-element list with no match.
+        //     Returns false. Consumes ~90k steps. Leaves 10k of budget.
+        //   - Rule "b": exists-scan over a 90k-element list whose match is
+        //     at position 50000 (the rule WOULD return true under a fresh
+        //     budget — pre-fix path of execution).
+        //
+        // With the shared per-request budget, rule "b" trips on iteration
+        // ~10000 (it only has 10k steps left), the engine catches the trip
+        // as fail-open per its policy, and returns ALLOW. Pre-fix, rule
+        // "b" would have evaluated to true after 50000 iterations and the
+        // engine would have returned DENY with rule "b"'s error code.
+        //
+        // Asserting ALLOW after this setup is the unambiguous distinguishing
+        // signal: if anyone deletes the reset-hoist in RuleEngine.evaluate
+        // and reintroduces the per-rule reset on CelProgram.evalBoolean,
+        // this test flips to DENY and fails.
+        java.util.List<Integer> emptyMatch = new java.util.ArrayList<>();
+        for (int n = 0; n < 90_000; n++) {
+            emptyMatch.add(n); // no -1 → exists returns false
+        }
+        java.util.List<Integer> midMatch = new java.util.ArrayList<>();
+        for (int n = 0; n < 90_000; n++) {
+            // -1 at position 50_000. Under a fresh per-rule budget, exists
+            // would return true after 50_001 iterations (well under 100k).
+            midMatch.add(n == 50_000 ? -1 : n);
+        }
+        Map<String, Object> activation = new LinkedHashMap<>();
+        activation.put("emptyMatch", emptyMatch);
+        activation.put("midMatch", midMatch);
+
+        RuleEngine engine = new RuleEngine();
+        engine.install(new RuleSetBuilder()
+            .put(denyRule("a-budget-burner", ApiKeys.METADATA, "emptyMatch.exists(x, x == -1)", 1))
+            .put(denyRule("b-would-match-with-fresh-budget", ApiKeys.METADATA,
+                "midMatch.exists(x, x == -1)", 2))
+            .build());
+        RuleDecision d = engine.evaluate(
+            ApiKeys.METADATA, "x", null, false, () -> activation);
+        // Per-request budget: rule "b" trips and fails open → ALLOW.
+        // Pre-fix per-rule budget: rule "b" returns true → DENY error 2.
+        assertFalse(d.denied(),
+            "per-request budget must prevent rule \"b\" from completing once "
+                + "rule \"a\" has consumed most of the shared 100k-step budget; "
+                + "pre-fix per-rule budget would have DENIED with rule \"b\"'s code");
+    }
+
+    @Test
+    public void perRequestStepBudgetIsResetBetweenRequests() {
+        // Defence-in-depth for the per-request budget: after one request
+        // trips the budget, the NEXT request on the same broker thread
+        // must start with a clean counter. Without the try/finally reset
+        // in RuleEngine.evaluate, the second request inherits a poisoned
+        // ThreadLocal and trips on its very first rule iteration — turning
+        // any single adversarial request into a poison pill for every
+        // subsequent request on that broker thread.
+        //
+        // Run the budget-burner pair from the previous test, then evaluate
+        // a normal cheap rule and confirm it can still match. With the
+        // finally-reset, the second request gets a fresh 100k budget and
+        // returns DENY normally; without it, the second request fails open.
+        java.util.List<Integer> emptyMatch = new java.util.ArrayList<>();
+        for (int n = 0; n < 90_000; n++) {
+            emptyMatch.add(n);
+        }
+        java.util.List<Integer> midMatch = new java.util.ArrayList<>();
+        for (int n = 0; n < 90_000; n++) {
+            midMatch.add(n == 50_000 ? -1 : n);
+        }
+        Map<String, Object> burner = new LinkedHashMap<>();
+        burner.put("emptyMatch", emptyMatch);
+        burner.put("midMatch", midMatch);
+
+        RuleEngine engine = new RuleEngine();
+        engine.install(new RuleSetBuilder()
+            .put(denyRule("a-burner", ApiKeys.METADATA, "emptyMatch.exists(x, x == -1)", 1))
+            .put(denyRule("b-trip", ApiKeys.METADATA, "midMatch.exists(x, x == -1)", 2))
+            .build());
+        engine.evaluate(ApiKeys.METADATA, "x", null, false, () -> burner);
+
+        // Second request: a different rule set, a simple matching predicate.
+        // With the finally-reset, this returns DENY normally. Without it,
+        // the counter is poisoned at >= 100k from the previous request and
+        // any subsequent comprehension iteration trips immediately.
+        engine.install(new RuleSetBuilder()
+            .put(denyRule("simple-match", ApiKeys.METADATA, "emptyMatch.exists(x, x == 17)", 99))
+            .build());
+        RuleDecision d = engine.evaluate(
+            ApiKeys.METADATA, "x", null, false, () -> burner);
+        assertTrue(d.denied(),
+            "second request must start with a fresh per-request step budget; "
+                + "the finally-reset in RuleEngine.evaluate exists to prevent "
+                + "cross-request counter poisoning");
+        assertEquals(99, d.errorCode());
+    }
+
+    @Test
     public void buggyPredicateFailsOpenAndDoesNotBlockSubsequentRules() {
         // A predicate that throws at evaluation (e.g. divide-by-zero) must
         // not crash the request path. The engine treats the throwing rule

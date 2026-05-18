@@ -22,7 +22,11 @@ import org.apache.kafka.server.rules.json.RuleJsonCodec;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.EnumSet;
+import java.util.List;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -57,6 +61,30 @@ public class GovernanceLoaderTest {
         String json = "{\"apiKeys\":[\"" + key.name() + "\"],\"action\":\"DENY\","
             + "\"when\":\"" + when + "\",\"errorCode\":" + errorCode + "}";
         return json.getBytes(StandardCharsets.UTF_8);
+    }
+
+    /**
+     * Mirror of {@code RuleJsonCodec.FORBIDDEN_API_KEYS} (kept in this package
+     * so tests across both rules sub-packages stay independent of the codec's
+     * package-private visibility). Tests that spread rules across "every api
+     * key" to exercise the GLOBAL {@code MAX_RULES} cap must skip these —
+     * authoring a rule against them is rejected at codec intake, so the
+     * iteration would otherwise short-circuit before reaching the cap.
+     */
+    private static final Set<ApiKeys> FORBIDDEN_TARGETS = EnumSet.of(
+        ApiKeys.API_VERSIONS,
+        ApiKeys.SASL_HANDSHAKE,
+        ApiKeys.SASL_AUTHENTICATE,
+        ApiKeys.ENVELOPE);
+
+    private static ApiKeys[] denyTargetableApiKeys() {
+        List<ApiKeys> keep = new ArrayList<>();
+        for (ApiKeys k : ApiKeys.values()) {
+            if (!FORBIDDEN_TARGETS.contains(k)) {
+                keep.add(k);
+            }
+        }
+        return keep.toArray(new ApiKeys[0]);
     }
 
     @Test
@@ -257,12 +285,14 @@ public class GovernanceLoaderTest {
         // pins the loader's catch of the IllegalStateException thrown by
         // RuleSetBuilder.put.
         //
-        // Spread rules across every api key (1024 rules / 88 keys ≈ 12 per
-        // key) so we trip the GLOBAL MAX_RULES cap, not the per-api-key
-        // cap (MAX_RULES_PER_API_KEY=128).
+        // Spread rules across every deny-targetable api key so we trip the
+        // GLOBAL MAX_RULES cap, not the per-api-key cap
+        // (MAX_RULES_PER_API_KEY=128). FORBIDDEN_TARGETS are skipped — the
+        // codec rejects rules against them at intake, which would otherwise
+        // short-circuit this loop before it reached MAX_RULES.
         RuleEngine engine = new RuleEngine();
         GovernanceLoader loader = new GovernanceLoader(engine);
-        ApiKeys[] keys = ApiKeys.values();
+        ApiKeys[] keys = denyTargetableApiKeys();
         for (int i = 0; i < RuleSetBuilder.MAX_RULES; i++) {
             loader.apply("r-" + i, envelope("true", keys[i % keys.length], 1 + (i % 100)));
         }
@@ -334,9 +364,11 @@ public class GovernanceLoaderTest {
 
         // Builder cap exceeded → false. Fill to the cap, then push one over.
         // (Reuse the same loader — putting good rules in does count, the cap
-        // overflow at the end is the only rejection.) Spread across every api
-        // key so we trip the GLOBAL MAX_RULES cap (not the per-api-key cap).
-        ApiKeys[] keys = ApiKeys.values();
+        // overflow at the end is the only rejection.) Spread across every
+        // deny-targetable api key so we trip the GLOBAL MAX_RULES cap (not
+        // the per-api-key cap); FORBIDDEN_TARGETS are skipped because the
+        // codec rejects them at intake.
+        ApiKeys[] keys = denyTargetableApiKeys();
         for (int i = 0; i < RuleSetBuilder.MAX_RULES; i++) {
             assertTrue(
                 loader.apply("cap-" + i, envelope("true", keys[i % keys.length], 1 + (i % 100))),

@@ -20,6 +20,7 @@ import org.apache.kafka.common.protocol.ApiKeys;
 import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.security.auth.KafkaPrincipal;
 import org.apache.kafka.common.utils.SecurityUtils;
+import org.apache.kafka.server.rules.cel.CelProgram;
 import org.apache.kafka.server.rules.extract.ActivationBudgetExceededException;
 
 import org.slf4j.Logger;
@@ -486,25 +487,49 @@ public final class RuleEngine {
                 apiKey, t.toString());
             return RuleDecision.ALLOW;
         }
-        for (Rule rule : rules) {
-            boolean matched;
-            try {
-                matched = rule.compiled().evalBoolean(activation::get);
-            } catch (Throwable t) {
-                // Catch Throwable, not just RuntimeException: a pathological CEL
-                // expression can raise StackOverflowError (deep comprehensions),
-                // OutOfMemoryError (huge string ops), or other Error subclasses.
-                // The request thread must never die because of a buggy rule —
-                // log loudly and treat the rule as ALLOW, then move to the next.
-                LOG.warn("rule '{}' failed open due to evaluation error on apiKey {}: {}",
-                    rule.id(), apiKey, t.toString());
-                continue;
+        // Round-8 audit HIGH (concurrency): the CEL eval-step budget is
+        // per-request, not per-rule. Resetting here (and not inside
+        // CelProgram.evalBoolean) means all rules targeting this api-key
+        // share the single MAX_EVAL_STEPS ceiling. With the per-api-key cap
+        // of 128 rules, the pre-fix per-rule reset gave a single request up
+        // to 128 * 100k = 12.8M CEL steps of legitimate budget — a
+        // published-rule-shaped DoS amplifier. With one reset per request,
+        // the bound is the documented 100k regardless of how many rules an
+        // operator has authored. Reset both before and after in a
+        // try/finally so a throwing evaluation (CelEvaluationException,
+        // StackOverflowError, OutOfMemoryError) cannot poison the next
+        // request's budget on the same broker thread.
+        CelProgram.resetEvalStepBudget();
+        try {
+            for (Rule rule : rules) {
+                boolean matched;
+                try {
+                    matched = rule.compiled().evalBoolean(activation::get);
+                } catch (Throwable t) {
+                    // Catch Throwable, not just RuntimeException: a pathological CEL
+                    // expression can raise StackOverflowError (deep comprehensions),
+                    // OutOfMemoryError (huge string ops), or other Error subclasses.
+                    // The request thread must never die because of a buggy rule —
+                    // log loudly and treat the rule as ALLOW, then move to the next.
+                    //
+                    // Note that after one rule trips the per-request budget, the
+                    // next rule in this loop will retrip on entry under the shared
+                    // counter and also land here as fail-open. That is the intended
+                    // DoS-defence behaviour: a request cannot multiply the step
+                    // budget by the number of rules an operator happens to have
+                    // published. See CelLimits.resetSteps javadoc.
+                    LOG.warn("rule '{}' failed open due to evaluation error on apiKey {}: {}",
+                        rule.id(), apiKey, t.toString());
+                    continue;
+                }
+                if (matched) {
+                    return RuleDecision.deny(rule.errorCode(), rule.id());
+                }
             }
-            if (matched) {
-                return RuleDecision.deny(rule.errorCode(), rule.id());
-            }
+            return RuleDecision.ALLOW;
+        } finally {
+            CelProgram.resetEvalStepBudget();
         }
-        return RuleDecision.ALLOW;
     }
 
     /**
