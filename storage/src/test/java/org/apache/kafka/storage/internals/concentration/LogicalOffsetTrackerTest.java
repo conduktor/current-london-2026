@@ -275,4 +275,141 @@ public class LogicalOffsetTrackerTest {
         assertEquals(9, r.logicalPartition());
         tracker.rollback(r);
     }
+
+    // ---- Batch reservation API (used by broker produce hook #2 for K-record produce batches) ----
+
+    @Test
+    public void reserveBatchAssignsContiguousOffsetsFromZero() {
+        LogicalOffsetTracker tracker = new LogicalOffsetTracker();
+        Reservation[] batch = tracker.reserveBatch("orders", 0, 5);
+        assertEquals(5, batch.length);
+        for (int i = 0; i < 5; i++) {
+            assertEquals(i, batch[i].logicalOffset(),
+                "batch member " + i + " must hold logical offset " + i);
+            assertEquals("orders", batch[i].logicalTopic());
+            assertEquals(0, batch[i].logicalPartition());
+        }
+        tracker.commitBatch(batch);
+        assertEquals(5L, tracker.nextLogicalOffset("orders", 0));
+    }
+
+    @Test
+    public void commitBatchAdvancesNextOffsetByBatchSize() {
+        LogicalOffsetTracker tracker = new LogicalOffsetTracker();
+        tracker.commit(tracker.reserve("orders", 0));            // offset 0
+        tracker.commitBatch(tracker.reserveBatch("orders", 0, 4)); // offsets 1..4
+        assertEquals(5L, tracker.nextLogicalOffset("orders", 0),
+            "after a 1-record commit + 4-record batch commit, next must be 5");
+    }
+
+    @Test
+    public void rollbackBatchDoesNotConsumeOffsets() {
+        // PROMPT acceptance criterion: a failed produce must not leave a gap. A rolled-back
+        // batch must release every offset it reserved so the next reserve picks them up.
+        LogicalOffsetTracker tracker = new LogicalOffsetTracker();
+        tracker.commit(tracker.reserve("orders", 0));    // offset 0
+        Reservation[] batch = tracker.reserveBatch("orders", 0, 3); // would-be 1, 2, 3
+        assertEquals(1L, batch[0].logicalOffset());
+        assertEquals(3L, batch[2].logicalOffset());
+        tracker.rollbackBatch(batch);
+        // Next reserve picks up at the rolled-back range.
+        Reservation retry = tracker.reserve("orders", 0);
+        assertEquals(1L, retry.logicalOffset(),
+            "rolled-back batch offsets must be reused — no gap");
+        tracker.commit(retry);
+        assertEquals(2L, tracker.nextLogicalOffset("orders", 0));
+    }
+
+    @Test
+    public void reserveBatchOfOneEqualsSingleReserve() {
+        LogicalOffsetTracker tracker = new LogicalOffsetTracker();
+        Reservation[] batch = tracker.reserveBatch("orders", 0, 1);
+        assertEquals(1, batch.length);
+        assertEquals(0L, batch[0].logicalOffset());
+        // Single-record commit must also work via the legacy commit() API for a batch-of-one.
+        tracker.commitBatch(batch);
+        assertEquals(1L, tracker.nextLogicalOffset("orders", 0));
+    }
+
+    @Test
+    public void reserveBatchWithNonPositiveCountThrows() {
+        LogicalOffsetTracker tracker = new LogicalOffsetTracker();
+        assertThrows(IllegalArgumentException.class,
+            () -> tracker.reserveBatch("orders", 0, 0));
+        assertThrows(IllegalArgumentException.class,
+            () -> tracker.reserveBatch("orders", 0, -1));
+    }
+
+    @Test
+    public void commitBatchOnForeignArrayIsRejected() {
+        // The tracker requires the SAME array reference returned by reserveBatch — a forged
+        // copy with the same contents must not be accepted as the outstanding batch.
+        LogicalOffsetTracker tracker = new LogicalOffsetTracker();
+        Reservation[] batch = tracker.reserveBatch("orders", 0, 3);
+        Reservation[] copy = batch.clone();
+        assertThrows(IllegalStateException.class, () -> tracker.commitBatch(copy));
+        // Recovery: original batch reference still works.
+        tracker.commitBatch(batch);
+        assertEquals(3L, tracker.nextLogicalOffset("orders", 0));
+    }
+
+    @Test
+    public void rollbackBatchOnForeignArrayIsRejected() {
+        LogicalOffsetTracker tracker = new LogicalOffsetTracker();
+        Reservation[] batch = tracker.reserveBatch("orders", 0, 2);
+        Reservation[] copy = batch.clone();
+        assertThrows(IllegalStateException.class, () -> tracker.rollbackBatch(copy));
+        tracker.rollbackBatch(batch);
+        assertEquals(0L, tracker.nextLogicalOffset("orders", 0));
+    }
+
+    @Test
+    public void reserveBatchSerialisesOnTheSamePartition() throws Exception {
+        // Two threads racing reserveBatch on the same partition must serialise — never assign
+        // overlapping logical-offset ranges. Pin this directly because hook #2 will rely on
+        // serialised reservations to maintain "no gaps".
+        LogicalOffsetTracker tracker = new LogicalOffsetTracker();
+        int batchesPerThread = 100;
+        int threads = 4;
+        int batchSize = 5;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        try {
+            CountDownLatch start = new CountDownLatch(1);
+            List<Future<List<Long>>> futures = new ArrayList<>();
+            for (int t = 0; t < threads; t++) {
+                futures.add(pool.submit(() -> {
+                    start.await();
+                    List<Long> seen = new ArrayList<>();
+                    for (int b = 0; b < batchesPerThread; b++) {
+                        Reservation[] batch = tracker.reserveBatch("orders", 0, batchSize);
+                        for (Reservation r : batch) seen.add(r.logicalOffset());
+                        tracker.commitBatch(batch);
+                    }
+                    return seen;
+                }));
+            }
+            start.countDown();
+            // Collect every offset reserved across every thread and assert the union covers
+            // [0, threads * batchesPerThread * batchSize) with no duplicates.
+            List<Long> all = new ArrayList<>();
+            for (Future<List<Long>> f : futures) all.addAll(f.get(30, TimeUnit.SECONDS));
+            assertEquals(threads * batchesPerThread * batchSize, all.size());
+            all.sort(Long::compareTo);
+            for (int i = 0; i < all.size(); i++) {
+                assertEquals((long) i, all.get(i).longValue(),
+                    "offset " + i + " must appear exactly once in the union");
+            }
+        } finally {
+            pool.shutdownNow();
+            assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    public void doubleCommitOfTheSameBatchIsRejected() {
+        LogicalOffsetTracker tracker = new LogicalOffsetTracker();
+        Reservation[] batch = tracker.reserveBatch("orders", 0, 2);
+        tracker.commitBatch(batch);
+        assertThrows(IllegalStateException.class, () -> tracker.commitBatch(batch));
+    }
 }

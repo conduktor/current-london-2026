@@ -156,6 +156,56 @@ public final class ConcentrationKernel implements AutoCloseable {
         tracker.rollback(reservation);
     }
 
+    /**
+     * Reserve a contiguous run of {@code count} logical offsets on one partition. Used by the
+     * produce hot path when a stock client sends a multi-record batch: the broker reserves K
+     * offsets, stamps them as headers on the K records, appends the batch, then commits or rolls
+     * back via the matching {@link #commitProduceBatch} / {@link #rollbackProduceBatch}.
+     *
+     * <p>The per-partition tracker lock is held from reserve through commit/rollback, so K must
+     * be small (one produce batch). The kernel does not impose an upper bound — that is the
+     * broker's job, mirroring its existing per-request validation.
+     */
+    public Reservation[] reserveProduceBatch(String logicalTopic, int logicalPartition, int count) {
+        ensureOpen();
+        LogicalTopicDescriptor d = registry.get(logicalTopic)
+            .orElseThrow(() -> new NoSuchElementException("logical topic not declared: " + logicalTopic));
+        if (logicalPartition < 0 || logicalPartition >= d.numLogicalPartitions()) {
+            throw new IllegalArgumentException(
+                "logical partition " + logicalPartition + " out of range [0," + d.numLogicalPartitions() + ")");
+        }
+        return tracker.reserveBatch(logicalTopic, logicalPartition, count);
+    }
+
+    /**
+     * Persist sidecar entries for every reservation in the batch in order
+     * {@code [firstBackingOffset, firstBackingOffset+1, ..., firstBackingOffset + batch.length - 1]}
+     * and commit the batch atomically. If any sidecar append throws, the whole batch is rolled
+     * back so the slots are reusable; previously appended sidecar entries are left in place but
+     * the tracker does not advance — recovery via backing-scan repairs the sidecar.
+     */
+    public void commitProduceBatch(Reservation[] batch, long firstBackingOffset) throws IOException {
+        ensureOpen();
+        Objects.requireNonNull(batch, "batch");
+        if (batch.length == 0) {
+            throw new IllegalArgumentException("commitProduceBatch requires a non-empty batch");
+        }
+        LogicalSidecarIndex sidecar = sidecarFor(batch[0].logicalTopic(), batch[0].logicalPartition());
+        try {
+            for (int i = 0; i < batch.length; i++) {
+                sidecar.append(firstBackingOffset + i);
+            }
+        } catch (IOException | RuntimeException e) {
+            tracker.rollbackBatch(batch);
+            throw e;
+        }
+        tracker.commitBatch(batch);
+    }
+
+    public void rollbackProduceBatch(Reservation[] batch) {
+        tracker.rollbackBatch(batch);
+    }
+
     // ------------------ Fetch path ------------------
 
     /**

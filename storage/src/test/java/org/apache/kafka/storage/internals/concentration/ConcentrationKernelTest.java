@@ -375,4 +375,89 @@ public class ConcentrationKernelTest {
         assertEquals(0, r.logicalPartition());
         kernel.commitProduce(r, 100L);
     }
+
+    // ---- Batch produce API (used by broker hook #2 for stock multi-record produce batches) ----
+
+    @Test
+    public void commitProduceBatchAppendsSidecarEntriesInOrderAndAdvancesTracker() throws IOException {
+        // The hot path: stock producer sends a K-record batch, broker reserves K logical offsets,
+        // backing append returns first backing offset B, broker commits the batch with
+        // [B, B+1, ..., B+K-1] persisted as sidecar entries against logical offsets [0..K-1].
+        kernel.declare(descriptor("orders", 4, "shared", 1));
+        Reservation[] batch = kernel.reserveProduceBatch("orders", 0, 5);
+        assertEquals(5, batch.length);
+        kernel.commitProduceBatch(batch, 1000L);
+        assertEquals(5L, kernel.nextLogicalOffset("orders", 0));
+        for (int i = 0; i < 5; i++) {
+            assertEquals(1000L + i, kernel.resolveBackingOffset("orders", 0, i),
+                "logical offset " + i + " must map to backing 1000+" + i);
+        }
+    }
+
+    @Test
+    public void rollbackProduceBatchReleasesAllReservedOffsets() throws IOException {
+        // PROMPT acceptance criterion mirror: a failed produce must not leave gaps. The whole
+        // K-record range comes back into play after the rollback.
+        kernel.declare(descriptor("orders", 4, "shared", 1));
+        kernel.commitProduce(kernel.reserveProduce("orders", 0), 500L);  // offset 0
+        Reservation[] batch = kernel.reserveProduceBatch("orders", 0, 3); // would-be 1..3
+        assertEquals(1L, batch[0].logicalOffset());
+        kernel.rollbackProduceBatch(batch);
+        // Next reservation reuses the rolled-back range with no gap.
+        Reservation retry = kernel.reserveProduce("orders", 0);
+        assertEquals(1L, retry.logicalOffset(),
+            "rolled-back batch offsets must be reused — no gap");
+        kernel.commitProduce(retry, 600L);
+        assertEquals(2L, kernel.nextLogicalOffset("orders", 0));
+    }
+
+    @Test
+    public void reserveProduceBatchRejectsUnknownTopicAndOutOfRangePartition() {
+        kernel.declare(descriptor("orders", 4, "shared", 1));
+        assertThrows(NoSuchElementException.class,
+            () -> kernel.reserveProduceBatch("ghost", 0, 3));
+        assertThrows(IllegalArgumentException.class,
+            () -> kernel.reserveProduceBatch("orders", 4, 3));   // N=4 → valid range [0,3]
+        assertThrows(IllegalArgumentException.class,
+            () -> kernel.reserveProduceBatch("orders", -1, 3));
+    }
+
+    @Test
+    public void commitProduceBatchOnEmptyArrayIsRejected() {
+        kernel.declare(descriptor("orders", 4, "shared", 1));
+        assertThrows(IllegalArgumentException.class,
+            () -> kernel.commitProduceBatch(new Reservation[0], 100L));
+    }
+
+    @Test
+    public void commitProduceBatchSidecarFailureRollsBackEntireBatch() throws IOException {
+        // If sidecar.append throws mid-batch (e.g., non-monotonic backing offset), the whole batch
+        // reservation is released so the slots can be reused. Tracker.nextOffset does NOT advance.
+        kernel.declare(descriptor("orders", 4, "shared", 1));
+        kernel.commitProduce(kernel.reserveProduce("orders", 0), 100L); // sidecar has [100]
+        Reservation[] batch = kernel.reserveProduceBatch("orders", 0, 3); // 1..3
+        // Pass a firstBackingOffset that goes non-monotonic mid-batch: 200, 201, 99.
+        // Actually the LogicalSidecarIndex enforces strict monotonicity on every append, so any
+        // backing offset <= the previous one throws. Here we go 200, 201, 202 — monotonic, no
+        // failure. We need a different way to force a failure. Easiest is to start the firstBacking
+        // below the existing high-water (100). The very first append will throw because 50 < 100.
+        assertThrows(RuntimeException.class,
+            () -> kernel.commitProduceBatch(batch, 50L));
+        // After the failure, no offsets were consumed by the batch — tracker still at 1.
+        assertEquals(1L, kernel.nextLogicalOffset("orders", 0),
+            "failed commit must roll back the batch so the high-water stays put");
+        // And a fresh reservation reuses offset 1 (no gap).
+        Reservation retry = kernel.reserveProduce("orders", 0);
+        assertEquals(1L, retry.logicalOffset());
+        kernel.commitProduce(retry, 200L);
+    }
+
+    @Test
+    public void reserveProduceBatchAfterCloseIsRejected() throws IOException {
+        kernel.declare(descriptor("orders", 4, "shared", 1));
+        kernel.close();
+        assertThrows(IllegalStateException.class,
+            () -> kernel.reserveProduceBatch("orders", 0, 3));
+        kernel = null;
+    }
 }

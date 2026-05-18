@@ -23,8 +23,14 @@ import java.util.concurrent.locks.ReentrantLock;
 /**
  * Per-(logicalTopic, logicalPartition) monotonic offset assignment with a serialised
  * reserve/commit/rollback protocol. v1 keeps the protocol simple — only one outstanding
- * reservation per partition at a time — which is enough to honour the acceptance criterion
+ * reservation batch per partition at a time — which is enough to honour the acceptance criterion
  * "subsequent appends do not leave offset gaps" without the stretch cascade-rollback machinery.
+ *
+ * <p>A reservation may be a single offset (legacy reserve/commit/rollback) or a contiguous run of
+ * K offsets ({@link #reserveBatch}/{@link #commitBatch}/{@link #rollbackBatch}). Batch semantics
+ * are all-or-nothing: every member of a reserved batch must be committed or every member must be
+ * rolled back. This matches what a stock Kafka producer needs — a multi-record produce batch is
+ * atomic at the leader (LogValidator assigns contiguous offsets), so the kernel mirrors that.
  *
  * <p>Partitions are independent; concurrent traffic across many logical partitions is not
  * serialised against each other.
@@ -41,7 +47,10 @@ public final class LogicalOffsetTracker {
         // intentionally lock-free for the fetch path.
         volatile long startOffset = 0L;
         volatile long nextOffset = 0L;
-        Reservation outstanding = null;
+        // The currently outstanding batch (length 1 for the legacy single-record API). null when
+        // no reservation is in flight. Equality is by reference: a caller-provided batch must be
+        // THE SAME array object the tracker handed out, not a copy.
+        Reservation[] outstandingBatch = null;
     }
 
     private final ConcurrentHashMap<Key, PartitionState> states = new ConcurrentHashMap<>();
@@ -52,25 +61,82 @@ public final class LogicalOffsetTracker {
     }
 
     public Reservation reserve(String logicalTopic, int logicalPartition) {
-        PartitionState s = stateFor(logicalTopic, logicalPartition);
-        s.lock.lock();
-        Reservation r = new Reservation(logicalTopic, logicalPartition, s.nextOffset);
-        s.outstanding = r;
-        return r;
+        return reserveBatch(logicalTopic, logicalPartition, 1)[0];
     }
 
     public void commit(Reservation reservation) {
-        PartitionState s = expectOutstanding(reservation);
-        s.nextOffset = reservation.logicalOffset() + 1;
-        reservation.markCommitted();
-        s.outstanding = null;
-        s.lock.unlock();
+        Objects.requireNonNull(reservation, "reservation");
+        commitBatchInternal(new Reservation[]{reservation}, /*expectSameRef*/ false);
     }
 
     public void rollback(Reservation reservation) {
-        PartitionState s = expectOutstanding(reservation);
-        reservation.markRolledBack();
-        s.outstanding = null;
+        Objects.requireNonNull(reservation, "reservation");
+        rollbackBatchInternal(new Reservation[]{reservation}, /*expectSameRef*/ false);
+    }
+
+    /**
+     * Reserve a contiguous run of {@code count} logical offsets on one partition. The returned
+     * array is the SAME object the tracker holds as its outstanding batch — pass it back verbatim
+     * to {@link #commitBatch} or {@link #rollbackBatch}. Used by the broker's produce hot path to
+     * stamp K records of a single produce batch with K contiguous logical offsets before the
+     * backing append.
+     *
+     * <p>The per-partition lock is acquired in {@code reserveBatch} and released in the matching
+     * {@code commitBatch} / {@code rollbackBatch}. Concurrent batches on the same partition are
+     * serialised; sibling partitions are independent.
+     *
+     * @throws IllegalArgumentException if {@code count <= 0}.
+     */
+    public Reservation[] reserveBatch(String logicalTopic, int logicalPartition, int count) {
+        if (count <= 0) {
+            throw new IllegalArgumentException("batch reservation count must be > 0, was " + count);
+        }
+        PartitionState s = stateFor(logicalTopic, logicalPartition);
+        s.lock.lock();
+        Reservation[] batch = new Reservation[count];
+        long base = s.nextOffset;
+        for (int i = 0; i < count; i++) {
+            batch[i] = new Reservation(logicalTopic, logicalPartition, base + i);
+        }
+        s.outstandingBatch = batch;
+        return batch;
+    }
+
+    /**
+     * Commit every reservation in the batch atomically. After return, the partition's
+     * nextLogicalOffset advances by {@code batch.length} and every reservation is in committed
+     * state. The same array reference returned by {@link #reserveBatch} must be passed back.
+     */
+    public void commitBatch(Reservation[] batch) {
+        Objects.requireNonNull(batch, "batch");
+        commitBatchInternal(batch, /*expectSameRef*/ true);
+    }
+
+    /**
+     * Roll back every reservation in the batch atomically. No offsets are consumed.
+     */
+    public void rollbackBatch(Reservation[] batch) {
+        Objects.requireNonNull(batch, "batch");
+        rollbackBatchInternal(batch, /*expectSameRef*/ true);
+    }
+
+    private void commitBatchInternal(Reservation[] batch, boolean expectSameRef) {
+        PartitionState s = expectOutstandingBatch(batch, expectSameRef);
+        Reservation last = batch[batch.length - 1];
+        s.nextOffset = last.logicalOffset() + 1;
+        for (Reservation r : batch) {
+            r.markCommitted();
+        }
+        s.outstandingBatch = null;
+        s.lock.unlock();
+    }
+
+    private void rollbackBatchInternal(Reservation[] batch, boolean expectSameRef) {
+        PartitionState s = expectOutstandingBatch(batch, expectSameRef);
+        for (Reservation r : batch) {
+            r.markRolledBack();
+        }
+        s.outstandingBatch = null;
         s.lock.unlock();
     }
 
@@ -126,11 +192,11 @@ public final class LogicalOffsetTracker {
         PartitionState s = states.get(key);
         if (s == null) return false;
         // Take the lock so we're synchronised against any in-flight reserve/commit. If the lock
-        // is held by another thread, the reservation it holds is the outstanding one; we will
-        // see it under our lock and refuse rather than silently dropping live state.
+        // is held by another thread, the reservation batch it holds is the outstanding one; we
+        // will see it under our lock and refuse rather than silently dropping live state.
         s.lock.lock();
         try {
-            if (s.outstanding != null) {
+            if (s.outstandingBatch != null) {
                 throw new IllegalStateException(
                     "cannot remove (" + logicalTopic + "," + logicalPartition
                         + "): a reservation is outstanding");
@@ -156,13 +222,48 @@ public final class LogicalOffsetTracker {
         s.nextOffset = nextOffset;
     }
 
-    private PartitionState expectOutstanding(Reservation reservation) {
-        Objects.requireNonNull(reservation, "reservation");
-        PartitionState s = states.get(new Key(reservation.logicalTopic(), reservation.logicalPartition()));
-        if (s == null || s.outstanding != reservation || reservation.state() != Reservation.State.OPEN) {
+    /**
+     * Resolve and validate the outstanding-batch state for a caller-provided batch. When
+     * {@code expectSameRef} is true (the {@link #commitBatch}/{@link #rollbackBatch} path) we
+     * require the caller to hand back the exact array reference {@link #reserveBatch} returned,
+     * because that's the strictest check available without a separate batch-id. The legacy
+     * single-record path wraps the lone reservation in a fresh 1-element array, so for that
+     * codepath we relax the array-identity check and instead match on the single Reservation's
+     * identity.
+     */
+    private PartitionState expectOutstandingBatch(Reservation[] batch, boolean expectSameRef) {
+        if (batch.length == 0) {
+            throw new IllegalStateException("batch is empty");
+        }
+        Reservation first = batch[0];
+        Objects.requireNonNull(first, "reservation[0]");
+        PartitionState s = states.get(new Key(first.logicalTopic(), first.logicalPartition()));
+        if (s == null || s.outstandingBatch == null) {
             throw new IllegalStateException(
-                "reservation is not the outstanding one for ("
-                    + reservation.logicalTopic() + "," + reservation.logicalPartition() + ")");
+                "no outstanding reservation for ("
+                    + first.logicalTopic() + "," + first.logicalPartition() + ")");
+        }
+        if (expectSameRef) {
+            if (s.outstandingBatch != batch) {
+                throw new IllegalStateException(
+                    "batch is not the outstanding one for ("
+                        + first.logicalTopic() + "," + first.logicalPartition() + ")");
+            }
+        } else {
+            // Legacy single-record path: outstanding must be exactly the same one-element batch
+            // *by Reservation identity*, since we just wrapped it.
+            if (s.outstandingBatch.length != 1 || s.outstandingBatch[0] != first) {
+                throw new IllegalStateException(
+                    "reservation is not the outstanding one for ("
+                        + first.logicalTopic() + "," + first.logicalPartition() + ")");
+            }
+        }
+        for (Reservation r : batch) {
+            if (r.state() != Reservation.State.OPEN) {
+                throw new IllegalStateException(
+                    "reservation already resolved for ("
+                        + first.logicalTopic() + "," + first.logicalPartition() + ")");
+            }
         }
         return s;
     }
