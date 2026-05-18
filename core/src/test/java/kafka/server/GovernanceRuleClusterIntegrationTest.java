@@ -21,6 +21,9 @@ import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.message.CreateTopicsRequestData;
+import org.apache.kafka.common.message.CreateTopicsRequestData.CreatableTopic;
+import org.apache.kafka.common.message.CreateTopicsRequestData.CreatableTopicCollection;
 import org.apache.kafka.common.protocol.ApiKeys;
 import org.apache.kafka.common.serialization.ByteArraySerializer;
 import org.apache.kafka.common.serialization.StringSerializer;
@@ -30,7 +33,10 @@ import org.apache.kafka.common.test.api.ClusterTest;
 import org.apache.kafka.common.test.api.ClusterTestDefaults;
 import org.apache.kafka.common.test.api.Type;
 import org.apache.kafka.server.rules.GovernanceTopic;
+import org.apache.kafka.server.rules.RuleDecision;
+import org.apache.kafka.server.rules.RuleEngine;
 import org.apache.kafka.server.rules.RuleSet;
+import org.apache.kafka.server.rules.extract.ApiMessageActivation;
 
 import java.nio.charset.StandardCharsets;
 import java.util.List;
@@ -107,9 +113,24 @@ public class GovernanceRuleClusterIntegrationTest {
         // scheduled every BrokerServer.GovernanceDrainIntervalMs (200ms),
         // so a 30s waitForCondition is generous; on a healthy machine
         // convergence typically lands in well under a second.
-        TestUtils.waitForCondition(() -> allBrokersHaveExactlyOneRuleForApiKey(cluster, ApiKeys.CREATE_TOPICS),
+        //
+        // The convergence predicate is intentionally a full end-to-end
+        // semantic check (Codex P1 audit follow-up): we don't just verify
+        // the bitset bit is set for CREATE_TOPICS on every broker — we
+        // build an activation that actually matches the rule's `when`
+        // expression and call RuleEngine.evaluate() on every broker. The
+        // assertion is:
+        //   - For an audit-prefixed topic name:  denied, rule id RULE_ID,
+        //     error code 29 — on every broker.
+        //   - For a non-prefixed topic name:    ALLOW — on every broker.
+        // A regression that left some broker with a wrong rule (different
+        // error code, different id, or a rule that fires on the wrong
+        // expression) would pass the bitset-only check but fail here.
+        TestUtils.waitForCondition(() -> allBrokersConvergedOnAuditPrefixDeny(cluster),
             30_000L,
-            "all three brokers must converge on the DENY rule installed via __governance");
+            "all three brokers must converge on the DENY rule installed via __governance — " +
+                "audit-prefixed CreateTopics must be denied with rule id '" + RULE_ID +
+                "' and error code 29, and non-matching CreateTopics must be allowed");
 
         // Tombstone the rule. Null value → log-compacted record key signals
         // removal. Note: the producer needs explicit null-handling — we
@@ -121,55 +142,93 @@ public class GovernanceRuleClusterIntegrationTest {
 
         // All three brokers must converge on the empty rule set. No broker
         // restart in this test — convergence happens entirely through the
-        // scheduled re-drain.
-        TestUtils.waitForCondition(() -> allBrokersHaveNoRuleForApiKey(cluster, ApiKeys.CREATE_TOPICS),
+        // scheduled re-drain. Again, semantic check: even the previously-
+        // matching audit-prefixed activation must now ALLOW on every broker.
+        TestUtils.waitForCondition(() -> allBrokersAllowAuditPrefixAfterTombstone(cluster),
             30_000L,
-            "all three brokers must converge on rule removal after tombstone — no restart needed");
+            "all three brokers must converge on rule removal after tombstone — " +
+                "audit-prefixed CreateTopics must be ALLOWED again (rule gone), no restart needed");
     }
 
-    private static boolean allBrokersHaveExactlyOneRuleForApiKey(ClusterInstance cluster, ApiKeys apiKey) {
+    /**
+     * Semantic convergence predicate (Codex P1 follow-up): every broker must
+     *   1. have the bitset bit set for CREATE_TOPICS (fast-path engagement);
+     *   2. DENY an audit-prefixed CreateTopics with the exact rule id and
+     *      error code we published — proves the rule's content (not just
+     *      "some" deny rule) converged byte-for-byte;
+     *   3. ALLOW a non-prefixed CreateTopics — proves the rule's `when`
+     *      expression actually distinguishes inputs and isn't a "deny all"
+     *      that happens to also catch the audit case.
+     */
+    private static boolean allBrokersConvergedOnAuditPrefixDeny(ClusterInstance cluster) {
         Map<Integer, KafkaBroker> brokers = cluster.brokers();
         if (brokers.size() != 3) {
-            // Sanity — @ClusterTestDefaults(brokers = 3) guarantees this, but
-            // if a future change drops a broker, fail fast with a clearer
-            // message than "convergence never happened".
             fail("expected 3 brokers, found " + brokers.size());
         }
         for (KafkaBroker broker : brokers.values()) {
-            RuleSet rs = ruleSetOf(broker);
-            // We must NOT inspect rs.size() in isolation — multiple rules may
-            // exist if tests run in parallel and share state, but @ClusterTest
-            // brings up a fresh KRaft cluster per test. Still, scope the
-            // assertion to the CreateTopics bitset bit.
-            if (!rs.hasDenyRuleFor(apiKey.id)) {
+            BrokerServer server = (BrokerServer) broker;
+            RuleEngine engine = server.ruleEngine();
+            RuleSet rs = engine.active();
+            assertNotNull(rs, "every broker must have a non-null active RuleSet once it accepts traffic");
+            // Fast-path bit must be set first.
+            if (!rs.hasDenyRuleFor(ApiKeys.CREATE_TOPICS.id)) {
                 return false;
             }
+            // Matching activation: an audit-prefixed topic must be denied
+            // with the exact rule id and error code we published.
+            RuleDecision matching = engine.evaluate(
+                ApiKeys.CREATE_TOPICS, "client-x", false,
+                () -> buildCreateTopicsActivation("audit-events"));
+            if (!matching.denied()) return false;
+            if (!RULE_ID.equals(matching.denyingRuleId())) return false;
+            if (matching.errorCode() != 29) return false;
+            // Non-matching activation: a plain topic must be allowed. If a
+            // regression installed a "deny all CREATE_TOPICS" rule that
+            // happens to match the audit case too, this catches it.
+            RuleDecision nonMatching = engine.evaluate(
+                ApiKeys.CREATE_TOPICS, "client-x", false,
+                () -> buildCreateTopicsActivation("orders"));
+            if (nonMatching.denied()) return false;
         }
         return true;
     }
 
-    private static boolean allBrokersHaveNoRuleForApiKey(ClusterInstance cluster, ApiKeys apiKey) {
+    /**
+     * Post-tombstone semantic predicate: even the previously-matching
+     * audit-prefixed activation must now be ALLOWED on every broker. A
+     * bitset-only check could pass here while a stale rule still fires
+     * under a different code path; this catches it.
+     */
+    private static boolean allBrokersAllowAuditPrefixAfterTombstone(ClusterInstance cluster) {
         for (KafkaBroker broker : cluster.brokers().values()) {
-            RuleSet rs = ruleSetOf(broker);
-            // After tombstone + re-drain, the CreateTopics bitset bit must
-            // be CLEAR on every broker. If even one broker still flags the
-            // bit, convergence has not happened yet.
-            if (rs.hasDenyRuleFor(apiKey.id)) {
-                return false;
-            }
+            BrokerServer server = (BrokerServer) broker;
+            RuleEngine engine = server.ruleEngine();
+            RuleSet rs = engine.active();
+            assertNotNull(rs);
+            // Bitset bit must be clear AND a previously-matching activation
+            // must now ALLOW. Either failure means convergence has not landed.
+            if (rs.hasDenyRuleFor(ApiKeys.CREATE_TOPICS.id)) return false;
+            RuleDecision d = engine.evaluate(
+                ApiKeys.CREATE_TOPICS, "client-x", false,
+                () -> buildCreateTopicsActivation("audit-events"));
+            if (d.denied()) return false;
         }
         return true;
     }
 
-    private static RuleSet ruleSetOf(KafkaBroker broker) {
-        // KafkaBroker is the public trait; BrokerServer is the concrete KRaft
-        // implementation that owns the RuleEngine. We cast here rather than
-        // adding ruleEngine() to the trait surface — keeping the trait clean
-        // of CEL-engine details is intentional.
-        BrokerServer server = (BrokerServer) broker;
-        RuleSet rs = server.ruleEngine().active();
-        assertNotNull(rs, "every broker must have a non-null active RuleSet once it accepts traffic");
-        return rs;
+    /**
+     * Build a CEL activation map that matches the shape the broker actually
+     * produces on the request path. Going through {@link ApiMessageActivation}
+     * (not a hand-rolled Map) guarantees the test sees the same envelope and
+     * the same field-name discipline a real CreateTopics request would; if a
+     * field-extractor regression broke the broker, this assertion would catch
+     * it too.
+     */
+    private static Map<String, Object> buildCreateTopicsActivation(String topicName) {
+        CreatableTopicCollection topics = new CreatableTopicCollection();
+        topics.add(new CreatableTopic().setName(topicName));
+        CreateTopicsRequestData data = new CreateTopicsRequestData().setTopics(topics);
+        return ApiMessageActivation.requestActivation(data);
     }
 
     @ClusterTest
