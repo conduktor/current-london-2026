@@ -150,12 +150,34 @@ final class IoUringTransportLayer implements TransportLayer {
 
     @Override
     public void addInterestOps(int ops) {
-        selectionKey.interestOps(selectionKey.interestOps() | ops);
+        int before = selectionKey.interestOps();
+        int after = before | ops;
+        selectionKey.interestOps(after);
+        // Mirror the NIO contract: when OP_READ comes back in the interest mask the channel
+        // is once again accepting reads. Flip Netty autoRead on so the kernel resumes pushing
+        // bytes. This is what KafkaChannel.maybeUnmute() relies on after MemoryPool pressure
+        // releases, and it is also the symmetric counterpart of removeInterestOps below.
+        if ((after & SelectionKey.OP_READ) != 0 && (before & SelectionKey.OP_READ) == 0
+                && nettyChannel.isOpen() && !nettyChannel.config().isAutoRead()) {
+            nettyChannel.config().setAutoRead(true);
+        }
     }
 
     @Override
     public void removeInterestOps(int ops) {
-        selectionKey.interestOps(selectionKey.interestOps() & ~ops);
+        int before = selectionKey.interestOps();
+        int after = before & ~ops;
+        selectionKey.interestOps(after);
+        // On the NIO path, removing OP_READ takes the SocketChannel out of the JDK selector's
+        // ready set so the broker stops draining the kernel buffer. On io_uring there is no
+        // SelectionKey driving the kernel — Netty's autoRead does. Reflect the mute side-effect
+        // here so KafkaChannel.mute() (called internally when MemoryPool.tryAllocate returns
+        // null) actually applies kernel-level backpressure instead of letting bytes pile up
+        // in the transport's inbound queue.
+        if ((after & SelectionKey.OP_READ) == 0 && (before & SelectionKey.OP_READ) != 0
+                && nettyChannel.isOpen() && nettyChannel.config().isAutoRead()) {
+            nettyChannel.config().setAutoRead(false);
+        }
     }
 
     @Override

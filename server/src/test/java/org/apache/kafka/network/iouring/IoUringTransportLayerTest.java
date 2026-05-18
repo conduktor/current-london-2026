@@ -126,6 +126,34 @@ class IoUringTransportLayerTest {
     }
 
     @Test
+    void removingOpReadFlipsNettyAutoReadOffForKernelBackpressure() {
+        // KafkaChannel.mute() (called internally when MemoryPool.tryAllocate returns null)
+        // calls transport.removeInterestOps(OP_READ). On NIO that takes the SocketChannel out
+        // of the JDK selector's ready set so the broker stops draining the kernel buffer. On
+        // io_uring there is no SelectionKey — Netty's autoRead drives kernel reads. So the
+        // transport layer has to flip autoRead off on OP_READ removal, or every byte the
+        // kernel has pushed into Netty keeps draining into our inbound queue under memory
+        // pressure and the broker OOMs instead of applying backpressure.
+        EmbeddedChannel netty = new EmbeddedChannel();
+        IoUringTransportLayer l = new IoUringTransportLayer(netty, REMOTE, LOCAL);
+        assertTrue(netty.config().isAutoRead(), "EmbeddedChannel default is autoRead=true");
+
+        l.removeInterestOps(SelectionKey.OP_READ);
+        assertFalse(netty.config().isAutoRead(),
+            "OP_READ removed -> autoRead flipped off so the kernel stops pushing bytes");
+
+        l.addInterestOps(SelectionKey.OP_READ);
+        assertTrue(netty.config().isAutoRead(),
+            "OP_READ added back -> autoRead flipped on so the kernel resumes pushing bytes");
+
+        // Idempotency: a redundant remove must not toggle autoRead from off→on by accident.
+        l.removeInterestOps(SelectionKey.OP_READ);
+        assertFalse(netty.config().isAutoRead());
+        l.removeInterestOps(SelectionKey.OP_READ); // already cleared
+        assertFalse(netty.config().isAutoRead(), "double-remove is a no-op");
+    }
+
+    @Test
     void readDrainsTheInboundQueueIntoTheDestinationByteBuffer() throws Exception {
         IoUringTransportLayer l = newLayer();
         byte[] payload = "hello-io_uring".getBytes();
