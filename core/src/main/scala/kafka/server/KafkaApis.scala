@@ -1364,18 +1364,47 @@ class KafkaApis(val requestChannel: RequestChannel,
 
     // Wrap the original sendResponseCallback so we (a) translate backing names back to view names,
     // (b) splice in per-partition epoch errors for views whose other partitions reached the
-    // storage layer, and (c) append any view-rewrite rejection responses we built above. The
-    // original callback also tacks on the topic-authorization-failure responses.
+    // storage layer, (c) STRIP the backing partition's leader_epoch off each re-keyed partition
+    // response, and (d) append any view-rewrite rejection responses we built above. The original
+    // callback also tacks on the topic-authorization-failure responses.
     //
     // The splice keeps the protocol invariant of one ListOffsetsTopicResponse per topic name —
     // duplicate-name entries would be ambiguous to the consumer (only the first parsed wins).
+    //
+    // Why strip leader_epoch: `ReplicaManager.fetchOffset` sets `LeaderEpoch` on each
+    // `ListOffsetsPartitionResponse` from the BACKING partition's leader-epoch ledger (see
+    // ReplicaManager.scala:1450). The view's ledger evolves independently and is generally LOWER
+    // than the backing's (the backing receives records continuously while the view receives
+    // none). Returning the backing epoch under the view's name would feed
+    // `Metadata.updateLastSeenEpochIfNewer(viewPartition, backingEpoch)` on the consumer side
+    // (see OffsetFetcherUtils.java:386), poisoning the consumer's view-side `lastSeenEpoch` with
+    // a backing-side value. The next ListOffsets / Fetch the consumer sends would carry
+    // `currentLeaderEpoch = backingEpoch` against the view's actual (lower) leader epoch,
+    // tripping `localLogWithEpochOrThrow` into `UNKNOWN_LEADER_EPOCH` (the request's epoch is
+    // ahead of the partition's). Combined with the consumer's metadata refresh returning the
+    // unchanged (lower) view leader epoch, the consumer would wedge in retry indefinitely.
+    //
+    // Setting `LeaderEpoch = UNDEFINED_EPOCH (-1)` is the protocol's "no useful epoch info"
+    // sentinel and is below any non-negative tracked epoch, so
+    // `updateLastSeenEpochIfNewer` is a no-op for it and the consumer keeps the legitimate
+    // view-side epoch it last observed via metadata. KIP-320 truncation detection for view
+    // consumers is already cross-ledger and out-of-scope per PROMPT.md; stripping here makes
+    // the response shape consistent with the consumer's view-leader-epoch state machine.
     def viewAwareSendResponseCallback(response: Seq[ListOffsetsTopicResponse]): Unit = {
       val translated: Seq[ListOffsetsTopicResponse] =
         if (backingToView.isEmpty) response
         else response.map { topicResp =>
           backingToView.get(topicResp.name) match {
             case Some(viewName) =>
-              val combined = new util.ArrayList[ListOffsetsPartitionResponse](topicResp.partitions)
+              val stripped = topicResp.partitions.asScala.map { p =>
+                new ListOffsetsPartitionResponse()
+                  .setPartitionIndex(p.partitionIndex)
+                  .setErrorCode(p.errorCode)
+                  .setTimestamp(p.timestamp)
+                  .setOffset(p.offset)
+                  .setLeaderEpoch(ListOffsetsResponse.UNKNOWN_EPOCH)
+              }
+              val combined = new util.ArrayList[ListOffsetsPartitionResponse](stripped.asJava)
               viewPartialPartitionErrors.get(viewName).foreach(errs => combined.addAll(errs.asJava))
               new ListOffsetsTopicResponse().setName(viewName).setPartitions(combined)
             case None => topicResp
