@@ -20,7 +20,7 @@ package kafka.server.metadata
 import java.util.OptionalInt
 import kafka.coordinator.transaction.TransactionCoordinator
 import kafka.log.LogManager
-import kafka.server.{KafkaConfig, ReplicaManager}
+import kafka.server.{BackingLogScanRecovery, KafkaConfig, ReplicaManager}
 import kafka.utils.Logging
 import org.apache.kafka.common.TopicPartition
 import org.apache.kafka.common.errors.TimeoutException
@@ -32,6 +32,7 @@ import org.apache.kafka.image.publisher.MetadataPublisher
 import org.apache.kafka.image.{MetadataDelta, MetadataImage, TopicDelta}
 import org.apache.kafka.server.common.RequestLocal
 import org.apache.kafka.server.fault.FaultHandler
+import org.apache.kafka.storage.internals.concentration.ConcentrationKernel
 
 import java.util.concurrent.CompletableFuture
 import scala.collection.mutable
@@ -77,6 +78,7 @@ class BrokerMetadataPublisher(
   aclPublisher: AclPublisher,
   fatalFaultHandler: FaultHandler,
   metadataPublishingFaultHandler: FaultHandler,
+  concentrationKernel: ConcentrationKernel,
 ) extends MetadataPublisher with Logging {
   logIdent = s"[BrokerMetadataPublisher id=${config.nodeId}] "
 
@@ -318,6 +320,16 @@ class BrokerMetadataPublisher(
       // point because LogManager#startup creates the LogCleaner object, if
       // log.cleaner.enable is true. TODO: improve this (see KAFKA-13610)
       Option(logManager.cleaner).foreach(config.dynamicConfig.addBrokerReconfigurable)
+
+      // Concentration hook #5 (full-scan path). The cheap path runs in BrokerServer before
+      // logManager.startup() and seeds the tracker from intact sidecar files. Any logical
+      // partition that lacks a sidecar (lost, corrupt, or never produced to) is rebuilt here
+      // by scanning the backing UnifiedLog — which only becomes available after the call
+      // above. The scan is a no-op when every declared partition already has a sidecar, so it
+      // doesn't penalize the common warm-restart case. A failure here is fatal: serving a
+      // logical topic without a valid offset mapping would silently corrupt producer/consumer
+      // state, so we fail broker startup instead.
+      new BackingLogScanRecovery(concentrationKernel, logManager).run()
     } catch {
       case t: Throwable => fatalFaultHandler.handleFault("Error starting LogManager", t)
     }

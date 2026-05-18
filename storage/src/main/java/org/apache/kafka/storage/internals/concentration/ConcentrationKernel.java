@@ -312,6 +312,33 @@ public final class ConcentrationKernel implements AutoCloseable {
     }
 
     /**
+     * Partitions declared on this broker that have NO sidecar file on disk, in registry order.
+     * Used by the full-scan recovery path to decide which backing partitions to scan and which
+     * (logicalTopic, logicalPartition) tuples to filter in. A partition appears here iff:
+     * <ul>
+     *   <li>Its logical topic has been declared via {@link #declare}, AND</li>
+     *   <li>The sidecar file {@code sidecarDir/<topic>/<partition>.sidecar} does not exist.</li>
+     * </ul>
+     * "Never produced to" and "sidecar lost / corrupt" both surface here — they are not
+     * distinguishable from disk alone. The downstream backing-scan handles both correctly: a
+     * never-produced partition has no matching records on the backing log so the iterator yields
+     * nothing, leaving the tracker at the default {@code (0, 0)}; a lost-index partition has
+     * records and is rebuilt from them.
+     */
+    public List<LogicalPartition> partitionsWithoutSidecar() {
+        ensureOpen();
+        List<LogicalPartition> out = new ArrayList<>();
+        for (LogicalTopicDescriptor d : registry.all()) {
+            for (int p = 0; p < d.numLogicalPartitions(); p++) {
+                if (!recoverer.sidecarFile(d.logicalName(), p).exists()) {
+                    out.add(new LogicalPartition(d.logicalName(), p));
+                }
+            }
+        }
+        return out;
+    }
+
+    /**
      * Cheap-path startup recovery. For every declared logical topic, enumerate the sidecar files
      * already on disk under {@code sidecarDir/<topic>/<partition>.sidecar} and seed the tracker
      * with their {@code (logicalStart=0, nextLogical=size)}.
