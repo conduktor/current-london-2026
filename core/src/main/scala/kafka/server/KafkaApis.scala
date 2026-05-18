@@ -397,6 +397,30 @@ class KafkaApis(val requestChannel: RequestChannel,
       }
     }
 
+    val tenantCtx = tenantContextFor(request)
+    val tenantScoped = tenantCtx.effectiveTenant.isPresent
+    // Refuse a privileged caller hitting a tenant-bound listener without a
+    // tenant principal — see handleTopicMetadataRequest for the rationale.
+    // Each requested topic-partition gets TOPIC_AUTHORIZATION_FAILED carrying
+    // the logical name the caller used; the request reaches neither
+    // authorization nor replicaManager.
+    if (tenantCtx.isPrivilegedOnTenantListener) {
+      val refused = mutable.Map[TopicPartition, PartitionResponse]()
+      produceRequest.data.topicData.forEach(t => t.partitionData.forEach(p =>
+        refused += new TopicPartition(t.name, p.index) -> new PartitionResponse(Errors.TOPIC_AUTHORIZATION_FAILED)))
+      requestChannel.sendResponse(request, new ProduceResponse(refused.asJava), None)
+      return
+    }
+
+    // IN rewrite — topic names in the request are logical; authorization,
+    // metadataCache.contains() and replicaManager.handleProduceAppend() below
+    // all key on physical names. Mutate the request's TopicProduceData names
+    // in place: the request object is a deserialised value owned by this
+    // handler and will be GC'd after sendResponseCallback fires.
+    if (tenantScoped) {
+      produceRequest.data.topicData.forEach(t => t.setName(tenantCtx.toPhysical(t.name)))
+    }
+
     val unauthorizedTopicResponses = mutable.Map[TopicPartition, PartitionResponse]()
     val nonExistingTopicResponses = mutable.Map[TopicPartition, PartitionResponse]()
     val invalidRequestResponses = mutable.Map[TopicPartition, PartitionResponse]()
@@ -431,11 +455,13 @@ class KafkaApis(val requestChannel: RequestChannel,
     // https://issues.apache.org/jira/browse/KAFKA-10730
     @nowarn("cat=deprecation")
     def sendResponseCallback(responseStatus: Map[TopicPartition, PartitionResponse]): Unit = {
-      val mergedResponseStatus = responseStatus ++ unauthorizedTopicResponses ++ nonExistingTopicResponses ++ invalidRequestResponses
+      val physicalResponseStatus = responseStatus ++ unauthorizedTopicResponses ++ nonExistingTopicResponses ++ invalidRequestResponses
       var errorInResponse = false
 
       val nodeEndpoints = new mutable.HashMap[Int, Node]
-      mergedResponseStatus.foreachEntry { (topicPartition, status) =>
+      // Iterate with PHYSICAL TopicPartitions — getCurrentLeader uses
+      // replicaManager / metadataCache, both of which key on physical names.
+      physicalResponseStatus.foreachEntry { (topicPartition, status) =>
         if (status.error != Errors.NONE) {
           errorInResponse = true
           debug("Produce request with correlation id %d from client %s on partition %s failed due to %s".format(
@@ -459,6 +485,15 @@ class KafkaApis(val requestChannel: RequestChannel,
           }
         }
       }
+
+      // OUT rewrite — only the response map keys (TopicPartitions) carry
+      // names; the PartitionResponse values are shared by reference, so the
+      // currentLeader info set above is preserved on the rekeyed entries.
+      // The client sees logical topic names in all paths including errors.
+      val mergedResponseStatus: Map[TopicPartition, PartitionResponse] =
+        if (tenantScoped) physicalResponseStatus.map { case (tp, pr) =>
+          new TopicPartition(tenantCtx.toLogical(tp.topic), tp.partition) -> pr
+        } else physicalResponseStatus
 
       // Record both bandwidth and request quota-specific values and throttle by muting the channel if any of the quotas
       // have been violated. If both quotas have been violated, use the max throttle time between the two quotas. Note

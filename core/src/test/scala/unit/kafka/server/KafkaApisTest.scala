@@ -10870,4 +10870,182 @@ class KafkaApisTest extends Logging {
     val topics = response.topicMetadata().asScala.map(_.topic).toSet
     assertEquals(Set("plain-topic"), topics)
   }
+
+  // ---------------------------------------------------------------------------
+  // Produce — multi-tenancy
+  //
+  // The producer client sees only the logical topic name. The broker authorizes,
+  // looks up metadata, and appends against the physical (prefixed) name. Errors
+  // come back keyed on the logical name. A privileged caller without a tenant
+  // prefix on a tenant-bound listener is refused outright; we never silently
+  // rewrite its writes into the tenant namespace.
+  // ---------------------------------------------------------------------------
+
+  private def buildSingleTopicProduceRequest(topic: String, partition: Int = 0): ProduceRequest = {
+    ProduceRequest.builder(new ProduceRequestData()
+      .setTopicData(new ProduceRequestData.TopicProduceDataCollection(
+        Collections.singletonList(new ProduceRequestData.TopicProduceData()
+          .setName(topic).setPartitionData(Collections.singletonList(
+            new ProduceRequestData.PartitionProduceData()
+              .setIndex(partition)
+              .setRecords(MemoryRecords.withRecords(Compression.NONE, new SimpleRecord("test".getBytes))))))
+          .iterator))
+      .setAcks(1.toShort)
+      .setTimeoutMs(5000))
+      .build(ApiKeys.PRODUCE.latestVersion)
+  }
+
+  @Test
+  def testProduceTenantRequestRewritesLogicalNameToPhysicalForReplicaManager(): Unit = {
+    // The producer sends "orders"; replicaManager.handleProduceAppend must be
+    // invoked with the physical TopicPartition "acme.orders-0", and the
+    // response visible to the client must carry the logical name.
+    val physicalTopic = "acme.orders"
+    addTopicToMetadataCache(physicalTopic, numPartitions = 1)
+
+    val produceRequest = buildSingleTopicProduceRequest("orders")
+    val request = buildRequest(
+      produceRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    val responseCallback: ArgumentCaptor[Map[TopicPartition, PartitionResponse] => Unit] =
+      ArgumentCaptor.forClass(classOf[Map[TopicPartition, PartitionResponse] => Unit])
+    val entriesPerPartition: ArgumentCaptor[Map[TopicPartition, MemoryRecords]] =
+      ArgumentCaptor.forClass(classOf[Map[TopicPartition, MemoryRecords]])
+
+    when(replicaManager.handleProduceAppend(
+      anyLong, anyShort, ArgumentMatchers.eq(false), any(),
+      entriesPerPartition.capture(),
+      responseCallback.capture(),
+      any(), any(), any(), any())
+    ).thenAnswer(_ => responseCallback.getValue.apply(
+      Map(new TopicPartition(physicalTopic, 0) -> new PartitionResponse(Errors.NONE))))
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), any[Long])).thenReturn(0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    kafkaApis = createKafkaApis(
+      authorizer = None,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    // replicaManager saw the physical name
+    val captured = entriesPerPartition.getValue
+    assertEquals(Set(new TopicPartition(physicalTopic, 0)), captured.keySet,
+      "replicaManager must receive the physical TopicPartition")
+
+    // client sees the logical name in the response
+    val response = verifyNoThrottling[ProduceResponse](request)
+    assertEquals(1, response.data.responses.size)
+    val topicProduceResponse = response.data.responses.asScala.head
+    assertEquals("orders", topicProduceResponse.name,
+      "client must see the logical topic name in the produce response")
+    val partitionProduceResponse = topicProduceResponse.partitionResponses.asScala.head
+    assertEquals(Errors.NONE, Errors.forCode(partitionProduceResponse.errorCode))
+  }
+
+  @Test
+  def testProduceTenantResponseStripsPhysicalPrefixFromErrorResponses(): Unit = {
+    // Tenant produces to an unknown topic. The error must mention "orders",
+    // not "acme.orders" — otherwise the physical prefix leaks via the error
+    // path. The topic is not in metadataCache so KafkaApis short-circuits
+    // with UNKNOWN_TOPIC_OR_PARTITION before reaching replicaManager.
+    val produceRequest = buildSingleTopicProduceRequest("orders")
+    val request = buildRequest(
+      produceRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), any[Long])).thenReturn(0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    kafkaApis = createKafkaApis(
+      authorizer = None,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[ProduceResponse](request)
+    assertEquals(1, response.data.responses.size)
+    val topicProduceResponse = response.data.responses.asScala.head
+    assertEquals("orders", topicProduceResponse.name,
+      "error response must carry the logical name")
+    val partitionProduceResponse = topicProduceResponse.partitionResponses.asScala.head
+    assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION,
+      Errors.forCode(partitionProduceResponse.errorCode))
+  }
+
+  @Test
+  def testProducePrivilegedCallerOnTenantBoundListenerIsRejected(): Unit = {
+    // Super-user without a `__tenant_` prefix produces on a tenant-bound
+    // listener. The broker MUST refuse every partition rather than silently
+    // rewrite "orders" into "acme.orders" — that would let a privileged caller
+    // pollute the tenant namespace, which is data corruption.
+    addTopicToMetadataCache("acme.orders", numPartitions = 1)
+
+    val produceRequest = buildSingleTopicProduceRequest("orders")
+    val request = buildRequest(
+      produceRequest,
+      listenerName = TENANT_LISTENER,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "Alice"))
+
+    kafkaApis = createKafkaApis(
+      authorizer = None,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[ProduceResponse](request)
+    assertEquals(1, response.data.responses.size)
+    val topicProduceResponse = response.data.responses.asScala.head
+    assertEquals("orders", topicProduceResponse.name,
+      "rejection response must carry the logical name the caller used")
+    val partitionProduceResponse = topicProduceResponse.partitionResponses.asScala.head
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED,
+      Errors.forCode(partitionProduceResponse.errorCode),
+      "privileged caller on tenant listener without tenant prefix must be refused")
+
+    // replicaManager MUST NOT be invoked: the request never reaches the append path.
+    verify(replicaManager, never()).handleProduceAppend(
+      anyLong, anyShort, anyBoolean, any(), any(), any(), any(), any(), any(), any())
+  }
+
+  @Test
+  def testProduceNonTenantRequestUnchangedWhenNoBinding(): Unit = {
+    // Single-tenant behaviour unchanged: no listener binding, no principal
+    // prefix, no rewrite, and no guard fires.
+    val topic = "plain-topic"
+    addTopicToMetadataCache(topic, numPartitions = 1)
+
+    val produceRequest = buildSingleTopicProduceRequest(topic)
+    val request = buildRequest(produceRequest)
+
+    val responseCallback: ArgumentCaptor[Map[TopicPartition, PartitionResponse] => Unit] =
+      ArgumentCaptor.forClass(classOf[Map[TopicPartition, PartitionResponse] => Unit])
+    val entriesPerPartition: ArgumentCaptor[Map[TopicPartition, MemoryRecords]] =
+      ArgumentCaptor.forClass(classOf[Map[TopicPartition, MemoryRecords]])
+
+    when(replicaManager.handleProduceAppend(
+      anyLong, anyShort, ArgumentMatchers.eq(false), any(),
+      entriesPerPartition.capture(),
+      responseCallback.capture(),
+      any(), any(), any(), any())
+    ).thenAnswer(_ => responseCallback.getValue.apply(
+      Map(new TopicPartition(topic, 0) -> new PartitionResponse(Errors.NONE))))
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), any[Long])).thenReturn(0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    assertEquals(Set(new TopicPartition(topic, 0)), entriesPerPartition.getValue.keySet)
+    val response = verifyNoThrottling[ProduceResponse](request)
+    assertEquals(topic, response.data.responses.asScala.head.name)
+  }
 }
