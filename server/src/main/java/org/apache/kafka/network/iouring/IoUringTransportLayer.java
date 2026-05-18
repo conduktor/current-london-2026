@@ -280,6 +280,26 @@ final class IoUringTransportLayer implements TransportLayer {
         }
         int remaining = src.remaining();
         if (remaining == 0) return 0;
+        // Backpressure: if Netty's outbound buffer has exceeded the high water mark,
+        // refuse to queue more bytes. Returning 0 makes ByteBufferSend.writeTo keep
+        // its source ByteBuffers intact, so the next Selector poll's write step will
+        // re-attempt — and onWritabilityChanged() will wake the poll the moment the
+        // buffer drains below the low water mark. Without this gate, each write()
+        // unconditionally allocates a fresh direct ByteBuf and hands it to Netty's
+        // unbounded outboundBuffer; a slow peer would let direct memory grow until
+        // the broker OOMs. This is the io_uring analog of NIO write() returning 0
+        // when the kernel's SO_SNDBUF is saturated.
+        //
+        // Restrict the gate to healthy channels (isActive() = open + connected).
+        // For a closed/disconnected channel, isWritable() is also false — but we
+        // WANT those writes to proceed so writeAndFlush's promise fails and
+        // surfaces the error through asyncWriteFailure. Returning 0 here on a
+        // dead channel would silently swallow the error: ByteBufferSend.writeTo
+        // would loop forever waiting for the channel to become writable again,
+        // which it never will, while the Send is silently considered "in flight".
+        if (nettyChannel.isActive() && !nettyChannel.isWritable()) {
+            return 0;
+        }
         // Use a pooled direct buffer so io_uring can submit the bytes without a heap-to-
         // direct intermediate copy. The buffer is released by Netty after the channel has
         // flushed it; we only own the writeAndFlush completion listener.

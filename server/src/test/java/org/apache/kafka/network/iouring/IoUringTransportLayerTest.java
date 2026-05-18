@@ -32,6 +32,7 @@ import io.netty.channel.embedded.EmbeddedChannel;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -226,6 +227,49 @@ class IoUringTransportLayerTest {
         written.readBytes(bytes);
         written.release();
         assertEquals("ack", new String(bytes));
+    }
+
+    @Test
+    void writeReturnsZeroWhenNettyChannelReportsNotWritable() throws Exception {
+        // Codex v5 BLOCKER: a slow consumer can let Netty's outboundBuffer grow without
+        // bound because write() unconditionally allocates a directBuffer and queues it.
+        // The defense is the same shape as NIO's: when the underlying buffer is saturated,
+        // write() must return 0 so ByteBufferSend.writeTo defers the send to the next
+        // poll. The Selector then re-attempts after onWritabilityChanged() wakes it.
+        //
+        // EmbeddedChannel's writability state is controlled via the user-defined
+        // writability bits on its ChannelOutboundBuffer — flipping bit 1 to false
+        // forces isWritable() to return false regardless of how many bytes are queued.
+        // This isolates the test from the water-mark configuration so we only verify
+        // the gate logic, not the water-mark plumbing.
+        EmbeddedChannel netty = new EmbeddedChannel();
+        IoUringTransportLayer l = new IoUringTransportLayer(netty, REMOTE, LOCAL);
+
+        // Sanity: a fresh channel is writable, so the first write succeeds.
+        ByteBuffer src = ByteBuffer.wrap(new byte[]{1, 2, 3, 4});
+        assertEquals(4, l.write(src), "fresh channel is writable; first write must succeed");
+        ByteBuf first = netty.readOutbound();
+        first.release();
+
+        // Force the channel to report not writable.
+        netty.unsafe().outboundBuffer().setUserDefinedWritability(1, false);
+        assertFalse(netty.isWritable(), "user-defined writability must flip isWritable() to false");
+
+        // Backpressure kicks in: write returns 0, no directBuffer is allocated.
+        ByteBuffer src2 = ByteBuffer.wrap(new byte[]{5, 6, 7, 8});
+        int n2 = l.write(src2);
+        assertEquals(0, n2, "writes must return 0 once isWritable() is false");
+        assertEquals(4, src2.remaining(),
+            "source ByteBuffer must be left intact so the next poll's write retries the same bytes");
+        assertNull(netty.readOutbound(),
+            "no bytes must have been handed to Netty during the backpressure window");
+
+        // Flip writability back: write resumes immediately.
+        netty.unsafe().outboundBuffer().setUserDefinedWritability(1, true);
+        assertTrue(netty.isWritable(), "restoring user-defined writability flips isWritable() back true");
+        assertEquals(4, l.write(src2), "with writability restored, the same source drains in one call");
+        ByteBuf second = netty.readOutbound();
+        second.release();
     }
 
     @Test
