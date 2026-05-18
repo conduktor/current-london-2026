@@ -587,6 +587,17 @@ class KafkaApis(val requestChannel: RequestChannel,
                 // describe() returned empty between isLogicalTopic() and now — concentration
                 // declaration was concurrently revoked. Treat as the topic having disappeared.
                 nonExistingTopicResponses += topicPartition -> new PartitionResponse(Errors.UNKNOWN_TOPIC_OR_PARTITION)
+              case e: IllegalArgumentException =>
+                // LogicalProduceStamper.stamp raises IllegalArgumentException on malformed input
+                // (multi-batch MemoryRecords, null records, record/offset-count mismatch). These
+                // shouldn't reach here from stock producers — KafkaProducer always sends a single
+                // batch per (topic, partition) entry — but a hand-crafted client could trigger
+                // the throw, and unhandled it would escape the request thread with no producer
+                // response (Codex r11 BLOCKER #98). The reservation was rolled back inside the
+                // try/finally above. Surface as CORRUPT_MESSAGE so the producer sees a typed
+                // error instead of a connection-level hang.
+                warn(s"Concentration produce stamping failed for $topicPartition: ${e.getMessage}")
+                invalidRequestResponses += topicPartition -> new PartitionResponse(Errors.CORRUPT_MESSAGE)
             }
         }
       }
