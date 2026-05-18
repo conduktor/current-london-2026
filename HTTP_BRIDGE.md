@@ -52,17 +52,16 @@ server/src/test/java/org/apache/kafka/network/http/
 | Production `RequestSubmitter` | **Done** | `KafkaApiRequestSubmitter` routes HTTP through `RequestChannel` → `KafkaApis`; authorization, quotas, replication inherited from the binary path |
 | `BrokerServer` integration | **Done** | Wired behind `http.bridge.enabled` (default `false`); operator-facing WARN + runbook describe the ANONYMOUS threat model |
 | SSE live tail | **Done** | `SseStreamer` recursive long-poll; `id: <offset>` + `data:` per record; `event: error` on partition errors; real-broker test covers replay → live boundary |
-| End-to-end (real broker) | **Done** | `HttpBridgeEndToEndTest`: HTTP-produce → binary-consume round-trip, mixed-partition 207, ACL deny → 403 (with `errorCode=29`, no Retry-After), SSE replay→live |
+| End-to-end (real broker) | **Done** | `HttpBridgeEndToEndTest`: HTTP-produce → binary-consume round-trip, mixed-partition 207, ACL deny on POST → 403 (FS4 write-side), ACL deny on GET → 403 (FS4 fetch-side), SSE replay→live, HAL+JSON cursor follow across pages with offset-contiguity assertion (FS5), quota-throttle → 200 + Retry-After (FS3 / AC3) |
 | Operator security guidance | **Done** | Startup WARN names "anonymous Kafka data-plane takeover"; `HTTP_BRIDGE.md` Security model section ships the three-guardrail runbook |
 | WebSocket (stretch) | **Deferred** | Explicit stretch per `PROMPT.md` line 4; not delivered |
-| Real-broker quota test (AC3) | **Deferred** | Quota → 200 + Retry-After is unit-tested in `ProduceResponseFormatterTest`; not yet exercised against a throttled broker over the real wire |
 
-206 unit tests pass in the `server` HTTP bridge slice, plus four real-broker end-to-end tests in `core`. Full broker still compiles. Run them with:
+206 unit tests pass in the `server` HTTP bridge slice, plus seven real-broker end-to-end tests in `core`. Full broker still compiles. Run them with:
 
 ```sh
 JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 ./gradlew \
   :server:test --tests 'org.apache.kafka.network.http.*' \
-  :core:test --tests 'integration.kafka.network.http.*'
+  :core:test --tests 'kafka.network.http.HttpBridgeEndToEndTest'
 ```
 
 ---
@@ -125,11 +124,10 @@ What this buys, for free:
 
 - **Per-request authentication on the HTTP path.** Every request runs as `KafkaPrincipal.ANONYMOUS`. See the Security model section above — this is the project's largest production-readiness caveat and the operator-facing WARN + runbook are the v1 mitigation.
 - **WebSocket subscribe with credit-based flow control** (`PROMPT.md` line 4 stretch).
-- **Real-broker quota test for AC3.** Quota → 200 + `Retry-After` is unit-tested in `ProduceResponseFormatterTest` (`positiveThrottleSetsRetryAfterOn200`, `throttleOn403IsSuppressed`, etc.). The real-broker counterpart would require provisioning a quota at startup, producing enough bytes to trip it, and asserting the `Retry-After` header on the HTTP response. Feasible but not currently exercised.
 
 ### Production-readiness summary
 
-The pure layer (`server/src/main/java/org/apache/kafka/network/http/`) is exhaustively unit-tested — 206 tests covering content-type negotiation, cursor encoding/decoding, request parsing edge cases, response formatting policy, Retry-After policy, error envelope shape, and SSE framing. The broker integration is covered by four real-broker end-to-end tests in `core/src/test/scala/integration/kafka/network/http/HttpBridgeEndToEndTest.scala` that boot a KRaft cluster via `KafkaClusterTestKit`, enable the bridge, and verify produce/fetch round-trips, mixed-partition 207, ACL-denied 403, and SSE replay-then-live continuity.
+The pure layer (`server/src/main/java/org/apache/kafka/network/http/`) is exhaustively unit-tested — 206 tests covering content-type negotiation, cursor encoding/decoding, request parsing edge cases, response formatting policy, Retry-After policy, error envelope shape, and SSE framing. The broker integration is covered by seven real-broker end-to-end tests in `core/src/test/scala/integration/kafka/network/http/HttpBridgeEndToEndTest.scala` that boot a KRaft cluster via `KafkaClusterTestKit`, enable the bridge, and verify produce/fetch round-trips, mixed-partition 207, ACL-denied 403 on both POST (write) and GET (fetch) paths, SSE replay-then-live continuity, HAL+JSON cursor follow across pages with offset-contiguity assertion, and quota-throttle → 200 + `Retry-After` against a tight `producer_byte_rate` quota on `User:ANONYMOUS`.
 
 `http.bridge.enabled=true` is safe to set in any cluster where the operator has followed the Security model section above — bound interface, fronting auth proxy, scoped ACLs. The startup WARN repeats the requirement in operator logs.
 
@@ -145,9 +143,9 @@ The bridge has **no per-request authentication in v1.** Every inbound HTTP reque
 
 1. **Bind to a specific trusted interface.** Set `http.bridge.host` to loopback (`127.0.0.1`) or a specific address on an access-controlled private network. Never `0.0.0.0` on a host with a public NIC. The bridge's host config is a Jetty bind address, not a CIDR or ACL — Jetty will accept any TCP connection that lands on that interface, so the network itself must be locked down separately (security group, iptables, namespace).
 2. **Force traffic through an authenticating front-end.** A reverse proxy that terminates TLS and enforces an auth scheme (mTLS, OAuth bearer, basic-with-LDAP, etc.) before forwarding to the bridge port. The network must make it impossible to reach the bridge directly — security-group / iptables / namespace-level enforcement, not just convention.
-3. **Scope ACLs for `User:ANONYMOUS`.** Run `kafka-acls --add --allow-principal User:ANONYMOUS --operation Read --operation Write --topic <name>` for exactly the topics the bridge is meant to expose, with each operation passed as its own `--operation` flag (the CLI does not accept `Read|Write`). A default-allow authorizer, no authorizer at all, or `allow.everyone.if.no.acl.found=true` on an otherwise-empty ACL set, all leave topics open to the bridge. The end-to-end ACL deny test (`HttpBridgeEndToEndTest.aclDeniedTopicReturns403`) demonstrates the enforcement path: a denied topic produces HTTP 403 with a per-partition `errorCode=29` (`TOPIC_AUTHORIZATION_FAILED`) and no `Retry-After`.
+3. **Scope ACLs for `User:ANONYMOUS`.** Run `kafka-acls --add --allow-principal User:ANONYMOUS --operation Read --operation Write --topic <name>` for exactly the topics the bridge is meant to expose, with each operation passed as its own `--operation` flag (the CLI does not accept `Read|Write`). A default-allow authorizer, no authorizer at all, or `allow.everyone.if.no.acl.found=true` on an otherwise-empty ACL set, all leave topics open to the bridge. Two end-to-end ACL deny tests demonstrate the enforcement path against a real broker: `HttpBridgeEndToEndTest.aclDeniedTopicReturns403` covers the POST / write side (denied WRITE → HTTP 403 with per-partition `errorCode=29` `TOPIC_AUTHORIZATION_FAILED` and no `Retry-After`); `HttpBridgeEndToEndTest.aclDeniedFetchReturns403` covers the GET / read side (denied READ → HTTP 403 with the same envelope shape and no `Retry-After`).
 
-The startup WARN at `BrokerServer.scala:642` repeats the headline so it cannot be missed in operator logs. If you find yourself silencing the WARN before doing the three steps above, you are configuring the bridge wrong.
+The startup WARN at `BrokerServer.scala:656` repeats the headline so it cannot be missed in operator logs. If you find yourself silencing the WARN before doing the three steps above, you are configuring the bridge wrong.
 
 Per-request authentication (a real principal derived from a client cert, JWT, or SASL handshake on the HTTP path) is a follow-up item, explicitly out of scope for v1.
 
