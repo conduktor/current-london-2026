@@ -4630,10 +4630,33 @@ class KafkaApis(val requestChannel: RequestChannel,
     val renewerList = createTokenRequest.data.renewers.asScala.toList.map(entry =>
       new KafkaPrincipal(entry.principalType, entry.principalName))
 
+    // Identity-laundering guard. Minting a delegation token whose owner (or
+    // any renewer) is in the tenant principal namespace transfers a tenant
+    // identity: once minted, the token-bearer can present the token on the
+    // tenant's own listener and TenantPrincipalBuilder will preserve the
+    // prefix (same-tenant re-auth path, see preservesSameTenantToken-
+    // ReauthUnchanged), giving them full tenant access. The cross-listener
+    // replay is already refused inside the principal builder; this closes
+    // the mint-time side. Rule: a caller whose own principal is not within
+    // tenant T cannot mint or name a renewer in T's principal namespace.
+    val tokenCallerTenant = tenantContextFor(request).effectiveTenant
+    def belongsToCallerTenant(name: String): Boolean =
+      name != null && tokenCallerTenant.isPresent &&
+        name.startsWith(org.apache.kafka.server.tenant.TenantNamespace.PRINCIPAL_PREFIX + tokenCallerTenant.get + ".")
+    def isForeignTenantPrincipal(name: String): Boolean =
+      isReservedTenantPrincipalNamespace(name) && !belongsToCallerTenant(name)
+    val foreignTenantPrincipal =
+      isForeignTenantPrincipal(ownerPrincipalName) ||
+      renewerList.exists(p => isForeignTenantPrincipal(p.getName))
+
     if (!allowTokenRequests(request)) {
       requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
         CreateDelegationTokenResponse.prepareResponse(request.context.requestVersion, requestThrottleMs,
           Errors.DELEGATION_TOKEN_REQUEST_NOT_ALLOWED, owner, requester))
+    } else if (foreignTenantPrincipal) {
+      requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
+        CreateDelegationTokenResponse.prepareResponse(request.context.requestVersion, requestThrottleMs,
+          Errors.DELEGATION_TOKEN_AUTHORIZATION_FAILED, owner, requester))
     } else if (!owner.equals(requester) && !authHelper.authorize(request.context, CREATE_TOKENS, USER, owner.toString)) {
       requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
         CreateDelegationTokenResponse.prepareResponse(request.context.requestVersion, requestThrottleMs,

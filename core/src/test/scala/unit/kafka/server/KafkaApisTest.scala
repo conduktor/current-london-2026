@@ -16602,4 +16602,109 @@ class KafkaApisTest extends Logging {
       "non-tenant caller must not see tenant-internal transactional ids in the listing")
   }
 
+  // ---------------------------------------------------------------------------
+  // CreateDelegationToken — multi-tenancy identity-laundering guard
+  //
+  // Minting a token whose owner (or any renewer) sits inside the tenant
+  // principal namespace (`__tenant_<id>.<user>`) transfers tenant identity:
+  // once minted, the holder can present the token on the tenant's own listener
+  // and TenantPrincipalBuilder will preserve the prefix on re-auth (see
+  // TenantPrincipalBuilderTest#preservesSameTenantTokenReauthUnchanged), giving
+  // them full access in that tenant. The cross-listener replay is already
+  // refused inside the principal builder; these tests pin the mint-time side.
+  // Rule: a caller whose own principal is not within tenant T cannot mint a
+  // token whose owner OR a renewer is in T's principal namespace.
+  // ---------------------------------------------------------------------------
+
+  @Test
+  def testCreateDelegationTokenClusterWideCallerRefusesTenantPrefixedOwner(): Unit = {
+    val createRequest = new CreateDelegationTokenRequest.Builder(
+      new CreateDelegationTokenRequestData()
+        .setOwnerPrincipalType(KafkaPrincipal.USER_TYPE)
+        .setOwnerPrincipalName("__tenant_acme.alice")).build()
+    val request = buildRequest(
+      createRequest,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleCreateTokenRequest(request)
+
+    val response = verifyNoThrottling[CreateDelegationTokenResponse](request)
+    assertEquals(Errors.DELEGATION_TOKEN_AUTHORIZATION_FAILED.code, response.data.errorCode,
+      "minting a token whose owner is in a tenant principal namespace must be refused for a non-tenant caller")
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
+  def testCreateDelegationTokenClusterWideCallerKeepsRegularOwnerForwarded(): Unit = {
+    // Control: non-tenant caller minting for an ordinary principal must still
+    // be forwarded — the guard targets the tenant namespace only.
+    val createRequest = new CreateDelegationTokenRequest.Builder(
+      new CreateDelegationTokenRequestData()
+        .setOwnerPrincipalType(KafkaPrincipal.USER_TYPE)
+        .setOwnerPrincipalName("regular-user")).build()
+    val request = buildRequest(
+      createRequest,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "regular-user"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleCreateTokenRequest(request)
+
+    verify(forwardingManager).forwardRequest(
+      ArgumentMatchers.eq(request),
+      any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
+  def testCreateDelegationTokenSameTenantCallerMintsForOwnPrincipalForwarded(): Unit = {
+    // Legitimate path: tenant principal mints a token for itself on its own
+    // listener. The owner matches the caller's effective tenant, so the guard
+    // must let it through.
+    val createRequest = new CreateDelegationTokenRequest.Builder(
+      new CreateDelegationTokenRequestData()
+        .setOwnerPrincipalType(KafkaPrincipal.USER_TYPE)
+        .setOwnerPrincipalName("__tenant_acme.alice")).build()
+    val request = buildRequest(
+      createRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleCreateTokenRequest(request)
+
+    verify(forwardingManager).forwardRequest(
+      ArgumentMatchers.eq(request),
+      any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
+  def testCreateDelegationTokenClusterWideCallerRefusesTenantPrefixedRenewer(): Unit = {
+    // The renewer side of the guard: a non-tenant caller cannot register a
+    // renewer inside a tenant's principal namespace even if the owner looks
+    // ordinary — otherwise the renewer would be able to extend a token whose
+    // owner-side guard the broker assumes is also enforced.
+    val renewers = new util.ArrayList[CreateDelegationTokenRequestData.CreatableRenewers]()
+    renewers.add(new CreateDelegationTokenRequestData.CreatableRenewers()
+      .setPrincipalType(KafkaPrincipal.USER_TYPE)
+      .setPrincipalName("__tenant_acme.bob"))
+    val createRequest = new CreateDelegationTokenRequest.Builder(
+      new CreateDelegationTokenRequestData()
+        .setOwnerPrincipalType(KafkaPrincipal.USER_TYPE)
+        .setOwnerPrincipalName("regular-user")
+        .setRenewers(renewers)).build()
+    val request = buildRequest(
+      createRequest,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleCreateTokenRequest(request)
+
+    val response = verifyNoThrottling[CreateDelegationTokenResponse](request)
+    assertEquals(Errors.DELEGATION_TOKEN_AUTHORIZATION_FAILED.code, response.data.errorCode,
+      "a non-tenant caller cannot register a renewer inside a tenant principal namespace")
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[Option[AbstractResponse] => Unit]())
+  }
+
 }
