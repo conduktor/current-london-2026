@@ -506,13 +506,32 @@ class KafkaApis(val requestChannel: RequestChannel,
                   } else {
                     val reservations = concentrationKernel.reserveProduceBatch(
                       topicPartition.topic, topicPartition.partition, k)
-                    val logicalOffsets = new Array[Long](reservations.length)
-                    var i = 0
-                    while (i < reservations.length) { logicalOffsets(i) = reservations(i).logicalOffset; i += 1 }
-                    val stamped = LogicalProduceStamper.stamp(
-                      memoryRecords, topicPartition.topic, topicPartition.partition, logicalOffsets)
-                    authorizedRequestInfo += (backingTp -> stamped)
-                    logicalByBacking += (backingTp -> (topicPartition, reservations, idempotentKey))
+                    // Audit H1: reserveProduceBatch acquires the per-partition reservation lock.
+                    // It is released only by commitProduceBatch or rollbackProduceBatch. The
+                    // window between here and storing into logicalByBacking is non-trivial
+                    // (header rewriting + buffer allocation), and LogicalProduceStamper.stamp
+                    // throws IllegalArgumentException on malformed records — a RuntimeException
+                    // that escapes the surrounding ApiException catch. Without this try/finally
+                    // a single bad batch would strand the lock forever, gating every subsequent
+                    // produce to the same logical partition.
+                    var stored = false
+                    try {
+                      val logicalOffsets = new Array[Long](reservations.length)
+                      var i = 0
+                      while (i < reservations.length) { logicalOffsets(i) = reservations(i).logicalOffset; i += 1 }
+                      val stamped = LogicalProduceStamper.stamp(
+                        memoryRecords, topicPartition.topic, topicPartition.partition, logicalOffsets)
+                      authorizedRequestInfo += (backingTp -> stamped)
+                      logicalByBacking += (backingTp -> (topicPartition, reservations, idempotentKey))
+                      stored = true
+                    } finally {
+                      if (!stored) {
+                        try concentrationKernel.rollbackProduceBatch(reservations)
+                        catch { case rbe: Throwable =>
+                          warn(s"Concentration rollback failed after stamp error for $topicPartition", rbe)
+                        }
+                      }
+                    }
                   }
                 }
               }
@@ -691,17 +710,36 @@ class KafkaApis(val requestChannel: RequestChannel,
     else {
       val internalTopicsAllowed = request.header.clientId == AdminUtils.ADMIN_CLIENT_ID
       val transactionSupportedOperation = AddPartitionsToTxnManager.produceRequestVersionToTransactionSupportedOperation(request.header.apiVersion())
-      // call the replica manager to append messages to the replicas
-      replicaManager.handleProduceAppend(
-        timeout = produceRequest.timeout.toLong,
-        requiredAcks = produceRequest.acks,
-        internalTopicsAllowed = internalTopicsAllowed,
-        transactionalId = produceRequest.transactionalId,
-        entriesPerPartition = authorizedRequestInfo,
-        responseCallback = sendResponseCallback,
-        recordValidationStatsCallback = processingStatsCallback,
-        requestLocal = requestLocal,
-        transactionSupportedOperation = transactionSupportedOperation)
+      // Audit H1 (defensive): handleProduceAppend normally invokes responseCallback (which is
+      // sendResponseCallback above and is where concentration commit/rollback happens). If it
+      // throws *synchronously* before reaching the callback, every reservation in
+      // logicalByBacking is stranded — its lock held forever and its logical offset slot
+      // unusable. Rollback explicitly on synchronous throw so the broker stays operable on
+      // partial failure (e.g. RequestLocal exhausted, replica manager mid-shutdown). The
+      // exception is rethrown so the request-handler surfaces the failure the same way it
+      // does for stock topics.
+      try {
+        // call the replica manager to append messages to the replicas
+        replicaManager.handleProduceAppend(
+          timeout = produceRequest.timeout.toLong,
+          requiredAcks = produceRequest.acks,
+          internalTopicsAllowed = internalTopicsAllowed,
+          transactionalId = produceRequest.transactionalId,
+          entriesPerPartition = authorizedRequestInfo,
+          responseCallback = sendResponseCallback,
+          recordValidationStatsCallback = processingStatsCallback,
+          requestLocal = requestLocal,
+          transactionSupportedOperation = transactionSupportedOperation)
+      } catch {
+        case t: Throwable =>
+          logicalByBacking.foreach { case (_, (logicalTp, reservations, _)) =>
+            try concentrationKernel.rollbackProduceBatch(reservations)
+            catch { case rbe: Throwable =>
+              warn(s"Concentration rollback failed after handleProduceAppend threw for $logicalTp", rbe)
+            }
+          }
+          throw t
+      }
 
       // if the request is put into the purgatory, it will have a held reference and hence cannot be garbage collected;
       // hence we clear its data here in order to let GC reclaim its memory since it is already appended to log
