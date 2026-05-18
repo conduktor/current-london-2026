@@ -58,7 +58,7 @@ import org.apache.kafka.common.resource.{Resource, ResourceType}
 import org.apache.kafka.common.security.auth.{KafkaPrincipal, SecurityProtocol}
 import org.apache.kafka.common.security.token.delegation.{DelegationToken, TokenInformation}
 import org.apache.kafka.common.utils.{ProducerIdAndEpoch, Time}
-import org.apache.kafka.common.{Node, TopicIdPartition, TopicPartition, Uuid}
+import org.apache.kafka.common.{ElectionType, Node, TopicIdPartition, TopicPartition, Uuid}
 import org.apache.kafka.coordinator.group.{Group, GroupCoordinator}
 import org.apache.kafka.coordinator.share.ShareCoordinator
 import org.apache.kafka.server.ClientMetricsManager
@@ -757,7 +757,7 @@ class KafkaApis(val requestChannel: RequestChannel,
         case ApiKeys.ALTER_REPLICA_LOG_DIRS => handleAlterReplicaLogDirsRequest(request)
         case ApiKeys.DESCRIBE_LOG_DIRS => handleDescribeLogDirsRequest(request)
         case ApiKeys.SASL_AUTHENTICATE => handleSaslAuthenticateRequest(request)
-        case ApiKeys.CREATE_PARTITIONS => forwardToController(request)
+        case ApiKeys.CREATE_PARTITIONS => handleCreatePartitionsRequest(request)
         // Create, renew and expire DelegationTokens must first validate that the connection
         // itself is not authenticated with a delegation token before maybeForwardToController.
         case ApiKeys.CREATE_DELEGATION_TOKEN => handleCreateTokenRequest(request)
@@ -765,9 +765,9 @@ class KafkaApis(val requestChannel: RequestChannel,
         case ApiKeys.EXPIRE_DELEGATION_TOKEN => handleExpireTokenRequest(request)
         case ApiKeys.DESCRIBE_DELEGATION_TOKEN => handleDescribeTokensRequest(request)
         case ApiKeys.DELETE_GROUPS => handleDeleteGroupsRequest(request, requestLocal).exceptionally(handleError)
-        case ApiKeys.ELECT_LEADERS => forwardToController(request)
+        case ApiKeys.ELECT_LEADERS => handleElectLeadersRequest(request)
         case ApiKeys.INCREMENTAL_ALTER_CONFIGS => handleIncrementalAlterConfigsRequest(request)
-        case ApiKeys.ALTER_PARTITION_REASSIGNMENTS => forwardToController(request)
+        case ApiKeys.ALTER_PARTITION_REASSIGNMENTS => handleAlterPartitionReassignmentsRequest(request)
         case ApiKeys.LIST_PARTITION_REASSIGNMENTS => forwardToController(request)
         case ApiKeys.OFFSET_DELETE => handleOffsetDeleteRequest(request, requestLocal).exceptionally(handleError)
         case ApiKeys.DESCRIBE_CLIENT_QUOTAS => handleDescribeClientQuotasRequest(request)
@@ -3936,6 +3936,187 @@ class KafkaApis(val requestChannel: RequestChannel,
       forwardingManager.forwardRequest(request,
         new IncrementalAlterConfigsRequest(remaining, request.header.apiVersion()),
         response => sendResponse(response.map(_.data())))
+    }
+  }
+
+  // CREATE_PARTITIONS — non-tenant outside-in guard. A cluster-wide admin
+  // asking for `acme.foo` to grow from 3 to 30 partitions would silently
+  // reshape a tenant's storage, breaking key-to-partition mappings (and the
+  // consumer-group / transactional-id sharding that depends on them). Tenant
+  // principals never reach here (CREATE_PARTITIONS is outside TENANT_ALLOWED_APIS);
+  // the guard is for cluster-wide callers naming a known tenant namespace.
+  // Mirrors handleAlterConfigsRequest split-and-merge.
+  def handleCreatePartitionsRequest(request: RequestChannel.Request): Unit = {
+    val original = request.body[CreatePartitionsRequest]
+    val pollutionRejected = new util.ArrayList[CreatePartitionsResponseData.CreatePartitionsTopicResult]()
+    val data = original.data()
+    if (!tenantContextFor(request).effectiveTenant.isPresent) {
+      val keep = new CreatePartitionsRequestData.CreatePartitionsTopicCollection(data.topics().size)
+      data.topics().forEach { t =>
+        if (isReservedTenantNamespace(t.name())) {
+          pollutionRejected.add(new CreatePartitionsResponseData.CreatePartitionsTopicResult()
+            .setName(t.name())
+            .setErrorCode(Errors.INVALID_TOPIC_EXCEPTION.code)
+            .setErrorMessage("Topic name '" + t.name() + "' is reserved (tenant namespace prefix)"))
+        } else {
+          keep.add(t.duplicate())
+        }
+      }
+      if (!pollutionRejected.isEmpty) {
+        data.setTopics(keep)
+      }
+    }
+
+    def sendResponse(secondPart: Option[ApiMessage]): Unit = {
+      secondPart match {
+        case Some(result: CreatePartitionsResponseData) =>
+          if (!pollutionRejected.isEmpty) {
+            val merged = new util.ArrayList[CreatePartitionsResponseData.CreatePartitionsTopicResult](
+              result.results.size + pollutionRejected.size)
+            merged.addAll(result.results)
+            merged.addAll(pollutionRejected)
+            result.setResults(merged)
+          }
+          requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
+            new CreatePartitionsResponse(result.setThrottleTimeMs(requestThrottleMs)))
+        case _ => handleInvalidVersionsDuringForwarding(request)
+      }
+    }
+    if (data.topics().isEmpty) {
+      sendResponse(Some(new CreatePartitionsResponseData()))
+    } else {
+      forwardingManager.forwardRequest(request,
+        new CreatePartitionsRequest.Builder(data).build(request.header.apiVersion()),
+        response => sendResponse(response.map(_.asInstanceOf[CreatePartitionsResponse].data())))
+    }
+  }
+
+  // ELECT_LEADERS — non-tenant outside-in guard. A cluster-wide admin naming
+  // `acme.orders-0` could force an unclean leader election on a tenant
+  // partition. A null topicPartitions list means "elect for all eligible" — a
+  // cluster-wide sweep that legitimately affects every topic and is NOT a
+  // naming attack; we let that through (the cluster admin already has ALTER
+  // on CLUSTER). Only explicit naming of a reserved namespace is refused.
+  def handleElectLeadersRequest(request: RequestChannel.Request): Unit = {
+    val original = request.body[ElectLeadersRequest]
+    val data = original.data()
+    val pollutionRejected = new util.ArrayList[ElectLeadersResponseData.ReplicaElectionResult]()
+    if (!tenantContextFor(request).effectiveTenant.isPresent && data.topicPartitions() != null) {
+      val keep = new ElectLeadersRequestData.TopicPartitionsCollection(data.topicPartitions().size)
+      data.topicPartitions().forEach { tp =>
+        if (isReservedTenantNamespace(tp.topic())) {
+          val partitionResults = new util.ArrayList[ElectLeadersResponseData.PartitionResult](tp.partitions().size)
+          tp.partitions().forEach { p =>
+            partitionResults.add(new ElectLeadersResponseData.PartitionResult()
+              .setPartitionId(p)
+              .setErrorCode(Errors.INVALID_TOPIC_EXCEPTION.code)
+              .setErrorMessage("Topic name '" + tp.topic() + "' is reserved (tenant namespace prefix)"))
+          }
+          pollutionRejected.add(new ElectLeadersResponseData.ReplicaElectionResult()
+            .setTopic(tp.topic())
+            .setPartitionResult(partitionResults))
+        } else {
+          keep.add(tp.duplicate())
+        }
+      }
+      if (!pollutionRejected.isEmpty) {
+        data.setTopicPartitions(keep)
+      }
+    }
+
+    def sendResponse(secondPart: Option[ApiMessage]): Unit = {
+      secondPart match {
+        case Some(result: ElectLeadersResponseData) =>
+          if (!pollutionRejected.isEmpty) {
+            val merged = new util.ArrayList[ElectLeadersResponseData.ReplicaElectionResult](
+              result.replicaElectionResults.size + pollutionRejected.size)
+            merged.addAll(result.replicaElectionResults)
+            merged.addAll(pollutionRejected)
+            result.setReplicaElectionResults(merged)
+          }
+          requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
+            new ElectLeadersResponse(result.setThrottleTimeMs(requestThrottleMs)))
+        case _ => handleInvalidVersionsDuringForwarding(request)
+      }
+    }
+    // After filtering, an originally non-null list that became empty means
+    // *every* requested topic was reserved. Don't degrade into a null-sweep
+    // (which would elect leaders for the entire cluster including the tenant
+    // topics we just refused) — return only the rejections.
+    val onlyReservedNamed = !pollutionRejected.isEmpty && data.topicPartitions() != null && data.topicPartitions().isEmpty
+    if (onlyReservedNamed) {
+      sendResponse(Some(new ElectLeadersResponseData()))
+    } else {
+      // ElectLeadersRequest.Builder takes a flat Collection<TopicPartition>; flatten
+      // the kept entries (or pass null straight through for a sweep).
+      val flat: util.Collection[TopicPartition] = if (data.topicPartitions() == null) null else {
+        val out = new util.ArrayList[TopicPartition]()
+        data.topicPartitions().forEach { tp =>
+          tp.partitions().forEach { p => out.add(new TopicPartition(tp.topic(), p)) }
+        }
+        out
+      }
+      forwardingManager.forwardRequest(request,
+        new ElectLeadersRequest.Builder(
+          ElectionType.valueOf(data.electionType()), flat, data.timeoutMs())
+          .build(request.header.apiVersion()),
+        response => sendResponse(response.map(_.asInstanceOf[ElectLeadersResponse].data())))
+    }
+  }
+
+  // ALTER_PARTITION_REASSIGNMENTS — non-tenant outside-in guard. A cluster-wide
+  // admin naming `acme.orders` could rewire replica placement on tenant
+  // partitions or, by passing null replicas, silently CANCEL the tenant's
+  // existing reassignments. Both are refused (the null-replicas "cancel" path
+  // travels in the same partitions list — we don't need a special branch).
+  def handleAlterPartitionReassignmentsRequest(request: RequestChannel.Request): Unit = {
+    val original = request.body[AlterPartitionReassignmentsRequest]
+    val data = original.data()
+    val pollutionRejected = new util.ArrayList[AlterPartitionReassignmentsResponseData.ReassignableTopicResponse]()
+    if (!tenantContextFor(request).effectiveTenant.isPresent) {
+      val keep = new util.ArrayList[AlterPartitionReassignmentsRequestData.ReassignableTopic](data.topics().size)
+      data.topics().forEach { t =>
+        if (isReservedTenantNamespace(t.name())) {
+          val partResults = new util.ArrayList[AlterPartitionReassignmentsResponseData.ReassignablePartitionResponse](t.partitions().size)
+          t.partitions().forEach { p =>
+            partResults.add(new AlterPartitionReassignmentsResponseData.ReassignablePartitionResponse()
+              .setPartitionIndex(p.partitionIndex())
+              .setErrorCode(Errors.INVALID_TOPIC_EXCEPTION.code)
+              .setErrorMessage("Topic name '" + t.name() + "' is reserved (tenant namespace prefix)"))
+          }
+          pollutionRejected.add(new AlterPartitionReassignmentsResponseData.ReassignableTopicResponse()
+            .setName(t.name())
+            .setPartitions(partResults))
+        } else {
+          keep.add(t)
+        }
+      }
+      if (!pollutionRejected.isEmpty) {
+        data.setTopics(keep)
+      }
+    }
+
+    def sendResponse(secondPart: Option[ApiMessage]): Unit = {
+      secondPart match {
+        case Some(result: AlterPartitionReassignmentsResponseData) =>
+          if (!pollutionRejected.isEmpty) {
+            val merged = new util.ArrayList[AlterPartitionReassignmentsResponseData.ReassignableTopicResponse](
+              result.responses.size + pollutionRejected.size)
+            merged.addAll(result.responses)
+            merged.addAll(pollutionRejected)
+            result.setResponses(merged)
+          }
+          requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
+            new AlterPartitionReassignmentsResponse(result.setThrottleTimeMs(requestThrottleMs)))
+        case _ => handleInvalidVersionsDuringForwarding(request)
+      }
+    }
+    if (data.topics().isEmpty) {
+      sendResponse(Some(new AlterPartitionReassignmentsResponseData()))
+    } else {
+      forwardingManager.forwardRequest(request,
+        new AlterPartitionReassignmentsRequest.Builder(data).build(request.header.apiVersion()),
+        response => sendResponse(response.map(_.asInstanceOf[AlterPartitionReassignmentsResponse].data())))
     }
   }
 

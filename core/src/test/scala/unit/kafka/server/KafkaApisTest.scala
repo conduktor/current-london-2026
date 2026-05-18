@@ -291,9 +291,22 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
-  def testElectLeadersForwarding(): Unit = {
+  def testElectLeadersSweepForwarded(): Unit = {
+    // ElectLeaders with null topicPartitions is the cluster-wide "elect for all
+    // eligible" sweep. The outside-in pollution guard does NOT block sweeps
+    // (the threat is explicit naming of a reserved namespace, not the inherent
+    // reality that cluster admins can affect everything). Verify that the
+    // request is still forwarded to the controller.
     val requestBuilder = new ElectLeadersRequest.Builder(ElectionType.PREFERRED, null, 30000)
-    testKraftForwarding(ApiKeys.ELECT_LEADERS, requestBuilder)
+    val header = new RequestHeader(ApiKeys.ELECT_LEADERS, ApiKeys.ELECT_LEADERS.latestVersion, clientId, 0)
+    val request = buildRequest(requestBuilder.build(header.apiVersion), requestHeader = Option(header))
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleElectLeadersRequest(request)
+    verify(forwardingManager, times(1)).forwardRequest(
+      any[RequestChannel.Request](),
+      any[AbstractRequest](),
+      any[Option[AbstractResponse] => Unit]())
   }
 
   @Test
@@ -490,18 +503,6 @@ class KafkaApisTest extends Logging {
     kafkaApis = createKafkaApis()
     testForwardableApi(kafkaApis = kafkaApis,
       ApiKeys.DESCRIBE_QUORUM,
-      requestBuilder
-    )
-  }
-
-  private def testKraftForwarding(
-    apiKey: ApiKeys,
-    requestBuilder: AbstractRequest.Builder[_ <: AbstractRequest]
-  ): Unit = {
-    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
-    kafkaApis = createKafkaApis()
-    testForwardableApi(kafkaApis = kafkaApis,
-      apiKey,
       requestBuilder
     )
   }
@@ -12651,6 +12652,228 @@ class KafkaApisTest extends Logging {
     val byName = response.data.responses.asScala.map(r => r.resourceName -> r.errorCode).toMap
     assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, byName("acme.foo"))
     assertEquals(Errors.NONE.code, byName("plain-topic"))
+  }
+
+  @Test
+  def testCreatePartitionsClusterWideListenerRejectsTenantPrefixedTopic(): Unit = {
+    // Outside-in: a cluster-wide super-user could otherwise grow `acme.orders`
+    // from 3 to 30 partitions, breaking the tenant's key-to-partition mapping
+    // (and the consumer-group/transactional-id sharding that depends on it).
+    // Refuse with INVALID_TOPIC_EXCEPTION before forwarding.
+    val topic = new CreatePartitionsRequestData.CreatePartitionsTopic()
+      .setName("acme.orders").setCount(30)
+    val data = new CreatePartitionsRequestData()
+      .setTimeoutMs(5000)
+    data.topics().add(topic)
+    val createReq = new CreatePartitionsRequest.Builder(data).build()
+    val request = buildRequest(createReq)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleCreatePartitionsRequest(request)
+
+    val response = verifyNoThrottling[CreatePartitionsResponse](request)
+    val byName = response.data.results.asScala.map(r => r.name -> r).toMap
+    assertEquals(1, byName.size, "single topic in / single result out")
+    val rejected = byName("acme.orders")
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, rejected.errorCode,
+      "tenant-prefixed topic must be refused on cluster-wide listener")
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[AbstractRequest](), any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
+  def testCreatePartitionsClusterWideListenerMixesAllowedAndRejectedEntries(): Unit = {
+    val polluting = new CreatePartitionsRequestData.CreatePartitionsTopic()
+      .setName("acme.orders").setCount(30)
+    val neutral = new CreatePartitionsRequestData.CreatePartitionsTopic()
+      .setName("plain-topic").setCount(6)
+    val data = new CreatePartitionsRequestData().setTimeoutMs(5000)
+    data.topics().add(polluting)
+    data.topics().add(neutral)
+    val createReq = new CreatePartitionsRequest.Builder(data).build()
+    val request = buildRequest(createReq)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleCreatePartitionsRequest(request)
+
+    val bodyCaptor: ArgumentCaptor[AbstractRequest] = ArgumentCaptor.forClass(classOf[AbstractRequest])
+    val callbackCaptor: ArgumentCaptor[Option[AbstractResponse] => Unit] =
+      ArgumentCaptor.forClass(classOf[Option[AbstractResponse] => Unit])
+    verify(forwardingManager).forwardRequest(
+      ArgumentMatchers.eq(request), bodyCaptor.capture(), callbackCaptor.capture())
+    val forwarded = bodyCaptor.getValue.asInstanceOf[CreatePartitionsRequest]
+    val forwardedNames = forwarded.data.topics.asScala.map(_.name).toSet
+    assertEquals(Set("plain-topic"), forwardedNames,
+      "only the non-polluting entry must reach the controller")
+
+    val controllerResponse = new CreatePartitionsResponseData()
+      .setResults(asList(new CreatePartitionsResponseData.CreatePartitionsTopicResult()
+        .setName("plain-topic").setErrorCode(Errors.NONE.code)))
+    callbackCaptor.getValue.apply(Some(new CreatePartitionsResponse(controllerResponse)))
+
+    val response = verifyNoThrottling[CreatePartitionsResponse](request)
+    val byName = response.data.results.asScala.map(r => r.name -> r.errorCode).toMap
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, byName("acme.orders"))
+    assertEquals(Errors.NONE.code, byName("plain-topic"))
+  }
+
+  @Test
+  def testElectLeadersClusterWideListenerRejectsTenantPrefixedTopic(): Unit = {
+    // A cluster-wide admin naming `acme.orders` would force an unclean leader
+    // election on a tenant partition. Refuse with INVALID_TOPIC_EXCEPTION
+    // per partition, do not forward to controller.
+    val builder = new ElectLeadersRequest.Builder(
+      ElectionType.PREFERRED,
+      util.Arrays.asList(new TopicPartition("acme.orders", 0), new TopicPartition("acme.orders", 1)),
+      30000)
+    val request = buildRequest(builder.build())
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleElectLeadersRequest(request)
+
+    val response = verifyNoThrottling[ElectLeadersResponse](request)
+    assertEquals(1, response.data.replicaElectionResults.size, "single topic in / single result group")
+    val res = response.data.replicaElectionResults.asScala.head
+    assertEquals("acme.orders", res.topic)
+    val byPart = res.partitionResult.asScala.map(p => p.partitionId -> p.errorCode).toMap
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, byPart(0))
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, byPart(1))
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[AbstractRequest](), any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
+  def testElectLeadersClusterWideListenerMixesAllowedAndRejectedEntries(): Unit = {
+    val builder = new ElectLeadersRequest.Builder(
+      ElectionType.PREFERRED,
+      util.Arrays.asList(new TopicPartition("acme.orders", 0), new TopicPartition("plain-topic", 0)),
+      30000)
+    val request = buildRequest(builder.build())
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleElectLeadersRequest(request)
+
+    val bodyCaptor: ArgumentCaptor[AbstractRequest] = ArgumentCaptor.forClass(classOf[AbstractRequest])
+    val callbackCaptor: ArgumentCaptor[Option[AbstractResponse] => Unit] =
+      ArgumentCaptor.forClass(classOf[Option[AbstractResponse] => Unit])
+    verify(forwardingManager).forwardRequest(
+      ArgumentMatchers.eq(request), bodyCaptor.capture(), callbackCaptor.capture())
+    val forwarded = bodyCaptor.getValue.asInstanceOf[ElectLeadersRequest]
+    val forwardedTopics = forwarded.data.topicPartitions.asScala.map(_.topic).toSet
+    assertEquals(Set("plain-topic"), forwardedTopics,
+      "only the non-polluting topic must reach the controller")
+
+    val controllerResponse = new ElectLeadersResponseData()
+      .setReplicaElectionResults(asList(new ElectLeadersResponseData.ReplicaElectionResult()
+        .setTopic("plain-topic")
+        .setPartitionResult(asList(new ElectLeadersResponseData.PartitionResult()
+          .setPartitionId(0).setErrorCode(Errors.NONE.code)))))
+    callbackCaptor.getValue.apply(Some(new ElectLeadersResponse(controllerResponse)))
+
+    val response = verifyNoThrottling[ElectLeadersResponse](request)
+    val byTopic = response.data.replicaElectionResults.asScala.map(r => r.topic -> r).toMap
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code,
+      byTopic("acme.orders").partitionResult.asScala.head.errorCode)
+    assertEquals(Errors.NONE.code,
+      byTopic("plain-topic").partitionResult.asScala.head.errorCode)
+  }
+
+  @Test
+  def testAlterPartitionReassignmentsClusterWideListenerRejectsTenantPrefixedTopic(): Unit = {
+    // A cluster-wide admin naming `acme.orders` could rewire replica placement
+    // OR — by passing null replicas — silently cancel the tenant's existing
+    // reassignments. Both vectors are refused at the broker.
+    val topic = new AlterPartitionReassignmentsRequestData.ReassignableTopic().setName("acme.orders")
+    topic.partitions().add(new AlterPartitionReassignmentsRequestData.ReassignablePartition()
+      .setPartitionIndex(0).setReplicas(null)) // null replicas = cancel reassignment
+    val data = new AlterPartitionReassignmentsRequestData().setTimeoutMs(5000)
+    data.topics().add(topic)
+    val req = new AlterPartitionReassignmentsRequest.Builder(data).build()
+    val request = buildRequest(req)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleAlterPartitionReassignmentsRequest(request)
+
+    val response = verifyNoThrottling[AlterPartitionReassignmentsResponse](request)
+    val byName = response.data.responses.asScala.map(r => r.name -> r).toMap
+    val rejected = byName("acme.orders")
+    val parts = rejected.partitions.asScala.map(p => p.partitionIndex -> p.errorCode).toMap
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, parts(0),
+      "tenant-prefixed topic must be refused on cluster-wide listener (cancel-reassignment vector)")
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[AbstractRequest](), any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
+  def testAlterPartitionReassignmentsClusterWideListenerMixesAllowedAndRejectedEntries(): Unit = {
+    val polluting = new AlterPartitionReassignmentsRequestData.ReassignableTopic().setName("acme.orders")
+    polluting.partitions().add(new AlterPartitionReassignmentsRequestData.ReassignablePartition()
+      .setPartitionIndex(0).setReplicas(util.Arrays.asList(1, 2)))
+    val neutral = new AlterPartitionReassignmentsRequestData.ReassignableTopic().setName("plain-topic")
+    neutral.partitions().add(new AlterPartitionReassignmentsRequestData.ReassignablePartition()
+      .setPartitionIndex(0).setReplicas(util.Arrays.asList(1, 2)))
+    val data = new AlterPartitionReassignmentsRequestData().setTimeoutMs(5000)
+    data.topics().add(polluting)
+    data.topics().add(neutral)
+    val req = new AlterPartitionReassignmentsRequest.Builder(data).build()
+    val request = buildRequest(req)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleAlterPartitionReassignmentsRequest(request)
+
+    val bodyCaptor: ArgumentCaptor[AbstractRequest] = ArgumentCaptor.forClass(classOf[AbstractRequest])
+    val callbackCaptor: ArgumentCaptor[Option[AbstractResponse] => Unit] =
+      ArgumentCaptor.forClass(classOf[Option[AbstractResponse] => Unit])
+    verify(forwardingManager).forwardRequest(
+      ArgumentMatchers.eq(request), bodyCaptor.capture(), callbackCaptor.capture())
+    val forwarded = bodyCaptor.getValue.asInstanceOf[AlterPartitionReassignmentsRequest]
+    val forwardedNames = forwarded.data.topics.asScala.map(_.name).toSet
+    assertEquals(Set("plain-topic"), forwardedNames,
+      "only the non-polluting topic must reach the controller")
+
+    val controllerResponse = new AlterPartitionReassignmentsResponseData()
+      .setResponses(asList(new AlterPartitionReassignmentsResponseData.ReassignableTopicResponse()
+        .setName("plain-topic")
+        .setPartitions(asList(new AlterPartitionReassignmentsResponseData.ReassignablePartitionResponse()
+          .setPartitionIndex(0).setErrorCode(Errors.NONE.code)))))
+    callbackCaptor.getValue.apply(Some(new AlterPartitionReassignmentsResponse(controllerResponse)))
+
+    val response = verifyNoThrottling[AlterPartitionReassignmentsResponse](request)
+    val byName = response.data.responses.asScala.map(r => r.name -> r).toMap
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code,
+      byName("acme.orders").partitions.asScala.head.errorCode)
+    assertEquals(Errors.NONE.code,
+      byName("plain-topic").partitions.asScala.head.errorCode)
+  }
+
+  @Test
+  def testCreatePartitionsTenantListenerForwardsUnchanged(): Unit = {
+    // Tenant principals never reach handleCreatePartitionsRequest in production
+    // (CREATE_PARTITIONS is outside TENANT_ALLOWED_APIS — refused at dispatch).
+    // The handler's `!effectiveTenant.isPresent` branch is the guard: a tenant
+    // context skips the filter entirely, leaving the request to forward as-is.
+    val topic = new CreatePartitionsRequestData.CreatePartitionsTopic()
+      .setName("acme.orders").setCount(30)
+    val data = new CreatePartitionsRequestData().setTimeoutMs(5000)
+    data.topics().add(topic)
+    val createReq = new CreatePartitionsRequest.Builder(data).build()
+    val request = buildRequest(
+      createReq,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleCreatePartitionsRequest(request)
+
+    verify(forwardingManager, times(1)).forwardRequest(any[RequestChannel.Request](),
+      any[AbstractRequest](), any[Option[AbstractResponse] => Unit]())
   }
 
   @Test
