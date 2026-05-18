@@ -16,36 +16,38 @@ historical NIO selector for any listener that cannot use io_uring.
 
 ## What is in place today
 
-| Class                       | Responsibility                                                                                   | Status          |
-|-----------------------------|--------------------------------------------------------------------------------------------------|-----------------|
-| `SelectorImplementation`    | Enum + lenient parser for the operator-facing config value.                                      | Done (tested).  |
-| `IoUringSupport`            | Reflective platform probe; loads on any JVM. Reports `isLinux`, `isAvailable`, and a reason.     | Done (tested).  |
-| `BrokerSelector`            | Internal interface extending `org.apache.kafka.common.network.Selectable` + 7 broker methods.    | Done.           |
-| `NioBrokerSelector`         | Pure pass-through adapter over the historical `Selector`. Anchors the NIO baseline.              | Done (tested).  |
-| `BrokerSelectorFactory`     | Pure decision function: `(requested, protocol, available) → effective implementation`.           | Done (tested).  |
-| `socket.selector.implementation` | Broker config knob, default `auto`. Registered in `SocketServerConfigs.CONFIG_DEF`.          | Done.           |
+| Class                            | Responsibility                                                                                                                                                                                              | Status         |
+|----------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|----------------|
+| `SelectorImplementation`         | Enum + lenient parser for the operator-facing config value.                                                                                                                                                 | Done (tested). |
+| `IoUringSupport`                 | Reflective platform probe; loads on any JVM. Reports `isLinux`, `isAvailable`, and a reason.                                                                                                                | Done (tested). |
+| `BrokerSelector`                 | Internal interface extending `org.apache.kafka.common.network.Selectable` + 7 broker methods.                                                                                                               | Done.          |
+| `NioBrokerSelector`              | Pure pass-through adapter over the historical `Selector`. Anchors the NIO baseline.                                                                                                                         | Done (tested). |
+| `BrokerSelectorFactory`          | Pure decision function: `(requested, protocol, available) → effective implementation`.                                                                                                                      | Done (tested). |
+| `socket.selector.implementation` | Broker config knob, default `auto`. Registered in `SocketServerConfigs.CONFIG_DEF` and exposed on `KafkaConfig` as `socketSelectorImplementation: SelectorImplementation`.                                  | Done.          |
+| `IoUringSelector`                | Channel-management core: bind, accept queue, completed receives/sends, idle expiry, mute/unmute via `KafkaChannelMuteBridge`, closingChannels lifecycle aligned with NIO (FIN drain, eviction notification). | Done (tested). |
+| `IoUringServerListener`          | Netty `ServerBootstrap` over `IoUringServerSocketChannel` with `SO_REUSEPORT`, `TCP_NODELAY`, `SO_KEEPALIVE`, operator-tunable `SO_SNDBUF` / `SO_RCVBUF` matching the NIO Acceptor.                          | Done (tested). |
+| `IoUringTransportLayer`          | Bridges `KafkaChannel` to a Netty `IoUringSocketChannel`: bounded inbound queue (releases on close), backpressure via Netty `autoRead`, async write failures relayed as `IOException` on the next `write`.  | Done (tested). |
+| `IoUringPlaintextAuthenticator`  | PLAINTEXT authenticator returning `KafkaPrincipal.ANONYMOUS` via the configured principal builder; matches NIO behavior.                                                                                    | Done (tested). |
+| `IoUringChannelMetadataRegistry` | Per-channel metadata bag used by the principal-builder path.                                                                                                                                                | Done (tested). |
+| `StubSocketChannel`              | Minimal NIO `SocketChannel` view exposing remote/local addresses, used by `KafkaChannel.socket()` callers.                                                                                                  | Done (tested). |
+| `NoopSelectionKey`               | Stable `SelectionKey` shim — `interestOps` cycles through `OP_READ` to drive `autoRead` on/off.                                                                                                             | Done (tested). |
+| `KafkaChannelMuteBridge`         | Lives under `org.apache.kafka.common.network` (same package as `KafkaChannel`) to expose the package-private `mute()` / `maybeUnmute()` state-machine transitions to the broker selector.                   | Done (tested). |
+| `SocketServer.scala` Processor   | `buildIoBundle()` resolves the effective selector per Processor, constructs an `IoUringSelector` + `IoUringServerListener` for io_uring listeners, falls back to the NIO `Selector` otherwise.              | Done.          |
 
-The 22 unit/integration tests under `server/src/test/java/org/apache/kafka/network/iouring/`
-are all green under JDK 21. `NioBrokerSelectorTest` opens a real loopback TCP
-connection and exercises register / round-trip / mute / unmute / local close /
-LRU candidate / close-all / unwrap, which has already pinned down two
-non-obvious `Selector` quirks (no disconnect notification on local close;
-`lowestPriorityChannel()` falls back to a registered channel when idle tracking
-is off) that any future io_uring backend must match.
+All unit/integration tests under `server/src/test/java/org/apache/kafka/network/iouring/`
+are green under JDK 21. The `IoUringSelectorTest`, `IoUringTransportLayerTest`,
+and `IoUringServerListenerIT` suites pin down: bind on a kernel-assigned port,
+round-trip a size-prefixed frame end-to-end through the real io_uring kernel
+transport, mute/unmute via `KafkaChannelMuteBridge`, single LOCAL_CLOSE
+notification deferred to eviction, async write failure surfaced as `IOException`,
+ByteBuf release on every error/close path, and the operator-configured TCP
+options reaching the bootstrap.
 
 ## What is intentionally not yet in place
 
-The next commit set will add:
-
-1. Netty 4.2.12.Final dependencies (`netty-transport-classes-io_uring` plus the
-   classifier-bound native artifact) under the `server` module. The jars are
-   already in the local Gradle cache; the wiring is the gating change.
-2. `KafkaConfig.scala` getter `socketSelectorImplementation: SelectorImplementation`.
-3. `IoUringSelector` — the real Netty-backed implementation. Architecture
-   sketched below.
-4. `Processor.createSelector` (`core/src/main/scala/kafka/network/SocketServer.scala`)
-   plumbed through `BrokerSelectorFactory.resolve`.
-5. The 10k-connection PLAINTEXT benchmark and its write-up.
+1. The 10k-connection PLAINTEXT benchmark write-up vs. the NIO baseline
+   (PROMPT.md "minimum viable outcome #4" — pending).
+2. SSL / SASL stretch items (PROMPT.md "Stretch" — explicit non-goal for v1).
 
 ## Architecture sketch for `IoUringSelector`
 
