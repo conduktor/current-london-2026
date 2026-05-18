@@ -53,6 +53,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -544,6 +545,55 @@ class KafkaHttpServerIntegrationTest {
             JsonNode payload = asJson(errorData.getBytes(StandardCharsets.UTF_8));
             assertEquals("NOT_LEADER_OR_FOLLOWER", payload.get("errorCode").asText());
             assertEquals("moved", payload.get("errorMessage").asText());
+        }
+    }
+
+    @Test
+    void sseSubmitterThrowableDoesNotEchoMessageInErrorFrame() throws Exception {
+        // Information-disclosure invariant for SSE, parallel to WsStreamerTest's
+        // submitterFailureDoesNotEchoThrowableMessageInErrorFrame. When the fetch future completes
+        // exceptionally with a stock JDK NPE — whose getMessage() includes broker class/field names like
+        // 'Cannot invoke "X.y()" because "z" is null' — the streamer must emit a sanitised
+        // `event: error` frame with errorCode=INTERNAL and an EMPTY errorMessage, never echoing the
+        // throwable's text. The full throwable is logged server-side, but no byte of it reaches the wire.
+        String sensitive =
+            "Cannot invoke \"BrokerSession.getReplicaQuotaManager()\" because the return value of "
+                + "\"BrokerServer.session()\" is null";
+        submitter.fetchFailure = new NullPointerException(sensitive);
+
+        InputStreamResponseListener listener = new InputStreamResponseListener();
+        client.newRequest(url("/v1/topics/orders/records?partition=0&from=earliest"))
+            .method(HttpMethod.GET)
+            .headers(h -> h.put("Accept", "text/event-stream"))
+            .send(listener);
+        Response response = listener.get(5, TimeUnit.SECONDS);
+        assertEquals(200, response.getStatus());
+
+        try (InputStream body = listener.getInputStream();
+             BufferedReader reader = new BufferedReader(new InputStreamReader(body, StandardCharsets.UTF_8))) {
+            boolean sawErrorEvent = false;
+            String errorData = null;
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if ("event: error".equals(line)) {
+                    sawErrorEvent = true;
+                } else if (sawErrorEvent && line.startsWith("data: ")) {
+                    errorData = line.substring(6);
+                    break;
+                }
+            }
+            assertTrue(sawErrorEvent, "stream must emit `event: error` on a throwable-fail submitter");
+            assertNotNull(errorData);
+            JsonNode payload = asJson(errorData.getBytes(StandardCharsets.UTF_8));
+            assertEquals("INTERNAL", payload.get("errorCode").asText(),
+                "throwable-fail submitter must surface a sanitised INTERNAL errorCode");
+            assertEquals("", payload.get("errorMessage").asText(),
+                "errorMessage must be empty — never echo throwable.getMessage() to the wire");
+            String emitted = payload.toString();
+            assertFalse(emitted.contains("BrokerSession"),
+                "sanitised error frame must not leak any portion of the throwable message; saw " + emitted);
+            assertFalse(emitted.contains("ReplicaQuotaManager"),
+                "sanitised error frame must not leak any portion of the throwable message; saw " + emitted);
         }
     }
 
@@ -1115,6 +1165,10 @@ class KafkaHttpServerIntegrationTest {
         RequestSubmitter.FetchResult fetchResult;
         RuntimeException produceFailure;
         CompletableFuture<RequestSubmitter.ProduceResult> produceFutureOverride;
+        // Mirrors produceFailure for the fetch path. When set, every submitFetch returns a future completed
+        // exceptionally with this throwable — used to exercise SseStreamer / WsStreamer's INTERNAL-on-throwable
+        // sanitisation path end-to-end.
+        Throwable fetchFailure;
         FetchRequestParser.FetchCommand lastFetch;
         // SSE flow: each submitFetch returns the next item in this queue. After the queue is exhausted, we return a
         // never-completing future so the SSE loop blocks waiting — the test then closes the connection to tear it down.
@@ -1143,6 +1197,11 @@ class KafkaHttpServerIntegrationTest {
         public CompletableFuture<FetchResult> submitFetch(FetchRequestParser.FetchCommand command) {
             this.lastFetch = command;
             fetchCommandLog.add(command);
+            if (fetchFailure != null) {
+                CompletableFuture<FetchResult> f = new CompletableFuture<>();
+                f.completeExceptionally(fetchFailure);
+                return f;
+            }
             if (fetchAlwaysEmpty) {
                 return CompletableFuture.completedFuture(new RequestSubmitter.FetchResult(
                     new FetchResponseFormatter.PartitionFetch(

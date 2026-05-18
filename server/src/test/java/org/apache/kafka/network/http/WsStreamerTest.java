@@ -30,6 +30,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.OptionalInt;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -278,6 +279,52 @@ class WsStreamerTest {
         assertEquals("INTERNAL", sink.errorAt(0).get("errorCode").asText());
         assertTrue(sink.closed.get());
         assertEquals(0, limiter.inUse(), "limiter slot must be released on terminal error");
+    }
+
+    @Test
+    void submitterFailureDoesNotEchoThrowableMessageInErrorFrame() {
+        // Information-disclosure invariant: the WS error frame's errorMessage MUST be sanitised to the
+        // empty string regardless of what the upstream throwable's getMessage() returned. The path we are
+        // pinning is failFetch → trySendErrorFrame("INTERNAL", null), where the null message becomes "".
+        // Stock JDK NPE text like 'Cannot invoke "X.y()" because "z" is null' would leak broker class and
+        // field names directly to clients if we ever regressed and passed throwable.getMessage() through.
+        String sensitive =
+            "Cannot invoke \"BrokerSession.getReplicaQuotaManager()\" because the return value of "
+                + "\"BrokerServer.session()\" is null";
+        submitter.queueFetchFailure(new NullPointerException(sensitive));
+
+        WsStreamer.start(sink, submitter, MAPPER, "t", 0, 0L, OptionalInt.empty(), 10, token, direct());
+
+        assertEquals(1, sink.errorCount(), "exactly one error frame on terminal failure");
+        JsonNode err = sink.errorAt(0);
+        assertEquals("INTERNAL", err.get("errorCode").asText());
+        assertEquals("", err.get("errorMessage").asText(),
+            "errorMessage must be sanitised to empty — never echo throwable.getMessage()");
+        String emitted = err.toString();
+        assertFalse(emitted.contains("BrokerSession"),
+            "sanitised error frame must not leak any portion of the throwable message; saw " + emitted);
+        assertFalse(emitted.contains("ReplicaQuotaManager"),
+            "sanitised error frame must not leak any portion of the throwable message; saw " + emitted);
+    }
+
+    @Test
+    void submitterCompletionExceptionUnwrappedButStillSanitisedInErrorFrame() {
+        // CompletableFuture wraps the original cause in CompletionException. failFetch unwraps the cause so
+        // the SERVER-SIDE log captures the actual broker exception, but the WIRE-SIDE error frame must stay
+        // sanitised. Even with the unwrap, the cause's getMessage() must not surface to the client.
+        NullPointerException cause = new NullPointerException("internal: ReplicaManager.fetchMessages() == null");
+        CompletionException wrapped = new CompletionException(cause);
+        submitter.queueFetchFailure(wrapped);
+
+        WsStreamer.start(sink, submitter, MAPPER, "t", 0, 0L, OptionalInt.empty(), 10, token, direct());
+
+        assertEquals(1, sink.errorCount());
+        JsonNode err = sink.errorAt(0);
+        assertEquals("INTERNAL", err.get("errorCode").asText());
+        assertEquals("", err.get("errorMessage").asText(),
+            "errorMessage must remain empty even after CompletionException unwrap");
+        assertFalse(err.toString().contains("ReplicaManager"),
+            "unwrap must not change wire-side sanitisation; saw " + err);
     }
 
     // ----- record framing -----
