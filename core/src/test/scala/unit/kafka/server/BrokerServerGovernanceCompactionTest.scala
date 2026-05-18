@@ -196,6 +196,70 @@ class BrokerServerGovernanceCompactionTest {
       s"effective policy must reflect the topic-level override, got: ${ex.getMessage}")
   }
 
+  // ── BLOCKER N5: __governance partition-count gate ──────────────────────
+  //
+  // BrokerGovernanceBootstrap hardcodes its cursor on partition 0 of
+  // __governance. A multi-partition topic silently drops every rule whose
+  // key hashes to a non-0 partition — fail-OPEN of the entire DENY engine.
+  // The gate must fire before SocketServer opens client traffic.
+
+  @Test
+  def singlePartitionTopicAbsentIsAllowed(): Unit = {
+    BrokerServer.requireGovernanceTopicSinglePartition(
+      topicExists = false, partitionCount = 0)
+  }
+
+  @Test
+  def singlePartitionExactlyOneIsAllowed(): Unit = {
+    BrokerServer.requireGovernanceTopicSinglePartition(
+      topicExists = true, partitionCount = 1)
+  }
+
+  @Test
+  def singlePartitionThreeFailsClosed(): Unit = {
+    // Operator created __governance with --partitions 3. Bootstrap drains
+    // only partition 0 — rules on 1/2 silently disappear. Must fail-closed.
+    val ex = assertThrows(classOf[IllegalStateException],
+      () => BrokerServer.requireGovernanceTopicSinglePartition(
+        topicExists = true, partitionCount = 3))
+    val msg = ex.getMessage
+    assertTrue(msg.contains(GovernanceTopic.NAME),
+      s"message must name __governance, got: $msg")
+    assertTrue(msg.contains("3 partition"),
+      s"message must report the offending partition count, got: $msg")
+    assertTrue(msg.contains("partition 0"),
+      s"message must explain the partition-0 drain assumption, got: $msg")
+    assertTrue(msg.contains("--partitions 1"),
+      s"message must include the remediation command, got: $msg")
+    assertTrue(msg.contains("fail OPEN"),
+      s"message must spell out the fail-OPEN consequence, got: $msg")
+  }
+
+  @Test
+  def singlePartitionTwoFailsClosed(): Unit = {
+    // Two partitions is the minimum-impact misconfig (roughly half the
+    // rules silently dropped) but still fail-OPEN. No exception for the
+    // "small" case.
+    val ex = assertThrows(classOf[IllegalStateException],
+      () => BrokerServer.requireGovernanceTopicSinglePartition(
+        topicExists = true, partitionCount = 2))
+    assertTrue(ex.getMessage.contains("2 partition"),
+      s"message must report 2 partitions, got: ${ex.getMessage}")
+  }
+
+  @Test
+  def singlePartitionZeroFailsClosed(): Unit = {
+    // Defensive: partitionCount = 0 should not occur in practice (a
+    // TopicImage with 0 partitions would be a metadata anomaly) but if
+    // it does, treat it like any other non-1 value rather than silently
+    // accepting it.
+    val ex = assertThrows(classOf[IllegalStateException],
+      () => BrokerServer.requireGovernanceTopicSinglePartition(
+        topicExists = true, partitionCount = 0))
+    assertTrue(ex.getMessage.contains("0 partition"),
+      s"message must report 0 partitions, got: ${ex.getMessage}")
+  }
+
   private def brokerDefaultList(values: String*): util.List[String] = {
     val out = new util.ArrayList[String]()
     values.foreach(out.add)

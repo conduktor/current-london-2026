@@ -172,6 +172,61 @@ object BrokerServer {
           s"(audit finding a016e43dc, round-12 HIGH-1, round-13 HIGH-1).")
     }
   }
+
+  /**
+   * Fail-closed enforcement that the {@code __governance} topic is created
+   * with exactly one partition. Round-14 BLOCKER N5 (compaction sub-agent).
+   *
+   * <p>[[BrokerGovernanceBootstrap]] hardcodes its drain cursor on
+   * {@code TopicPartition(__governance, 0)}: it only ever consumes partition
+   * 0 of this topic. If an operator creates the topic with
+   * {@code --partitions 3}, rule keys hash across partitions 0/1/2 (Kafka's
+   * default DefaultPartitioner uses {@code murmur2(key)} when a key is
+   * present) and the broker silently drains roughly one-third of them,
+   * skipping the rest. Every DENY rule that hashes to partition 1 or 2
+   * silently disappears — a fail-OPEN of the entire rule engine that
+   * survives restarts and produces no diagnostic.
+   *
+   * <p>The contract on this topic is "single-partition compacted log" — a
+   * cluster-wide ordered stream of rule mutations. There is no use case for
+   * sharding it: the request path consults the engine's atomic
+   * {@link kafka.server.RuleEngine#active} snapshot per request, never the
+   * topic, so partition fanout adds no scaling benefit and only opens this
+   * fail-OPEN hole. Closing this is mandatory before opening client
+   * traffic; the broker refuses to start until the topic is recreated with
+   * the correct shape.
+   *
+   * <p>When {@code topicExists} is false (fresh cluster, topic not yet
+   * created) the helper returns silently — same posture as
+   * {@link #requireGovernanceTopicCompactPolicy}: a yet-to-be-created topic
+   * cannot be misshapen.
+   *
+   * @param topicExists true iff the metadata image has a TopicImage for the
+   *                    governance topic (i.e. operator has created it)
+   * @param partitionCount the number of partitions on the topic, read from
+   *                       {@code topicImage.partitions().size()}; ignored
+   *                       when {@code topicExists} is false
+   */
+  def requireGovernanceTopicSinglePartition(
+      topicExists: Boolean,
+      partitionCount: Int): Unit = {
+    if (!topicExists) return
+    if (partitionCount != 1) {
+      throw new IllegalStateException(
+        s"Topic ${GovernanceTopic.NAME} has $partitionCount partition(s), but " +
+          s"the broker's rule-engine bootstrap consumes only partition 0 of " +
+          s"this topic. A non-1 partition count silently drops every rule " +
+          s"whose key hashes to a non-0 partition, causing the broker to " +
+          s"fail OPEN on those CEL DENY rules. The broker refuses to start " +
+          s"until this is fixed. There is NO supported way to alter partition " +
+          s"count on a compacted topic in place — delete and recreate: " +
+          s"bin/kafka-topics.sh --bootstrap-server <broker> --delete --topic " +
+          s"${GovernanceTopic.NAME} && bin/kafka-topics.sh --bootstrap-server " +
+          s"<broker> --create --topic ${GovernanceTopic.NAME} --partitions 1 " +
+          s"--replication-factor <RF> --config cleanup.policy=compact " +
+          s"(audit round-14 BLOCKER N5).")
+    }
+  }
 }
 
 /**
@@ -932,6 +987,12 @@ class BrokerServer(
         .get(TopicConfig.CLEANUP_POLICY_CONFIG) else null
       BrokerServer.requireGovernanceTopicCompactPolicy(
         govImage != null, govTopicLevel, config.logCleanupPolicy)
+      // Round-14 BLOCKER N5 (compaction sub-agent): BrokerGovernanceBootstrap
+      // hardcodes drain on partition 0 of __governance. A multi-partition
+      // topic silently fail-OPENs every rule whose key hashes to a non-0
+      // partition. Fail-closed before opening client traffic.
+      BrokerServer.requireGovernanceTopicSinglePartition(
+        govImage != null, if (govImage != null) govImage.partitions().size() else 0)
       val drained = governanceBootstrap.drainStartup(
         BrokerServer.GovernanceStartupDrainDeadlineMs)
       info(s"governance bootstrap drained $drained rule record(s) from " +
