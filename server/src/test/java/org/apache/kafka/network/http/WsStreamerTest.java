@@ -32,8 +32,10 @@ import java.util.OptionalInt;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -385,6 +387,79 @@ class WsStreamerTest {
 
         assertEquals(0, sink.recordCount(), "no delivery after close");
         assertEquals(0, submitter.fetchCallCount(), "no fetch must be issued after close");
+    }
+
+    // ----- executor rejection (Jetty pool saturated / shut down) -----
+
+    @Test
+    void executorRejectionOnInitialDispatchTearsDownStreamCleanly() {
+        // The synchronous catch path inside scheduleDrain. Models a Jetty thread pool that's already shut
+        // down when WsStreamer.start runs (or saturated past its queue): the very first httpExecutor.execute
+        // throws RejectedExecutionException, the streamer logs it, clears drainScheduled, and tears down.
+        // The limiter slot MUST be released — without this, every saturated upgrade would leak one slot.
+        Executor rejecting = task -> {
+            throw new RejectedExecutionException("test reject");
+        };
+
+        WsStreamer streamer =
+            WsStreamer.start(sink, submitter, MAPPER, "t", 0, 0L, OptionalInt.empty(), 5, token, rejecting);
+
+        assertTrue(streamer.isClosed(), "executor rejection on initial dispatch must close the stream");
+        assertTrue(sink.closed.get(), "executor rejection must close the sink");
+        assertEquals(0, limiter.inUse(), "executor rejection must release the limiter slot");
+        assertEquals(0, submitter.fetchCallCount(), "no fetch may run when the initial drain never dispatched");
+    }
+
+    @Test
+    void executorRejectionOnFetchDispatchSurfacesInternalAndTearsDown() {
+        // The .exceptionally terminal-handler path inside maybeKickFetch. Models a Jetty thread pool that
+        // accepts the initial drain but refuses subsequent dispatches — exactly the saturated-mid-stream
+        // failure mode that motivated commit 3f6cbc4ade.
+        //
+        // Sequence:
+        //   1. WsStreamer.start → scheduleDrain → httpExecutor.execute(drainAndMaybeFetch). [call #1: allowed]
+        //   2. drainAndMaybeFetch runs inline, drainBufferWhileCredited returns (buffer empty),
+        //      maybeKickFetch fetches via submitter (already-completed future).
+        //   3. .whenCompleteAsync(handleFetchResult, httpExecutor) attempts to dispatch the callback
+        //      onto httpExecutor since the future is already complete. [call #2: rejected]
+        //   4. The dependent stage completes exceptionally with RejectedExecutionException; the
+        //      registered .exceptionally lambda fires synchronously on the calling thread (since the
+        //      stage is already complete-exceptionally).
+        //   5. handleSchedulingFailure: clears fetchInFlight, emits sanitised INTERNAL error frame,
+        //      calls close() — which releases the limiter token and closes the sink.
+        //
+        // Without the .exceptionally landed in commit 3f6cbc4ade, the RejectedExecutionException would
+        // land on an unobserved future and the stream would wedge with fetchInFlight=true forever,
+        // leaking the limiter slot until JVM shutdown.
+        submitter.queueFetch(records(0, 3));
+        Executor onceThenReject = new Executor() {
+            private final AtomicInteger remaining = new AtomicInteger(1);
+            @Override
+            public void execute(Runnable r) {
+                if (remaining.getAndDecrement() > 0) {
+                    r.run();
+                } else {
+                    throw new RejectedExecutionException("test reject after first dispatch");
+                }
+            }
+        };
+
+        WsStreamer streamer = WsStreamer.start(sink, submitter, MAPPER, "t", 0, 0L, OptionalInt.empty(),
+            5, token, onceThenReject);
+
+        assertEquals(1, sink.errorCount(), "executor rejection on fetch dispatch must surface an error frame");
+        JsonNode err = sink.errorAt(0);
+        assertEquals("INTERNAL", err.get("errorCode").asText());
+        assertEquals("", err.get("errorMessage").asText(),
+            "errorMessage must stay sanitised — never leak the RejectedExecutionException's text");
+        assertFalse(err.toString().toLowerCase(java.util.Locale.ROOT).contains("rejected"),
+            "sanitised error frame must not echo the rejection message; saw " + err);
+        assertTrue(streamer.isClosed(), "stream must close after executor rejection");
+        assertTrue(sink.closed.get());
+        assertEquals(0, limiter.inUse(), "executor rejection must release the limiter slot");
+        // The records the submitter returned were never delivered — the rejection beat the drain.
+        assertEquals(0, sink.recordCount(),
+            "no records may be delivered when the post-fetch dispatch was rejected");
     }
 
     // ----- concurrency -----
