@@ -66,7 +66,7 @@ import org.apache.kafka.server.share.context.ShareFetchContext
 import org.apache.kafka.server.share.{ErroneousAndValidPartitionData, SharePartitionKey}
 import org.apache.kafka.server.share.acknowledge.ShareAcknowledgementBatch
 import org.apache.kafka.server.storage.log.{FetchIsolation, FetchParams, FetchPartitionData}
-import org.apache.kafka.storage.internals.concentration.{ConcentrationKernel, IdempotentBatchKey, IdempotentBatchResult, LogicalFetchTranslator, LogicalProduceStamper, Reservation}
+import org.apache.kafka.storage.internals.concentration.{BackingGenerationChangedException, ConcentrationKernel, IdempotentBatchKey, IdempotentBatchResult, LogicalFetchTranslator, LogicalProduceStamper, Reservation}
 import org.apache.kafka.storage.internals.log.AppendOrigin
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats
 
@@ -657,6 +657,17 @@ class KafkaApis(val requestChannel: RequestChannel,
                   }
                   logicalTp -> status
                 } catch {
+                  case e: BackingGenerationChangedException =>
+                    // BLOCKER 3: gate generation advanced between reserve and commit — this
+                    // broker lost leadership of the backing partition while the produce was in
+                    // flight. The kernel already rolled back the reservation so the tracker is
+                    // consistent. Surface as NOT_LEADER_OR_FOLLOWER so the producer's stock
+                    // metadata-refresh + retry routes the request to the new leader; using
+                    // KAFKA_STORAGE_ERROR here would be misleading because the storage layer
+                    // didn't fail — leadership did.
+                    info(s"Concentration commit fenced by gate-generation change for logical " +
+                      s"$logicalTp -> backing $tp: ${e.getMessage}")
+                    logicalTp -> new PartitionResponse(Errors.NOT_LEADER_OR_FOLLOWER)
                   case e: Throwable =>
                     // Durable sidecar commit failed AFTER the backing append succeeded — we
                     // can't acknowledge logical offsets we never wrote down. Surface as

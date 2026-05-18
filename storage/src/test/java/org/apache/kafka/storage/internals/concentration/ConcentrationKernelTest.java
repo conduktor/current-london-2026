@@ -1384,4 +1384,110 @@ public class ConcentrationKernelTest {
         assertEquals(20L, kernel.resolveBackingOffset("invoices", 0, 0L));
         assertEquals(21L, kernel.resolveBackingOffset("invoices", 0, 1L));
     }
+
+    // ------------------ BLOCKER 3: gate-generation fence on in-flight commit ------------------
+    //
+    // The race: a producer call holds an open Reservation while the kernel's per-backing gate
+    // closes (this broker lost leadership of the backing partition). If commitProduceBatch ran
+    // unconditionally, it would publish a logical→backing mapping for an offset that may not
+    // survive the new leader's leader-epoch resolution — orphaning the sidecar entry and risking
+    // a "deleted record" being served on the next leader-acquisition. The fence stamps each
+    // Reservation with the generation captured at reserve time and aborts commit if the
+    // generation has advanced.
+
+    @Test
+    public void commitProduceFencedByGenerationChange() throws IOException {
+        // Single-record commitProduce variant.
+        kernel.declare(descriptor("orders", 4, "shared", 2));
+        TopicPartition backing = new TopicPartition("shared",
+            LogicalPartitionMapper.backingPartitionFor(kernel.describe("orders").orElseThrow(), 0));
+
+        Reservation r = kernel.reserveProduce("orders", 0);
+        assertTrue(r.hasBackingStamp(), "kernel must stamp the reservation with backing+generation");
+        assertEquals(backing, r.backing());
+        long stampedGen = r.generation();
+
+        // Close the gate between reserve and commit — bumps generation.
+        kernel.markBackingUnready(backing);
+        assertEquals(stampedGen + 1, kernel.currentGeneration(backing),
+            "markBackingUnready must bump generation");
+
+        BackingGenerationChangedException e = assertThrows(BackingGenerationChangedException.class,
+            () -> kernel.commitProduce(r, 100L),
+            "commit must reject when the gate-generation moved between reserve and commit");
+        assertTrue(e.getMessage().contains(backing.toString()),
+            "exception message must name the backing partition for operator diagnostics: " + e.getMessage());
+
+        // Reservation must be rolled back so the partition's tracker state is consistent — the
+        // slot is freed, nextLogicalOffset did NOT advance, and a follow-up reserve (once the
+        // gate re-opens) returns the same offset that the rejected reservation held.
+        assertEquals(0L, kernel.nextLogicalOffset("orders", 0),
+            "fenced commit must roll back the reservation (no offset gap left behind)");
+    }
+
+    @Test
+    public void commitProduceBatchFencedByGenerationChange() throws IOException {
+        // Batch variant. The same fence guards multi-record produce batches — the broker's
+        // produce hot path always uses the batch form via reserveProduceBatch.
+        kernel.declare(descriptor("orders", 4, "shared", 2));
+        TopicPartition backing = new TopicPartition("shared",
+            LogicalPartitionMapper.backingPartitionFor(kernel.describe("orders").orElseThrow(), 1));
+
+        Reservation[] batch = kernel.reserveProduceBatch("orders", 1, 3);
+        for (Reservation r : batch) {
+            assertTrue(r.hasBackingStamp(), "every reservation in the batch must be stamped");
+            assertEquals(backing, r.backing());
+        }
+        long stampedGen = batch[0].generation();
+
+        kernel.markBackingUnready(backing);
+        assertEquals(stampedGen + 1, kernel.currentGeneration(backing));
+
+        assertThrows(BackingGenerationChangedException.class,
+            () -> kernel.commitProduceBatch(batch, 50L),
+            "batch commit must reject under gate-generation change");
+
+        // Whole batch is rolled back atomically — three offsets returned to the tracker.
+        assertEquals(0L, kernel.nextLogicalOffset("orders", 1),
+            "fenced batch commit must roll back ALL three reservations");
+    }
+
+    @Test
+    public void commitFenceTriggersEvenAfterGateReopensAtNewerGeneration() throws IOException {
+        // After markBackingUnready → markBackingReady cycle, generation has moved by 1 even
+        // though the gate is open again. A reservation that was opened BEFORE the cycle still
+        // holds the old generation, so the commit must still be rejected — leaderEpoch may have
+        // changed under the cycle and the backing offset we'd commit could be from a stale view.
+        kernel.declare(descriptor("orders", 4, "shared", 2));
+        TopicPartition backing = new TopicPartition("shared",
+            LogicalPartitionMapper.backingPartitionFor(kernel.describe("orders").orElseThrow(), 2));
+
+        Reservation r = kernel.reserveProduce("orders", 2);
+        long stampedGen = r.generation();
+
+        kernel.markBackingUnready(backing);
+        kernel.markBackingReady(backing);
+        assertTrue(kernel.isBackingReady(backing), "gate is open again");
+        assertEquals(stampedGen + 1, kernel.currentGeneration(backing),
+            "but generation has still advanced — that's exactly what we fence on");
+
+        assertThrows(BackingGenerationChangedException.class,
+            () -> kernel.commitProduce(r, 9L));
+        assertEquals(0L, kernel.nextLogicalOffset("orders", 2));
+    }
+
+    @Test
+    public void commitProduceSucceedsWhenGenerationUnchanged() throws IOException {
+        // Positive control: the fence is a no-op when nothing happens to the gate between
+        // reserve and commit. Without this test, the regression suite couldn't tell apart "fence
+        // works" from "fence always trips".
+        kernel.declare(descriptor("orders", 4, "shared", 2));
+        Reservation r = kernel.reserveProduce("orders", 0);
+        // No markBackingUnready call here — generation stays at stamp value.
+        kernel.commitProduce(r, 100L);
+        assertEquals(1L, kernel.nextLogicalOffset("orders", 0),
+            "happy-path commit must advance the tracker exactly once");
+        assertEquals(100L, kernel.resolveBackingOffset("orders", 0, 0L),
+            "happy-path commit must persist the sidecar entry");
+    }
 }

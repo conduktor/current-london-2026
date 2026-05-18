@@ -309,17 +309,31 @@ public final class ConcentrationKernel implements AutoCloseable {
             throw new IllegalArgumentException(
                 "logical partition " + logicalPartition + " out of range [0," + d.numLogicalPartitions() + ")");
         }
-        return tracker.reserve(logicalTopic, logicalPartition);
+        TopicPartition backing = new TopicPartition(d.backingTopic(),
+            LogicalPartitionMapper.backingPartitionFor(d, logicalPartition));
+        long gen = currentGeneration(backing);
+        Reservation r = tracker.reserve(logicalTopic, logicalPartition);
+        r.stampBackingGate(backing, gen);
+        return r;
     }
 
     /**
      * Persist the (logical → backing) sidecar entry and commit the reservation. If the sidecar
      * append throws (e.g., backing-offset non-monotonic — caller bug), the reservation is rolled
      * back automatically so the slot is free for the next reserve. The exception is propagated.
+     *
+     * <p>BLOCKER 3 fence: if the reservation was stamped at reserve time, the current backing-gate
+     * generation must still match — otherwise the broker lost leadership of the backing partition
+     * between reserve and commit, and committing this entry would write a sidecar mapping for a
+     * backing offset that the new leader may truncate. Rejects with
+     * {@link BackingGenerationChangedException} (an {@link IOException}) which the broker maps to
+     * {@code NOT_LEADER_OR_FOLLOWER}. The reservation is rolled back before the throw so the
+     * tracker stays in a consistent state.
      */
     public void commitProduce(Reservation reservation, long backingOffset) throws IOException {
         ensureOpen();
         Objects.requireNonNull(reservation, "reservation");
+        checkBackingGenerationOrRollback(reservation);
         LogicalSidecarIndex sidecar = sidecarFor(reservation.logicalTopic(), reservation.logicalPartition());
         try {
             sidecar.append(backingOffset);
@@ -332,6 +346,35 @@ public final class ConcentrationKernel implements AutoCloseable {
 
     public void rollbackProduce(Reservation reservation) {
         tracker.rollback(reservation);
+    }
+
+    /**
+     * BLOCKER 3 fence. If the reservation carries a backing-gate stamp (production path), verify
+     * the gate generation has not advanced between reserve and now. On mismatch, roll back the
+     * reservation and throw {@link BackingGenerationChangedException}. Tracker-only reservations
+     * (raw {@link LogicalOffsetTracker} use in unit tests) skip the check — they have no
+     * backing-gate context.
+     *
+     * <p>Single-record commits pass a one-element batch path via {@code tracker.rollback}; batch
+     * commits pass an array via {@code tracker.rollbackBatch}. The caller picks the right form.
+     */
+    private void checkBackingGenerationOrRollback(Reservation reservation) throws BackingGenerationChangedException {
+        if (!reservation.hasBackingStamp()) return;
+        long current = currentGeneration(reservation.backing());
+        if (current != reservation.generation()) {
+            tracker.rollback(reservation);
+            throw new BackingGenerationChangedException(reservation.backing(), reservation.generation(), current);
+        }
+    }
+
+    private void checkBackingGenerationOrRollbackBatch(Reservation[] batch) throws BackingGenerationChangedException {
+        Reservation first = batch[0];
+        if (!first.hasBackingStamp()) return;
+        long current = currentGeneration(first.backing());
+        if (current != first.generation()) {
+            tracker.rollbackBatch(batch);
+            throw new BackingGenerationChangedException(first.backing(), first.generation(), current);
+        }
     }
 
     /**
@@ -352,7 +395,14 @@ public final class ConcentrationKernel implements AutoCloseable {
             throw new IllegalArgumentException(
                 "logical partition " + logicalPartition + " out of range [0," + d.numLogicalPartitions() + ")");
         }
-        return tracker.reserveBatch(logicalTopic, logicalPartition, count);
+        TopicPartition backing = new TopicPartition(d.backingTopic(),
+            LogicalPartitionMapper.backingPartitionFor(d, logicalPartition));
+        long gen = currentGeneration(backing);
+        Reservation[] batch = tracker.reserveBatch(logicalTopic, logicalPartition, count);
+        for (Reservation r : batch) {
+            r.stampBackingGate(backing, gen);
+        }
+        return batch;
     }
 
     /**
@@ -361,6 +411,14 @@ public final class ConcentrationKernel implements AutoCloseable {
      * and commit the batch atomically. If any sidecar append throws, the whole batch is rolled
      * back so the slots are reusable; previously appended sidecar entries are left in place but
      * the tracker does not advance — recovery via backing-scan repairs the sidecar.
+     *
+     * <p>BLOCKER 3 fence: if the reservation was stamped at reserve time (production path), the
+     * current backing-gate generation must still match. A mismatch means the gate closed between
+     * reserve and commit — typically the broker lost leadership of the backing partition while
+     * the produce callback was in flight. Committing in that window would publish a
+     * logical→backing mapping for a backing offset a new leader may truncate. Rejecting with
+     * {@link BackingGenerationChangedException} surfaces as {@code NOT_LEADER_OR_FOLLOWER} on the
+     * produce response so the producer retries against the new leader.
      */
     public void commitProduceBatch(Reservation[] batch, long firstBackingOffset) throws IOException {
         ensureOpen();
@@ -368,6 +426,7 @@ public final class ConcentrationKernel implements AutoCloseable {
         if (batch.length == 0) {
             throw new IllegalArgumentException("commitProduceBatch requires a non-empty batch");
         }
+        checkBackingGenerationOrRollbackBatch(batch);
         LogicalSidecarIndex sidecar = sidecarFor(batch[0].logicalTopic(), batch[0].logicalPartition());
         try {
             for (int i = 0; i < batch.length; i++) {
