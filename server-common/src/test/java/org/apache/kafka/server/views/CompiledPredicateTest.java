@@ -606,6 +606,39 @@ class CompiledPredicateTest {
                 () -> "AND with no rescue must remain SKIP, got " + r);
     }
 
+    // ---------- tombstone semantics (Codex Finding 2) ----------
+
+    /**
+     * A record with no body (tombstone in a compacted backing topic) must NOT pass a negated
+     * body-touching predicate. The naive {@code body.region != "blocked"} would otherwise see
+     * {@code null != "blocked"} as TRUE and silently retain every tombstone in the view —
+     * the same anti-pattern PROMPT.md line 46 calls out for invalid-UTF-8 headers and
+     * out-of-long-range integers. We achieve the safe behaviour by treating null body as
+     * BODY_UNUSABLE, which propagates SKIP through bodyAt.
+     */
+    @Test
+    void tombstoneDoesNotPassNegatedBodyPredicate() {
+        CompiledPredicate p = compiler.compile("body.region != 'blocked'");
+        RecordContext ctx = RecordContexts.builder().key("k".getBytes()).build();
+        Optional<Boolean> r = p.evaluate(ctx);
+        assertTrue(r.isEmpty(),
+                () -> "tombstone (null body) must yield SKIP through body predicate, got " + r);
+    }
+
+    /**
+     * Companion: a predicate that doesn't touch body should still evaluate cleanly on a
+     * tombstone — the view operator can opt into tombstone-passthrough by writing a key-only
+     * predicate.
+     */
+    @Test
+    void tombstoneEvaluatesNormallyForKeyOnlyPredicate() {
+        CompiledPredicate p = compiler.compile("key == 'tomb'");
+        RecordContext ctx = RecordContexts.builder().key("tomb".getBytes()).build();
+        Optional<Boolean> r = p.evaluate(ctx);
+        assertTrue(r.isPresent() && r.get(),
+                () -> "key-only predicate on tombstone must evaluate normally, got " + r);
+    }
+
     @Test
     void leftDeterminateTrueStillShortCircuitsOrWithoutEvaluatingRight() {
         // Pre-existing behaviour preserved: a determinate-TRUE left makes OR return TRUE without

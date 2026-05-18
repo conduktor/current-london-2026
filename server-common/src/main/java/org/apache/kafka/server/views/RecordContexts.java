@@ -223,6 +223,14 @@ public final class RecordContexts {
         @Override
         public Object bodyAt(List<String> path) {
             if (bodyBuf == null) {
+                // Tombstones (record with null value) reach this branch on a compacted backing
+                // topic. We treat "no body" as BODY_UNUSABLE — same outcome as malformed JSON —
+                // so any body-accessing predicate skips the record. The alternative would be to
+                // surface body.X as null and let `body.region != "blocked"` retain tombstones,
+                // but that would silently pass null-body records through negated predicates
+                // (the same anti-pattern PROMPT.md line 46 calls out for invalid-UTF-8 headers
+                // and out-of-long-range integers). Predicates that intentionally want to retain
+                // tombstones can do so by not referencing body at all (e.g. `key == 'foo'`).
                 return BODY_UNUSABLE;
             }
             if (bodyUnusable) {
