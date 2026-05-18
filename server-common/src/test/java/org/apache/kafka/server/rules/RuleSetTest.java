@@ -150,4 +150,47 @@ public class RuleSetTest {
     public void emptyIsSingleton() {
         assertSame(RuleSet.EMPTY, new RuleSetBuilder().build());
     }
+
+    @Test
+    public void putRejectsNewIdsPastMaxRulesCap() {
+        // Fill the builder to the cap with distinct ids, then verify the
+        // (cap+1)'th distinct id is rejected. The cap exists so per-request
+        // CEL evaluation cost is bounded regardless of how many rules the
+        // operator publishes to __governance.
+        RuleSetBuilder b = new RuleSetBuilder();
+        for (int i = 0; i < RuleSetBuilder.MAX_RULES; i++) {
+            b.put(rule("rule-" + i, ApiKeys.FETCH));
+        }
+        assertEquals(RuleSetBuilder.MAX_RULES, b.size());
+        IllegalStateException ex = assertThrows(IllegalStateException.class,
+            () -> b.put(rule("rule-overflow", ApiKeys.FETCH)));
+        assertTrue(ex.getMessage().contains("rule-overflow"),
+            "exception must name the rejected rule id: " + ex.getMessage());
+        assertTrue(ex.getMessage().contains(String.valueOf(RuleSetBuilder.MAX_RULES)),
+            "exception must name the cap value: " + ex.getMessage());
+    }
+
+    @Test
+    public void putAllowsReplacementAtMaxRulesCap() {
+        // Updates to an existing rule id never grow the working set, so they
+        // must succeed even at the cap. Otherwise the only way to ever fix
+        // or tombstone a rule once the cap is full would be to drop the
+        // entire RuleSet — a brittle operational property.
+        RuleSetBuilder b = new RuleSetBuilder();
+        for (int i = 0; i < RuleSetBuilder.MAX_RULES; i++) {
+            b.put(rule("rule-" + i, ApiKeys.FETCH));
+        }
+        // Same id, different content: must replace in place.
+        Rule replacement = new Rule("rule-0", Collections.singletonList(ApiKeys.METADATA),
+            RuleAction.DENY, "false", 99, FALSE_PROGRAM);
+        b.put(replacement);
+        RuleSet rs = b.build();
+        assertEquals(RuleSetBuilder.MAX_RULES, rs.size(),
+            "replacement must not grow the set");
+        // The replacement now targets METADATA, not FETCH — verify it
+        // actually landed by checking the per-key list rather than relying
+        // on size alone.
+        assertTrue(rs.hasDenyRuleFor((short) ApiKeys.METADATA.id),
+            "replacement rule's new apiKey must be reflected in the bitset");
+    }
 }

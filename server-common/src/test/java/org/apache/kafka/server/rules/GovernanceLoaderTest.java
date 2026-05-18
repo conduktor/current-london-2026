@@ -249,6 +249,44 @@ public class GovernanceLoaderTest {
     }
 
     @Test
+    public void capExceededIsTreatedAsPerRecordFailure() {
+        // RuleSetBuilder.MAX_RULES bounds the worst-case per-request CEL
+        // evaluation cost. A record that would push the working set past
+        // that cap must be rejected per-record (preserving the previously
+        // installed RuleSet), not abort the drain or corrupt state. This
+        // pins the loader's catch of the IllegalStateException thrown by
+        // RuleSetBuilder.put.
+        RuleEngine engine = new RuleEngine();
+        GovernanceLoader loader = new GovernanceLoader(engine);
+        // Fill the working set to the cap with distinct rules, committing
+        // once so the engine has a valid pre-overflow snapshot.
+        for (int i = 0; i < RuleSetBuilder.MAX_RULES; i++) {
+            loader.apply("r-" + i, envelope("true", ApiKeys.METADATA, 1 + (i % 100)));
+        }
+        loader.commit();
+        RuleSet capSnapshot = engine.active();
+        assertEquals(RuleSetBuilder.MAX_RULES, capSnapshot.size());
+        // The (cap+1)'th new rule must be rejected, but the drain must keep
+        // flowing — a subsequent good update to an existing id must still
+        // land and a commit must publish a coherent RuleSet.
+        loader.apply("r-overflow", envelope("true", ApiKeys.METADATA, 42));
+        loader.apply("r-0", envelope("true", ApiKeys.METADATA, 999));
+        loader.commit();
+        RuleSet afterOverflow = engine.active();
+        assertEquals(RuleSetBuilder.MAX_RULES, afterOverflow.size(),
+            "overflow record must not have landed");
+        // 'r-0' was updated to errorCode 999; verify the in-place update
+        // still works at the cap.
+        RuleDecision d = engine.evaluate(
+            ApiKeys.METADATA, "client", false, Collections::emptyMap);
+        assertTrue(d.denied(), "engine must still be denying via the cap'd set");
+        assertEquals("r-0", d.denyingRuleId(),
+            "updated r-0 must still be first in declared order");
+        assertEquals(999, d.errorCode(),
+            "in-place update at the cap must take effect");
+    }
+
+    @Test
     public void encodeDecodeViaCodecLinesUpWithLoader() {
         // Sanity: the loader and the codec must agree on what a record looks
         // like. We use the codec's own encode() to produce input — if a

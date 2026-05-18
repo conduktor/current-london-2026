@@ -117,7 +117,16 @@ public final class GovernanceLoader {
                 "previously installed version of this rule (if any) is preserved", key, e.getMessage());
             return;
         }
-        working.put(rule);
+        // RuleSetBuilder.put rejects new ids past its MAX_RULES cap. Treat
+        // that like a malformed envelope at this level: log, preserve prior
+        // state, keep draining the topic. Updates to an existing id never
+        // trip the cap (the set does not grow).
+        try {
+            working.put(rule);
+        } catch (IllegalStateException e) {
+            LOG.warn("rejecting __governance update for rule '{}': {} — " +
+                "previously installed RuleSet is preserved", key, e.getMessage());
+        }
     }
 
     /**
