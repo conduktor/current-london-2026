@@ -767,6 +767,14 @@ class KafkaConfig private(doLog: Boolean, val props: util.Map[_, _])
     // listener produces an unstamped principal and KafkaApis refuses every
     // request as `isPrivilegedOnTenantListener` — a silent denial of service.
     org.apache.kafka.server.tenant.TenantConfig.validatePrincipalBuilderBindings(originals, principalBuilderClass)
+
+    // Refuse to start a broker whose super.users list contains a __tenant_
+    // principal. A super-user is exempt from every ACL check, so a tenant
+    // principal in super.users would silently bypass tenant isolation — the
+    // privileged-on-tenant-listener guard at the handler level cannot save
+    // you because that guard only triggers when the listener is tenant-bound
+    // and the principal is NOT tenant-stamped.
+    org.apache.kafka.server.tenant.TenantConfig.validateSuperUsersAreNotTenantPrefixed(originals)
   }
 
   /**

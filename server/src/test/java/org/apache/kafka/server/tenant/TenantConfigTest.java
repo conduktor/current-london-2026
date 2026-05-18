@@ -234,4 +234,80 @@ class TenantConfigTest {
         assertTrue(ex.getMessage().contains("tenant_acme"),
             "error should name the offending listener; was: " + ex.getMessage());
     }
+
+    @Test
+    void validateSuperUsersPassesWhenUnset() {
+        Map<String, Object> props = new HashMap<>();
+        TenantConfig.validateSuperUsersAreNotTenantPrefixed(props);
+    }
+
+    @Test
+    void validateSuperUsersPassesForOperatorPrincipals() {
+        // The legitimate shape: operator principals only, no tenant prefix.
+        Map<String, Object> props = new HashMap<>();
+        props.put("super.users", "User:admin;User:alice;User:bob");
+        TenantConfig.validateSuperUsersAreNotTenantPrefixed(props);
+    }
+
+    @Test
+    void validateSuperUsersRejectsTenantPrefixedPrincipal() {
+        // The trap: super.users grants cluster-wide ACL bypass to anything it
+        // contains. A tenant-stamped principal in this list would silently
+        // bypass tenant isolation — the handler-level guard does not save you
+        // because the authorizer never asks.
+        Map<String, Object> props = new HashMap<>();
+        props.put("super.users", "User:admin;User:__tenant_acme.alice");
+
+        ConfigException ex = assertThrows(ConfigException.class,
+            () -> TenantConfig.validateSuperUsersAreNotTenantPrefixed(props));
+        assertTrue(ex.getMessage().contains("__tenant_acme.alice"),
+            "error should quote the offending entry; was: " + ex.getMessage());
+        assertTrue(ex.getMessage().contains(TenantNamespace.PRINCIPAL_PREFIX),
+            "error should explain the reserved prefix; was: " + ex.getMessage());
+    }
+
+    @Test
+    void validateSuperUsersAggregatesMultipleOffenders() {
+        // Two tenant-prefixed entries: report both so they can be fixed in a
+        // single deploy. Order of offenders is not asserted (Set semantics) —
+        // only that each one appears in the message.
+        Map<String, Object> props = new HashMap<>();
+        props.put("super.users",
+            "User:__tenant_acme.alice;User:admin;User:__tenant_beta.bob");
+
+        ConfigException ex = assertThrows(ConfigException.class,
+            () -> TenantConfig.validateSuperUsersAreNotTenantPrefixed(props));
+        assertTrue(ex.getMessage().contains("__tenant_acme.alice"),
+            "error should name first offender; was: " + ex.getMessage());
+        assertTrue(ex.getMessage().contains("__tenant_beta.bob"),
+            "error should name second offender; was: " + ex.getMessage());
+    }
+
+    @Test
+    void validateSuperUsersIgnoresEmptyAndWhitespaceEntries() {
+        // The split on ';' produces empty trailing entries when the value ends
+        // with ';' or contains '  '; treat them as no-op rather than refusing.
+        Map<String, Object> props = new HashMap<>();
+        props.put("super.users", "User:admin;  ;User:bob;");
+        TenantConfig.validateSuperUsersAreNotTenantPrefixed(props);
+    }
+
+    @Test
+    void validateSuperUsersHandlesMalformedEntryWithoutColon() {
+        // A malformed entry (no `:`) is rejected by the authorizer itself; this
+        // check only flags the tenant-prefix concern. A bare `__tenant_acme.alice`
+        // (without `User:`) STILL has the reserved prefix at position 0, so we
+        // must catch it. Conversely, an unrelated malformed entry like `admin`
+        // is left alone.
+        Map<String, Object> okProps = new HashMap<>();
+        okProps.put("super.users", "admin");
+        TenantConfig.validateSuperUsersAreNotTenantPrefixed(okProps);
+
+        Map<String, Object> badProps = new HashMap<>();
+        badProps.put("super.users", "__tenant_acme.alice");
+        ConfigException ex = assertThrows(ConfigException.class,
+            () -> TenantConfig.validateSuperUsersAreNotTenantPrefixed(badProps));
+        assertTrue(ex.getMessage().contains("__tenant_acme.alice"),
+            "error should quote the offender even when the User: prefix is missing");
+    }
 }

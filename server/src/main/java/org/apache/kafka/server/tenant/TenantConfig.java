@@ -42,6 +42,9 @@ public final class TenantConfig {
     public static final String TENANT_ID_KEY = "tenant.id";
     public static final String LISTENER_PREFIX = "listener.name.";
     public static final String PRINCIPAL_BUILDER_CLASS_KEY = "principal.builder.class";
+    // Mirrors {@code StandardAuthorizer.SUPER_USERS_CONFIG}; duplicated as a
+    // string so this module does not depend on {@code metadata}.
+    static final String SUPER_USERS_KEY = "super.users";
 
     private static final TenantConfig EMPTY = new TenantConfig(new HashMap<>());
 
@@ -221,6 +224,59 @@ public final class TenantConfig {
             return listener + " (uses " + ref.name + ")";
         }
         return null;
+    }
+
+    /**
+     * Refuse to start a broker whose {@code super.users} list contains an entry
+     * whose principal name carries the reserved {@link TenantNamespace#PRINCIPAL_PREFIX}.
+     * A super-user is exempt from every ACL check ({@code StandardAuthorizerData}
+     * matches on the full principal string), so a misconfigured
+     * {@code super.users=User:__tenant_acme.alice} would silently elevate a
+     * tenant principal to cluster-wide bypass — defeating both tenant isolation
+     * and the privileged-on-tenant-listener guard, which still treats the
+     * principal as a normal tenant request at the handler level.
+     *
+     * <p>The {@code super.users} property is a {@code ;}-separated list of
+     * {@code User:name} entries (Kafka convention). Any entry whose post-{@code :}
+     * name starts with the tenant prefix is fatal, listed in the
+     * {@link ConfigException}.
+     *
+     * @param brokerProps the broker's raw originals map
+     * @throws ConfigException listing every offending entry
+     */
+    public static void validateSuperUsersAreNotTenantPrefixed(Map<String, ?> brokerProps) {
+        Object raw = brokerProps.get(SUPER_USERS_KEY);
+        if (raw == null) {
+            return;
+        }
+        String value = raw.toString();
+        if (value.isEmpty()) {
+            return;
+        }
+        List<String> offenders = new ArrayList<>();
+        for (String entry : value.split(";")) {
+            String trimmed = entry.trim();
+            if (trimmed.isEmpty()) {
+                continue;
+            }
+            int colon = trimmed.indexOf(':');
+            // A super.users entry without `:` is malformed and the authorizer
+            // itself will reject it. We only flag the tenant-prefix case so the
+            // error message is precise — leave other validation to the auth path.
+            String name = colon < 0 ? trimmed : trimmed.substring(colon + 1);
+            if (name.startsWith(TenantNamespace.PRINCIPAL_PREFIX)) {
+                offenders.add(trimmed);
+            }
+        }
+        if (offenders.isEmpty()) {
+            return;
+        }
+        throw new ConfigException(SUPER_USERS_KEY, value,
+            "super.users entries " + String.join(", ", offenders)
+                + " use the reserved tenant prefix '" + TenantNamespace.PRINCIPAL_PREFIX
+                + "'. A super-user bypasses every ACL check, so granting it to a "
+                + "tenant principal defeats tenant isolation. Configure super.users "
+                + "with operator principals only; never with tenant principals.");
     }
 
     private static BuilderRef resolveBuilderRef(Object listenerOverride, Class<?> defaultBuilderClass) {
