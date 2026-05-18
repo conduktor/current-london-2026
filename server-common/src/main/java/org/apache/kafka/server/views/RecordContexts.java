@@ -155,6 +155,10 @@ public final class RecordContexts {
             return body;
         }
 
+        @Override public byte[] rawHeader(String name) {
+            return headers.get(name);
+        }
+
         @Override public long offset() {
             return offset;
         }
@@ -439,8 +443,11 @@ public final class RecordContexts {
         try {
             return p.getLongValue();
         } catch (IOException overflow) {
-            // Integer that doesn't fit in a long — silently treat as missing.
-            return null;
+            // Integer beyond Long range: a downstream `body.field != 1` predicate would
+            // otherwise see null and (because null != 1 is true under equality semantics)
+            // wrongly retain the record. PROMPT.md scenario "out-of-long-range integers
+            // silently skip those records" requires record-skip, so we surface BODY_UNUSABLE.
+            return RecordContext.BODY_UNUSABLE;
         }
     }
 

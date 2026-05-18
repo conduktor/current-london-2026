@@ -38,6 +38,15 @@ public interface RecordContext {
     /** Raw value bytes, or null if the record has no value. */
     byte[] rawBody();
 
+    /**
+     * Raw header bytes for {@code name}, or {@code null} if the header is not set on the record.
+     * Used alongside {@link #header(String)} to distinguish "header absent" (null value, predicate
+     * sees {@code null}) from "header present but bytes are not valid UTF-8" (SKIP record). The
+     * spec (PROMPT.md scenario list) requires invalid-UTF-8 headers to silently skip the record
+     * rather than falsely satisfy {@code header != literal} via a null bypass.
+     */
+    byte[] rawHeader(String name);
+
     /** UTF-8 decode of the raw key, or empty if the key is null or invalid UTF-8. */
     Optional<String> keyAsString();
 
@@ -45,6 +54,8 @@ public interface RecordContext {
      * UTF-8 decode of a header value by name. Empty if the header doesn't exist or the bytes
      * are not valid UTF-8. Header lookups do not throw — invalid headers are silently treated
      * as missing, as required by the spec's "malformed headers must not crash the fetch" rule.
+     * Callers that need to distinguish absent from undecodable must pair this with
+     * {@link #rawHeader(String)}.
      */
     Optional<String> header(String name);
 

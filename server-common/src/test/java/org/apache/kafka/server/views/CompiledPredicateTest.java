@@ -430,4 +430,87 @@ class CompiledPredicateTest {
         assertEquals((threads / 2) * iterations, trueCount.get());
         assertEquals((threads / 2) * iterations, falseCount.get());
     }
+
+    // ---------- malformed-scalar access control (PROMPT.md scenario list) ----------
+
+    /**
+     * A {@code header != literal} predicate must NOT retain a record whose header bytes are
+     * invalid UTF-8. Pre-fix the resolver returned {@code null} for both "header missing" and
+     * "header present but undecodable"; {@code null != literal} evaluates to {@code true}, so an
+     * adversary could craft a header value with invalid UTF-8 to slip past a {@code tenant !=
+     * 'blocked'} filter. The fix is to surface the decode failure as a record-skip.
+     */
+    @Test
+    void invalidUtf8HeaderDoesNotPassNegatedPredicate() {
+        CompiledPredicate p = compiler.compile("headers['x-tenant'] != 'blocked'");
+        byte[] invalid = new byte[]{(byte) 0xC0, (byte) 0x80}; // overlong NUL — not valid UTF-8
+        RecordContext ctx = RecordContexts.builder()
+                .body("{}".getBytes())
+                .header("x-tenant", invalid)
+                .build();
+        Optional<Boolean> r = p.evaluate(ctx);
+        assertTrue(r.isEmpty(),
+                () -> "invalid-UTF-8 header must yield SKIP (empty), got " + r);
+    }
+
+    /**
+     * Companion to the previous test: when the header is genuinely absent (not just undecodable)
+     * a {@code header != literal} predicate must still evaluate to a boolean — predicate authors
+     * legitimately use this idiom to allow records that don't carry the header at all. Absent
+     * remains the {@code null} value, which is unequal to any non-null literal.
+     */
+    @Test
+    void absentHeaderEvaluatesAsNullForNegatedPredicate() {
+        CompiledPredicate p = compiler.compile("headers['x-tenant'] != 'blocked'");
+        RecordContext ctx = RecordContexts.builder().body("{}".getBytes()).build();
+        Optional<Boolean> r = p.evaluate(ctx);
+        assertTrue(r.isPresent() && r.get(),
+                () -> "absent header is null, null != 'blocked' is true, record kept; got " + r);
+    }
+
+    @Test
+    void invalidUtf8KeyDoesNotPassNegatedPredicate() {
+        CompiledPredicate p = compiler.compile("key != 'blocked'");
+        byte[] invalid = new byte[]{(byte) 0xC0, (byte) 0x80};
+        RecordContext ctx = RecordContexts.builder().body("{}".getBytes()).key(invalid).build();
+        Optional<Boolean> r = p.evaluate(ctx);
+        assertTrue(r.isEmpty(),
+                () -> "invalid-UTF-8 key must yield SKIP (empty), got " + r);
+    }
+
+    @Test
+    void absentKeyEvaluatesAsNullForNegatedPredicate() {
+        CompiledPredicate p = compiler.compile("key != 'blocked'");
+        RecordContext ctx = RecordContexts.builder().body("{}".getBytes()).build();
+        Optional<Boolean> r = p.evaluate(ctx);
+        assertTrue(r.isPresent() && r.get(),
+                () -> "absent key is null, null != 'blocked' is true, record kept; got " + r);
+    }
+
+    /**
+     * Out-of-long-range integer in the JSON body. The number is syntactically valid JSON but
+     * doesn't fit in a Java {@code long}; pre-fix the parser silently treated it as {@code null}
+     * and a predicate like {@code body.account_id != 1} would falsely retain the record.
+     */
+    @Test
+    void outOfLongRangeIntegerDoesNotPassNegatedPredicate() {
+        CompiledPredicate p = compiler.compile("body.account_id != 1");
+        // 21 digits — overflows Long.MAX_VALUE (19-digit ceiling).
+        RecordContext ctx = jsonRecord("{\"account_id\":999999999999999999999}");
+        Optional<Boolean> r = p.evaluate(ctx);
+        assertTrue(r.isEmpty(),
+                () -> "out-of-long-range integer must yield SKIP, got " + r);
+    }
+
+    @Test
+    void outOfLongRangeIntegerDoesNotPassPositiveEquality() {
+        // The mirror case: {body.account_id == 1} should also skip (not return false), so a
+        // downstream predicate like `(body.account_id == 1) || other_condition` doesn't silently
+        // turn the overflow into a "false" that gets OR'd away.
+        CompiledPredicate p = compiler.compile("body.account_id == 1");
+        RecordContext ctx = jsonRecord("{\"account_id\":999999999999999999999}");
+        Optional<Boolean> r = p.evaluate(ctx);
+        assertTrue(r.isEmpty(),
+                () -> "out-of-long-range integer must yield SKIP, got " + r);
+    }
 }

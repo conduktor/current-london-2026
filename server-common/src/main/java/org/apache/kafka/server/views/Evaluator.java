@@ -18,6 +18,7 @@ package org.apache.kafka.server.views;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 
 /**
  * Tree-walking AST interpreter. One {@link #evaluate(Ast.Node, RecordContext)} call processes a
@@ -354,12 +355,9 @@ final class Evaluator {
                 if (!path.accessors.isEmpty()) return null;
                 return ctx.timestamp();
             case "key":
-                if (!path.accessors.isEmpty()) return null;
-                return ctx.keyAsString().orElse(null);
-            case "headers": {
-                if (path.accessors.size() != 1) return null;
-                return ctx.header(path.accessors.get(0)).orElse(null);
-            }
+                return resolveKey(path, ctx);
+            case "headers":
+                return resolveHeader(path, ctx);
             case "body": {
                 List<String> tail = new ArrayList<>(path.accessors);
                 Object v = ctx.bodyAt(tail);
@@ -374,5 +372,29 @@ final class Evaluator {
                 // Should never reach here — parser rejects unknown roots.
                 return null;
         }
+    }
+
+    /**
+     * Resolves the {@code key} binding with absent-vs-undecodable disambiguation. Empty
+     * {@link Optional} from {@link RecordContext#keyAsString} can mean (1) the record has no key
+     * — legitimate null, predicate {@code key == 'x'} evaluates to false, {@code key == null}
+     * to true — or (2) key bytes are present but not valid UTF-8 (UNDECODABLE — per PROMPT.md
+     * scenario "invalid UTF-8 ... silently skips those records" we return SKIP, otherwise
+     * {@code key != 'blocked'} would falsely retain the record).
+     */
+    private Object resolveKey(Ast.Path path, RecordContext ctx) {
+        if (!path.accessors.isEmpty()) return null;
+        Optional<String> decoded = ctx.keyAsString();
+        if (decoded.isPresent()) return decoded.get();
+        return ctx.rawKey() == null ? null : SKIP;
+    }
+
+    /** Same absent-vs-undecodable distinction as {@link #resolveKey} for header accessors. */
+    private Object resolveHeader(Ast.Path path, RecordContext ctx) {
+        if (path.accessors.size() != 1) return null;
+        String name = path.accessors.get(0);
+        Optional<String> decoded = ctx.header(name);
+        if (decoded.isPresent()) return decoded.get();
+        return ctx.rawHeader(name) == null ? null : SKIP;
     }
 }
