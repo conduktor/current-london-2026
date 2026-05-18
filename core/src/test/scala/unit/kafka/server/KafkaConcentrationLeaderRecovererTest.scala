@@ -225,6 +225,45 @@ class KafkaConcentrationLeaderRecovererTest {
   }
 
   @Test
+  def runScanBoundsScopeByHighWatermarkNotLogEndOffset(): Unit = {
+    // Codex round-9 BLOCKER 1: leader-acquisition recovery must bound its scan to
+    // unifiedLog.highWatermark, not unifiedLog.logEndOffset. Records past HW have not been
+    // committed by the cluster — a subsequent leader-epoch resolution may truncate them and
+    // orphan any sidecar entries that referenced them. The behavioural pin: the recoverer
+    // reads highWatermark, and DOES NOT consult logEndOffset on this path.
+    val kernel = mock(classOf[ConcentrationKernel])
+    val logManager = mock(classOf[LogManager])
+    val executor = synchronousExecutor()
+    when(kernel.isBackingTopic(backingTp.topic)).thenReturn(true)
+    when(kernel.currentGeneration(backingTp)).thenReturn(123L)
+    when(kernel.logicalPartitionsForBacking(backingTp))
+      .thenReturn(filterOf("orders", 0))
+    stubScanLock(kernel, backingTp)
+    val unifiedLog = mock(classOf[UnifiedLog])
+    when(unifiedLog.logStartOffset).thenReturn(0L)
+    // HW < LEO: a sliver of uncommitted tail exists. The recoverer must scan [0, HW), not
+    // [0, LEO). We engineer HW = 7 and LEO = 9999 — if the recoverer mistakenly read LEO it
+    // would try to construct an iterator over a far-larger range. We deliberately do NOT
+    // stub logEndOffset; if the production code reads it the mock returns 0 (the long
+    // default), the empty-log branch fires, and the assertions on publish + recoverFromBackingScan
+    // shape would diverge from what an HW-bound scan produces.
+    when(unifiedLog.highWatermark).thenReturn(7L)
+    when(logManager.getLog(mockEq(backingTp), any[Boolean])).thenReturn(Some(unifiedLog))
+    val partition = mock(classOf[Partition])
+    when(partition.getLeaderEpoch).thenReturn(11)
+    val recoverer = new KafkaConcentrationLeaderRecoverer(kernel, logManager, executor)
+
+    recoverer.onMakeLeader(backingTp, partition)
+
+    // The behavioural pin: highWatermark was read, logEndOffset was NOT.
+    verify(unifiedLog, atLeastOnce()).highWatermark
+    verify(unifiedLog, never()).logEndOffset
+    // And the scan path was entered (non-empty branch under HW=7) and publish was attempted.
+    verify(kernel).recoverFromBackingScan(any[util.Iterator[RecoveryRecord]], any[util.Set[LogicalPartition]])
+    verify(kernel).publishIfGenerationMatches(mockEq(backingTp), mockEq(123L), any[Runnable])
+  }
+
+  @Test
   def scanAbortsWithoutPublishWhenEpochMovedBeforeScanStarted(): Unit = {
     // Cheap pre-fence: if the partition is no longer leader at the captured epoch when
     // the scan thread starts, abandon the scan. This is an optimisation, not a
@@ -242,7 +281,9 @@ class KafkaConcentrationLeaderRecovererTest {
     stubScanLock(kernel, backingTp)
     val unifiedLog = mock(classOf[UnifiedLog])
     when(unifiedLog.logStartOffset).thenReturn(0L)
-    when(unifiedLog.logEndOffset).thenReturn(1000L)
+    // BLOCKER 1 contract: recovery scope is HW-bounded, not LEO. Stub HW to a non-zero value
+    // so this test exercises the epoch-moved pre-fence (not the empty-log shortcut).
+    when(unifiedLog.highWatermark).thenReturn(1000L)
     when(logManager.getLog(backingTp)).thenReturn(Some(unifiedLog))
     val partition = mock(classOf[Partition])
     // First call (capture) returns 5; second call (pre-fence inside runScan) returns 6.
@@ -275,7 +316,8 @@ class KafkaConcentrationLeaderRecovererTest {
     stubScanLock(kernel, backingTp)
     val unifiedLog = mock(classOf[UnifiedLog])
     when(unifiedLog.logStartOffset).thenReturn(0L)
-    when(unifiedLog.logEndOffset).thenReturn(100L)
+    // BLOCKER 1: HW-bounded scan. Non-zero HW puts us on the real-scan path that throws.
+    when(unifiedLog.highWatermark).thenReturn(100L)
     when(logManager.getLog(mockEq(backingTp), any[Boolean])).thenReturn(Some(unifiedLog))
     doThrow(new RuntimeException("simulated scan fault"))
       .when(kernel).recoverFromBackingScan(any[util.Iterator[RecoveryRecord]], any[util.Set[LogicalPartition]])
@@ -338,7 +380,8 @@ class KafkaConcentrationLeaderRecovererTest {
     val realLock = stubScanLock(kernel, backingTp)
     val unifiedLog = mock(classOf[UnifiedLog])
     when(unifiedLog.logStartOffset).thenReturn(0L)
-    when(unifiedLog.logEndOffset).thenReturn(100L)
+    // BLOCKER 1: HW-bounded scan. Non-zero HW puts us on the real-scan path that throws.
+    when(unifiedLog.highWatermark).thenReturn(100L)
     when(logManager.getLog(mockEq(backingTp), any[Boolean])).thenReturn(Some(unifiedLog))
     doThrow(new RuntimeException("simulated scan fault"))
       .when(kernel).recoverFromBackingScan(any[util.Iterator[RecoveryRecord]], any[util.Set[LogicalPartition]])

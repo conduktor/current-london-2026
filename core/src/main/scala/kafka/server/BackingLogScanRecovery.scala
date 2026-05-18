@@ -117,14 +117,23 @@ class BackingLogScanRecovery(
       unifiedLog: UnifiedLog,
       filter: util.Set[LogicalPartition]): Unit = {
     val startOffset = unifiedLog.logStartOffset
-    val endOffset = unifiedLog.logEndOffset
+    // Codex round-9 BLOCKER 1: bound recovery to the high watermark, not the log end offset.
+    // Records past HW have NOT been committed by the cluster — they may be truncated by a
+    // subsequent leader-epoch resolution if this broker turns out to be a follower whose tail
+    // diverged from the new leader. Stamping sidecar entries for those offsets would publish
+    // logical→physical mappings that later point at deleted backing offsets. Scanning HW-bound
+    // costs nothing in the steady state (the HW catches LEO promptly under acks=all produce);
+    // any records produced through this broker as leader after recovery are added incrementally
+    // to the sidecar through the produce-commit path.
+    val endOffset = unifiedLog.highWatermark
     if (startOffset >= endOffset) {
-      log.info(s"BackingLogScanRecovery: backing partition $tp is empty " +
-        s"(startOffset=$startOffset == endOffset=$endOffset); ${filter.size} sidecars stay absent")
+      log.info(s"BackingLogScanRecovery: backing partition $tp has no durable records to " +
+        s"recover (startOffset=$startOffset, highWatermark=$endOffset); ${filter.size} " +
+        "sidecars stay absent until leader-acquisition rescans under the kernel readiness gate")
       return
     }
-    log.info(s"BackingLogScanRecovery: scanning $tp [$startOffset, $endOffset) for " +
-      s"${filter.size} logical partition(s)")
+    log.info(s"BackingLogScanRecovery: scanning $tp [$startOffset, $endOffset) (HW-bounded) " +
+      s"for ${filter.size} logical partition(s)")
     val iter = new BackingLogPageIterator(unifiedLog, filter, readBufferBytes, startOffset, endOffset)
     kernel.recoverFromBackingScan(iter)
   }
@@ -133,9 +142,9 @@ class BackingLogScanRecovery(
 /**
  * Iterator that walks a single {@link UnifiedLog} page-by-page and yields one
  * {@link RecoveryRecord} per stamped backing record whose logical partition appears in
- * {@code filter}. Uses {@link FetchIsolation#LOG_END} — recovery must see all durable records on
- * this replica, not just those past the high watermark. The high watermark is not yet
- * trustworthy at recovery time anyway, because it gets recomputed once replication catches up.
+ * {@code filter}. Uses {@link FetchIsolation#HIGH_WATERMARK} so the recovery scan only consumes
+ * committed records — Codex round-9 BLOCKER 1. Records past the HW may be truncated later by
+ * leader-epoch resolution and would orphan any sidecar entries that referenced them.
  */
 private class BackingLogPageIterator(
     unifiedLog: UnifiedLog,
@@ -172,7 +181,7 @@ private class BackingLogPageIterator(
       val fdi = unifiedLog.read(
         startOffset = nextOffset,
         maxLength = pageBytes,
-        isolation = FetchIsolation.LOG_END,
+        isolation = FetchIsolation.HIGH_WATERMARK,
         minOneMessage = true)
       val records = fdi.records
       // Walk batches to find the last offset we read so we can advance; do this BEFORE we exit

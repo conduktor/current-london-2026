@@ -241,6 +241,62 @@ class BackingLogScanRecoveryTest {
   }
 
   @Test
+  def runStampsNothingWhenHighWatermarkIsZero(): Unit = {
+    // BLOCKER 1: a freshly-loaded UnifiedLog has HW = logStartOffset (typically 0) until
+    // replication catches up or the leader explicitly advances HW. Records physically on
+    // disk past HW are NOT committed and may yet be truncated by leader-epoch resolution.
+    // Recovery must skip them — even though they pass the LogicalRecoveryExtractor's
+    // header check — and leave the sidecar absent. The leader-acquisition rescan (driven
+    // by KafkaConcentrationLeaderRecoverer) handles the catch-up once HW advances.
+    val backingTopic = "backing-hw-zero"
+    kernel.declare(new LogicalTopicDescriptor("orders", 1, backingTopic, 1))
+    val src = MemoryRecords.withRecords(Compression.NONE,
+      new SimpleRecord(time.milliseconds(), "k".getBytes, "v".getBytes))
+    val stamped = LogicalProduceStamper.stamp(src, "orders", 0, Array(0L))
+    unifiedLog.appendAsLeader(stamped, 0)
+    assertEquals(0L, unifiedLog.highWatermark, "HW must be 0 (no replication catch-up yet)")
+    assertTrue(unifiedLog.logEndOffset > 0L, "LEO must be > 0 — data exists, just not yet HW-durable")
+
+    val tp = new TopicPartition(backingTopic, 0)
+    when(logManager.getLog(tp, false)).thenReturn(Some(unifiedLog))
+
+    new BackingLogScanRecovery(kernel, logManager).run()
+
+    assertEquals(1, kernel.partitionsWithoutSidecar().size,
+      "no records are HW-durable — the sidecar must stay absent")
+    assertEquals(0L, kernel.nextLogicalOffset("orders", 0),
+      "tracker stays at default — recovery refused to stamp uncommitted records")
+  }
+
+  @Test
+  def runDoesNotRecoverRecordsPastHighWatermark(): Unit = {
+    // BLOCKER 1: when HW < LEO at recovery time, only the [logStartOffset, HW) prefix is
+    // committed. Records in [HW, LEO) belong to the uncommitted tail and must NOT seed
+    // sidecar state — a subsequent leader-epoch resolution may truncate them, and any
+    // sidecar entry stamped now would point to a deleted physical offset on restart.
+    val backingTopic = "backing-hw-bound"
+    kernel.declare(new LogicalTopicDescriptor("orders", 1, backingTopic, 1))
+    for (i <- 0 until 5) {
+      appendStamped("orders", 0, Array(i.toLong), key = s"k$i", value = s"v$i")
+    }
+    // UnifiedLog.updateHighWatermark allows non-monotonic moves (it warns but does not
+    // reject) so tests can simulate the in-flight uncommitted-tail state. Production never
+    // hits this path — HW only moves forward — but the test needs to engineer HW < LEO to
+    // exercise the bound.
+    unifiedLog.updateHighWatermark(3L)
+    assertEquals(3L, unifiedLog.highWatermark, "test setup: HW must land at 3")
+    assertEquals(5L, unifiedLog.logEndOffset, "test setup: LEO must land at 5")
+
+    val tp = new TopicPartition(backingTopic, 0)
+    when(logManager.getLog(tp, false)).thenReturn(Some(unifiedLog))
+
+    new BackingLogScanRecovery(kernel, logManager).run()
+
+    assertEquals(3L, kernel.nextLogicalOffset("orders", 0),
+      "recovery must stop at HW: records 3 and 4 are past HW and must not seed sidecar state")
+  }
+
+  @Test
   def runIgnoresUnstampedRecordsOnBackingLog(): Unit = {
     // A backing partition could in principle contain pre-feature records or records produced
     // by a path that bypassed the stamper. The scan must skip them silently rather than crash.
@@ -267,5 +323,11 @@ class BackingLogScanRecoveryTest {
       new SimpleRecord(time.milliseconds(), key.getBytes, value.getBytes))
     val stamped = LogicalProduceStamper.stamp(src, logicalTopic, logicalPartition, logicalOffsets)
     unifiedLog.appendAsLeader(stamped, 0)
+    // BLOCKER 1: recovery is bounded by the high watermark, not LEO. UnifiedLog.appendAsLeader
+    // advances LEO but does NOT advance HW (HW only moves once the leader has observed ISR
+    // catch up, or when set explicitly). Tests that want the recovery scan to actually consume
+    // a freshly-appended record must move HW along with LEO. This mirrors the production
+    // invariant: by the time recovery runs, durable records have HW = LEO.
+    unifiedLog.updateHighWatermark(unifiedLog.logEndOffset)
   }
 }

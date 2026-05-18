@@ -49,7 +49,9 @@ import java.util.concurrent.atomic.AtomicLong
  *     per-backing generation token by 1;
  *  2. captures the new generation;
  *  3. submits a Runnable to the recovery executor that scans the backing log from
- *     {@code logStartOffset} to {@code logEndOffset}, applies the rebuilt sidecar state via
+ *     {@code logStartOffset} to {@code highWatermark} (Codex round-9 BLOCKER 1 — never past
+ *     HW, because records past HW may yet be truncated by leader-epoch resolution and orphan
+ *     any sidecar entries that referenced them), applies the rebuilt sidecar state via
  *     {@code kernel.recoverFromBackingScan}, and finally publishes by calling
  *     {@code kernel.publishIfGenerationMatches(backingTp, generation, no-op)} which flips the
  *     gate back to ready under the per-key lock IFF the generation is still current.
@@ -244,7 +246,14 @@ class KafkaConcentrationLeaderRecoverer(
       }
       val unifiedLog = unifiedLogOpt.get
       val startOffset = unifiedLog.logStartOffset
-      val endOffset = unifiedLog.logEndOffset
+      // Codex round-9 BLOCKER 1: bound to the high watermark, not the log end offset. Records
+      // past HW have not been committed by the cluster. A leadership flap after we stamp the
+      // sidecar through LEO would expose logical→physical mappings to consumers that later
+      // resolve to truncated physical offsets. The HW-bound is also consistent with Kafka's
+      // standard consumer guarantee. Records produced through this broker as leader AFTER the
+      // gate opens are added to the sidecar incrementally through the produce-commit path; the
+      // recovery scan only seeds state from the durable prefix at leader-acquisition time.
+      val endOffset = unifiedLog.highWatermark
 
       if (startOffset >= endOffset) {
         // Empty backing log. Reset every filter partition to (persistedStart, 0) under the
