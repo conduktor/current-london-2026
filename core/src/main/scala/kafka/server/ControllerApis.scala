@@ -366,6 +366,22 @@ class ControllerApis(
               "declaration from the controller's broker config and restart, then any physical " +
               "topic of the same name can be deleted via the normal path."))
           iterator.remove()
+        } else if (declaredBackingTopicNames.contains(name)) {
+          // r19 ADV-A BLOCKER #139: symmetry gap with #137. A principal holding DELETE on
+          // the backing topic name (e.g. "shared") who resolves the backing's UUID via any
+          // METADATA / DescribeTopicPartitions response can DeleteTopics(topicId=<backing>)
+          // and KRaft will delete the physical backing log — taking every logical tenant's
+          // data on that backing with it (committed offsets, sidecar indices, in-flight
+          // produces, idempotent-state). This is a single-RPC multi-tenant-data-loss path.
+          // Auth-first precedence holds because `deletable.contains(name)` cleared above —
+          // the operator-remediation message is only disclosed to principals already known
+          // to be authorized for the delete.
+          appendResponse(name, id, new ApiError(INVALID_REQUEST,
+            s"Topic '$name' is the backing topic for one or more declared logical topics " +
+              "in concentration.logical.topics on this controller. Backing topics cannot be " +
+              "deleted via DeleteTopics while declarations are active; remove the " +
+              "declaration(s) and restart to delete the backing."))
+          iterator.remove()
         }
       }
       // For each topic that was provided by name, check if authentication failed.
@@ -394,6 +410,20 @@ class ControllerApis(
                   "this controller. Logical topics cannot be deleted via DeleteTopics; remove the " +
                   "declaration from the controller's broker config and restart, then any physical " +
                   "topic of the same name can be deleted via the normal path."))
+            } else {
+              appendResponse(name, ZERO_UUID, new ApiError(TOPIC_AUTHORIZATION_FAILED))
+            }
+          } else if (declaredBackingTopicNames.contains(name)) {
+            // r19 ADV-A BLOCKER #139 (name path): a principal with DELETE on the backing name
+            // could otherwise delete the physical backing log and take every logical tenant's
+            // data with it. Same describable+deletable split as the logical-name branch above
+            // so the declared-backing set is not enumerable by describe-only principals.
+            if (deletable.contains(name)) {
+              appendResponse(name, ZERO_UUID, new ApiError(INVALID_REQUEST,
+                s"Topic '$name' is the backing topic for one or more declared logical topics " +
+                  "in concentration.logical.topics on this controller. Backing topics cannot be " +
+                  "deleted via DeleteTopics while declarations are active; remove the " +
+                  "declaration(s) and restart to delete the backing."))
             } else {
               appendResponse(name, ZERO_UUID, new ApiError(TOPIC_AUTHORIZATION_FAILED))
             }

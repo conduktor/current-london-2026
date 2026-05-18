@@ -1355,6 +1355,104 @@ class ControllerApisTest {
     ).get().asScala.toSet)
   }
 
+  /**
+   * r19 ADV-A BLOCKER #139 — DeleteTopics must refuse the backing-topic name of a declared
+   * logical, by NAME path. Before this fix, a principal with DELETE on the backing name
+   * "shared" could send DeleteTopics(["shared"]) and the controller would delete the
+   * physical backing log — taking every logical tenant on that backing with it (committed
+   * offsets, sidecar indices, in-flight produces). The same shape as #137 but on a
+   * data-loss RPC instead of a partition-count RPC.
+   */
+  @Test
+  def testDeleteTopicsRejectsDeclaredBackingName(): Unit = {
+    val sharedId = Uuid.fromString("vZKYST0pSA2HO5x_6hoO2Q")
+    val controller = new MockController.Builder().
+      newInitialTopic("shared", sharedId).build()
+    val props = new Properties()
+    props.put(ServerConfigs.CONCENTRATION_LOGICAL_TOPICS_CONFIG, "orders:100:shared:4,payments:50:shared:4")
+    controllerApis = createControllerApis(None, controller, props)
+    val request = new DeleteTopicsRequestData().setTopicNames(
+      util.Arrays.asList("shared", "innocent"))
+    val expectedResponse = Set(
+      new DeletableTopicResult().setName("shared").
+        setErrorCode(INVALID_REQUEST.code()).
+        setErrorMessage("Topic 'shared' is the backing topic for one or more declared logical " +
+          "topics in concentration.logical.topics on this controller. Backing topics cannot be " +
+          "deleted via DeleteTopics while declarations are active; remove the declaration(s) " +
+          "and restart to delete the backing."),
+      new DeletableTopicResult().setName("innocent").
+        setErrorCode(UNKNOWN_TOPIC_OR_PARTITION.code()).
+        setErrorMessage("This server does not host this topic-partition."))
+    assertEquals(expectedResponse, controllerApis.deleteTopics(ANONYMOUS_CONTEXT, request,
+      ApiKeys.DELETE_TOPICS.latestVersion().toInt,
+      hasClusterAuth = true,
+      _ => Set.empty,
+      _ => Set.empty).get().asScala.toSet)
+  }
+
+  /**
+   * r19 ADV-A BLOCKER #139 — DeleteTopics by UUID must also refuse the backing-topic name.
+   * UUIDs are trivial to obtain (any METADATA response surfaces them), so the UUID path
+   * must hold the same data-loss guard as the name path. After findTopicNames resolves
+   * the backing UUID to its name "shared", the declaredBackingTopicNames check rejects.
+   */
+  @Test
+  def testDeleteTopicsByIdRejectsDeclaredBackingName(): Unit = {
+    val sharedId = Uuid.fromString("vZKYST0pSA2HO5x_6hoO2Q")
+    val innocentId = Uuid.fromString("VlFu5c51ToiNx64wtwkhQw")
+    val controller = new MockController.Builder().
+      newInitialTopic("shared", sharedId).
+      newInitialTopic("innocent", innocentId).build()
+    val props = new Properties()
+    props.put(ServerConfigs.CONCENTRATION_LOGICAL_TOPICS_CONFIG, "orders:100:shared:4")
+    controllerApis = createControllerApis(None, controller, props)
+    val request = new DeleteTopicsRequestData()
+    request.topics().add(new DeleteTopicState().setName(null).setTopicId(sharedId))
+    request.topics().add(new DeleteTopicState().setName(null).setTopicId(innocentId))
+
+    val expectedResponse = Set(
+      new DeletableTopicResult().setName("shared").setTopicId(sharedId).
+        setErrorCode(INVALID_REQUEST.code()).
+        setErrorMessage("Topic 'shared' is the backing topic for one or more declared logical " +
+          "topics in concentration.logical.topics on this controller. Backing topics cannot be " +
+          "deleted via DeleteTopics while declarations are active; remove the declaration(s) " +
+          "and restart to delete the backing."),
+      new DeletableTopicResult().setName("innocent").setTopicId(innocentId))
+    assertEquals(expectedResponse, controllerApis.deleteTopics(ANONYMOUS_CONTEXT, request,
+      ApiKeys.DELETE_TOPICS.latestVersion().toInt,
+      hasClusterAuth = true,
+      _ => Set.empty,
+      _ => Set.empty).get().asScala.toSet)
+  }
+
+  /**
+   * r19 ADV-A BLOCKER #139 — auth-first / shadow-second precedence on the name path. A
+   * describe-only principal must see TOPIC_AUTHORIZATION_FAILED (identical to a real-but-
+   * unauthorized topic), NOT the backing-name operator message. Otherwise the declared-
+   * backing set is enumerable by anyone with DESCRIBE.
+   */
+  @Test
+  def testDeleteTopicsBackingRejectionRequiresDeletePermission(): Unit = {
+    val sharedId = Uuid.fromString("vZKYST0pSA2HO5x_6hoO2Q")
+    val controller = new MockController.Builder().
+      newInitialTopic("shared", sharedId).build()
+    val props = new Properties()
+    props.put(ServerConfigs.CONCENTRATION_LOGICAL_TOPICS_CONFIG, "orders:100:shared:4")
+    controllerApis = createControllerApis(None, controller, props)
+    val request = new DeleteTopicsRequestData().setTopicNames(
+      util.Arrays.asList("shared"))
+
+    val expectedResponse = Set(
+      new DeletableTopicResult().setName("shared").setErrorCode(TOPIC_AUTHORIZATION_FAILED.code())
+        .setErrorMessage("Topic authorization failed."))
+    assertEquals(expectedResponse, controllerApis.deleteTopics(ANONYMOUS_CONTEXT, request,
+      ApiKeys.DELETE_TOPICS.latestVersion().toInt,
+      hasClusterAuth = false,
+      _ => Set("shared"), // describable
+      _ => Set.empty       // not deletable
+    ).get().asScala.toSet)
+  }
+
   @ParameterizedTest
   @ValueSource(booleans = Array(true, false))
   def testCreatePartitionsRequest(validateOnly: Boolean): Unit = {
