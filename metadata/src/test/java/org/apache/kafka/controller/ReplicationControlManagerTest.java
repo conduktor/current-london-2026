@@ -98,6 +98,7 @@ import org.apache.kafka.server.common.EligibleLeaderReplicasVersion;
 import org.apache.kafka.server.common.MetadataVersion;
 import org.apache.kafka.server.common.TopicIdPartition;
 import org.apache.kafka.server.policy.CreateTopicPolicy;
+import org.apache.kafka.server.views.ViewTopicConfig;
 import org.apache.kafka.server.util.MockRandom;
 import org.apache.kafka.timeline.SnapshotRegistry;
 
@@ -1639,6 +1640,83 @@ public class ReplicationControlManagerTest {
         assertArrayEquals(
                 new Uuid[] {DirectoryId.UNASSIGNED, Uuid.fromString("dxCDSgNjQvS4WuyqEKoCwA")},
                 replicationControl.getPartition(replicationControl.getTopicId("foo"), 5).directories);
+    }
+
+    @Test
+    public void testCreatePartitionsRejectedOnViewTopic() {
+        // PROMPT.md: views are virtual read-only topics whose partition count is determined by the
+        // backing topic at fetch redirect time. CreatePartitions on a view would surface phantom
+        // partitions whose backing index does not exist — fetch would fail with
+        // UNKNOWN_TOPIC_OR_PARTITION, OffsetFetch would commit against nothing, and the view's
+        // metadata would diverge from the backing's. ReplicationControlManager.createPartitions
+        // must reject view topics with INVALID_TOPIC_EXCEPTION before mutating state.
+        ReplicationControlTestContext ctx = new ReplicationControlTestContext.Builder().build();
+        ReplicationControlManager replicationControl = ctx.replicationControl;
+        CreateTopicsRequestData request = new CreateTopicsRequestData();
+        request.topics().add(new CreatableTopic().setName("view").
+            setNumPartitions(2).setReplicationFactor((short) 2));
+        request.topics().add(new CreatableTopic().setName("regular").
+            setNumPartitions(2).setReplicationFactor((short) 2));
+        ctx.registerBrokersWithDirs(
+                0, Collections.emptyList(),
+                1, asList(Uuid.fromString("QMzamNQVQ7GnJK9DwQHG7Q"), Uuid.fromString("loDxEBLETdedNnQGOKKENw")),
+                3, Collections.singletonList(Uuid.fromString("dxCDSgNjQvS4WuyqEKoCwA")));
+        ctx.unfenceBrokers(0, 1, 3);
+        ControllerRequestContext createTopicsContext = anonymousContextFor(ApiKeys.CREATE_TOPICS);
+        ControllerResult<CreateTopicsResponseData> createTopicResult = replicationControl.
+            createTopics(createTopicsContext, request, new HashSet<>(Arrays.asList("view", "regular")));
+        ctx.replay(createTopicResult.records());
+
+        // Mark "view" as a view topic by setting the predicate config — that's how
+        // ReplicationControlManager.createPartitions (line ~1849) distinguishes views.
+        ctx.alterTopicConfig("view", ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.x == 1");
+
+        List<CreatePartitionsTopic> topics = new ArrayList<>();
+        topics.add(new CreatePartitionsTopic().setName("view").setCount(4).setAssignments(null));
+        topics.add(new CreatePartitionsTopic().setName("regular").setCount(4).setAssignments(null));
+        ControllerRequestContext requestContext = anonymousContextFor(ApiKeys.CREATE_PARTITIONS);
+        ControllerResult<List<CreatePartitionsTopicResult>> result =
+            replicationControl.createPartitions(requestContext, topics);
+
+        // View topic must fail with INVALID_TOPIC_EXCEPTION and a message that explains why; the
+        // regular topic in the same request must still succeed end-to-end. Partial success matters:
+        // a single view in a multi-topic CreatePartitions must not poison the whole request.
+        CreatePartitionsTopicResult viewResult = result.response().stream()
+            .filter(r -> r.name().equals("view")).findFirst().orElseThrow();
+        CreatePartitionsTopicResult regularResult = result.response().stream()
+            .filter(r -> r.name().equals("regular")).findFirst().orElseThrow();
+        assertEquals(INVALID_TOPIC_EXCEPTION.code(), viewResult.errorCode(),
+            "CreatePartitions on a view topic must surface INVALID_TOPIC_EXCEPTION");
+        assertNotNull(viewResult.errorMessage(),
+            "the rejection should carry an operator-readable reason");
+        assertTrue(viewResult.errorMessage().contains("view"),
+            "the error message should mention 'view' so operators can correlate (got: " +
+                viewResult.errorMessage() + ")");
+        assertEquals(NONE.code(), regularResult.errorCode(),
+            "a non-view topic in the same multi-topic request must still succeed");
+
+        // Replay the records so the partition state reflects what actually got persisted. The view
+        // entry threw an ApiException pre-mutation, so it produced no records; the regular entry
+        // succeeded and produced new partition records. After replay, the view must still have its
+        // original 2 partitions and the regular topic must have grown to 4. That's the load-bearing
+        // invariant: a single view in a multi-topic CreatePartitions must not poison the whole
+        // request, and the view itself must not gain phantom partitions.
+        ctx.replay(result.records());
+        Uuid viewId = replicationControl.getTopicId("view");
+        Uuid regularId = replicationControl.getTopicId("regular");
+        assertNotNull(replicationControl.getPartition(viewId, 0),
+            "view partition 0 must still exist (pre-existing)");
+        assertNotNull(replicationControl.getPartition(viewId, 1),
+            "view partition 1 must still exist (pre-existing)");
+        assertNull(replicationControl.getPartition(viewId, 2),
+            "no new view partition should have been created (partition 2 must not exist)");
+        assertNull(replicationControl.getPartition(viewId, 3),
+            "no new view partition should have been created (partition 3 must not exist)");
+        // The regular topic, by contrast, must have grown to 4 partitions.
+        assertNotNull(replicationControl.getPartition(regularId, 2),
+            "regular topic partition 2 must have been created");
+        assertNotNull(replicationControl.getPartition(regularId, 3),
+            "regular topic partition 3 must have been created");
     }
 
     @Test

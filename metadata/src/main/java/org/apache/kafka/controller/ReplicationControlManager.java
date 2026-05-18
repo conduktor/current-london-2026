@@ -97,6 +97,7 @@ import org.apache.kafka.server.common.ApiMessageAndVersion;
 import org.apache.kafka.server.common.TopicIdPartition;
 import org.apache.kafka.server.mutable.BoundedList;
 import org.apache.kafka.server.policy.CreateTopicPolicy;
+import org.apache.kafka.server.views.ViewTopicConfig;
 import org.apache.kafka.timeline.SnapshotRegistry;
 import org.apache.kafka.timeline.TimelineHashMap;
 import org.apache.kafka.timeline.TimelineHashSet;
@@ -1837,6 +1838,23 @@ public class ReplicationControlManager {
         TopicControlInfo topicInfo = topics.get(topicId);
         if (topicInfo == null) {
             throw new UnknownTopicOrPartitionException();
+        }
+        // View topics have no storage of their own; their partition count is determined by the
+        // backing topic at fetch redirect time. Allowing CreatePartitions to extend a view would
+        // surface phantom view partitions whose backing index does not exist — fetch would fail
+        // with UNKNOWN_TOPIC_OR_PARTITION, OffsetFetch would commit offsets against nothing, and
+        // the view's metadata would diverge from the backing's. Reject before mutating state.
+        //
+        // We read the raw dynamic-topic-config map (currentTopicConfig) instead of going through
+        // getTopicConfig/resolveEffectiveTopicConfig: the latter looks up the ConfigDef.ConfigKey
+        // by name and NPEs if the key is not registered with the controller's KafkaConfigSchema
+        // (which is the case for FakeKafkaConfigSchema in tests). The raw map is sufficient — we
+        // only need to know whether the predicate was explicitly set on this topic.
+        String viewPredicate = configurationControl.currentTopicConfig(topic.name())
+            .get(ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG);
+        if (viewPredicate != null && !viewPredicate.isEmpty()) {
+            throw new InvalidTopicException("Cannot add partitions to view topic '" + topic.name() +
+                    "': view partition count is determined by the backing topic.");
         }
         if (topic.count() == topicInfo.parts.size()) {
             throw new InvalidPartitionsException("Topic already has " +

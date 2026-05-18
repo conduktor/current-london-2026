@@ -94,6 +94,7 @@
         <allow pkg="org.apache.kafka.server.mutable" />
         <allow pkg="org.apache.kafka.server.policy"/>
         <allow pkg="org.apache.kafka.server.util"/>
+        <allow pkg="org.apache.kafka.server.views"/>
         <allow pkg="org.apache.kafka.snapshot" />
         <allow pkg="org.apache.kafka.test" />
         <allow pkg="org.apache.kafka.timeline" />
