@@ -311,6 +311,10 @@ class KafkaConfig private(doLog: Boolean, val props: util.Map[_, _])
   val socketReceiveBufferBytes = getInt(SocketServerConfigs.SOCKET_RECEIVE_BUFFER_BYTES_CONFIG)
   val socketRequestMaxBytes = getInt(SocketServerConfigs.SOCKET_REQUEST_MAX_BYTES_CONFIG)
   val socketListenBacklogSize = getInt(SocketServerConfigs.SOCKET_LISTEN_BACKLOG_SIZE_CONFIG)
+  // Parsed once at construction so misconfigured values fail boot, not the first accept.
+  val socketSelectorImplementation: org.apache.kafka.network.iouring.SelectorImplementation =
+    org.apache.kafka.network.iouring.SelectorImplementation.fromConfig(
+      getString(SocketServerConfigs.SOCKET_SELECTOR_IMPLEMENTATION_CONFIG))
   val maxConnectionsPerIp = getInt(SocketServerConfigs.MAX_CONNECTIONS_PER_IP_CONFIG)
   val maxConnectionsPerIpOverrides: Map[String, Int] =
     getMap(SocketServerConfigs.MAX_CONNECTIONS_PER_IP_OVERRIDES_CONFIG, getString(SocketServerConfigs.MAX_CONNECTIONS_PER_IP_OVERRIDES_CONFIG)).map { case (k, v) => (k, v.toInt)}
