@@ -121,6 +121,14 @@ public final class IoUringSelector implements BrokerSelector {
     private final long connectionsMaxIdleNanos;
     private final Time time;
     /**
+     * Broker configs threaded down to {@link IoUringPlaintextAuthenticator}'s
+     * {@link org.apache.kafka.common.network.ChannelBuilders#createPrincipalBuilder}. Required
+     * so a user-configured {@code principal.builder.class} is honored on the io_uring path —
+     * passing an empty map would silently fall back to DefaultKafkaPrincipalBuilder, diverging
+     * from the NIO PLAINTEXT path on the same broker.
+     */
+    private final Map<String, ?> configs;
+    /**
      * Processor id baked into every connection id we mint. The Kafka request-handling path
      * decrements connection quotas by parsing the connection id with {@link
      * org.apache.kafka.common.network.ServerConnectionId}, so the id must follow the
@@ -166,13 +174,23 @@ public final class IoUringSelector implements BrokerSelector {
     private final AtomicLong idGen = new AtomicLong();
     private volatile boolean closed;
 
-    /** Test-only constructor: uses processor id 0 (kept so existing unit tests don't churn). */
+    /** Test-only constructor: uses processor id 0 and an empty configs map (default principal builder). */
     public IoUringSelector(ListenerName listenerName,
                            int maxReceiveSize,
                            MemoryPool memoryPool,
                            long connectionsMaxIdleNanos,
                            Time time) {
-        this(listenerName, maxReceiveSize, memoryPool, connectionsMaxIdleNanos, time, 0);
+        this(listenerName, maxReceiveSize, memoryPool, connectionsMaxIdleNanos, time, 0, java.util.Collections.emptyMap());
+    }
+
+    /** Test-only constructor: empty configs map (default principal builder). */
+    public IoUringSelector(ListenerName listenerName,
+                           int maxReceiveSize,
+                           MemoryPool memoryPool,
+                           long connectionsMaxIdleNanos,
+                           Time time,
+                           int processorId) {
+        this(listenerName, maxReceiveSize, memoryPool, connectionsMaxIdleNanos, time, processorId, java.util.Collections.emptyMap());
     }
 
     public IoUringSelector(ListenerName listenerName,
@@ -180,13 +198,15 @@ public final class IoUringSelector implements BrokerSelector {
                            MemoryPool memoryPool,
                            long connectionsMaxIdleNanos,
                            Time time,
-                           int processorId) {
+                           int processorId,
+                           Map<String, ?> configs) {
         this.listenerName = Objects.requireNonNull(listenerName, "listenerName");
         this.maxReceiveSize = maxReceiveSize;
         this.memoryPool = Objects.requireNonNull(memoryPool, "memoryPool");
         this.connectionsMaxIdleNanos = connectionsMaxIdleNanos;
         this.time = Objects.requireNonNull(time, "time");
         this.processorId = processorId;
+        this.configs = Objects.requireNonNull(configs, "configs");
     }
 
     // -------------------------------------------------------------------------
@@ -209,7 +229,7 @@ public final class IoUringSelector implements BrokerSelector {
                   + remote.getAddress().getHostAddress() + ":" + remote.getPort() + "-"
                   + processorId + "-" + idGen.incrementAndGet();
         IoUringTransportLayer transport = new IoUringTransportLayer(nettyChannel, remote, local);
-        Authenticator authenticator = new IoUringPlaintextAuthenticator(transport, listenerName);
+        Authenticator authenticator = new IoUringPlaintextAuthenticator(transport, listenerName, configs);
         IoUringChannelMetadataRegistry metadata = new IoUringChannelMetadataRegistry();
         KafkaChannel channel = new KafkaChannel(id, transport, () -> authenticator, maxReceiveSize, memoryPool, metadata);
 

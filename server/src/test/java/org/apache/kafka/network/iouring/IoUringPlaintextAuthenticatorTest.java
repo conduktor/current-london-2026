@@ -16,13 +16,19 @@
  */
 package org.apache.kafka.network.iouring;
 
+import org.apache.kafka.common.config.internals.BrokerSecurityConfigs;
 import org.apache.kafka.common.network.ListenerName;
+import org.apache.kafka.common.security.auth.AuthenticationContext;
 import org.apache.kafka.common.security.auth.KafkaPrincipal;
+import org.apache.kafka.common.security.auth.KafkaPrincipalBuilder;
+import org.apache.kafka.common.security.auth.PlaintextAuthenticationContext;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 import java.net.InetSocketAddress;
+import java.util.Collections;
+import java.util.Map;
 
 import io.netty.channel.embedded.EmbeddedChannel;
 
@@ -48,7 +54,7 @@ class IoUringPlaintextAuthenticatorTest {
         layer = new IoUringTransportLayer(channel,
             new InetSocketAddress("198.51.100.7", 1234),
             new InetSocketAddress("203.0.113.1", 9092));
-        auth = new IoUringPlaintextAuthenticator(layer, ListenerName.normalised("PLAINTEXT"));
+        auth = new IoUringPlaintextAuthenticator(layer, ListenerName.normalised("PLAINTEXT"), Collections.emptyMap());
 
         auth.authenticate(); // no exception
         assertTrue(auth.complete(), "PLAINTEXT auth is always complete");
@@ -60,10 +66,44 @@ class IoUringPlaintextAuthenticatorTest {
         layer = new IoUringTransportLayer(channel,
             new InetSocketAddress("198.51.100.7", 1234),
             new InetSocketAddress("203.0.113.1", 9092));
-        auth = new IoUringPlaintextAuthenticator(layer, ListenerName.normalised("PLAINTEXT"));
+        auth = new IoUringPlaintextAuthenticator(layer, ListenerName.normalised("PLAINTEXT"), Collections.emptyMap());
 
         KafkaPrincipal p = auth.principal();
         assertEquals(KafkaPrincipal.ANONYMOUS, p,
             "PLAINTEXT must yield ANONYMOUS — the broker's authorizer keys off this");
+    }
+
+    @Test
+    void customPrincipalBuilderClassIsHonored() {
+        // Without threading the broker configs through, the io_uring path would silently
+        // fall back to DefaultKafkaPrincipalBuilder and emit ANONYMOUS regardless of what
+        // the user set principal.builder.class to — diverging from NIO PLAINTEXT on the
+        // same broker. The configs map is the only signal the user gave us; if we lose
+        // it we lose user-defined authorization semantics on PLAINTEXT.
+        channel = new EmbeddedChannel();
+        layer = new IoUringTransportLayer(channel,
+            new InetSocketAddress("198.51.100.7", 1234),
+            new InetSocketAddress("203.0.113.1", 9092));
+        Map<String, Object> configs = Collections.singletonMap(
+            BrokerSecurityConfigs.PRINCIPAL_BUILDER_CLASS_CONFIG, IpPrincipalBuilder.class);
+        auth = new IoUringPlaintextAuthenticator(layer, ListenerName.normalised("PLAINTEXT"), configs);
+
+        KafkaPrincipal p = auth.principal();
+        assertEquals("User", p.getPrincipalType());
+        assertEquals("198.51.100.7", p.getName(),
+            "custom builder must be loaded from configs and applied — otherwise io_uring " +
+            "PLAINTEXT silently diverges from NIO PLAINTEXT authorization");
+    }
+
+    /** Test-only builder that derives the principal name from the remote IP. */
+    public static final class IpPrincipalBuilder implements KafkaPrincipalBuilder {
+        @Override
+        public KafkaPrincipal build(AuthenticationContext context) {
+            if (context instanceof PlaintextAuthenticationContext) {
+                return new KafkaPrincipal(KafkaPrincipal.USER_TYPE,
+                    ((PlaintextAuthenticationContext) context).clientAddress().getHostAddress());
+            }
+            return KafkaPrincipal.ANONYMOUS;
+        }
     }
 }

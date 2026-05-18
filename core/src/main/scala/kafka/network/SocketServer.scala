@@ -942,13 +942,19 @@ private[kafka] class Processor(
           "(SO_REUSEPORT sharding needs every Processor to bind on the same configured port; " +
           "wildcard port 0 is not supported in this version)")
       }
+      // Threaded to IoUringPlaintextAuthenticator so a user-configured PRINCIPAL_BUILDER_CLASS_CONFIG
+      // is honored on this listener — mirroring the NIO PlaintextChannelBuilder path which calls
+      // configure(channelBuilderConfigs(config, listenerName)). valuesWithPrefixOverride applies
+      // any "listener.name.<name>." prefix overrides so per-listener principal builders work too.
+      val ioUringChannelConfigs = config.valuesWithPrefixOverride(listenerName.configPrefix)
       val ioUringSelector = new org.apache.kafka.network.iouring.IoUringSelector(
         listenerName,
         maxRequestSize,
         memoryPool,
         java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(connectionsMaxIdleMs),
         time,
-        id)
+        id,
+        ioUringChannelConfigs)
       val bindAddress = new java.net.InetSocketAddress(endPoint.host, endPoint.port)
       val listener = new org.apache.kafka.network.iouring.IoUringServerListener(
         bindAddress, ioUringSelector, config.socketListenBacklogSize)

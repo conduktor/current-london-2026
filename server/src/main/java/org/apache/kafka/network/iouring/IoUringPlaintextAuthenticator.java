@@ -27,7 +27,7 @@ import org.apache.kafka.common.utils.Utils;
 
 import java.io.Closeable;
 import java.net.InetAddress;
-import java.util.Collections;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -52,10 +52,15 @@ final class IoUringPlaintextAuthenticator implements Authenticator {
     private final KafkaPrincipalBuilder principalBuilder;
     private final ListenerName listenerName;
 
-    IoUringPlaintextAuthenticator(IoUringTransportLayer transportLayer, ListenerName listenerName) {
+    IoUringPlaintextAuthenticator(IoUringTransportLayer transportLayer, ListenerName listenerName,
+                                  Map<String, ?> configs) {
         this.transportLayer = transportLayer;
         this.listenerName = listenerName;
-        this.principalBuilder = ChannelBuilders.createPrincipalBuilder(Collections.emptyMap(), null, null);
+        // Match PlaintextChannelBuilder.PlaintextAuthenticator: the broker's parsed configs
+        // are required so a user-configured PRINCIPAL_BUILDER_CLASS_CONFIG is honored. Passing
+        // an empty map silently falls back to DefaultKafkaPrincipalBuilder, which is a
+        // semantic divergence from the NIO path on the same broker.
+        this.principalBuilder = ChannelBuilders.createPrincipalBuilder(configs, null, null);
     }
 
     @Override
