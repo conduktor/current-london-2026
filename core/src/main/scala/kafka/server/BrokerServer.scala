@@ -23,7 +23,9 @@ import kafka.log.LogManager
 import kafka.log.remote.RemoteLogManager
 import com.fasterxml.jackson.databind.ObjectMapper
 import kafka.network.{DataPlaneAcceptor, SocketServer}
-import org.apache.kafka.network.http.{KafkaHttpBridge, KafkaHttpServer, NotImplementedRequestSubmitter}
+import kafka.network.http.KafkaApiRequestSubmitter
+import org.apache.kafka.network.http.{KafkaHttpBridge, KafkaHttpServer}
+import org.apache.kafka.common.security.auth.KafkaPrincipal
 import kafka.raft.KafkaRaftManager
 import kafka.server.metadata._
 import kafka.server.share.SharePartitionManager
@@ -615,10 +617,20 @@ class BrokerServer(
         enableRequestProcessingFuture, startupDeadline, time)
 
       // Embedded HTTP bridge (off by default). Started after SocketServer so the binary protocol is ready before the
-      // bridge starts accepting work; the current submitter wiring is a placeholder that returns 504 for everything.
-      // The bridge owns its own Jetty thread pool; it does not borrow KafkaRequestHandler threads.
+      // bridge starts accepting work. The bridge owns its own Jetty thread pool; it does not borrow
+      // KafkaRequestHandler threads. v1 attributes every HTTP request to the ANONYMOUS principal — the broker's
+      // configured authorizer evaluates ACLs against this principal exactly as it would for a binary connection that
+      // didn't complete SASL. Authentication is a follow-up item; until then, granting read/write to ANONYMOUS is the
+      // intended way to allow HTTP traffic.
       if (config.httpBridgeEnabled) {
-        val bridge = new KafkaHttpBridge(new ObjectMapper(), new NotImplementedRequestSubmitter())
+        val submitter = new KafkaApiRequestSubmitter(
+          requestChannel = socketServer.dataPlaneRequestChannel,
+          time = time,
+          principal = KafkaPrincipal.ANONYMOUS,
+          listenerName = config.interBrokerListenerName,
+          topicIdLookup = name => metadataCache.getTopicId(name)
+        )
+        val bridge = new KafkaHttpBridge(new ObjectMapper(), submitter)
         httpBridgeServer = new KafkaHttpServer(config.httpBridgeHost, config.httpBridgePort, bridge, new ObjectMapper())
         httpBridgeServer.start()
         info(s"HTTP bridge listening on ${config.httpBridgeHost}:${httpBridgeServer.boundPort()}")
