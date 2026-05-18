@@ -170,6 +170,19 @@ public final class KafkaHttpServlet extends HttpServlet {
         // out as a one-shot 400, not a half-opened event-stream that then immediately errors. After this point the
         // streamer owns the AsyncContext and the response lifetime.
         if (ContentTypeNegotiator.TEXT_EVENT_STREAM.equals(contentType)) {
+            // HEAD short-circuit. Jetty's default HttpServlet.doHead wraps the response in a body-counting
+            // NoBodyResponse and delegates to doGet; for the SSE branch that would acquire a limiter slot,
+            // start an AsyncContext, and run the streamer against the wrapper — its writes never throw
+            // IOException, so the slot would be held until the underlying socket finally closes. A bursty
+            // HEAD probe could therefore exhaust the SSE cap. Emit only the headers (RFC 9110 §9.3.2 — HEAD
+            // returns the same headers GET would, no body) and return before any slot or async work.
+            if ("HEAD".equalsIgnoreCase(req.getMethod())) {
+                resp.setStatus(HttpStatusMapper.OK);
+                resp.setContentType(ContentTypeNegotiator.TEXT_EVENT_STREAM);
+                resp.setCharacterEncoding("UTF-8");
+                resp.setHeader("Cache-Control", "no-cache");
+                return;
+            }
             FetchRequestParser.FetchCommand command;
             try {
                 command = FetchRequestParser.parse(topic, params);

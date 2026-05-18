@@ -810,6 +810,51 @@ class KafkaHttpServerIntegrationTest {
         secondListener.getInputStream().close();
     }
 
+    @Test
+    void sseHeadRequestDoesNotAcquireLimiterSlot() throws Exception {
+        // Regression for the HEAD-leak DoS: Jetty's default HttpServlet.doHead wraps the response in a
+        // body-counting NoBodyResponse and delegates to doGet. Without the explicit HEAD short-circuit
+        // in the SSE branch, a HEAD with Accept: text/event-stream would acquire a slot, start the
+        // streamer, and never see an IOException on its writes (the wrapper silently absorbs them) —
+        // meaning a burst of HEAD requests could exhaust the SSE cap. With the fix, HEAD returns 200 +
+        // the SSE headers and never touches the limiter; a follow-up GET under cap=1 must succeed.
+        tearDown();
+        startServer(DEFAULT_TEST_MAX_BODY_BYTES, 1, DEFAULT_TEST_MAX_WS_SUBSCRIPTIONS);
+
+        com.yammer.metrics.core.Gauge<?> active = (com.yammer.metrics.core.Gauge<?>)
+            org.apache.kafka.server.metrics.KafkaYammerMetrics.defaultRegistry().allMetrics()
+                .get(bridgeMetricName("ActiveSseStreams"));
+        assertNotNull(active, "ActiveSseStreams gauge must be registered");
+
+        // Fire several HEAD probes — each must return 200 with SSE headers and zero body.
+        for (int i = 0; i < 5; i++) {
+            org.eclipse.jetty.client.ContentResponse head = client.newRequest(
+                    url("/v1/topics/orders/records?partition=0"))
+                .method(HttpMethod.HEAD)
+                .headers(h -> h.put("Accept", "text/event-stream"))
+                .timeout(5, TimeUnit.SECONDS)
+                .send();
+            assertEquals(200, head.getStatus(), "HEAD on SSE endpoint must return 200");
+            assertEquals(ContentTypeNegotiator.TEXT_EVENT_STREAM, head.getMediaType(),
+                "HEAD must mirror the Content-Type GET would set");
+            assertEquals(0, head.getContent().length, "HEAD response must have empty body");
+        }
+        assertEquals(0, ((Number) active.value()).intValue(),
+            "HEAD requests must NOT acquire SSE limiter slots — ActiveSseStreams stays 0");
+
+        // With cap=1 and the HEADs not having leaked, a fresh GET-SSE must succeed.
+        submitter.fetchAlwaysEmpty = true;
+        InputStreamResponseListener listener = new InputStreamResponseListener();
+        client.newRequest(url("/v1/topics/orders/records?partition=0&from=earliest"))
+            .method(HttpMethod.GET)
+            .headers(h -> h.put("Accept", "text/event-stream"))
+            .send(listener);
+        Response response = listener.get(5, TimeUnit.SECONDS);
+        assertEquals(200, response.getStatus(),
+            "GET-SSE under cap=1 must succeed after preceding HEAD probes — would be 429 if any HEAD leaked");
+        listener.getInputStream().close();
+    }
+
     // ----- WebSocket -----
 
     @Test
