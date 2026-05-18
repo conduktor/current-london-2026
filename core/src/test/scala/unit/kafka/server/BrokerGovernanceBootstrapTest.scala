@@ -65,11 +65,86 @@ class BrokerGovernanceBootstrapTest {
     val engine = new RuleEngine()
     when(rm.getLog(tp)).thenReturn(None)
 
+    // Default probe says TopicAbsent — no rules to enforce, empty RuleSet is correct.
     val boot = new BrokerGovernanceBootstrap(rm, engine, tp)
     val n = boot.drainOnce()
 
     assertEquals(0L, n, "missing log should drain nothing")
     assertEquals(0, engine.active().size(), "no rules should be installed")
+  }
+
+  @Test
+  def drainOnceFailsClosedWhenTopicExistsButBrokerIsNotAReplica(): Unit = {
+    // Codex P0 #1: when __governance exists on the cluster but this broker is
+    // not a replica of partition 0, drainOnce MUST throw under the strict
+    // default. Empty-RuleSet-fallthrough would silently fail-open every rule
+    // for clients hitting this broker.
+    val rm = mock(classOf[ReplicaManager])
+    val engine = new RuleEngine()
+    when(rm.getLog(tp)).thenReturn(None)
+
+    val probe: () => LocalReplicaStatus = () => LocalReplicaStatus.NonReplica
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp,
+      injectedLoader = null,
+      localReplicaStatus = probe,
+      requireLocalReplica = true)
+
+    val ex = assertThrows(classOf[IllegalStateException], () => boot.drainOnce())
+    // Error message must surface both the actionable knobs to the operator:
+    // either assign a replica, or set the config to fail-open with a warning.
+    val msg = ex.getMessage
+    assertTrue(msg.contains("not a replica"),
+      s"error must say the broker is not a replica, got: $msg")
+    assertTrue(msg.contains("governance.bootstrap.require.local.replica"),
+      s"error must name the config knob, got: $msg")
+    // No rules were installed — engine stays at the broker's startup-empty state.
+    assertEquals(0, engine.active().size())
+  }
+
+  @Test
+  def drainOnceWarnsAndCommitsEmptyWhenNonReplicaAndKnobIsOff(): Unit = {
+    // With require.local.replica=false the operator has explicitly opted into
+    // fail-open. drainOnce must NOT throw — it must commit an empty RuleSet
+    // and let the broker accept traffic. The loud-warning side is best
+    // verified at logging-config level; here we just verify the path
+    // doesn't throw and the engine reflects the empty install.
+    val rm = mock(classOf[ReplicaManager])
+    val engine = new RuleEngine()
+    when(rm.getLog(tp)).thenReturn(None)
+
+    val probe: () => LocalReplicaStatus = () => LocalReplicaStatus.NonReplica
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp,
+      injectedLoader = null,
+      localReplicaStatus = probe,
+      requireLocalReplica = false)
+
+    val n = boot.drainOnce()
+    assertEquals(0L, n)
+    assertEquals(0, engine.active().size(),
+      "non-replica fail-open path must install empty RuleSet without throwing")
+  }
+
+  @Test
+  def drainOnceTreatsLocalReplicaWithoutLogAsTransientNotFatal(): Unit = {
+    // Metadata says we ARE a replica but ReplicaManager has no log object
+    // yet (startup race: log dir not opened, or reassignment in flight). This
+    // must NOT abort startup — the periodic re-drain will pick up records
+    // once the log opens. Until then, an empty RuleSet is the correct state
+    // (there can't be any rules on a partition whose log isn't open yet on
+    // this broker).
+    val rm = mock(classOf[ReplicaManager])
+    val engine = new RuleEngine()
+    when(rm.getLog(tp)).thenReturn(None)
+
+    val probe: () => LocalReplicaStatus = () => LocalReplicaStatus.LocalReplica
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp,
+      injectedLoader = null,
+      localReplicaStatus = probe,
+      requireLocalReplica = true)
+
+    val n = boot.drainOnce()
+    assertEquals(0L, n)
+    assertEquals(0, engine.active().size())
   }
 
   @Test

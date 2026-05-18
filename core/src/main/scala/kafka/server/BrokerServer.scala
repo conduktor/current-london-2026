@@ -473,7 +473,42 @@ class BrokerServer(
       // The actual drain from the __governance log happens below, before
       // SocketServer.enableRequestProcessing — see governanceBootstrap.
       ruleEngine = new RuleEngine()
-      governanceBootstrap = new BrokerGovernanceBootstrap(replicaManager, ruleEngine)
+
+      // Authoritative probe for "is this broker a replica of __governance-0?".
+      // The legacy bootstrap conflated "topic absent" with "broker not a
+      // replica" via a single `getLog == None` branch, which silently fail-
+      // opened on every non-replica broker. We use the KRaft metadata image
+      // — the same image the broker uses for every other replica-assignment
+      // decision — and let BrokerGovernanceBootstrap fail closed (or warn
+      // loudly with the config knob off) on the NonReplica state.
+      val localReplicaProbe: () => LocalReplicaStatus = () => {
+        val image = metadataCache.currentImage()
+        val topicImage = image.topics().getTopic(GovernanceTopic.NAME)
+        if (topicImage == null) {
+          LocalReplicaStatus.TopicAbsent
+        } else {
+          val part = topicImage.partitions().get(0)
+          if (part == null) LocalReplicaStatus.TopicAbsent
+          else if (part.replicas.contains(config.nodeId)) LocalReplicaStatus.LocalReplica
+          else LocalReplicaStatus.NonReplica
+        }
+      }
+      // governance.bootstrap.require.local.replica — fail-closed by default.
+      // Read directly from originals() rather than wiring through KafkaConfig
+      // so this P0 broker-safety knob doesn't drag in config doc / validator
+      // surface area. Promote to a first-class config if it ever sees broader
+      // operational use.
+      val requireLocalReplica: Boolean =
+        Option(config.originals().get("governance.bootstrap.require.local.replica"))
+          .map(_.toString.trim.toLowerCase) match {
+          case Some("false") | Some("no") | Some("0") => false
+          case _ => true
+        }
+      governanceBootstrap = new BrokerGovernanceBootstrap(
+        replicaManager = replicaManager,
+        ruleEngine = ruleEngine,
+        localReplicaStatus = localReplicaProbe,
+        requireLocalReplica = requireLocalReplica)
 
       dataPlaneRequestProcessor = new KafkaApis(
         requestChannel = socketServer.dataPlaneRequestChannel,

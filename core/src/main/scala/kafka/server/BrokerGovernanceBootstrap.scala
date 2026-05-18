@@ -30,6 +30,32 @@ import java.nio.charset.StandardCharsets
 import java.util.concurrent.atomic.AtomicLong
 
 /**
+ * Three-state classification of this broker's relationship to the governance
+ * partition at the moment a drain runs. Distinguishing these is critical: the
+ * legacy code conflated "topic doesn't exist yet" and "broker is not a replica"
+ * into a single `getLog == None` branch, which silently fail-opened on any
+ * non-replica broker in a multi-broker cluster. Codex flagged this on audit.
+ *
+ *   - [[TopicAbsent]]: the {@code __governance} topic has not been created
+ *     anywhere in the cluster. There are no rules to enforce. Empty RuleSet
+ *     is correct; not a startup failure.
+ *   - [[LocalReplica]]: this broker is in the replica set of __governance-0.
+ *     Normal local-log drain path applies.
+ *   - [[NonReplica]]: the topic exists but this broker is not a replica of
+ *     partition 0. Under the strict default ({@code requireLocalReplica=true})
+ *     this is a fatal startup error — the broker would otherwise enforce an
+ *     empty RuleSet while real rules exist on the cluster, which is a silent
+ *     fail-open of every rule. With the knob off, an operator has opted into
+ *     fail-open with a loud warning.
+ */
+sealed trait LocalReplicaStatus
+object LocalReplicaStatus {
+  case object TopicAbsent extends LocalReplicaStatus
+  case object LocalReplica extends LocalReplicaStatus
+  case object NonReplica extends LocalReplicaStatus
+}
+
+/**
  * Bootstraps and maintains the broker's [[RuleEngine]] from the
  * [[org.apache.kafka.server.rules.GovernanceTopic]] log.
  *
@@ -71,7 +97,10 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
                                 ruleEngine: RuleEngine,
                                 topicPartition: TopicPartition =
                                   new TopicPartition(GovernanceTopic.NAME, 0),
-                                injectedLoader: GovernanceLoader = null)
+                                injectedLoader: GovernanceLoader = null,
+                                localReplicaStatus: () => LocalReplicaStatus =
+                                  () => LocalReplicaStatus.TopicAbsent,
+                                requireLocalReplica: Boolean = true)
   extends Logging {
 
   // Visible for tests so a Mockito spy/mock can simulate a poisoned record.
@@ -104,10 +133,65 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
     val tp = topicPartition
     replicaManager.getLog(tp) match {
       case None =>
-        // Log does not exist locally — no rules to drain.  Install an empty
-        // (or unchanged) snapshot so the engine has a well-defined state.
-        loader.commit()
-        0L
+        // Disambiguate "topic doesn't exist" from "broker is not a replica" —
+        // the legacy code conflated both into an empty-RuleSet fall-through,
+        // which silently fail-opened on every non-replica broker. Codex
+        // flagged this on audit; see [[LocalReplicaStatus]] javadoc.
+        localReplicaStatus() match {
+          case LocalReplicaStatus.TopicAbsent =>
+            // Topic genuinely does not exist anywhere in the cluster — there
+            // are no rules to enforce. Install the empty/unchanged snapshot
+            // so the engine has a well-defined state.
+            loader.commit()
+            0L
+
+          case LocalReplicaStatus.NonReplica if requireLocalReplica =>
+            // The cluster has __governance, this broker is not a replica, and
+            // the operator has not opted into fail-open. Aborting startup is
+            // the safe choice: an empty RuleSet on this broker while real
+            // DENY rules exist on the topic would silently bypass every
+            // governance rule for any client that hits this broker.
+            //
+            // The error message must give the operator the exact knobs to
+            // turn — a fail-closed startup that the operator can't unblock
+            // is just an outage. They have two valid recoveries:
+            //   1. Assign a replica of the partition to this broker.
+            //   2. Set governance.bootstrap.require.local.replica=false
+            //      (loud-warning fail-open).
+            throw new IllegalStateException(
+              s"governance topic ${tp.topic} exists in the cluster but this " +
+                s"broker is not a replica of partition ${tp.partition}; an " +
+                s"empty RuleSet on this broker would silently fail-open every " +
+                s"governance rule. Either assign a replica of " +
+                s"${tp.topic}-${tp.partition} to this broker, or set " +
+                s"governance.bootstrap.require.local.replica=false to opt " +
+                s"into fail-open with a loud warning.")
+
+          case LocalReplicaStatus.NonReplica =>
+            // Operator has explicitly opted into fail-open. Log it at ERROR
+            // every drain — this is a security-critical posture and an
+            // operator scanning logs must see it on every drain pass, not
+            // just at startup.
+            error(s"governance topic ${tp.topic} exists but this broker is " +
+              s"not a replica of partition ${tp.partition}; " +
+              s"governance.bootstrap.require.local.replica=false — " +
+              s"proceeding with EMPTY RuleSet, every governance rule is " +
+              s"being silently bypassed on this broker")
+            loader.commit()
+            0L
+
+          case LocalReplicaStatus.LocalReplica =>
+            // Metadata says this broker IS a replica but ReplicaManager has
+            // no log object yet. This is a startup-time race (the log dir
+            // hasn't been opened) or a transient state during reassignment;
+            // either way, the next scheduled drain will retry. Don't fail
+            // startup — there are no rules to enforce until the log opens.
+            warn(s"governance partition $tp reports this broker as a replica " +
+              s"but the local log is not yet available — proceeding with " +
+              s"empty RuleSet; next periodic drain will retry")
+            loader.commit()
+            0L
+        }
 
       case Some(log) =>
         val startOffset = math.max(log.logStartOffset, nextOffset.get())
