@@ -67,7 +67,17 @@ import java.util.Set;
  */
 public final class RuleJsonCodec {
 
-    private static final ObjectMapper MAPPER = new ObjectMapper();
+    // Round-11 audit (JSON-codec sub-agent, MEDIUM): enable strict-duplicate
+    // detection so an envelope like {"apiKeys":["A"],"apiKeys":["METADATA"]}
+    // is rejected rather than silently last-wins. Without this, a rule-
+    // authoring tool that inspects the canonical encoded bytes would see
+    // ["METADATA"] while the same envelope as authored by a malicious or
+    // buggy publisher writes ["A"] in the first key and ["METADATA"] in the
+    // second — Jackson's default keeps the last and drops the first without
+    // warning. Cheap defence-in-depth at rule-load cadence; no impact on
+    // legitimate envelopes which never have duplicate keys.
+    private static final ObjectMapper MAPPER = new ObjectMapper()
+        .configure(com.fasterxml.jackson.core.JsonParser.Feature.STRICT_DUPLICATE_DETECTION, true);
 
     private static final String FIELD_API_KEYS = "apiKeys";
     private static final String FIELD_ACTION = "action";

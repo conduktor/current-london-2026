@@ -182,6 +182,24 @@ public class RuleJsonCodecTest {
     }
 
     @Test
+    public void duplicateJsonKeysRejected() {
+        // Round-11 audit (JSON-codec sub-agent, MEDIUM): default Jackson
+        // applies last-wins semantics to duplicate JSON keys — a rule
+        // envelope with two "apiKeys" entries would silently use the second
+        // and drop the first. A bytes-level rule-authoring tool comparing
+        // its canonical-encoded view to the broker's loaded state would
+        // see a mismatch. With STRICT_DUPLICATE_DETECTION enabled, the
+        // parser raises and we reject at intake.
+        String json = "{\"apiKeys\":[\"CREATE_TOPICS\"],"
+            + "\"apiKeys\":[\"METADATA\"],"
+            + "\"action\":\"DENY\","
+            + "\"when\":\"true\","
+            + "\"errorCode\":47}";
+        assertThrows(RuleEnvelopeException.class,
+            () -> RuleJsonCodec.decode("k", json.getBytes(StandardCharsets.UTF_8)));
+    }
+
+    @Test
     public void nullValueIsRejectedAsAnEnvelope() {
         // Tombstones are signalled by the *record value* being null at the
         // loader level — not by this codec. Calling decode(..., null) is

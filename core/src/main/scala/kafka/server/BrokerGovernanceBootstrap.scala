@@ -628,7 +628,16 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
         drainOnce()
       } catch {
         case t: Throwable =>
-          maybeWarnSuppressed(t.getMessage)
+          // Round-11 audit (audit-forgery sub-agent, HIGH): include the
+          // exception class in the dedup key, not just the message text.
+          // Two distinct bugs whose getMessage happens to collide (e.g.
+          // an IOException and an IllegalStateException that both report
+          // "governance partition not present" via different code paths)
+          // would otherwise be conflated — the operator would see a
+          // single "repeated N times" rollup instead of separate WARN
+          // bursts for each fault. Class-qualified key ensures distinct
+          // failure modes surface distinctly.
+          maybeWarnSuppressed(s"${t.getClass.getName}: ${t.getMessage}")
       }
     }
     scheduler.schedule("governance-rules-drain", task, intervalMs, intervalMs)
