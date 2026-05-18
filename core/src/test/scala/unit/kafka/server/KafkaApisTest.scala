@@ -15417,4 +15417,83 @@ class KafkaApisTest extends Logging {
     verify(sharePartitionManager, never()).acknowledgeSessionUpdate(anyString(), any())
   }
 
+  // The dispatch gate refuses tenant principals from LIST_GROUPS (not in
+  // TENANT_ALLOWED_APIS). The remaining outside-in vector is a non-tenant
+  // cluster admin: their wildcard DESCRIBE GROUP would otherwise return every
+  // tenant's physical `__tenant_*.*` group id verbatim, enumerating which
+  // tenants exist on the broker. The handler now filters those entries out.
+  @Test
+  def testListGroupsOutsideInFiltersTenantPrincipalNamespace(): Unit = {
+    val listGroupsRequest = new ListGroupsRequestData()
+    val request = buildRequest(new ListGroupsRequest.Builder(listGroupsRequest).build())
+
+    val future = new CompletableFuture[ListGroupsResponseData]()
+    when(groupCoordinator.listGroups(request.context, listGroupsRequest)).thenReturn(future)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleListGroupsRequest(request)
+
+    future.complete(new ListGroupsResponseData().setGroups(List(
+      new ListGroupsResponseData.ListedGroup().setGroupId("__tenant_acme.consumer"),
+      new ListGroupsResponseData.ListedGroup().setGroupId("regular-group")
+    ).asJava))
+
+    val response = verifyNoThrottling[ListGroupsResponse](request)
+    val visible = response.data.groups.asScala.map(_.groupId).toSet
+    assertEquals(Set("regular-group"), visible,
+      "non-tenant caller must not see tenant-internal group ids in the listing")
+  }
+
+  @Test
+  def testDescribeTransactionsOutsideInRefusesTenantPrincipalNamespace(): Unit = {
+    val data = new DescribeTransactionsRequestData()
+      .setTransactionalIds(List("__tenant_acme.checkout-tx", "regular-txn").asJava)
+    val request = buildRequest(new DescribeTransactionsRequest.Builder(data).build())
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    when(txnCoordinator.handleDescribeTransactions("regular-txn"))
+      .thenReturn(new DescribeTransactionsResponseData.TransactionState()
+        .setErrorCode(Errors.NONE.code)
+        .setTransactionalId("regular-txn")
+        .setProducerId(7L)
+        .setProducerEpoch(1)
+        .setTransactionState("Ongoing")
+        .setTransactionTimeoutMs(60_000))
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDescribeTransactionsRequest(request)
+
+    val response = verifyNoThrottling[DescribeTransactionsResponse](request)
+    val states = response.data.transactionStates.asScala.map(s => s.transactionalId -> s.errorCode).toMap
+    assertEquals(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.code, states("__tenant_acme.checkout-tx"),
+      "reserved-form txnId must be refused without consulting the coordinator")
+    assertEquals(Errors.NONE.code, states("regular-txn"),
+      "sibling non-reserved txnId must still succeed in the same batch")
+    verify(txnCoordinator, never()).handleDescribeTransactions(ArgumentMatchers.eq("__tenant_acme.checkout-tx"))
+  }
+
+  @Test
+  def testListTransactionsOutsideInFiltersTenantPrincipalNamespace(): Unit = {
+    val data = new ListTransactionsRequestData()
+    val request = buildRequest(new ListTransactionsRequest.Builder(data).build())
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    val transactionStates = new util.ArrayList[ListTransactionsResponseData.TransactionState]()
+    transactionStates.add(new ListTransactionsResponseData.TransactionState()
+      .setTransactionalId("__tenant_acme.checkout-tx").setProducerId(7L).setTransactionState("Ongoing"))
+    transactionStates.add(new ListTransactionsResponseData.TransactionState()
+      .setTransactionalId("regular-txn").setProducerId(8L).setTransactionState("Ongoing"))
+    when(txnCoordinator.handleListTransactions(Set.empty[Long], Set.empty[String], -1L))
+      .thenReturn(new ListTransactionsResponseData()
+        .setErrorCode(Errors.NONE.code)
+        .setTransactionStates(transactionStates))
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleListTransactionsRequest(request)
+
+    val response = verifyNoThrottling[ListTransactionsResponse](request)
+    val visible = response.data.transactionStates.asScala.map(_.transactionalId).toSet
+    assertEquals(Set("regular-txn"), visible,
+      "non-tenant caller must not see tenant-internal transactional ids in the listing")
+  }
+
 }

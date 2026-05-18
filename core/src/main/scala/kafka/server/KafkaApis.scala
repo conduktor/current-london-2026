@@ -2546,6 +2546,7 @@ class KafkaApis(val requestChannel: RequestChannel,
 
   def handleListGroupsRequest(request: RequestChannel.Request): CompletableFuture[Unit] = {
     val listGroupsRequest = request.body[ListGroupsRequest]
+    val tenantCtx = tenantContextFor(request)
     val hasClusterDescribe = authHelper.authorize(request.context, DESCRIBE, CLUSTER, CLUSTER_NAME, logIfDenied = false)
 
     groupCoordinator.listGroups(
@@ -2555,16 +2556,21 @@ class KafkaApis(val requestChannel: RequestChannel,
       if (exception != null) {
         requestHelper.sendMaybeThrottle(request, listGroupsRequest.getErrorResponse(exception))
       } else {
-        val listGroupsResponse = if (hasClusterDescribe) {
-          // With describe cluster access all groups are returned. We keep this alternative for backward compatibility.
-          new ListGroupsResponse(response)
-        } else {
-          // Otherwise, only groups with described group are returned.
-          val authorizedGroups = response.groups.asScala.filter { group =>
+        // Hide tenant-internal coordinator records (`__tenant_<known>.*`) from
+        // a cluster-wide listing so the wire response cannot be used to
+        // enumerate which tenants exist. Tenant principals never reach this
+        // handler — LIST_GROUPS is not in TENANT_ALLOWED_APIS, so the
+        // dispatch gate refuses them upstream — but a non-tenant cluster
+        // admin holding wildcard DESCRIBE would otherwise see every tenant's
+        // physical group ids verbatim.
+        val visibleGroups = response.groups.asScala.filter { group =>
+          val authorised = hasClusterDescribe ||
             authHelper.authorize(request.context, DESCRIBE, GROUP, group.groupId, logIfDenied = false)
-          }
-          new ListGroupsResponse(response.setGroups(authorizedGroups.asJava))
+          val tenantInternal = !tenantCtx.effectiveTenant.isPresent &&
+            isReservedTenantPrincipalNamespace(group.groupId)
+          authorised && !tenantInternal
         }
+        val listGroupsResponse = new ListGroupsResponse(response.setGroups(visibleGroups.asJava))
         requestHelper.sendMaybeThrottle(request, listGroupsResponse)
       }
     }
@@ -4364,10 +4370,23 @@ class KafkaApis(val requestChannel: RequestChannel,
 
   def handleDescribeTransactionsRequest(request: RequestChannel.Request): Unit = {
     val describeTransactionsRequest = request.body[DescribeTransactionsRequest]
+    val tenantCtx = tenantContextFor(request)
     val response = new DescribeTransactionsResponseData()
 
     describeTransactionsRequest.data.transactionalIds.forEach { transactionalId =>
-      val transactionState = if (!authHelper.authorize(request.context, DESCRIBE, TRANSACTIONAL_ID, transactionalId)) {
+      val outsideInRefused = !tenantCtx.effectiveTenant.isPresent &&
+        isReservedTenantPrincipalNamespace(transactionalId)
+      val transactionState = if (outsideInRefused) {
+        // Outside-in: a non-tenant caller naming `__tenant_<known>.X` would
+        // otherwise read the tenant's producer epoch, txn timeout and partition
+        // list directly from `__transaction_state`. Refuse with the same wire
+        // shape an authz failure produces so the response cannot be used to
+        // probe tenant existence. Tenant principals are refused upstream by the
+        // dispatch gate (DESCRIBE_TRANSACTIONS is not in TENANT_ALLOWED_APIS).
+        new DescribeTransactionsResponseData.TransactionState()
+          .setTransactionalId(transactionalId)
+          .setErrorCode(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.code)
+      } else if (!authHelper.authorize(request.context, DESCRIBE, TRANSACTIONAL_ID, transactionalId)) {
         new DescribeTransactionsResponseData.TransactionState()
           .setTransactionalId(transactionalId)
           .setErrorCode(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.code)
@@ -4392,17 +4411,25 @@ class KafkaApis(val requestChannel: RequestChannel,
 
   def handleListTransactionsRequest(request: RequestChannel.Request): Unit = {
     val listTransactionsRequest = request.body[ListTransactionsRequest]
+    val tenantCtx = tenantContextFor(request)
     val filteredProducerIds = listTransactionsRequest.data.producerIdFilters.asScala.map(Long.unbox).toSet
     val filteredStates = listTransactionsRequest.data.stateFilters.asScala.toSet
     val durationFilter = listTransactionsRequest.data.durationFilter()
     val response = txnCoordinator.handleListTransactions(filteredProducerIds, filteredStates, durationFilter)
 
     // The response should contain only transactionalIds that the principal
-    // has `Describe` permission to access.
+    // has `Describe` permission to access. Also hide tenant-internal
+    // (`__tenant_<known>.*`) entries from non-tenant callers so the listing
+    // cannot be used to enumerate tenants. Tenant principals never reach
+    // this handler (LIST_TRANSACTIONS is not in TENANT_ALLOWED_APIS).
     val transactionStateIter = response.transactionStates.iterator()
     while (transactionStateIter.hasNext) {
       val transactionState = transactionStateIter.next()
-      if (!authHelper.authorize(request.context, DESCRIBE, TRANSACTIONAL_ID, transactionState.transactionalId)) {
+      val txnId = transactionState.transactionalId
+      val tenantInternal = !tenantCtx.effectiveTenant.isPresent &&
+        isReservedTenantPrincipalNamespace(txnId)
+      if (tenantInternal ||
+          !authHelper.authorize(request.context, DESCRIBE, TRANSACTIONAL_ID, txnId)) {
         transactionStateIter.remove()
       }
     }
