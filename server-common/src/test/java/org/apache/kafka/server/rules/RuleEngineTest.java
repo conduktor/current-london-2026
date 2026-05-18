@@ -635,17 +635,26 @@ public class RuleEngineTest {
     }
 
     @Test
-    public void parseBypassPrincipalsThrowsOnInnerWhitespace() {
-        // Codex round-4 F2: SecurityUtils.parseKafkaPrincipal splits on the
-        // first ':' but does not strip whitespace from the components. So
-        // "User :broker" parses to KafkaPrincipal(type="User ", name="broker")
-        // whose canonical form is "User :broker" — but KafkaApis canonicalises
-        // a runtime peer principal as `getPrincipalType() + ":" + getName()`,
-        // which never carries an inner space. Result: the allow-list entry
-        // is silently unreachable, the parsed set is non-empty (so the
-        // BrokerServer empty-set guard does NOT fire), and we have an
-        // effective empty-bypass that the strict-empty-rejection was
-        // designed to prevent. Reject these entries at parse.
+    public void parseBypassPrincipalsThrowsOnPaddedComponent() {
+        // Codex round-4 F2 (narrowed in round-5 F4):
+        // SecurityUtils.parseKafkaPrincipal splits on the first ':' but does
+        // not strip whitespace from the components. So "User :broker" parses
+        // to KafkaPrincipal(type="User ", name="broker") whose canonical
+        // form is "User :broker" — but KafkaApis canonicalises a runtime
+        // peer principal as `getPrincipalType() + ":" + getName()`, which
+        // never carries that trailing space on the type. Result: the
+        // allow-list entry is silently unreachable, the parsed set is non-
+        // empty (so the BrokerServer empty-set guard does NOT fire), and we
+        // have an effective empty-bypass that the strict-empty-rejection
+        // was designed to prevent. Reject these padded entries at parse.
+        //
+        // Round-5 F4 narrowed the check from "any whitespace anywhere" to
+        // "whitespace at the leading or trailing position only" so that
+        // legitimate SSL DNs (which contain spaces inside CN values) are
+        // not refused — see parseBypassPrincipalsAcceptsSslDnWithInternalWhitespace.
+        // The post-split positions of operator-typo whitespace are always
+        // leading or trailing, so this narrowing does not weaken catch
+        // coverage for the typo cases below.
         IllegalArgumentException ex1 = org.junit.jupiter.api.Assertions
             .assertThrows(IllegalArgumentException.class,
                 () -> RuleEngine.parseBypassPrincipals("User :broker"));
@@ -659,10 +668,40 @@ public class RuleEngineTest {
         assertTrue(ex2.getMessage().contains("whitespace"),
             "leading-whitespace name must be rejected; got: " + ex2.getMessage());
 
-        // Tab inside the type.
+        // Tab at the trailing edge of the type. The outer segment trim
+        // (String.trim()) strips ASCII whitespace from the SEGMENT, not
+        // from the components — "User\t:broker" trims to itself, so the
+        // tab survives to the parser as part of the type.
         org.junit.jupiter.api.Assertions.assertThrows(
             IllegalArgumentException.class,
             () -> RuleEngine.parseBypassPrincipals("User\t:broker"));
+    }
+
+    @Test
+    public void parseBypassPrincipalsAcceptsSslDnWithInternalWhitespace() {
+        // Codex round-5 P1 regression: the default DefaultKafkaPrincipalBuilder
+        // for SSL listeners produces principal names that are the raw
+        // X500Principal.getName() of the peer cert, which for any cert with
+        // multi-word RDN values (eg. CN="Broker One") contains internal
+        // spaces. An earlier iteration of the F2 check rejected ANY
+        // whitespace in the name and would have refused legitimate SSL
+        // broker principals at startup. Internal whitespace must be
+        // accepted — only leading/trailing/all-whitespace is rejected.
+        String sslDn = "User:CN=Broker One,OU=Kafka Brokers,O=Example Corp,C=US";
+        java.util.Set<String> out = RuleEngine.parseBypassPrincipals(sslDn);
+        assertEquals(1, out.size());
+        assertTrue(out.contains(sslDn),
+            "SSL DN with internal whitespace must round-trip to its canonical "
+                + "form; got: " + out);
+
+        // Same rule on the type side, defensively: a hypothetical custom
+        // principal type with internal whitespace is unusual but not
+        // syntactically forbidden, and the parser should not be the thing
+        // that decides which principal types exist.
+        java.util.Set<String> typeWithSpace = RuleEngine.parseBypassPrincipals(
+            "Service Account:bot");
+        assertTrue(typeWithSpace.contains("Service Account:bot"),
+            "type with internal whitespace must be accepted; got: " + typeWithSpace);
     }
 
     @Test

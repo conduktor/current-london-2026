@@ -240,28 +240,41 @@ public final class RuleEngine {
             // unreachable, producing an effective empty allow-list that
             // bypasses the BrokerServer empty-set guard.
             //
-            // Use containsAnyWhitespaceChar() which considers both
-            // Character.isWhitespace AND Character.isSpaceChar; the latter
-            // adds non-breaking variants (NBSP U+00A0, NARROW NBSP U+202F,
-            // FIGURE SPACE U+2007) that the JDK's isWhitespace explicitly
-            // excludes. Neither String.isBlank() nor String.strip() catches
-            // those — they both delegate to Character.isWhitespace. NBSP
-            // is the typical copy-paste-from-docs failure mode.
+            // Reject empty, all-whitespace, or leading/trailing-whitespace
+            // components. Do NOT reject INTERNAL whitespace: SSL broker
+            // principals legitimately contain spaces inside the DN — the
+            // default DefaultKafkaPrincipalBuilder uses
+            // `X500Principal.getName()` which produces strings like
+            // `CN=Broker One,OU=Kafka Brokers,O=Example Corp,C=US` where the
+            // spaces inside the CN value are part of the canonical runtime
+            // peer principal. Earlier rounds of this fix rejected ALL
+            // whitespace and would have refused valid SSL operator configs
+            // at startup (Codex round-5 P1).
+            //
+            // Use the union of Character.isWhitespace AND
+            // Character.isSpaceChar so non-breaking Unicode spaces (NBSP
+            // U+00A0, NARROW NBSP U+202F, FIGURE SPACE U+2007) are also
+            // caught at the leading/trailing positions and in the
+            // all-whitespace check — String.isBlank()/strip() miss those.
             String type = principal.getPrincipalType();
             String name = principal.getName();
-            if (type.isEmpty() || containsAnyWhitespaceChar(type)) {
+            if (type.isEmpty() || isAllWhitespace(type) || hasLeadingOrTrailingWhitespace(type)) {
                 throw new IllegalArgumentException(
-                    "governance.bypass.principals entry has blank or whitespace-"
-                    + "padded principal type: '" + trimmed + "'. Format is "
-                    + "`type:name` (eg. `User:broker`); both components must be "
-                    + "non-empty with no whitespace (ASCII or Unicode).");
+                    "governance.bypass.principals entry has blank, whitespace-"
+                    + "only or whitespace-padded principal type: '" + trimmed
+                    + "'. Format is `type:name` (eg. `User:broker`); the type "
+                    + "must be non-empty and must not start or end with "
+                    + "whitespace (ASCII or Unicode). Internal whitespace is "
+                    + "allowed (eg. inside an SSL DN).");
             }
-            if (name.isEmpty() || containsAnyWhitespaceChar(name)) {
+            if (name.isEmpty() || isAllWhitespace(name) || hasLeadingOrTrailingWhitespace(name)) {
                 throw new IllegalArgumentException(
-                    "governance.bypass.principals entry has blank or whitespace-"
-                    + "padded principal name: '" + trimmed + "'. Format is "
-                    + "`type:name` (eg. `User:broker`); both components must be "
-                    + "non-empty with no whitespace (ASCII or Unicode).");
+                    "governance.bypass.principals entry has blank, whitespace-"
+                    + "only or whitespace-padded principal name: '" + trimmed
+                    + "'. Format is `type:name` (eg. `User:broker`); the name "
+                    + "must be non-empty and must not start or end with "
+                    + "whitespace (ASCII or Unicode). Internal whitespace is "
+                    + "allowed (eg. SSL DNs like `CN=Broker One,OU=...`).");
             }
             out.add(principal.toString());
         }
@@ -269,8 +282,8 @@ public final class RuleEngine {
     }
 
     /**
-     * True if any code point in {@code s} is recognised as whitespace by
-     * either {@link Character#isWhitespace(int)} (covers ASCII space, tab,
+     * True if {@code c} is recognised as whitespace by either
+     * {@link Character#isWhitespace(int)} (covers ASCII space, tab,
      * newline, and the Unicode SPACE_SEPARATOR / LINE_SEPARATOR /
      * PARAGRAPH_SEPARATOR categories <i>except</i> the non-breaking
      * variants) or {@link Character#isSpaceChar(int)} (covers the
@@ -279,15 +292,34 @@ public final class RuleEngine {
      * "any whitespace-looking character".
      *
      * <p>We need both predicates because the JDK's {@code isWhitespace}
-     * historically excluded non-breaking variants for compatibility with
-     * legacy formatting rules, so {@code String.isBlank()} and
-     * {@code String.strip()} also exclude them. An entry like
+     * historically excludes the non-breaking variants for compatibility
+     * with legacy formatting rules, so {@code String.isBlank()} and
+     * {@code String.strip()} also miss them. An entry like
      * {@code User:[NBSP]} would slip past those checks even though its
      * canonical form can never match a runtime peer principal.
      */
-    private static boolean containsAnyWhitespaceChar(String s) {
-        return s.codePoints()
-            .anyMatch(c -> Character.isWhitespace(c) || Character.isSpaceChar(c));
+    private static boolean isAnyWhitespaceCodePoint(int c) {
+        return Character.isWhitespace(c) || Character.isSpaceChar(c);
+    }
+
+    /** True if {@code s} is non-empty and every code point is whitespace. */
+    private static boolean isAllWhitespace(String s) {
+        return !s.isEmpty()
+            && s.codePoints().allMatch(RuleEngine::isAnyWhitespaceCodePoint);
+    }
+
+    /**
+     * True if {@code s}'s first or last code point is whitespace. Internal
+     * whitespace is NOT flagged here — that is intentional, see the caller
+     * in {@link #parseBypassPrincipals(String)}.
+     */
+    private static boolean hasLeadingOrTrailingWhitespace(String s) {
+        if (s.isEmpty()) {
+            return false;
+        }
+        int first = s.codePointAt(0);
+        int last = s.codePointBefore(s.length());
+        return isAnyWhitespaceCodePoint(first) || isAnyWhitespaceCodePoint(last);
     }
 
     /**
