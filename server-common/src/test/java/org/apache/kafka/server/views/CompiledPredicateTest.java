@@ -146,6 +146,69 @@ class CompiledPredicateTest {
     // ---------- silent-skip behaviour ----------
 
     @Test
+    void skipsRecordWhenLeafKeyAppearsTwice() {
+        // Predicates are an access-control boundary. RFC 8259 leaves duplicate-key behaviour
+        // "undefined"; parsers disagree (Jackson last-wins; some first-wins). An adversary
+        // who can write to the backing topic could craft {"region":"EU","region":"US"} to bypass
+        // a body.region == "US" predicate that some downstream parser reads as "EU".
+        // The navigator refuses the record (BODY_UNUSABLE → SKIP) regardless of which value
+        // a downstream parser would have picked.
+        CompiledPredicate p = compiler.compile("body.region == 'US'");
+        Optional<Boolean> r = p.evaluate(jsonRecord("{\"region\":\"EU\",\"region\":\"US\"}"));
+        assertTrue(r.isEmpty(),
+                () -> "expected skip on duplicate leaf key, got " + r);
+    }
+
+    @Test
+    void skipsRecordWhenLeafKeyDuplicatedWithSameValue() {
+        // Even when both occurrences have the same value, refuse — the navigator can't know
+        // a downstream parser will agree.
+        CompiledPredicate p = compiler.compile("body.region == 'US'");
+        Optional<Boolean> r = p.evaluate(jsonRecord("{\"region\":\"US\",\"region\":\"US\"}"));
+        assertTrue(r.isEmpty(),
+                () -> "expected skip on duplicate leaf key even with identical values, got " + r);
+    }
+
+    @Test
+    void skipsRecordWhenLeafKeyDuplicateAppearsAfterOtherFields() {
+        // The duplicate-scan must continue past the first match through the rest of the object.
+        CompiledPredicate p = compiler.compile("body.region == 'US'");
+        Optional<Boolean> r = p.evaluate(
+                jsonRecord("{\"region\":\"US\",\"other\":1,\"region\":\"EU\"}"));
+        assertTrue(r.isEmpty(),
+                () -> "expected skip on duplicate leaf key after sibling field, got " + r);
+    }
+
+    @Test
+    void leafKeyDuplicateInsideUnrelatedSubobjectDoesNotPoisonOtherPaths() {
+        // body.color is at root; the duplicate is inside body.meta — shouldn't affect body.color.
+        CompiledPredicate p = compiler.compile("body.color == 'red'");
+        assertTrue(p.evaluate(jsonRecord(
+                "{\"color\":\"red\",\"meta\":{\"x\":1,\"x\":2}}")).orElse(false));
+    }
+
+    @Test
+    void skipsRecordWhenLongValueExceedsIeeeSafeRange() {
+        // 2^53 = 9_007_199_254_740_992 is the largest integer all doubles can exactly represent.
+        // A Long larger than that loses precision when promoted to double. An adversary could
+        // craft Long values that "equal" the rounded double representation of a different literal,
+        // bypassing a predicate. Refuse the equality outside the IEEE-safe range.
+        CompiledPredicate p = compiler.compile("body.x == 9007199254740992.0");
+        // Body has 9007199254740993 (one above 2^53). Without the safe-range check this would
+        // promote to (double) 9007199254740992 and compare equal — wrong.
+        Optional<Boolean> r = p.evaluate(jsonRecord("{\"x\":9007199254740993}"));
+        assertFalse(r.orElse(true),
+                () -> "expected false (no precision-loss match) for Long beyond 2^53, got " + r);
+    }
+
+    @Test
+    void longInsideIeeeSafeRangeStillMatchesDoubleLiteral() {
+        // Sanity: when the Long is inside the safe range, equality with a Double literal still works.
+        CompiledPredicate p = compiler.compile("body.x == 42.0");
+        assertTrue(p.evaluate(jsonRecord("{\"x\":42}")).orElse(false));
+    }
+
+    @Test
     void skipsRecordWhenBodyIsMalformedJson() {
         CompiledPredicate p = compiler.compile("body.color == 'red'");
         Optional<Boolean> r = p.evaluate(RecordContexts.builder()

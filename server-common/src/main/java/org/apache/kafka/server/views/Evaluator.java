@@ -154,24 +154,56 @@ final class Evaluator {
         return v instanceof Boolean && (Boolean) v;
     }
 
+    /** 2^53 — largest integer that all IEEE-754 doubles can represent exactly. A {@code long}
+     *  beyond this range loses precision when promoted to {@code double}, so mixed-type
+     *  equality and ordered comparison must refuse rather than silently match nearby values. */
+    private static final long IEEE_SAFE_INTEGER = 1L << 53;
+
     /**
      * Equality across numeric types: 1 == 1.0 is true. String == number is false (not unknown)
      * because consumers reasonably expect equality to be total. JSON-null / missing operand
      * compares unequal to any non-null value, equal to itself.
+     *
+     * <p>For mixed Long/Double equality the operands are only compared in {@code double} space
+     * when the Long is inside the IEEE-safe-integer range ({@code |L| <= 2^53}). Outside that
+     * range the equality returns {@code false}: predicates are an access-control boundary, and
+     * naïve {@code (double) L == D} comparison would let an adversary craft Long values that
+     * "equal" the rounded double representation of a different literal (e.g. body Long
+     * {@code 2^53 + 1} matching predicate Double {@code 2^53.0}).
      */
     private static boolean equalsValues(Object l, Object r) {
         if (l == null && r == null) return true;
         if (l == null || r == null) return false;
         if (l instanceof Number && r instanceof Number) {
-            // Promote to double only when needed; otherwise compare longs precisely.
-            if (l instanceof Long && r instanceof Long) {
-                return ((Long) l).longValue() == ((Long) r).longValue();
-            }
-            return ((Number) l).doubleValue() == ((Number) r).doubleValue();
+            return equalsNumeric((Number) l, (Number) r);
         }
         if (l instanceof Boolean && r instanceof Boolean) return l.equals(r);
         if (l instanceof String && r instanceof String) return l.equals(r);
         return false;
+    }
+
+    private static boolean equalsNumeric(Number l, Number r) {
+        if (l instanceof Long && r instanceof Long) {
+            return ((Long) l).longValue() == ((Long) r).longValue();
+        }
+        if (l instanceof Long) {
+            return numericEqLongDouble((Long) l, r.doubleValue());
+        }
+        if (r instanceof Long) {
+            return numericEqLongDouble((Long) r, l.doubleValue());
+        }
+        // Both Double.
+        return l.doubleValue() == r.doubleValue();
+    }
+
+    private static boolean numericEqLongDouble(long longSide, double doubleSide) {
+        if (Double.isNaN(doubleSide) || Double.isInfinite(doubleSide)) return false;
+        if (longSide > IEEE_SAFE_INTEGER || longSide < -IEEE_SAFE_INTEGER) {
+            // Long is outside the range where (double) longSide is exact. Refuse to match
+            // rather than silently equate to a rounded value.
+            return false;
+        }
+        return (double) longSide == doubleSide;
     }
 
     /**
