@@ -573,7 +573,7 @@ public final class RuleEngine {
                 // requests in the same window only bump the counter.
                 maybeWarnBudgetExceeded(apiKey, budget);
                 return RuleDecision.deny(Errors.POLICY_VIOLATION.code(), ACTIVATION_BUDGET_RULE_ID);
-            } catch (Throwable t) {
+            } catch (Exception e) {
                 // Codex deep-audit P0 fix: a throwing activation supplier MUST NOT
                 // propagate into the request thread. The most realistic failure mode
                 // is ApiMessageActivation walking a request whose accessor blows up
@@ -582,27 +582,46 @@ public final class RuleEngine {
                 // exception escapes into KafkaApis.handle(), turning a buggy
                 // governance extractor into a request-thread crash.
                 //
-                // We catch Throwable to match the per-rule policy below: a
-                // StackOverflowError from a deeply nested ApiMessage walk or an
-                // OutOfMemoryError from a giant Records buffer must not be allowed
-                // to take the request thread with it either.
+                // Round-15 Walker HIGH H2: narrowed from {@code Throwable} to
+                // {@code Exception}. With the round-15 walker hardening in place
+                // (MAX_DEPTH=32 across both message AND iterable layers per
+                // HIGH-H1, MAX_ACCESSOR_INVOCATIONS=10_000 across nested- and
+                // flat-scalar widths) the walker has a bounded worst-case work
+                // ceiling on EVERY dimension that can amplify legitimate input
+                // shapes. Under that guarantee, an {@link Error} subclass from
+                // here (OutOfMemoryError, StackOverflowError, LinkageError, an
+                // InternalError or UnknownError from the JVM, ThreadDeath, …)
+                // is no longer a "buggy rule" symptom — it is either:
+                //   (1) a bound-logic bug we MUST surface, not paper over, or
+                //   (2) a global JVM-level failure where the request thread is
+                //       not actually safe to continue on anyway.
+                // Either case is worse to silently fail-open on than to let
+                // propagate. Specifically: continuing to ALLOW under a heap-
+                // exhausted JVM means an attacker who can pin OOM (or trigger
+                // a bound-logic bug) gets a DENY-rule bypass on every
+                // subsequent request until the operator notices. KafkaApis.
+                // handle has its own outer Throwable catch that turns Error
+                // propagation into a 5xx response per request — visible signal,
+                // fail-CLOSED at the request layer.
                 //
-                // Posture is "fail-open": a broken governance feature degrades to
-                // ALLOW, never to a broker request failure. This matches the
-                // per-rule fail-open below ("a buggy rule must not be able to
-                // crash the request path") and is the only outcome consistent
-                // with that policy — no rule can be evaluated without an
-                // activation map, so ALLOW is the only available safe answer.
+                // The narrowed Exception catch still covers every realistic
+                // walker failure mode: any RuntimeException (NullPointer,
+                // ClassCast, IllegalArg, ReflectiveOperation wrappers, …) and
+                // any checked exception that surfaces here. Posture remains
+                // fail-OPEN for these because they are local, bounded faults
+                // in the extractor that should degrade to ALLOW, not a request
+                // failure, while the broker bug gets fixed.
                 //
-                // The attacker-shape exception above is caught FIRST so it never
-                // falls through this generic branch; see that catch's comment for
-                // why budget overflow needs the opposite posture.
+                // The attacker-shape ActivationBudgetExceededException above
+                // is caught FIRST so it never falls through this generic
+                // branch; see that catch's comment for why budget overflow
+                // needs the opposite posture.
                 //
                 // Round-15 recent-changes BLOCKER-1: route the WARN through a
                 // throttle that mirrors maybeWarnEvalError below — same hot-path,
                 // same wire-derived-string-in-toString hazard, same need to
                 // sanitise via LogSafe before writing to SLF4J.
-                maybeWarnActivationSupplierFailed(apiKey, t);
+                maybeWarnActivationSupplierFailed(apiKey, e);
                 return RuleDecision.ALLOW;
             }
             // Round-8 audit HIGH (concurrency): the CEL eval-step budget is
@@ -623,18 +642,40 @@ public final class RuleEngine {
                     boolean matched;
                     try {
                         matched = rule.compiled().evalBoolean(activation::get);
-                    } catch (Throwable t) {
-                        // Catch Throwable, not just RuntimeException: a pathological CEL
-                        // expression can raise StackOverflowError (deep comprehensions),
-                        // OutOfMemoryError (huge string ops), or other Error subclasses.
-                        // The request thread must never die because of a buggy rule —
-                        // log loudly and treat the rule as ALLOW, then move to the next.
+                    } catch (Exception e) {
+                        // Round-15 Walker HIGH H2: narrowed from {@code Throwable}
+                        // to {@code Exception}. The CEL step-budget cap
+                        // (CelProgram.MAX_EVAL_STEPS) plus the parse-depth and
+                        // collection-literal caps already bound legitimate CEL
+                        // evaluation work; the per-rule fail-open here used to
+                        // catch StackOverflowError / OutOfMemoryError from a
+                        // pathological rule, but that posture silently absorbs
+                        // a JVM-level signal that almost certainly means
+                        // something is wrong globally (a CEL bound-logic bug,
+                        // a runaway allocation in a custom string op). Letting
+                        // Error subclasses propagate through to KafkaApis's
+                        // outer Throwable catch turns the request into a clear
+                        // 5xx and makes the bug visible — far better than
+                        // marking the rule ALLOW and continuing to the next
+                        // rule in the loop, which would re-trip on entry under
+                        // the same shared per-request CEL step counter.
                         //
-                        // Note that after one rule trips the per-request budget, the
-                        // next rule in this loop will retrip on entry under the shared
-                        // counter and also land here as fail-open. That is the intended
-                        // DoS-defence behaviour: a request cannot multiply the step
-                        // budget by the number of rules an operator happens to have
+                        // CelEvaluationException, NullPointerException,
+                        // IllegalStateException, ClassCastException — the
+                        // realistic failure modes of an operator-published
+                        // rule under a malformed activation map — are all
+                        // RuntimeException subclasses and still caught.
+                        // Posture for them remains fail-OPEN at the per-rule
+                        // level: a single buggy rule must not be able to deny
+                        // every request, but a JVM-level fault deserves to
+                        // surface.
+                        //
+                        // Note that after one rule trips the per-request CEL
+                        // step budget, the next rule in this loop will retrip
+                        // on entry under the shared counter and also land here
+                        // as fail-open. That is the intended DoS-defence
+                        // behaviour: a request cannot multiply the step budget
+                        // by the number of rules an operator happens to have
                         // published. See CelLimits.resetSteps javadoc.
                         // Round-14 BLOCKER L-1: this WARN sits on the per-rule,
                         // per-request hot path. A single buggy rule that throws
@@ -647,7 +688,7 @@ public final class RuleEngine {
                         // (strict charset, length cap) but goes through
                         // LogSafe for consistency with other wire-into-log
                         // sites.
-                        maybeWarnEvalError(rule.id(), apiKey, t);
+                        maybeWarnEvalError(rule.id(), apiKey, e);
                         continue;
                     }
                     if (matched) {

@@ -41,6 +41,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -150,23 +151,80 @@ public class RuleEngineTest {
     }
 
     @Test
-    public void activationSupplierThrowingErrorAlsoFailsOpen() {
-        // Stronger guarantee: even an Error (StackOverflowError from a deeply
-        // nested ApiMessage walk, OutOfMemoryError from a giant Records buffer)
-        // must not escape evaluate(). Per-rule evaluation already catches
-        // Throwable; the supplier must too. Without this, a single very large
-        // request could crash the broker's request thread.
+    public void activationSupplierThrowingErrorPropagatesUnderRound15Hardening() {
+        // Round-15 Walker HIGH H2 (reversed previous policy):
+        // pre-round-15 this test asserted that an Error (StackOverflowError /
+        // OutOfMemoryError / LinkageError) from the activation supplier
+        // failed OPEN. That posture made sense before the walker was fully
+        // budget-bounded — a single very large request could otherwise crash
+        // the broker thread. With round-15 in place (MAX_DEPTH=32 across
+        // BOTH message AND iterable layers per HIGH-H1, plus the existing
+        // MAX_ACCESSOR_INVOCATIONS=10_000 budget covering nested- and flat-
+        // scalar widths), the walker has a bounded worst-case work ceiling
+        // on every dimension that attacker-shaped input can amplify.
+        //
+        // Under that guarantee, an Error from the supplier is no longer a
+        // "buggy rule" symptom — it is either:
+        //   (1) a bound-logic bug we MUST surface, not paper over, or
+        //   (2) a JVM-level failure where the request thread is not actually
+        //       safe to continue on anyway.
+        // Catching it would silently fail-OPEN — and an attacker who can
+        // pin a bound-logic bug to a single API key would then bypass every
+        // DENY rule on that key on every subsequent request until the
+        // operator noticed. The correct posture is to let the Error
+        // propagate to KafkaApis's outer Throwable catch, which turns it
+        // into a 5xx response per request — visible signal, fail-CLOSED at
+        // the request layer.
+        //
+        // The narrowed catch site is `catch (Exception e)`; this test pins
+        // that Error subclasses are NOT caught.
         RuleEngine engine = new RuleEngine();
         engine.install(new RuleSetBuilder()
             .put(denyRule("deny-all", ApiKeys.METADATA, "true", 99))
             .build());
+        StackOverflowError thrown = assertThrows(StackOverflowError.class, () ->
+            engine.evaluate(
+                ApiKeys.METADATA, "client", null, false,
+                () -> {
+                    throw new StackOverflowError("simulated deep walk");
+                }));
+        assertEquals("simulated deep walk", thrown.getMessage(),
+            "the original Error must propagate verbatim (not be re-wrapped)");
+    }
+
+    @Test
+    public void activationSupplierThrowingErrorClearsInEvaluateThreadLocal() {
+        // Companion to activationSupplierThrowingErrorPropagatesUnderRound15Hardening:
+        // even though Error subclasses now propagate from the catch site,
+        // the OUTER finally at the end of evaluate() must still clear the
+        // IN_EVALUATE re-entry flag. Otherwise a pool thread that serviced a
+        // request which raised an Error from the supplier would observe a
+        // stale TRUE on its next request and throw IllegalStateException
+        // from the re-entry guard — turning a one-request fault into a
+        // thread-poisoning DoS.
+        //
+        // This test invokes evaluate() twice on the same thread: the first
+        // call throws Error from the supplier, the second runs cleanly.
+        // If the outer finally were skipped, the second call would throw
+        // IllegalStateException instead of returning a clean decision.
+        RuleEngine engine = new RuleEngine();
+        engine.install(new RuleSetBuilder()
+            .put(denyRule("deny-all", ApiKeys.METADATA, "true", 99))
+            .build());
+        // Call 1: Error propagates.
+        assertThrows(OutOfMemoryError.class, () ->
+            engine.evaluate(
+                ApiKeys.METADATA, "client", null, false,
+                () -> {
+                    throw new OutOfMemoryError("simulated heap pressure");
+                }));
+        // Call 2: same thread, must run cleanly — if the outer finally was
+        // skipped, this would throw IllegalStateException("re-entry").
         RuleDecision d = engine.evaluate(
-            ApiKeys.METADATA, "client", null, false,
-            () -> {
-                throw new StackOverflowError("simulated deep walk");
-            });
-        assertSame(RuleDecision.ALLOW, d,
-            "Errors from the activation supplier must fail open, same as RuntimeExceptions");
+            ApiKeys.METADATA, "client", null, false, Collections::emptyMap);
+        assertTrue(d.denied(),
+            "second evaluation on the same thread must not be blocked by " +
+                "a leaked IN_EVALUATE=TRUE from the first call's Error propagation");
     }
 
     @Test
@@ -645,12 +703,26 @@ public class RuleEngineTest {
     }
 
     @Test
-    public void buggyPredicateThrowingErrorAlsoFailsOpenAndDoesNotKillRequestThread() {
-        // CEL is hand-rolled and a pathological program could in principle raise
-        // an Error (e.g. StackOverflowError on a deep comprehension), not just a
-        // RuntimeException. The engine must catch Throwable so the request
-        // thread is never killed by a buggy rule. We simulate via a CelProgram
-        // Mockito mock that raises an Error inside evalBoolean.
+    public void buggyPredicateThrowingErrorPropagatesUnderRound15Hardening() {
+        // Round-15 Walker HIGH H2 (reversed previous policy):
+        // pre-round-15 this test asserted that an Error (StackOverflowError
+        // from a deep CEL comprehension, OutOfMemoryError from a huge string
+        // op) raised inside per-rule evalBoolean was caught and the rule was
+        // skipped to ALLOW (with a fall-through to the next rule). That
+        // posture made sense when the CEL bounds were under-specified.
+        //
+        // Round-15 hardened the CEL step budget (CelProgram.MAX_EVAL_STEPS),
+        // parse depth (MAX_PARSE_DEPTH), and collection-literal limits.
+        // Under those caps, an Error subclass from CEL eval is no longer a
+        // "buggy rule" symptom — it almost certainly indicates a CEL bound-
+        // logic bug, and silently absorbing it lets the bug accumulate
+        // across all production traffic. Letting Error propagate through
+        // to KafkaApis's outer Throwable catch turns the request into a
+        // 5xx and makes the bug visible.
+        //
+        // The narrowed catch site is `catch (Exception e)`; this test pins
+        // that Error subclasses propagate from inside the per-rule loop —
+        // they do NOT fall through to the next rule.
         org.apache.kafka.server.rules.cel.CelProgram crashy =
             org.mockito.Mockito.mock(org.apache.kafka.server.rules.cel.CelProgram.class);
         org.mockito.Mockito.when(crashy.evalBoolean(org.mockito.ArgumentMatchers.any()))
@@ -667,11 +739,49 @@ public class RuleEngineTest {
             .put(throwing)
             .put(denyRule("after", ApiKeys.METADATA, "true", 99))
             .build());
+        StackOverflowError thrown = assertThrows(StackOverflowError.class, () ->
+            engine.evaluate(
+                ApiKeys.METADATA, "x", null, false,
+                () -> Collections.singletonMap("request", Collections.emptyMap())));
+        assertEquals("simulated runaway recursion", thrown.getMessage(),
+            "the original Error must propagate verbatim (not be wrapped or swallowed)");
+    }
+
+    @Test
+    public void buggyPredicateThrowingExceptionStillFailsOpenAndAdvancesToNextRule() {
+        // Round-15 Walker HIGH H2 complement: the narrowed `catch (Exception)`
+        // still catches the realistic per-rule failure modes — CelEvaluationException,
+        // NullPointerException, IllegalStateException, ClassCastException from
+        // a buggy predicate or malformed activation map. For these, posture
+        // remains fail-OPEN at the per-rule level: a single buggy operator-
+        // authored rule must not be able to deny every request, and the rule
+        // loop must advance to evaluate subsequent rules.
+        //
+        // This test pins that contract: a rule that throws RuntimeException
+        // is skipped, and the next rule's DENY still takes effect.
+        org.apache.kafka.server.rules.cel.CelProgram buggy =
+            org.mockito.Mockito.mock(org.apache.kafka.server.rules.cel.CelProgram.class);
+        org.mockito.Mockito.when(buggy.evalBoolean(org.mockito.ArgumentMatchers.any()))
+            .thenThrow(new IllegalStateException("simulated CEL bug — null traversal"));
+        Rule throwing = new Rule(
+            "buggy-rule",
+            Collections.singletonList(ApiKeys.METADATA),
+            RuleAction.DENY,
+            "true",
+            7,
+            buggy);
+        RuleEngine engine = new RuleEngine();
+        engine.install(new RuleSetBuilder()
+            .put(throwing)
+            .put(denyRule("after", ApiKeys.METADATA, "true", 99))
+            .build());
         RuleDecision d = engine.evaluate(
-            ApiKeys.METADATA, "x", null, false, () -> Collections.singletonMap("request", Collections.emptyMap()));
-        assertTrue(d.denied());
+            ApiKeys.METADATA, "x", null, false,
+            () -> Collections.singletonMap("request", Collections.emptyMap()));
+        assertTrue(d.denied(), "the next rule's DENY must take effect");
         assertEquals(99, d.errorCode());
-        assertEquals("after", d.denyingRuleId());
+        assertEquals("after", d.denyingRuleId(),
+            "rule loop must advance past the buggy rule to the next candidate");
     }
 
     @Test
