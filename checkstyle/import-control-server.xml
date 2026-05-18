@@ -102,6 +102,8 @@
 
   <subpackage name="network">
     <allow pkg="com.fasterxml.jackson" />
+    <!-- network.* subpackages (e.g. iouring) need to reference siblings such as SocketServerConfigs -->
+    <allow pkg="org.apache.kafka.network" />
   </subpackage>
 
 </import-control>

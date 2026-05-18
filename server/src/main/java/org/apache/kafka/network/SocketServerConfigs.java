@@ -154,6 +154,14 @@ public class SocketServerConfigs {
     public static final int NUM_NETWORK_THREADS_DEFAULT = 3;
     public static final String NUM_NETWORK_THREADS_DOC = "The number of threads that the server uses for receiving requests from the network and sending responses to the network. Noted: each listener (except for controller listener) creates its own thread pool.";
 
+    public static final String SOCKET_SELECTOR_IMPLEMENTATION_CONFIG = "socket.selector.implementation";
+    public static final String SOCKET_SELECTOR_IMPLEMENTATION_DEFAULT = "auto";
+    public static final String SOCKET_SELECTOR_IMPLEMENTATION_DOC = "The I/O backend the broker uses for client and inter-broker connections. " +
+            "<code>nio</code> selects the historical Java NIO selector. " +
+            "<code>io_uring</code> selects a Netty io_uring-backed selector; Linux only and PLAINTEXT only in this version " +
+            "(SSL, SASL_PLAINTEXT and SASL_SSL listeners fall back to NIO). " +
+            "<code>auto</code> chooses <code>io_uring</code> when supported and <code>nio</code> otherwise.";
+
     public static final ConfigDef CONFIG_DEF =  new ConfigDef()
             .define(LISTENERS_CONFIG, STRING, LISTENERS_DEFAULT, HIGH, LISTENERS_DOC)
             .define(ADVERTISED_LISTENERS_CONFIG, STRING, null, HIGH, ADVERTISED_LISTENERS_DOC)
@@ -170,7 +178,8 @@ public class SocketServerConfigs {
             .define(FAILED_AUTHENTICATION_DELAY_MS_CONFIG, INT, FAILED_AUTHENTICATION_DELAY_MS_DEFAULT, atLeast(0), LOW, FAILED_AUTHENTICATION_DELAY_MS_DOC)
             .define(QUEUED_MAX_REQUESTS_CONFIG, INT, QUEUED_MAX_REQUESTS_DEFAULT, atLeast(1), HIGH, QUEUED_MAX_REQUESTS_DOC)
             .define(QUEUED_MAX_BYTES_CONFIG, LONG, QUEUED_MAX_REQUEST_BYTES_DEFAULT, MEDIUM, QUEUED_MAX_REQUEST_BYTES_DOC)
-            .define(NUM_NETWORK_THREADS_CONFIG, INT, NUM_NETWORK_THREADS_DEFAULT, atLeast(1), HIGH, NUM_NETWORK_THREADS_DOC);
+            .define(NUM_NETWORK_THREADS_CONFIG, INT, NUM_NETWORK_THREADS_DEFAULT, atLeast(1), HIGH, NUM_NETWORK_THREADS_DOC)
+            .define(SOCKET_SELECTOR_IMPLEMENTATION_CONFIG, STRING, SOCKET_SELECTOR_IMPLEMENTATION_DEFAULT, MEDIUM, SOCKET_SELECTOR_IMPLEMENTATION_DOC);
 
     private static final Pattern URI_PARSE_REGEXP = Pattern.compile(
         "^(.*)://\\[?([0-9a-zA-Z\\-%._:]*)\\]?:(-?[0-9]+)");
