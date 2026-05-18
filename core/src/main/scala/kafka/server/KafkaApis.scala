@@ -4693,6 +4693,37 @@ class KafkaApis(val requestChannel: RequestChannel,
     }
   }
 
+  // DESCRIBE_LOG_DIRS — tenant existence-oracle + disk-usage enumeration guard.
+  //
+  // The stock handler authorises only on CLUSTER:DESCRIBE and then enumerates
+  // either every local partition (isAllTopicPartitions) or the explicit topic
+  // list. With multi-tenancy two leaks fall out for a cluster-wide caller:
+  //
+  //  1. WILDCARD ENUMERATION: isAllTopicPartitions emits every tenant's
+  //     physical topic names with per-partition byte size + offset lag —
+  //     strictly more revealing than #93's DescribeTopicPartitions leak
+  //     (which exposed names only).
+  //  2. EXISTENCE + DISK-USAGE ORACLE: an explicit `acme.orders` request
+  //     either returns a populated result or a KafkaStorageException-shaped
+  //     gap depending on local-partition presence, letting the caller probe
+  //     tenant topic presence and traffic shape.
+  //
+  // Defense: silent-strip on both vectors (matches #87's
+  // ListPartitionReassignments and #92's DescribeProducers patterns).
+  //  - explicit-topic path: drop any TopicPartition whose topic name lives in
+  //    a reserved tenant namespace BEFORE calling replicaManager.describeLogDirs,
+  //    so the response never lists the topic and there is no error-code
+  //    signal to compare against an unknown-topic miss.
+  //  - all-partitions path: strip reserved-namespace topics from each Topics
+  //    entry of every DescribeLogDirsResult after the local enumeration.
+  //
+  // Internal topics (`__consumer_offsets`, `__transaction_state`,
+  // `__share_group_state`) are exempt — they are never tenant-prefixed and
+  // legitimate cluster admin tooling needs to see them.
+  //
+  // DESCRIBE_LOG_DIRS is not in TENANT_ALLOWED_APIS, so tenant principals are
+  // already refused at the dispatch gate; tenant context is empty here by
+  // construction. Guard short-circuits cleanly when no tenants are configured.
   def handleDescribeLogDirsRequest(request: RequestChannel.Request): Unit = {
     val describeLogDirsDirRequest = request.body[DescribeLogDirsRequest]
     val (logDirInfos, error) = {
@@ -4705,7 +4736,29 @@ class KafkaApis(val requestChannel: RequestChannel,
               logDirTopic => logDirTopic.partitions.asScala.map(partitionIndex =>
                 new TopicPartition(logDirTopic.topic, partitionIndex))).toSet
 
-        (replicaManager.describeLogDirs(partitions), Errors.NONE)
+        // Outside-in pre-filter on the explicit-topic path: a TopicPartition
+        // naming a reserved-tenant topic is dropped before reaching the
+        // log-dir scan. The all-partitions path doesn't need pre-filtering
+        // (every partition came from the local log manager, all owned by
+        // this broker); we scrub on the response side instead.
+        val scrubbedPartitions =
+          if (describeLogDirsDirRequest.isAllTopicPartitions) partitions
+          else partitions.filterNot(tp => isReservedTenantNamespace(tp.topic))
+
+        val rawResults = replicaManager.describeLogDirs(scrubbedPartitions)
+        // Response-side scrub. The result list groups partitions by log dir,
+        // then by topic; walk both levels and remove tenant-owned Topics
+        // entries in place. Empty-after-scrub result entries are kept so the
+        // response shape (one entry per log dir) is preserved.
+        val scrubbedResults: List[DescribeLogDirsResponseData.DescribeLogDirsResult] =
+          if (tenantConfig.allTenants.isEmpty) rawResults
+          else rawResults.map { dirResult =>
+            val keptTopics = dirResult.topics.asScala
+              .filterNot(t => isReservedTenantNamespace(t.name))
+              .asJava
+            dirResult.setTopics(keptTopics)
+          }
+        (scrubbedResults, Errors.NONE)
       } else {
         (List.empty[DescribeLogDirsResponseData.DescribeLogDirsResult], Errors.CLUSTER_AUTHORIZATION_FAILED)
       }

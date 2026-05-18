@@ -16846,6 +16846,231 @@ class KafkaApisTest extends Logging {
   }
 
   // ---------------------------------------------------------------------------
+  // DescribeLogDirs — tenant existence-oracle + disk-usage enumeration guard.
+  //
+  // The stock handler authorises only on CLUSTER:DESCRIBE then enumerates
+  // every local partition (isAllTopicPartitions) or the explicit topic list.
+  // For a cluster-wide caller against a multi-tenant broker that yields two
+  // leaks:
+  //  - WILDCARD: response includes every tenant's physical topic name with
+  //    per-partition size + offset-lag (strictly more revealing than #93).
+  //  - EXPLICIT: a request naming `acme.orders` reveals existence + disk
+  //    usage of that tenant's topic.
+  //
+  // Defense: silent-strip on both vectors. Tests pin the contract for the
+  // explicit-topic pre-filter, the response-side scrub (which doubles as
+  // defense-in-depth against an out-of-band describeLogDirs implementation),
+  // and the neutral-passthrough when no tenants are configured. Internal
+  // topics (`__consumer_offsets`, `__transaction_state`, ...) are exempt.
+  // ---------------------------------------------------------------------------
+
+  private def describeLogDirsResult(logDir: String,
+                                    topics: Seq[String]): DescribeLogDirsResponseData.DescribeLogDirsResult = {
+    val dirTopics = topics.map(name =>
+      new DescribeLogDirsResponseData.DescribeLogDirsTopic()
+        .setName(name)
+        .setPartitions(util.Collections.singletonList(
+          new DescribeLogDirsResponseData.DescribeLogDirsPartition()
+            .setPartitionIndex(0).setPartitionSize(1024L).setOffsetLag(0L).setIsFutureKey(false))))
+    new DescribeLogDirsResponseData.DescribeLogDirsResult()
+      .setLogDir(logDir)
+      .setErrorCode(Errors.NONE.code)
+      .setTotalBytes(1L << 30)
+      .setUsableBytes(1L << 28)
+      .setTopics(dirTopics.asJava)
+  }
+
+  @Test
+  def testDescribeLogDirsExplicitTenantTopicPreFilteredBeforeReplicaManager(): Unit = {
+    // Outside-in pre-filter: a non-tenant caller on the cluster-wide listener
+    // asking about `acme.orders` (physical form of acme's logical `orders`)
+    // is dropped at the partitions-set stage, BEFORE replicaManager.describeLogDirs
+    // is invoked. That makes the response indistinguishable from
+    // "topic does not exist on this broker" (no result row) and prevents
+    // timing/cost differentials that would otherwise distinguish a refused
+    // tenant-topic probe from a true unknown-topic miss.
+    val data = new DescribeLogDirsRequestData().setTopics(
+      new DescribeLogDirsRequestData.DescribableLogDirTopicCollection(util.Arrays.asList(
+        new DescribeLogDirsRequestData.DescribableLogDirTopic()
+          .setTopic("acme.orders")
+          .setPartitions(util.Collections.singletonList(Int.box(0))),
+        new DescribeLogDirsRequestData.DescribableLogDirTopic()
+          .setTopic("regular-topic")
+          .setPartitions(util.Collections.singletonList(Int.box(0)))
+      ).iterator()))
+    val request = buildRequest(new DescribeLogDirsRequest.Builder(data).build())
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    val partitionsCaptor: ArgumentCaptor[Set[TopicPartition]] =
+      ArgumentCaptor.forClass(classOf[Set[TopicPartition]])
+    when(replicaManager.describeLogDirs(partitionsCaptor.capture()))
+      .thenReturn(List(describeLogDirsResult("/var/lib/kafka", Seq("regular-topic"))))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDescribeLogDirsRequest(request)
+
+    val captured = partitionsCaptor.getValue
+    assertEquals(Set(new TopicPartition("regular-topic", 0)), captured,
+      "reserved-form partition must be stripped before reaching replicaManager.describeLogDirs")
+    assertFalse(captured.exists(_.topic == "acme.orders"),
+      "tenant-physical partition must not be passed to the log-dir scan")
+
+    val response = verifyNoThrottling[DescribeLogDirsResponse](request)
+    val visibleTopics = response.data.results.asScala
+      .flatMap(_.topics.asScala.map(_.name)).toSet
+    assertEquals(Set("regular-topic"), visibleTopics,
+      "tenant-physical topic must not appear in any result row")
+    assertEquals(Errors.NONE.code, response.data.errorCode,
+      "top-level error code stays NONE: the stripped partition is silent, not refused")
+  }
+
+  @Test
+  def testDescribeLogDirsResponseSideScrubsTenantTopicsDefenseInDepth(): Unit = {
+    // Defense-in-depth: even if describeLogDirs returns a result containing
+    // a tenant-namespaced topic (e.g. because of a future refactor or a
+    // backdoor path that bypasses the pre-filter), the response-side scrub
+    // removes it. Two configured tenants (acme + beta) pin that the scrub
+    // covers every known prefix, not just the listener-bound one.
+    val data = new DescribeLogDirsRequestData().setTopics(
+      new DescribeLogDirsRequestData.DescribableLogDirTopicCollection(util.Arrays.asList(
+        new DescribeLogDirsRequestData.DescribableLogDirTopic()
+          .setTopic("regular-topic")
+          .setPartitions(util.Collections.singletonList(Int.box(0)))
+      ).iterator()))
+    val request = buildRequest(new DescribeLogDirsRequest.Builder(data).build())
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    // Mock returns BOTH the requested non-tenant topic AND a tenant-prefixed
+    // topic the request never named. The response-side scrub must strip it.
+    when(replicaManager.describeLogDirs(any[Set[TopicPartition]]()))
+      .thenReturn(List(describeLogDirsResult("/var/lib/kafka",
+        Seq("acme.orders", "regular-topic", "beta.events"))))
+
+    val props = new util.HashMap[String, Object]()
+    props.put(s"listener.name.${TENANT_LISTENER.value.toLowerCase}.tenant.id", "acme")
+    props.put("listener.name.tenant_beta.tenant.id", "beta")
+    kafkaApis = createKafkaApis(tenantConfig = TenantConfig.from(props))
+    kafkaApis.handleDescribeLogDirsRequest(request)
+
+    val response = verifyNoThrottling[DescribeLogDirsResponse](request)
+    val visibleTopics = response.data.results.asScala
+      .flatMap(_.topics.asScala.map(_.name)).toSet
+    assertEquals(Set("regular-topic"), visibleTopics,
+      "response-side scrub must remove every reserved-tenant topic across all configured prefixes")
+    assertEquals(1, response.data.results.size,
+      "log-dir result entries are preserved even when their Topics list is scrubbed to empty")
+  }
+
+  @Test
+  def testDescribeLogDirsAllTopicsScrubsTenantTopicsFromResponse(): Unit = {
+    // Wildcard path (setTopics(null) → isAllTopicPartitions=true). The handler
+    // enumerates every local partition, then asks replicaManager to describe
+    // them. Without the scrub, the response would list every tenant's
+    // physical topic name plus per-partition size + offset lag — the
+    // primary vector this guard is designed to close.
+    val data = new DescribeLogDirsRequestData().setTopics(
+      new DescribeLogDirsRequestData.DescribableLogDirTopicCollection())
+    val request = buildRequest(new DescribeLogDirsRequest.Builder(data).build())
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    // logManager.allLogs is iterated to build the partitions set; return an
+    // empty iterable — the test only exercises the response-side scrub.
+    val mockLogManager = mock(classOf[kafka.log.LogManager])
+    when(mockLogManager.allLogs).thenReturn(Iterable.empty[UnifiedLog])
+    when(replicaManager.logManager).thenReturn(mockLogManager)
+    when(replicaManager.describeLogDirs(any[Set[TopicPartition]]()))
+      .thenReturn(List(describeLogDirsResult("/var/lib/kafka",
+        Seq("acme.orders", "acme.payments", "public-topic", "__consumer_offsets"))))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDescribeLogDirsRequest(request)
+
+    val response = verifyNoThrottling[DescribeLogDirsResponse](request)
+    val visibleTopics = response.data.results.asScala
+      .flatMap(_.topics.asScala.map(_.name)).toSet
+    assertEquals(Set("public-topic", "__consumer_offsets"), visibleTopics,
+      "wildcard path must strip every acme.* topic but retain internal + non-reserved topics")
+  }
+
+  @Test
+  def testDescribeLogDirsInternalTopicsRetained(): Unit = {
+    // Internal topics (`__consumer_offsets`, `__transaction_state`,
+    // `__share_group_state`) are never tenant-prefixed; legitimate cluster
+    // admin tooling must continue to see them through both the pre-filter
+    // and the response-side scrub.
+    val data = new DescribeLogDirsRequestData().setTopics(
+      new DescribeLogDirsRequestData.DescribableLogDirTopicCollection(util.Arrays.asList(
+        new DescribeLogDirsRequestData.DescribableLogDirTopic()
+          .setTopic("__consumer_offsets")
+          .setPartitions(util.Collections.singletonList(Int.box(0))),
+        new DescribeLogDirsRequestData.DescribableLogDirTopic()
+          .setTopic("__transaction_state")
+          .setPartitions(util.Collections.singletonList(Int.box(0)))
+      ).iterator()))
+    val request = buildRequest(new DescribeLogDirsRequest.Builder(data).build())
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    val partitionsCaptor: ArgumentCaptor[Set[TopicPartition]] =
+      ArgumentCaptor.forClass(classOf[Set[TopicPartition]])
+    when(replicaManager.describeLogDirs(partitionsCaptor.capture()))
+      .thenReturn(List(describeLogDirsResult("/var/lib/kafka",
+        Seq("__consumer_offsets", "__transaction_state"))))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDescribeLogDirsRequest(request)
+
+    val captured = partitionsCaptor.getValue
+    assertEquals(
+      Set(new TopicPartition("__consumer_offsets", 0), new TopicPartition("__transaction_state", 0)),
+      captured,
+      "internal topics must reach the log-dir scan unfiltered")
+
+    val response = verifyNoThrottling[DescribeLogDirsResponse](request)
+    val visibleTopics = response.data.results.asScala
+      .flatMap(_.topics.asScala.map(_.name)).toSet
+    assertEquals(Set("__consumer_offsets", "__transaction_state"), visibleTopics,
+      "internal topics must survive the response-side scrub")
+  }
+
+  @Test
+  def testDescribeLogDirsClusterWideListenerKeepsDottedNamesWhenNoTenantsConfigured(): Unit = {
+    // Without any configured tenants, `<id>.<topic>` is just a name with a
+    // dot — the guard must not fire, otherwise legitimate non-tenant clusters
+    // lose visibility into topics with dots in their names.
+    val data = new DescribeLogDirsRequestData().setTopics(
+      new DescribeLogDirsRequestData.DescribableLogDirTopicCollection(util.Arrays.asList(
+        new DescribeLogDirsRequestData.DescribableLogDirTopic()
+          .setTopic("acme.orders")
+          .setPartitions(util.Collections.singletonList(Int.box(0)))
+      ).iterator()))
+    val request = buildRequest(new DescribeLogDirsRequest.Builder(data).build())
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    val partitionsCaptor: ArgumentCaptor[Set[TopicPartition]] =
+      ArgumentCaptor.forClass(classOf[Set[TopicPartition]])
+    when(replicaManager.describeLogDirs(partitionsCaptor.capture()))
+      .thenReturn(List(describeLogDirsResult("/var/lib/kafka", Seq("acme.orders"))))
+
+    kafkaApis = createKafkaApis() // no tenantConfig
+    kafkaApis.handleDescribeLogDirsRequest(request)
+
+    val captured = partitionsCaptor.getValue
+    assertEquals(Set(new TopicPartition("acme.orders", 0)), captured,
+      "with no tenants configured the dotted topic must reach the log-dir scan unfiltered")
+
+    val response = verifyNoThrottling[DescribeLogDirsResponse](request)
+    val visibleTopics = response.data.results.asScala
+      .flatMap(_.topics.asScala.map(_.name)).toSet
+    assertEquals(Set("acme.orders"), visibleTopics,
+      "with no tenants configured the dotted topic must appear in the response")
+  }
+
+  // ---------------------------------------------------------------------------
   // CreateDelegationToken — multi-tenancy identity-laundering guard
   //
   // Minting a token whose owner (or any renewer) sits inside the tenant
