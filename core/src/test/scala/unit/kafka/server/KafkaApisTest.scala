@@ -2008,6 +2008,11 @@ class KafkaApisTest extends Logging {
     for (version <- ApiKeys.PRODUCE.oldestVersion to ApiKeys.PRODUCE.latestVersion) {
 
       reset(replicaManager, clientQuotaManager, clientRequestQuotaManager, requestChannel, txnCoordinator)
+      // KafkaApis.handleProduceRequest now reads the topic's compression.policy via
+      // replicaManager.getLogConfig. The real method returns Option[LogConfig], never null;
+      // Mockito defaults to null. Stub it to None so produce tests that don't care about
+      // log config behave as if the topic has no override (default policy = none).
+      when(replicaManager.getLogConfig(any[TopicPartition])).thenReturn(None)
 
       val responseCallback: ArgumentCaptor[Map[TopicPartition, PartitionResponse] => Unit] = ArgumentCaptor.forClass(classOf[Map[TopicPartition, PartitionResponse] => Unit])
 
@@ -2067,6 +2072,11 @@ class KafkaApisTest extends Logging {
     for (version <- 10 to ApiKeys.PRODUCE.latestVersion) {
 
       reset(replicaManager, clientQuotaManager, clientRequestQuotaManager, requestChannel, txnCoordinator)
+      // KafkaApis.handleProduceRequest now reads the topic's compression.policy via
+      // replicaManager.getLogConfig. The real method returns Option[LogConfig], never null;
+      // Mockito defaults to null. Stub it to None so produce tests that don't care about
+      // log config behave as if the topic has no override (default policy = none).
+      when(replicaManager.getLogConfig(any[TopicPartition])).thenReturn(None)
 
       val responseCallback: ArgumentCaptor[Map[TopicPartition, PartitionResponse] => Unit] = ArgumentCaptor.forClass(classOf[Map[TopicPartition, PartitionResponse] => Unit])
 
@@ -2135,6 +2145,11 @@ class KafkaApisTest extends Logging {
     for (version <- 10 to ApiKeys.PRODUCE.latestVersion) {
 
       reset(replicaManager, clientQuotaManager, clientRequestQuotaManager, requestChannel, txnCoordinator)
+      // KafkaApis.handleProduceRequest now reads the topic's compression.policy via
+      // replicaManager.getLogConfig. The real method returns Option[LogConfig], never null;
+      // Mockito defaults to null. Stub it to None so produce tests that don't care about
+      // log config behave as if the topic has no override (default policy = none).
+      when(replicaManager.getLogConfig(any[TopicPartition])).thenReturn(None)
 
       val responseCallback: ArgumentCaptor[Map[TopicPartition, PartitionResponse] => Unit] = ArgumentCaptor.forClass(classOf[Map[TopicPartition, PartitionResponse] => Unit])
 
@@ -2199,6 +2214,11 @@ class KafkaApisTest extends Logging {
     for (version <- 10 to ApiKeys.PRODUCE.latestVersion) {
 
       reset(replicaManager, clientQuotaManager, clientRequestQuotaManager, requestChannel, txnCoordinator)
+      // KafkaApis.handleProduceRequest now reads the topic's compression.policy via
+      // replicaManager.getLogConfig. The real method returns Option[LogConfig], never null;
+      // Mockito defaults to null. Stub it to None so produce tests that don't care about
+      // log config behave as if the topic has no override (default policy = none).
+      when(replicaManager.getLogConfig(any[TopicPartition])).thenReturn(None)
 
       val responseCallback: ArgumentCaptor[Map[TopicPartition, PartitionResponse] => Unit] = ArgumentCaptor.forClass(classOf[Map[TopicPartition, PartitionResponse] => Unit])
 
@@ -2264,6 +2284,11 @@ class KafkaApisTest extends Logging {
     for (version <- ApiKeys.PRODUCE.oldestVersion to ApiKeys.PRODUCE.latestVersion) {
 
       reset(replicaManager, clientQuotaManager, clientRequestQuotaManager, requestChannel, txnCoordinator)
+      // KafkaApis.handleProduceRequest now reads the topic's compression.policy via
+      // replicaManager.getLogConfig. The real method returns Option[LogConfig], never null;
+      // Mockito defaults to null. Stub it to None so produce tests that don't care about
+      // log config behave as if the topic has no override (default policy = none).
+      when(replicaManager.getLogConfig(any[TopicPartition])).thenReturn(None)
 
       val tp = new TopicPartition("topic", 0)
 
