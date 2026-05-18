@@ -22,6 +22,7 @@ import org.apache.kafka.common.record.MemoryRecords;
 import org.apache.kafka.common.record.MemoryRecordsBuilder;
 import org.apache.kafka.common.record.Record;
 import org.apache.kafka.common.record.RecordBatch;
+import org.apache.kafka.common.record.Records;
 import org.apache.kafka.common.record.TimestampType;
 
 import java.nio.ByteBuffer;
@@ -61,7 +62,7 @@ public final class LogicalFetchTranslator {
      *
      * @throws NullPointerException if any argument is null
      */
-    public static MemoryRecords translate(MemoryRecords source, String targetLogicalTopic) {
+    public static MemoryRecords translate(Records source, String targetLogicalTopic) {
         Objects.requireNonNull(source, "source");
         Objects.requireNonNull(targetLogicalTopic, "targetLogicalTopic");
 
@@ -72,7 +73,7 @@ public final class LogicalFetchTranslator {
         return rebuildBatch(filtered);
     }
 
-    private static FilterResult collectSurvivors(MemoryRecords source, String targetLogicalTopic) {
+    private static FilterResult collectSurvivors(Records source, String targetLogicalTopic) {
         List<SurvivingRecord> survivors = new ArrayList<>();
         byte magic = RecordBatch.CURRENT_MAGIC_VALUE;
         TimestampType timestampType = TimestampType.CREATE_TIME;
