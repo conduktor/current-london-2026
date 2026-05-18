@@ -18,6 +18,7 @@ package org.apache.kafka.server.views;
 
 import org.apache.kafka.common.header.Header;
 import org.apache.kafka.common.record.MemoryRecords;
+import org.apache.kafka.common.record.MutableRecordBatch;
 import org.apache.kafka.common.record.Record;
 import org.apache.kafka.common.record.RecordBatch;
 import org.apache.kafka.common.utils.BufferSupplier;
@@ -120,6 +121,26 @@ public final class ViewFilter {
         ByteBuffer out = result.outputBuffer();
         out.flip();
         MemoryRecords filtered = MemoryRecords.readableRecords(out);
+        // Strip the backing topic's partition_leader_epoch from every filtered batch header. The
+        // view partition maintains its own (lower) leader-epoch ledger, so leaking the backing
+        // epoch through the records wedges the consumer:
+        //   CompletedFetch  -> lastEpoch = currentBatch.partitionLeaderEpoch()    (backing epoch)
+        //   FetchCollector  -> position.offsetEpoch = lastEpoch
+        //   SubscriptionState -> AWAIT_VALIDATION on the *view* partition with the *backing* epoch
+        //   OffsetsForLeaderEpoch on the view -> currently rejected with INVALID_REQUEST
+        //   handleResponse default branch -> partition stays in partitionsToRetry forever
+        // so the consumer is stuck in non-fetchable AWAIT_VALIDATION + infinite OFLE retry.
+        // Mutating partition_leader_epoch in place is safe: the DefaultRecordBatch byte layout
+        // places PARTITION_LEADER_EPOCH_OFFSET (12) BEFORE ATTRIBUTES_OFFSET (21), and the v2
+        // CRC32C covers only [ATTRIBUTES_OFFSET, end), so the 4-byte rewrite does NOT invalidate
+        // the batch checksum. Legacy v0/v1 batches don't carry the field at all and throw on the
+        // setter, so we guard on magic >= MAGIC_VALUE_V2 — those batches cannot leak a backing
+        // epoch because the field doesn't exist on the wire.
+        for (MutableRecordBatch batch : filtered.batches()) {
+            if (batch.magic() >= RecordBatch.MAGIC_VALUE_V2) {
+                batch.setPartitionLeaderEpoch(RecordBatch.NO_PARTITION_LEADER_EPOCH);
+            }
+        }
         metrics.recordBytes(inputSize, filtered.sizeInBytes());
         return filtered;
     }

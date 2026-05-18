@@ -389,6 +389,66 @@ class ViewFilterTest {
         }
     }
 
+    @Test
+    void filteredBatchesAlwaysCarryNoPartitionLeaderEpochRegardlessOfSource() {
+        // The view partition keeps its own (lower) leader-epoch ledger. If the filter forwards the
+        // backing topic's partition_leader_epoch through filtered records, the consumer's
+        // CompletedFetch pins position.offsetEpoch to the backing epoch; the next fetch tries to
+        // validate that epoch against the view ledger via OffsetsForLeaderEpoch, which we reject
+        // with INVALID_REQUEST. The consumer's handleResponse default branch then retries forever
+        // while the partition is stuck in AWAIT_VALIDATION (non-fetchable). Strip the field on the
+        // way out — pin -1 / NO_PARTITION_LEADER_EPOCH so the consumer never enters validation.
+        CompiledPredicate p = compiler.compile("body.color == 'red'");
+        // Build a batch that explicitly carries a non-trivial backing partition_leader_epoch
+        // (simulating a backing topic that has gone through several leader elections). Use the
+        // builder constructor so we can set partitionLeaderEpoch directly.
+        ByteBuffer buffer = ByteBuffer.allocate(2048);
+        int sourceBackingEpoch = 1234;
+        MemoryRecordsBuilder builder = new MemoryRecordsBuilder(
+                buffer,
+                RecordBatch.CURRENT_MAGIC_VALUE,
+                Compression.NONE,
+                TimestampType.CREATE_TIME,
+                0L,
+                0L,
+                RecordBatch.NO_PRODUCER_ID,
+                RecordBatch.NO_PRODUCER_EPOCH,
+                RecordBatch.NO_SEQUENCE,
+                false,
+                false,
+                sourceBackingEpoch,
+                buffer.capacity());
+        builder.append(0L, null, "{\"color\":\"red\"}".getBytes(StandardCharsets.UTF_8));
+        builder.append(0L, null, "{\"color\":\"blue\"}".getBytes(StandardCharsets.UTF_8));
+        builder.append(0L, null, "{\"color\":\"red\"}".getBytes(StandardCharsets.UTF_8));
+        builder.close();
+        buffer.flip();
+        MemoryRecords input = MemoryRecords.readableRecords(buffer);
+
+        // Sanity check: the source batch really does carry the backing epoch.
+        for (MutableRecordBatch sourceBatch : input.batches()) {
+            assertEquals(sourceBackingEpoch, sourceBatch.partitionLeaderEpoch(),
+                    "input batch must carry the backing epoch so the strip is observable");
+        }
+
+        MemoryRecords output = ViewFilter.apply(p, input, 0);
+
+        boolean sawBatch = false;
+        for (MutableRecordBatch batch : output.batches()) {
+            sawBatch = true;
+            assertEquals(RecordBatch.NO_PARTITION_LEADER_EPOCH, batch.partitionLeaderEpoch(),
+                    "every filtered batch must have partition_leader_epoch == -1 so the consumer "
+                            + "never pins position.offsetEpoch to the backing epoch");
+            // The CRC must remain valid after the in-place setter. DefaultRecordBatch.isValid()
+            // recomputes the checksum from ATTRIBUTES_OFFSET onwards and compares against the
+            // stored CRC. If partition_leader_epoch were inside CRC coverage, this would fail —
+            // catching any future change to the v2 batch layout that breaks the assumption.
+            assertTrue(((org.apache.kafka.common.record.DefaultRecordBatch) batch).isValid(),
+                    "filtered batch CRC must remain valid after stripping partition_leader_epoch");
+        }
+        assertTrue(sawBatch, "expected at least one filtered batch in the output");
+    }
+
     private static SimpleRecord rec(String json) {
         byte[] body = json == null ? null : json.getBytes(StandardCharsets.UTF_8);
         return new SimpleRecord(0L, null, body);
