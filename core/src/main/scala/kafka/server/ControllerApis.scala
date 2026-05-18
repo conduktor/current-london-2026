@@ -33,7 +33,7 @@ import org.apache.kafka.clients.admin.{AlterConfigOp, EndpointType}
 import org.apache.kafka.common.Uuid.ZERO_UUID
 import org.apache.kafka.common.acl.AclOperation.{ALTER, ALTER_CONFIGS, CLUSTER_ACTION, CREATE, CREATE_TOKENS, DELETE, DESCRIBE, DESCRIBE_CONFIGS}
 import org.apache.kafka.common.config.ConfigResource
-import org.apache.kafka.common.errors.{ApiException, ClusterAuthorizationException, InvalidRequestException, TopicDeletionDisabledException, UnsupportedVersionException}
+import org.apache.kafka.common.errors.{ApiException, ClusterAuthorizationException, InvalidRequestException, ThrottlingQuotaExceededException, TopicDeletionDisabledException, UnsupportedVersionException}
 import org.apache.kafka.common.internals.FatalExitError
 import org.apache.kafka.common.internals.Topic
 import org.apache.kafka.common.message.AlterConfigsResponseData.{AlterConfigsResourceResponse => OldAlterConfigsResourceResponse}
@@ -445,22 +445,40 @@ class ControllerApis(
     } else {
       authorizedTopicNames.iterator.filter(declaredLogicalTopicNames.contains).toSet
     }
+    // Per-topic verdict override for shadowed names. Default is TOPIC_ALREADY_EXISTS; flipped
+    // to THROTTLING_QUOTA_EXCEEDED below if applyPartitionChangeQuota throws (r17 BLOCKER fix —
+    // see comment block below).
+    var shadowQuotaExceeded = false
     if (shadowedNames.nonEmpty) {
       // Charge controller mutation quota for shadow-rejected topics (r16 MEDIUM N3-followup).
       // The controller's normal createTopics path records the quota internally; we short-circuit
       // before reaching it, so without this an authorized client could probe the entire declared
       // logical-topic set by sending bulk CreateTopics requests and observing TOPIC_ALREADY_EXISTS
       // verdicts at zero quota cost (cheap DoS / declaration-enumeration oracle). Per-topic
-      // accounting matches the controller's own charge: numPartitions per topic, with -1
-      // (broker-default) treated as 1 — the minimum needed to ensure each shadow-rejected name
-      // costs something. applyPartitionChangeQuota throws ThrottlingQuotaExceededException on
-      // exhaustion, which propagates as THROTTLING_QUOTA_EXCEEDED — same surface as a normal
-      // controller-side quota hit.
-      val shadowedPartitionCharge = request.topics().asScala.iterator
-        .filter(t => shadowedNames.contains(t.name))
-        .map(t => Math.max(1, t.numPartitions))
-        .sum
-      context.applyPartitionChangeQuota(shadowedPartitionCharge)
+      // accounting: numPartitions per topic with -1 (broker-default) and any non-positive value
+      // clamped to 1, then capped at Integer.MAX_VALUE via saturating Long addition (r17 HIGH —
+      // a malicious client cannot wedge the per-(user,clientId) quota sensor with negative
+      // wrap-around by sending Int.MaxValue numPartitions on multiple shadow names).
+      var charge: Long = 0L
+      request.topics().forEach { t =>
+        if (shadowedNames.contains(t.name)) {
+          val perTopic: Long = if (t.numPartitions <= 0) 1L else t.numPartitions.toLong
+          charge = Math.min(Int.MaxValue.toLong, charge + perTopic)
+        }
+      }
+      try {
+        context.applyPartitionChangeQuota(charge.toInt)
+      } catch {
+        case _: ThrottlingQuotaExceededException =>
+          // r17 BLOCKER fix: do NOT let this propagate. The synchronous throw escapes
+          // createTopics and is caught by handle()'s outer catch, which calls
+          // CreateTopicsRequest.getErrorResponse(t) — painting EVERY topic in the request
+          // (including innocent authorized non-shadow names) with THROTTLING_QUOTA_EXCEEDED.
+          // Instead, mark only shadowed names as throttled below and let the rest proceed
+          // through the normal controller create path (which will itself charge quota and
+          // either succeed or return its own per-topic verdict).
+          shadowQuotaExceeded = true
+      }
     }
     val describableTopicNames = getDescribableTopics.apply(allowedTopicNames).asJava
     val effectiveRequest = request.duplicate()
@@ -492,11 +510,19 @@ class ControllerApis(
             setErrorCode(TOPIC_AUTHORIZATION_FAILED.code).
             setErrorMessage("Authorization failed."))
         } else if (shadowedNames.contains(name)) {
-          response.topics().add(new CreatableTopicResult().
-            setName(name).
-            setErrorCode(TOPIC_ALREADY_EXISTS.code).
-            setErrorMessage("Topic name collides with a declared logical topic on this " +
-              "controller; refusing to create a physical topic that would shadow it."))
+          if (shadowQuotaExceeded) {
+            response.topics().add(new CreatableTopicResult().
+              setName(name).
+              setErrorCode(THROTTLING_QUOTA_EXCEEDED.code).
+              setErrorMessage("Controller mutation quota exceeded while charging shadow-rejection " +
+                "of a name that collides with a declared logical topic on this controller."))
+          } else {
+            response.topics().add(new CreatableTopicResult().
+              setName(name).
+              setErrorCode(TOPIC_ALREADY_EXISTS.code).
+              setErrorMessage("Topic name collides with a declared logical topic on this " +
+                "controller; refusing to create a physical topic that would shadow it."))
+          }
         }
       }
       response

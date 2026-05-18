@@ -888,6 +888,95 @@ class ControllerApisTest {
       s"expected shadow-rejection to charge 10 mutation-quota permits; got $quotaCharges")
   }
 
+  /**
+   * r17 BLOCKER — quota-throw must NOT propagate synchronously out of createTopics.
+   *
+   * Before the fix: context.applyPartitionChangeQuota for the shadow bulk charge threw
+   * ThrottlingQuotaExceededException synchronously, escaping createTopics entirely. The
+   * throw was caught by handle()'s outer catch, which routed to
+   * CreateTopicsRequest.getErrorResponse(t) — which paints EVERY topic in the request
+   * (including innocent authorized non-shadow names) with THROTTLING_QUOTA_EXCEEDED and
+   * bypasses sendResponseMaybeThrottleWithControllerQuota entirely.
+   *
+   * The fix catches the exception inside createTopics, flips the per-shadow verdict to
+   * THROTTLING_QUOTA_EXCEEDED, and lets the (non-shadow) tail proceed through
+   * controller.createTopics. The discriminator below: an applier that throws ONLY on the
+   * bulk shadow charge (>=2 permits) and succeeds on MockController's per-topic single-
+   * permit charges — innocent topics therefore get NONE in the response, proving that
+   * createTopics did NOT take the synchronous-throw path.
+   */
+  @Test
+  def testCreateTopicsShadowQuotaThrowOnlyHitsShadowedNames(): Unit = {
+    val controller = new MockController.Builder().build()
+    val props = new Properties()
+    props.put(ServerConfigs.CONCENTRATION_LOGICAL_TOPICS_CONFIG, "orders:100:shared:4,payments:50:shared:4")
+    controllerApis = createControllerApis(None, controller, props)
+    val request = new CreateTopicsRequestData().setTopics(new CreatableTopicCollection(
+      util.Arrays.asList(
+        new CreatableTopic().setName("orders").setNumPartitions(1).setReplicationFactor(3),
+        new CreatableTopic().setName("payments").setNumPartitions(1).setReplicationFactor(3),
+        new CreatableTopic().setName("innocent1").setNumPartitions(1).setReplicationFactor(3),
+        new CreatableTopic().setName("innocent2").setNumPartitions(1).setReplicationFactor(3),
+      ).iterator()))
+    val ctx = org.apache.kafka.controller.ControllerRequestContextUtil.anonymousContextFor(
+      ApiKeys.CREATE_TOPICS,
+      ApiKeys.CREATE_TOPICS.latestVersion(),
+      new java.util.function.Consumer[Integer]() {
+        override def accept(permits: Integer): Unit = {
+          if (permits >= 2) throw new ThrottlingQuotaExceededException(0, "test bulk")
+        }
+      })
+    val response = controllerApis.createTopics(ctx, request,
+      hasClusterAuth = true,
+      _ => Set("orders", "payments", "innocent1", "innocent2"),
+      _ => Set("orders", "payments", "innocent1", "innocent2")).get()
+    val byName = response.topics().asScala.map(r => r.name -> r.errorCode).toMap
+    assertEquals(THROTTLING_QUOTA_EXCEEDED.code, byName("orders"),
+      s"orders should be throttled; got ${byName.get("orders")}")
+    assertEquals(THROTTLING_QUOTA_EXCEEDED.code, byName("payments"),
+      s"payments should be throttled; got ${byName.get("payments")}")
+    assertEquals(NONE.code, byName("innocent1"),
+      s"innocent1 must NOT inherit the throttle verdict; got ${byName.get("innocent1")}")
+    assertEquals(NONE.code, byName("innocent2"),
+      s"innocent2 must NOT inherit the throttle verdict; got ${byName.get("innocent2")}")
+  }
+
+  /**
+   * r17 HIGH — Int overflow on shadow-partition charge sum.
+   *
+   * Two shadowed topics with numPartitions = Int.MaxValue used to overflow .sum to a
+   * negative value, which was then handed to applyPartitionChangeQuota and recorded
+   * into the quota sensor as a negative permit (corrupting the per-(user,clientId) bucket).
+   * The fix saturates with Long arithmetic and caps at Integer.MAX_VALUE.
+   */
+  @Test
+  def testCreateTopicsShadowChargeSaturatesOnIntOverflow(): Unit = {
+    val controller = new MockController.Builder().build()
+    val props = new Properties()
+    props.put(ServerConfigs.CONCENTRATION_LOGICAL_TOPICS_CONFIG, "orders:100:shared:4,payments:50:shared:4")
+    controllerApis = createControllerApis(None, controller, props)
+    val request = new CreateTopicsRequestData().setTopics(new CreatableTopicCollection(
+      util.Arrays.asList(
+        new CreatableTopic().setName("orders").setNumPartitions(Int.MaxValue).setReplicationFactor(3),
+        new CreatableTopic().setName("payments").setNumPartitions(Int.MaxValue).setReplicationFactor(3),
+      ).iterator()))
+    val quotaCharges = new util.ArrayList[Integer]()
+    val ctx = org.apache.kafka.controller.ControllerRequestContextUtil.anonymousContextFor(
+      ApiKeys.CREATE_TOPICS,
+      ApiKeys.CREATE_TOPICS.latestVersion(),
+      new java.util.function.Consumer[Integer]() {
+        override def accept(permits: Integer): Unit = quotaCharges.add(permits)
+      })
+    controllerApis.createTopics(ctx, request,
+      hasClusterAuth = true,
+      _ => Set("orders", "payments"),
+      _ => Set("orders", "payments")).get()
+    assertTrue(quotaCharges.asScala.exists(p => p == Int.MaxValue),
+      s"expected saturated charge of Int.MaxValue; got $quotaCharges")
+    assertTrue(quotaCharges.asScala.forall(p => p >= 0),
+      s"no charge should be negative; got $quotaCharges")
+  }
+
   @Test
   def testDeleteTopicsByName(): Unit = {
     val fooId = Uuid.fromString("vZKYST0pSA2HO5x_6hoO2Q")
