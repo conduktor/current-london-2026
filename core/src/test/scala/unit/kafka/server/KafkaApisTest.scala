@@ -5729,19 +5729,30 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
-  def testOffsetForLeaderEpochOnViewTopicReturnsInvalidRequestAndDoesNotConsultReplicaManager(): Unit = {
+  def testOffsetForLeaderEpochOnViewTopicReturnsNonWedgingNoneForConsumer(): Unit = {
     // OffsetsForLeaderEpoch returns (leader_epoch, end_offset) pairs from the partition's own
     // local-log ledger. For view topics, that ledger is meaningless: the view partition never
     // receives records directly (produce to a view is rejected per PROMPT.md), and the records
-    // a view consumer reads carry the BACKING's leader epochs in their batch headers. Round-
-    // tripping a view-side epoch lookup back to a consumer doing KIP-320 truncation detection
-    // would either silently mismatch ledgers or — if the view's empty log is consulted — return
-    // UNDEFINED_EPOCH_OFFSET regardless. Reject up front with INVALID_REQUEST so the consumer
-    // does not silently lose truncation safety on a per-fetch basis. Pin that:
-    //   (a) view partitions surface INVALID_REQUEST with the protocol's sentinel epoch/offset,
+    // a view consumer reads carry epoch-stripped batch headers (ViewFilter sets
+    // partition_leader_epoch = NO_PARTITION_LEADER_EPOCH on emitted batches). Steady-state, the
+    // consumer never sends OFLE on a view partition because its `position.offsetEpoch` is
+    // empty — but a consumer that booted under the OLD code (before the three epoch-scrubbing
+    // fixes landed) can still have a poisoned in-memory offsetEpoch and send OFLE on a view.
+    //
+    // INVALID_REQUEST falls into OffsetsForLeaderEpochUtils.handleResponse's `default:` branch,
+    // leaving the partition in `partitionsToRetry` forever — silent AWAIT_VALIDATION wedge.
+    // The handler returns `Errors.NONE + (leaderEpoch=0, endOffset=Long.MaxValue)` instead, which
+    // drives SubscriptionState.maybeCompleteValidation to `completeValidation()` cleanly:
+    //   - endOffset != UNDEFINED_EPOCH_OFFSET (-1)  ⇒ skip truncation-sentinel branch
+    //   - leaderEpoch != UNDEFINED_EPOCH (-1)        ⇒ skip truncation-sentinel branch
+    //   - endOffset (Long.MaxValue) >= currentPosition.offset ⇒ skip truncation-reset branch
+    //   - falls through to state.completeValidation() and partition exits AWAIT_VALIDATION
+    // Pin that:
+    //   (a) view partitions surface NONE with leaderEpoch=0 and endOffset=Long.MaxValue (non-
+    //       UNDEFINED, non-truncating synthetic values),
     //   (b) replicaManager.lastOffsetForLeaderEpoch is NOT consulted for view partitions, and
     //   (c) non-view topics inside the SAME request still pass through to the replica layer
-    //       unchanged — the view rejection must not poison the request for unrelated topics.
+    //       unchanged — the view rewrite must not poison the request for unrelated topics.
     val viewTopic = "ofl-view"
     val backingTopic = "ofl-backing"
     val plainTopic = "ofl-plain"
@@ -5799,17 +5810,20 @@ class KafkaApisTest extends Logging {
     val response = verifyNoThrottling[OffsetsForLeaderEpochResponse](request)
     val byTopic = response.data.topics.asScala.map(t => t.topic -> t).toMap
 
-    // (a) View topic: INVALID_REQUEST with sentinel epoch + end offset.
+    // (a) View topic (consumer caller): NONE + non-truncating synthetic (epoch, endOffset).
     val viewResult = byTopic(viewTopic)
     assertEquals(1, viewResult.partitions.size)
     val viewPart = viewResult.partitions.iterator.next
     assertEquals(0, viewPart.partition)
-    assertEquals(Errors.INVALID_REQUEST.code, viewPart.errorCode,
-      "view topic must surface INVALID_REQUEST — OFLEpoch is unsupported for views")
-    assertEquals(OffsetsForLeaderEpochResponse.UNDEFINED_EPOCH, viewPart.leaderEpoch,
-      "the leader_epoch field must use the protocol's UNDEFINED sentinel for unsupported lookups")
-    assertEquals(OffsetsForLeaderEpochResponse.UNDEFINED_EPOCH_OFFSET, viewPart.endOffset,
-      "the end_offset field must use the protocol's UNDEFINED sentinel for unsupported lookups")
+    assertEquals(Errors.NONE.code, viewPart.errorCode,
+      "view topic must surface NONE for consumer OFLE — INVALID_REQUEST would wedge the consumer " +
+        "in AWAIT_VALIDATION via OffsetsForLeaderEpochUtils.handleResponse's default-case retry loop")
+    assertEquals(0, viewPart.leaderEpoch,
+      "leader_epoch must be a non-UNDEFINED value so SubscriptionState.maybeCompleteValidation does " +
+        "not enter the truncation-sentinel branch (UNDEFINED_EPOCH is -1)")
+    assertEquals(Long.MaxValue, viewPart.endOffset,
+      "end_offset must be >= any plausible consumer fetch position so maybeCompleteValidation falls " +
+        "through to completeValidation() instead of the truncation-reset branch")
 
     // (b) Replica layer must have been invoked at most once, and with NO view topics in its
     // input. The thenAnswer block asserts on each invocation; calling verify here pins that the
@@ -5828,6 +5842,76 @@ class KafkaApisTest extends Logging {
     assertEquals(Errors.NONE.code, plainPart.errorCode)
     assertEquals(7, plainPart.leaderEpoch)
     assertEquals(123L, plainPart.endOffset)
+  }
+
+  @Test
+  def testOffsetForLeaderEpochOnViewTopicReturnsInvalidRequestForFollower(): Unit = {
+    // Followers must NEVER replicate from a view leader — views are read-only virtual topics
+    // with no records of their own. An OFLE arriving with a non-CONSUMER_REPLICA_ID is always
+    // a bug (either a misbehaving broker or a custom client impersonating one), and the
+    // consumer-side recovery does not apply: the follower side is expected to fail loudly so
+    // the operator notices, not to silently complete validation against synthetic offsets.
+    // Pin that for follower callers the handler keeps the original INVALID_REQUEST + UNDEFINED
+    // response and still does NOT consult the replica layer for view partitions.
+    val viewTopic = "ofl-view-follower"
+    val backingTopic = "ofl-backing-follower"
+    val viewTopicId = Uuid.randomUuid()
+    val backingTopicId = Uuid.randomUuid()
+
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, backingTopic)
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.x == 1")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+    addTopicToMetadataCache(viewTopic, numPartitions = 1, topicId = viewTopicId)
+    addTopicToMetadataCache(backingTopic, numPartitions = 1, topicId = backingTopicId)
+
+    // Stub the replica layer to fail loudly if it is invoked with view topics. Follower OFLE
+    // for a view is forbidden — the handler must short-circuit before reaching the replica layer.
+    when(replicaManager.lastOffsetForLeaderEpoch(any[Seq[OffsetForLeaderTopic]]))
+      .thenAnswer(ans => {
+        val topicsArg = ans.getArgument[Seq[OffsetForLeaderTopic]](0)
+        assertTrue(
+          topicsArg.forall(t => t.topic != viewTopic),
+          s"replicaManager.lastOffsetForLeaderEpoch must not be invoked with view topics; got $topicsArg")
+        topicsArg.map(t => new OffsetForLeaderTopicResult()
+          .setTopic(t.topic)
+          .setPartitions(t.partitions.asScala.map(p => new EpochEndOffset()
+            .setPartition(p.partition)
+            .setErrorCode(Errors.NONE.code)).toList.asJava))
+      })
+
+    val epochs = new OffsetForLeaderTopicCollection()
+    epochs.add(new OffsetForLeaderTopic()
+      .setTopic(viewTopic)
+      .setPartitions(List(new OffsetForLeaderPartition()
+        .setPartition(0)
+        .setCurrentLeaderEpoch(3)
+        .setLeaderEpoch(2)).asJava))
+    // forFollower uses an explicit broker replicaId (here 5), which makes the request a follower
+    // OFLE rather than a consumer OFLE. This is the test discriminator between the two branches.
+    val request = buildRequest(OffsetsForLeaderEpochRequest.Builder.forFollower(epochs, 5).build())
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+    // No authorizer is configured — AuthHelper.authorize returns true by default for None
+    // authorizers (cf. AuthHelper.authorize using authorizer.forall { ... }), so the handler's
+    // CLUSTER_ACTION branch takes effect and routes all topics through `authorizedTopics`.
+    kafkaApis = createKafkaApis(configRepository = configRepository)
+    kafkaApis.handleOffsetForLeaderEpochRequest(request)
+
+    val response = verifyNoThrottling[OffsetsForLeaderEpochResponse](request)
+    val byTopic = response.data.topics.asScala.map(t => t.topic -> t).toMap
+
+    val viewResult = byTopic(viewTopic)
+    assertEquals(1, viewResult.partitions.size)
+    val viewPart = viewResult.partitions.iterator.next
+    assertEquals(0, viewPart.partition)
+    assertEquals(Errors.INVALID_REQUEST.code, viewPart.errorCode,
+      "follower OFLE on a view must surface INVALID_REQUEST — followers should never replicate " +
+        "from a view leader, so a synthetic NONE response would silently mask a broker-side bug")
+    assertEquals(OffsetsForLeaderEpochResponse.UNDEFINED_EPOCH, viewPart.leaderEpoch,
+      "follower path keeps the protocol's UNDEFINED epoch sentinel")
+    assertEquals(OffsetsForLeaderEpochResponse.UNDEFINED_EPOCH_OFFSET, viewPart.endOffset,
+      "follower path keeps the protocol's UNDEFINED end-offset sentinel")
   }
 
   @Test

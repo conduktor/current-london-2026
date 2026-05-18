@@ -2781,41 +2781,68 @@ class KafkaApis(val requestChannel: RequestChannel,
         (topics, Seq.empty[OffsetForLeaderTopic])
       else authHelper.partitionSeqByAuthorized(request.context, DESCRIBE, TOPIC, topics)(_.topic)
 
-    // View topics never accept OffsetsForLeaderEpoch.
+    // View topics have no client-validatable leader-epoch ledger of their own:
     //
     //   1. (epoch, end_offset) returned by `replicaManager.lastOffsetForLeaderEpoch` reflects
-    //      the VIEW partition's own leader-epoch ledger. The view's local log never receives
-    //      records directly — produce is rejected before backing-topic resolution (PROMPT.md
-    //      acceptance criterion) — so the view's epoch ledger has no meaningful end offsets
-    //      to return. Forwarding to the backing topic does not help either: a backing epoch
-    //      is not interchangeable with a view epoch (the two ledgers evolve independently;
-    //      see view-fetch and view-ListOffsets epoch fixes).
+    //      the VIEW partition's own local log, which never receives records directly —
+    //      produce to a view is rejected per PROMPT.md, and the records a view consumer reads
+    //      carry epoch-stripped batch headers (partition_leader_epoch = NO_PARTITION_LEADER_EPOCH;
+    //      see ViewFilter). Asking the replica layer for a view-side (epoch, offset) lookup
+    //      either returns UNDEFINED or is meaningless. Forwarding to the backing does not help:
+    //      backing epochs are not interchangeable with view epochs (independent ledgers, KIP-595).
     //
-    //   2. KIP-320 truncation detection at the consumer relies on round-tripping (epoch,
-    //      offset) pairs that ARE in the same ledger as the records the consumer is reading.
-    //      Because filtered records emitted from a view carry the backing's leader-epoch in
-    //      their batch header (we do not re-stamp them), a view consumer's KIP-320 protocol
-    //      flow is already cross-ledger and unsafe — returning a view-side epoch lookup here
-    //      would only make the inconsistency more silent.
+    //   2. Inter-broker followers never replicate from a view leader (views are read-only virtual
+    //      topics with no records of their own). A follower OFLE on a view is always a bug; it
+    //      gets `INVALID_REQUEST` so it fails loudly.
     //
-    //   3. Inter-broker followers never replicate from a view leader (views are read-only
-    //      virtual topics with no records of their own), so a view OFLEpoch from a follower
-    //      is never a healthy code path.
+    //   3. Consumer-side OFLE on a view requires care. The original implementation returned
+    //      `INVALID_REQUEST + UNDEFINED_EPOCH + UNDEFINED_EPOCH_OFFSET` for all callers, which
+    //      worked safely IF the consumer never sent OFLE on a view partition. The three
+    //      epoch-scrubbing fixes upstream make that the steady-state expectation: ViewFilter
+    //      strips `partition_leader_epoch` from every batch header, divergingEpoch is rewritten
+    //      to empty in applyViewFilter, and OffsetFetch normalizes CommittedLeaderEpoch to -1
+    //      for view topics — so `position.offsetEpoch` stays empty on view partitions and OFLE
+    //      is never sent (cf. OffsetsForLeaderEpochUtils.prepareRequest, which short-circuits
+    //      when offsetEpoch is empty). But for an upgrade rollout where a consumer was running
+    //      *before* those scrubs landed, an in-memory poisoned `offsetEpoch` can still trigger
+    //      OFLE on a view. With INVALID_REQUEST the consumer falls into
+    //      OffsetsForLeaderEpochUtils.handleResponse's `default:` case, leaves the partition in
+    //      `partitionsToRetry`, and re-sends forever — the partition is silently wedged in
+    //      AWAIT_VALIDATION. Returning `NONE + (leaderEpoch=0, endOffset=Long.MAX_VALUE)`
+    //      instead drives SubscriptionState.maybeCompleteValidation into its `completeValidation()`
+    //      branch (endOffset >= currentPosition.offset, and neither field is UNDEFINED), so the
+    //      consumer exits AWAIT_VALIDATION cleanly without entering the truncation-reset path.
+    //      The synthetic values are safe because the consumer's only consumer of the returned
+    //      EpochEndOffset is `maybeCompleteValidation`; nothing else reads them (cf.
+    //      OffsetForEpochResult.endOffsets in OffsetsForLeaderEpochUtils).
     //
-    // Reject every partition with INVALID_REQUEST and the sentinel UNDEFINED_EPOCH /
-    // UNDEFINED_EPOCH_OFFSET values so the field semantics in the response message match a
-    // genuinely-unsatisfiable lookup. KIP-320 truncation detection is degraded on view
-    // consumers — they cannot detect log truncation across a leader change — which is an
-    // acceptable trade-off for the topic-views feature and documented in PROMPT.md as
-    // out-of-scope for stretch goals.
+    // Note: KIP-320 truncation detection is intrinsically degraded on view consumers — a view
+    // has no end-offset ledger to validate against — which is an acceptable trade-off for the
+    // topic-views feature (documented as out-of-scope for stretch goals in PROMPT.md). The
+    // consumer-side recovery here trades "wedged AWAIT_VALIDATION" for "no truncation detection
+    // on view partitions"; the latter is consistent with the design intent.
+    val isConsumerRequest = offsetForLeaderEpoch.replicaId == OffsetsForLeaderEpochRequest.CONSUMER_REPLICA_ID
     val (viewTopics, nonViewTopics) = authorizedTopics.partition(t => isViewTopic(t.topic))
     val endOffsetsForViewPartitions = viewTopics.map { offsetForLeaderTopic =>
       val partitions = offsetForLeaderTopic.partitions.asScala.map { offsetForLeaderPartition =>
-        new EpochEndOffset()
-          .setPartition(offsetForLeaderPartition.partition)
-          .setErrorCode(Errors.INVALID_REQUEST.code)
-          .setLeaderEpoch(OffsetsForLeaderEpochResponse.UNDEFINED_EPOCH)
-          .setEndOffset(OffsetsForLeaderEpochResponse.UNDEFINED_EPOCH_OFFSET)
+        if (isConsumerRequest) {
+          // Synthetic non-wedging response — see point (3) above for the consumer-side rationale.
+          // leaderEpoch=0 and endOffset=Long.MaxValue together defeat the UNDEFINED-sentinel
+          // check AND the `endOffset < currentPosition.offset` truncation check, so
+          // maybeCompleteValidation falls through to completeValidation() unconditionally.
+          new EpochEndOffset()
+            .setPartition(offsetForLeaderPartition.partition)
+            .setErrorCode(Errors.NONE.code)
+            .setLeaderEpoch(0)
+            .setEndOffset(Long.MaxValue)
+        } else {
+          // Follower / inter-broker OFLE on a view is never a healthy code path — point (2).
+          new EpochEndOffset()
+            .setPartition(offsetForLeaderPartition.partition)
+            .setErrorCode(Errors.INVALID_REQUEST.code)
+            .setLeaderEpoch(OffsetsForLeaderEpochResponse.UNDEFINED_EPOCH)
+            .setEndOffset(OffsetsForLeaderEpochResponse.UNDEFINED_EPOCH_OFFSET)
+        }
       }
       new OffsetForLeaderTopicResult()
         .setTopic(offsetForLeaderTopic.topic)
