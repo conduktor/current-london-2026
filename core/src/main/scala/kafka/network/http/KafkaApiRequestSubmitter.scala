@@ -214,8 +214,17 @@ class KafkaApiRequestSubmitter(
         // data (see KafkaApis.handleFetchRequest → fetchContext.getThrottledResponse). The throttle is not a fetch
         // error; surface it as an empty successful page so the formatter emits 200 + Retry-After per PROMPT.md AC3
         // instead of fabricating UNKNOWN_TOPIC_OR_PARTITION (which collapses to 404 and drops Retry-After).
+        //
+        // logStartOffset and highWatermark: the broker did not include them. Reporting them as 0L would
+        // tell the formatter "the partition starts at 0 and is empty up to 0", which a cursor-following
+        // client would read as "snap back to 0 and replay from the beginning" — exactly the wrong move
+        // under a transient throttle. The honest fallback is command.offset(): we know the broker did not
+        // reject with OFFSET_OUT_OF_RANGE so logStartOffset <= command.offset(), and an HWM at the
+        // requested offset means "no records past where you asked" which is what an empty page implies.
+        // Cursors then refuse to advance, the Retry-After header tells the client to wait, and the next
+        // poll resumes from the same offset.
         new PartitionFetch(command.partition(), Errors.NONE, null,
-          command.offset(), 0L, 0L, util.List.of[FetchedRecord]())
+          command.offset(), command.offset(), command.offset(), util.List.of[FetchedRecord]())
       case None =>
         new PartitionFetch(command.partition(), Errors.UNKNOWN_TOPIC_OR_PARTITION,
           "Broker returned no partition data for the requested partition",

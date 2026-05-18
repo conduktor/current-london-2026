@@ -264,6 +264,12 @@ class KafkaApiRequestSubmitterTest {
     assertEquals(0, result.partition().records().size())
     assertEquals(42L, result.partition().requestedOffset(),
       "requested offset must round-trip so the formatter's _links cursors remain accurate")
+    assertEquals(42L, result.partition().logStartOffset(),
+      "throttled response carries no broker offsets; the honest fallback is the request offset so cursor-following " +
+        "clients do not snap to 0 (which would replay from the beginning under a transient throttle)")
+    assertEquals(42L, result.partition().highWatermark(),
+      "highWatermark must mirror the request offset for the same reason — an HWM at the requested offset means " +
+        "'no records past where you asked', not 'the partition is empty'")
     assertEquals(750L, result.throttleTimeMs(),
       "throttle hint must flow through so the formatter can emit Retry-After")
   }
