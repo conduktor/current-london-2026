@@ -199,4 +199,31 @@ public final class TenantContext {
             .map(t -> TenantNamespace.groupBelongsTo(t, physicalGroupId))
             .orElse(false);
     }
+
+    /**
+     * Rewrites a tenant's logical transactional id to its physical form. If no
+     * tenant is in scope the id passes through untouched, so handlers may call
+     * this unconditionally before reaching the transaction coordinator. Same
+     * encoding as {@link #toPhysicalGroup} — both coordinator-keyed namespaces
+     * partition by hash and must be tenant-distinct.
+     */
+    public String toPhysicalTxnId(String logicalTxnId) {
+        return effectiveTenant()
+            .map(t -> TenantNamespace.txnIdToPhysical(t, logicalTxnId))
+            .orElse(logicalTxnId);
+    }
+
+    /** Inverse of {@link #toPhysicalTxnId}; strips the tenant prefix on response. */
+    public String toLogicalTxnId(String physicalTxnId) {
+        return effectiveTenant()
+            .map(t -> TenantNamespace.txnIdToLogical(t, physicalTxnId))
+            .orElse(physicalTxnId);
+    }
+
+    /** True if {@code physicalTxnId} is in the effective tenant's namespace. */
+    public boolean txnIdBelongsToTenant(String physicalTxnId) {
+        return effectiveTenant()
+            .map(t -> TenantNamespace.txnIdBelongsTo(t, physicalTxnId))
+            .orElse(false);
+    }
 }

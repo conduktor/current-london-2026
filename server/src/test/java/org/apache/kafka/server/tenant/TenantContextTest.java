@@ -203,4 +203,46 @@ class TenantContextTest {
         TenantContext ctx = TenantContext.of(SUPER, Optional.empty());
         assertFalse(ctx.groupBelongsToTenant("__tenant_acme.foo"));
     }
+
+    @Test
+    void txnIdRewriteInDelegatesToNamespace() {
+        TenantContext ctx = TenantContext.of(ACME, Optional.empty());
+        assertEquals("__tenant_acme.orders-txn", ctx.toPhysicalTxnId("orders-txn"));
+    }
+
+    @Test
+    void txnIdRewriteInIsIdentityForNonTenantContext() {
+        // No tenant in scope → pass through. Allows the handler to call
+        // toPhysicalTxnId unconditionally before reaching the coordinator.
+        TenantContext ctx = TenantContext.of(SUPER, Optional.empty());
+        assertEquals("orders-txn", ctx.toPhysicalTxnId("orders-txn"));
+    }
+
+    @Test
+    void txnIdRewriteInPassesThroughNullForIdempotentProducers() {
+        // InitProducerId allows null transactional_id; the rewrite must not
+        // crash and must not invent a non-null value.
+        TenantContext ctx = TenantContext.of(ACME, Optional.empty());
+        assertEquals(null, ctx.toPhysicalTxnId(null));
+    }
+
+    @Test
+    void txnIdRewriteOutDelegatesToNamespace() {
+        TenantContext ctx = TenantContext.of(ACME, Optional.empty());
+        assertEquals("orders-txn", ctx.toLogicalTxnId("__tenant_acme.orders-txn"));
+    }
+
+    @Test
+    void txnIdBelongsToTenantOnlyMatchesPrefixedForms() {
+        TenantContext ctx = TenantContext.of(ACME, Optional.empty());
+        assertTrue(ctx.txnIdBelongsToTenant("__tenant_acme.foo"));
+        assertFalse(ctx.txnIdBelongsToTenant("__tenant_other.foo"));
+        assertFalse(ctx.txnIdBelongsToTenant("foo"));
+    }
+
+    @Test
+    void txnIdBelongsToTenantIsFalseWhenNoTenantInScope() {
+        TenantContext ctx = TenantContext.of(SUPER, Optional.empty());
+        assertFalse(ctx.txnIdBelongsToTenant("__tenant_acme.foo"));
+    }
 }

@@ -168,20 +168,7 @@ public final class TenantNamespace {
      * uglier physical name in this tenant's namespace.
      */
     public static String groupToPhysical(String tenantId, String logicalGroupId) {
-        validateTenantId(tenantId);
-        if (logicalGroupId == null) {
-            return null;
-        }
-        String prefix = PRINCIPAL_PREFIX + tenantId + SEPARATOR;
-        if (logicalGroupId.startsWith(prefix)) {
-            return logicalGroupId;
-        }
-        if (logicalGroupId.startsWith(PRINCIPAL_PREFIX)) {
-            throw new IllegalArgumentException(
-                "Group id '" + logicalGroupId + "' uses reserved prefix '"
-                    + PRINCIPAL_PREFIX + "' but does not match tenant '" + tenantId + "'");
-        }
-        return prefix + logicalGroupId;
+        return withPrincipalPrefix(tenantId, logicalGroupId, "Group");
     }
 
     /**
@@ -191,14 +178,7 @@ public final class TenantNamespace {
      * sees the logical name it submitted.
      */
     public static String groupToLogical(String tenantId, String physicalGroupId) {
-        if (physicalGroupId == null) {
-            return null;
-        }
-        String prefix = PRINCIPAL_PREFIX + tenantId + SEPARATOR;
-        if (physicalGroupId.startsWith(prefix)) {
-            return physicalGroupId.substring(prefix.length());
-        }
-        return physicalGroupId;
+        return stripPrincipalPrefix(tenantId, physicalGroupId);
     }
 
     /**
@@ -207,10 +187,79 @@ public final class TenantNamespace {
      * all-partitions OffsetFetch responses or to refuse cross-tenant lookups.
      */
     public static boolean groupBelongsTo(String tenantId, String physicalGroupId) {
-        if (physicalGroupId == null) {
+        return hasPrincipalPrefix(tenantId, physicalGroupId);
+    }
+
+    /**
+     * Translates a tenant's logical transactional id to the physical form the
+     * broker stores: {@code __tenant_<id>.<logicalTxnId>}. Same wire encoding
+     * as group ids — both live in coordinator-keyed namespaces that partition
+     * by hash, so two tenants sharing the same external transactional id must
+     * resolve to distinct coordinator state.
+     *
+     * <p>Idempotent if the input already carries this tenant's prefix
+     * (admin-tool passthrough). Rejects any foreign {@code __tenant_} prefix.
+     */
+    public static String txnIdToPhysical(String tenantId, String logicalTxnId) {
+        return withPrincipalPrefix(tenantId, logicalTxnId, "Transactional");
+    }
+
+    /**
+     * Inverse of {@link #txnIdToPhysical(String, String)}. Strips this
+     * tenant's prefix if present; returns the input unchanged otherwise. Used
+     * on response paths that echo the transactional id back to the client.
+     */
+    public static String txnIdToLogical(String tenantId, String physicalTxnId) {
+        return stripPrincipalPrefix(tenantId, physicalTxnId);
+    }
+
+    /**
+     * True if {@code physicalTxnId} is in {@code tenantId}'s namespace. Useful
+     * for refusing cross-tenant transactional lookups at the FindCoordinator
+     * boundary.
+     */
+    public static boolean txnIdBelongsTo(String tenantId, String physicalTxnId) {
+        return hasPrincipalPrefix(tenantId, physicalTxnId);
+    }
+
+    // Shared encoding for principal-prefixed coordinator-keyed namespaces
+    // (consumer groups, transactional ids). The encoding is identical because
+    // both are stored in __consumer_offsets / __transaction_state by hash of
+    // the id and must be tenant-distinct; only the error-message label
+    // differs so a caller sees which class of id was refused.
+    private static String withPrincipalPrefix(String tenantId, String logicalId, String entityKind) {
+        validateTenantId(tenantId);
+        if (logicalId == null) {
+            return null;
+        }
+        String prefix = PRINCIPAL_PREFIX + tenantId + SEPARATOR;
+        if (logicalId.startsWith(prefix)) {
+            return logicalId;
+        }
+        if (logicalId.startsWith(PRINCIPAL_PREFIX)) {
+            throw new IllegalArgumentException(
+                entityKind + " id '" + logicalId + "' uses reserved prefix '"
+                    + PRINCIPAL_PREFIX + "' but does not match tenant '" + tenantId + "'");
+        }
+        return prefix + logicalId;
+    }
+
+    private static String stripPrincipalPrefix(String tenantId, String physicalId) {
+        if (physicalId == null) {
+            return null;
+        }
+        String prefix = PRINCIPAL_PREFIX + tenantId + SEPARATOR;
+        if (physicalId.startsWith(prefix)) {
+            return physicalId.substring(prefix.length());
+        }
+        return physicalId;
+    }
+
+    private static boolean hasPrincipalPrefix(String tenantId, String physicalId) {
+        if (physicalId == null) {
             return false;
         }
-        return physicalGroupId.startsWith(PRINCIPAL_PREFIX + tenantId + SEPARATOR);
+        return physicalId.startsWith(PRINCIPAL_PREFIX + tenantId + SEPARATOR);
     }
 
     public static void validateTenantId(String tenantId) {

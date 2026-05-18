@@ -372,4 +372,97 @@ class TenantNamespaceTest {
         assertFalse(TenantNamespace.groupBelongsTo("acme", "__tenant_acmebis.foo"));
         assertFalse(TenantNamespace.groupBelongsTo("acme", null));
     }
+
+    // --- Transactional ID rewrites (PROMPT.md line 47) ---
+
+    @Test
+    void txnIdToPhysicalPrefixesLogicalIdWithTenantPrincipalPrefix() {
+        // Same encoding as consumer-group ids: __transaction_state is keyed by
+        // hash(transactional_id) so two tenants using the same external id must
+        // collide-distinct on coordinator state.
+        assertEquals("__tenant_acme.orders-txn",
+            TenantNamespace.txnIdToPhysical("acme", "orders-txn"));
+    }
+
+    @Test
+    void txnIdToPhysicalPassesThroughAlreadyPrefixedIdForSameTenant() {
+        // Admin-tool passthrough: explicitly addressing the physical form must
+        // not double-prefix.
+        assertEquals("__tenant_acme.foo",
+            TenantNamespace.txnIdToPhysical("acme", "__tenant_acme.foo"));
+    }
+
+    @Test
+    void txnIdToPhysicalRejectsCrossTenantPrefixedId() {
+        // Hostile or confused: refuse rather than store
+        // __tenant_acme.__tenant_other.foo in acme's namespace.
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+            () -> TenantNamespace.txnIdToPhysical("acme", "__tenant_other.foo"));
+        assertTrue(ex.getMessage().contains("reserved prefix"));
+        // Error label distinguishes the entity kind — useful for the operator
+        // diagnosing a misuse from a noisy log line.
+        assertTrue(ex.getMessage().contains("Transactional"));
+    }
+
+    @Test
+    void txnIdToPhysicalRejectsReservedPrefixWithoutDot() {
+        assertThrows(IllegalArgumentException.class,
+            () -> TenantNamespace.txnIdToPhysical("acme", "__tenant_xyz"));
+    }
+
+    @Test
+    void txnIdToPhysicalReturnsNullForNullInput() {
+        // InitProducerId allows null transactional_id (idempotent-only producers).
+        // Treat null as no-op so handlers can rewrite unconditionally.
+        assertEquals(null, TenantNamespace.txnIdToPhysical("acme", null));
+    }
+
+    @Test
+    void txnIdToPhysicalAllowsEmptyLogicalId() {
+        // Kafka does not forbid empty transactional ids at the namespace layer;
+        // the coordinator owns higher-level validation.
+        assertEquals("__tenant_acme.", TenantNamespace.txnIdToPhysical("acme", ""));
+    }
+
+    @Test
+    void txnIdToPhysicalAllowsDotsInsideLogicalId() {
+        assertEquals("__tenant_acme.foo.bar",
+            TenantNamespace.txnIdToPhysical("acme", "foo.bar"));
+    }
+
+    @Test
+    void txnIdToPhysicalRejectsNullOrEmptyTenantId() {
+        assertThrows(IllegalArgumentException.class,
+            () -> TenantNamespace.txnIdToPhysical(null, "foo"));
+        assertThrows(IllegalArgumentException.class,
+            () -> TenantNamespace.txnIdToPhysical("", "foo"));
+    }
+
+    @Test
+    void txnIdToLogicalStripsTenantPrefixWhenPresent() {
+        assertEquals("orders-txn",
+            TenantNamespace.txnIdToLogical("acme", "__tenant_acme.orders-txn"));
+    }
+
+    @Test
+    void txnIdToLogicalReturnsForeignTxnIdUnchanged() {
+        // Defensive: never silently rewrite a foreign id into the tenant's
+        // namespace on the response path.
+        assertEquals("__tenant_other.foo",
+            TenantNamespace.txnIdToLogical("acme", "__tenant_other.foo"));
+    }
+
+    @Test
+    void txnIdToLogicalReturnsNullForNullInput() {
+        assertEquals(null, TenantNamespace.txnIdToLogical("acme", null));
+    }
+
+    @Test
+    void txnIdBelongsToOnlyMatchesExactTenantPrefix() {
+        assertTrue(TenantNamespace.txnIdBelongsTo("acme", "__tenant_acme.foo"));
+        assertFalse(TenantNamespace.txnIdBelongsTo("acme", "__tenant_other.foo"));
+        assertFalse(TenantNamespace.txnIdBelongsTo("acme", "foo"));
+        assertFalse(TenantNamespace.txnIdBelongsTo("acme", "__tenant_acmebis.foo"));
+        assertFalse(TenantNamespace.txnIdBelongsTo("acme", null));
+    }
 }
