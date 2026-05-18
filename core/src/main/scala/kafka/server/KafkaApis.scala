@@ -2495,6 +2495,24 @@ class KafkaApis(val requestChannel: RequestChannel,
     }
   }
 
+  private def rewriteTenantTxnId(
+    tenantCtx: TenantContext,
+    logicalTxnId: String
+  ): Either[Errors, String] = {
+    // Mirror rewriteTenantGroupId: unsafe context refuses with the wire-shape
+    // error a foreign-tenant or unauthorised principal would already produce,
+    // so callers cannot distinguish "you can't see this tenant" from
+    // "rewrite failed" from "auth failed".
+    if (tenantCtx.isUnsafe) {
+      Left(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED)
+    } else {
+      try Right(tenantCtx.toPhysicalTxnId(logicalTxnId))
+      catch {
+        case _: IllegalArgumentException => Left(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED)
+      }
+    }
+  }
+
   def handleJoinGroupRequest(
     request: RequestChannel.Request,
     requestLocal: RequestLocal
@@ -2915,45 +2933,61 @@ class KafkaApis(val requestChannel: RequestChannel,
 
   def handleEndTxnRequest(request: RequestChannel.Request, requestLocal: RequestLocal): Unit = {
     val endTxnRequest = request.body[EndTxnRequest]
-    val transactionalId = endTxnRequest.data.transactionalId
+    val tenantCtx = tenantContextFor(request)
+    val logicalTransactionalId = endTxnRequest.data.transactionalId
 
-    if (authHelper.authorize(request.context, WRITE, TRANSACTIONAL_ID, transactionalId)) {
-      def sendResponseCallback(error: Errors, newProducerId: Long, newProducerEpoch: Short): Unit = {
-        def createResponse(requestThrottleMs: Int): AbstractResponse = {
-          val finalError =
-            if (endTxnRequest.version < 2 && error == Errors.PRODUCER_FENCED) {
-              // For older clients, they could not understand the new PRODUCER_FENCED error code,
-              // so we need to return the INVALID_PRODUCER_EPOCH to have the same client handling logic.
-              Errors.INVALID_PRODUCER_EPOCH
-            } else {
-              error
+    // Rewrite the transactional id to its physical form before auth + coordinator
+    // dispatch — `__transaction_state` shards by hash(transactionalId), so two
+    // tenants reusing the same external id only stay isolated when the physical
+    // form (`__tenant_<id>.<external>`) is what reaches the coordinator. An
+    // unsafe context, or a tenant trying to End a foreign-tenant-prefixed id,
+    // refuses with TRANSACTIONAL_ID_AUTHORIZATION_FAILED — the same wire shape
+    // unauthenticated callers already see.
+    rewriteTenantTxnId(tenantCtx, logicalTransactionalId) match {
+      case Left(err) =>
+        requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
+          new EndTxnResponse(new EndTxnResponseData()
+              .setErrorCode(err.code)
+              .setThrottleTimeMs(requestThrottleMs)))
+      case Right(physicalTransactionalId) =>
+        if (authHelper.authorize(request.context, WRITE, TRANSACTIONAL_ID, physicalTransactionalId)) {
+          def sendResponseCallback(error: Errors, newProducerId: Long, newProducerEpoch: Short): Unit = {
+            def createResponse(requestThrottleMs: Int): AbstractResponse = {
+              val finalError =
+                if (endTxnRequest.version < 2 && error == Errors.PRODUCER_FENCED) {
+                  // For older clients, they could not understand the new PRODUCER_FENCED error code,
+                  // so we need to return the INVALID_PRODUCER_EPOCH to have the same client handling logic.
+                  Errors.INVALID_PRODUCER_EPOCH
+                } else {
+                  error
+                }
+              val responseBody = new EndTxnResponse(new EndTxnResponseData()
+                .setErrorCode(finalError.code)
+                .setProducerId(newProducerId)
+                .setProducerEpoch(newProducerEpoch)
+                .setThrottleTimeMs(requestThrottleMs))
+              trace(s"Completed ${logicalTransactionalId}'s EndTxnRequest " +
+                s"with committed: ${endTxnRequest.data.committed}, " +
+                s"errors: $error from client ${request.header.clientId}.")
+              responseBody
             }
-          val responseBody = new EndTxnResponse(new EndTxnResponseData()
-            .setErrorCode(finalError.code)
-            .setProducerId(newProducerId)
-            .setProducerEpoch(newProducerEpoch)
-            .setThrottleTimeMs(requestThrottleMs))
-          trace(s"Completed ${endTxnRequest.data.transactionalId}'s EndTxnRequest " +
-            s"with committed: ${endTxnRequest.data.committed}, " +
-            s"errors: $error from client ${request.header.clientId}.")
-          responseBody
-        }
-        requestHelper.sendResponseMaybeThrottle(request, createResponse)
-      }
+            requestHelper.sendResponseMaybeThrottle(request, createResponse)
+          }
 
-      txnCoordinator.handleEndTransaction(endTxnRequest.data.transactionalId,
-        endTxnRequest.data.producerId,
-        endTxnRequest.data.producerEpoch,
-        endTxnRequest.result(),
-        TransactionVersion.transactionVersionForEndTxn(endTxnRequest),
-        sendResponseCallback,
-        requestLocal)
-    } else
-      requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
-        new EndTxnResponse(new EndTxnResponseData()
-            .setErrorCode(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.code)
-            .setThrottleTimeMs(requestThrottleMs))
-      )
+          txnCoordinator.handleEndTransaction(physicalTransactionalId,
+            endTxnRequest.data.producerId,
+            endTxnRequest.data.producerEpoch,
+            endTxnRequest.result(),
+            TransactionVersion.transactionVersionForEndTxn(endTxnRequest),
+            sendResponseCallback,
+            requestLocal)
+        } else
+          requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
+            new EndTxnResponse(new EndTxnResponseData()
+                .setErrorCode(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.code)
+                .setThrottleTimeMs(requestThrottleMs))
+          )
+    }
   }
 
   def handleWriteTxnMarkersRequest(request: RequestChannel.Request, requestLocal: RequestLocal): Unit = {
@@ -3388,6 +3422,13 @@ class KafkaApis(val requestChannel: RequestChannel,
     requestLocal: RequestLocal
   ): CompletableFuture[Unit] = {
     val txnOffsetCommitRequest = request.body[TxnOffsetCommitRequest]
+    val tenantCtx = tenantContextFor(request)
+
+    def rewriteResponseToLogical(response: TxnOffsetCommitResponse): Unit = {
+      if (tenantCtx.effectiveTenant.isPresent) {
+        response.data().topics().forEach(t => t.setName(tenantCtx.toLogical(t.name)))
+      }
+    }
 
     def sendResponse(response: TxnOffsetCommitResponse): Unit = {
       // We need to replace COORDINATOR_LOAD_IN_PROGRESS with COORDINATOR_NOT_AVAILABLE
@@ -3405,7 +3446,32 @@ class KafkaApis(val requestChannel: RequestChannel,
         }
       }
 
+      rewriteResponseToLogical(response)
       requestHelper.sendMaybeThrottle(request, response)
+    }
+
+    // Three independent identifiers in this request must be rewritten to physical:
+    //   - transactionalId : keys `__transaction_state` by hash; two tenants
+    //     sharing an external txn id stay isolated only on the physical form.
+    //   - groupId         : keys `__consumer_offsets` partition via
+    //     groupCoordinator.commitTransactionalOffsets → partitionFor(groupId);
+    //     same reasoning — the wire form alone collides across tenants.
+    //   - topic names     : the offsets themselves point at physical topics;
+    //     the response must strip the prefix back before reaching the client.
+    rewriteTenantTxnId(tenantCtx, txnOffsetCommitRequest.data.transactionalId) match {
+      case Left(err) =>
+        sendResponse(txnOffsetCommitRequest.getErrorResponse(err.exception))
+        return CompletableFuture.completedFuture[Unit](())
+      case Right(physicalTxnId) =>
+        txnOffsetCommitRequest.data.setTransactionalId(physicalTxnId)
+    }
+
+    rewriteTenantGroupId(tenantCtx, txnOffsetCommitRequest.data.groupId) match {
+      case Left(err) =>
+        sendResponse(txnOffsetCommitRequest.getErrorResponse(err.exception))
+        return CompletableFuture.completedFuture[Unit](())
+      case Right(physicalGroupId) =>
+        txnOffsetCommitRequest.data.setGroupId(physicalGroupId)
     }
 
     // authorize for the transactionalId and the consumer group. Note that we skip producerId authorization
@@ -3417,6 +3483,25 @@ class KafkaApis(val requestChannel: RequestChannel,
       sendResponse(txnOffsetCommitRequest.getErrorResponse(Errors.GROUP_AUTHORIZATION_FAILED.exception))
       CompletableFuture.completedFuture[Unit](())
     } else {
+      // Reserved-physical-form refusal: see handleOffsetCommitRequest. A tenant
+      // submitting `acme.foo` would round-trip to `acme.acme.foo` and collide
+      // on the response builder's by-name map; refuse the whole request rather
+      // than partially satisfy. Send the error response directly through
+      // requestHelper rather than `sendResponse` — the topic names on the wire
+      // must stay as the literal logical names the tenant submitted, and the
+      // sendResponse helper would otherwise toLogical-strip `acme.foo` into
+      // `foo`, losing the offender's identity on the wire.
+      if (tenantCtx.effectiveTenant.isPresent &&
+          txnOffsetCommitRequest.data.topics.asScala.exists(t => tenantCtx.isReservedPhysicalForm(t.name))) {
+        requestHelper.sendMaybeThrottle(request,
+          txnOffsetCommitRequest.getErrorResponse(new InvalidTopicException(
+            "TxnOffsetCommit refused: one or more topic names use the reserved tenant-prefix form")))
+        return CompletableFuture.completedFuture[Unit](())
+      }
+      if (tenantCtx.effectiveTenant.isPresent) {
+        txnOffsetCommitRequest.data.topics.forEach(t => t.setName(tenantCtx.toPhysical(t.name)))
+      }
+
       val authorizedTopics = authHelper.filterByAuthorized(
         request.context,
         READ,
@@ -4969,9 +5054,12 @@ object KafkaApis {
   // to physical for authorisation + coordinator dispatch and echo logical
   // names on the response.
   //
-  // The remaining transactional handlers (EndTxn, TxnOffsetCommit) and the
-  // share / consumer-group v2 APIs remain refused at this dispatch boundary
-  // until later phases lift them.
+  // Phase 3b.4 closes the loop on transactional traffic: END_TXN and
+  // TXN_OFFSET_COMMIT now rewrite the transactional id (and group id +
+  // topic names on TxnOffsetCommit) to physical for coordinator dispatch
+  // and restore logical names on the response. The share / consumer-group
+  // v2 APIs and the configs/groups admin APIs (Phase 3c / 3d) remain
+  // refused at this dispatch boundary until those phases lift them.
   private[server] val TENANT_ALLOWED_APIS: Set[ApiKeys] = Set(
     ApiKeys.PRODUCE,
     ApiKeys.FETCH,
@@ -4990,6 +5078,8 @@ object KafkaApis {
     ApiKeys.DELETE_RECORDS,
     ApiKeys.ADD_PARTITIONS_TO_TXN,
     ApiKeys.ADD_OFFSETS_TO_TXN,
+    ApiKeys.END_TXN,
+    ApiKeys.TXN_OFFSET_COMMIT,
     ApiKeys.SASL_HANDSHAKE,
     ApiKeys.SASL_AUTHENTICATE,
     ApiKeys.API_VERSIONS

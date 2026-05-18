@@ -13329,6 +13329,272 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testEndTxnTenantRewritesTransactionalIdToPhysical(): Unit = {
+    // `__transaction_state` shards by hash(transactionalId); two tenants
+    // sharing the external id "my-txn" only stay isolated when the physical
+    // form (`__tenant_acme.my-txn`) is what reaches the coordinator.
+    val responseCallback: ArgumentCaptor[(Errors, Long, Short) => Unit] =
+      ArgumentCaptor.forClass(classOf[(Errors, Long, Short) => Unit])
+    val endTxnRequest = new EndTxnRequest.Builder(
+      new EndTxnRequestData()
+        .setTransactionalId("my-txn")
+        .setProducerId(42L)
+        .setProducerEpoch(0.toShort)
+        .setCommitted(true),
+      true
+    ).build(ApiKeys.END_TXN.latestVersion)
+    val request = buildRequest(endTxnRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    val requestLocal = RequestLocal.withThreadConfinedCaching
+    when(txnCoordinator.handleEndTransaction(
+      ArgumentMatchers.eq("__tenant_acme.my-txn"),
+      ArgumentMatchers.eq(42L),
+      ArgumentMatchers.eq(0.toShort),
+      ArgumentMatchers.eq(TransactionResult.COMMIT),
+      any[TransactionVersion](),
+      responseCallback.capture(),
+      ArgumentMatchers.eq(requestLocal)
+    )).thenAnswer(_ => responseCallback.getValue.apply(Errors.NONE, RecordBatch.NO_PRODUCER_ID, RecordBatch.NO_PRODUCER_EPOCH))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleEndTxnRequest(request, requestLocal)
+
+    val response = verifyNoThrottling[EndTxnResponse](request)
+    assertEquals(Errors.NONE.code, response.data.errorCode)
+    // The coordinator-side verify above pins the physical form; no extra
+    // assertion needed.
+  }
+
+  @Test
+  def testEndTxnTenantRefusesCrossTenantPrefixedTransactionalId(): Unit = {
+    // Tenant `acme` tries to End a transaction keyed `__tenant_other.foo`.
+    // The rewrite refuses with TRANSACTIONAL_ID_AUTHORIZATION_FAILED — same
+    // wire shape an unauthorised principal would produce — so the response
+    // cannot leak the foreign tenant's existence.
+    val endTxnRequest = new EndTxnRequest.Builder(
+      new EndTxnRequestData()
+        .setTransactionalId("__tenant_other.foo")
+        .setProducerId(42L)
+        .setProducerEpoch(0.toShort)
+        .setCommitted(true),
+      true
+    ).build(ApiKeys.END_TXN.latestVersion)
+    val request = buildRequest(endTxnRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleEndTxnRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[EndTxnResponse](request)
+    assertEquals(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.code, response.data.errorCode)
+    verify(txnCoordinator, never()).handleEndTransaction(
+      anyString(), anyLong(), anyShort(), any[TransactionResult](),
+      any[TransactionVersion](), any(), any[RequestLocal]())
+  }
+
+  @Test
+  def testEndTxnPrivilegedCallerOnTenantBoundListenerIsRefused(): Unit = {
+    // Super-user with no `__tenant_` prefix hits the tenant-bound listener.
+    // The unsafe-context guard must short-circuit before the rewrite — the
+    // listener binding alone would otherwise wrap "my-txn" into the tenant
+    // namespace and let the privileged caller drive tenant coordinator state.
+    val endTxnRequest = new EndTxnRequest.Builder(
+      new EndTxnRequestData()
+        .setTransactionalId("my-txn")
+        .setProducerId(42L)
+        .setProducerEpoch(0.toShort)
+        .setCommitted(true),
+      true
+    ).build(ApiKeys.END_TXN.latestVersion)
+    val request = buildRequest(endTxnRequest,
+      listenerName = TENANT_LISTENER,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleEndTxnRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[EndTxnResponse](request)
+    assertEquals(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.code, response.data.errorCode)
+    verify(txnCoordinator, never()).handleEndTransaction(
+      anyString(), anyLong(), anyShort(), any[TransactionResult](),
+      any[TransactionVersion](), any(), any[RequestLocal]())
+  }
+
+  @Test
+  def testTxnOffsetCommitTenantRewritesAllThreeKeysToPhysical(): Unit = {
+    // TxnOffsetCommit routes THREE identifiers into the broker state:
+    //   - transactionalId  → __transaction_state record key
+    //   - groupId          → __consumer_offsets partition selector
+    //   - per-topic offset → topic-partition key in __consumer_offsets
+    // All three must reach the coordinator on physical names and the response
+    // must echo logical names back to the tenant.
+    val topic = "acme.orders"
+    addTopicToMetadataCache(topic, numPartitions = 1)
+    val partitionOffsetCommitData = new TxnOffsetCommitRequest.CommittedOffset(15L, "", Optional.empty())
+    val tp = new TopicPartition("orders", 0)
+
+    val offsetCommitRequest = new TxnOffsetCommitRequest.Builder(
+      "my-txn",
+      "orders-consumer",
+      42L,
+      0.toShort,
+      Map(tp -> partitionOffsetCommitData).asJava,
+      false
+    ).build(ApiKeys.TXN_OFFSET_COMMIT.latestVersion)
+    val request = buildRequest(offsetCommitRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    val requestLocal = RequestLocal.withThreadConfinedCaching
+    val future = new CompletableFuture[TxnOffsetCommitResponseData]()
+    when(groupCoordinator.commitTransactionalOffsets(
+      ArgumentMatchers.eq(request.context),
+      any[TxnOffsetCommitRequestData](),
+      ArgumentMatchers.eq(requestLocal.bufferSupplier)
+    )).thenReturn(future)
+
+    future.complete(new TxnOffsetCommitResponseData()
+      .setTopics(List(
+        new TxnOffsetCommitResponseData.TxnOffsetCommitResponseTopic()
+          .setName("acme.orders")
+          .setPartitions(List(
+            new TxnOffsetCommitResponseData.TxnOffsetCommitResponsePartition()
+              .setPartitionIndex(0)
+              .setErrorCode(Errors.NONE.code)
+          ).asJava)
+      ).asJava))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleTxnOffsetCommitRequest(request, requestLocal)
+
+    // The coordinator must see physical names on all three keys.
+    val captor = ArgumentCaptor.forClass(classOf[TxnOffsetCommitRequestData])
+    verify(groupCoordinator).commitTransactionalOffsets(
+      ArgumentMatchers.eq(request.context),
+      captor.capture(),
+      ArgumentMatchers.eq(requestLocal.bufferSupplier))
+    val captured = captor.getValue
+    assertEquals("__tenant_acme.my-txn", captured.transactionalId)
+    assertEquals("__tenant_acme.orders-consumer", captured.groupId)
+    assertEquals(1, captured.topics.size)
+    assertEquals("acme.orders", captured.topics.get(0).name)
+
+    // The response must surface logical names to the client.
+    val response = verifyNoThrottling[TxnOffsetCommitResponse](request)
+    assertEquals(1, response.data.topics.size)
+    assertEquals("orders", response.data.topics.get(0).name)
+    assertEquals(Errors.NONE.code, response.data.topics.get(0).partitions.get(0).errorCode)
+  }
+
+  @Test
+  def testTxnOffsetCommitTenantRefusesCrossTenantPrefixedTransactionalId(): Unit = {
+    val offsetCommitRequest = new TxnOffsetCommitRequest.Builder(
+      "__tenant_other.foo",
+      "orders-consumer",
+      42L,
+      0.toShort,
+      Map(new TopicPartition("orders", 0) ->
+        new TxnOffsetCommitRequest.CommittedOffset(15L, "", Optional.empty())).asJava,
+      false
+    ).build(ApiKeys.TXN_OFFSET_COMMIT.latestVersion)
+    val request = buildRequest(offsetCommitRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleTxnOffsetCommitRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[TxnOffsetCommitResponse](request)
+    // getErrorResponse echoes every partition with the error; check the one
+    // partition we sent.
+    assertEquals(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED,
+      response.errors().get(new TopicPartition("orders", 0)))
+    verify(groupCoordinator, never()).commitTransactionalOffsets(
+      any[RequestContext](), any[TxnOffsetCommitRequestData](), any())
+  }
+
+  @Test
+  def testTxnOffsetCommitTenantRefusesCrossTenantPrefixedGroupId(): Unit = {
+    val offsetCommitRequest = new TxnOffsetCommitRequest.Builder(
+      "my-txn",
+      "__tenant_other.foo",
+      42L,
+      0.toShort,
+      Map(new TopicPartition("orders", 0) ->
+        new TxnOffsetCommitRequest.CommittedOffset(15L, "", Optional.empty())).asJava,
+      false
+    ).build(ApiKeys.TXN_OFFSET_COMMIT.latestVersion)
+    val request = buildRequest(offsetCommitRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleTxnOffsetCommitRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[TxnOffsetCommitResponse](request)
+    assertEquals(Errors.GROUP_AUTHORIZATION_FAILED,
+      response.errors().get(new TopicPartition("orders", 0)))
+    verify(groupCoordinator, never()).commitTransactionalOffsets(
+      any[RequestContext](), any[TxnOffsetCommitRequestData](), any())
+  }
+
+  @Test
+  def testTxnOffsetCommitTenantRejectsReservedPhysicalFormTopic(): Unit = {
+    // A tenant submitting the reserved physical form `acme.foo` would round-
+    // trip to `acme.acme.foo` and collide on the response builder's by-name
+    // map. Refuse the whole request with INVALID_TOPIC_EXCEPTION.
+    val offsetCommitRequest = new TxnOffsetCommitRequest.Builder(
+      "my-txn",
+      "orders-consumer",
+      42L,
+      0.toShort,
+      Map(new TopicPartition("acme.foo", 0) ->
+        new TxnOffsetCommitRequest.CommittedOffset(15L, "", Optional.empty())).asJava,
+      false
+    ).build(ApiKeys.TXN_OFFSET_COMMIT.latestVersion)
+    val request = buildRequest(offsetCommitRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleTxnOffsetCommitRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[TxnOffsetCommitResponse](request)
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION,
+      response.errors().get(new TopicPartition("acme.foo", 0)))
+    verify(groupCoordinator, never()).commitTransactionalOffsets(
+      any[RequestContext](), any[TxnOffsetCommitRequestData](), any())
+  }
+
+  @Test
+  def testTxnOffsetCommitPrivilegedCallerOnTenantBoundListenerIsRefused(): Unit = {
+    val offsetCommitRequest = new TxnOffsetCommitRequest.Builder(
+      "my-txn",
+      "orders-consumer",
+      42L,
+      0.toShort,
+      Map(new TopicPartition("orders", 0) ->
+        new TxnOffsetCommitRequest.CommittedOffset(15L, "", Optional.empty())).asJava,
+      false
+    ).build(ApiKeys.TXN_OFFSET_COMMIT.latestVersion)
+    val request = buildRequest(offsetCommitRequest,
+      listenerName = TENANT_LISTENER,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleTxnOffsetCommitRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[TxnOffsetCommitResponse](request)
+    assertEquals(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED,
+      response.errors().get(new TopicPartition("orders", 0)))
+    verify(groupCoordinator, never()).commitTransactionalOffsets(
+      any[RequestContext](), any[TxnOffsetCommitRequestData](), any())
+  }
+
+  @Test
   def testJoinGroupTenantRewritesGroupIdToPhysical(): Unit = {
     val data = new JoinGroupRequestData()
       .setGroupId("orders-consumer")
