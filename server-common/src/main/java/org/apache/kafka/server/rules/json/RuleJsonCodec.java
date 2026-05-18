@@ -93,6 +93,23 @@ public final class RuleJsonCodec {
     static final int MAX_ENVELOPE_BYTES = 65 * 1024;
 
     /**
+     * Maximum rule-id length accepted by {@link #decode(String, byte[])}.
+     * Rule ids are Kafka record keys on the {@code __governance} topic; their
+     * only upper bound at the protocol layer is {@code max.message.bytes}
+     * (default 1 MiB). Round-11 audit (audit-forgery sub-agent, CRITICAL):
+     * an unbounded id is a log-amplification primitive — every DENY emission
+     * in {@code KafkaApis.handle} logs the id verbatim, so a 900&#x202F;KB id
+     * yields a 900&#x202F;KB log line per denied request, gigabytes per
+     * second on a hot api-key.
+     *
+     * <p>256 characters is comfortably wider than any legitimate operator
+     * identifier (file-system path components, audit handles, JIRA ticket
+     * shapes) while keeping a single log line cheap. The cap is intake-only:
+     * existing well-formed ids in the wild are not affected.
+     */
+    static final int MAX_RULE_ID_LEN = 256;
+
+    /**
      * Api-keys on which a DENY rule would brick the cluster — rejected at rule
      * load time. The CEL engine sits at the top of {@code KafkaApis.handle()}
      * (single interception point per PROMPT.md), which means a DENY rule on a
@@ -161,6 +178,25 @@ public final class RuleJsonCodec {
     public static Rule decode(String id, byte[] value) {
         if (id == null || id.isEmpty()) {
             throw new RuleEnvelopeException("rule id (record key) must be non-empty");
+        }
+        // Round-11 audit (audit-forgery sub-agent, CRITICAL): bound the id
+        // length BEFORE any per-char or downstream emit can see it. Rule ids
+        // are Kafka record keys, capped only by max.message.bytes (default
+        // 1 MiB), so without this check a published 900 KB id would amplify
+        // every DENY log line in KafkaApis to ~900 KB — gigabytes/s on a hot
+        // api-key. The bound is placed early so the same envelope cannot
+        // reach the forbidden-codepoint scan and the engine-internal
+        // reservation check with an absurd id either. Operator-authored ids
+        // (audit handles, ticket-shaped strings, namespaced names) live well
+        // inside 256 chars; nothing legitimate is affected.
+        if (id.length() > MAX_RULE_ID_LEN) {
+            throw new RuleEnvelopeException(
+                "rule id length " + id.length() + " exceeds max of "
+                    + MAX_RULE_ID_LEN + "; rule ids are operator-authored "
+                    + "identifiers (audit handles, ticket numbers, namespaced "
+                    + "names) and have no legitimate use for multi-kilobyte "
+                    + "strings — every DENY emission logs the id verbatim, so "
+                    + "an unbounded id is a log-amplification primitive");
         }
         // Reject any whitespace in the rule id. Rule ids are operator-authored
         // identifiers — log keys, audit handles — and have no legitimate use
@@ -285,15 +321,34 @@ public final class RuleJsonCodec {
      * ids: ASCII whitespace ({@link Character#isWhitespace}), the broader
      * Unicode Space_Separator class ({@link Character#isSpaceChar} —
      * {@code U+00A0} NBSP, {@code U+202F} NNBSP, {@code U+2007} FIGURE SPACE,
-     * and friends), plus explicit zero-width / BOM / line-separator
-     * codepoints that downstream normalisers collapse but the JVM's
-     * isWhitespace/isSpaceChar do not flag.
+     * and friends), C0 / C1 control codes (Round-11 audit-forgery sub-agent,
+     * CRITICAL — ASCII {@code 0x00–0x1F} including BEL/BS/ESC, {@code 0x7F}
+     * DEL, and the C1 range {@code 0x80–0x9F}), plus explicit zero-width /
+     * BOM / line-separator codepoints that downstream normalisers collapse
+     * but the JVM's isWhitespace/isSpaceChar do not flag.
+     *
+     * <p>The C0/C1 range matters specifically for log-injection: every DENY
+     * emission in {@code KafkaApis.handle} writes the id verbatim into the
+     * broker log; an id containing {@code ESC[2J ESC[H} clears the operator's
+     * terminal and can repaint forged audit lines (impersonating a
+     * "WARN [audit] approved by admin@…" entry while suppressing the real
+     * denial). NUL truncates id strings in some legacy log shippers
+     * (rsyslog, older fluentd parsers). Operator-authored identifiers have
+     * no legitimate use for any control codepoint.
      *
      * <p>Centralising the list keeps the codec-intake check and any future
      * audit-log emitter in sync. Adding a codepoint here is a strictly
      * additive constraint — operator ids never contain these.
      */
     private static boolean isForbiddenIdCodepoint(char c) {
+        // C0 controls (0x00-0x1F), DEL (0x7F), C1 controls (0x80-0x9F).
+        // Note that several ASCII whitespace codepoints (TAB, LF, VT, FF, CR)
+        // are inside this range and would also be flagged by isWhitespace
+        // below — but a dedicated range check is cheaper than a per-char
+        // method call and pins the log-injection rationale next to the check.
+        if (c <= 0x1F || c == 0x7F || (c >= 0x80 && c <= 0x9F)) {
+            return true;
+        }
         if (Character.isWhitespace(c) || Character.isSpaceChar(c)) {
             return true;
         }

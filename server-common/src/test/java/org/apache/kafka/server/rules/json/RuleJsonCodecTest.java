@@ -123,6 +123,37 @@ public class RuleJsonCodecTest {
     }
 
     @Test
+    public void parseFailureMessageDoesNotEchoFullSource() {
+        // Round-11 audit (audit-forgery sub-agent, CRITICAL): the
+        // CelCompiler's RuntimeException catch previously embedded the full
+        // CEL source verbatim in the failure message. Since MAX_EXPR_LEN is
+        // 8192 chars, a deliberately malformed envelope could pin an 8 KB
+        // string into every GovernanceLoader WARN log line. The fix
+        // truncates the source to ~80 chars + a length annotation.
+        //
+        // A long all-digit literal triggers Long.parseLong overflow in the
+        // lexer (CelCompiler$Lexer.number), which throws NumberFormatException —
+        // a RuntimeException — caught at CelCompiler.java's outer catch.
+        // This is exactly the path that previously echoed the full source.
+        StringBuilder hugeNum = new StringBuilder();
+        for (int i = 0; i < 400; i++) {
+            hugeNum.append('9');
+        }
+        String json = "{\"apiKeys\":[\"METADATA\"],\"action\":\"DENY\","
+            + "\"when\":\"" + hugeNum + "\",\"errorCode\":1}";
+        RuleEnvelopeException ex = assertThrows(RuleEnvelopeException.class,
+            () -> RuleJsonCodec.decode("k", json.getBytes(StandardCharsets.UTF_8)));
+        String msg = ex.getMessage();
+        // Full 400-char source must NOT appear; truncation marker MUST.
+        assertTrue(!msg.contains(hugeNum.toString()),
+            "log line must not echo full 400-char source: " + msg);
+        assertTrue(msg.contains("truncated"),
+            "message must signal truncation: " + msg);
+        assertTrue(msg.contains("400 chars"),
+            "message must report the original length so an operator can correlate: " + msg);
+    }
+
+    @Test
     public void missingActionRejected() {
         String json = "{\"apiKeys\":[\"METADATA\"],\"when\":\"true\",\"errorCode\":1}";
         assertThrows(RuleEnvelopeException.class,
@@ -243,6 +274,66 @@ public class RuleJsonCodecTest {
             assertTrue(ex.getMessage().contains("forbidden codepoint"),
                 "rejection must name the forbidden codepoint: " + ex.getMessage());
         }
+    }
+
+    @Test
+    public void controlCharactersInIdRejected() {
+        // Round-11 audit (audit-forgery sub-agent, CRITICAL): rule ids are
+        // logged verbatim by every DENY emission in KafkaApis.handle and by
+        // every codec/loader rejection. An id containing C0 control codes
+        // (ESC, BEL, NUL, BS) or DEL/C1 controls is a log-injection
+        // primitive: ESC sequences can clear an operator's terminal and
+        // repaint forged audit lines on a tail -f / Kibana-render pipeline,
+        // NUL can truncate the id in legacy log shippers, BS can rewrite
+        // earlier characters on a terminal. The old isForbiddenIdCodepoint
+        // covered whitespace + zero-width + bidi but NOT the C0/C1 control
+        // ranges (specifically: ESC 0x1B, BEL 0x07, NUL 0x00 are not
+        // isWhitespace under Java semantics; DEL 0x7F is also not).
+        //
+        // We probe one representative per band — NUL, BEL, BS, ESC, DEL, and
+        // a C1 control — plus an in-the-wild attack shape (ESC[2J ESC[H to
+        // clear screen and home cursor, followed by a fake audit line).
+        String[] hostile = {
+            "rule\u0000id",                       // embedded NUL (truncates in legacy log shippers)
+            "rule\u0007id",                       // embedded BEL (audible bell in terminal)
+            "rule\u0008id",                       // embedded BS (rewrites earlier chars on terminal)
+            "rule\u001Bid",                       // embedded ESC (start of ANSI sequence)
+            "rule\u007Fid",                       // embedded DEL
+            "rule\u0085id",                       // C1 NEL (Next Line)
+            "evil\u001B[2J\u001B[H[audit] approved",   // full ANSI attack: clear+home then forged audit
+        };
+        for (String id : hostile) {
+            RuleEnvelopeException ex = assertThrows(RuleEnvelopeException.class,
+                () -> RuleJsonCodec.decode(id, SAMPLE.getBytes(StandardCharsets.UTF_8)),
+                "id should be rejected: '" + id + "'");
+            assertTrue(ex.getMessage().contains("forbidden codepoint"),
+                "rejection must name the forbidden codepoint: " + ex.getMessage());
+        }
+    }
+
+    @Test
+    public void overlongIdRejected() {
+        // Round-11 audit (audit-forgery sub-agent, CRITICAL): rule ids are
+        // Kafka record keys, bounded only by max.message.bytes (default
+        // 1 MiB). Every DENY in KafkaApis.handle logs the id verbatim, so
+        // a 900 KB id would amplify the broker log by ~900 KB per denial —
+        // gigabytes/s on a hot api-key. Bound at 256.
+        StringBuilder huge = new StringBuilder();
+        for (int i = 0; i < 257; i++) {
+            huge.append('x');
+        }
+        String id = huge.toString();
+        RuleEnvelopeException ex = assertThrows(RuleEnvelopeException.class,
+            () -> RuleJsonCodec.decode(id, SAMPLE.getBytes(StandardCharsets.UTF_8)));
+        assertTrue(ex.getMessage().contains("exceeds max"),
+            "rejection must name the length cap: " + ex.getMessage());
+        // The boundary case — exactly the max — must still be accepted.
+        StringBuilder boundary = new StringBuilder();
+        for (int i = 0; i < 256; i++) {
+            boundary.append('x');
+        }
+        Rule ok = RuleJsonCodec.decode(boundary.toString(), SAMPLE.getBytes(StandardCharsets.UTF_8));
+        assertEquals(256, ok.id().length());
     }
 
     @Test

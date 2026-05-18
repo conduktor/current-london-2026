@@ -59,8 +59,41 @@ public final class CelCompiler {
         } catch (CelCompilationException e) {
             throw e;
         } catch (RuntimeException e) {
-            throw new CelCompilationException("failed to parse: " + source + " (" + e.getMessage() + ")", e);
+            // Round-11 audit (audit-forgery sub-agent, CRITICAL): the source
+            // is bounded by MAX_EXPR_LEN=8192, which means a deliberately
+            // malformed envelope can pin an 8 KB string into every parse-
+            // failure log line emitted by GovernanceLoader. Truncate to a
+            // short head so the message stays diagnostically useful (the
+            // operator can usually identify the rule from the first ~80
+            // chars) without amplifying every rejected envelope. The full
+            // source is still available on the rule envelope itself — this
+            // only bounds the log-line side-channel.
+            //
+            // The cause's own getMessage() also echoes the offending input
+            // for some JDK exceptions (e.g. NumberFormatException from
+            // Long.parseLong embeds the raw digit string). Truncate both
+            // sides so neither contributes an 8 KB tail.
+            throw new CelCompilationException(
+                "failed to parse: " + truncateForLog(source)
+                    + " (" + truncateForLog(e.getMessage()) + ")", e);
         }
+    }
+
+    /**
+     * Truncate a CEL source string for embedding in an exception/log message.
+     * Operator-authored rules under ~80 chars pass through unchanged; longer
+     * ones get a head fragment plus an ellipsis + length annotation so the
+     * rejection log line stays bounded regardless of {@link CelLimits#MAX_EXPR_LEN}.
+     */
+    static String truncateForLog(String source) {
+        if (source == null) {
+            return "null";
+        }
+        int max = 80;
+        if (source.length() <= max) {
+            return source;
+        }
+        return source.substring(0, max) + "...[truncated, " + source.length() + " chars]";
     }
 
     enum TokKind {
