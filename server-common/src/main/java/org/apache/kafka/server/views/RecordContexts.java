@@ -20,6 +20,7 @@ import com.fasterxml.jackson.core.JsonFactory;
 import com.fasterxml.jackson.core.JsonParser;
 import com.fasterxml.jackson.core.JsonToken;
 import com.fasterxml.jackson.core.StreamReadConstraints;
+import com.fasterxml.jackson.databind.util.TokenBuffer;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -241,55 +242,83 @@ public final class RecordContexts {
      * downstream parser would have picked.
      *
      * <p>At INTERMEDIATE levels (any path segment that descends into a sub-object), the
-     * navigator remains first-wins. Detecting duplicates there without buffering whole subtrees
-     * is significantly more work, and intermediate-compound-duplicates require an exotic JSON
-     * shape (an object with two keys of the same name both pointing at sub-objects) that
-     * realistic producers — including Jackson's serializer — do not emit. We document this as
-     * a known limitation rather than guarding it: predicates whose path traverses through an
-     * intermediate level with duplicate sibling keys see the FIRST occurrence.
+     * same duplicate-detection guard applies. When {@code findField} matches an intermediate
+     * key it captures the matched value's subtree into a {@link TokenBuffer} and continues
+     * scanning the rest of the parent object; a second occurrence of the same key produces
+     * {@link RecordContext#BODY_UNUSABLE}. The captured subtree is then replayed via
+     * {@link TokenBuffer#asParser()} so the outer loop can descend into it. This costs one
+     * subtree-sized buffer at each intermediate level (bounded by
+     * {@link PredicateLimits#maxBodyBytes}), traded for an access-control guarantee:
+     * predicates whose path traverses an intermediate level with duplicate sibling keys
+     * always refuse the record rather than silently picking one occurrence.
      */
     private static Object parseAndNavigate(byte[] body, List<String> path, int maxDepth) {
-        try (JsonParser p = JSON_FACTORY.createParser(new ByteArrayInputStream(body))) {
-            JsonToken t = p.nextToken();
-            if (t == null) {
-                return null;
-            }
-            int depth = 0;
-            int pi = 0;
-            Object capturedLeaf = null;
-            while (pi < path.size()) {
-                if (t != JsonToken.START_OBJECT) {
-                    return null;
-                }
-                depth++;
-                if (depth > maxDepth) {
-                    return RecordContext.BODY_UNUSABLE;
-                }
-                boolean isLastStep = pi == path.size() - 1;
-                NavStep step = findField(p, path.get(pi), isLastStep);
-                if (step == NavStep.MALFORMED) {
-                    return RecordContext.BODY_UNUSABLE;
-                }
-                if (step.token == null) {
-                    return null; // field not found
-                }
-                t = step.token;
-                if (step.capturedScalar != ScalarSlot.UNSET) {
-                    // Leaf was pre-captured by findField; the parser has scanned past it
-                    // to detect duplicates, so don't try to re-read it.
-                    capturedLeaf = step.capturedScalar;
-                }
-                pi++;
-            }
-            if (capturedLeaf != ScalarSlot.UNSET && capturedLeaf != null) {
-                return capturedLeaf;
-            }
-            // Leaf wasn't pre-captured (e.g. compound at leaf position, or intermediate-only paths
-            // in the {@code path.isEmpty()} case where {@code t} is still the root). Fall back to
-            // reading at the current parser position.
-            return extractLeaf(p, t);
+        // Replay parsers (one per intermediate-level descent that captured a subtree into a
+        // TokenBuffer) must be closed alongside the root parser. Tracked in a list because we
+        // only know how many we need as we descend.
+        List<JsonParser> open = new ArrayList<>(1);
+        try {
+            return navigate(body, path, maxDepth, open);
         } catch (IOException e) {
             return RecordContext.BODY_UNUSABLE;
+        } finally {
+            closeAll(open);
+        }
+    }
+
+    /** The descent body of {@link #parseAndNavigate}. Pulled out so the outer method holds only
+     *  the resource-management try/catch/finally — the descent logic alone keeps NPath complexity
+     *  inside the project's checkstyle threshold. */
+    private static Object navigate(byte[] body, List<String> path, int maxDepth, List<JsonParser> open)
+            throws IOException {
+        JsonParser current = JSON_FACTORY.createParser(new ByteArrayInputStream(body));
+        open.add(current);
+        JsonToken t = current.nextToken();
+        if (t == null) {
+            return null;
+        }
+        Object capturedLeaf = null;
+        for (int pi = 0; pi < path.size(); pi++) {
+            if (t != JsonToken.START_OBJECT) {
+                return null;
+            }
+            if (pi + 1 > maxDepth) {
+                return RecordContext.BODY_UNUSABLE;
+            }
+            NavStep step = findField(current, path.get(pi), pi == path.size() - 1);
+            if (step == NavStep.MALFORMED) {
+                return RecordContext.BODY_UNUSABLE;
+            }
+            if (step.token == null) {
+                return null; // field not found
+            }
+            t = step.token;
+            if (step.capturedScalar != ScalarSlot.UNSET) {
+                // Leaf pre-captured by findField; the parser has scanned past it.
+                capturedLeaf = step.capturedScalar;
+            }
+            if (step.replayParser != null) {
+                // Intermediate descent through a captured subtree: subsequent findField
+                // calls operate on the replay parser, positioned AT the matched value token.
+                current = step.replayParser;
+                open.add(current);
+            }
+        }
+        if (capturedLeaf != ScalarSlot.UNSET && capturedLeaf != null) {
+            return capturedLeaf;
+        }
+        // Leaf wasn't pre-captured (e.g. compound at leaf position, or empty path so {@code t}
+        // is still the root). Fall back to reading at the current parser position.
+        return extractLeaf(current, t);
+    }
+
+    private static void closeAll(List<JsonParser> parsers) {
+        for (JsonParser p : parsers) {
+            try {
+                p.close();
+            } catch (IOException ignored) {
+                // Closing must not mask the navigation result.
+            }
         }
     }
 
@@ -301,24 +330,24 @@ public final class RecordContexts {
     }
 
     /**
-     * Scans the current object for {@code wanted}.
+     * Scans the current object for {@code wanted} and detects duplicate occurrences at this
+     * level. The scan ALWAYS reads the whole object — at both leaf and intermediate levels —
+     * because RFC 8259 leaves duplicate-key behaviour undefined and predicates are an
+     * access-control boundary (see {@link #parseAndNavigate} javadoc for the threat model).
      *
-     * <p>When {@code isLastStep} is true, the navigator scans the ENTIRE current object — even
-     * after finding a match — to detect duplicate occurrences of {@code wanted}. The matched
-     * scalar value is captured eagerly because the parser advances past it during the duplicate
-     * scan; the captured value rides back on {@link NavStep#capturedScalar} so
-     * {@link #parseAndNavigate} can return it without re-reading the parser.
+     * <p>At LEAF level the matched scalar value is captured eagerly (parser advances past it
+     * during the duplicate scan); the captured value rides back on
+     * {@link NavStep#capturedScalar}.
      *
-     * <p>When {@code isLastStep} is false (i.e. there are more path segments to descend), the
-     * navigator returns on first match so the outer loop can descend into the matched value's
-     * sub-object. Duplicate detection in this case would require buffering whole sub-object
-     * trees, which is significantly more work and only matters in adversarial JSON shapes —
-     * see the {@link #parseAndNavigate} javadoc.
+     * <p>At INTERMEDIATE level the matched value's whole subtree is captured into a
+     * {@link TokenBuffer}, and a replay parser ({@link NavStep#replayParser}) is handed back
+     * so the outer loop can descend into the captured subtree on the next iteration.
      */
     private static NavStep findField(JsonParser p, String wanted, boolean isLastStep) throws IOException {
         JsonToken t;
         JsonToken matchedToken = null;
         Object capturedScalar = ScalarSlot.UNSET;
+        TokenBuffer capturedSubtree = null;
         while ((t = p.nextToken()) != JsonToken.END_OBJECT && t != null) {
             if (t != JsonToken.FIELD_NAME) {
                 return NavStep.MALFORMED;
@@ -331,17 +360,21 @@ public final class RecordContexts {
                     return NavStep.MALFORMED;
                 }
                 matchedToken = valueToken;
-                if (!isLastStep) {
-                    // Intermediate level: return immediately so the outer loop descends into
-                    // the matched value. First-wins for intermediate paths; see javadoc.
-                    return new NavStep(valueToken, ScalarSlot.UNSET);
-                }
-                // Leaf level: capture the scalar value before the parser moves on.
-                capturedScalar = captureLeaf(p, valueToken);
-                if (valueToken == JsonToken.START_OBJECT || valueToken == JsonToken.START_ARRAY) {
-                    // Compound at leaf position; captured value is null (extractLeaf semantics).
-                    // We still must skip children so the duplicate-scan stays at the correct level.
-                    p.skipChildren();
+                if (isLastStep) {
+                    // Leaf level: capture the scalar value before the parser moves on.
+                    capturedScalar = extractLeaf(p, valueToken);
+                    if (valueToken == JsonToken.START_OBJECT || valueToken == JsonToken.START_ARRAY) {
+                        // Compound at leaf position; captured value is null (extractLeaf semantics).
+                        // We still must skip children so the duplicate-scan stays at the correct level.
+                        p.skipChildren();
+                    }
+                } else {
+                    // Intermediate level: capture the matched subtree so we can keep scanning
+                    // the parent for duplicates without losing position. copyCurrentStructure
+                    // advances the parser to the closing token of the captured value, leaving
+                    // the outer scan free to read the next FIELD_NAME or END_OBJECT.
+                    capturedSubtree = new TokenBuffer(p);
+                    capturedSubtree.copyCurrentStructure(p);
                 }
                 continue;
             }
@@ -352,27 +385,33 @@ public final class RecordContexts {
         if (matchedToken == null) {
             return NavStep.NOT_FOUND;
         }
-        return new NavStep(matchedToken, capturedScalar);
-    }
-
-    /** Same shape as {@link #extractLeaf} but called by {@link #findField} during the
-     *  duplicate-aware leaf scan. Reads at the parser's current position (which is at the value
-     *  token just consumed by findField). */
-    private static Object captureLeaf(JsonParser p, JsonToken t) throws IOException {
-        return extractLeaf(p, t);
+        if (capturedSubtree != null) {
+            // Replay parser: positioned BEFORE the first token, so advance once to put it AT
+            // the captured matched value (mirroring what the original parser would have been at
+            // when we returned matchedToken in the no-TokenBuffer version).
+            JsonParser replay = capturedSubtree.asParser();
+            JsonToken first = replay.nextToken();
+            return new NavStep(first, ScalarSlot.UNSET, replay);
+        }
+        return new NavStep(matchedToken, capturedScalar, null);
     }
 
     /** Tiny tuple type used by {@link #findField}. */
     private static final class NavStep {
-        static final NavStep NOT_FOUND = new NavStep(null, ScalarSlot.UNSET);
-        static final NavStep MALFORMED = new NavStep(null, ScalarSlot.UNSET);
+        static final NavStep NOT_FOUND = new NavStep(null, ScalarSlot.UNSET, null);
+        static final NavStep MALFORMED = new NavStep(null, ScalarSlot.UNSET, null);
         final JsonToken token;
         /** Pre-captured leaf value, or {@link ScalarSlot#UNSET} if no leaf was captured.
          *  {@code null} is a valid captured value, so we distinguish via the UNSET sentinel. */
         final Object capturedScalar;
-        NavStep(JsonToken token, Object capturedScalar) {
+        /** When non-null, the outer loop must switch to this parser for the next descent step.
+         *  Used when an intermediate-level match was captured into a {@link TokenBuffer} to
+         *  allow continued duplicate-scanning of the parent. */
+        final JsonParser replayParser;
+        NavStep(JsonToken token, Object capturedScalar, JsonParser replayParser) {
             this.token = token;
             this.capturedScalar = capturedScalar;
+            this.replayParser = replayParser;
         }
     }
 

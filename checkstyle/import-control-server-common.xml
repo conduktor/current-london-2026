@@ -101,13 +101,17 @@
 
         <subpackage name="views">
             <!-- Topic Views: broker-side filtering of records using a sandboxed predicate
-                 language. JSON body navigation needs the Jackson streaming parser. The
-                 ViewFilter bridges into MemoryRecords.filterTo which lives under
-                 common.record and common.header; building MemoryRecords in tests also
-                 needs common.compress for Compression.NONE. The ViewMetrics class
-                 registers Yammer meters via KafkaMetricsGroup, so the same dependencies
-                 the server.metrics subpackage uses are needed here too. -->
+                 language. JSON body navigation needs the Jackson streaming parser; the
+                 intermediate-level duplicate-key detector uses TokenBuffer from
+                 jackson-databind to capture a matched subtree so the rest of the parent
+                 can be scanned for duplicates before descending. The ViewFilter bridges
+                 into MemoryRecords.filterTo which lives under common.record and
+                 common.header; building MemoryRecords in tests also needs common.compress
+                 for Compression.NONE. The ViewMetrics class registers Yammer meters via
+                 KafkaMetricsGroup, so the same dependencies the server.metrics subpackage
+                 uses are needed here too. -->
             <allow pkg="com.fasterxml.jackson.core" />
+            <allow class="com.fasterxml.jackson.databind.util.TokenBuffer" />
             <allow pkg="com.yammer.metrics.core" />
             <allow pkg="org.apache.kafka.common.record" />
             <allow pkg="org.apache.kafka.common.header" />

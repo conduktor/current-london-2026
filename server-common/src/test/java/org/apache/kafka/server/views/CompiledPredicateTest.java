@@ -188,6 +188,62 @@ class CompiledPredicateTest {
     }
 
     @Test
+    void skipsRecordWhenIntermediateKeyAppearsTwice() {
+        // Same threat model as the leaf-level duplicate-key test, but at an INTERMEDIATE
+        // path segment. An adversary writing two "user" objects at root could steer
+        // body.user.region to "US" via the first occurrence while a downstream parser
+        // (Jackson last-wins) reads "EU" from the second — bypassing the predicate.
+        CompiledPredicate p = compiler.compile("body.user.region == 'US'");
+        Optional<Boolean> r = p.evaluate(jsonRecord(
+                "{\"user\":{\"region\":\"US\"},\"user\":{\"region\":\"EU\"}}"));
+        assertTrue(r.isEmpty(),
+                () -> "expected skip on intermediate-level duplicate key, got " + r);
+    }
+
+    @Test
+    void skipsRecordWhenIntermediateKeyDuplicateAppearsAfterSiblings() {
+        // The intermediate-level duplicate-scan must continue past the first match through
+        // the rest of the parent object, even when unrelated siblings sit between the
+        // two duplicate occurrences.
+        CompiledPredicate p = compiler.compile("body.user.region == 'US'");
+        Optional<Boolean> r = p.evaluate(jsonRecord(
+                "{\"user\":{\"region\":\"US\"},\"other\":1,\"user\":{\"region\":\"EU\"}}"));
+        assertTrue(r.isEmpty(),
+                () -> "expected skip on intermediate-level duplicate key after sibling, got " + r);
+    }
+
+    @Test
+    void skipsRecordWhenDeeperIntermediateKeyAppearsTwice() {
+        // Intermediate-duplicate guard must apply at every path level, not only the first.
+        // Path body.outer.inner.value: the duplicate is at level 2 (the "inner" key).
+        CompiledPredicate p = compiler.compile("body.outer.inner.value == 1");
+        Optional<Boolean> r = p.evaluate(jsonRecord(
+                "{\"outer\":{\"inner\":{\"value\":1},\"inner\":{\"value\":2}}}"));
+        assertTrue(r.isEmpty(),
+                () -> "expected skip on deeper intermediate-level duplicate key, got " + r);
+    }
+
+    @Test
+    void intermediatePathStillResolvesWhenNoDuplicate() {
+        // Sanity: with the TokenBuffer-based intermediate-level scan, non-adversarial nested
+        // paths must continue to resolve normally.
+        CompiledPredicate p = compiler.compile("body.user.region == 'US'");
+        assertTrue(p.evaluate(jsonRecord(
+                "{\"user\":{\"region\":\"US\"}}")).orElse(false));
+        assertFalse(p.evaluate(jsonRecord(
+                "{\"user\":{\"region\":\"EU\"}}")).orElse(false));
+    }
+
+    @Test
+    void intermediateDuplicateInsideUnrelatedSubobjectDoesNotPoisonOtherPaths() {
+        // body.color is at root; the duplicate intermediate keys live in body.meta — predicate
+        // doesn't traverse there, so it must not refuse the record.
+        CompiledPredicate p = compiler.compile("body.color == 'red'");
+        assertTrue(p.evaluate(jsonRecord(
+                "{\"color\":\"red\",\"meta\":{\"sub\":{\"a\":1},\"sub\":{\"a\":2}}}")).orElse(false));
+    }
+
+    @Test
     void skipsRecordWhenLongValueExceedsIeeeSafeRange() {
         // 2^53 = 9_007_199_254_740_992 is the largest integer all doubles can exactly represent.
         // A Long larger than that loses precision when promoted to double. An adversary could
