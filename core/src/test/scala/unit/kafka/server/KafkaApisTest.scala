@@ -54,6 +54,7 @@ import org.apache.kafka.common.message.ListOffsetsResponseData.{ListOffsetsParti
 import org.apache.kafka.common.message.MetadataResponseData.MetadataResponseTopic
 import org.apache.kafka.common.message.OffsetDeleteRequestData.{OffsetDeleteRequestPartition, OffsetDeleteRequestTopic, OffsetDeleteRequestTopicCollection}
 import org.apache.kafka.common.message.OffsetDeleteResponseData.{OffsetDeleteResponsePartition, OffsetDeleteResponsePartitionCollection, OffsetDeleteResponseTopic, OffsetDeleteResponseTopicCollection}
+import org.apache.kafka.common.message.OffsetForLeaderEpochRequestData.{OffsetForLeaderPartition, OffsetForLeaderTopic, OffsetForLeaderTopicCollection}
 import org.apache.kafka.common.message.ShareFetchRequestData.{AcknowledgementBatch, ForgottenTopic}
 import org.apache.kafka.common.message.ShareFetchResponseData.{AcquiredRecords, PartitionData, ShareFetchableTopicResponse}
 import org.apache.kafka.common.metadata.{TopicRecord, PartitionRecord, RegisterBrokerRecord}
@@ -4897,6 +4898,166 @@ class KafkaApisTest extends Logging {
 
     verify(replicaManager, never()).fetchOffset(any(), any(), any(), anyInt, any(), anyInt, anyShort,
       any(), any(), anyInt)
+  }
+
+  @Test
+  def testOffsetForLeaderEpochOnLogicalTopicSynthesizesLogicalLeoAndBackingEpoch(): Unit = {
+    // r16 BLOCKER #93-A. ReplicaManager.lastOffsetForLeaderEpoch returns UNKNOWN_TOPIC_OR_PARTITION
+    // for logical topics (they're not in metadataCache). The consumer's KIP-320 truncation-detection
+    // utility (OffsetsForLeaderEpochUtils) does NOT remove the partition from partitionsToRetry on
+    // UNKNOWN — the consumer spins forever and can't complete fetch validation. The handler must
+    // synthesize a response from kernel state. In v1 logical offsets are append-only at the logical
+    // layer, so the honest answer is "no truncation up to current logical LEO under current backing
+    // leader epoch" — endOffset >= clientOffset always holds and the consumer's check passes.
+    val logicalTopic = "orders"
+    val backingTopic = "concentrated"
+    val descriptor = new LogicalTopicDescriptor(logicalTopic, 1024, backingTopic, 4)
+    addTopicToMetadataCache(backingTopic, numPartitions = 4)
+
+    when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
+    when(concentrationKernel.describe(logicalTopic)).thenReturn(Optional.of(descriptor))
+    when(concentrationKernel.backingPartitionFor(logicalTopic, 0)).thenReturn(0)
+    when(concentrationKernel.isBackingReady(any[TopicPartition])).thenReturn(true)
+    when(concentrationKernel.nextLogicalOffset(logicalTopic, 0)).thenReturn(7_500L)
+
+    val backingPartition = mock(classOf[Partition])
+    when(backingPartition.isLeader).thenReturn(true)
+    when(backingPartition.getLeaderEpoch).thenReturn(11)
+    when(replicaManager.onlinePartition(any[TopicPartition])).thenReturn(Some(backingPartition))
+
+    val topic = new OffsetForLeaderTopic()
+      .setTopic(logicalTopic)
+      .setPartitions(List(
+        new OffsetForLeaderPartition()
+          .setPartition(0)
+          .setLeaderEpoch(5)
+          .setCurrentLeaderEpoch(11)
+      ).asJava)
+    val request = buildRequest(OffsetsForLeaderEpochRequest.Builder.forConsumer(
+      new OffsetForLeaderTopicCollection(List(topic).iterator.asJava)).build())
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleOffsetForLeaderEpochRequest(request)
+
+    val response = verifyNoThrottling[OffsetsForLeaderEpochResponse](request)
+    val topicResp = response.data.topics.asScala.find(_.topic == logicalTopic).get
+    val partitionResp = topicResp.partitions.asScala.head
+    assertEquals(Errors.NONE.code, partitionResp.errorCode)
+    assertEquals(0, partitionResp.partition)
+    assertEquals(11, partitionResp.leaderEpoch,
+      "logical synthesis must surface backing partition's current leader epoch — UNKNOWN_LEADER_EPOCH " +
+      "default (-1) would mis-route the consumer through retry instead of completing validation")
+    assertEquals(7_500L, partitionResp.endOffset,
+      "endOffset must be the logical LEO (kernel.nextLogicalOffset), NOT the backing log's end — " +
+      "a backing offset would make the consumer think it has missed records (endOffset < its position)")
+
+    // ReplicaManager must NEVER receive a logical-topic OFLE; the kernel is the source of truth.
+    verify(replicaManager, never()).lastOffsetForLeaderEpoch(any())
+  }
+
+  @Test
+  def testOffsetForLeaderEpochOnLogicalTopicWhenBackingNotReadyReturnsNotLeaderOrFollower(): Unit = {
+    // Same readiness gate as Produce/Fetch/ListOffsets. Returning the kernel's tracker state while
+    // it's mid-rebuild (leader-loss or first acquisition) would expose stale offsets — the consumer
+    // would compare its known offset against a stale LEO and either think no truncation occurred
+    // when it did (silent wrong-data on next fetch) or reset to a stale offset.
+    val logicalTopic = "orders"
+    val backingTopic = "concentrated"
+    val descriptor = new LogicalTopicDescriptor(logicalTopic, 1024, backingTopic, 4)
+    addTopicToMetadataCache(backingTopic, numPartitions = 4)
+
+    when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
+    when(concentrationKernel.describe(logicalTopic)).thenReturn(Optional.of(descriptor))
+    when(concentrationKernel.backingPartitionFor(logicalTopic, 0)).thenReturn(0)
+    when(concentrationKernel.isBackingReady(any[TopicPartition])).thenReturn(false)
+
+    val backingPartition = mock(classOf[Partition])
+    when(backingPartition.isLeader).thenReturn(true)
+    when(replicaManager.onlinePartition(any[TopicPartition])).thenReturn(Some(backingPartition))
+
+    val topic = new OffsetForLeaderTopic()
+      .setTopic(logicalTopic)
+      .setPartitions(List(new OffsetForLeaderPartition().setPartition(0).setLeaderEpoch(5)).asJava)
+    val request = buildRequest(OffsetsForLeaderEpochRequest.Builder.forConsumer(
+      new OffsetForLeaderTopicCollection(List(topic).iterator.asJava)).build())
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleOffsetForLeaderEpochRequest(request)
+
+    val response = verifyNoThrottling[OffsetsForLeaderEpochResponse](request)
+    val partitionResp = response.data.topics.asScala.find(_.topic == logicalTopic).get
+      .partitions.asScala.head
+    assertEquals(Errors.NOT_LEADER_OR_FOLLOWER.code, partitionResp.errorCode)
+    // Default LEO/epoch on error path — consumer ignores these on NOT_LEADER, but be explicit.
+    verify(concentrationKernel, never()).nextLogicalOffset(any[String], anyInt)
+  }
+
+  @Test
+  def testOffsetForLeaderEpochOnLogicalTopicWhenNotLeaderReturnsNotLeaderOrFollower(): Unit = {
+    // Same leader-only contract as Fetch (Codex Q5) and ListOffsets. A non-leader broker's kernel
+    // tracker has never observed the produces (only the leader updates it), so it would return
+    // logical LEO = 0 — making any consumer past offset 0 think every record after the first was
+    // truncated. NOT_LEADER_OR_FOLLOWER routes the consumer through metadata refresh.
+    val logicalTopic = "orders"
+    val backingTopic = "concentrated"
+    val descriptor = new LogicalTopicDescriptor(logicalTopic, 1024, backingTopic, 4)
+    addTopicToMetadataCache(backingTopic, numPartitions = 4)
+
+    when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
+    when(concentrationKernel.describe(logicalTopic)).thenReturn(Optional.of(descriptor))
+    when(concentrationKernel.backingPartitionFor(logicalTopic, 0)).thenReturn(0)
+    val backingPartition = mock(classOf[Partition])
+    when(backingPartition.isLeader).thenReturn(false)
+    when(replicaManager.onlinePartition(any[TopicPartition])).thenReturn(Some(backingPartition))
+
+    val topic = new OffsetForLeaderTopic()
+      .setTopic(logicalTopic)
+      .setPartitions(List(new OffsetForLeaderPartition().setPartition(0).setLeaderEpoch(5)).asJava)
+    val request = buildRequest(OffsetsForLeaderEpochRequest.Builder.forConsumer(
+      new OffsetForLeaderTopicCollection(List(topic).iterator.asJava)).build())
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleOffsetForLeaderEpochRequest(request)
+
+    val response = verifyNoThrottling[OffsetsForLeaderEpochResponse](request)
+    val partitionResp = response.data.topics.asScala.find(_.topic == logicalTopic).get
+      .partitions.asScala.head
+    assertEquals(Errors.NOT_LEADER_OR_FOLLOWER.code, partitionResp.errorCode)
+    verify(concentrationKernel, never()).nextLogicalOffset(any[String], anyInt)
+  }
+
+  @Test
+  def testOffsetForLeaderEpochOnLogicalTopicOutOfRangePartitionReturnsUnknownTopicOrPartition(): Unit = {
+    val logicalTopic = "orders"
+    val backingTopic = "concentrated"
+    val descriptor = new LogicalTopicDescriptor(logicalTopic, 1024, backingTopic, 4)
+    addTopicToMetadataCache(backingTopic, numPartitions = 4)
+
+    when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
+    when(concentrationKernel.describe(logicalTopic)).thenReturn(Optional.of(descriptor))
+
+    val topic = new OffsetForLeaderTopic()
+      .setTopic(logicalTopic)
+      .setPartitions(List(new OffsetForLeaderPartition().setPartition(2048).setLeaderEpoch(0)).asJava)
+    val request = buildRequest(OffsetsForLeaderEpochRequest.Builder.forConsumer(
+      new OffsetForLeaderTopicCollection(List(topic).iterator.asJava)).build())
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleOffsetForLeaderEpochRequest(request)
+
+    val response = verifyNoThrottling[OffsetsForLeaderEpochResponse](request)
+    val partitionResp = response.data.topics.asScala.find(_.topic == logicalTopic).get
+      .partitions.asScala.head
+    assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION.code, partitionResp.errorCode,
+      "out-of-range logical partition must surface as UNKNOWN, NOT leak a kernel ArrayIndex through")
   }
 
   @Test

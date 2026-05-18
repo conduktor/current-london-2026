@@ -3050,7 +3050,77 @@ class KafkaApis(val requestChannel: RequestChannel,
         (topics, Seq.empty[OffsetForLeaderTopic])
       else authHelper.partitionSeqByAuthorized(request.context, DESCRIBE, TOPIC, topics)(_.topic)
 
-    val endOffsetsForAuthorizedPartitions = replicaManager.lastOffsetForLeaderEpoch(authorizedTopics)
+    // r16 BLOCKER #93-A. Logical topics are not in metadataCache, so ReplicaManager.lastOffsetForLeaderEpoch
+    // returns UNKNOWN_TOPIC_OR_PARTITION for them. The consumer's OffsetsForLeaderEpochUtils (KIP-320
+    // truncation detection) does NOT remove the partition from `partitionsToRetry` on UNKNOWN — the
+    // consumer spins forever and can't make validation progress. We synthesize the response here so
+    // the consumer's check resolves cleanly.
+    //
+    // v1 semantics: logical offsets are append-only — DeleteRecords advances log-start, but no
+    // leader-driven truncation happens at the logical layer. So the honest answer is "no truncation
+    // up to the current logical LEO, under the current backing leader epoch". The consumer's
+    // endOffset >= clientOffset check passes and validation completes. Per-logical-epoch tracking
+    // is a v2 follow-up (would let us answer the more precise "end offset of YOUR epoch" question).
+    val (logicalAuthorized, nonLogicalAuthorized) =
+      authorizedTopics.partition(t => concentrationKernel.isLogicalTopic(t.topic))
+
+    val logicalResults: Seq[OffsetForLeaderTopicResult] = logicalAuthorized.map { topic =>
+      val descriptorOpt = concentrationKernel.describe(topic.topic)
+      val partResponses = topic.partitions.asScala.map { p =>
+        if (descriptorOpt.isEmpty) {
+          // Declaration was revoked between isLogicalTopic() and describe(). Mirror ListOffsets
+          // behavior: surface UNKNOWN_TOPIC_OR_PARTITION so the client refreshes metadata.
+          new EpochEndOffset()
+            .setPartition(p.partition)
+            .setErrorCode(Errors.UNKNOWN_TOPIC_OR_PARTITION.code)
+        } else {
+          val descriptor = descriptorOpt.get
+          if (p.partition < 0 || p.partition >= descriptor.numLogicalPartitions) {
+            new EpochEndOffset()
+              .setPartition(p.partition)
+              .setErrorCode(Errors.UNKNOWN_TOPIC_OR_PARTITION.code)
+          } else {
+            val backingTp = new TopicPartition(descriptor.backingTopic,
+              concentrationKernel.backingPartitionFor(topic.topic, p.partition))
+            replicaManager.onlinePartition(backingTp) match {
+              case Some(part) if part.isLeader =>
+                if (!concentrationKernel.isBackingReady(backingTp)) {
+                  // Tracker is mid-rebuild (leader-loss or first acquisition before recoverer
+                  // publishes). Returning nextLogicalOffset here would expose stale tracker
+                  // state — same gate as ListOffsets uses.
+                  new EpochEndOffset()
+                    .setPartition(p.partition)
+                    .setErrorCode(Errors.NOT_LEADER_OR_FOLLOWER.code)
+                } else {
+                  new EpochEndOffset()
+                    .setPartition(p.partition)
+                    .setErrorCode(Errors.NONE.code)
+                    .setLeaderEpoch(part.getLeaderEpoch)
+                    .setEndOffset(concentrationKernel.nextLogicalOffset(topic.topic, p.partition))
+                }
+              case _ =>
+                // Same leader-only contract as Fetch/ListOffsets: a non-leader broker's tracker
+                // has never observed the produces, so it would return logical LEO = 0. Route the
+                // consumer through metadata refresh back to the actual leader.
+                new EpochEndOffset()
+                  .setPartition(p.partition)
+                  .setErrorCode(Errors.NOT_LEADER_OR_FOLLOWER.code)
+            }
+          }
+        }
+      }
+      new OffsetForLeaderTopicResult()
+        .setTopic(topic.topic)
+        .setPartitions(partResponses.toList.asJava)
+    }
+
+    // Guard against ReplicaManager being called with an empty Seq — purely defensive against test
+    // mocks returning null for unstubbed empty-arg calls (Mockito default). Real ReplicaManager
+    // returns an empty Seq, but skipping the call when there's nothing to do is also marginally
+    // cheaper on the all-logical-topics request path.
+    val endOffsetsForAuthorizedPartitions =
+      if (nonLogicalAuthorized.isEmpty) Seq.empty[OffsetForLeaderTopicResult]
+      else replicaManager.lastOffsetForLeaderEpoch(nonLogicalAuthorized)
     val endOffsetsForUnauthorizedPartitions = unauthorizedTopics.map { offsetForLeaderTopic =>
       val partitions = offsetForLeaderTopic.partitions.asScala.map { offsetForLeaderPartition =>
         new EpochEndOffset()
@@ -3064,7 +3134,7 @@ class KafkaApis(val requestChannel: RequestChannel,
     }
 
     val endOffsetsForAllTopics = new OffsetForLeaderTopicResultCollection(
-      (endOffsetsForAuthorizedPartitions ++ endOffsetsForUnauthorizedPartitions).asJava.iterator
+      (logicalResults ++ endOffsetsForAuthorizedPartitions ++ endOffsetsForUnauthorizedPartitions).asJava.iterator
     )
 
     requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
