@@ -379,7 +379,15 @@ public final class IoUringSelector implements BrokerSelector {
                         receivesThisPoll.add(channel.id());
                         madeProgress = true;
                     }
-                } catch (IOException e) {
+                } catch (Exception e) {
+                    // Catch Exception, not just IOException: KafkaChannel.read() declares
+                    // throws IOException, but NetworkReceive throws InvalidReceiveException
+                    // (a KafkaException -> RuntimeException) when the wire reports a negative
+                    // size or a size > socket.request.max.bytes. Catching only IOException
+                    // lets that escape poll() so Processor.poll() never sees the failure,
+                    // the channel is never closed, the connection quota is never decremented,
+                    // and the unread Netty ByteBufs accumulate until idle expiry or direct-
+                    // memory failure. Matches NIO Selector.pollSelectionKeys's catch (Exception).
                     log.debug("Read failed on channel {}", channel.id(), e);
                     enqueueClose(channel.id(), ChannelState.LOCAL_CLOSE);
                     it.remove();
@@ -401,7 +409,11 @@ public final class IoUringSelector implements BrokerSelector {
                         completedSends.add(send);
                         madeProgress = true;
                     }
-                } catch (IOException e) {
+                } catch (Exception e) {
+                    // Same rationale as the read path: catch Exception, not just IOException,
+                    // so a RuntimeException from inside the send chain (e.g. an outbound
+                    // ByteBufferSend tripping over a malformed message) routes through
+                    // FAILED_SEND instead of escaping poll() and stranding the channel.
                     log.debug("Write failed on channel {}", channel.id(), e);
                     enqueueClose(channel.id(), ChannelState.FAILED_SEND);
                     it.remove();
@@ -449,38 +461,6 @@ public final class IoUringSelector implements BrokerSelector {
     }
 
     /**
-     * Step 3 of {@link #poll(long)}: drain {@link #pendingDisconnects}, surface each id
-     * in {@link #disconnected}, and stash the channel in {@link #closingChannels} so the
-     * Processor can still resolve any final completedReceives via
-     * {@code closingChannel(id)} before the next poll evicts it.
-     *
-     * <p>Two invariants are enforced here:
-     * <ul>
-     *   <li><b>same-poll accept+disconnect:</b> a channel in {@link #justAccepted} that
-     *       FINs before the Processor has run {@code applyConnectionQuotasForNewlyAcceptedChannels}
-     *       is dropped silently (no {@code disconnected} entry, removed from
-     *       {@code connected}). Surfacing it would let {@code processDisconnected} call
-     *       {@code connectionQuotas.dec} on a counter that was never {@code inc}'d.
-     *   <li><b>one completedReceive per channel per poll:</b> the final-read drain is
-     *       skipped if step 2 already produced a receive for this id. Remaining buffered
-     *       bytes stay readable through {@code closingChannel(id)} for one more poll —
-     *       same as NIO's {@code Selector.clear()}.
-     *   <li><b>muted channels do not produce a final receive:</b> a channel that was
-     *       muted (operator or MemoryPool) at FIN time must not have its inbound queue
-     *       drained here. The Processor explicitly relies on the invariant that the
-     *       request flow stays paused until {@code unmute()} is called, and muting
-     *       only blocks new kernel pushes, not bytes already in the transport queue. NIO
-     *       enforces this via {@code maybeReadFromClosingChannel} skipping muted channels
-     *       at {@code Selector.java#698}. We defer the buffered bytes to the next poll's
-     *       {@code closingChannel(id)} resolution path, where the channel will be
-     *       drained only after the operator unmutes — matching NIO precisely.
-     * </ul>
-     *
-     * @return {@code true} if any channel transitioned to disconnected (or any silent
-     *         drop happened), so the caller can mark progress and skip the wait at the
-     *         end of {@link #poll(long)}.
-     */
-    /**
      * Drain {@link #closingChannels} left over from the previous poll. NIO's
      * {@code Selector.clear} at {@code clients/.../Selector.java#842-863} is the model:
      * a channel stays in {@code closingChannels} as long as
@@ -524,7 +504,11 @@ public final class IoUringSelector implements BrokerSelector {
                             receivesThisPoll.add(id);
                             keepClosing = true;
                         }
-                    } catch (IOException e) {
+                    } catch (Exception e) {
+                        // Catch Exception, not just IOException: an InvalidReceiveException
+                        // (RuntimeException) here means the final-read tripped on a malformed
+                        // size prefix. We just want to evict the channel and let the next poll's
+                        // closingChannel(id) path be a no-op — escaping would leak the channel.
                         log.trace("Read from closing channel {} failed, evicting", id, e);
                     }
                 }
@@ -537,6 +521,38 @@ public final class IoUringSelector implements BrokerSelector {
         }
     }
 
+    /**
+     * Step 3 of {@link #poll(long)}: drain {@link #pendingDisconnects}, surface each id
+     * in {@link #disconnected}, and stash the channel in {@link #closingChannels} so the
+     * Processor can still resolve any final completedReceives via
+     * {@code closingChannel(id)} before the next poll evicts it.
+     *
+     * <p>Two invariants are enforced here:
+     * <ul>
+     *   <li><b>same-poll accept+disconnect:</b> a channel in {@link #justAccepted} that
+     *       FINs before the Processor has run {@code applyConnectionQuotasForNewlyAcceptedChannels}
+     *       is dropped silently (no {@code disconnected} entry, removed from
+     *       {@code connected}). Surfacing it would let {@code processDisconnected} call
+     *       {@code connectionQuotas.dec} on a counter that was never {@code inc}'d.
+     *   <li><b>one completedReceive per channel per poll:</b> the final-read drain is
+     *       skipped if step 2 already produced a receive for this id. Remaining buffered
+     *       bytes stay readable through {@code closingChannel(id)} for one more poll —
+     *       same as NIO's {@code Selector.clear()}.
+     *   <li><b>muted channels do not produce a final receive:</b> a channel that was
+     *       muted (operator or MemoryPool) at FIN time must not have its inbound queue
+     *       drained here. The Processor explicitly relies on the invariant that the
+     *       request flow stays paused until {@code unmute()} is called, and muting
+     *       only blocks new kernel pushes, not bytes already in the transport queue. NIO
+     *       enforces this via {@code maybeReadFromClosingChannel} skipping muted channels
+     *       at {@code Selector.java#698}. We defer the buffered bytes to the next poll's
+     *       {@code closingChannel(id)} resolution path, where the channel will be
+     *       drained only after the operator unmutes — matching NIO precisely.
+     * </ul>
+     *
+     * @return {@code true} if any channel transitioned to disconnected (or any silent
+     *         drop happened), so the caller can mark progress and skip the wait at the
+     *         end of {@link #poll(long)}.
+     */
     private boolean drainPendingDisconnects() {
         boolean madeProgress = false;
         String disconnectId;
@@ -564,7 +580,11 @@ public final class IoUringSelector implements BrokerSelector {
                         }
                         if (read <= 0) break;
                     }
-                } catch (IOException e) {
+                } catch (Exception e) {
+                    // Catch Exception, not just IOException: InvalidReceiveException
+                    // (RuntimeException) during the FIN-drain must not escape — the
+                    // channel still needs to land in closingChannels for the eviction
+                    // notification path; otherwise the disconnect notification is lost.
                     log.debug("Final read on disconnecting channel {} failed", disconnectId, e);
                 }
             }

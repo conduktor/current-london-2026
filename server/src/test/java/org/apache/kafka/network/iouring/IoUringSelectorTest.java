@@ -250,6 +250,52 @@ class IoUringSelectorTest {
     }
 
     @Test
+    void malformedFrameSizeClosesTheChannelRatherThanEscapingPoll() throws Exception {
+        // Codex v5 BLOCKER: KafkaChannel.read() declares throws IOException, but the
+        // underlying NetworkReceive throws InvalidReceiveException (a KafkaException ->
+        // RuntimeException) when the wire reports a negative size or a size greater than
+        // socket.request.max.bytes. Before the fix this escaped poll() because we caught
+        // only IOException; the Processor never saw the failure and the channel leaked.
+        // Two malformed inputs to exercise both code paths in NetworkReceive:
+        //   - a negative size prefix (rejected first)
+        //   - a size that fits but exceeds maxSize (rejected second)
+        // For each, the channel must route through ChannelState.LOCAL_CLOSE (queued via
+        // enqueueClose) and surface in disconnected() on the next poll's eviction step.
+
+        // Case 1: negative size prefix. After the accept poll completes, the channel
+        // is no longer in justAccepted, so the next poll's read step actually runs
+        // channel.read(), which trips InvalidReceiveException from NetworkReceive.
+        IoUringSelector s1 = newSelector(IDLE_NANOS_NEVER);
+        EmbeddedChannel netty1 = acceptNew(s1, REMOTE_A);
+        s1.poll(0); // accept
+        String id1 = s1.connected().get(0);
+        ByteBuf bad = Unpooled.buffer(4).writeInt(-1);
+        s1.onRead(netty1, bad);
+        // poll() must NOT throw — the InvalidReceiveException must be absorbed inside
+        // the catch (Exception) on the read path, and the channel must be routed
+        // through enqueueClose (which populates disconnected in the same poll).
+        s1.poll(0); // read step trips exception, enqueueClose -> disconnected[id1]
+        assertTrue(s1.disconnected().containsKey(id1),
+            "malformed negative size must surface as a disconnect, not escape poll(): id1=" + id1
+                + " disconnected=" + s1.disconnected());
+        assertEquals(ChannelState.LOCAL_CLOSE, s1.disconnected().get(id1));
+        s1.close();
+
+        // Case 2: positive size that exceeds the configured maxSize.
+        IoUringSelector s2 = newSelector(IDLE_NANOS_NEVER);
+        EmbeddedChannel netty2 = acceptNew(s2, REMOTE_B);
+        s2.poll(0); // accept
+        String id2 = s2.connected().get(0);
+        ByteBuf oversized = Unpooled.buffer(4).writeInt(MAX_RECEIVE + 1);
+        s2.onRead(netty2, oversized);
+        s2.poll(0); // read step trips exception
+        assertTrue(s2.disconnected().containsKey(id2),
+            "oversized frame must surface as a disconnect, not escape poll(): id2=" + id2
+                + " disconnected=" + s2.disconnected());
+        assertEquals(ChannelState.LOCAL_CLOSE, s2.disconnected().get(id2));
+    }
+
+    @Test
     void sendIsWrittenToTheNettyOutboundAndCompletes() throws Exception {
         IoUringSelector s = newSelector(IDLE_NANOS_NEVER);
         EmbeddedChannel netty = acceptNew(s, REMOTE_A);
