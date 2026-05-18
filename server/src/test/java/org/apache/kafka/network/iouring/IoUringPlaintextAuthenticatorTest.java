@@ -16,6 +16,7 @@
  */
 package org.apache.kafka.network.iouring;
 
+import org.apache.kafka.common.Configurable;
 import org.apache.kafka.common.config.internals.BrokerSecurityConfigs;
 import org.apache.kafka.common.network.ListenerName;
 import org.apache.kafka.common.security.auth.AuthenticationContext;
@@ -28,6 +29,7 @@ import org.junit.jupiter.api.Test;
 
 import java.net.InetSocketAddress;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.Map;
 
 import io.netty.channel.embedded.EmbeddedChannel;
@@ -95,6 +97,30 @@ class IoUringPlaintextAuthenticatorTest {
             "PLAINTEXT silently diverges from NIO PLAINTEXT authorization");
     }
 
+    @Test
+    void configurablePrincipalBuilderReceivesTheConfigsMap() {
+        // Regression for the principal-builder configs-map divergence flagged by the
+        // round-4 audit. A custom KafkaPrincipalBuilder that implements Configurable
+        // must receive the broker configs through configure(), and any non-schema keys
+        // the user provided must be visible — that's what NIO does (via
+        // ChannelBuilders.channelBuilderConfigs which merges originals on top of
+        // valuesWithPrefixOverride). The io_uring path must agree.
+        channel = new EmbeddedChannel();
+        layer = new IoUringTransportLayer(channel,
+            new InetSocketAddress("198.51.100.7", 1234),
+            new InetSocketAddress("203.0.113.1", 9092));
+        Map<String, Object> configs = new HashMap<>();
+        configs.put(BrokerSecurityConfigs.PRINCIPAL_BUILDER_CLASS_CONFIG, ConfigurablePrincipalBuilder.class);
+        configs.put("principal.builder.custom.tag", "rack-A");
+        auth = new IoUringPlaintextAuthenticator(layer, ListenerName.normalised("PLAINTEXT"), configs);
+
+        KafkaPrincipal p = auth.principal();
+        assertEquals("User", p.getPrincipalType());
+        assertEquals("rack-A:198.51.100.7", p.getName(),
+            "configure() must have seen the non-schema 'principal.builder.custom.tag' key — " +
+            "otherwise a Configurable principal builder behaves differently on io_uring than on NIO");
+    }
+
     /** Test-only builder that derives the principal name from the remote IP. */
     public static final class IpPrincipalBuilder implements KafkaPrincipalBuilder {
         @Override
@@ -102,6 +128,30 @@ class IoUringPlaintextAuthenticatorTest {
             if (context instanceof PlaintextAuthenticationContext) {
                 return new KafkaPrincipal(KafkaPrincipal.USER_TYPE,
                     ((PlaintextAuthenticationContext) context).clientAddress().getHostAddress());
+            }
+            return KafkaPrincipal.ANONYMOUS;
+        }
+    }
+
+    /**
+     * Test-only builder that reads a non-schema key out of its configure() map. If the
+     * io_uring caller forwards only valuesWithPrefixOverride (which excludes keys that
+     * are not in the broker schema), this builder would see a null tag — divergent from NIO.
+     */
+    public static final class ConfigurablePrincipalBuilder implements KafkaPrincipalBuilder, Configurable {
+        private String tag = "<unset>";
+
+        @Override
+        public void configure(Map<String, ?> configs) {
+            Object t = configs.get("principal.builder.custom.tag");
+            if (t != null) tag = t.toString();
+        }
+
+        @Override
+        public KafkaPrincipal build(AuthenticationContext context) {
+            if (context instanceof PlaintextAuthenticationContext) {
+                return new KafkaPrincipal(KafkaPrincipal.USER_TYPE,
+                    tag + ":" + ((PlaintextAuthenticationContext) context).clientAddress().getHostAddress());
             }
             return KafkaPrincipal.ANONYMOUS;
         }

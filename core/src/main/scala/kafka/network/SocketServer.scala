@@ -944,9 +944,8 @@ private[kafka] class Processor(
       }
       // Threaded to IoUringPlaintextAuthenticator so a user-configured PRINCIPAL_BUILDER_CLASS_CONFIG
       // is honored on this listener — mirroring the NIO PlaintextChannelBuilder path which calls
-      // configure(channelBuilderConfigs(config, listenerName)). valuesWithPrefixOverride applies
-      // any "listener.name.<name>." prefix overrides so per-listener principal builders work too.
-      val ioUringChannelConfigs = config.valuesWithPrefixOverride(listenerName.configPrefix)
+      // configure(channelBuilderConfigs(config, listenerName)).
+      val ioUringChannelConfigs = ioUringChannelBuilderConfigs()
       val ioUringSelector = new org.apache.kafka.network.iouring.IoUringSelector(
         listenerName,
         maxRequestSize,
@@ -974,6 +973,49 @@ private[kafka] class Processor(
         )
       )), None)
     }
+  }
+
+  /**
+   * Build the configs map handed to IoUringPlaintextAuthenticator's principal builder,
+   * mirroring ChannelBuilders.channelBuilderConfigs (package-private under clients/).
+   *
+   * The NIO PlaintextChannelBuilder receives a map that merges
+   * config.valuesWithPrefixOverride(listenerPrefix) (the parsed view, with per-listener
+   * overrides applied) with config.originals() (the raw user-provided keys, including any
+   * keys NOT in the schema such as principal.builder.* custom keys). A Configurable
+   * principal builder reads this combined map in configure().
+   *
+   * If the io_uring path only forwarded valuesWithPrefixOverride, a custom builder whose
+   * configure() reads non-schema keys would see them on a NIO listener but not on an
+   * io_uring listener — a silent transport-level divergence. Replicate the merge here so
+   * the two transports agree on what the user said.
+   */
+  private def ioUringChannelBuilderConfigs(): java.util.Map[String, _] = {
+    val parsedConfigs = new java.util.HashMap[String, AnyRef]()
+    parsedConfigs.putAll(config.valuesWithPrefixOverride(listenerName.configPrefix))
+    val listenerPrefix = listenerName.configPrefix
+    config.originals.entrySet.forEach { e =>
+      val key = e.getKey
+      // Skip: already in parsed map.
+      if (parsedConfigs.containsKey(key)) {
+        // no-op
+      // Skip: listener-prefixed duplicate where the unprefixed key is already parsed.
+      } else if (key.startsWith(listenerPrefix) &&
+                 parsedConfigs.containsKey(key.substring(listenerPrefix.length))) {
+        // no-op
+      } else {
+        // Mirrors ChannelBuilders.channelBuilderConfigs' third filter: drop keys whose
+        // first-dot-stripped suffix is already in parsed (e.g. mechanism-prefixed keys
+        // like "PLAIN.some.prop" when "some.prop" exists).
+        val dotIdx = key.indexOf('.')
+        if (dotIdx >= 0 && parsedConfigs.containsKey(key.substring(dotIdx + 1))) {
+          // no-op
+        } else {
+          parsedConfigs.put(key, e.getValue)
+        }
+      }
+    }
+    parsedConfigs
   }
 
   // Visible to override for testing. Returns the underlying Java-NIO KSelector so existing
