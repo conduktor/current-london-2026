@@ -8292,6 +8292,110 @@ class KafkaApisTest extends Logging {
     )
   }
 
+  @Test
+  def testHandleShareFetchOnBackingTopicIsRejectedWithInvalidTopic(): Unit = {
+    // r19 ADV-A BLOCKER #136: a backing topic's physical log multiplexes records from N
+    // logical topics; demux happens in LogicalFetchTranslator on the regular Fetch path.
+    // SharePartitionManager does not apply LogicalFetchTranslator, so a share-fetch on the
+    // backing name would deliver raw interleaved records (with ConcentrationHeaders) — a
+    // cross-tenant payload leak. The handler must reject with INVALID_TOPIC_EXCEPTION at
+    // the same level as Produce (KafkaApis.scala:553) and Fetch (KafkaApis.scala:1169).
+    val backingTopic = "backing-topic"
+    val backingTopicId = Uuid.randomUuid()
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
+    addTopicToMetadataCache(backingTopic, 1, topicId = backingTopicId)
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+    // Intentionally do NOT stub isLogicalTopic — the backing guard must short-circuit before
+    // it is reached. If the order regressed, the default (false) would let the request fall
+    // through to sharePartitionManager.fetchMessages, which the never() verify below detects.
+
+    val backingTip = new TopicIdPartition(backingTopicId, new TopicPartition(backingTopic, 0))
+    val erroneousPartitions = new util.HashMap[TopicIdPartition, ShareFetchResponseData.PartitionData]()
+    val validPartitions = new util.HashMap[TopicIdPartition, ShareFetchRequest.SharePartitionData]()
+    validPartitions.put(backingTip, new ShareFetchRequest.SharePartitionData(backingTopicId, partitionMaxBytes))
+    val erroneousAndValidPartitionData = new ErroneousAndValidPartitionData(erroneousPartitions, validPartitions)
+
+    val authorizedTopics: Set[String] = Set(backingTopic)
+
+    val shareFetchRequestData = new ShareFetchRequestData()
+      .setGroupId("group")
+      .setMemberId(Uuid.ZERO_UUID.toString)
+      .setShareSessionEpoch(0)
+      .setTopics(List(new ShareFetchRequestData.FetchTopic()
+        .setTopicId(backingTopicId)
+        .setPartitions(List(new ShareFetchRequestData.FetchPartition()
+          .setPartitionIndex(0)
+          .setPartitionMaxBytes(partitionMaxBytes)).asJava)).asJava)
+    val shareFetchRequest = new ShareFetchRequest.Builder(shareFetchRequestData).build(ApiKeys.SHARE_FETCH.latestVersion)
+    val request = buildRequest(shareFetchRequest)
+    kafkaApis = createKafkaApis(
+      overrideProperties = Map(
+        ServerConfigs.UNSTABLE_API_VERSIONS_ENABLE_CONFIG -> "true",
+        ShareGroupConfig.SHARE_GROUP_ENABLE_CONFIG -> "true"),
+      )
+
+    val fetchResult: Map[TopicIdPartition, ShareFetchResponseData.PartitionData] =
+      kafkaApis.handleFetchFromShareFetchRequest(
+        request,
+        erroneousAndValidPartitionData,
+        sharePartitionManager,
+        authorizedTopics
+      ).get()
+
+    assertEquals(1, fetchResult.size)
+    val partitionData = fetchResult.getOrElse(backingTip, null)
+    assertNotNull(partitionData, "response must contain an entry for the rejected backing TIP")
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, partitionData.errorCode,
+      "share-fetch on a backing topic must be rejected with INVALID_TOPIC_EXCEPTION")
+    // SharePartitionManager must never see the backing-topic fetch — the guard short-circuits.
+    verify(sharePartitionManager, never()).fetchMessages(any(), any(), any(), any())
+  }
+
+  @Test
+  def testHandleShareAcknowledgeOnBackingTopicIsRejectedWithInvalidTopic(): Unit = {
+    // r19 ADV-A BLOCKER #136 (ack side): symmetric with the share-fetch backing guard.
+    // Acking a backing-topic offset would bind the share group's per-record state to backing
+    // offsets that span multiple tenants, corrupting acquisition tracking for everyone sharing
+    // that backing. Reject as INVALID_TOPIC_EXCEPTION (non-retriable) at the same level as the
+    // share-fetch guard, before SharePartitionManager.acknowledge ever sees the request.
+    val backingTopic = "backing-topic"
+    val backingTopicId = Uuid.randomUuid()
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
+    addTopicToMetadataCache(backingTopic, 1, topicId = backingTopicId)
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+    // isLogicalTopic is checked AFTER isBackingTopic and is intentionally unstubbed; default
+    // (false) lets us catch any future ordering regression via the never() verify below.
+
+    val backingTip = new TopicIdPartition(backingTopicId, new TopicPartition(backingTopic, 0))
+    val acknowledgementData = mutable.Map[TopicIdPartition, util.List[ShareAcknowledgementBatch]]()
+    acknowledgementData += (backingTip -> util.Arrays.asList(
+      new ShareAcknowledgementBatch(0, 9, Collections.singletonList(1.toByte))))
+
+    val authorizedTopics: Set[String] = Set(backingTopic)
+    val erroneous = mutable.Map[TopicIdPartition, ShareAcknowledgeResponseData.PartitionData]()
+
+    kafkaApis = createKafkaApis(
+      overrideProperties = Map(
+        ServerConfigs.UNSTABLE_API_VERSIONS_ENABLE_CONFIG -> "true",
+        ShareGroupConfig.SHARE_GROUP_ENABLE_CONFIG -> "true"),
+      )
+    val ackResult = kafkaApis.handleAcknowledgements(
+      acknowledgementData,
+      erroneous,
+      sharePartitionManager,
+      authorizedTopics,
+      "group",
+      Uuid.randomUuid().toString
+    ).get()
+
+    assertEquals(1, ackResult.size)
+    val partitionData = ackResult.getOrElse(backingTip, null)
+    assertNotNull(partitionData, "ack response must contain an entry for the rejected backing TIP")
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, partitionData.errorCode,
+      "share-acknowledge on a backing topic must be rejected with INVALID_TOPIC_EXCEPTION")
+    verify(sharePartitionManager, never()).acknowledge(any(), any(), any())
+  }
+
   private def compareResponsePartitions(expPartitionIndex: Int,
                                         expErrorCode: Short,
                                         expAckErrorCode: Short,

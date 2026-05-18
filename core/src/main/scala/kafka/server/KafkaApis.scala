@@ -4053,6 +4053,13 @@ class KafkaApis(val requestChannel: RequestChannel,
     erroneousAndValidPartitionData.validTopicIdPartitions.forEach { case (topicIdPartition, sharePartitionData) =>
       if (!authorizedTopics.contains(topicIdPartition.topicPartition.topic))
         erroneous += topicIdPartition -> ShareFetchResponse.partitionResponse(topicIdPartition, Errors.TOPIC_AUTHORIZATION_FAILED)
+      else if (concentrationKernel.isBackingTopic(topicIdPartition.topicPartition.topic))
+        // r19 ADV-A BLOCKER #136: backing topics carry interleaved records for multiple logical
+        // topics, demuxed only by LogicalFetchTranslator on the regular Fetch path. SharePartitionManager
+        // does not apply that translator, so a share-fetch on the backing name would return the raw
+        // multiplexed records (LOGICAL_TOPIC headers and all) to the share consumer — cross-tenant
+        // payload leak. Reject the same way Produce does (KafkaApis.scala:553).
+        erroneous += topicIdPartition -> ShareFetchResponse.partitionResponse(topicIdPartition, Errors.INVALID_TOPIC_EXCEPTION)
       else if (concentrationKernel.isLogicalTopic(topicIdPartition.topicPartition.topic))
         // Share groups (KIP-932) need per-record ack tracking keyed by the partition the record
         // physically lives on. Logical topics fan in to a shared backing partition where multiple
@@ -4141,6 +4148,13 @@ class KafkaApis(val requestChannel: RequestChannel,
         if (!authorizedTopics.contains(topicIdPartition.topicPartition.topic))
           erroneous += topicIdPartition ->
             ShareAcknowledgeResponse.partitionResponse(topicIdPartition, Errors.TOPIC_AUTHORIZATION_FAILED)
+        else if (concentrationKernel.isBackingTopic(topicIdPartition.topicPartition.topic))
+          // r19 ADV-A BLOCKER #136: symmetric with handleFetchFromShareFetchRequest. Acking the
+          // backing topic directly would bind the share-group's per-record state to backing
+          // offsets that span multiple tenants, corrupting acquisition tracking for everyone
+          // sharing that backing. Reject as INVALID_TOPIC_EXCEPTION (non-retriable).
+          erroneous += topicIdPartition ->
+            ShareAcknowledgeResponse.partitionResponse(topicIdPartition, Errors.INVALID_TOPIC_EXCEPTION)
         else if (concentrationKernel.isLogicalTopic(topicIdPartition.topicPartition.topic))
           // Symmetric with handleFetchFromShareFetchRequest: logical topics aren't share-group-eligible
           // in v1. A client that somehow obtained a logical TopicIdPartition (e.g. via DescribeTopicPartitions)
