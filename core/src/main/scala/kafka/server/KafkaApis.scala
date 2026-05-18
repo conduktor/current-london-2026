@@ -66,6 +66,7 @@ import org.apache.kafka.server.share.context.ShareFetchContext
 import org.apache.kafka.server.share.{ErroneousAndValidPartitionData, SharePartitionKey}
 import org.apache.kafka.server.share.acknowledge.ShareAcknowledgementBatch
 import org.apache.kafka.server.storage.log.{FetchIsolation, FetchParams, FetchPartitionData}
+import org.apache.kafka.server.views.ViewRegistry
 import org.apache.kafka.storage.internals.log.AppendOrigin
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats
 
@@ -405,6 +406,13 @@ class KafkaApis(val requestChannel: RequestChannel,
         unauthorizedTopicResponses += topicPartition -> new PartitionResponse(Errors.TOPIC_AUTHORIZATION_FAILED)
       else if (!metadataCache.contains(topicPartition))
         nonExistingTopicResponses += topicPartition -> new PartitionResponse(Errors.UNKNOWN_TOPIC_OR_PARTITION)
+      else if (isViewTopic(topicPartition.topic))
+        // Views are read-only. PROMPT.md mandates this rejection happens before any backing-topic
+        // resolution — produce never resolves to the backing topic, so positioning the check here,
+        // before validateRecords (which has no backing-topic awareness anyway), satisfies that.
+        invalidRequestResponses += topicPartition -> new PartitionResponse(
+          Errors.INVALID_REQUEST,
+          s"Cannot produce to view topic '${topicPartition.topic}': views are read-only.")
       else
         try {
           ProduceRequest.validateRecords(request.header.apiVersion, memoryRecords)
@@ -521,6 +529,23 @@ class KafkaApis(val requestChannel: RequestChannel,
       // hence we clear its data here in order to let GC reclaim its memory since it is already appended to log
       produceRequest.clearPartitionRecords()
     }
+  }
+
+  // A topic is a view iff all three view configs are present and non-blank in its Properties.
+  // We deliberately go through TopicViewConfigs.fromMap (the same path used by the view runtime)
+  // so the all-or-none rule lives in exactly one place. Reading configRepository on each call is
+  // fine on the produce path — produce is the slow path and never compiles predicates.
+  private[server] def isViewTopic(topicName: String): Boolean = {
+    val props = configRepository.topicConfig(topicName)
+    if (props == null || props.isEmpty) return false
+    val map = new util.HashMap[String, String]()
+    val it = props.stringPropertyNames().iterator()
+    while (it.hasNext) {
+      val k = it.next()
+      val v = props.getProperty(k)
+      if (v != null) map.put(k, v)
+    }
+    ViewRegistry.TopicViewConfigs.fromMap(map).isPresent
   }
 
   /**

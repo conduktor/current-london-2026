@@ -93,6 +93,7 @@ import org.apache.kafka.server.share.context.{FinalContext, ShareSessionContext}
 import org.apache.kafka.server.share.session.{ShareSession, ShareSessionKey}
 import org.apache.kafka.server.storage.log.{FetchParams, FetchPartitionData}
 import org.apache.kafka.server.util.{FutureUtils, MockTime}
+import org.apache.kafka.server.views.ViewTopicConfig
 import org.apache.kafka.storage.internals.log.{AppendOrigin, LogConfig}
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats
 import org.junit.jupiter.api.Assertions._
@@ -2057,6 +2058,249 @@ class KafkaApisTest extends Logging {
         kafkaApis.close()
       }
     }
+  }
+
+  @Test
+  def testProduceToViewTopicIsRejected(): Unit = {
+    // PROMPT.md: "Produce to a view returns INVALID_REQUEST before the backing topic is resolved;
+    // views accept reads only." The rejection must happen at the handler entry point, before any
+    // resolution of the backing topic — we verify it by asserting replicaManager.handleProduceAppend
+    // is never invoked for the view-configured partition.
+    val viewTopic = "red-orders"
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, "orders-raw")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.color == 'red'")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+
+    addTopicToMetadataCache(viewTopic, numPartitions = 1)
+
+    val tp = new TopicPartition(viewTopic, 0)
+    val produceRequest = ProduceRequest.builder(new ProduceRequestData()
+      .setTopicData(new ProduceRequestData.TopicProduceDataCollection(
+        Collections.singletonList(new ProduceRequestData.TopicProduceData()
+          .setName(tp.topic).setPartitionData(Collections.singletonList(
+          new ProduceRequestData.PartitionProduceData()
+            .setIndex(tp.partition)
+            .setRecords(MemoryRecords.withRecords(Compression.NONE, new SimpleRecord("test".getBytes))))))
+          .iterator))
+      .setAcks(1.toShort)
+      .setTimeoutMs(5000))
+      .build(ApiKeys.PRODUCE.latestVersion)
+    val request = buildRequest(produceRequest)
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    kafkaApis = createKafkaApis(configRepository = configRepository)
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[ProduceResponse](request)
+    assertEquals(1, response.data.responses.size)
+    val partitionResponse = response.data.responses.asScala.head.partitionResponses.asScala.head
+    assertEquals(Errors.INVALID_REQUEST, Errors.forCode(partitionResponse.errorCode),
+      "produce to a view must be rejected with INVALID_REQUEST")
+    assertNotNull(partitionResponse.errorMessage,
+      "the rejection should carry a human-readable reason")
+
+    // The append must never reach replicaManager — that's what "before backing-topic resolution"
+    // means in practice. Any path that calls handleProduceAppend has already crossed the line we
+    // were told to draw.
+    verify(replicaManager, never()).handleProduceAppend(anyLong, anyShort, anyBoolean(),
+      any(), any(), any(), any(), any(), any(), any())
+  }
+
+  @Test
+  def testProduceToRegularTopicIsNotRejectedAsView(): Unit = {
+    // Counter-test for testProduceToViewTopicIsRejected: a regular topic (no view configs at all)
+    // must NOT be rejected. Guards against accidentally treating every topic with non-empty config
+    // as a view.
+    val topic = "regular"
+    addTopicToMetadataCache(topic, numPartitions = 1)
+
+    val tp = new TopicPartition(topic, 0)
+    val produceRequest = ProduceRequest.builder(new ProduceRequestData()
+      .setTopicData(new ProduceRequestData.TopicProduceDataCollection(
+        Collections.singletonList(new ProduceRequestData.TopicProduceData()
+          .setName(tp.topic).setPartitionData(Collections.singletonList(
+          new ProduceRequestData.PartitionProduceData()
+            .setIndex(tp.partition)
+            .setRecords(MemoryRecords.withRecords(Compression.NONE, new SimpleRecord("test".getBytes))))))
+          .iterator))
+      .setAcks(1.toShort)
+      .setTimeoutMs(5000))
+      .build(ApiKeys.PRODUCE.latestVersion)
+    val request = buildRequest(produceRequest)
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    // The regular topic must reach replicaManager — proves the view check does not over-match.
+    verify(replicaManager).handleProduceAppend(anyLong, anyShort, anyBoolean(), any(), any(),
+      any(), any(), any(), any(), any())
+  }
+
+  @Test
+  def testProduceToPartiallyConfiguredTopicIsNotRejected(): Unit = {
+    // A topic with only one of the three view configs set is NOT a view — the all-or-none rule
+    // (enforced by TopicViewConfigs.fromMap and LogConfig.validateValues) must hold here too. We
+    // assert that by feeding a half-configured topic and confirming the produce is forwarded to
+    // replicaManager.
+    val topic = "half-configured"
+    val configRepository = new MockConfigRepository()
+    // Only backing-topic set; no predicate, no offset mode.
+    configRepository.setTopicConfig(topic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, "raw")
+
+    addTopicToMetadataCache(topic, numPartitions = 1)
+
+    val tp = new TopicPartition(topic, 0)
+    val produceRequest = ProduceRequest.builder(new ProduceRequestData()
+      .setTopicData(new ProduceRequestData.TopicProduceDataCollection(
+        Collections.singletonList(new ProduceRequestData.TopicProduceData()
+          .setName(tp.topic).setPartitionData(Collections.singletonList(
+          new ProduceRequestData.PartitionProduceData()
+            .setIndex(tp.partition)
+            .setRecords(MemoryRecords.withRecords(Compression.NONE, new SimpleRecord("test".getBytes))))))
+          .iterator))
+      .setAcks(1.toShort)
+      .setTimeoutMs(5000))
+      .build(ApiKeys.PRODUCE.latestVersion)
+    val request = buildRequest(produceRequest)
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    kafkaApis = createKafkaApis(configRepository = configRepository)
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    verify(replicaManager).handleProduceAppend(anyLong, anyShort, anyBoolean(), any(), any(),
+      any(), any(), any(), any(), any())
+  }
+
+  @Test
+  def testProduceMixesViewAndRegularPartitionsInSameRequest(): Unit = {
+    // The interesting failure mode: a producer batches partitions across topics in a single
+    // request. The view partition must be rejected while the regular partition flows through to
+    // the replica manager untouched. This is the bug-prone case where a naive "fail the whole
+    // request on any view partition" would over-reject.
+    val viewTopic = "red-orders"
+    val regularTopic = "normal"
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, "orders-raw")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.color == 'red'")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+
+    addTopicToMetadataCache(viewTopic, numPartitions = 1)
+    addTopicToMetadataCache(regularTopic, numPartitions = 1)
+
+    val viewTp = new TopicPartition(viewTopic, 0)
+    val regularTp = new TopicPartition(regularTopic, 0)
+
+    val topicData = new ProduceRequestData.TopicProduceDataCollection()
+    topicData.add(new ProduceRequestData.TopicProduceData()
+      .setName(viewTp.topic).setPartitionData(Collections.singletonList(
+      new ProduceRequestData.PartitionProduceData()
+        .setIndex(viewTp.partition)
+        .setRecords(MemoryRecords.withRecords(Compression.NONE, new SimpleRecord("v".getBytes))))))
+    topicData.add(new ProduceRequestData.TopicProduceData()
+      .setName(regularTp.topic).setPartitionData(Collections.singletonList(
+      new ProduceRequestData.PartitionProduceData()
+        .setIndex(regularTp.partition)
+        .setRecords(MemoryRecords.withRecords(Compression.NONE, new SimpleRecord("r".getBytes))))))
+
+    val produceRequest = ProduceRequest.builder(new ProduceRequestData()
+      .setTopicData(topicData)
+      .setAcks(1.toShort)
+      .setTimeoutMs(5000))
+      .build(ApiKeys.PRODUCE.latestVersion)
+    val request = buildRequest(produceRequest)
+
+    val responseCallback: ArgumentCaptor[Map[TopicPartition, PartitionResponse] => Unit] =
+      ArgumentCaptor.forClass(classOf[Map[TopicPartition, PartitionResponse] => Unit])
+    when(replicaManager.handleProduceAppend(anyLong, anyShort, ArgumentMatchers.eq(false), any(),
+      any(), responseCallback.capture(), any(), any(), any(), any()))
+      .thenAnswer(_ => responseCallback.getValue.apply(Map(regularTp -> new PartitionResponse(Errors.NONE))))
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    kafkaApis = createKafkaApis(configRepository = configRepository)
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[ProduceResponse](request)
+    val byPartition = response.data.responses.asScala.flatMap { t =>
+      t.partitionResponses.asScala.map(p => new TopicPartition(t.name, p.index) -> p)
+    }.toMap
+
+    assertEquals(Errors.INVALID_REQUEST, Errors.forCode(byPartition(viewTp).errorCode),
+      "view partition must be rejected")
+    assertEquals(Errors.NONE, Errors.forCode(byPartition(regularTp).errorCode),
+      "regular partition in the same request must still succeed")
+  }
+
+  @Test
+  def testTransactionalProduceToViewTopicIsRejected(): Unit = {
+    // Transactional produces share the per-partition loop, so the rejection must still fire. We
+    // also assert handleProduceAppend is never called, proving the EOS state machine never even
+    // observed the view partition.
+    val viewTopic = "txn-view"
+    val txnId = "txn-1"
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, "orders-raw")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.x == 1")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+
+    addTopicToMetadataCache(viewTopic, numPartitions = 1)
+
+    val tp = new TopicPartition(viewTopic, 0)
+    val produceRequest = ProduceRequest.builder(new ProduceRequestData()
+      .setTopicData(new ProduceRequestData.TopicProduceDataCollection(
+        Collections.singletonList(new ProduceRequestData.TopicProduceData()
+          .setName(tp.topic).setPartitionData(Collections.singletonList(
+          new ProduceRequestData.PartitionProduceData()
+            .setIndex(tp.partition)
+            .setRecords(MemoryRecords.withTransactionalRecords(Compression.NONE, 0, 0, 0, new SimpleRecord("t".getBytes))))))
+          .iterator))
+      .setAcks(1.toShort)
+      .setTransactionalId(txnId)
+      .setTimeoutMs(5000))
+      .build(ApiKeys.PRODUCE.latestVersion)
+    val request = buildRequest(produceRequest)
+
+    // The transactional auth check runs first; allow it so the per-partition loop is reached.
+    val authorizer: Authorizer = mock(classOf[Authorizer])
+    when(authorizer.authorize(any[RequestContext], any[java.util.List[Action]]))
+      .thenAnswer(invocation => {
+        val actions = invocation.getArgument[java.util.List[Action]](1)
+        val results = new java.util.ArrayList[AuthorizationResult](actions.size)
+        actions.forEach(_ => results.add(AuthorizationResult.ALLOWED))
+        results
+      })
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    kafkaApis = createKafkaApis(authorizer = Some(authorizer), configRepository = configRepository)
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[ProduceResponse](request)
+    val partitionResponse = response.data.responses.asScala.head.partitionResponses.asScala.head
+    assertEquals(Errors.INVALID_REQUEST, Errors.forCode(partitionResponse.errorCode),
+      "transactional produce to a view must be rejected with INVALID_REQUEST")
+    verify(replicaManager, never()).handleProduceAppend(anyLong, anyShort, anyBoolean(),
+      any(), any(), any(), any(), any(), any(), any())
   }
 
   @Test
