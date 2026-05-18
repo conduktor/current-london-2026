@@ -40,6 +40,8 @@ import org.junit.jupiter.api.Test;
 import java.io.BufferedReader;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.net.Socket;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -1164,6 +1166,11 @@ class KafkaHttpServerIntegrationTest {
             "pre-servlet rejection body must not be HTML, got: " + body);
         assertFalse(body.contains("Jetty"),
             "pre-servlet rejection body must not leak the Jetty version string, got: " + body);
+        // The Server response header is the other half of the version-leak surface. Jetty's HttpConfiguration
+        // defaults emit "Server: Jetty(<version>)" on every response; sealing the body without sealing the
+        // header would leave the fingerprint trivially observable from any HEAD or curl -I against /v1.
+        assertNull(resp.getHeaders().get("Server"),
+            "Server response header must be suppressed, got: " + resp.getHeaders().get("Server"));
         JsonNode envelope = asJson(resp.getContent());
         assertEquals(404, envelope.get("errorCode").asInt(),
             "envelope errorCode must mirror HTTP status per the bridge contract");
@@ -1187,6 +1194,8 @@ class KafkaHttpServerIntegrationTest {
         String body = new String(resp.getContent(), StandardCharsets.UTF_8);
         assertFalse(body.contains("Jetty"),
             "root-path rejection body must not leak the Jetty version string, got: " + body);
+        assertNull(resp.getHeaders().get("Server"),
+            "Server response header must be suppressed on root probes, got: " + resp.getHeaders().get("Server"));
         JsonNode envelope = asJson(resp.getContent());
         assertEquals(404, envelope.get("errorCode").asInt());
         assertNotNull(envelope.get("errorMessage"));
@@ -1212,6 +1221,127 @@ class KafkaHttpServerIntegrationTest {
             "Accept: text/html must not unlock the HTML branch, got: " + body);
         assertFalse(body.contains("Jetty"),
             "Accept: text/html must not unlock the Jetty version leak, got: " + body);
+        assertNull(resp.getHeaders().get("Server"),
+            "Accept: text/html must not unlock the Server header leak, got: " + resp.getHeaders().get("Server"));
+    }
+
+    @Test
+    void happyPathResponseHasNoServerVersionHeader() throws Exception {
+        // The Server-header leak is observable on every response, not just errors — the most innocuous probe a curious
+        // operator could send (a HEAD on /v1) would otherwise expose the Jetty version. Pin the success path explicitly
+        // so a future HttpConfiguration regression cannot reintroduce the fingerprint on the happy branch only.
+        submitter.produceResult = new RequestSubmitter.ProduceResult(
+            Collections.singletonList(
+                new ProduceResponseFormatter.PartitionResult(0, 99L, Errors.NONE, null)),
+            0L);
+
+        ContentResponse resp = client.newRequest(url("/v1/topics/orders/records"))
+            .method(HttpMethod.POST)
+            .body(new StringRequestContent("application/json",
+                "{\"records\":[{\"partition\":0,\"value\":{\"type\":\"STRING\",\"data\":\"hi\"}}]}"))
+            .send();
+
+        assertEquals(200, resp.getStatus());
+        assertNull(resp.getHeaders().get("Server"),
+            "Server response header must be suppressed on success too, got: " + resp.getHeaders().get("Server"));
+        assertNull(resp.getHeaders().get("X-Powered-By"),
+            "X-Powered-By must be suppressed, got: " + resp.getHeaders().get("X-Powered-By"));
+    }
+
+    @Test
+    void preDispatchRejectionOnPutEmitsJsonEnvelope() throws Exception {
+        // Jetty's parent ErrorHandler.handle short-circuits via errorPageForMethod() — by default it only returns true
+        // for {GET, POST, HEAD} (ERROR_METHODS), so a PUT/DELETE/PATCH that triggers a pre-dispatch URI rejection
+        // (e.g. ambiguous %2F) gets an empty body. The HttpClient API will not send arbitrary methods on a path Jetty
+        // rejects before dispatch, so drive the wire directly with a raw socket: send "PUT /v1/topics/foo%2Fbar HTTP/1.1"
+        // and assert the response carries the bridge's JSON envelope rather than an empty 4xx body. This is the line
+        // CoreJsonErrorHandler.errorPageForMethod=true seals.
+        assertJsonEnvelopeOnPreDispatchRejection("PUT", "/v1/topics/foo%2Fbar/records");
+    }
+
+    @Test
+    void preDispatchRejectionOnDeleteEmitsJsonEnvelope() throws Exception {
+        assertJsonEnvelopeOnPreDispatchRejection("DELETE", "/v1/topics/foo%2Fbar/records");
+    }
+
+    @Test
+    void preDispatchRejectionOnPatchEmitsJsonEnvelope() throws Exception {
+        assertJsonEnvelopeOnPreDispatchRejection("PATCH", "/v1/topics/foo%2Fbar/records");
+    }
+
+    /**
+     * Drive a raw HTTP/1.1 request on a fresh socket and assert the response is the bridge's
+     * {@code {errorCode, errorMessage}} envelope rather than an empty body. The HttpClient used by the rest of these
+     * tests sanitises path and method at the API layer, so the pre-dispatch error pathway can only be exercised by
+     * speaking HTTP directly on the wire.
+     */
+    private void assertJsonEnvelopeOnPreDispatchRejection(String method, String path) throws Exception {
+        try (Socket s = new Socket("127.0.0.1", server.boundPort())) {
+            s.setSoTimeout(5000);
+            OutputStream out = s.getOutputStream();
+            String req = method + " " + path + " HTTP/1.1\r\n"
+                + "Host: 127.0.0.1\r\n"
+                + "Connection: close\r\n"
+                + "Content-Length: 0\r\n"
+                + "\r\n";
+            out.write(req.getBytes(StandardCharsets.US_ASCII));
+            out.flush();
+
+            String raw = readAllAscii(s.getInputStream());
+            // Status line: "HTTP/1.1 4xx ...". Ambiguous %2F triggers a 400 from Jetty's URI compliance check; we
+            // assert the family rather than the exact code to stay tolerant if Jetty narrows that to 404 in a future
+            // release — the contract is "JSON envelope on rejection", not "exactly 400".
+            assertTrue(raw.startsWith("HTTP/1.1 4"),
+                method + " " + path + " must produce a 4xx response, got status line: "
+                    + raw.split("\r\n", 2)[0]);
+            int headerEnd = raw.indexOf("\r\n\r\n");
+            assertTrue(headerEnd >= 0,
+                method + " " + path + " response must terminate its headers, got: " + raw);
+            String headers = raw.substring(0, headerEnd);
+            String body = raw.substring(headerEnd + 4);
+            assertFalse(body.isEmpty(),
+                method + " " + path + " must emit a JSON envelope body, got empty body. Headers: " + headers);
+            assertTrue(headers.toLowerCase(java.util.Locale.ROOT).contains("content-type: application/json"),
+                method + " " + path + " must declare application/json, got headers: " + headers);
+            // The body may be chunked; strip a leading hex chunk-size + CRLF if present so the JSON parser sees clean
+            // bytes. Anything between the headers and the JSON would otherwise corrupt the parse.
+            String json = stripChunkPrefix(body);
+            JsonNode envelope = asJson(json.getBytes(StandardCharsets.UTF_8));
+            assertNotNull(envelope.get("errorCode"),
+                method + " " + path + " envelope must include errorCode, got: " + json);
+            assertNotNull(envelope.get("errorMessage"),
+                method + " " + path + " envelope must include errorMessage, got: " + json);
+            assertFalse(headers.toLowerCase(java.util.Locale.ROOT).contains("server: jetty"),
+                method + " " + path + " must not leak the Jetty version header, got headers: " + headers);
+        }
+    }
+
+    private static String readAllAscii(InputStream in) throws Exception {
+        // Read until EOF; the request line above sends "Connection: close" so the server closes after the response.
+        java.io.ByteArrayOutputStream buf = new java.io.ByteArrayOutputStream();
+        byte[] tmp = new byte[1024];
+        int n;
+        while ((n = in.read(tmp)) > 0) {
+            buf.write(tmp, 0, n);
+        }
+        return buf.toString(StandardCharsets.UTF_8);
+    }
+
+    private static String stripChunkPrefix(String body) {
+        // Tolerate chunked transfer-encoding without pulling in a full HTTP/1.1 chunked decoder: if the first line of
+        // the body is a hex chunk size, drop it. The bridge envelope is small (<1 KiB) so a single chunk covers it
+        // and the trailing "0\r\n\r\n" terminator can be ignored by the JSON parser.
+        int eol = body.indexOf("\r\n");
+        if (eol > 0 && eol < 8) {
+            String head = body.substring(0, eol);
+            try {
+                Integer.parseInt(head.trim(), 16);
+                return body.substring(eol + 2);
+            } catch (NumberFormatException ignored) {
+                // not a chunk size; fall through
+            }
+        }
+        return body;
     }
 
     @Test

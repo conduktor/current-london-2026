@@ -24,6 +24,8 @@ import org.eclipse.jetty.ee10.servlet.ServletContextRequest;
 import org.eclipse.jetty.ee10.servlet.ServletHolder;
 import org.eclipse.jetty.ee10.websocket.server.config.JettyWebSocketServletContainerInitializer;
 import org.eclipse.jetty.http.HttpHeader;
+import org.eclipse.jetty.server.HttpConfiguration;
+import org.eclipse.jetty.server.HttpConnectionFactory;
 import org.eclipse.jetty.server.Request;
 import org.eclipse.jetty.server.Response;
 import org.eclipse.jetty.server.Server;
@@ -152,7 +154,14 @@ public final class KafkaHttpServer {
         // broker restarts. shutdownGraceMs == 0 keeps the legacy ungraceful behaviour, which the test harness
         // relies on for fast teardown.
         jetty.setStopTimeout(shutdownGraceMs);
-        ServerConnector connector = new ServerConnector(jetty);
+        // Suppress the "Server: Jetty(<version>)" and "X-Powered-By" response headers. Jetty's HttpConfiguration
+        // defaults emit the version on every response, which violates the bridge's no-fingerprint contract — the
+        // same contract the Server-level CoreJsonErrorHandler below was added to enforce for error bodies. Sealing
+        // the body without sealing the header would leave the leak fully open via a trivial HEAD on /v1.
+        HttpConfiguration httpConfig = new HttpConfiguration();
+        httpConfig.setSendServerVersion(false);
+        httpConfig.setSendXPoweredBy(false);
+        ServerConnector connector = new ServerConnector(jetty, new HttpConnectionFactory(httpConfig));
         connector.setHost(host);
         connector.setPort(port);
         jetty.addConnector(connector);
@@ -371,6 +380,20 @@ public final class KafkaHttpServer {
             setShowCauses(false);
             setShowMessageInTitle(false);
             setDefaultResponseMimeType(ContentTypeNegotiator.APPLICATION_JSON);
+        }
+
+        /**
+         * Jetty's parent {@code ErrorHandler.handle} consults {@code errorPageForMethod} before calling
+         * {@code generateResponse}; the default implementation returns true only for {@code {GET, POST, HEAD}} via a
+         * hardcoded {@code ERROR_METHODS} set, and any other method (PUT/DELETE/PATCH/OPTIONS/TRACE/CONNECT) is
+         * short-circuited to {@code callback.succeeded()} with no body. A {@code PUT /v1/topics/foo%2Fbar} that
+         * Jetty's URI compliance rejects pre-dispatch would emit an empty body, breaking the bridge's
+         * "every error response includes errorCode and errorMessage" contract for any non-{GET,POST,HEAD} caller.
+         * Returning true for every method routes all pre-dispatch rejections through {@link #generateResponse} below.
+         */
+        @Override
+        public boolean errorPageForMethod(String method) {
+            return true;
         }
 
         @Override
