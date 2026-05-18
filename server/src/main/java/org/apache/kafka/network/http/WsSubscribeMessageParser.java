@@ -54,7 +54,12 @@ public final class WsSubscribeMessageParser {
         try {
             root = MAPPER.readTree(json);
         } catch (JsonProcessingException e) {
-            throw new BadMessageException("message is not valid JSON: " + e.getOriginalMessage(), e);
+            // Same defect class as the produce-body parse-error sanitisation: the BadMessageException reason text
+            // reaches the wire (via KafkaWebSocketEndpoint.closeWithProtocolError → close frame + error envelope),
+            // and Jackson's getOriginalMessage() exposes byte offsets / a snippet of the malformed input. Keep the
+            // wire-side phrase fixed; the full Jackson diagnostic is captured server-side by the endpoint's debug
+            // log line on BadMessageException.
+            throw new BadMessageException("message is not valid JSON", e);
         }
         if (root == null || !root.isObject()) {
             throw new BadMessageException("message must be a JSON object");

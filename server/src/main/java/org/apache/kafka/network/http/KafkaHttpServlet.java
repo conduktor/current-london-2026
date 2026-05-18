@@ -101,7 +101,12 @@ public final class KafkaHttpServlet extends HttpServlet {
             metrics.recordRequest(HttpBridgeMetrics.Operation.PRODUCE, elapsedMs(startNanos), HttpStatusMapper.PAYLOAD_TOO_LARGE);
             return;
         } catch (JsonProcessingException e) {
-            writeBadRequest(resp, "body is not valid JSON: " + e.getOriginalMessage());
+            // Log the parser's diagnostic server-side; never echo it to the client. Jackson's getOriginalMessage()
+            // reveals byte offsets, snippet of input, and the parse rule that tripped — not a leak on the level of
+            // an NPE class/field name, but the same defect class. A fixed generic phrase keeps the error envelope
+            // shape stable across parse-failure modes.
+            LOG.debug("rejected produce request with malformed JSON body", e);
+            writeBadRequest(resp, "body is not valid JSON");
             metrics.recordRequest(HttpBridgeMetrics.Operation.PRODUCE, elapsedMs(startNanos), HttpStatusMapper.BAD_REQUEST);
             return;
         } catch (IOException e) {
@@ -113,7 +118,12 @@ public final class KafkaHttpServlet extends HttpServlet {
                 metrics.recordRequest(HttpBridgeMetrics.Operation.PRODUCE, elapsedMs(startNanos), HttpStatusMapper.PAYLOAD_TOO_LARGE);
                 return;
             }
-            writeBadRequest(resp, "could not read request body: " + e.getMessage());
+            // Anything else (Jetty's BadMessageException for malformed chunked transfer, oversized headers, ...) is
+            // logged server-side but reported to the client as a fixed phrase. e.getMessage() on these throwables
+            // can disclose Jetty internals and partial request state — same defect class as the NPE-text leak that
+            // Fix #4 plugged on the 500 path.
+            LOG.warn("HTTP bridge failed to read produce request body", e);
+            writeBadRequest(resp, "could not read request body");
             metrics.recordRequest(HttpBridgeMetrics.Operation.PRODUCE, elapsedMs(startNanos), HttpStatusMapper.BAD_REQUEST);
             return;
         }
