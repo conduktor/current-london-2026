@@ -438,6 +438,72 @@ class HttpBridgeEndToEndTest {
     }
   }
 
+  @Test
+  def aclDeniedFetchReturns403(): Unit = {
+    // PROMPT.md FS4 (fetch side): a GET on a topic where the ANONYMOUS principal lacks READ must return 403 with the
+    // standard error envelope. Mirrors aclDeniedTopicReturns403 (which covers the WRITE-deny path on POST) but
+    // exercises a separate code path inside KafkaApis (handleFetchRequest's authHelper.filterByAuthorized → per-
+    // partition TOPIC_AUTHORIZATION_FAILED on the FetchResponse). The fetch-side authorizer leaves WRITE allowed so we
+    // can seed a record before asserting the deny.
+    val deniedTopic = HttpBridgeEndToEndTest.DenyAnonymousFetchAuthorizer.DeniedTopic
+    val cluster = new KafkaClusterTestKit.Builder(
+      new TestKitNodes.Builder()
+        .setNumBrokerNodes(1)
+        .setNumControllerNodes(1)
+        .build())
+      .setConfigProp(SocketServerConfigs.HTTP_BRIDGE_ENABLED_CONFIG, "true")
+      .setConfigProp(SocketServerConfigs.HTTP_BRIDGE_HOST_CONFIG, "127.0.0.1")
+      .setConfigProp(SocketServerConfigs.HTTP_BRIDGE_PORT_CONFIG, "0")
+      .setConfigProp(ServerConfigs.AUTHORIZER_CLASS_NAME_CONFIG,
+        classOf[HttpBridgeEndToEndTest.DenyAnonymousFetchAuthorizer].getName)
+      .setConfigProp(StandardAuthorizer.SUPER_USERS_CONFIG, "User:ANONYMOUS")
+      .build()
+    try {
+      cluster.format()
+      cluster.startup()
+      cluster.waitForReadyBrokers()
+
+      val broker = cluster.brokers().get(0)
+      TestUtils.waitUntilTrue(() => broker.brokerState == BrokerState.RUNNING, "Broker never reached RUNNING.")
+      TestUtils.waitUntilTrue(() => broker.httpBridgeServer != null && broker.httpBridgeServer.boundPort() > 0,
+        "HTTP bridge never bound its port.")
+      val bridgePort = broker.httpBridgeServer.boundPort()
+
+      createTopic(cluster, deniedTopic, partitions = 1)
+
+      // Seed a record — WRITE is allowed for the test topic; only READ is denied. We seed through the HTTP bridge for
+      // consistency with the rest of the file (and because that path is already proven to work in
+      // producedRecordIsVisibleViaHttpFetchAndBinaryConsumer).
+      val seedBody =
+        s"""
+           |{ "records": [ { "partition": 0, "value": { "type": "STRING", "data": "seed" } } ] }
+           |""".stripMargin
+      val seedResp = postJson(s"http://127.0.0.1:$bridgePort/v1/topics/$deniedTopic/records", seedBody)
+      assertEquals(200, seedResp.statusCode(),
+        s"seed produce must succeed when only READ is denied, body=${seedResp.body()}")
+
+      // The denied fetch: per-partition TOPIC_AUTHORIZATION_FAILED in the FetchResponse collapses to HTTP 403.
+      val fetchResp = httpGet(s"http://127.0.0.1:$bridgePort/v1/topics/$deniedTopic/records?partition=0&offset=0")
+      assertEquals(403, fetchResp.statusCode(),
+        s"ACL deny on READ must surface HTTP 403; got status=${fetchResp.statusCode()}, body=${fetchResp.body()}")
+      // PROMPT.md AC7: 403 must NOT carry Retry-After — that header is reserved for 503 / 504 / throttle paths.
+      assertNull(fetchResp.headers().firstValue("Retry-After").orElse(null),
+        s"403 must not carry Retry-After, headers=${fetchResp.headers().map()}")
+      val errJson = parseJson(fetchResp.body())
+      // Error envelope: {errorCode, errorMessage, topic, partition}. errorCode 29 = TOPIC_AUTHORIZATION_FAILED.
+      assertEquals(29, errJson.get("errorCode").asInt(),
+        s"errorCode must be 29 = TOPIC_AUTHORIZATION_FAILED, body=${fetchResp.body()}")
+      assertFalse(errJson.get("errorMessage").isNull,
+        s"errorMessage is mandatory on every error response, body=${fetchResp.body()}")
+      assertEquals(deniedTopic, errJson.get("topic").asText(),
+        s"error body must keep the topic context, body=${fetchResp.body()}")
+      assertEquals(0, errJson.get("partition").asInt(),
+        s"error body must name the partition that was denied, body=${fetchResp.body()}")
+    } finally {
+      cluster.close()
+    }
+  }
+
   // ----- helpers -------------------------------------------------------------------------------------------------
 
   private def createTopic(cluster: KafkaClusterTestKit, name: String, partitions: Int): Unit = {
@@ -541,5 +607,41 @@ object HttpBridgeEndToEndTest {
 
   object DenyAnonymousAuthorizer {
     val DeniedTopic = "http-bridge-acl-deny"
+  }
+
+  /**
+   * Sibling of [[DenyAnonymousAuthorizer]] for the fetch-side ACL test: same shape but denies READ on the test topic
+   * instead of WRITE. The override returns ALLOWED/DENIED directly (it does not call {@code super.authorize}); the
+   * {@code super.users=User:ANONYMOUS} the test sets is a safety belt for any code path that consults the super-user
+   * list outside this method (e.g. internal controller bootstrap), not the mechanism by which non-target actions are
+   * permitted here. We keep this as a separate class rather than parameterising the existing authorizer because each
+   * test names its own AUTHORIZER_CLASS_NAME_CONFIG and the topic + operation are intrinsically linked, so
+   * parameterisation would cost a config-prop trip without saving any code.
+   */
+  class DenyAnonymousFetchAuthorizer extends StandardAuthorizer {
+    override def authorize(
+      requestContext: AuthorizableRequestContext,
+      actions: util.List[Action]
+    ): util.List[AuthorizationResult] = {
+      val anonymous = requestContext.principal() == KafkaPrincipal.ANONYMOUS
+      val results = new util.ArrayList[AuthorizationResult](actions.size())
+      val it = actions.iterator()
+      while (it.hasNext) {
+        val a = it.next()
+        if (anonymous
+            && a.resourcePattern().resourceType() == ResourceType.TOPIC
+            && a.resourcePattern().name() == DenyAnonymousFetchAuthorizer.DeniedTopic
+            && a.operation() == AclOperation.READ) {
+          results.add(AuthorizationResult.DENIED)
+        } else {
+          results.add(AuthorizationResult.ALLOWED)
+        }
+      }
+      results
+    }
+  }
+
+  object DenyAnonymousFetchAuthorizer {
+    val DeniedTopic = "http-bridge-acl-fetch-deny"
   }
 }
