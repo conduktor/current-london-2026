@@ -17,6 +17,7 @@
 package org.apache.kafka.server.rules.json;
 
 import org.apache.kafka.common.protocol.ApiKeys;
+import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.server.rules.Rule;
 import org.apache.kafka.server.rules.RuleAction;
 
@@ -261,14 +262,57 @@ public class RuleJsonCodecTest {
     }
 
     @Test
-    public void errorCodeAtShortMaxAccepted() {
-        // Boundary: Short.MAX_VALUE (32767) is the largest expressible code,
-        // so it must round-trip cleanly even though Kafka's currently-assigned
-        // Errors codes top out well below that.
+    public void errorCodeAtHighestKnownErrorAccepted() {
+        // Boundary: the highest currently-assigned Errors code must round-trip
+        // cleanly. Before round-8 task #96 the codec accepted any int in
+        // [1, Short.MAX_VALUE] — including codes that mapped to nothing on
+        // the wire — so this test used Short.MAX_VALUE (32767). The new
+        // contract is "must be a known Errors enum value", so we use the
+        // top-end known code. If Kafka adds a new Errors entry above this
+        // and this test starts failing, update to the new highest — the
+        // intent is to pin the boundary, not freeze a specific number.
         String json = "{\"apiKeys\":[\"METADATA\"],\"action\":\"DENY\","
-            + "\"when\":\"true\",\"errorCode\":32767}";
+            + "\"when\":\"true\",\"errorCode\":" + Errors.REBOOTSTRAP_REQUIRED.code() + "}";
         Rule r = RuleJsonCodec.decode("k", json.getBytes(StandardCharsets.UTF_8));
-        assertEquals(Short.MAX_VALUE, r.errorCode());
+        assertEquals(Errors.REBOOTSTRAP_REQUIRED.code(), r.errorCode());
+    }
+
+    @Test
+    public void errorCodeAboveHighestKnownButInShortRangeRejected() {
+        // Round-8 task #96: an errorCode in the wire-protocol range
+        // [1, Short.MAX_VALUE] that does NOT correspond to any known
+        // Errors enum value must be rejected at parse time. Without this
+        // check, Errors.forCode((short) 999) folds the value to
+        // UNKNOWN_SERVER_ERROR on the wire — the rule fires but clients
+        // see a generic server error instead of the operator's intent.
+        // The operator typo is invisible until traffic hits a denial.
+        String json = "{\"apiKeys\":[\"METADATA\"],\"action\":\"DENY\","
+            + "\"when\":\"true\",\"errorCode\":999}";
+        RuleEnvelopeException ex = assertThrows(RuleEnvelopeException.class,
+            () -> RuleJsonCodec.decode("k", json.getBytes(StandardCharsets.UTF_8)));
+        assertTrue(ex.getMessage().contains("999"),
+            "error must name the offending value: " + ex.getMessage());
+        assertTrue(ex.getMessage().contains("UNKNOWN_SERVER_ERROR"),
+            "error must explain the fallback the operator would otherwise see "
+                + "on the wire: " + ex.getMessage());
+    }
+
+    @Test
+    public void errorCodeJustAboveHighestKnownRejected() {
+        // Round-8 task #96 boundary: REBOOTSTRAP_REQUIRED is currently the
+        // highest assigned Errors code (129). The next int up — 130 — is
+        // still inside the wire-protocol range bound and would have been
+        // accepted before the known-code check. Pin that the very next
+        // step above the known range is rejected; this is the most likely
+        // operator typo shape ("I picked an error code one greater than
+        // the latest one I saw in the docs").
+        int oneAboveHighestKnown = Errors.REBOOTSTRAP_REQUIRED.code() + 1;
+        String json = "{\"apiKeys\":[\"METADATA\"],\"action\":\"DENY\","
+            + "\"when\":\"true\",\"errorCode\":" + oneAboveHighestKnown + "}";
+        RuleEnvelopeException ex = assertThrows(RuleEnvelopeException.class,
+            () -> RuleJsonCodec.decode("k", json.getBytes(StandardCharsets.UTF_8)));
+        assertTrue(ex.getMessage().contains(String.valueOf(oneAboveHighestKnown)),
+            "error must name the offending value: " + ex.getMessage());
     }
 
     @Test

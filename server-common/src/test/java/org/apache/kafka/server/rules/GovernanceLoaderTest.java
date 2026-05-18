@@ -293,6 +293,9 @@ public class GovernanceLoaderTest {
         RuleEngine engine = new RuleEngine();
         GovernanceLoader loader = new GovernanceLoader(engine);
         ApiKeys[] keys = denyTargetableApiKeys();
+        // 1 + (i % 100) generates codes in [1, 100], all of which are
+        // currently-assigned Errors enum values (the codec rejects unknown
+        // codes per round-8 task #96).
         for (int i = 0; i < RuleSetBuilder.MAX_RULES; i++) {
             loader.apply("r-" + i, envelope("true", keys[i % keys.length], 1 + (i % 100)));
         }
@@ -306,20 +309,22 @@ public class GovernanceLoaderTest {
         // update lands on the same api key where r-0 originally lived.
         ApiKeys k0 = keys[0];
         loader.apply("r-overflow", envelope("true", k0, 42));
-        loader.apply("r-0", envelope("true", k0, 999));
+        loader.apply("r-0", envelope("true", k0, 129));
         loader.commit();
         RuleSet afterOverflow = engine.active();
         assertEquals(RuleSetBuilder.MAX_RULES, afterOverflow.size(),
             "overflow record must not have landed");
-        // 'r-0' was updated to errorCode 999; verify the in-place update
-        // still works at the cap (evaluate against the api key where r-0
-        // lives — keys[0]).
+        // 'r-0' was updated to errorCode 129 (REBOOTSTRAP_REQUIRED — a
+        // known Errors code that is distinct from r-0's original code so
+        // the in-place update is observable); verify the update still works
+        // at the cap (evaluate against the api key where r-0 lives —
+        // keys[0]).
         RuleDecision d = engine.evaluate(
             k0, "client", false, Collections::emptyMap);
         assertTrue(d.denied(), "engine must still be denying via the cap'd set");
         assertEquals("r-0", d.denyingRuleId(),
             "updated r-0 must still be first in declared order");
-        assertEquals(999, d.errorCode(),
+        assertEquals(129, d.errorCode(),
             "in-place update at the cap must take effect");
     }
 
@@ -369,6 +374,7 @@ public class GovernanceLoaderTest {
         // the per-api-key cap); FORBIDDEN_TARGETS are skipped because the
         // codec rejects them at intake.
         ApiKeys[] keys = denyTargetableApiKeys();
+        // 1 + (i % 100) generates codes in [1, 100], all known Errors codes.
         for (int i = 0; i < RuleSetBuilder.MAX_RULES; i++) {
             assertTrue(
                 loader.apply("cap-" + i, envelope("true", keys[i % keys.length], 1 + (i % 100))),

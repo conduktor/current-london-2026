@@ -17,6 +17,7 @@
 package org.apache.kafka.server.rules.json;
 
 import org.apache.kafka.common.protocol.ApiKeys;
+import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.server.rules.Rule;
 import org.apache.kafka.server.rules.RuleAction;
 import org.apache.kafka.server.rules.cel.CelCompilationException;
@@ -320,6 +321,20 @@ public final class RuleJsonCodec {
      *   <li>Codes above {@link Short#MAX_VALUE} cannot be expressed on the wire
      *       at all, so the narrowing to short would silently mis-map them.</li>
      * </ul>
+     *
+     * <p>The value must also map to a known {@link Errors} enum constant — see
+     * the round-8 audit's "validate errorCode against the allowed Errors set"
+     * finding. Kafka has no runtime per-API allowed-errors registry (the
+     * api-key → errors mapping lives only in the response message-spec JSON
+     * files as comments), so a literal per-API check would require pinning the
+     * engine to a specific Kafka version. The achievable subset is the
+     * Errors-known check: an envelope with {@code "errorCode": 999} would
+     * otherwise satisfy the range bound but {@link Errors#forCode} silently
+     * folds it to {@link Errors#UNKNOWN_SERVER_ERROR} on the wire — the rule
+     * fires but the client sees a generic server error rather than the
+     * operator's intended denial code. Rejecting unknown codes at load time
+     * surfaces the operator typo at rule-publish time rather than at
+     * request-time on the broker.
      */
     private static int parseErrorCode(JsonNode n) {
         if (n == null || !n.isInt()) {
@@ -330,6 +345,22 @@ public final class RuleJsonCodec {
             throw new RuleEnvelopeException(
                 "'" + FIELD_ERROR_CODE + "' must be in [1, " + Short.MAX_VALUE
                     + "] (Kafka wire-protocol short error code; 0 is Errors.NONE), got " + code);
+        }
+        // Errors.forCode returns UNKNOWN_SERVER_ERROR (code -1) for unknown
+        // codes — equality on the returned enum's code() is the precise
+        // "known to Kafka" check that survives any future Errors enum
+        // re-ordering or addition. We deliberately do not let the equality
+        // pass through for UNKNOWN_SERVER_ERROR itself: its code is -1 which
+        // the range bound above has already rejected, so an operator cannot
+        // accidentally end up here with code == -1.
+        Errors mapped = Errors.forCode((short) code);
+        if (mapped.code() != code) {
+            throw new RuleEnvelopeException(
+                "'" + FIELD_ERROR_CODE + "' " + code + " is not a known Kafka "
+                    + "error code (Errors.forCode(" + code + ") returns "
+                    + mapped.name() + " by fallback). Pick a code from "
+                    + "org.apache.kafka.common.protocol.Errors that matches "
+                    + "the denial you want clients to see.");
         }
         return code;
     }
