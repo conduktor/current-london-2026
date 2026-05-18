@@ -108,7 +108,35 @@ class KafkaApis(val requestChannel: RequestChannel,
                 val tokenManager: DelegationTokenManager,
                 val apiVersionManager: ApiVersionManager,
                 val clientMetricsManager: ClientMetricsManager,
-                val ruleEngine: RuleEngine = new RuleEngine()
+                // Round-15 Walker HIGH H2 sibling fix (Request-path HIGH-2):
+                // NO default value. Pre-round-15 this read
+                //   val ruleEngine: RuleEngine = new RuleEngine()
+                // which silently fell back to a fresh, EMPTY RuleEngine on
+                // any call site that omitted the argument — the empty
+                // engine has no rules, so RuleEngine.mayDeny always returns
+                // false, no DENY ever fires, and the entire CEL governance
+                // surface is silently fail-OPEN.
+                //
+                // Production wiring (BrokerServer.scala) and the lone test
+                // fixture (KafkaApisTest.scala) both pass `ruleEngine`
+                // explicitly today, so the default was unreachable in
+                // practice — but it survived as a latent footgun. A future
+                // refactor that splits/renames the constructor, a new test
+                // helper that forgets to plumb the engine through, or a
+                // copy-paste of the construction site for a controller-
+                // resident handler would all silently disable governance
+                // for that path. Removing the default forces the compiler
+                // to flag the missing argument, surfacing the wiring gap
+                // instead of letting governance silently fail-OPEN.
+                //
+                // If a future caller genuinely needs a no-op engine (e.g. a
+                // test that exercises NON-governance code paths and doesn't
+                // want governance noise), it should construct
+                //   new RuleEngine()
+                // at the call site explicitly. The explicitness keeps the
+                // "this code path bypasses governance" decision visible at
+                // the construction site, not buried in a default value.
+                val ruleEngine: RuleEngine
 ) extends ApiRequestHandler with Logging {
 
   type FetchResponseStats = Map[TopicPartition, RecordValidationStats]
