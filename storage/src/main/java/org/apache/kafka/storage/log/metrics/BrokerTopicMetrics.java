@@ -50,6 +50,7 @@ public final class BrokerTopicMetrics {
     public static final String INVALID_MAGIC_NUMBER_RECORDS_PER_SEC = "InvalidMagicNumberRecordsPerSec";
     public static final String INVALID_MESSAGE_CRC_RECORDS_PER_SEC = "InvalidMessageCrcRecordsPerSec";
     public static final String INVALID_OFFSET_OR_SEQUENCE_RECORDS_PER_SEC = "InvalidOffsetOrSequenceRecordsPerSec";
+    public static final String BATCHES_REJECTED_BY_COMPRESSION_POLICY_PER_SEC = "BatchesRejectedByCompressionPolicyPerSec";
 
     // KAFKA-16972: BrokerTopicMetrics is migrated from "kafka.server" package.
     // For backward compatibility, we keep the old package name as metric group name.
@@ -83,6 +84,7 @@ public final class BrokerTopicMetrics {
         metricTypeMap.put(INVALID_MAGIC_NUMBER_RECORDS_PER_SEC, new MeterWrapper(INVALID_MAGIC_NUMBER_RECORDS_PER_SEC, "requests"));
         metricTypeMap.put(INVALID_MESSAGE_CRC_RECORDS_PER_SEC, new MeterWrapper(INVALID_MESSAGE_CRC_RECORDS_PER_SEC, "requests"));
         metricTypeMap.put(INVALID_OFFSET_OR_SEQUENCE_RECORDS_PER_SEC, new MeterWrapper(INVALID_OFFSET_OR_SEQUENCE_RECORDS_PER_SEC, "requests"));
+        metricTypeMap.put(BATCHES_REJECTED_BY_COMPRESSION_POLICY_PER_SEC, new MeterWrapper(BATCHES_REJECTED_BY_COMPRESSION_POLICY_PER_SEC, "batches"));
 
         if (!name.isPresent()) {
             metricTypeMap.put(REPLICATION_BYTES_IN_PER_SEC, new MeterWrapper(REPLICATION_BYTES_IN_PER_SEC, "bytes"));
@@ -220,6 +222,10 @@ public final class BrokerTopicMetrics {
 
     public Meter invalidOffsetOrSequenceRecordsPerSec() {
         return metricTypeMap.get(INVALID_OFFSET_OR_SEQUENCE_RECORDS_PER_SEC).meter();
+    }
+
+    public Meter batchesRejectedByCompressionPolicyRate() {
+        return metricTypeMap.get(BATCHES_REJECTED_BY_COMPRESSION_POLICY_PER_SEC).meter();
     }
 
     public GaugeWrapper remoteCopyLagBytesAggrMetric() {

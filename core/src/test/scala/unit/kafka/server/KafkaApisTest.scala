@@ -2556,6 +2556,80 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testCompressionPolicyRejectionIncrementsPerTopicAndAllTopicsMeter(): Unit = {
+    // Pins the broker-side observability for batches rejected by compression.policy:
+    // a rejection must mark BOTH the per-topic and the all-topics
+    // BatchesRejectedByCompressionPolicyPerSec meter exactly once per offending batch.
+    val topic = "topic"
+    addTopicToMetadataCache(topic, numPartitions = 1)
+    val tp = new TopicPartition(topic, 0)
+
+    when(replicaManager.compressionPolicy(ArgumentMatchers.eq(tp)))
+      .thenReturn(CompressionPolicy.REQUIRED)
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](), any[Long])).thenReturn(0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val perTopicMeter = brokerTopicStats.topicStats(topic).batchesRejectedByCompressionPolicyRate
+    val allTopicsMeter = brokerTopicStats.allTopicsStats.batchesRejectedByCompressionPolicyRate
+    val perTopicBefore = perTopicMeter.count
+    val allTopicsBefore = allTopicsMeter.count
+
+    val produceRequest = buildSingleTopicProduceRequest(tp,
+      MemoryRecords.withRecords(Compression.NONE, new SimpleRecord("v".getBytes)),
+      ApiKeys.PRODUCE.latestVersion)
+    val request = buildRequest(produceRequest)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[ProduceResponse](request)
+    val partitionResponse = response.data.responses.asScala.head.partitionResponses.asScala.head
+    assertEquals(Errors.INVALID_RECORD, Errors.forCode(partitionResponse.errorCode))
+    assertEquals(perTopicBefore + 1, perTopicMeter.count,
+      "per-topic BatchesRejectedByCompressionPolicyPerSec must increment on rejection")
+    assertEquals(allTopicsBefore + 1, allTopicsMeter.count,
+      "all-topics BatchesRejectedByCompressionPolicyPerSec must increment on rejection")
+  }
+
+  @Test
+  def testCompressionPolicyAcceptanceDoesNotIncrementRejectionMeter(): Unit = {
+    // A compressed batch on a REQUIRED topic flows through unchanged; the rejection meter
+    // must stay flat. Pins that the mark() lives strictly on the failure branch.
+    val topic = "topic"
+    addTopicToMetadataCache(topic, numPartitions = 1)
+    val tp = new TopicPartition(topic, 0)
+
+    when(replicaManager.compressionPolicy(ArgumentMatchers.eq(tp)))
+      .thenReturn(CompressionPolicy.REQUIRED)
+    val responseCallback: ArgumentCaptor[Map[TopicPartition, PartitionResponse] => Unit] =
+      ArgumentCaptor.forClass(classOf[Map[TopicPartition, PartitionResponse] => Unit])
+    when(replicaManager.handleProduceAppend(anyLong, anyShort, ArgumentMatchers.eq(false), any(), any(),
+      responseCallback.capture(), any(), any(), any(), any())
+    ).thenAnswer(_ => responseCallback.getValue.apply(Map(tp -> new PartitionResponse(Errors.NONE))))
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](), any[Long])).thenReturn(0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val perTopicMeter = brokerTopicStats.topicStats(topic).batchesRejectedByCompressionPolicyRate
+    val allTopicsMeter = brokerTopicStats.allTopicsStats.batchesRejectedByCompressionPolicyRate
+    val perTopicBefore = perTopicMeter.count
+    val allTopicsBefore = allTopicsMeter.count
+
+    val produceRequest = buildSingleTopicProduceRequest(tp,
+      MemoryRecords.withRecords(Compression.lz4().build(), new SimpleRecord("v".getBytes)),
+      ApiKeys.PRODUCE.latestVersion)
+    val request = buildRequest(produceRequest)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[ProduceResponse](request)
+    val partitionResponse = response.data.responses.asScala.head.partitionResponses.asScala.head
+    assertEquals(Errors.NONE, Errors.forCode(partitionResponse.errorCode))
+    assertEquals(perTopicBefore, perTopicMeter.count,
+      "per-topic rejection meter must NOT increment when the batch satisfies the policy")
+    assertEquals(allTopicsBefore, allTopicsMeter.count,
+      "all-topics rejection meter must NOT increment when the batch satisfies the policy")
+  }
+
+  @Test
   def testAddPartitionsToTxnWithInvalidPartition(): Unit = {
     val topic = "topic"
     addTopicToMetadataCache(topic, numPartitions = 1)

@@ -543,6 +543,8 @@ class KafkaApis(val requestChannel: RequestChannel,
     while (batchIter.hasNext) {
       val batch = batchIter.next()
       if (policy.isViolatedBy(batch.compressionType)) {
+        brokerTopicStats.topicStats(topicPartition.topic).batchesRejectedByCompressionPolicyRate.mark()
+        brokerTopicStats.allTopicsStats.batchesRejectedByCompressionPolicyRate.mark()
         throw new InvalidRecordException(
           s"Produce to $topicPartition was rejected by compression.policy=${policy.value}: " +
           s"batch has compression.type=${batch.compressionType.name} but the topic requires compressed batches.")
