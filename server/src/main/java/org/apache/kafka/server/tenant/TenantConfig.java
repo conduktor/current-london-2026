@@ -23,6 +23,7 @@ import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * Broker-wide view of which listeners are bound to which tenant id. Built once
@@ -98,5 +99,16 @@ public final class TenantConfig {
 
     public boolean isEmpty() {
         return bindingsByListener.isEmpty();
+    }
+
+    /**
+     * Every tenant id with at least one listener binding on this broker. Used by
+     * cluster-wide handlers to refuse requests that would create or address
+     * resources in a known tenant's namespace from an unbound listener — the
+     * "outside-in pollution" trap a super-user on an open listener could
+     * otherwise drop topics into.
+     */
+    public Set<String> allTenants() {
+        return Set.copyOf(bindingsByListener.values());
     }
 }

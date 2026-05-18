@@ -226,7 +226,58 @@ class KafkaApis(val requestChannel: RequestChannel,
       return
     }
     if (!ctx.effectiveTenant.isPresent) {
-      forwardToController(request)
+      // Outside-in pollution guard. A privileged caller on an unbound listener
+      // could otherwise CreateTopics("acme.foo") literally; tenant acme on its
+      // own listener would then see `foo` in ListTopics because the broker
+      // cannot tell intent apart from prefix. Reject any topic name beginning
+      // with `<knownTenantId>.` (for any configured tenant) at the broker so
+      // the controller never sees the tenant-prefixed name. Internal topics
+      // are exempt — they are never tenant-namespaced.
+      val knownTenants = tenantConfig.allTenants
+      if (knownTenants.isEmpty) {
+        forwardToController(request)
+        return
+      }
+      val createReq = request.body[CreateTopicsRequest]
+      val pollutionRejected = new util.ArrayList[CreateTopicsResponseData.CreatableTopicResult]()
+      val forwardable = new CreateTopicsRequestData.CreatableTopicCollection(createReq.data.topics.size)
+      createReq.data.topics.forEach { t =>
+        val name = t.name
+        val pollutes = name != null && !Topic.isInternal(name) &&
+          knownTenants.asScala.exists(id => name.startsWith(id + "."))
+        if (pollutes) {
+          pollutionRejected.add(new CreateTopicsResponseData.CreatableTopicResult()
+            .setName(name)
+            .setErrorCode(Errors.INVALID_TOPIC_EXCEPTION.code)
+            .setErrorMessage("Topic name '" + name + "' is reserved (tenant namespace prefix)"))
+        } else {
+          forwardable.add(t.duplicate())
+        }
+      }
+      if (pollutionRejected.isEmpty) {
+        forwardToController(request)
+        return
+      }
+      if (forwardable.isEmpty) {
+        val responses = new CreateTopicsResponseData.CreatableTopicResultCollection(pollutionRejected.size)
+        pollutionRejected.forEach(r => responses.add(r))
+        requestChannel.sendResponse(request,
+          new CreateTopicsResponse(new CreateTopicsResponseData().setTopics(responses)), None)
+        return
+      }
+      createReq.data.setTopics(forwardable)
+      forwardingManager.forwardRequest(request, createReq, {
+        case Some(resp: CreateTopicsResponse) =>
+          val merged = new CreateTopicsResponseData.CreatableTopicResultCollection(
+            resp.data.topics.size + pollutionRejected.size)
+          pollutionRejected.forEach(r => merged.add(r))
+          resp.data.topics.forEach(r => merged.add(r.duplicate()))
+          resp.data.setTopics(merged)
+          requestHelper.sendForwardedResponse(request, resp)
+        case Some(other) =>
+          requestHelper.sendForwardedResponse(request, other)
+        case None => handleInvalidVersionsDuringForwarding(request)
+      })
       return
     }
     val createReq = request.body[CreateTopicsRequest]

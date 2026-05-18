@@ -11892,6 +11892,124 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testCreateTopicsClusterWideListenerRejectsTenantPrefixedNames(): Unit = {
+    // Outside-in pollution: a super-user on the cluster-wide (non-tenant)
+    // listener could otherwise CreateTopics("acme.foo") literally; tenant acme
+    // on its own listener would then see `foo` in ListTopics because the broker
+    // cannot tell intent apart from prefix. The broker refuses the entry at
+    // the dispatch layer so the controller never materialises the topic.
+    val createRequest = new CreateTopicsRequest.Builder(new CreateTopicsRequestData()
+      .setTopics(new CreateTopicsRequestData.CreatableTopicCollection(
+        Collections.singleton(new CreateTopicsRequestData.CreatableTopic()
+          .setName("acme.foo").setNumPartitions(1).setReplicationFactor(1.toShort)).iterator)))
+      .build()
+    val request = buildRequest(createRequest)
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleCreateTopicsRequest(request)
+
+    val response = verifyNoThrottling[CreateTopicsResponse](request)
+    val result = response.data.topics.asScala.head
+    assertEquals("acme.foo", result.name,
+      "rejection must keep the wire name the cluster-wide caller sent")
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, result.errorCode,
+      "tenant-prefixed name from a non-tenant listener must be refused")
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[AbstractRequest](), any[Option[AbstractResponse] => Unit]())
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
+  def testCreateTopicsClusterWideListenerMixesAllowedAndRejectedEntries(): Unit = {
+    // Mixed batch: one tenant-prefixed name (rejected), one neutral name
+    // (forwarded). The pattern mirrors the per-tenant reserved-form guard:
+    // refuse the polluting entry, forward the rest, merge responses on return.
+    val createRequest = new CreateTopicsRequest.Builder(new CreateTopicsRequestData()
+      .setTopics(new CreateTopicsRequestData.CreatableTopicCollection(util.Arrays.asList(
+        new CreateTopicsRequestData.CreatableTopic()
+          .setName("acme.foo").setNumPartitions(1).setReplicationFactor(1.toShort),
+        new CreateTopicsRequestData.CreatableTopic()
+          .setName("plain-topic").setNumPartitions(1).setReplicationFactor(1.toShort)).iterator)))
+      .build()
+    val request = buildRequest(createRequest)
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleCreateTopicsRequest(request)
+
+    val bodyCaptor: ArgumentCaptor[AbstractRequest] = ArgumentCaptor.forClass(classOf[AbstractRequest])
+    val callbackCaptor: ArgumentCaptor[Option[AbstractResponse] => Unit] =
+      ArgumentCaptor.forClass(classOf[Option[AbstractResponse] => Unit])
+    verify(forwardingManager).forwardRequest(
+      ArgumentMatchers.eq(request),
+      bodyCaptor.capture(),
+      callbackCaptor.capture())
+    val forwarded = bodyCaptor.getValue.asInstanceOf[CreateTopicsRequest]
+    assertEquals(Set("plain-topic"),
+      forwarded.data.topics.asScala.map(_.name).toSet,
+      "only the non-polluting entry must reach the controller")
+
+    val controllerResponse = new CreateTopicsResponse(new CreateTopicsResponseData()
+      .setTopics(new CreateTopicsResponseData.CreatableTopicResultCollection(
+        Collections.singleton(new CreateTopicsResponseData.CreatableTopicResult()
+          .setName("plain-topic").setErrorCode(Errors.NONE.code)).iterator)))
+    val callback = callbackCaptor.getValue
+    callback(Some(controllerResponse))
+
+    val response = verifyNoThrottling[CreateTopicsResponse](request)
+    val byName = response.data.topics.asScala.map(t => t.name -> t.errorCode).toMap
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, byName("acme.foo"),
+      "tenant-prefixed entry must be rejected at the broker")
+    assertEquals(Errors.NONE.code, byName("plain-topic"),
+      "non-polluting entry must surface the controller's outcome unchanged")
+  }
+
+  @Test
+  def testCreateTopicsClusterWideListenerForwardsTenantLookingNamesWhenNoTenantsConfigured(): Unit = {
+    // Pollution guard is gated on TenantConfig.allTenants. With no tenants
+    // configured, the broker behaves as a stock single-tenant cluster and the
+    // request is forwarded verbatim — including topics whose names happen to
+    // contain a dot.
+    val createRequest = new CreateTopicsRequest.Builder(new CreateTopicsRequestData()
+      .setTopics(new CreateTopicsRequestData.CreatableTopicCollection(
+        Collections.singleton(new CreateTopicsRequestData.CreatableTopic()
+          .setName("acme.foo").setNumPartitions(1).setReplicationFactor(1.toShort)).iterator)))
+      .build()
+    val request = buildRequest(createRequest)
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleCreateTopicsRequest(request)
+
+    verify(forwardingManager).forwardRequest(
+      ArgumentMatchers.eq(request),
+      any[Option[AbstractResponse] => Unit]())
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[AbstractRequest](), any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
+  def testCreateTopicsClusterWideListenerPassesInternalTopicsThrough(): Unit = {
+    // Internal topics are never tenant-namespaced. Even with tenants
+    // configured, `__consumer_offsets` (etc.) must not be misclassified as
+    // pollution and must reach the controller via the standard path.
+    val createRequest = new CreateTopicsRequest.Builder(new CreateTopicsRequestData()
+      .setTopics(new CreateTopicsRequestData.CreatableTopicCollection(
+        Collections.singleton(new CreateTopicsRequestData.CreatableTopic()
+          .setName("__consumer_offsets").setNumPartitions(1).setReplicationFactor(1.toShort)).iterator)))
+      .build()
+    val request = buildRequest(createRequest)
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleCreateTopicsRequest(request)
+
+    verify(forwardingManager).forwardRequest(
+      ArgumentMatchers.eq(request),
+      any[Option[AbstractResponse] => Unit]())
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[AbstractRequest](), any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
   def testDeleteTopicsTenantRejectsReservedPhysicalFormLogicalName(): Unit = {
     // DeleteTopics by-name with `acme.orders` would rewrite to `acme.acme.orders`,
     // which (if it exists at all) is a phantom artefact rather than the topic the

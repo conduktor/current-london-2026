@@ -23,6 +23,7 @@ import org.junit.jupiter.api.Test;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -109,5 +110,23 @@ class TenantConfigTest {
 
         assertFalse(cfg.isTenantBoundListener(new ListenerName("X")));
         assertEquals(Optional.empty(), cfg.boundTenantFor(new ListenerName("X")));
+    }
+
+    @Test
+    void allTenantsReturnsEveryConfiguredId() {
+        // The cluster-wide-listener outside-in pollution guard iterates this
+        // set to decide whether a topic name starts with a tenant prefix.
+        Map<String, Object> props = new HashMap<>();
+        props.put("listener.name.tenant_acme.tenant.id", "acme");
+        props.put("listener.name.tenant_beta.tenant.id", "beta");
+
+        TenantConfig cfg = TenantConfig.from(props);
+
+        assertEquals(Set.of("acme", "beta"), cfg.allTenants());
+    }
+
+    @Test
+    void allTenantsReturnsEmptyWhenUnconfigured() {
+        assertTrue(TenantConfig.empty().allTenants().isEmpty());
     }
 }
