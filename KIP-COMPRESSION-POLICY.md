@@ -375,6 +375,36 @@ unrelated jobs and break the principle of least surprise for every operator
 who already knows what `compression.type` means. A separate, narrowly-scoped
 config is cleaner.
 
+### A fourth keyword `optional`
+
+An early draft of the Stretch backlog mentioned an `optional` keyword. We
+rejected it as a distinct value because all three plausible readings either
+duplicate existing functionality or violate the "first-class declarative
+admission rule" framing this KIP is built on:
+
+- **`optional` = synonym for `none`.** Adds a fourth name to the enumeration
+  with no behavioural difference, expanding the API surface every operator
+  must understand for zero return.
+- **`optional` = "uncompressed is fine, and if compressed it must be from a
+  particular allow-list".** A coherent third state, but operationally that is
+  "allow-list ∪ {NONE}" — and the existing allow-list shape covers exactly
+  half of this need (codec selection); the other half (also accept
+  uncompressed) is already what every existing topic does by default. The
+  combined need is niche enough that nobody on the spec has actually asked
+  for it. If it becomes load-bearing later, a follow-up extension can add a
+  `none,gzip,lz4` token (a sentinel `none` inside the list with explicit
+  carve-out semantics, distinct from the currently-rejected `none`-in-list).
+- **`optional` = "log a warning instead of rejecting".** This is *advisory
+  enforcement*, an orthogonal concept that would apply to any policy
+  (required/forbidden/allow-list) rather than being a fourth value. It is
+  better expressed as a separate flag (e.g.
+  `compression.policy.action=warn`) in a future KIP, not as a keyword
+  collision with the existing four shapes.
+
+Keeping the keyword set closed at `{none, required, forbidden}` plus the
+allow-list shape keeps the surface narrow and the rejection-message taxonomy
+unambiguous.
+
 ### Reuse `min.compression.ratio` ideas
 
 A "minimum compression ratio" check is appealing on paper but requires the
