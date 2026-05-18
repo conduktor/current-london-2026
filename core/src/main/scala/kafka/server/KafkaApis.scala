@@ -3051,6 +3051,34 @@ class KafkaApis(val requestChannel: RequestChannel,
           // to the response with TOPIC_AUTHORIZATION_FAILED.
           responseBuilder.addPartitions[TxnOffsetCommitRequestData.TxnOffsetCommitRequestPartition](
             topic.name, topic.partitions, _.partitionIndex, Errors.TOPIC_AUTHORIZATION_FAILED)
+        } else if (concentrationKernel.isBackingTopic(topic.name)) {
+          // r19 ADV-A BLOCKER #142: backing topics carry interleaved records for multiple
+          // logical tenants. Allowing a transactional offset commit against the backing
+          // partition smuggles the backing partition into __consumer_offsets via the
+          // tx-staged offsets path — and v1 has no logical-aware end-txn / abort logic to
+          // clear it. Pin this as INVALID_TOPIC_EXCEPTION (non-retriable) so the producer
+          // sees a clear, topic-level failure, mirroring the produce-side backing
+          // rejection at :553 and the AddPartitionsToTxn rejection landed in #140.
+          // Check runs AFTER authz so unauthorized callers still see
+          // TOPIC_AUTHORIZATION_FAILED first (no-enumeration-oracle posture).
+          responseBuilder.addPartitions[TxnOffsetCommitRequestData.TxnOffsetCommitRequestPartition](
+            topic.name, topic.partitions, _.partitionIndex, Errors.INVALID_TOPIC_EXCEPTION)
+        } else if (concentrationKernel.isLogicalTopic(topic.name)) {
+          // r19 ADV-A BLOCKER #142 (logical side): logical topics are non-transactional in
+          // v1 — the produce path rejects transactional batches at :621 with
+          // INVALID_TXN_STATE, and AddPartitionsToTxn mirrors this rejection (#140). Reject
+          // TxnOffsetCommit on logical topics too: otherwise the group coordinator writes a
+          // tx-staged offset for the logical-named partition into __consumer_offsets, and
+          // no logical-aware end-txn / abort logic exists to clear it correctly — the
+          // offset would either stay staged forever (stuck consumer) or be cleared by a
+          // marker that applies to the wrong logical scope (duplicated delivery). Same
+          // INVALID_TXN_STATE error code so a transactional client sees a coherent
+          // non-retriable failure at every step of the protocol. Note: logical topics
+          // intentionally live OUTSIDE metadataCache (the kernel owns their partition
+          // count); without this branch they would fall through to UNKNOWN_TOPIC_OR_PARTITION
+          // below, which is misleading and treated as retriable by stock clients.
+          responseBuilder.addPartitions[TxnOffsetCommitRequestData.TxnOffsetCommitRequestPartition](
+            topic.name, topic.partitions, _.partitionIndex, Errors.INVALID_TXN_STATE)
         } else if (!metadataCache.contains(topic.name)) {
           // If the topic is unknown, we add the topic and all its partitions
           // to the response with UNKNOWN_TOPIC_OR_PARTITION.

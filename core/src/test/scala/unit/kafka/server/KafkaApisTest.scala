@@ -2274,6 +2274,90 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testTxnOffsetCommitRejectsBackingTopicWithInvalidTopicException(): Unit = {
+    // r19 ADV-A BLOCKER #142: backing topics carry interleaved records for multiple logical
+    // tenants. Committing TRANSACTIONAL offsets against the backing partition smuggles the
+    // backing partition into __consumer_offsets via the txn-staged offsets path — and there
+    // is no logical-aware end-txn / abort logic in v1 to clear it. The handler must reject
+    // at the topic level with INVALID_TOPIC_EXCEPTION (non-retriable), mirroring the
+    // produce-side backing rejection at KafkaApis.scala:553 and the AddPartitionsToTxn
+    // rejection landed in #140. The check must run AFTER authz (so unauthorized callers
+    // see TOPIC_AUTHORIZATION_FAILED first, preserving the no-enumeration-oracle posture)
+    // and BEFORE the offsets are forwarded to groupCoordinator.commitTransactionalOffsets.
+    val backingTopic = "backing-topic"
+    addTopicToMetadataCache(backingTopic, numPartitions = 1)
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+    // isLogicalTopic intentionally unstubbed (default false) — if the order regresses and
+    // the backing guard moves below the logical check, the verify(never) on
+    // commitTransactionalOffsets would still catch a forward because the fall-through
+    // would not place backing-tp in authorizedTopicCommittedOffsets.
+
+    val backingTp = new TopicPartition(backingTopic, 0)
+    val partitionOffsetCommitData = new TxnOffsetCommitRequest.CommittedOffset(15L, "", Optional.empty())
+    val txnOffsetCommitRequest = new TxnOffsetCommitRequest.Builder(
+      "txnId",
+      "groupId",
+      15L,
+      0.toShort,
+      Map(backingTp -> partitionOffsetCommitData).asJava,
+      true
+    ).build()
+    val request = buildRequest(txnOffsetCommitRequest)
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleTxnOffsetCommitRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[TxnOffsetCommitResponse](request)
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION, response.errors().get(backingTp),
+      "TxnOffsetCommit on a backing topic must be rejected with INVALID_TOPIC_EXCEPTION")
+    // Group coordinator must NEVER see the backing partition.
+    verify(groupCoordinator, never()).commitTransactionalOffsets(any(), any(), any())
+  }
+
+  @Test
+  def testTxnOffsetCommitRejectsLogicalTopicAsNonTransactional(): Unit = {
+    // r19 ADV-A BLOCKER #142 (logical side): logical topics are non-transactional in v1 —
+    // the produce path rejects transactional batches at KafkaApis.scala:621 with
+    // INVALID_TXN_STATE, and AddPartitionsToTxn mirrors this rejection at KafkaApis.scala
+    // (companion #140). Reject TxnOffsetCommit on logical topics too: otherwise the group
+    // coordinator writes a tx-staged offset for the logical-named partition into
+    // __consumer_offsets, and no logical-aware end-txn / abort logic exists to clear it
+    // correctly — the offset would either stay staged forever (stuck consumer) or be
+    // cleared by a marker that applies to the wrong logical scope (duplicated delivery).
+    // Mirror INVALID_TXN_STATE end-to-end so a transactional client sees a coherent
+    // non-retriable failure at every step of the protocol.
+    val logicalTopic = "logical-topic"
+    // Logical topics intentionally live OUTSIDE the metadata cache (the kernel owns their
+    // partition count). We do NOT call addTopicToMetadataCache here — the production path
+    // must rely on isLogicalTopic, not metadata presence.
+    when(concentrationKernel.isBackingTopic(logicalTopic)).thenReturn(false)
+    when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
+
+    val logicalTp = new TopicPartition(logicalTopic, 0)
+    val partitionOffsetCommitData = new TxnOffsetCommitRequest.CommittedOffset(15L, "", Optional.empty())
+    val txnOffsetCommitRequest = new TxnOffsetCommitRequest.Builder(
+      "txnId",
+      "groupId",
+      15L,
+      0.toShort,
+      Map(logicalTp -> partitionOffsetCommitData).asJava,
+      true
+    ).build()
+    val request = buildRequest(txnOffsetCommitRequest)
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleTxnOffsetCommitRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[TxnOffsetCommitResponse](request)
+    assertEquals(Errors.INVALID_TXN_STATE, response.errors().get(logicalTp),
+      "TxnOffsetCommit on a logical topic must be rejected with INVALID_TXN_STATE " +
+        "(v1 declares logical topics non-transactional)")
+    verify(groupCoordinator, never()).commitTransactionalOffsets(any(), any(), any())
+  }
+
+  @Test
   def shouldReplaceProducerFencedWithInvalidProducerEpochInEndTxnWithOlderClient(): Unit = {
     val topic = "topic"
     addTopicToMetadataCache(topic, numPartitions = 2)
