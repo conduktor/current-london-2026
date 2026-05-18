@@ -71,7 +71,7 @@ import java.util.concurrent.TimeUnit;
  * batched producer).
  */
 @State(Scope.Benchmark)
-@Fork(value = 1)
+@Fork(value = 2)
 @Warmup(iterations = 3, time = 1)
 @Measurement(iterations = 5, time = 1)
 @BenchmarkMode(Mode.AverageTime)
@@ -88,6 +88,27 @@ public class CompressionPolicyEnforcementBenchmark {
     public void setup() {
         compressedBatches = buildBatches(Compression.lz4().build(), batchCount);
         uncompressedBatches = buildBatches(Compression.NONE, batchCount);
+        // Sanity check: a bench that lies about its setup gives meaningless numbers. Confirm
+        // both MemoryRecords actually iterate the expected number of batches with the expected
+        // codec on each batch, before any @Benchmark method runs.
+        assertBatchShape(compressedBatches, batchCount, CompressionType.LZ4);
+        assertBatchShape(uncompressedBatches, batchCount, CompressionType.NONE);
+    }
+
+    private static void assertBatchShape(MemoryRecords records, int expectedBatches, CompressionType expectedCodec) {
+        int seen = 0;
+        for (RecordBatch batch : records.batches()) {
+            if (batch.compressionType() != expectedCodec) {
+                throw new IllegalStateException("expected every batch to use codec=" + expectedCodec
+                    + ", but batch #" + seen + " used codec=" + batch.compressionType());
+            }
+            seen++;
+        }
+        if (seen != expectedBatches) {
+            throw new IllegalStateException("expected " + expectedBatches
+                + " batches but iterated " + seen + " -- the concatenation buffer is mis-sized "
+                + "or MemoryRecords.readableRecords is coalescing batches");
+        }
     }
 
     /**
