@@ -219,4 +219,56 @@ class TenantNamespaceTest {
         assertFalse(TenantNamespace.isInternalTopic("orders"));
         assertFalse(TenantNamespace.isInternalTopic("acme.orders"));
     }
+
+    @Test
+    void isInvalidLogicalFormFlagsEmptyDotAndDoubleDot() {
+        // Kafka's Topic.validate refuses these literally. If we let them
+        // through, the controller would reject the prefixed form ("acme.",
+        // "acme..", "acme...") and the error message would carry the
+        // physical name back to the tenant.
+        assertTrue(TenantNamespace.isInvalidLogicalForm("acme", ""));
+        assertTrue(TenantNamespace.isInvalidLogicalForm("acme", "."));
+        assertTrue(TenantNamespace.isInvalidLogicalForm("acme", ".."));
+    }
+
+    @Test
+    void isInvalidLogicalFormFlagsNamesWithIllegalChars() {
+        // LEGAL_CHARS is `[a-zA-Z0-9._-]`. A slash would prefix to "acme.a/b"
+        // which the controller refuses with the physical form in the message.
+        assertTrue(TenantNamespace.isInvalidLogicalForm("acme", "a/b"));
+        assertTrue(TenantNamespace.isInvalidLogicalForm("acme", "a:b"));
+        assertTrue(TenantNamespace.isInvalidLogicalForm("acme", "a b"));
+    }
+
+    @Test
+    void isInvalidLogicalFormAcceptsLegalNames() {
+        assertFalse(TenantNamespace.isInvalidLogicalForm("acme", "orders"));
+        assertFalse(TenantNamespace.isInvalidLogicalForm("acme", "legacy.event"));
+        assertFalse(TenantNamespace.isInvalidLogicalForm("acme", "a-1_b.2"));
+    }
+
+    @Test
+    void isInvalidLogicalFormIgnoresInternalTopics() {
+        // Internal topics never go through the rewrite, so length / pattern
+        // validation does not apply to them.
+        assertFalse(TenantNamespace.isInvalidLogicalForm("acme", "__consumer_offsets"));
+        assertFalse(TenantNamespace.isInvalidLogicalForm("acme", "__transaction_state"));
+    }
+
+    @Test
+    void isInvalidLogicalFormIsFalseForNullName() {
+        // Handlers guard against null separately; the namespace helper treats
+        // null as "no opinion" to keep call-site semantics simple.
+        assertFalse(TenantNamespace.isInvalidLogicalForm("acme", null));
+    }
+
+    @Test
+    void isInvalidLogicalFormFlagsNamesAlsoFlaggedByTopicIsValid() {
+        // Topic.isValid also rejects names > 249 chars. We don't rely on
+        // this overlap (isOverlongLogicalForm catches the prefixed case at
+        // a tighter bound), but document that the predicates are
+        // independent enough to coexist without inversion.
+        String tooLong = "a".repeat(250);
+        assertTrue(TenantNamespace.isInvalidLogicalForm("acme", tooLong));
+    }
 }

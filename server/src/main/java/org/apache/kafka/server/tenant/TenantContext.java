@@ -150,6 +150,19 @@ public final class TenantContext {
             .orElse(false);
     }
 
+    /**
+     * True if {@code logicalTopic} would fail Kafka's own topic validation
+     * (empty, ".", "..", illegal chars). Handlers consult this BEFORE calling
+     * {@link #toPhysical} so the rejection echoes the LOGICAL name and the
+     * controller never sees a request bearing the physical form of an
+     * invalid name. Internal topics are exempt.
+     */
+    public boolean isInvalidLogicalForm(String logicalTopic) {
+        return effectiveTenant()
+            .map(t -> TenantNamespace.isInvalidLogicalForm(t, logicalTopic))
+            .orElse(false);
+    }
+
     public String toLogical(String physicalTopic) {
         return effectiveTenant()
             .map(t -> TenantNamespace.toLogical(t, physicalTopic))

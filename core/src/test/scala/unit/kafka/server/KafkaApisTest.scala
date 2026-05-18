@@ -11981,6 +11981,47 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testCreateTopicsTenantRejectsLogicalNamesFailingKafkaTopicValidation(): Unit = {
+    // Logical names that Kafka's own Topic.validate refuses ("", ".", "..",
+    // illegal chars) would, if rewritten, produce physical names like `acme.`,
+    // `acme..`, `acme...`, `acme.a/b` — names the controller itself rejects.
+    // The broker must refuse the entry up front with INVALID_TOPIC_EXCEPTION
+    // and the LOGICAL name preserved, and not forward.
+    val invalidNames = util.Arrays.asList(
+      new CreateTopicsRequestData.CreatableTopic()
+        .setName(".").setNumPartitions(1).setReplicationFactor(1.toShort),
+      new CreateTopicsRequestData.CreatableTopic()
+        .setName("..").setNumPartitions(1).setReplicationFactor(1.toShort),
+      new CreateTopicsRequestData.CreatableTopic()
+        .setName("a/b").setNumPartitions(1).setReplicationFactor(1.toShort))
+    val createRequest = new CreateTopicsRequest.Builder(new CreateTopicsRequestData()
+      .setTopics(new CreateTopicsRequestData.CreatableTopicCollection(invalidNames.iterator)))
+      .build()
+    val request = buildRequest(
+      createRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleCreateTopicsRequest(request)
+
+    val response = verifyNoThrottling[CreateTopicsResponse](request)
+    val byName = response.data.topics.asScala.map(t => t.name -> t).toMap
+    Set(".", "..", "a/b").foreach { name =>
+      val r = byName(name)
+      assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, r.errorCode,
+        s"invalid logical name '$name' must be refused with INVALID_TOPIC_EXCEPTION")
+      assertNotNull(r.errorMessage)
+      assertTrue(r.errorMessage.contains(name),
+        s"error message must quote the logical name '$name' back: ${r.errorMessage}")
+      assertFalse(r.errorMessage.contains("acme." + name),
+        s"error message must not embed the physical form 'acme.$name': ${r.errorMessage}")
+    }
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[AbstractRequest](), any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
   def testCreateTopicsClusterWideListenerRejectsTenantPrefixedNames(): Unit = {
     // Outside-in pollution: a super-user on the cluster-wide (non-tenant)
     // listener could otherwise CreateTopics("acme.foo") literally; tenant acme

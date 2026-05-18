@@ -98,6 +98,26 @@ public final class TenantNamespace {
     }
 
     /**
+     * True if {@code logicalTopic} cannot be safely rewritten because it would
+     * fail Kafka's own topic validation ("", ".", "..", non-LEGAL_CHARS, or
+     * length &gt; MAX_NAME_LENGTH). Internal topics are exempt — they are
+     * never prefixed and pass through untouched.
+     *
+     * <p>Handlers consult this BEFORE calling {@link #toPhysical} so the
+     * rejection error message can quote the LOGICAL name the tenant sent.
+     * Letting the controller reject "{@code <tenantId>.}" or "{@code <tenantId>..}"
+     * would (a) carry the physical prefix back in the error string, leaking the
+     * namespace, and (b) on Produce auto-create, briefly materialise the
+     * malformed name before the rejection landed.
+     */
+    public static boolean isInvalidLogicalForm(String tenantId, String logicalTopic) {
+        if (logicalTopic == null || isInternalTopic(logicalTopic)) {
+            return false;
+        }
+        return !Topic.isValid(logicalTopic);
+    }
+
+    /**
      * True if {@code logicalTopic} begins with {@code <tenantId>.} and is not an
      * internal topic. Such a name is what {@link #toLogical} would produce for
      * a physical topic in this tenant's namespace; accepting it on the inbound
