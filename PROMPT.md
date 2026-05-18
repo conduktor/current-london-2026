@@ -15,6 +15,59 @@ A single broker-side rule engine that evaluates CEL `DENY` rules against any req
 3. Single interception point at the top of `KafkaApis.handle()`: bitset check on active deny-targeting API keys → if hit, evaluate matching rules → on DENY, short-circuit with the configured error code. Two paths reach the controller without traversing `KafkaApis.handle()` and are by design out of scope for the engine: (a) admin clients connected via `bootstrap.controllers` (KIP-1003), and (b) broker-internal forwarding from `AutoTopicCreationManager` for `CREATE_TOPICS` triggered by METADATA / FIND_COORDINATOR auto-creation. Operators relying on `CREATE_TOPICS` rules must set `auto.create.topics.enable=false` to close path (b); path (a) is operator-only by construction.
 4. Internal `__governance` load path: the broker's bootstrap reads the local `__governance` log directly via `ReplicaManager.getLog` (no consumer, no `KafkaApis.handle()` traversal); steady-state reload then runs on the scheduler. Atomic `RuleSet` swap publishes through an `AtomicReference`.
 
+## Limits & posture (locked-in contracts the code enforces)
+These are operator-facing facts about the engine that are NOT derivable from the rule schema alone. Rule authors and cluster operators need to know them to avoid silent over- or under-matching; future contributors need to know them to avoid accidentally tightening a fail-safe ratchet.
+
+**Rule-set caps (`RuleSetBuilder`):**
+- `MAX_RULES = 1024` — total distinct rules across all API keys. Crossing this rejects the offending rule and preserves the prior good set.
+- `MAX_RULES_PER_API_KEY = 128` — per-API DENY rule cap.
+
+**CEL evaluation caps (`CelLimits`):**
+- `MAX_EXPR_LEN = 8192` characters — rule source length, checked at compile.
+- `MAX_PARSE_DEPTH = 64` — recursive-descent parser depth.
+- `MAX_NODES = 1024` — AST node count per program.
+- `MAX_EVAL_STEPS = 100_000` — per-request step budget. Every AST node access (Field, Index, comprehension iteration, string op proportional to char-work, regex input length) charges against this budget. A trip raises `CelEvaluationException`; the rule engine catches and returns ALLOW for that one rule (fail-open per predicate, fail-stale on the set).
+- `MAX_STRING_RESULT_LEN = 16384` characters — output string ops cannot blow this.
+- `MAX_REGEX_INPUT_LENGTH = 16384` characters — input to `re.matches`. Defence-in-depth against pathological-input attacks even though `.matches(<literal>)` uses RE2 (linear-time guarantee).
+
+**Activation walker caps (`ApiMessageActivation`):**
+- `MAX_ACCESSOR_INVOCATIONS = 10_000` — total reflective accessor calls per single request walk. Iterable widths bump the same counter so a million-element flat scalar list still trips. Overflow throws `ActivationBudgetExceededException`, which the engine maps to a `POLICY_VIOLATION` short-circuit on the offending request (fail-closed: an over-wide request is rejected, not silently allowed).
+- `MAX_DEPTH = 8` — recursion limit on nested DTO walks.
+
+**Scalar shape contracts the walker hands to CEL:**
+- `Integer / Short / Byte → Long` — uniform numeric contract. Enum-coded byte fields (`isolationLevel`, `keyType`, `configOperation`, etc.) surface as their `Long` int8 code, NOT as a symbolic name. Operators write `request.isolationLevel == 1`, not `== "READ_COMMITTED"` — the symbolic form would silently always-false. Pinned by `ApiMessageActivationEnumByteTest`.
+- `Double / Float → null` — fractional values cannot survive `longValue()` coercion in CEL comparisons without silent truncation, so the walker surfaces them as null. `op.value == 1` reliably evaluates false, not "true for any [0.5, 1.49)". Pinned by `ApiMessageActivationDoubleTest`.
+- `byte[] / ByteBuffer → {sizeInBytes: long}` descriptor — a CEL-usable size-bounded contract that does NOT pin the underlying buffer in the activation map. Closes both a shape hazard (raw byte[] has no useful CEL equality contract) and a credential-exfiltration / memory-pinning hazard for envelope payloads. Pinned by `ApiMessageActivationBytesTest`.
+- `BaseRecords → {sizeInBytes: long}` — same shape as byte[]/ByteBuffer, deliberately opaque so PRODUCE/FETCH record payloads cannot be probed via rule predicates.
+- `Uuid → String` (Kafka canonical base64url 22-char form). Rules compare `t.topicId == "<base64url>"`. Pinned by `ApiMessageActivationUuidTest`.
+
+**`SENSITIVE_NAMES` redaction (walker-level, defence-in-depth):**
+The walker filters out reflective accessors whose names match `authBytes`, `salt`, `saltedPassword`, `password`, `hmac`, `secret`, `clientSecret` (case-insensitive) BEFORE invocation, so credential-bearing byte fields never reach the activation map. Sister redaction `redactSensitiveConfigValue` handles the AlterableConfig name-pair pattern, masking `value` when the sibling `name` matches a credential config key (`*.password`, `sasl.jaas.config`, `*.keystore.key`, `*.keystore.certificate.chain`, `*.truststore.certificates`, `*secret*`).
+
+**Reserved rule-id shape:**
+The rule-id field `__name__` is reserved engine-internal; the JSON codec rejects rule envelopes that set it. Operators must not use `__`-prefixed ids.
+
+**Configs:**
+- `governance.bootstrap.require.local.replica` (default `true`) — undocumented advanced knob, read directly from `KafkaConfig.originals()` rather than wired through a typed config, deliberately kept off the operator surface until broader operational use justifies the doc-and-validator overhead. Set to `false` to opt out of the local-replica requirement on a broker that does not host `__governance`.
+- `governance.bypass.principals` — privileged-listener allow-list; principal-based, not client-id-based.
+
+**Internal timing constants (`BrokerServer`):**
+Not configurable. Hardcoded constants on `BrokerServer`. Document here so anyone tuning them sees the operational tradeoff:
+- `GovernanceStartupDrainDeadlineMs = 30_000` — total wall-clock budget for the bootstrap drain. On expiry, the broker continues startup with whatever `__governance` state it has drained; the steady-state reload picks up the rest.
+- `GovernanceDrainIntervalMs = 200` — steady-state poll interval. Atomic `RuleSet` swap publishes through an `AtomicReference` on each iteration that observes a non-empty delta.
+
+**Fail-stale-not-empty posture:**
+If a `__governance` reload batch fails to parse, validate, or compile, the engine preserves the previous good `RuleSet` and refuses to publish an empty or partial swap. The contract is: a transient broker, parser, or storage failure must NEVER cross the engine state from "enforcing" to "permissive". Per-record failures within a batch reject only the offending envelope; valid records in the same batch land normally.
+
+**ISR catch-up gate at bootstrap:**
+The bootstrap drain waits for the local `__governance` log to reach the high-watermark of the controller's view before accepting client connections, so the broker does not accept traffic against an out-of-date rule set on first start after a partition.
+
+**Activation envelope shape (`request.*`):**
+v1 exposes only `request.*` (the protocol DTO walked into a Map via reflection). The Stretch section above tracks the future shape `{request: ..., principal: ..., session: ...}`; rules MUST NOT depend on those keys today.
+
+**CEL subset supported:**
+The engine ships a hand-written recursive-descent parser, NOT cel-java. Supported: identifiers, field access, indexing, equality / comparison operators, logical AND/OR/NOT, integer / string / bytes literals, the `in` operator, `exists` / `all` macros over Iterables, string `.startsWith/.endsWith/.contains/.matches(<regex literal>)`, integer arithmetic on `Long`s. Unsupported (rejected at parse): float literals, `dyn`, `has()`, `cel.bind`, timestamps, durations, user-defined functions, unbounded macros. The subset is intentional — it bounds the engine's blast radius and is the precondition for the static cost analysis that backs `MAX_NODES` / `MAX_EVAL_STEPS`.
+
 ## Stretch (only after the minimum lands)
 - `ALLOW` and `FILTER` actions.
 - `principal.*`, `session.*`, `client.*` evaluation contexts.
