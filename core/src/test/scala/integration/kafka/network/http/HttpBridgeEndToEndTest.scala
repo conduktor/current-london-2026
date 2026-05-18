@@ -36,12 +36,13 @@ import org.junit.jupiter.api.Assertions._
 import org.junit.jupiter.api.{Tag, Test, Timeout}
 
 import java.net.URI
-import java.net.http.{HttpClient, HttpRequest, HttpResponse}
+import java.net.http.{HttpClient, HttpRequest, HttpResponse, WebSocket}
 import java.nio.charset.StandardCharsets
 import java.time.Duration
 import java.util
 import java.util.Collections
 import java.util.Properties
+import java.util.concurrent.{CompletionStage, CopyOnWriteArrayList, CountDownLatch, TimeUnit}
 
 import scala.jdk.CollectionConverters._
 
@@ -250,6 +251,174 @@ class HttpBridgeEndToEndTest {
       } finally {
         reader.close()
         conn.disconnect()
+      }
+    } finally {
+      cluster.close()
+    }
+  }
+
+  @Test
+  def wsSubscribeFlowDeliversExactCreditedRecordsAgainstRealBroker(): Unit = {
+    // PROMPT.md FS2 / AC5 — end-to-end credit-gated WebSocket subscription against a real KRaft broker. The unit-level
+    // contract (exactly N delivered, M more after a flow grant) is covered by WsStreamerTest with a stub submitter;
+    // KafkaHttpServerIntegrationTest covers the same contract through a real Jetty WS upgrade against a
+    // ControllableSubmitter. This test is the load-bearing real-broker counterpart — produce 20 records over HTTP,
+    // open a WS subscribe with initialCredits=5, assert exactly 5 record frames land before the stream pauses, send a
+    // flow grant for 10, and assert exactly 10 more arrive. If any link in the chain (KafkaHttpServer's upgrade
+    // creator, the WsStreamer dispatch loop, the shared RequestSubmitter's submitFetch path, the real broker's fetch
+    // purgatory) drifts from the spec, this test fails. The JDK 21 native WebSocket client keeps the test free of any
+    // additional :core test-dependency on jetty-websocket-client — :core already pulls in java.net.http.HttpClient.
+    val cluster = new KafkaClusterTestKit.Builder(
+      new TestKitNodes.Builder()
+        .setNumBrokerNodes(1)
+        .setNumControllerNodes(1)
+        .build())
+      .setConfigProp(SocketServerConfigs.HTTP_BRIDGE_ENABLED_CONFIG, "true")
+      .setConfigProp(SocketServerConfigs.HTTP_BRIDGE_HOST_CONFIG, "127.0.0.1")
+      .setConfigProp(SocketServerConfigs.HTTP_BRIDGE_PORT_CONFIG, "0")
+      .build()
+    val topicName = "http-bridge-ws"
+    try {
+      cluster.format()
+      cluster.startup()
+      cluster.waitForReadyBrokers()
+
+      val broker = cluster.brokers().get(0)
+      TestUtils.waitUntilTrue(() => broker.brokerState == BrokerState.RUNNING, "Broker never reached RUNNING.")
+      TestUtils.waitUntilTrue(() => broker.httpBridgeServer != null && broker.httpBridgeServer.boundPort() > 0,
+        "HTTP bridge never bound its port.")
+      val bridgePort = broker.httpBridgeServer.boundPort()
+
+      createTopic(cluster, topicName, partitions = 1)
+
+      // Seed 20 records on partition 0 via the HTTP produce endpoint. The broker assigns offsets 0..19 in order;
+      // we'll assert delivery offsets match this sequence after the WS subscribe drains them.
+      val recordsJson = (0 until 20).map { i =>
+        s"""{ "partition": 0, "value": { "type": "STRING", "data": "rec-$i" } }"""
+      }.mkString(",")
+      val seedBody = s"""{ "records": [ $recordsJson ] }"""
+      val seedResp = postJson(s"http://127.0.0.1:$bridgePort/v1/topics/$topicName/records", seedBody)
+      assertEquals(200, seedResp.statusCode(),
+        s"seed produce must succeed before opening the WS subscribe, body=${seedResp.body()}")
+
+      val received = new CopyOnWriteArrayList[JsonNode]()
+      // Two latches drive the test's two checkpoints: 5 after subscribe(initialCredits=5), then 15 after flow(10).
+      // Using independent latches (rather than one running counter) makes the failure message precise — we know
+      // exactly which phase under-delivered.
+      val firstFiveLatch = new CountDownLatch(5)
+      val fifteenLatch = new CountDownLatch(15)
+      val openedLatch = new CountDownLatch(1)
+      val closedLatch = new CountDownLatch(1)
+      // Captures the first transport-level failure surfaced by WebSocket.Listener.onError. Junit assertions thrown
+      // from listener-thread callbacks are dropped silently — the safe pattern is to capture here and rethrow on the
+      // main thread after each await, so a broken upgrade / I/O failure becomes an actionable test message instead
+      // of an indirect 15-second timeout. AtomicReference is the obvious shape; we keep only the first error because
+      // a transport break usually cascades (close → ioexception → secondary errors) and the first one is the
+      // diagnostic one.
+      val listenerError = new java.util.concurrent.atomic.AtomicReference[Throwable]()
+
+      val listener = new WebSocket.Listener {
+        // Jetty MAY split a text payload across multiple onText invocations (per the JSR-356 successor's contract on
+        // the JDK client). For tiny frames this is unlikely, but defending against it is cheap: accumulate until
+        // last=true, then parse and dispatch.
+        private val buffer = new java.lang.StringBuilder
+
+        override def onOpen(ws: WebSocket): Unit = {
+          openedLatch.countDown()
+          ws.request(1) // pull the first frame
+        }
+
+        override def onText(ws: WebSocket, data: CharSequence, last: Boolean): CompletionStage[_] = {
+          buffer.append(data)
+          if (last) {
+            val node = mapper.readTree(buffer.toString)
+            buffer.setLength(0)
+            received.add(node)
+            // Only count record frames toward the AC5 delivery contract — an error or info envelope (if the server
+            // ever introduced one) must not count against the credit budget. Today the server only emits records,
+            // but coding to "type=record" keeps the assertion semantically correct under future evolution.
+            if ("record" == node.get("type").asText()) {
+              firstFiveLatch.countDown()
+              fifteenLatch.countDown()
+            }
+          }
+          ws.request(1)
+          null
+        }
+
+        override def onClose(ws: WebSocket, statusCode: Int, reason: String): CompletionStage[_] = {
+          closedLatch.countDown()
+          null
+        }
+
+        override def onError(ws: WebSocket, error: Throwable): Unit = {
+          // Surface the failure on the main thread via the AtomicReference; failOnListenerError() is called after
+          // each await so the test fails with the actual cause, not a timeout.
+          listenerError.compareAndSet(null, error)
+        }
+      }
+
+      def failOnListenerError(): Unit = {
+        val t = listenerError.get()
+        if (t != null) {
+          throw new AssertionError(s"WS listener reported transport-level error: ${t.getClass.getName}: ${t.getMessage}", t)
+        }
+      }
+
+      val wsUri = URI.create(s"ws://127.0.0.1:$bridgePort/v1/topics/$topicName/subscribe")
+      val ws = httpClient.newWebSocketBuilder()
+        .connectTimeout(Duration.ofSeconds(10))
+        .buildAsync(wsUri, listener)
+        .get(10, TimeUnit.SECONDS)
+      try {
+        assertTrue(openedLatch.await(10, TimeUnit.SECONDS), "WS never reached onOpen against the real broker")
+        failOnListenerError()
+
+        // Phase 1: subscribe with exactly 5 credits. Server must deliver records 0..4 and then stop.
+        val subscribe = """{"type":"subscribe","partition":0,"offset":0,"initialCredits":5}"""
+        ws.sendText(subscribe, true).get(5, TimeUnit.SECONDS)
+        assertTrue(firstFiveLatch.await(15, TimeUnit.SECONDS),
+          s"with initialCredits=5 the WS subscriber must receive 5 records within 15s — got ${received.size()}")
+        failOnListenerError()
+
+        // Settle: give the server 500 ms to (try to) push a 6th record. If credit accounting is broken (e.g. a
+        // refund-and-replay loop), a 6th record would slip in here. The 500 ms is intentionally generous — under a
+        // bug the test should be deterministic, not flaky.
+        Thread.sleep(500)
+        assertEquals(5, received.size(),
+          s"with initialCredits=5 the server must deliver exactly 5 records — got ${received.size()}: $received")
+
+        // Phase 2: flow grant for 10. Total delivered must become exactly 15.
+        val flow = """{"type":"flow","credits":10}"""
+        ws.sendText(flow, true).get(5, TimeUnit.SECONDS)
+        assertTrue(fifteenLatch.await(15, TimeUnit.SECONDS),
+          s"after granting 10 more credits the total must reach 15 within 15s — got ${received.size()}")
+        failOnListenerError()
+        Thread.sleep(500)
+        assertEquals(15, received.size(),
+          s"after initialCredits=5 + flow(10) the server must deliver exactly 15 — got ${received.size()}")
+        failOnListenerError()
+
+        // Delivered offsets must be 0..14 contiguously. A regression that re-reads or skips records would surface
+        // here as a misordered or gapped sequence.
+        val offsets = (0 until received.size()).map(i => received.get(i).get("offset").asLong())
+        assertEquals((0L until 15L).toSeq, offsets,
+          s"delivered record offsets must form 0..14 contiguously — got $offsets")
+        // Record values round-trip the produced STRING envelope's data field. Verify the first and last to confirm
+        // the wire format on the WS side is the same {"type":"record","offset":N,"value":{"type":"STRING","data":...}}
+        // shape that the unit tests pin — proving we're not silently double-encoding or stripping the envelope.
+        assertEquals("rec-0", received.get(0).get("value").get("data").asText())
+        assertEquals("rec-14", received.get(14).get("value").get("data").asText())
+
+        // Clean shutdown: NORMAL_CLOSURE. The endpoint must observe the close, tear down the streamer, and release
+        // the limiter slot. We don't read the cap-rejection metric here because the cap test
+        // (wsReturns503WhenSubscriptionCapReached in the Java suite) already covers that path with a stricter
+        // configuration; this test owns the happy-path credit-flow contract.
+        ws.sendClose(WebSocket.NORMAL_CLOSURE, "test done").get(5, TimeUnit.SECONDS)
+        assertTrue(closedLatch.await(10, TimeUnit.SECONDS),
+          "WS never observed onClose after sendClose — the server should echo the close frame promptly")
+      } finally {
+        if (!ws.isOutputClosed) ws.abort()
       }
     } finally {
       cluster.close()
