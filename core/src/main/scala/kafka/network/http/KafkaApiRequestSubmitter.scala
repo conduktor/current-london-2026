@@ -27,7 +27,7 @@ import org.apache.kafka.common.message.ProduceRequestData
 import org.apache.kafka.common.message.ProduceRequestData.{PartitionProduceData, TopicProduceData, TopicProduceDataCollection}
 import org.apache.kafka.common.network.{ClientInformation, ListenerName}
 import org.apache.kafka.common.protocol.{ApiKeys, Errors}
-import org.apache.kafka.common.record.{MemoryRecords, SimpleRecord}
+import org.apache.kafka.common.record.{MemoryRecords, Records, SimpleRecord}
 import org.apache.kafka.common.requests.{AbstractResponse, FetchRequest, FetchResponse, ProduceRequest, ProduceResponse, RequestContext, RequestHeader}
 import org.apache.kafka.common.security.auth.{KafkaPrincipal, SecurityProtocol}
 import org.apache.kafka.common.utils.Time
@@ -235,25 +235,29 @@ class KafkaApiRequestSubmitter(
 
   private def extractRecords(partition: FetchResponseData.PartitionData): util.List[FetchedRecord] = {
     val out = new util.ArrayList[FetchedRecord]()
-    val records = partition.records()
-    if (records == null) return out
-
-    // BaseRecords -> MemoryRecords (the only concrete type the broker writes into responses today). If someone wires
-    // a different implementation in future, we'll get a ClassCastException here — better an honest failure than a
-    // silent empty result.
-    val memoryRecords = records.asInstanceOf[MemoryRecords]
-    memoryRecords.records().forEach { record =>
-      val offset = record.offset()
-      val timestamp = record.timestamp()
-      val key: Array[Byte] = if (record.hasKey) bytesOf(record.key()) else null
-      val value: Array[Byte] = if (record.hasValue) bytesOf(record.value()) else Array.emptyByteArray
-      val contentType: String = record.headers().toSeq.find(_.key() == "content-type") match {
-        case Some(h) if h.value() != null => new String(h.value(), StandardCharsets.UTF_8)
-        case _ => null
-      }
-      out.add(new FetchedRecord(offset, key, value, contentType, timestamp))
+    val baseRecords = partition.records()
+    // The broker returns FileRecords for on-disk fetches and MemoryRecords for in-memory ones; both implement Records,
+    // which is where iteration lives. Casting to Records (not MemoryRecords!) is what makes a real fetch work — the
+    // broker hands us FileRecords zero-copy from the segment file.
+    baseRecords match {
+      case null => out
+      case r: Records =>
+        r.records().forEach { record =>
+          val offset = record.offset()
+          val timestamp = record.timestamp()
+          val key: Array[Byte] = if (record.hasKey) bytesOf(record.key()) else null
+          val value: Array[Byte] = if (record.hasValue) bytesOf(record.value()) else Array.emptyByteArray
+          val contentType: String = record.headers().toSeq.find(_.key() == "content-type") match {
+            case Some(h) if h.value() != null => new String(h.value(), StandardCharsets.UTF_8)
+            case _ => null
+          }
+          out.add(new FetchedRecord(offset, key, value, contentType, timestamp))
+        }
+        out
+      case other =>
+        throw new IllegalStateException(
+          s"Unsupported records implementation in fetch response: ${other.getClass.getName}")
     }
-    out
   }
 
   private def bytesOf(buf: java.nio.ByteBuffer): Array[Byte] = {

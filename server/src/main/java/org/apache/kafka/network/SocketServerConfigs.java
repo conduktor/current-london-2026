@@ -164,7 +164,7 @@ public class SocketServerConfigs {
 
     public static final String HTTP_BRIDGE_PORT_CONFIG = "http.bridge.port";
     public static final int HTTP_BRIDGE_PORT_DEFAULT = 8082;
-    public static final String HTTP_BRIDGE_PORT_DOC = "TCP port the HTTP bridge listener binds to when " + HTTP_BRIDGE_ENABLED_CONFIG + " is true. Defaults to 8082, the same port used by Confluent's REST Proxy so existing tooling can point at the broker directly without reconfiguration.";
+    public static final String HTTP_BRIDGE_PORT_DOC = "TCP port the HTTP bridge listener binds to when " + HTTP_BRIDGE_ENABLED_CONFIG + " is true. Defaults to 8082, the same port used by Confluent's REST Proxy so existing tooling can point at the broker directly without reconfiguration. A value of 0 binds an ephemeral port chosen by the OS — useful for tests and CI; the actually bound port is reported in the broker log.";
 
     public static final ConfigDef CONFIG_DEF =  new ConfigDef()
             .define(LISTENERS_CONFIG, STRING, LISTENERS_DEFAULT, HIGH, LISTENERS_DOC)
@@ -185,7 +185,7 @@ public class SocketServerConfigs {
             .define(NUM_NETWORK_THREADS_CONFIG, INT, NUM_NETWORK_THREADS_DEFAULT, atLeast(1), HIGH, NUM_NETWORK_THREADS_DOC)
             .define(HTTP_BRIDGE_ENABLED_CONFIG, ConfigDef.Type.BOOLEAN, HTTP_BRIDGE_ENABLED_DEFAULT, LOW, HTTP_BRIDGE_ENABLED_DOC)
             .define(HTTP_BRIDGE_HOST_CONFIG, STRING, HTTP_BRIDGE_HOST_DEFAULT, LOW, HTTP_BRIDGE_HOST_DOC)
-            .define(HTTP_BRIDGE_PORT_CONFIG, INT, HTTP_BRIDGE_PORT_DEFAULT, atLeast(1), LOW, HTTP_BRIDGE_PORT_DOC);
+            .define(HTTP_BRIDGE_PORT_CONFIG, INT, HTTP_BRIDGE_PORT_DEFAULT, atLeast(0), LOW, HTTP_BRIDGE_PORT_DOC);
 
     private static final Pattern URI_PARSE_REGEXP = Pattern.compile(
         "^(.*)://\\[?([0-9a-zA-Z\\-%._:]*)\\]?:(-?[0-9]+)");
