@@ -654,6 +654,110 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testCreateTopicsForwardsUnchangedWhenNoLogicalTopicsDeclared(): Unit = {
+    // No declared logical topics — the interceptor must hand off to the normal forwarding path
+    // (the 2-arg forwardRequest overload, identical to a vanilla CreateTopics).
+    when(concentrationKernel.allDeclaredLogicalTopicNames()).thenReturn(Collections.emptySet[String])
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
+
+    val requestData = new CreateTopicsRequestData()
+    requestData.topics().add(new CreatableTopic().setName("orders").setNumPartitions(1).setReplicationFactor(1.toShort))
+    val request = buildRequest(new CreateTopicsRequest.Builder(requestData).build())
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handle(request, RequestLocal.withThreadConfinedCaching)
+
+    verify(forwardingManager).forwardRequest(
+      ArgumentMatchers.eq(request),
+      any[Option[AbstractResponse] => Unit]()
+    )
+    verify(forwardingManager, never).forwardRequest(
+      any[RequestChannel.Request](),
+      any[AbstractRequest](),
+      any[Option[AbstractResponse] => Unit]()
+    )
+    verify(requestChannel, never).sendResponse(any(), any(), any())
+  }
+
+  @Test
+  def testCreateTopicsRejectsAllShadowingNamesWithoutForwarding(): Unit = {
+    // Every requested topic name collides with a declared logical topic. The interceptor must
+    // synthesize a CreateTopicsResponse with TOPIC_ALREADY_EXISTS per name and short-circuit —
+    // no forward to the controller.
+    when(concentrationKernel.allDeclaredLogicalTopicNames())
+      .thenReturn(Set("orders", "events").asJava)
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
+
+    val requestData = new CreateTopicsRequestData()
+    requestData.topics().add(new CreatableTopic().setName("orders").setNumPartitions(1).setReplicationFactor(1.toShort))
+    requestData.topics().add(new CreatableTopic().setName("events").setNumPartitions(1).setReplicationFactor(1.toShort))
+    val request = buildRequest(new CreateTopicsRequest.Builder(requestData).build())
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handle(request, RequestLocal.withThreadConfinedCaching)
+
+    verify(forwardingManager, never).forwardRequest(
+      any[RequestChannel.Request](),
+      any[Option[AbstractResponse] => Unit]()
+    )
+    verify(forwardingManager, never).forwardRequest(
+      any[RequestChannel.Request](),
+      any[AbstractRequest](),
+      any[Option[AbstractResponse] => Unit]()
+    )
+
+    val response = verifyNoThrottling[CreateTopicsResponse](request)
+    val byName = response.data.topics().iterator().asScala.map(t => t.name() -> t.errorCode()).toMap
+    assertEquals(2, byName.size)
+    assertEquals(Errors.TOPIC_ALREADY_EXISTS.code, byName("orders"))
+    assertEquals(Errors.TOPIC_ALREADY_EXISTS.code, byName("events"))
+  }
+
+  @Test
+  def testCreateTopicsForwardsRemainderAndInjectsShadowRejections(): Unit = {
+    // Mixed request: one logical-shadowing topic and one normal topic. The interceptor must
+    // mutate the request body (drop the shadow), forward the remainder via the 3-arg overload,
+    // and merge a TOPIC_ALREADY_EXISTS entry into the controller's reply.
+    when(concentrationKernel.allDeclaredLogicalTopicNames())
+      .thenReturn(Collections.singleton[String]("orders"))
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
+
+    val requestData = new CreateTopicsRequestData()
+    requestData.topics().add(new CreatableTopic().setName("orders").setNumPartitions(1).setReplicationFactor(1.toShort))
+    requestData.topics().add(new CreatableTopic().setName("items").setNumPartitions(1).setReplicationFactor(1.toShort))
+    val request = buildRequest(new CreateTopicsRequest.Builder(requestData).build())
+
+    kafkaApis = createKafkaApis()
+    val forwardedBody: ArgumentCaptor[AbstractRequest] = ArgumentCaptor.forClass(classOf[AbstractRequest])
+    val forwardCallback: ArgumentCaptor[Option[AbstractResponse] => Unit] =
+      ArgumentCaptor.forClass(classOf[Option[AbstractResponse] => Unit])
+
+    kafkaApis.handle(request, RequestLocal.withThreadConfinedCaching)
+
+    verify(forwardingManager).forwardRequest(
+      ArgumentMatchers.eq(request),
+      forwardedBody.capture(),
+      forwardCallback.capture()
+    )
+
+    val forwarded = forwardedBody.getValue.asInstanceOf[CreateTopicsRequest]
+    val forwardedNames = forwarded.data.topics().iterator().asScala.map(_.name()).toSet
+    assertEquals(Set("items"), forwardedNames)
+
+    // Controller responds with NONE for "items"; the interceptor must inject the
+    // TOPIC_ALREADY_EXISTS entry for the shadow we removed before delivering to the client.
+    val controllerResponseData = new CreateTopicsResponseData()
+    controllerResponseData.topics().add(new CreatableTopicResult().setName("items").setErrorCode(Errors.NONE.code))
+    forwardCallback.getValue.apply(Some(new CreateTopicsResponse(controllerResponseData)))
+
+    val response = verifyNoThrottling[CreateTopicsResponse](request)
+    val byName = response.data.topics().iterator().asScala.map(t => t.name() -> t.errorCode()).toMap
+    assertEquals(2, byName.size)
+    assertEquals(Errors.NONE.code, byName("items"))
+    assertEquals(Errors.TOPIC_ALREADY_EXISTS.code, byName("orders"))
+  }
+
+  @Test
   def testFindCoordinatorAutoTopicCreationForOffsetTopic(): Unit = {
     testFindCoordinatorWithTopicCreation(CoordinatorType.GROUP)
   }

@@ -121,6 +121,19 @@ class BrokerMetadataPublisher(
       // Publish the new metadata image to the metadata cache.
       metadataCache.setImage(newImage)
 
+      // Recompute the kernel's shadow set against the freshly-published topic image. Any logical
+      // topic name that now collides with a real physical topic (operator declared "orders" but a
+      // physical "orders" exists, or someone created "orders" on another broker and KRaft just
+      // propagated it) gets shadowed — isLogicalTopic returns false for the name and traffic
+      // falls through to stock physical handling. Without this, every produce/fetch to "orders"
+      // routes through the logical kernel and the physical topic becomes invisible.
+      try {
+        concentrationKernel.applyShadowOverlay(newImage.topics().topicsByName().keySet())
+      } catch {
+        case t: Throwable => metadataPublishingFaultHandler.handleFault(
+          s"Error refreshing concentration shadow overlay in $deltaName", t)
+      }
+
       def metadataVersionLogMsg = s"metadata.version ${newImage.features().metadataVersion()}"
 
       if (_firstPublish) {

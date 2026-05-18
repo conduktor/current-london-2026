@@ -175,6 +175,27 @@ public final class ConcentrationKernel implements AutoCloseable {
     }
     private volatile boolean closed = false;
 
+    /**
+     * Logical-topic names that collide with a real physical topic discovered in the KRaft metadata
+     * image. Computed by {@link #applyShadowOverlay(Set)} on every metadata image apply.
+     *
+     * <p>Why this exists: a logical declaration ("orders") and a physical topic with the same name
+     * can coexist if the operator (a) declared the logical name when a physical topic with that
+     * name already existed in the cluster, or (b) created a physical topic after the broker
+     * declared the logical name (CreateTopics interception is best-effort — another broker without
+     * the declaration would let it through, and once it's in KRaft every broker sees it). Without
+     * the shadow filter, every produce/fetch to "orders" gets routed through the logical kernel
+     * (KafkaApis dispatches on {@link #isLogicalTopic(String)} BEFORE checking the metadata cache),
+     * silently redirecting traffic away from the physical topic and orphaning it.
+     *
+     * <p>The fix is symmetric: when a name is in this set, the kernel pretends it is NOT a logical
+     * topic — {@link #isLogicalTopic}, {@link #allLogicalTopicNames}, {@link #describe} and
+     * {@link #logicalTopicByTopicId} all act as if the declaration doesn't exist. Traffic falls
+     * through to stock physical handling. The descriptor remains in the registry so the topic
+     * "un-shadows" cleanly if the physical topic is later deleted.
+     */
+    private final Set<String> shadowedLogicalNames = ConcurrentHashMap.newKeySet();
+
     public ConcentrationKernel(File sidecarDir) {
         this.recoverer = new BackingScanRecoverer(Objects.requireNonNull(sidecarDir, "sidecarDir"));
     }
@@ -187,6 +208,11 @@ public final class ConcentrationKernel implements AutoCloseable {
     }
 
     public Optional<LogicalTopicDescriptor> describe(String logicalName) {
+        // Shadowed declarations report as absent so any code path that holds a name (e.g., a fetch
+        // mid-flight) sees the same "this is not a logical topic" verdict as isLogicalTopic.
+        if (shadowedLogicalNames.contains(logicalName)) {
+            return Optional.empty();
+        }
         return registry.get(logicalName);
     }
 
@@ -195,13 +221,36 @@ public final class ConcentrationKernel implements AutoCloseable {
     }
 
     /**
-     * True if {@code name} has been declared as a logical topic on this broker. Used by broker hot
-     * paths (produce / fetch / DeleteRecords) to decide whether to route a request through the
-     * kernel or treat it as a stock physical-topic request. Cheap concurrent read — the registry
-     * is a {@link java.util.concurrent.ConcurrentHashMap} under the hood.
+     * True if {@code name} has been declared as a logical topic on this broker AND is not shadowed
+     * by a real physical topic of the same name. Used by broker hot paths (produce / fetch /
+     * DeleteRecords) to decide whether to route a request through the kernel or treat it as a
+     * stock physical-topic request. Cheap concurrent read — the registry is a {@link
+     * java.util.concurrent.ConcurrentHashMap} under the hood and the shadow set is
+     * {@link ConcurrentHashMap#newKeySet()}.
      */
     public boolean isLogicalTopic(String name) {
+        return registry.contains(name) && !shadowedLogicalNames.contains(name);
+    }
+
+    /**
+     * True if {@code name} has been declared as a logical topic on this broker, regardless of
+     * shadow state. Used by the CreateTopics interceptor to reject any attempt to create a
+     * physical topic with a name reserved for a logical declaration — including names that are
+     * already shadowed (creating a duplicate physical topic would still be a bug; the controller
+     * would reject it as TOPIC_ALREADY_EXISTS, but we surface a clearer reason).
+     */
+    public boolean isLogicalTopicDeclared(String name) {
         return registry.contains(name);
+    }
+
+    /**
+     * True if {@code name} is a declared logical topic that is currently shadowed by a real
+     * physical topic of the same name. Exposed for tests and operational observability — the
+     * broker logs a WARN whenever a name transitions into shadowed state in
+     * {@link #applyShadowOverlay(Set)}.
+     */
+    public boolean isShadowed(String name) {
+        return shadowedLogicalNames.contains(name);
     }
 
     /**
@@ -223,9 +272,66 @@ public final class ConcentrationKernel implements AutoCloseable {
     public Set<String> allLogicalTopicNames() {
         Set<String> out = new HashSet<>();
         for (LogicalTopicDescriptor d : registry.all()) {
+            String name = d.logicalName();
+            if (!shadowedLogicalNames.contains(name)) {
+                out.add(name);
+            }
+        }
+        return Set.copyOf(out);
+    }
+
+    /**
+     * Snapshot of every declared logical topic name including those currently shadowed by a real
+     * physical topic. Used by the CreateTopics interceptor — see {@link #isLogicalTopicDeclared}
+     * for the per-name version. Keep separate from {@link #allLogicalTopicNames} so the METADATA
+     * overlay never re-exposes a shadowed name back to clients.
+     */
+    public Set<String> allDeclaredLogicalTopicNames() {
+        Set<String> out = new HashSet<>();
+        for (LogicalTopicDescriptor d : registry.all()) {
             out.add(d.logicalName());
         }
         return Set.copyOf(out);
+    }
+
+    /**
+     * Recompute the shadow set against the current physical-topic name set published by the KRaft
+     * metadata image. Called by {@link kafka.server.metadata.BrokerMetadataPublisher} after every
+     * image apply.
+     *
+     * <p>Behaviour:
+     * <ul>
+     *   <li>For each declared logical name in the registry, add it to the shadow set if the same
+     *       name appears in {@code physicalTopicNames}; otherwise remove it.</li>
+     *   <li>Transitions are logged at WARN (new shadow) and INFO (shadow cleared) so an operator
+     *       can grep for unexpected overlaps in their broker logs.</li>
+     * </ul>
+     *
+     * <p>This is the single defence against silent cross-topic redirection: declarations live in
+     * broker config and the kernel cannot detect collisions at declare-time (the metadata image
+     * hasn't loaded yet). Re-evaluating on every image apply means new physical topics created
+     * elsewhere in the cluster (or pre-existing ones surfacing on first publish) shadow their
+     * logical namesake within a single metadata heartbeat.
+     */
+    public void applyShadowOverlay(Set<String> physicalTopicNames) {
+        Objects.requireNonNull(physicalTopicNames, "physicalTopicNames");
+        for (LogicalTopicDescriptor d : registry.all()) {
+            String name = d.logicalName();
+            boolean isShadow = physicalTopicNames.contains(name);
+            if (isShadow) {
+                if (shadowedLogicalNames.add(name)) {
+                    log.warn("Logical topic '{}' is shadowed by a physical topic of the same name "
+                            + "— concentration for this logical declaration is disabled until the "
+                            + "physical topic is removed. All produces/fetches to '{}' will route "
+                            + "to the physical topic.", name, name);
+                }
+            } else {
+                if (shadowedLogicalNames.remove(name)) {
+                    log.info("Logical topic '{}' is no longer shadowed (physical topic removed); "
+                            + "concentration handling resumes.", name);
+                }
+            }
+        }
     }
 
     /**
@@ -267,8 +373,15 @@ public final class ConcentrationKernel implements AutoCloseable {
     public Optional<String> logicalTopicByTopicId(Uuid topicId) {
         Objects.requireNonNull(topicId, "topicId");
         for (LogicalTopicDescriptor d : registry.all()) {
-            if (logicalTopicId(d.logicalName()).equals(topicId)) {
-                return Optional.of(d.logicalName());
+            String name = d.logicalName();
+            if (logicalTopicId(name).equals(topicId)) {
+                // Treat a shadowed name as if the logical-id mapping doesn't exist — a client
+                // refreshing by the logical UUID falls through to UNKNOWN_TOPIC_ID and refreshes
+                // by name, which routes correctly to the physical topic.
+                if (shadowedLogicalNames.contains(name)) {
+                    return Optional.empty();
+                }
+                return Optional.of(name);
             }
         }
         return Optional.empty();

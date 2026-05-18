@@ -143,6 +143,90 @@ class KafkaApis(val requestChannel: RequestChannel,
     forwardingManager.forwardRequest(request, responseCallback)
   }
 
+  /**
+   * Intercept CREATE_TOPICS to reject names that collide with a declared logical topic. Without
+   * this guard, an operator (or any client with CREATE on the cluster) could create a real
+   * physical topic whose name matches a logical declaration on this broker — every subsequent
+   * produce/fetch to that name would then collide on the dispatch path (r12 HIGH #104,
+   * r14 BLOCKER B1). The kernel's shadow-overlay re-routes around the collision at runtime, but
+   * preventing the collision at creation time keeps cluster state tidy and surfaces the operator
+   * error early with a clear TOPIC_ALREADY_EXISTS verdict.
+   *
+   * <p>The check uses {@code allDeclaredLogicalTopicNames()} (not the shadow-filtered
+   * {@code allLogicalTopicNames()}) so a name that is currently shadowed by an existing physical
+   * topic still rejects a second create attempt — the controller would reject it as duplicate
+   * too, but we surface the more specific reason.
+   *
+   * <p>Behaviour matrix:
+   * <ul>
+   *   <li>No collisions: forward unchanged.</li>
+   *   <li>All requested topics collide: synthesize a response with one
+   *       {@code TOPIC_ALREADY_EXISTS} entry per topic; do not forward.</li>
+   *   <li>Mixed: mutate the request body to remove colliding entries, forward the remainder,
+   *       inject the collision entries into the controller's response before returning.</li>
+   * </ul>
+   */
+  private def maybeForwardCreateTopicsRejectingLogicalShadow(request: RequestChannel.Request): Unit = {
+    val createTopicsRequest = request.body[CreateTopicsRequest]
+    val declared = concentrationKernel.allDeclaredLogicalTopicNames()
+    if (declared.isEmpty) {
+      forwardToController(request)
+      return
+    }
+
+    val removed = scala.collection.mutable.ArrayBuffer[String]()
+    val iter = createTopicsRequest.data.topics().iterator()
+    while (iter.hasNext) {
+      val t = iter.next()
+      if (declared.contains(t.name)) {
+        removed += t.name
+        iter.remove()
+      }
+    }
+
+    if (removed.isEmpty) {
+      forwardToController(request)
+      return
+    }
+
+    val errorMsg = "Topic name collides with a declared logical topic on this broker; " +
+      "refusing to create a physical topic that would shadow it."
+
+    if (createTopicsRequest.data.topics().isEmpty) {
+      // Every requested topic collided — short-circuit without involving the controller. Build a
+      // CreateTopicsResponse with TOPIC_ALREADY_EXISTS per shadowed name, matching the per-topic
+      // response shape stock controllers emit for duplicate-name failures.
+      val responseData = new CreateTopicsResponseData()
+      removed.foreach { name =>
+        responseData.topics().add(new CreateTopicsResponseData.CreatableTopicResult()
+          .setName(name)
+          .setErrorCode(Errors.TOPIC_ALREADY_EXISTS.code)
+          .setErrorMessage(errorMsg))
+      }
+      requestHelper.sendMaybeThrottle(request, new CreateTopicsResponse(responseData))
+      return
+    }
+
+    // Mixed: forward the filtered request to the controller, then merge the collision entries
+    // into the response so the client sees the full per-topic verdict.
+    forwardingManager.forwardRequest(request, createTopicsRequest, {
+      case Some(response: CreateTopicsResponse) =>
+        removed.foreach { name =>
+          response.data.topics().add(new CreateTopicsResponseData.CreatableTopicResult()
+            .setName(name)
+            .setErrorCode(Errors.TOPIC_ALREADY_EXISTS.code)
+            .setErrorMessage(errorMsg))
+        }
+        requestHelper.sendForwardedResponse(request, response)
+      case Some(other) =>
+        // Controller returned a non-CreateTopics response (e.g., an error envelope). Forward
+        // as-is — the collision entries can't be merged into something we don't understand and
+        // the client will see the controller's verdict.
+        requestHelper.sendForwardedResponse(request, other)
+      case None => handleInvalidVersionsDuringForwarding(request)
+    })
+  }
+
   private def handleInvalidVersionsDuringForwarding(request: RequestChannel.Request): Unit = {
     info(s"The client connection will be closed due to controller responded " +
       s"unsupported version exception during $request forwarding. " +
@@ -186,7 +270,7 @@ class KafkaApis(val requestChannel: RequestChannel,
         case ApiKeys.LIST_GROUPS => handleListGroupsRequest(request).exceptionally(handleError)
         case ApiKeys.SASL_HANDSHAKE => handleSaslHandshakeRequest(request)
         case ApiKeys.API_VERSIONS => handleApiVersionsRequest(request)
-        case ApiKeys.CREATE_TOPICS => forwardToController(request)
+        case ApiKeys.CREATE_TOPICS => maybeForwardCreateTopicsRejectingLogicalShadow(request)
         case ApiKeys.DELETE_TOPICS => forwardToController(request)
         case ApiKeys.DELETE_RECORDS => handleDeleteRecordsRequest(request)
         case ApiKeys.INIT_PRODUCER_ID => handleInitProducerIdRequest(request, requestLocal)

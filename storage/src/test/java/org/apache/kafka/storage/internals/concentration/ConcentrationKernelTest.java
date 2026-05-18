@@ -1552,4 +1552,72 @@ public class ConcentrationKernelTest {
         assertEquals(Set.of("orders", "payments"), names,
             "allLogicalTopicNames must return every declared logical topic");
     }
+
+    @Test
+    public void applyShadowOverlayMarksLogicalNameShadowedWhenPhysicalExists() {
+        // r14 BLOCKER B1 / r12 #104: if a real physical topic with the same name as a logical
+        // declaration appears in the metadata image, the kernel must transparently disable
+        // concentration handling for that name — otherwise produce/fetch routes through the
+        // logical kernel and orphans the physical topic.
+        kernel.declare(descriptor("orders", 4, "shared", 2));
+        assertTrue(kernel.isLogicalTopic("orders"));
+        assertFalse(kernel.isShadowed("orders"));
+
+        kernel.applyShadowOverlay(Set.of("orders", "other-physical"));
+
+        assertTrue(kernel.isShadowed("orders"));
+        assertFalse(kernel.isLogicalTopic("orders"),
+            "isLogicalTopic must report shadowed names as non-logical so hot paths route to physical");
+        assertTrue(kernel.isLogicalTopicDeclared("orders"),
+            "isLogicalTopicDeclared keeps reporting declared names regardless of shadow state");
+        assertTrue(kernel.allLogicalTopicNames().isEmpty(),
+            "shadowed names must not appear in the METADATA overlay set");
+        assertTrue(kernel.allDeclaredLogicalTopicNames().contains("orders"),
+            "CreateTopics interceptor must still see the declaration to reject collisions");
+        assertTrue(kernel.describe("orders").isEmpty(),
+            "describe() must return empty for shadowed names so mid-flight code paths see the same verdict");
+    }
+
+    @Test
+    public void applyShadowOverlayClearsShadowWhenPhysicalDisappears() {
+        // Operator deletes the colliding physical topic. The next metadata image should drop the
+        // shadow flag and re-enable concentration for the logical declaration.
+        kernel.declare(descriptor("orders", 4, "shared", 2));
+        kernel.applyShadowOverlay(Set.of("orders"));
+        assertTrue(kernel.isShadowed("orders"));
+
+        kernel.applyShadowOverlay(Set.of()); // physical topic gone
+
+        assertFalse(kernel.isShadowed("orders"));
+        assertTrue(kernel.isLogicalTopic("orders"));
+        assertEquals(Set.of("orders"), kernel.allLogicalTopicNames());
+    }
+
+    @Test
+    public void applyShadowOverlayLeavesUnrelatedNamesAlone() {
+        // Physical topics that don't collide with any logical declaration must not appear in the
+        // shadow set — the overlay only tracks logical-name collisions.
+        kernel.declare(descriptor("orders", 4, "shared", 2));
+        kernel.applyShadowOverlay(Set.of("unrelated-physical", "another-physical"));
+
+        assertFalse(kernel.isShadowed("orders"));
+        assertFalse(kernel.isShadowed("unrelated-physical"));
+        assertTrue(kernel.isLogicalTopic("orders"));
+    }
+
+    @Test
+    public void logicalTopicByTopicIdReturnsEmptyForShadowedName() {
+        // Defence-in-depth: a v12+ client cached the logical UUID before the physical topic
+        // appeared. Once shadowed, the kernel must not resolve the UUID back to the (now-shadowed)
+        // logical name, or the METADATA path would re-enter logical synthesis through the by-id
+        // overlay.
+        kernel.declare(descriptor("orders", 4, "shared", 2));
+        Uuid logicalId = kernel.logicalTopicId("orders");
+        assertEquals("orders", kernel.logicalTopicByTopicId(logicalId).orElse(null));
+
+        kernel.applyShadowOverlay(Set.of("orders"));
+
+        assertTrue(kernel.logicalTopicByTopicId(logicalId).isEmpty(),
+            "shadowed names must not be reachable via the by-topic-id overlay");
+    }
 }
