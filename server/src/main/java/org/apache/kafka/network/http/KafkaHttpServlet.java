@@ -212,8 +212,10 @@ public final class KafkaHttpServlet extends HttpServlet {
         HttpServletResponse resp = (HttpServletResponse) async.getResponse();
         try {
             if (throwable != null) {
+                // Stock JDK exception messages can leak class and field names ("Cannot invoke X.y() because z is null").
+                // The full throwable is logged for operators; the client gets a sanitised generic phrase.
                 LOG.warn("HTTP bridge produced an unhandled exception", throwable);
-                writeInternalError(resp, throwable.getMessage());
+                writeInternalError(resp, "internal server error");
             } else {
                 writeBridgeResponse(resp, response, contentType);
             }

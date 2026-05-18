@@ -21,6 +21,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 
 import org.apache.kafka.common.protocol.Errors;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -48,6 +51,8 @@ import java.util.concurrent.TimeoutException;
  * response. This invariant is what lets the transport adapter be a thin shell with no error-handling logic of its own.
  */
 public final class KafkaHttpBridge {
+
+    private static final Logger LOG = LoggerFactory.getLogger(KafkaHttpBridge.class);
 
     /** Sentinel that disables the safety net — for tests that want to assert pre-timeout behaviour deterministically. */
     public static final long NO_TIMEOUT = 0L;
@@ -94,8 +99,12 @@ public final class KafkaHttpBridge {
                         "request timed out after " + requestTimeoutMs + "ms", 0L);
                 }
                 if (throwable != null) {
+                    // Log the real cause server-side; never echo throwable.getMessage() to the client. Stock JDK
+                    // messages (e.g. "Cannot invoke X.y() because z is null") leak class and field names; sanitised
+                    // Kafka errors already flow through the partition/topic-error paths above, not this branch.
+                    LOG.warn("HTTP bridge produce failed unexpectedly for {}", command.topic(), throwable);
                     return produceFormatter.topLevelError(
-                        command.topic(), Errors.UNKNOWN_SERVER_ERROR, throwable.getMessage(), 0L);
+                        command.topic(), Errors.UNKNOWN_SERVER_ERROR, null, 0L);
                 }
                 return produceFormatter.format(command.topic(), result.partitions(), result.throttleTimeMs());
             });
@@ -118,8 +127,10 @@ public final class KafkaHttpBridge {
                         "request timed out after " + requestTimeoutMs + "ms", 0L);
                 }
                 if (throwable != null) {
+                    // See produce() above — never echo throwable.getMessage() to the client.
+                    LOG.warn("HTTP bridge fetch failed unexpectedly for {}", command.topic(), throwable);
                     return fetchFormatter.topLevelError(
-                        command.topic(), Errors.UNKNOWN_SERVER_ERROR, throwable.getMessage(), 0L);
+                        command.topic(), Errors.UNKNOWN_SERVER_ERROR, null, 0L);
                 }
                 return fetchFormatter.format(command.topic(), result.partition(), result.throttleTimeMs());
             });

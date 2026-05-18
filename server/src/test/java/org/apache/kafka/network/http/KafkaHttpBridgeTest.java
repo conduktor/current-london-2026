@@ -179,14 +179,20 @@ class KafkaHttpBridgeTest {
     @Test
     void produceReturns500WhenSubmitterFails() throws Exception {
         FakeSubmitter submitter = new FakeSubmitter();
-        submitter.produceFailure = new RuntimeException("broker down");
+        // Deliberately put internals-revealing text in the exception so we can prove the bridge does NOT echo it.
+        submitter.produceFailure = new RuntimeException("Cannot invoke kafka.Foo.bar() because secret is null");
 
         KafkaHttpBridge bridge = new KafkaHttpBridge(mapper, submitter);
         HttpBridgeResponse r = bridge.produce("orders",
             json("{\"records\":[{\"value\":{\"type\":\"STRING\",\"data\":\"x\"}}]}")).get();
 
         assertEquals(500, r.status());
-        assertNotNull(r.body().get("errorMessage"));
+        assertEquals(Errors.UNKNOWN_SERVER_ERROR.code(), r.body().get("errorCode").asInt());
+        String errorMessage = r.body().get("errorMessage").asText();
+        assertEquals(Errors.UNKNOWN_SERVER_ERROR.message(), errorMessage,
+            "client must see the sanitised Kafka error text, never the throwable's getMessage()");
+        assertFalse(errorMessage.contains("secret"),
+            "throwable details must not leak through the error envelope");
     }
 
     // ----- fetch: happy path -----
@@ -274,7 +280,9 @@ class KafkaHttpBridgeTest {
             public CompletableFuture<RequestSubmitter.FetchResult> submitFetch(
                     FetchRequestParser.FetchCommand command) {
                 CompletableFuture<RequestSubmitter.FetchResult> f = new CompletableFuture<>();
-                f.completeExceptionally(new RuntimeException("broker down"));
+                // Deliberately put internals-revealing text here — the bridge must NOT echo it back to the client.
+                f.completeExceptionally(new RuntimeException(
+                    "Cannot invoke org.apache.kafka.Foo.bar() because secret is null"));
                 return f;
             }
         };
@@ -283,6 +291,12 @@ class KafkaHttpBridgeTest {
         HttpBridgeResponse r = bridge.fetch("orders", QueryParams.of("partition", "0", "offset", "0")).get();
 
         assertEquals(500, r.status());
+        assertEquals(Errors.UNKNOWN_SERVER_ERROR.code(), r.body().get("errorCode").asInt());
+        String errorMessage = r.body().get("errorMessage").asText();
+        assertEquals(Errors.UNKNOWN_SERVER_ERROR.message(), errorMessage,
+            "client must see the sanitised Kafka error text, never the throwable's getMessage()");
+        assertFalse(errorMessage.contains("secret"),
+            "throwable details must not leak through the error envelope");
     }
 
     @Test
