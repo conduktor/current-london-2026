@@ -2019,6 +2019,7 @@ class KafkaApis(val requestChannel: RequestChannel,
     val unauthorizedTopicResponses = mutable.Map[TopicPartition, DeleteRecordsPartitionResult]()
     val nonExistingTopicResponses = mutable.Map[TopicPartition, DeleteRecordsPartitionResult]()
     val logicalTopicResponses = mutable.Map[TopicPartition, DeleteRecordsPartitionResult]()
+    val invalidTopicResponses = mutable.Map[TopicPartition, DeleteRecordsPartitionResult]()
     val authorizedForDeleteTopicOffsets = mutable.Map[TopicPartition, Long]()
 
     val topics = deleteRecordsRequest.data.topics.asScala
@@ -2033,6 +2034,16 @@ class KafkaApis(val requestChannel: RequestChannel,
         unauthorizedTopicResponses += topicPartition -> new DeleteRecordsPartitionResult()
           .setLowWatermark(DeleteRecordsResponse.INVALID_LOW_WATERMARK)
           .setErrorCode(Errors.TOPIC_AUTHORIZATION_FAILED.code)
+      else if (concentrationKernel.isBackingTopic(topicPartition.topic))
+        // Concentration v1: a backing topic's physical log is shared by N>>1 logical topics;
+        // truncating it with a stock DeleteRecords would drop records that logical topics on
+        // sibling partitions still consider readable, while sidecar logical start offsets stay
+        // unchanged — a silent correctness break. Pin the rejection at the same level as the
+        // Produce-path guard (line 423), using INVALID_TOPIC_EXCEPTION so admin clients see a
+        // clear non-retriable failure pointing them at the logical topic name.
+        invalidTopicResponses += topicPartition -> new DeleteRecordsPartitionResult()
+          .setLowWatermark(DeleteRecordsResponse.INVALID_LOW_WATERMARK)
+          .setErrorCode(Errors.INVALID_TOPIC_EXCEPTION.code)
       else if (concentrationKernel.isLogicalTopic(topicPartition.topic)) {
         // Concentration v1: a logical-topic DeleteRecords advances only THIS logical partition's
         // start offset; the backing log is not truncated and sibling logical topics on the same
@@ -2124,7 +2135,7 @@ class KafkaApis(val requestChannel: RequestChannel,
 
     // the callback for sending a DeleteRecordsResponse
     def sendResponseCallback(authorizedTopicResponses: Map[TopicPartition, DeleteRecordsPartitionResult]): Unit = {
-      val mergedResponseStatus = authorizedTopicResponses ++ unauthorizedTopicResponses ++ nonExistingTopicResponses ++ logicalTopicResponses
+      val mergedResponseStatus = authorizedTopicResponses ++ unauthorizedTopicResponses ++ nonExistingTopicResponses ++ logicalTopicResponses ++ invalidTopicResponses
       mergedResponseStatus.foreachEntry { (topicPartition, status) =>
         if (status.errorCode != Errors.NONE.code) {
           debug("DeleteRecordsRequest with correlation id %d from client %s on partition %s failed due to %s".format(

@@ -3034,6 +3034,45 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testDeleteRecordsOnBackingTopicIsRejectedWithInvalidTopic(): Unit = {
+    // Codex BLOCKER 4 / Gemini #58. A backing topic's physical log is shared by N logical
+    // topics on the same partition. A stock DeleteRecords against the backing name would
+    // truncate physical state under all of them while sidecar logical start offsets stay
+    // unchanged — silent correctness break. The handler must reject at the same level as
+    // the Produce-path guard (KafkaApis.scala:423), surfacing INVALID_TOPIC_EXCEPTION.
+    val backingTopic = "backing-topic"
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+    // isLogicalTopic is checked AFTER isBackingTopic; we don't stub it because the guard
+    // must short-circuit before reaching it. If the order regressed, the unstubbed default
+    // (false) would still let the request fall through to replicaManager — which the
+    // never() verify below detects.
+
+    val deleteRecordsRequest = new DeleteRecordsRequest.Builder(new DeleteRecordsRequestData()
+      .setTopics(Collections.singletonList(new DeleteRecordsTopic()
+        .setName(backingTopic)
+        .setPartitions(Collections.singletonList(new DeleteRecordsPartition()
+          .setOffset(42L)
+          .setPartitionIndex(0)))))
+      .setTimeoutMs(5000)).build()
+    val request = buildRequest(deleteRecordsRequest)
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleDeleteRecordsRequest(request)
+
+    val response = verifyNoThrottling[DeleteRecordsResponse](request)
+    val partitionResult = response.data.topics.asScala.head.partitions.asScala.head
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION, Errors.forCode(partitionResult.errorCode))
+    assertEquals(DeleteRecordsResponse.INVALID_LOW_WATERMARK, partitionResult.lowWatermark)
+    // Neither the kernel nor the replica manager must see this request — it is rejected
+    // entirely at the handler level.
+    verify(concentrationKernel, never()).advanceStartOffset(any[String], anyInt, anyLong)
+    verify(replicaManager, never()).deleteRecords(anyLong, any(), any(), anyBoolean)
+  }
+
+  @Test
   def testDeleteRecordsOnLogicalTopicAdvancesKernelStartOffsetAndBypassesReplicaManager(): Unit = {
     // Concentration v1 PROMPT.md acceptance criterion 3: DeleteRecords on a logical topic
     // advances ONLY that logical partition's start offset; the backing log is not truncated.
