@@ -95,7 +95,7 @@ import org.apache.kafka.server.share.context.{FinalContext, ShareSessionContext}
 import org.apache.kafka.server.share.session.{ShareSession, ShareSessionKey}
 import org.apache.kafka.server.storage.log.{FetchParams, FetchPartitionData}
 import org.apache.kafka.server.util.{FutureUtils, MockTime}
-import org.apache.kafka.storage.internals.concentration.{ConcentrationKernel, LogicalTopicDescriptor}
+import org.apache.kafka.storage.internals.concentration.{ConcentrationHeaders, ConcentrationKernel, LogicalTopicDescriptor, Reservation}
 import org.apache.kafka.storage.internals.log.{AppendOrigin, LogConfig}
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats
 import org.junit.jupiter.api.Assertions._
@@ -2108,6 +2108,294 @@ class KafkaApisTest extends Logging {
     // otherwise the rejection would be racing the real append rather than short-circuiting it.
     verify(replicaManager, never()).handleProduceAppend(anyLong, anyShort, ArgumentMatchers.eq(false),
       any(), any(), any(), any(), any(), any(), any())
+  }
+
+  @Test
+  def testProduceToLogicalTopicStampsHeadersAndCommitsLogicalOffsets(): Unit = {
+    // Concentration hook #2 happy path. A stock producer sends a 3-record batch to logical
+    // topic "orders" partition 0. The hook must:
+    //   1. Resolve backing partition via the kernel.
+    //   2. Reserve 3 logical offsets atomically.
+    //   3. Stamp every record with __concentration_logical_topic and __concentration_logical_offset.
+    //   4. Route the rewritten batch to ReplicaManager keyed by the BACKING topic-partition.
+    //   5. On success, commit the reservation and remap the response key back to the LOGICAL TP
+    //      with baseOffset/lastOffset rewritten from backing offsets into logical offsets.
+    // Anchoring all five in one test pins the full produce-path contract — splitting them would
+    // either need a wider seam in production code or duplicate mock plumbing five times over.
+    val logicalTopic = "orders"
+    val backingTopic = "concentrated"
+    val descriptor = new LogicalTopicDescriptor(logicalTopic, 1024, backingTopic, 4)
+    addTopicToMetadataCache(backingTopic, numPartitions = 4)
+
+    when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
+    when(concentrationKernel.describe(logicalTopic)).thenReturn(Optional.of(descriptor))
+    when(concentrationKernel.backingPartitionFor(logicalTopic, 0)).thenReturn(2)
+
+    val res0 = mock(classOf[Reservation]); when(res0.logicalOffset).thenReturn(500L)
+    val res1 = mock(classOf[Reservation]); when(res1.logicalOffset).thenReturn(501L)
+    val res2 = mock(classOf[Reservation]); when(res2.logicalOffset).thenReturn(502L)
+    val reservations = Array(res0, res1, res2)
+    when(concentrationKernel.reserveProduceBatch(logicalTopic, 0, 3)).thenReturn(reservations)
+
+    val tp = new TopicPartition(logicalTopic, 0)
+    val originalRecords = MemoryRecords.withRecords(Compression.NONE,
+      new SimpleRecord("k1".getBytes, "v1".getBytes),
+      new SimpleRecord("k2".getBytes, "v2".getBytes),
+      new SimpleRecord("k3".getBytes, "v3".getBytes))
+    val produceRequest = ProduceRequest.builder(new ProduceRequestData()
+      .setTopicData(new ProduceRequestData.TopicProduceDataCollection(
+        Collections.singletonList(new ProduceRequestData.TopicProduceData()
+          .setName(tp.topic).setPartitionData(Collections.singletonList(
+            new ProduceRequestData.PartitionProduceData()
+              .setIndex(tp.partition)
+              .setRecords(originalRecords))))
+          .iterator))
+      .setAcks(1.toShort)
+      .setTimeoutMs(5000))
+      .build(ApiKeys.PRODUCE.latestVersion)
+    val request = buildRequest(produceRequest)
+
+    val entriesCaptor: ArgumentCaptor[Map[TopicPartition, MemoryRecords]] =
+      ArgumentCaptor.forClass(classOf[Map[TopicPartition, MemoryRecords]])
+    val callbackCaptor: ArgumentCaptor[Map[TopicPartition, PartitionResponse] => Unit] =
+      ArgumentCaptor.forClass(classOf[Map[TopicPartition, PartitionResponse] => Unit])
+
+    val backingTp = new TopicPartition(backingTopic, 2)
+    when(replicaManager.handleProduceAppend(anyLong, anyShort, ArgumentMatchers.eq(false),
+      any(), entriesCaptor.capture(), callbackCaptor.capture(),
+      any(), any(), any(), any())
+    ).thenAnswer { _ =>
+      // Simulate ReplicaManager succeeding with backing baseOffset=900. The hook must rewrite
+      // this into the logical baseOffset (500) before the producer sees the response.
+      callbackCaptor.getValue.apply(Map(backingTp -> new PartitionResponse(
+        Errors.NONE, 900L, RecordBatch.NO_TIMESTAMP, 0L)))
+    }
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    // ReplicaManager saw the BACKING topic-partition, not the logical one, with stamped records.
+    val capturedEntries = entriesCaptor.getValue
+    assertTrue(capturedEntries.contains(backingTp),
+      s"expected backing TP $backingTp in entries, got ${capturedEntries.keys}")
+    assertFalse(capturedEntries.contains(tp),
+      "logical TP must not leak into ReplicaManager.handleProduceAppend")
+    val stamped = capturedEntries(backingTp)
+    val stampedRecords = stamped.records().iterator()
+    var i = 0
+    while (stampedRecords.hasNext) {
+      val r = stampedRecords.next()
+      val hs = r.headers()
+      assertTrue(hs.length >= 2, s"record $i missing concentration headers")
+      assertEquals(ConcentrationHeaders.LOGICAL_TOPIC_HEADER, hs(hs.length - 2).key())
+      assertEquals(logicalTopic, new String(hs(hs.length - 2).value(),
+        java.nio.charset.StandardCharsets.UTF_8))
+      assertEquals(ConcentrationHeaders.LOGICAL_OFFSET_HEADER, hs(hs.length - 1).key())
+      assertEquals(500L + i,
+        java.nio.ByteBuffer.wrap(hs(hs.length - 1).value()).getLong)
+      i += 1
+    }
+    assertEquals(3, i, "expected 3 stamped records")
+
+    // Commit was invoked with the backing baseOffset returned by ReplicaManager.
+    verify(concentrationKernel).commitProduceBatch(reservations, 900L)
+    verify(concentrationKernel, never()).rollbackProduceBatch(any())
+
+    // The producer-visible response is keyed by the LOGICAL TP and carries logical offsets.
+    val response = verifyNoThrottling[ProduceResponse](request)
+    assertEquals(1, response.data.responses.size)
+    val topicProduceResponse = response.data.responses.asScala.head
+    assertEquals(logicalTopic, topicProduceResponse.name)
+    val partitionProduceResponse = topicProduceResponse.partitionResponses.asScala.head
+    assertEquals(0, partitionProduceResponse.index)
+    assertEquals(Errors.NONE, Errors.forCode(partitionProduceResponse.errorCode))
+    assertEquals(500L, partitionProduceResponse.baseOffset,
+      "baseOffset must be the FIRST logical offset, not the backing offset (900)")
+  }
+
+  @Test
+  def testProduceToLogicalTopicRollsBackReservationOnAppendError(): Unit = {
+    // When the backing append fails (NotLeader, log full, anything non-NONE), the kernel
+    // reservation must be rolled back so the next produce doesn't see a phantom hole at the
+    // reserved logical offsets. The producer-visible response is still keyed by the logical
+    // TP — leaking the backing TP into the error path would be a metadata leak.
+    val logicalTopic = "orders"
+    val backingTopic = "concentrated"
+    val descriptor = new LogicalTopicDescriptor(logicalTopic, 1024, backingTopic, 4)
+    addTopicToMetadataCache(backingTopic, numPartitions = 4)
+    when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
+    when(concentrationKernel.describe(logicalTopic)).thenReturn(Optional.of(descriptor))
+    when(concentrationKernel.backingPartitionFor(logicalTopic, 0)).thenReturn(2)
+
+    val res0 = mock(classOf[Reservation]); when(res0.logicalOffset).thenReturn(7L)
+    val reservations = Array(res0)
+    when(concentrationKernel.reserveProduceBatch(logicalTopic, 0, 1)).thenReturn(reservations)
+
+    val tp = new TopicPartition(logicalTopic, 0)
+    val produceRequest = ProduceRequest.builder(new ProduceRequestData()
+      .setTopicData(new ProduceRequestData.TopicProduceDataCollection(
+        Collections.singletonList(new ProduceRequestData.TopicProduceData()
+          .setName(tp.topic).setPartitionData(Collections.singletonList(
+            new ProduceRequestData.PartitionProduceData()
+              .setIndex(tp.partition)
+              .setRecords(MemoryRecords.withRecords(Compression.NONE,
+                new SimpleRecord("payload".getBytes))))))
+          .iterator))
+      .setAcks(1.toShort)
+      .setTimeoutMs(5000))
+      .build(ApiKeys.PRODUCE.latestVersion)
+    val request = buildRequest(produceRequest)
+
+    val callbackCaptor: ArgumentCaptor[Map[TopicPartition, PartitionResponse] => Unit] =
+      ArgumentCaptor.forClass(classOf[Map[TopicPartition, PartitionResponse] => Unit])
+    val backingTp = new TopicPartition(backingTopic, 2)
+    when(replicaManager.handleProduceAppend(anyLong, anyShort, ArgumentMatchers.eq(false),
+      any(), any(), callbackCaptor.capture(),
+      any(), any(), any(), any())
+    ).thenAnswer { _ =>
+      // KAFKA_STORAGE_ERROR is a representative "append failed" condition that doesn't
+      // require the response path to look up a current leader (which would need a mocked
+      // Partition). It exercises the rollback branch without that ceremony.
+      callbackCaptor.getValue.apply(Map(backingTp -> new PartitionResponse(Errors.KAFKA_STORAGE_ERROR)))
+    }
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    verify(concentrationKernel).rollbackProduceBatch(reservations)
+    verify(concentrationKernel, never()).commitProduceBatch(any(), anyLong)
+
+    val response = verifyNoThrottling[ProduceResponse](request)
+    val topicProduceResponse = response.data.responses.asScala.head
+    assertEquals(logicalTopic, topicProduceResponse.name,
+      "error response must be remapped to the logical TP — leaking the backing TP is a metadata leak")
+    val partitionProduceResponse = topicProduceResponse.partitionResponses.asScala.head
+    assertEquals(Errors.KAFKA_STORAGE_ERROR, Errors.forCode(partitionProduceResponse.errorCode))
+  }
+
+  @Test
+  def testProduceToLogicalTopicRejectsOutOfRangePartitionWithUnknownTopicOrPartition(): Unit = {
+    // A logical topic declared with N=1024 partitions must reject produces to partition 1024+.
+    // This is a client routing bug, not transient — UNKNOWN_TOPIC_OR_PARTITION is the same
+    // error stock topics return for out-of-range partition.
+    val logicalTopic = "orders"
+    val backingTopic = "concentrated"
+    when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
+    when(concentrationKernel.describe(logicalTopic))
+      .thenReturn(Optional.of(new LogicalTopicDescriptor(logicalTopic, 1024, backingTopic, 4)))
+
+    val tp = new TopicPartition(logicalTopic, 9999)
+    val produceRequest = ProduceRequest.builder(new ProduceRequestData()
+      .setTopicData(new ProduceRequestData.TopicProduceDataCollection(
+        Collections.singletonList(new ProduceRequestData.TopicProduceData()
+          .setName(tp.topic).setPartitionData(Collections.singletonList(
+            new ProduceRequestData.PartitionProduceData()
+              .setIndex(tp.partition)
+              .setRecords(MemoryRecords.withRecords(Compression.NONE,
+                new SimpleRecord("payload".getBytes))))))
+          .iterator))
+      .setAcks(1.toShort).setTimeoutMs(5000))
+      .build(ApiKeys.PRODUCE.latestVersion)
+    val request = buildRequest(produceRequest)
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[ProduceResponse](request)
+    val partitionProduceResponse = response.data.responses.asScala.head.partitionResponses.asScala.head
+    assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION, Errors.forCode(partitionProduceResponse.errorCode))
+    // Out-of-range partition must NEVER reach the reservation or append path.
+    verify(concentrationKernel, never()).reserveProduceBatch(any[String], anyInt, anyInt)
+    verify(replicaManager, never()).handleProduceAppend(anyLong, anyShort, ArgumentMatchers.eq(false),
+      any(), any(), any(), any(), any(), any(), any())
+  }
+
+  @Test
+  def testProduceToLogicalTopicCollidingOnBackingPartitionFailsSecondEntry(): Unit = {
+    // v1 limitation: two logical topics in the SAME ProduceRequest routing to the same backing
+    // partition would collide in authorizedRequestInfo's TP key, silently dropping or
+    // coalescing records. We fail the SECOND entry loudly with KAFKA_STORAGE_ERROR rather than
+    // silently corrupt offset sequencing. The first entry must still succeed normally.
+    val logicalA = "orders"
+    val logicalB = "events"
+    val backingTopic = "concentrated"
+    val descriptorA = new LogicalTopicDescriptor(logicalA, 1024, backingTopic, 4)
+    val descriptorB = new LogicalTopicDescriptor(logicalB, 1024, backingTopic, 4)
+    addTopicToMetadataCache(backingTopic, numPartitions = 4)
+    when(concentrationKernel.isLogicalTopic(logicalA)).thenReturn(true)
+    when(concentrationKernel.isLogicalTopic(logicalB)).thenReturn(true)
+    when(concentrationKernel.describe(logicalA)).thenReturn(Optional.of(descriptorA))
+    when(concentrationKernel.describe(logicalB)).thenReturn(Optional.of(descriptorB))
+    // Both logical topics route to backing partition 2 — engineered collision.
+    when(concentrationKernel.backingPartitionFor(logicalA, 0)).thenReturn(2)
+    when(concentrationKernel.backingPartitionFor(logicalB, 0)).thenReturn(2)
+
+    val resA0 = mock(classOf[Reservation]); when(resA0.logicalOffset).thenReturn(100L)
+    when(concentrationKernel.reserveProduceBatch(logicalA, 0, 1)).thenReturn(Array(resA0))
+
+    val tpA = new TopicPartition(logicalA, 0)
+    val tpB = new TopicPartition(logicalB, 0)
+    val produceRequest = ProduceRequest.builder(new ProduceRequestData()
+      .setTopicData(new ProduceRequestData.TopicProduceDataCollection(java.util.Arrays.asList(
+        new ProduceRequestData.TopicProduceData()
+          .setName(tpA.topic).setPartitionData(Collections.singletonList(
+            new ProduceRequestData.PartitionProduceData()
+              .setIndex(tpA.partition)
+              .setRecords(MemoryRecords.withRecords(Compression.NONE, new SimpleRecord("a".getBytes))))),
+        new ProduceRequestData.TopicProduceData()
+          .setName(tpB.topic).setPartitionData(Collections.singletonList(
+            new ProduceRequestData.PartitionProduceData()
+              .setIndex(tpB.partition)
+              .setRecords(MemoryRecords.withRecords(Compression.NONE, new SimpleRecord("b".getBytes))))))
+          .iterator))
+      .setAcks(1.toShort).setTimeoutMs(5000))
+      .build(ApiKeys.PRODUCE.latestVersion)
+    val request = buildRequest(produceRequest)
+
+    val callbackCaptor: ArgumentCaptor[Map[TopicPartition, PartitionResponse] => Unit] =
+      ArgumentCaptor.forClass(classOf[Map[TopicPartition, PartitionResponse] => Unit])
+    val backingTp = new TopicPartition(backingTopic, 2)
+    when(replicaManager.handleProduceAppend(anyLong, anyShort, ArgumentMatchers.eq(false),
+      any(), any(), callbackCaptor.capture(),
+      any(), any(), any(), any())
+    ).thenAnswer { _ =>
+      callbackCaptor.getValue.apply(Map(backingTp -> new PartitionResponse(
+        Errors.NONE, 50L, RecordBatch.NO_TIMESTAMP, 0L)))
+    }
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[ProduceResponse](request)
+    val byTopic = response.data.responses.asScala.map(r => r.name -> r).toMap
+    val responseA = byTopic(logicalA).partitionResponses.asScala.head
+    val responseB = byTopic(logicalB).partitionResponses.asScala.head
+
+    assertEquals(Errors.NONE, Errors.forCode(responseA.errorCode), "first colliding entry must succeed")
+    assertEquals(100L, responseA.baseOffset)
+    assertEquals(Errors.KAFKA_STORAGE_ERROR, Errors.forCode(responseB.errorCode),
+      "second colliding entry must be rejected loudly, not silently coalesced")
+
+    // Only the first entry consumed a reservation.
+    verify(concentrationKernel).reserveProduceBatch(logicalA, 0, 1)
+    verify(concentrationKernel, never()).reserveProduceBatch(ArgumentMatchers.eq(logicalB), anyInt, anyInt)
   }
 
   @Test

@@ -66,7 +66,7 @@ import org.apache.kafka.server.share.context.ShareFetchContext
 import org.apache.kafka.server.share.{ErroneousAndValidPartitionData, SharePartitionKey}
 import org.apache.kafka.server.share.acknowledge.ShareAcknowledgementBatch
 import org.apache.kafka.server.storage.log.{FetchIsolation, FetchParams, FetchPartitionData}
-import org.apache.kafka.storage.internals.concentration.ConcentrationKernel
+import org.apache.kafka.storage.internals.concentration.{ConcentrationKernel, LogicalProduceStamper, Reservation}
 import org.apache.kafka.storage.internals.log.AppendOrigin
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats
 
@@ -398,6 +398,12 @@ class KafkaApis(val requestChannel: RequestChannel,
     val nonExistingTopicResponses = mutable.Map[TopicPartition, PartitionResponse]()
     val invalidRequestResponses = mutable.Map[TopicPartition, PartitionResponse]()
     val authorizedRequestInfo = mutable.Map[TopicPartition, MemoryRecords]()
+    // Concentration hook #2 side-map. Each entry pins one logical-topic produce that has been
+    // rewritten in authorizedRequestInfo to its backing-topic key. We need three pieces at
+    // response time: the original logical TopicPartition (to remap the response back so the
+    // producer sees its own topic+partition), and the Reservation[] (so we can commit on
+    // success / rollback on error). Kept empty unless any logical topic appears in this request.
+    val logicalByBacking = mutable.Map[TopicPartition, (TopicPartition, Array[Reservation])]()
     // cache the result to avoid redundant authorization calls
     val authorizedTopics = authHelper.filterByAuthorized(request.context, WRITE, TOPIC,
       produceRequest.data().topicData().asScala)(_.name())
@@ -417,6 +423,58 @@ class KafkaApis(val requestChannel: RequestChannel,
         // payloads and break per-logical-topic offset sequencing. Pin this as the topic-level
         // error (INVALID_TOPIC_EXCEPTION) so the producer sees a clear, non-retriable failure.
         invalidRequestResponses += topicPartition -> new PartitionResponse(Errors.INVALID_TOPIC_EXCEPTION)
+      else if (concentrationKernel.isLogicalTopic(topicPartition.topic)) {
+        // Concentration hook #2: produce routing + offset assignment for a logical topic. The
+        // record-validation step still runs against the raw client-supplied MemoryRecords so
+        // protocol violations are caught BEFORE we reserve logical offsets — a reservation we
+        // can't fulfil means we have to rollback, which is more expensive than refusing up front.
+        val descriptor = concentrationKernel.describe(topicPartition.topic).get
+        if (topicPartition.partition < 0 || topicPartition.partition >= descriptor.numLogicalPartitions) {
+          // Out-of-range partition is a client routing bug, not a transient error.
+          nonExistingTopicResponses += topicPartition -> new PartitionResponse(Errors.UNKNOWN_TOPIC_OR_PARTITION)
+        } else {
+          val backingPartition = concentrationKernel.backingPartitionFor(topicPartition.topic, topicPartition.partition)
+          val backingTp = new TopicPartition(descriptor.backingTopic, backingPartition)
+          if (!metadataCache.contains(backingTp))
+            nonExistingTopicResponses += topicPartition -> new PartitionResponse(Errors.UNKNOWN_TOPIC_OR_PARTITION)
+          else if (logicalByBacking.contains(backingTp))
+            // v1 limitation: two logical topics in the SAME ProduceRequest that both route to
+            // the same backing partition would collide in authorizedRequestInfo's TP key. Rather
+            // than silently dropping or coalescing (and risking record reordering), we fail the
+            // second entry loudly with KAFKA_STORAGE_ERROR. Realistic producer clients don't
+            // multiplex across logical topics in one ProduceRequest, so this path is rare.
+            invalidRequestResponses += topicPartition -> new PartitionResponse(Errors.KAFKA_STORAGE_ERROR,
+              "concentration v1 does not yet coalesce two logical topics that share a backing partition")
+          else
+            try {
+              ProduceRequest.validateRecords(request.header.apiVersion, memoryRecords)
+              val k = LogicalProduceStamper.countRecords(memoryRecords)
+              if (k == 0) {
+                // Empty batch — pass through as NONE so the producer sees an immediate ack
+                // without us consuming any logical offsets. Mirrors stock-topic behaviour:
+                // ProduceRequest.validateRecords already accepted it, no further work needed.
+                invalidRequestResponses += topicPartition -> new PartitionResponse(Errors.NONE,
+                  -1L, RecordBatch.NO_TIMESTAMP, -1L)
+              } else {
+                val reservations = concentrationKernel.reserveProduceBatch(
+                  topicPartition.topic, topicPartition.partition, k)
+                val logicalOffsets = new Array[Long](reservations.length)
+                var i = 0
+                while (i < reservations.length) { logicalOffsets(i) = reservations(i).logicalOffset; i += 1 }
+                val stamped = LogicalProduceStamper.stamp(memoryRecords, topicPartition.topic, logicalOffsets)
+                authorizedRequestInfo += (backingTp -> stamped)
+                logicalByBacking += (backingTp -> (topicPartition, reservations))
+              }
+            } catch {
+              case e: ApiException =>
+                invalidRequestResponses += topicPartition -> new PartitionResponse(Errors.forException(e))
+              case _: java.util.NoSuchElementException =>
+                // describe() returned empty between isLogicalTopic() and now — concentration
+                // declaration was concurrently revoked. Treat as the topic having disappeared.
+                nonExistingTopicResponses += topicPartition -> new PartitionResponse(Errors.UNKNOWN_TOPIC_OR_PARTITION)
+            }
+        }
+      }
       else if (!metadataCache.contains(topicPartition))
         nonExistingTopicResponses += topicPartition -> new PartitionResponse(Errors.UNKNOWN_TOPIC_OR_PARTITION)
       else
@@ -435,7 +493,49 @@ class KafkaApis(val requestChannel: RequestChannel,
     // https://issues.apache.org/jira/browse/KAFKA-10730
     @nowarn("cat=deprecation")
     def sendResponseCallback(responseStatus: Map[TopicPartition, PartitionResponse]): Unit = {
-      val mergedResponseStatus = responseStatus ++ unauthorizedTopicResponses ++ nonExistingTopicResponses ++ invalidRequestResponses
+      // Concentration hook #2 commit/rollback + key remap. For every backing-TP in
+      // responseStatus that came from a logical-topic produce, either commit the reservation
+      // (translating the returned backing baseOffset into a logical baseOffset) or roll it
+      // back if the append failed. Either way, rewrite the key to the original logical TP so
+      // the producer sees its own topic+partition, never the backing.
+      val remappedStatus =
+        if (logicalByBacking.isEmpty) responseStatus
+        else responseStatus.map { case (tp, status) =>
+          logicalByBacking.get(tp) match {
+            case Some((logicalTp, reservations)) =>
+              if (status.error == Errors.NONE) {
+                try {
+                  concentrationKernel.commitProduceBatch(reservations, status.baseOffset)
+                  // Rewrite backing-offset baseOffset/lastOffset to logical offsets — the
+                  // producer's view must be anchored to the logical topic, not the shared
+                  // backing whose offsets it has no knowledge of.
+                  status.baseOffset = reservations(0).logicalOffset
+                  status.lastOffset = reservations(reservations.length - 1).logicalOffset
+                  logicalTp -> status
+                } catch {
+                  case e: Throwable =>
+                    // Durable sidecar commit failed AFTER the backing append succeeded — we
+                    // can't acknowledge logical offsets we never wrote down. Surface as
+                    // KAFKA_STORAGE_ERROR so the producer retries (and idempotent producers
+                    // dedupe via baseSequence). The hole left in the logical sequence will be
+                    // healed by BackingScanRecoverer when the broker next restarts.
+                    error(s"Concentration commit failed for logical $logicalTp -> backing $tp", e)
+                    logicalTp -> new PartitionResponse(Errors.KAFKA_STORAGE_ERROR)
+                }
+              } else {
+                // Backing append failed. Release the reservations so we don't strand a hole at
+                // these logical offsets. Rollback exceptions are non-fatal — we still need to
+                // surface the original error to the client.
+                try concentrationKernel.rollbackProduceBatch(reservations)
+                catch { case e: Throwable =>
+                  warn(s"Concentration rollback failed for logical $logicalTp -> backing $tp", e)
+                }
+                logicalTp -> status
+              }
+            case None => tp -> status
+          }
+        }
+      val mergedResponseStatus = remappedStatus ++ unauthorizedTopicResponses ++ nonExistingTopicResponses ++ invalidRequestResponses
       var errorInResponse = false
 
       val nodeEndpoints = new mutable.HashMap[Int, Node]
