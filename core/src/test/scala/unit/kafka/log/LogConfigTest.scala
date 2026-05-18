@@ -30,7 +30,7 @@ import org.junit.jupiter.api.Test
 import java.util.{Collections, Properties}
 import org.apache.kafka.server.config.ServerLogConfigs
 import org.apache.kafka.server.log.remote.storage.RemoteLogManagerConfig
-import org.apache.kafka.storage.internals.log.{LogConfig, ThrottledReplicaListValidator}
+import org.apache.kafka.storage.internals.log.{CompressionPolicy, LogConfig, ThrottledReplicaListValidator}
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.ValueSource
 
@@ -445,6 +445,36 @@ class LogConfigTest {
     val logProps = new Properties
     logProps.put(TopicConfig.REMOTE_LOG_DELETE_ON_DISABLE_CONFIG, deleteOnDisable.toString)
     LogConfig.validate(logProps)
+  }
+
+  @Test
+  def testCompressionPolicyConfigRecognised(): Unit = {
+    assertTrue(LogConfig.configNames.contains(LogConfig.COMPRESSION_POLICY_CONFIG),
+      s"${LogConfig.COMPRESSION_POLICY_CONFIG} should be a registered topic config")
+  }
+
+  @Test
+  def testCompressionPolicyConfigDefault(): Unit = {
+    val logConfig = new LogConfig(new Properties())
+    assertEquals(CompressionPolicy.NONE, logConfig.compressionPolicy,
+      "Default compression.policy should be NONE so behaviour is identical to vanilla Kafka")
+  }
+
+  @ParameterizedTest
+  @ValueSource(strings = Array("none", "required"))
+  def testCompressionPolicyConfigAcceptsKnownValues(value: String): Unit = {
+    val props = new Properties()
+    props.setProperty(LogConfig.COMPRESSION_POLICY_CONFIG, value)
+    val logConfig = new LogConfig(props)
+    assertEquals(CompressionPolicy.forName(value), logConfig.compressionPolicy)
+  }
+
+  @ParameterizedTest
+  @ValueSource(strings = Array("yes", "123", "", "always", "optional", "NONE", "Required"))
+  def testCompressionPolicyConfigRejectsUnknownValues(value: String): Unit = {
+    val props = new Properties()
+    props.setProperty(LogConfig.COMPRESSION_POLICY_CONFIG, value)
+    assertThrows(classOf[ConfigException], () => { new LogConfig(props); () })
   }
 
   @Test

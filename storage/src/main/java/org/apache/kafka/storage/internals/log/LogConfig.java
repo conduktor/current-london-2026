@@ -125,6 +125,17 @@ public class LogConfig extends AbstractConfig {
     // Visible for testing
     public static final String SERVER_DEFAULT_HEADER_NAME = "Server Default Property";
 
+    // Topic config: server-side compression policy. Recognised on the broker only so that
+    // unmodified clients can continue to read and write topics that use it.
+    public static final String COMPRESSION_POLICY_CONFIG = "compression.policy";
+    public static final String COMPRESSION_POLICY_DOC =
+            "Server-side policy for the compression of producer batches. " +
+            "<code>none</code> (default) preserves vanilla behaviour. " +
+            "<code>required</code> rejects produce requests whose batches carry " +
+            "<code>compression.type=none</code> with INVALID_RECORD on a per-partition basis. " +
+            "The check applies to client appends only; replication and internal origins are unaffected.";
+    public static final String DEFAULT_COMPRESSION_POLICY = CompressionPolicy.NONE.name;
+
     public static final int DEFAULT_MAX_MESSAGE_BYTES = 1024 * 1024 + Records.LOG_OVERHEAD;
     public static final int DEFAULT_SEGMENT_BYTES = 1024 * 1024 * 1024;
     public static final long DEFAULT_SEGMENT_MS = 24 * 7 * 60 * 60 * 1000L;
@@ -150,7 +161,8 @@ public class LogConfig extends AbstractConfig {
             TopicConfig.REMOTE_LOG_DELETE_ON_DISABLE_CONFIG,
             TopicConfig.REMOTE_LOG_COPY_DISABLE_CONFIG,
             QuotaConfig.LEADER_REPLICATION_THROTTLED_REPLICAS_CONFIG,
-            QuotaConfig.FOLLOWER_REPLICATION_THROTTLED_REPLICAS_CONFIG
+            QuotaConfig.FOLLOWER_REPLICATION_THROTTLED_REPLICAS_CONFIG,
+            COMPRESSION_POLICY_CONFIG
     );
 
     public static final ConfigDef SERVER_CONFIG_DEF = new ConfigDef()
@@ -257,7 +269,9 @@ public class LogConfig extends AbstractConfig {
                 .define(TopicConfig.LOCAL_LOG_RETENTION_BYTES_CONFIG, LONG, DEFAULT_LOCAL_RETENTION_BYTES, atLeast(-2), MEDIUM,
                         TopicConfig.LOCAL_LOG_RETENTION_BYTES_DOC)
                 .define(TopicConfig.REMOTE_LOG_COPY_DISABLE_CONFIG, BOOLEAN, false, MEDIUM, TopicConfig.REMOTE_LOG_COPY_DISABLE_DOC)
-                .define(TopicConfig.REMOTE_LOG_DELETE_ON_DISABLE_CONFIG, BOOLEAN, false, MEDIUM, TopicConfig.REMOTE_LOG_DELETE_ON_DISABLE_DOC);
+                .define(TopicConfig.REMOTE_LOG_DELETE_ON_DISABLE_CONFIG, BOOLEAN, false, MEDIUM, TopicConfig.REMOTE_LOG_DELETE_ON_DISABLE_DOC)
+                .define(COMPRESSION_POLICY_CONFIG, STRING, DEFAULT_COMPRESSION_POLICY,
+                        in(CompressionPolicy.names().toArray(new String[0])), MEDIUM, COMPRESSION_POLICY_DOC);
     }
 
     public final Set<String> overriddenConfigs;
@@ -286,6 +300,7 @@ public class LogConfig extends AbstractConfig {
     public final int minInSyncReplicas;
     public final BrokerCompressionType compressionType;
     public final Optional<Compression> compression;
+    public final CompressionPolicy compressionPolicy;
     public final boolean preallocate;
 
     public final TimestampType messageTimestampType;
@@ -336,6 +351,7 @@ public class LogConfig extends AbstractConfig {
         this.minInSyncReplicas = getInt(TopicConfig.MIN_IN_SYNC_REPLICAS_CONFIG);
         this.compressionType = BrokerCompressionType.forName(getString(TopicConfig.COMPRESSION_TYPE_CONFIG));
         this.compression = getCompression();
+        this.compressionPolicy = CompressionPolicy.forName(getString(COMPRESSION_POLICY_CONFIG));
         this.preallocate = getBoolean(TopicConfig.PREALLOCATE_CONFIG);
         this.messageTimestampType = TimestampType.forName(getString(TopicConfig.MESSAGE_TIMESTAMP_TYPE_CONFIG));
         this.messageTimestampBeforeMaxMs = getLong(TopicConfig.MESSAGE_TIMESTAMP_BEFORE_MAX_MS_CONFIG);
@@ -651,6 +667,7 @@ public class LogConfig extends AbstractConfig {
                 ", uncleanLeaderElectionEnable=" + uncleanLeaderElectionEnable +
                 ", minInSyncReplicas=" + minInSyncReplicas +
                 ", compressionType='" + compressionType + '\'' +
+                ", compressionPolicy=" + compressionPolicy +
                 ", preallocate=" + preallocate +
                 ", messageTimestampType=" + messageTimestampType +
                 ", leaderReplicationThrottledReplicas=" + leaderReplicationThrottledReplicas +
