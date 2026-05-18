@@ -165,8 +165,12 @@ final class SseStreamer {
             return;
         }
         if (throwable != null) {
+            // Log the throwable server-side; never echo throwable.getMessage() to the client. Stock JDK
+            // messages (e.g. NPE "Cannot invoke X.y() because z is null") leak broker class/field names.
+            // Per-partition Kafka errors with sanitised text flow through the view.error() != NONE branch
+            // below; this throwable branch is reached only on unexpected futures completion failures.
             LOG.warn("SSE fetch submission failed for {}/{} at offset {}", topic, partition, currentOffset, throwable);
-            tryWriteErrorFrame("INTERNAL", throwable.getMessage());
+            tryWriteErrorFrame("INTERNAL", null);
             closeStream();
             return;
         }

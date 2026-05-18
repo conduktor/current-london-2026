@@ -148,8 +148,11 @@ public final class KafkaWebSocketEndpoint implements Session.Listener.AutoDemand
             // Anything else (the streamer's start path can throw if a fetch submission blows up at
             // construction time, for example) is treated as an internal error. Close 1011 so the
             // client distinguishes "I did something wrong" (1003) from "server failed" (1011).
+            // Log the throwable server-side; never pass e.getMessage() into the close reason or
+            // error envelope — stock JDK messages (e.g. NPE "Cannot invoke X.y() because z is null")
+            // leak broker class/field names to any subscribed client.
             LOG.warn("WS unexpected failure handling frame on {}", topic, e);
-            closeWithInternalError(e.getMessage());
+            closeWithInternalError(null);
         }
     }
 

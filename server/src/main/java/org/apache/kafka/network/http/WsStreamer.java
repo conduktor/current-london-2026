@@ -317,8 +317,10 @@ public final class WsStreamer {
             submitter.submitFetch(command).whenCompleteAsync(this::handleFetchResult, httpExecutor);
         } catch (RuntimeException e) {
             fetchInFlight.set(false);
+            // Log the real throwable server-side; never echo throwable.getMessage() to the client. Stock JDK
+            // messages (e.g. NPE "Cannot invoke X.y() because z is null") leak broker class/field names.
             LOG.warn("WS fetch submission failed for {}/{}", topic, partition, e);
-            trySendErrorFrame("INTERNAL", e.getMessage());
+            trySendErrorFrame("INTERNAL", null);
             close();
         }
     }
@@ -404,8 +406,11 @@ public final class WsStreamer {
         if (throwable instanceof java.util.concurrent.CompletionException && throwable.getCause() != null) {
             cause = throwable.getCause();
         }
+        // Log the cause server-side; never echo cause.getMessage() to the client. Per-partition errors with
+        // sanitised Kafka text already flow through the view.error() != NONE branch in handleFetchResult; this
+        // failFetch path is reached only on unexpected throwables where the message can leak internals.
         LOG.warn("WS fetch submission failed for {}/{} at offset {}", topic, partition, currentOffset, cause);
-        trySendErrorFrame("INTERNAL", cause.getMessage());
+        trySendErrorFrame("INTERNAL", null);
         close();
     }
 
