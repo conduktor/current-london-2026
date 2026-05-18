@@ -223,9 +223,47 @@ class KafkaApis(val requestChannel: RequestChannel,
           fromPrivilegedListener,
           () => ApiMessageActivation.requestActivation(request.body[AbstractRequest].data()))
         if (ruleDecision.denied) {
-          val denyError = Errors.forCode(ruleDecision.errorCode.toShort)
+          // Resolve the operator-authored errorCode into an Errors value.
+          // RuleJsonCodec.parseErrorCode already rejects 0 (Errors.NONE) at
+          // envelope intake (round-8 task #99) and rejects unknown codes
+          // (round-8 task #96), so a denyError that is NONE or has a null
+          // exception cannot reach here through a normal rule-publishing
+          // path. The defence-in-depth check below makes the invariant
+          // locally visible — if a future bug ever lets a 0 errorCode
+          // through (e.g. a new RuleDecision.deny caller that forgets to
+          // validate, a codec refactor that relaxes the NONE rejection),
+          // we log loudly and substitute POLICY_VIOLATION rather than
+          // call sendErrorResponseMaybeThrottle with a null exception
+          // (which would NPE on the request thread). Round-9 integration
+          // boundary finding Q7.
+          //
+          // Substituting POLICY_VIOLATION (matching the activation-budget
+          // sentinel's posture) preserves the operator's denial intent
+          // even when the error-code construction is buggy: the request
+          // is still denied, just with a less-precise code than authored.
+          // Failing OPEN here would silently subvert the operator's rule;
+          // failing with a null exception would NPE the request thread.
+          val authored = Errors.forCode(ruleDecision.errorCode.toShort)
+          val denyError =
+            if (authored == Errors.NONE || authored.exception == null) {
+              error(s"CEL rule '${ruleDecision.denyingRuleId}' produced an invalid " +
+                s"errorCode=${ruleDecision.errorCode} (resolved to ${authored.name} with " +
+                s"exception=${authored.exception}). This is a bug — the codec should have " +
+                s"rejected this at intake. Substituting POLICY_VIOLATION to honour the " +
+                s"denial intent without crashing the request thread.")
+              Errors.POLICY_VIOLATION
+            } else {
+              authored
+            }
           info(s"CEL rule '${ruleDecision.denyingRuleId}' denied ${request.header.apiKey} from " +
             s"clientId='${request.header.clientId}' with ${denyError.name}")
+          // sendErrorResponseMaybeThrottle still calls
+          // maybeRecordAndGetThrottleTimeMs first — a CEL-denied request
+          // DOES consume quota. This is the safe operator posture: an
+          // attacker spraying soon-denied requests still gets throttled,
+          // so they cannot get "free quota" for denied requests. Round-9
+          // integration boundary finding Q8 — do not "optimise" the
+          // throttle away on this code path.
           requestHelper.sendErrorResponseMaybeThrottle(request, denyError.exception)
           return
         }

@@ -350,6 +350,64 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testCelRuleGateSubstitutesPolicyViolationWhenAuthoredCodeResolvesToNone(): Unit = {
+    // Round-9 integration boundary finding Q7 — defence-in-depth for the
+    // deny short-circuit at KafkaApis.handle when the rule's authored
+    // errorCode somehow resolves to Errors.NONE (whose .exception is null).
+    //
+    // RuleJsonCodec.parseErrorCode already rejects 0 (NONE) at envelope
+    // intake — that's the FIRST line of defence and the path operator-
+    // authored rules take. This test bypasses the codec by constructing
+    // a Rule object directly with errorCode=0 to simulate the scenario the
+    // defensive code is guarding against: a future bug where some other
+    // RuleDecision.deny caller constructs a denial with a 0 code (e.g. a
+    // new envelope source that forgets to validate, or a codec refactor
+    // that relaxes the NONE rejection).
+    //
+    // Pre-fix, sendErrorResponseMaybeThrottle(request, null) would NPE the
+    // request thread (Errors.NONE.exception returns null, and the response
+    // construction does not tolerate null exceptions on every path). Post-
+    // fix, the gate substitutes POLICY_VIOLATION and continues — denial
+    // intent is preserved, the bug is logged loudly, the request thread
+    // does not crash.
+    val engine = new RuleEngine()
+    val whenSrc = "request.allowAutoTopicCreation == true"
+    val compiled = CelCompiler.compile(whenSrc)
+    // errorCode=0 = Errors.NONE.code. Bypassing the codec — Rule's
+    // constructor does not validate errorCode (codec does), so this is
+    // the exact bug-construction path the defensive code targets.
+    val rule = new Rule(
+      "rule-with-bug-shaped-error-code",
+      Collections.singletonList(ApiKeys.METADATA),
+      RuleAction.DENY,
+      whenSrc,
+      Errors.NONE.code.toInt,
+      compiled)
+    engine.install(new RuleSetBuilder().put(rule).build())
+
+    val metadataRequestData = new MetadataRequestData().setTopics(
+      Collections.singletonList(new MetadataRequestData.MetadataRequestTopic().setName("t1")))
+    val metadataRequest = new MetadataRequest(metadataRequestData, ApiKeys.METADATA.latestVersion)
+    val request = buildRequest(metadataRequest)
+
+    kafkaApis = createKafkaApis(ruleEngine = engine)
+    kafkaApis.handle(request, RequestLocal.noCaching)
+
+    // Denial intent preserved: a MetadataResponse comes back, and the
+    // topic carries POLICY_VIOLATION (44), not NONE (0). The latter
+    // would mean the deny short-circuit silently fell through to the
+    // happy-path Metadata handler.
+    val response = verifyNoThrottling[MetadataResponse](request)
+    val topics = response.data.topics
+    assertEquals(1, topics.size)
+    val errCode = topics.iterator.next.errorCode
+    assertEquals(Errors.POLICY_VIOLATION.code, errCode,
+      "the deny path must substitute POLICY_VIOLATION when the authored " +
+        "errorCode resolves to NONE; got errorCode=" + errCode + " (NONE=0, " +
+        "POLICY_VIOLATION=" + Errors.POLICY_VIOLATION.code + ")")
+  }
+
+  @Test
   def testDescribeConfigsWithAuthorizer(): Unit = {
     val authorizer: Authorizer = mock(classOf[Authorizer])
 
