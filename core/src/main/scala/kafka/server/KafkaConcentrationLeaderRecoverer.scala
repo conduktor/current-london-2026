@@ -90,12 +90,15 @@ import java.util.concurrent.atomic.AtomicLong
  * default) because the scan is I/O-bound on the backing log and the marginal speedup from a
  * larger pool is dominated by disk contention.
  *
- * Recoveries for the {@em same} backing partition are NOT explicitly serialised here; the
- * generation-token CAS in {@code publishIfGenerationMatches} is the correctness gate. If
- * recovery N is still running when leader-acquisition N+1 schedules recovery N+1, both may
- * mutate sidecar files concurrently. The kernel's per-(logicalTopic, logicalPartition)
- * sidecar locks serialise their actual file writes; recovery N's publish will see a moved
- * generation and return false; recovery N+1's publish wins.
+ * Recoveries for the {@em same} backing partition ARE serialised — via
+ * {@code kernel.backingScanLock(backingTp)}, acquired by {@link #runScan} for the duration of
+ * pre-truncate → stream-consume → publish. Without this serialisation two scans for the same
+ * backing would open separate {@code LogicalSidecarIndex} handles to the same on-disk file and
+ * race their writes; the generation CAS at publish time only fences which gate-open wins, not
+ * which scan's bytes survive. After acquiring the scan lock, {@code runScan} re-checks the
+ * captured generation against the kernel's current generation: if it has moved (another
+ * leader-acquisition arrived while we were queued), the scan abandons before touching state and
+ * trusts the in-flight scan to complete the rebuild.
  *
  * <h3>Shutdown</h3>
  *
@@ -175,7 +178,37 @@ class KafkaConcentrationLeaderRecoverer(
       capturedGeneration: Long,
       filter: java.util.Set[LogicalPartition]): Unit = {
     val started = System.nanoTime()
+    // Resolve the scan lock under a guarded try: kernel.backingScanLock invokes ensureOpen() and
+    // throws IllegalStateException if the kernel has been closed between executor.submit and now.
+    // Without this guard the exception escapes runScan uncaught and the executor silently
+    // swallows it — operators get no log, just a perpetually closed gate.
+    val scanLock = try {
+      kernel.backingScanLock(backingTp)
+    } catch {
+      case e: IllegalStateException =>
+        log.info(s"Concentration recovery [task=$taskId] $backingTp: kernel closed before scan " +
+          s"could start; aborting (gate stays closed): ${e.getMessage}")
+        return
+    }
+    // Acquire BEFORE touching any sidecar state. Codex BLOCKER 1: without this, two concurrent
+    // scans for the same backing race their truncate+append calls on the same sidecar file. The
+    // lock makes "rebuild the sidecar for this backing" a critical section; the generation
+    // re-check below is the stale-fence that lets a queued scan early-exit once a fresher scan
+    // has already done the work.
+    scanLock.lock()
     try {
+      // Post-acquire generation re-check. If a later leader-acquisition has already bumped the
+      // generation while we were queued for the scan lock, the next event's scan will run after
+      // ours releases — there is no point in us scanning and publishing only to be overwritten.
+      // Abort cleanly: the gate stays closed (markBackingUnready was called by every event), and
+      // the next scan in the queue (or the one already running on its own backing) handles the
+      // rebuild.
+      val currentGen = kernel.currentGeneration(backingTp)
+      if (currentGen != capturedGeneration) {
+        log.info(s"Concentration recovery [task=$taskId] $backingTp: generation moved " +
+          s"$capturedGeneration → $currentGen before scan lock was acquired; aborting (gate stays closed)")
+        return
+      }
       val unifiedLogOpt = logManager.getLog(backingTp)
       if (unifiedLogOpt.isEmpty) {
         // No local log for this backing partition. This is legitimate if the partition was
@@ -255,6 +288,8 @@ class KafkaConcentrationLeaderRecoverer(
         // as visible NOT_LEADER_OR_FOLLOWER on every logical request to the backing.
         log.warn(s"Concentration recovery [task=$taskId] $backingTp FAILED at " +
           s"epoch=$capturedEpoch gen=$capturedGeneration; gate stays closed: ${t.getMessage}", t)
+    } finally {
+      scanLock.unlock()
     }
   }
 

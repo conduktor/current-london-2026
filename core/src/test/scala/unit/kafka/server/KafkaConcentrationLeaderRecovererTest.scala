@@ -27,6 +27,7 @@ import org.mockito.Mockito._
 
 import java.util
 import java.util.concurrent.{Executors, RejectedExecutionException, TimeUnit}
+import java.util.concurrent.locks.ReentrantLock
 
 class KafkaConcentrationLeaderRecovererTest {
 
@@ -45,6 +46,16 @@ class KafkaConcentrationLeaderRecovererTest {
       null
     }
     exec
+  }
+
+  // runScan acquires kernel.backingScanLock(backingTp) before any sidecar mutation. Mockito's
+  // mock default for ReentrantLock-returning methods is null, so every test that drives runScan
+  // must stub the accessor with a real lock — otherwise the very first call lock.lock() NPEs
+  // and the test failure obscures the actual scan-path behaviour we are trying to assert.
+  private def stubScanLock(kernel: ConcentrationKernel, tp: TopicPartition): ReentrantLock = {
+    val lock = new ReentrantLock()
+    when(kernel.backingScanLock(tp)).thenReturn(lock)
+    lock
   }
 
   private def filterOf(logicalTopic: String, partitions: Int*): util.Set[LogicalPartition] = {
@@ -167,6 +178,7 @@ class KafkaConcentrationLeaderRecovererTest {
     when(kernel.currentGeneration(backingTp)).thenReturn(11L)
     when(kernel.logicalPartitionsForBacking(backingTp))
       .thenReturn(filterOf("orders", 0))
+    stubScanLock(kernel, backingTp)
     when(logManager.getLog(mockEq(backingTp), any[Boolean])).thenReturn(None)
     val partition = mock(classOf[Partition])
     when(partition.getLeaderEpoch).thenReturn(2)
@@ -197,6 +209,7 @@ class KafkaConcentrationLeaderRecovererTest {
     when(kernel.currentGeneration(backingTp)).thenReturn(99L)
     when(kernel.logicalPartitionsForBacking(backingTp))
       .thenReturn(filterOf("orders", 0, 1))
+    stubScanLock(kernel, backingTp)
     val unifiedLog = mock(classOf[UnifiedLog])
     when(unifiedLog.logStartOffset).thenReturn(0L)
     when(unifiedLog.logEndOffset).thenReturn(0L)
@@ -226,6 +239,7 @@ class KafkaConcentrationLeaderRecovererTest {
     when(kernel.currentGeneration(backingTp)).thenReturn(50L)
     when(kernel.logicalPartitionsForBacking(backingTp))
       .thenReturn(filterOf("orders", 0))
+    stubScanLock(kernel, backingTp)
     val unifiedLog = mock(classOf[UnifiedLog])
     when(unifiedLog.logStartOffset).thenReturn(0L)
     when(unifiedLog.logEndOffset).thenReturn(1000L)
@@ -258,6 +272,7 @@ class KafkaConcentrationLeaderRecovererTest {
     when(kernel.currentGeneration(backingTp)).thenReturn(7L)
     when(kernel.logicalPartitionsForBacking(backingTp))
       .thenReturn(filterOf("orders", 0))
+    stubScanLock(kernel, backingTp)
     val unifiedLog = mock(classOf[UnifiedLog])
     when(unifiedLog.logStartOffset).thenReturn(0L)
     when(unifiedLog.logEndOffset).thenReturn(100L)
@@ -272,6 +287,97 @@ class KafkaConcentrationLeaderRecovererTest {
     recoverer.onMakeLeader(backingTp, partition)
 
     verify(kernel, never()).publishIfGenerationMatches(any[TopicPartition], any[Long].asInstanceOf[Long], any[Runnable])
+  }
+
+  @Test
+  def scanAbortsWithoutTouchingStateWhenGenerationMovedBeforeLockAcquired(): Unit = {
+    // BLOCKER 1 fix: runScan acquires kernel.backingScanLock(backingTp) before any sidecar
+    // mutation, and then re-checks the generation. If the kernel reports a different generation
+    // than the one captured at submit time, another leader-acquisition has already bumped the
+    // gate and a fresher scan is in flight (or done). The stale scan MUST early-exit without
+    // calling recoverFromBackingScan — otherwise it would re-truncate the rebuilt sidecar with
+    // its own (now invalid) view and the gate-open of the fresher scan would expose a partial
+    // rebuild. The publish-time CAS alone would not save us here: the corruption happens during
+    // the scan, before the publish is even attempted.
+    val kernel = mock(classOf[ConcentrationKernel])
+    val logManager = mock(classOf[LogManager])
+    val executor = synchronousExecutor()
+    when(kernel.isBackingTopic(backingTp.topic)).thenReturn(true)
+    // captured at submit time (inside onMakeLeader): generation = 5
+    when(kernel.currentGeneration(backingTp)).thenReturn(5L, 9L)
+    when(kernel.logicalPartitionsForBacking(backingTp))
+      .thenReturn(filterOf("orders", 0))
+    stubScanLock(kernel, backingTp)
+    val partition = mock(classOf[Partition])
+    when(partition.getLeaderEpoch).thenReturn(3)
+    val recoverer = new KafkaConcentrationLeaderRecoverer(kernel, logManager, executor)
+
+    recoverer.onMakeLeader(backingTp, partition)
+
+    // Gate-close still happened (markBackingUnready ran on the submitter's thread before scan
+    // was queued), but the scan body did not touch any sidecar state and did not publish.
+    verify(kernel).markBackingUnready(backingTp)
+    verify(kernel, never()).recoverFromBackingScan(any[util.Iterator[RecoveryRecord]], any[util.Set[LogicalPartition]])
+    verify(kernel, never()).publishIfGenerationMatches(any[TopicPartition], any[Long].asInstanceOf[Long], any[Runnable])
+    // logManager.getLog must NOT have been consulted either — early-exit fires BEFORE any I/O.
+    verifyNoInteractions(logManager)
+  }
+
+  @Test
+  def scanAcquiresAndReleasesBackingScanLockEvenOnException(): Unit = {
+    // The lock-acquire / lock-release contract: every runScan path — happy, exception, early
+    // exit — must release the per-backing scan lock so a later leader-acquisition is not
+    // permanently blocked. Use a real ReentrantLock so we can assert isLocked() after the call.
+    val kernel = mock(classOf[ConcentrationKernel])
+    val logManager = mock(classOf[LogManager])
+    val executor = synchronousExecutor()
+    when(kernel.isBackingTopic(backingTp.topic)).thenReturn(true)
+    when(kernel.currentGeneration(backingTp)).thenReturn(7L)
+    when(kernel.logicalPartitionsForBacking(backingTp))
+      .thenReturn(filterOf("orders", 0))
+    val realLock = stubScanLock(kernel, backingTp)
+    val unifiedLog = mock(classOf[UnifiedLog])
+    when(unifiedLog.logStartOffset).thenReturn(0L)
+    when(unifiedLog.logEndOffset).thenReturn(100L)
+    when(logManager.getLog(mockEq(backingTp), any[Boolean])).thenReturn(Some(unifiedLog))
+    doThrow(new RuntimeException("simulated scan fault"))
+      .when(kernel).recoverFromBackingScan(any[util.Iterator[RecoveryRecord]], any[util.Set[LogicalPartition]])
+    val partition = mock(classOf[Partition])
+    when(partition.getLeaderEpoch).thenReturn(1)
+    val recoverer = new KafkaConcentrationLeaderRecoverer(kernel, logManager, executor)
+
+    recoverer.onMakeLeader(backingTp, partition)
+
+    assertFalse(realLock.isLocked, "scan lock must be released even after a scan exception")
+  }
+
+  @Test
+  def scanAbortsCleanlyWhenKernelClosedBeforeScanLockResolved(): Unit = {
+    // Operability contract: if the kernel is closed between executor.submit and runScan reaching
+    // kernel.backingScanLock(...), the IllegalStateException from ensureOpen() must be caught,
+    // logged, and the scan must abort cleanly — NOT escape uncaught into the Runnable wrapper
+    // (where the executor would silently swallow it, leaving operators with a perpetually closed
+    // gate and no log trail). This is a defensive guard against the narrow shutdown-ordering
+    // window where the broker closes the kernel before draining the recovery executor.
+    val kernel = mock(classOf[ConcentrationKernel])
+    val logManager = mock(classOf[LogManager])
+    val executor = synchronousExecutor()
+    when(kernel.isBackingTopic(backingTp.topic)).thenReturn(true)
+    when(kernel.currentGeneration(backingTp)).thenReturn(3L)
+    when(kernel.logicalPartitionsForBacking(backingTp))
+      .thenReturn(filterOf("orders", 0))
+    when(kernel.backingScanLock(backingTp))
+      .thenThrow(new IllegalStateException("ConcentrationKernel is closed"))
+    val partition = mock(classOf[Partition])
+    when(partition.getLeaderEpoch).thenReturn(1)
+    val recoverer = new KafkaConcentrationLeaderRecoverer(kernel, logManager, executor)
+
+    // Must not throw. The scan body must never have been entered.
+    recoverer.onMakeLeader(backingTp, partition)
+
+    verify(kernel, never()).recoverFromBackingScan(any[util.Iterator[RecoveryRecord]], any[util.Set[LogicalPartition]])
+    verify(kernel, never()).publishIfGenerationMatches(any[TopicPartition], any[Long].asInstanceOf[Long], any[Runnable])
+    verifyNoInteractions(logManager)
   }
 
   @Test

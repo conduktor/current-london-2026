@@ -32,6 +32,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Broker-facing facade for the concentration kernel. Owns the {@link LogicalTopicRegistry},
@@ -127,6 +128,28 @@ public final class ConcentrationKernel implements AutoCloseable {
      * {@link kafka.cluster.Partition} leader-epoch fence alone is not sufficient).
      */
     private final ConcurrentHashMap<TopicPartition, BackingGateState> backingGateState = new ConcurrentHashMap<>();
+
+    /**
+     * Per-backing scan lock — held by {@code KafkaConcentrationLeaderRecoverer.runScan} for the
+     * duration of the rebuild (pre-truncate → consume stream → publish). Codex BLOCKER 1: without
+     * this, two leader-acquisitions for the same backing in flight on the recovery executor pool
+     * race their {@code recoverFromBackingScan} calls. Each scan opens its own
+     * {@link LogicalSidecarIndex} handles via {@link BackingScanRecoverer#openSidecar}, so two
+     * threads end up writing to the same on-disk sidecar file simultaneously — the generation CAS
+     * at publish time only fences which gate-open wins, not which scan's writes survive.
+     *
+     * <p>This lock makes "rebuild the sidecar for backing X" a critical section. The stale-fence
+     * is layered on top: after acquiring the lock, {@code runScan} re-checks the generation and
+     * aborts without touching state if it has moved — this lets a quick succession of
+     * leader-acquisitions collapse into "one scan does the work, the later ones early-exit"
+     * rather than "every scan runs to completion then gets discarded".
+     *
+     * <p>Lock ordering with {@link #publishIfGenerationMatches}: this scan lock is OUTER, the
+     * {@code backingGateState.compute()} per-key lock inside {@code publishIfGenerationMatches}
+     * is INNER. Callers must never invert this ordering — there is no path that takes the gate
+     * lock first and then asks for a scan lock.
+     */
+    private final ConcurrentHashMap<TopicPartition, ReentrantLock> backingScanLocks = new ConcurrentHashMap<>();
 
     /**
      * Per-backing readiness gate state. Value object so the entire (ready, generation) pair can be
@@ -554,6 +577,19 @@ public final class ConcentrationKernel implements AutoCloseable {
         Objects.requireNonNull(backing, "backing");
         BackingGateState s = backingGateState.get(backing);
         return s == null ? 0L : s.generation;
+    }
+
+    /**
+     * Lazily-initialised per-backing scan lock. See {@link #backingScanLocks} for the rationale.
+     * The map grows monotonically with the set of backing partitions this broker has ever been
+     * leader for; locks are not evicted because the cost of one {@link ReentrantLock} per backing
+     * is tiny (~40 bytes) and re-creating one on a rapid leader churn would risk losing
+     * mutual-exclusion mid-flip.
+     */
+    public ReentrantLock backingScanLock(TopicPartition backing) {
+        Objects.requireNonNull(backing, "backing");
+        ensureOpen();
+        return backingScanLocks.computeIfAbsent(backing, k -> new ReentrantLock());
     }
 
     /**

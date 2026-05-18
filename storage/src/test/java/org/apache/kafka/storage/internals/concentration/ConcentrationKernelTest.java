@@ -34,6 +34,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -1163,5 +1164,125 @@ public class ConcentrationKernelTest {
     @Test
     public void logicalPartitionsForBackingRejectsNullPartition() {
         assertThrows(NullPointerException.class, () -> kernel.logicalPartitionsForBacking(null));
+    }
+
+    // ---------- backingScanLock — Codex BLOCKER 1 ----------
+
+    @Test
+    public void backingScanLockReturnsSameInstanceForSameBacking() {
+        // The lock IS the serialisation primitive used by the leader-recoverer to make
+        // "rebuild this backing" a critical section. Two callers asking for the lock for the
+        // same backing must observe the same monitor — otherwise both can be "inside" their lock
+        // at once and the critical section is fictional.
+        TopicPartition tp = new TopicPartition("shared", 0);
+        java.util.concurrent.locks.ReentrantLock a = kernel.backingScanLock(tp);
+        java.util.concurrent.locks.ReentrantLock b = kernel.backingScanLock(new TopicPartition("shared", 0));
+        assertSame(a, b);
+    }
+
+    @Test
+    public void backingScanLockIsDistinctPerBacking() {
+        // Recoveries for different backings run in parallel on the recovery thread pool —
+        // taking the same lock for distinct backings would serialise unrelated work and
+        // negate the pool entirely. Different (topic, partition) tuples MUST yield distinct
+        // locks. This includes (topic, P) vs (topic, P') and (topicA, 0) vs (topicB, 0).
+        java.util.concurrent.locks.ReentrantLock t0 = kernel.backingScanLock(new TopicPartition("shared", 0));
+        java.util.concurrent.locks.ReentrantLock t1 = kernel.backingScanLock(new TopicPartition("shared", 1));
+        java.util.concurrent.locks.ReentrantLock other = kernel.backingScanLock(new TopicPartition("other", 0));
+        assertNotSame(t0, t1);
+        assertNotSame(t0, other);
+        assertNotSame(t1, other);
+    }
+
+    @Test
+    public void backingScanLockIsReentrant() {
+        // The synchronous-executor unit-test path (see KafkaConcentrationLeaderRecovererTest)
+        // calls runScan on the same thread that just took the lock-acquiring path. The
+        // synchronous executor case relies on this not deadlocking. Re-entry must be supported.
+        java.util.concurrent.locks.ReentrantLock lock = kernel.backingScanLock(new TopicPartition("shared", 0));
+        lock.lock();
+        try {
+            assertTrue(lock.tryLock(), "lock must be reentrant for same-thread reacquisition");
+            lock.unlock();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Test
+    public void backingScanLockSerialisesConcurrentHoldersForSameBacking() throws InterruptedException {
+        // The actual concurrency contract: while one thread holds the lock, another thread asking
+        // for the same lock MUST block until release. This is what closes Codex BLOCKER 1 — two
+        // simultaneous recoveries for the same backing cannot both be mid-rebuild on disjoint
+        // sidecar handles.
+        TopicPartition tp = new TopicPartition("shared", 0);
+        java.util.concurrent.locks.ReentrantLock lock = kernel.backingScanLock(tp);
+
+        java.util.concurrent.CountDownLatch firstHasLock = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch firstMayRelease = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicBoolean secondAcquiredEarly = new java.util.concurrent.atomic.AtomicBoolean(false);
+
+        Thread first = new Thread(() -> {
+            lock.lock();
+            try {
+                firstHasLock.countDown();
+                try {
+                    firstMayRelease.await(2, java.util.concurrent.TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            } finally {
+                lock.unlock();
+            }
+        }, "first-holder");
+
+        first.start();
+        assertTrue(firstHasLock.await(1, java.util.concurrent.TimeUnit.SECONDS),
+            "first thread must acquire the lock");
+
+        Thread second = new Thread(() -> {
+            // Ask for the lock for the SAME backing — must NOT succeed until first releases.
+            // We deliberately ask via the kernel accessor (not the lock reference) to also cover
+            // the "fresh lookup yields the same instance" invariant under concurrency.
+            java.util.concurrent.locks.ReentrantLock again = kernel.backingScanLock(tp);
+            if (again.tryLock()) {
+                try {
+                    secondAcquiredEarly.set(true);
+                } finally {
+                    again.unlock();
+                }
+            } else {
+                again.lock();
+                again.unlock();
+            }
+        }, "second-holder");
+
+        second.start();
+        // Give the second thread a small window to (incorrectly) acquire if the lock weren't
+        // shared between (kernel.backingScanLock(tp), kernel.backingScanLock(tp)) callers.
+        Thread.sleep(50);
+        assertFalse(secondAcquiredEarly.get(),
+            "second thread MUST NOT acquire the same-backing lock while first holds it");
+
+        firstMayRelease.countDown();
+        first.join(2_000);
+        second.join(2_000);
+        assertFalse(first.isAlive());
+        assertFalse(second.isAlive());
+    }
+
+    @Test
+    public void backingScanLockRejectsNullPartition() {
+        assertThrows(NullPointerException.class, () -> kernel.backingScanLock(null));
+    }
+
+    @Test
+    public void backingScanLockRejectsClosedKernel() throws IOException {
+        // Same defensive guard as the rest of the recovery surface — once the kernel is closed
+        // the lock must not be handed out. Otherwise a late-arriving recovery task could acquire
+        // a lock against state that no longer exists.
+        kernel.close();
+        assertThrows(IllegalStateException.class,
+            () -> kernel.backingScanLock(new TopicPartition("shared", 0)));
     }
 }
