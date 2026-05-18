@@ -188,6 +188,10 @@ public class SocketServerConfigs {
     public static final int HTTP_BRIDGE_MAX_CONCURRENT_SSE_STREAMS_DEFAULT = 100;
     public static final String HTTP_BRIDGE_MAX_CONCURRENT_SSE_STREAMS_DOC = "Upper bound on the number of Server-Sent Events streams the HTTP bridge will serve concurrently (GET /v1/topics/{topic}/records with Accept: text/event-stream). Each SSE stream holds a Jetty thread for the lifetime of the connection, recursively long-polls the broker via the fetch pipeline, and is bounded only by the client closing the connection. Without this cap a hostile or runaway client can open arbitrarily many simultaneous streams until the Jetty thread pool is exhausted — at which point even one-shot produce/fetch requests stall behind it. New stream attempts past the cap are rejected with HTTP 429 Too Many Requests and a Retry-After header so clients back off cleanly. The default of 100 is conservative for a single-broker deployment; raise it if you have explicit capacity planning for streaming consumers and have sized the Jetty thread pool accordingly. Set to 0 to disable SSE entirely.";
 
+    public static final String HTTP_BRIDGE_MAX_CONCURRENT_WS_SUBSCRIPTIONS_CONFIG = "http.bridge.max.concurrent.ws.subscriptions";
+    public static final int HTTP_BRIDGE_MAX_CONCURRENT_WS_SUBSCRIPTIONS_DEFAULT = 100;
+    public static final String HTTP_BRIDGE_MAX_CONCURRENT_WS_SUBSCRIPTIONS_DOC = "Upper bound on the number of WebSocket subscriptions the HTTP bridge will serve concurrently (the WebSocket upgrade on /v1/topics/{topic}/subscribe). Each subscription holds a Jetty thread for the lifetime of the connection, recursively long-polls the broker via the fetch pipeline, and is gated on a client-granted credit budget. Without this cap a hostile or runaway client can open arbitrarily many simultaneous subscriptions until the Jetty thread pool is exhausted — at which point even one-shot produce/fetch requests stall behind it. New WebSocket upgrade attempts past the cap are refused at the handshake with HTTP 503 Service Unavailable so the client never enters the subscribe protocol against a connection that would immediately close. This cap is independent of the SSE cap because the two paths have different per-connection cost profiles. The default of 100 mirrors the SSE default and is conservative for a single-broker deployment. Set to 0 to disable WebSocket subscribe entirely while leaving produce/fetch/SSE open.";
+
     public static final ConfigDef CONFIG_DEF =  new ConfigDef()
             .define(LISTENERS_CONFIG, STRING, LISTENERS_DEFAULT, HIGH, LISTENERS_DOC)
             .define(ADVERTISED_LISTENERS_CONFIG, STRING, null, HIGH, ADVERTISED_LISTENERS_DOC)
@@ -210,7 +214,8 @@ public class SocketServerConfigs {
             .define(HTTP_BRIDGE_PORT_CONFIG, INT, HTTP_BRIDGE_PORT_DEFAULT, atLeast(0), LOW, HTTP_BRIDGE_PORT_DOC)
             .define(HTTP_BRIDGE_MAX_REQUEST_BODY_BYTES_CONFIG, INT, HTTP_BRIDGE_MAX_REQUEST_BODY_BYTES_DEFAULT, atLeast(0), LOW, HTTP_BRIDGE_MAX_REQUEST_BODY_BYTES_DOC)
             .define(HTTP_BRIDGE_REQUEST_TIMEOUT_MS_CONFIG, INT, HTTP_BRIDGE_REQUEST_TIMEOUT_MS_DEFAULT, atLeast(1), LOW, HTTP_BRIDGE_REQUEST_TIMEOUT_MS_DOC)
-            .define(HTTP_BRIDGE_MAX_CONCURRENT_SSE_STREAMS_CONFIG, INT, HTTP_BRIDGE_MAX_CONCURRENT_SSE_STREAMS_DEFAULT, atLeast(0), LOW, HTTP_BRIDGE_MAX_CONCURRENT_SSE_STREAMS_DOC);
+            .define(HTTP_BRIDGE_MAX_CONCURRENT_SSE_STREAMS_CONFIG, INT, HTTP_BRIDGE_MAX_CONCURRENT_SSE_STREAMS_DEFAULT, atLeast(0), LOW, HTTP_BRIDGE_MAX_CONCURRENT_SSE_STREAMS_DOC)
+            .define(HTTP_BRIDGE_MAX_CONCURRENT_WS_SUBSCRIPTIONS_CONFIG, INT, HTTP_BRIDGE_MAX_CONCURRENT_WS_SUBSCRIPTIONS_DEFAULT, atLeast(0), LOW, HTTP_BRIDGE_MAX_CONCURRENT_WS_SUBSCRIPTIONS_DOC);
 
     private static final Pattern URI_PARSE_REGEXP = Pattern.compile(
         "^(.*)://\\[?([0-9a-zA-Z\\-%._:]*)\\]?:(-?[0-9]+)");
