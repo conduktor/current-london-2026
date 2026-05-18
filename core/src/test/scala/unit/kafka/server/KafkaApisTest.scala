@@ -28,7 +28,7 @@ import kafka.utils.{CoreUtils, Log4jController, Logging, TestUtils}
 import org.apache.kafka.clients.admin.AlterConfigOp.OpType
 import org.apache.kafka.clients.admin.{AlterConfigOp, ConfigEntry}
 import org.apache.kafka.common._
-import org.apache.kafka.common.acl.AclOperation
+import org.apache.kafka.common.acl.{AclOperation, AclPermissionType}
 import org.apache.kafka.common.compress.Compression
 import org.apache.kafka.common.config.ConfigResource
 import org.apache.kafka.common.config.ConfigResource.Type.{BROKER, BROKER_LOGGER}
@@ -12850,6 +12850,355 @@ class KafkaApisTest extends Logging {
       byName("acme.orders").partitions.asScala.head.errorCode)
     assertEquals(Errors.NONE.code,
       byName("plain-topic").partitions.asScala.head.errorCode)
+  }
+
+  @Test
+  def testListPartitionReassignmentsStripsTenantTopicsFromControllerResponse(): Unit = {
+    // The controller has no notion of tenants — it returns every in-flight
+    // reassignment by its physical topic name. A cluster-wide caller seeing
+    // `acme.orders` in the response learns the existence + partition shape of
+    // tenant data. The broker must scrub reserved-prefix topics from the
+    // response before handing it back. Scrubbing is silent: no per-entry
+    // "rejected" status, so the caller cannot distinguish "topic doesn't
+    // exist" from "topic exists but belongs to a tenant".
+    val req = new ListPartitionReassignmentsRequest.Builder(
+      new ListPartitionReassignmentsRequestData().setTimeoutMs(5000)).build()
+    val request = buildRequest(req)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleListPartitionReassignmentsRequest(request)
+
+    val callbackCaptor: ArgumentCaptor[Option[AbstractResponse] => Unit] =
+      ArgumentCaptor.forClass(classOf[Option[AbstractResponse] => Unit])
+    verify(forwardingManager).forwardRequest(
+      ArgumentMatchers.eq(request),
+      callbackCaptor.capture())
+
+    val controllerData = new ListPartitionReassignmentsResponseData()
+      .setTopics(util.Arrays.asList(
+        new ListPartitionReassignmentsResponseData.OngoingTopicReassignment()
+          .setName("acme.orders")
+          .setPartitions(util.Arrays.asList(
+            new ListPartitionReassignmentsResponseData.OngoingPartitionReassignment()
+              .setPartitionIndex(0).setReplicas(util.Arrays.asList(1, 2)))),
+        new ListPartitionReassignmentsResponseData.OngoingTopicReassignment()
+          .setName("public-orders")
+          .setPartitions(util.Arrays.asList(
+            new ListPartitionReassignmentsResponseData.OngoingPartitionReassignment()
+              .setPartitionIndex(0).setReplicas(util.Arrays.asList(3, 4))))))
+    callbackCaptor.getValue.apply(Some(new ListPartitionReassignmentsResponse(controllerData)))
+
+    val response = verifyNoThrottling[ListPartitionReassignmentsResponse](request)
+    val names = response.data.topics.asScala.map(_.name).toSet
+    assertEquals(Set("public-orders"), names,
+      "tenant-prefixed reassignment must be stripped from the response")
+  }
+
+  @Test
+  def testListPartitionReassignmentsLeavesNeutralResponseAlone(): Unit = {
+    // Control: with no tenant-prefixed topics in the controller response, the
+    // filter passes the topic list through unchanged.
+    val req = new ListPartitionReassignmentsRequest.Builder(
+      new ListPartitionReassignmentsRequestData().setTimeoutMs(5000)).build()
+    val request = buildRequest(req)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleListPartitionReassignmentsRequest(request)
+
+    val callbackCaptor: ArgumentCaptor[Option[AbstractResponse] => Unit] =
+      ArgumentCaptor.forClass(classOf[Option[AbstractResponse] => Unit])
+    verify(forwardingManager).forwardRequest(
+      ArgumentMatchers.eq(request),
+      callbackCaptor.capture())
+
+    val controllerData = new ListPartitionReassignmentsResponseData()
+      .setTopics(util.Arrays.asList(
+        new ListPartitionReassignmentsResponseData.OngoingTopicReassignment()
+          .setName("public-orders")
+          .setPartitions(util.Arrays.asList(
+            new ListPartitionReassignmentsResponseData.OngoingPartitionReassignment()
+              .setPartitionIndex(0).setReplicas(util.Arrays.asList(3, 4))))))
+    callbackCaptor.getValue.apply(Some(new ListPartitionReassignmentsResponse(controllerData)))
+
+    val response = verifyNoThrottling[ListPartitionReassignmentsResponse](request)
+    val names = response.data.topics.asScala.map(_.name).toSet
+    assertEquals(Set("public-orders"), names)
+  }
+
+  private def aclCreation(resourceType: ResourceType,
+                          resourceName: String,
+                          principal: String): CreateAclsRequestData.AclCreation =
+    new CreateAclsRequestData.AclCreation()
+      .setResourceType(resourceType.code)
+      .setResourceName(resourceName)
+      .setResourcePatternType(PatternType.LITERAL.code)
+      .setPrincipal(principal)
+      .setHost("*")
+      .setOperation(AclOperation.READ.code)
+      .setPermissionType(AclPermissionType.ALLOW.code)
+
+  @Test
+  def testCreateAclsClusterWideListenerRejectsTenantPrefixedTopicResource(): Unit = {
+    // ACL written against `Topic:acme.orders` would grant cross-tenant access
+    // to the named principal. The Authorizer applies the binding literally;
+    // it has no notion of tenant ownership. Refuse before forwarding.
+    val creation = aclCreation(ResourceType.TOPIC, "acme.orders", "User:bob")
+    val req = new CreateAclsRequest.Builder(new CreateAclsRequestData()
+      .setCreations(util.Arrays.asList(creation))).build()
+    val request = buildRequest(req)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleCreateAclsRequest(request)
+
+    val response = verifyNoThrottling[CreateAclsResponse](request)
+    assertEquals(1, response.data.results.size)
+    val r = response.data.results.get(0)
+    assertEquals(Errors.INVALID_REQUEST.code, r.errorCode)
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[AbstractRequest](), any[Option[AbstractResponse] => Unit]())
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
+  def testCreateAclsClusterWideListenerRejectsTenantPrefixedPrincipal(): Unit = {
+    // ACL targeting `User:__tenant_acme.alice` would escalate or shadow the
+    // tenant principal's authorization without the tenant's consent.
+    val creation = aclCreation(ResourceType.TOPIC, "plain-topic", "User:__tenant_acme.alice")
+    val req = new CreateAclsRequest.Builder(new CreateAclsRequestData()
+      .setCreations(util.Arrays.asList(creation))).build()
+    val request = buildRequest(req)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleCreateAclsRequest(request)
+
+    val response = verifyNoThrottling[CreateAclsResponse](request)
+    assertEquals(1, response.data.results.size)
+    assertEquals(Errors.INVALID_REQUEST.code, response.data.results.get(0).errorCode)
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[AbstractRequest](), any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
+  def testCreateAclsClusterWideListenerMixesAllowedAndRejectedEntries(): Unit = {
+    // Mixed batch [tenant-topic, neutral, tenant-principal, neutral]: only
+    // entries 1 and 3 (0-indexed) reach the controller; entries 0 and 2 are
+    // rejected at the broker. The response must surface results at the
+    // original positions — CreateAclsResponse.Results is positional w.r.t.
+    // the request's Creations.
+    val creations = util.Arrays.asList(
+      aclCreation(ResourceType.TOPIC, "acme.orders", "User:bob"),       // 0: refuse
+      aclCreation(ResourceType.TOPIC, "plain-a", "User:bob"),           // 1: allow
+      aclCreation(ResourceType.TOPIC, "plain-b", "User:__tenant_acme.alice"), // 2: refuse
+      aclCreation(ResourceType.TOPIC, "plain-c", "User:carol"))         // 3: allow
+    val req = new CreateAclsRequest.Builder(new CreateAclsRequestData()
+      .setCreations(creations)).build()
+    val request = buildRequest(req)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleCreateAclsRequest(request)
+
+    val bodyCaptor: ArgumentCaptor[AbstractRequest] = ArgumentCaptor.forClass(classOf[AbstractRequest])
+    val callbackCaptor: ArgumentCaptor[Option[AbstractResponse] => Unit] =
+      ArgumentCaptor.forClass(classOf[Option[AbstractResponse] => Unit])
+    verify(forwardingManager).forwardRequest(
+      ArgumentMatchers.eq(request), bodyCaptor.capture(), callbackCaptor.capture())
+    val forwarded = bodyCaptor.getValue.asInstanceOf[CreateAclsRequest]
+    val forwardedNames = forwarded.data.creations.asScala.map(c =>
+      (c.resourceName, c.principal)).toList
+    assertEquals(List(("plain-a", "User:bob"), ("plain-c", "User:carol")), forwardedNames,
+      "only the two non-polluting entries must reach the controller")
+
+    // Controller responds for the two kept entries (positions 0 and 1 in the
+    // forwarded request); the merger must place them back at positions 1 and 3.
+    val controllerResults = util.Arrays.asList(
+      new CreateAclsResponseData.AclCreationResult().setErrorCode(Errors.NONE.code),
+      new CreateAclsResponseData.AclCreationResult().setErrorCode(Errors.NONE.code))
+    callbackCaptor.getValue.apply(Some(new CreateAclsResponse(
+      new CreateAclsResponseData().setResults(controllerResults))))
+
+    val response = verifyNoThrottling[CreateAclsResponse](request)
+    val codes = response.data.results.asScala.map(_.errorCode).toList
+    assertEquals(List(
+      Errors.INVALID_REQUEST.code,  // 0: refused
+      Errors.NONE.code,             // 1: controller said OK
+      Errors.INVALID_REQUEST.code,  // 2: refused
+      Errors.NONE.code), codes)     // 3: controller said OK
+  }
+
+  @Test
+  def testCreateAclsClusterWideListenerForwardsTenantLookingNamesWhenNoTenantsConfigured(): Unit = {
+    // Guard is gated on TenantConfig.allTenants. With no tenants, `acme.foo`
+    // is just a topic name and the broker forwards verbatim.
+    val creation = aclCreation(ResourceType.TOPIC, "acme.orders", "User:bob")
+    val req = new CreateAclsRequest.Builder(new CreateAclsRequestData()
+      .setCreations(util.Arrays.asList(creation))).build()
+    val request = buildRequest(req)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleCreateAclsRequest(request)
+
+    verify(forwardingManager, times(1)).forwardRequest(
+      ArgumentMatchers.eq(request),
+      any[Option[AbstractResponse] => Unit]())
+  }
+
+  private def aclFilter(resourceType: ResourceType,
+                        resourceNameFilter: String,
+                        principalFilter: String): DeleteAclsRequestData.DeleteAclsFilter =
+    new DeleteAclsRequestData.DeleteAclsFilter()
+      .setResourceTypeFilter(resourceType.code)
+      .setResourceNameFilter(resourceNameFilter)
+      .setPatternTypeFilter(PatternType.LITERAL.code)
+      .setPrincipalFilter(principalFilter)
+      .setHostFilter(null)
+      .setOperation(AclOperation.READ.code)
+      .setPermissionType(AclPermissionType.ALLOW.code)
+
+  @Test
+  def testDeleteAclsClusterWideListenerRejectsExplicitTenantTopicFilter(): Unit = {
+    // Explicit-name filter against `Topic:acme.orders` would yank tenant ACLs.
+    // Refuse at the broker; the controller never sees the filter.
+    val filter = aclFilter(ResourceType.TOPIC, "acme.orders", null)
+    val req = new DeleteAclsRequest.Builder(new DeleteAclsRequestData()
+      .setFilters(util.Arrays.asList(filter))).build()
+    val request = buildRequest(req)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDeleteAclsRequest(request)
+
+    val response = verifyNoThrottling[DeleteAclsResponse](request)
+    assertEquals(1, response.data.filterResults.size)
+    assertEquals(Errors.INVALID_REQUEST.code, response.data.filterResults.get(0).errorCode)
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[AbstractRequest](), any[Option[AbstractResponse] => Unit]())
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
+  def testDeleteAclsClusterWideListenerRejectsExplicitTenantPrincipalFilter(): Unit = {
+    // Explicit principal filter `User:__tenant_acme.alice` revokes the
+    // tenant principal's grants. Refuse.
+    val filter = aclFilter(ResourceType.TOPIC, null, "User:__tenant_acme.alice")
+    val req = new DeleteAclsRequest.Builder(new DeleteAclsRequestData()
+      .setFilters(util.Arrays.asList(filter))).build()
+    val request = buildRequest(req)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDeleteAclsRequest(request)
+
+    val response = verifyNoThrottling[DeleteAclsResponse](request)
+    assertEquals(1, response.data.filterResults.size)
+    assertEquals(Errors.INVALID_REQUEST.code, response.data.filterResults.get(0).errorCode)
+  }
+
+  @Test
+  def testDeleteAclsClusterWideListenerScrubsMatchingAclsForWildcardFilter(): Unit = {
+    // Wildcard filter (null resourceNameFilter AND null principalFilter) DOES
+    // proceed to the controller — that is legitimate cluster-admin reach. But
+    // the response's MatchingAcls echoes resource + principal names of every
+    // ACL that matched. Tenant-owned entries in that echo are a free
+    // enumeration of tenant ACLs; the leak guard scrubs them.
+    val filter = aclFilter(ResourceType.TOPIC, null, null)
+    val req = new DeleteAclsRequest.Builder(new DeleteAclsRequestData()
+      .setFilters(util.Arrays.asList(filter))).build()
+    val request = buildRequest(req)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDeleteAclsRequest(request)
+
+    val callbackCaptor: ArgumentCaptor[Option[AbstractResponse] => Unit] =
+      ArgumentCaptor.forClass(classOf[Option[AbstractResponse] => Unit])
+    verify(forwardingManager).forwardRequest(
+      ArgumentMatchers.eq(request), callbackCaptor.capture())
+
+    val controllerMatchingAcls = util.Arrays.asList(
+      new DeleteAclsResponseData.DeleteAclsMatchingAcl()
+        .setResourceType(ResourceType.TOPIC.code)
+        .setResourceName("acme.orders")
+        .setPatternType(PatternType.LITERAL.code)
+        .setPrincipal("User:bob")
+        .setHost("*")
+        .setOperation(AclOperation.READ.code)
+        .setPermissionType(AclPermissionType.ALLOW.code),
+      new DeleteAclsResponseData.DeleteAclsMatchingAcl()
+        .setResourceType(ResourceType.TOPIC.code)
+        .setResourceName("plain-topic")
+        .setPatternType(PatternType.LITERAL.code)
+        .setPrincipal("User:__tenant_acme.alice")
+        .setHost("*")
+        .setOperation(AclOperation.READ.code)
+        .setPermissionType(AclPermissionType.ALLOW.code),
+      new DeleteAclsResponseData.DeleteAclsMatchingAcl()
+        .setResourceType(ResourceType.TOPIC.code)
+        .setResourceName("plain-topic")
+        .setPatternType(PatternType.LITERAL.code)
+        .setPrincipal("User:bob")
+        .setHost("*")
+        .setOperation(AclOperation.READ.code)
+        .setPermissionType(AclPermissionType.ALLOW.code))
+    val filterResult = new DeleteAclsResponseData.DeleteAclsFilterResult()
+      .setErrorCode(Errors.NONE.code)
+      .setMatchingAcls(controllerMatchingAcls)
+    callbackCaptor.getValue.apply(Some(new DeleteAclsResponse(
+      new DeleteAclsResponseData().setFilterResults(util.Arrays.asList(filterResult)),
+      req.version)))
+
+    val response = verifyNoThrottling[DeleteAclsResponse](request)
+    val matching = response.data.filterResults.get(0).matchingAcls.asScala.toList
+    assertEquals(1, matching.size,
+      "tenant-named resource and tenant-principal entries must be scrubbed from MatchingAcls")
+    assertEquals("plain-topic", matching.head.resourceName)
+    assertEquals("User:bob", matching.head.principal)
+  }
+
+  @Test
+  def testDeleteAclsClusterWideListenerLeavesNeutralExplicitFilterAlone(): Unit = {
+    // A specific filter that does NOT name a tenant namespace must reach the
+    // controller verbatim; the response's MatchingAcls (also non-tenant) must
+    // pass through untouched.
+    val filter = aclFilter(ResourceType.TOPIC, "plain-topic", "User:bob")
+    val req = new DeleteAclsRequest.Builder(new DeleteAclsRequestData()
+      .setFilters(util.Arrays.asList(filter))).build()
+    val request = buildRequest(req)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDeleteAclsRequest(request)
+
+    val callbackCaptor: ArgumentCaptor[Option[AbstractResponse] => Unit] =
+      ArgumentCaptor.forClass(classOf[Option[AbstractResponse] => Unit])
+    verify(forwardingManager).forwardRequest(
+      ArgumentMatchers.eq(request), callbackCaptor.capture())
+
+    val matchingAcl = new DeleteAclsResponseData.DeleteAclsMatchingAcl()
+      .setResourceType(ResourceType.TOPIC.code)
+      .setResourceName("plain-topic")
+      .setPatternType(PatternType.LITERAL.code)
+      .setPrincipal("User:bob")
+      .setHost("*")
+      .setOperation(AclOperation.READ.code)
+      .setPermissionType(AclPermissionType.ALLOW.code)
+    val filterResult = new DeleteAclsResponseData.DeleteAclsFilterResult()
+      .setErrorCode(Errors.NONE.code)
+      .setMatchingAcls(util.Arrays.asList(matchingAcl))
+    callbackCaptor.getValue.apply(Some(new DeleteAclsResponse(
+      new DeleteAclsResponseData().setFilterResults(util.Arrays.asList(filterResult)),
+      req.version)))
+
+    val response = verifyNoThrottling[DeleteAclsResponse](request)
+    assertEquals(1, response.data.filterResults.get(0).matchingAcls.size,
+      "non-tenant matching ACL must not be scrubbed")
   }
 
   @Test

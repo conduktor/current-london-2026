@@ -750,8 +750,8 @@ class KafkaApis(val requestChannel: RequestChannel,
         case ApiKeys.WRITE_TXN_MARKERS => handleWriteTxnMarkersRequest(request, requestLocal)
         case ApiKeys.TXN_OFFSET_COMMIT => handleTxnOffsetCommitRequest(request, requestLocal).exceptionally(handleError)
         case ApiKeys.DESCRIBE_ACLS => handleDescribeAcls(request)
-        case ApiKeys.CREATE_ACLS => forwardToController(request)
-        case ApiKeys.DELETE_ACLS => forwardToController(request)
+        case ApiKeys.CREATE_ACLS => handleCreateAclsRequest(request)
+        case ApiKeys.DELETE_ACLS => handleDeleteAclsRequest(request)
         case ApiKeys.ALTER_CONFIGS => handleAlterConfigsRequest(request)
         case ApiKeys.DESCRIBE_CONFIGS => handleDescribeConfigsRequest(request)
         case ApiKeys.ALTER_REPLICA_LOG_DIRS => handleAlterReplicaLogDirsRequest(request)
@@ -768,7 +768,7 @@ class KafkaApis(val requestChannel: RequestChannel,
         case ApiKeys.ELECT_LEADERS => handleElectLeadersRequest(request)
         case ApiKeys.INCREMENTAL_ALTER_CONFIGS => handleIncrementalAlterConfigsRequest(request)
         case ApiKeys.ALTER_PARTITION_REASSIGNMENTS => handleAlterPartitionReassignmentsRequest(request)
-        case ApiKeys.LIST_PARTITION_REASSIGNMENTS => forwardToController(request)
+        case ApiKeys.LIST_PARTITION_REASSIGNMENTS => handleListPartitionReassignmentsRequest(request)
         case ApiKeys.OFFSET_DELETE => handleOffsetDeleteRequest(request, requestLocal).exceptionally(handleError)
         case ApiKeys.DESCRIBE_CLIENT_QUOTAS => handleDescribeClientQuotasRequest(request)
         case ApiKeys.ALTER_CLIENT_QUOTAS => forwardToController(request)
@@ -4118,6 +4118,236 @@ class KafkaApis(val requestChannel: RequestChannel,
         new AlterPartitionReassignmentsRequest.Builder(data).build(request.header.apiVersion()),
         response => sendResponse(response.map(_.asInstanceOf[AlterPartitionReassignmentsResponse].data())))
     }
+  }
+
+  // LIST_PARTITION_REASSIGNMENTS — outside-in name leak. The controller returns
+  // every in-flight reassignment by its physical topic name; a cluster-wide
+  // caller would otherwise see `acme.orders`, `beta.events`, ... A cluster
+  // admin has no business knowing the tenant physical names. Tenants don't
+  // reach this RPC (not in TENANT_ALLOWED_APIS), so unconditionally stripping
+  // any reserved-prefix topic from the response is correct — the only callers
+  // we see here are non-tenant. Stripping is silent (no per-entry "rejected")
+  // so the caller cannot probe which prefixes are tenant ids by watching for
+  // refusals; an unknown `foo.bar` and a tenant `acme.orders` are equally
+  // absent from the response.
+  def handleListPartitionReassignmentsRequest(request: RequestChannel.Request): Unit = {
+    def responseCallback(responseOpt: Option[AbstractResponse]): Unit = {
+      responseOpt match {
+        case Some(response) =>
+          val r = response.asInstanceOf[ListPartitionReassignmentsResponse]
+          if (r.data.topics != null) {
+            val filtered = new util.ArrayList[ListPartitionReassignmentsResponseData.OngoingTopicReassignment](r.data.topics.size)
+            r.data.topics.forEach { t =>
+              if (!isReservedTenantNamespace(t.name)) filtered.add(t)
+            }
+            r.data.setTopics(filtered)
+          }
+          requestHelper.sendForwardedResponse(request, response)
+        case None => handleInvalidVersionsDuringForwarding(request)
+      }
+    }
+    forwardingManager.forwardRequest(request, responseCallback)
+  }
+
+  // CREATE_ACLS — outside-in privilege-escalation guard. A cluster-wide admin
+  // writing an ACL against a tenant resource (`Topic:acme.orders`) or naming a
+  // tenant principal (`User:__tenant_acme.alice`) would directly mutate tenant
+  // authorization state — granting cross-tenant access, escalating a tenant
+  // principal's reach, or shadowing tenant-owned ACLs. The Authorizer applies
+  // these bindings literally; it has no notion of tenant boundaries. Refuse
+  // each entry that names a KNOWN tenant namespace; forward the rest.
+  //
+  // The CreateAcls response carries no resource info per entry — Results is
+  // positional w.r.t. the original creations list — so we must preserve the
+  // index of each rejected entry and interleave the controller's responses
+  // back in at the kept positions.
+  def handleCreateAclsRequest(request: RequestChannel.Request): Unit = {
+    val original = request.body[CreateAclsRequest]
+    val creations = original.data.creations
+    val rejections = new util.HashMap[Integer, CreateAclsResponseData.AclCreationResult]()
+    if (!tenantContextFor(request).effectiveTenant.isPresent) {
+      var i = 0
+      while (i < creations.size) {
+        val c = creations.get(i)
+        val topicRefuse = c.resourceType == ResourceType.TOPIC.code &&
+          isReservedTenantNamespace(c.resourceName)
+        val principalRefuse = isReservedUserPrincipalLiteral(c.principal)
+        if (topicRefuse || principalRefuse) {
+          val what = if (topicRefuse) "Resource name '" + c.resourceName + "'"
+            else "Principal '" + c.principal + "'"
+          rejections.put(i, new CreateAclsResponseData.AclCreationResult()
+            .setErrorCode(Errors.INVALID_REQUEST.code)
+            .setErrorMessage(what + " is reserved (tenant namespace prefix)"))
+        }
+        i += 1
+      }
+    }
+    if (rejections.isEmpty) {
+      forwardToController(request)
+      return
+    }
+    val kept = new util.ArrayList[CreateAclsRequestData.AclCreation](creations.size - rejections.size)
+    var k = 0
+    while (k < creations.size) {
+      if (!rejections.containsKey(k)) kept.add(creations.get(k))
+      k += 1
+    }
+    def sendResponse(controllerResponseOpt: Option[AbstractResponse]): Unit = {
+      val controllerResults: util.List[CreateAclsResponseData.AclCreationResult] = controllerResponseOpt match {
+        case Some(r: CreateAclsResponse) => r.data.results
+        case _ => Collections.emptyList()
+      }
+      val merged = new util.ArrayList[CreateAclsResponseData.AclCreationResult](creations.size)
+      var idx = 0
+      var fwdIdx = 0
+      while (idx < creations.size) {
+        if (rejections.containsKey(idx)) {
+          merged.add(rejections.get(idx))
+        } else {
+          if (fwdIdx < controllerResults.size) merged.add(controllerResults.get(fwdIdx))
+          else merged.add(new CreateAclsResponseData.AclCreationResult()
+            .setErrorCode(Errors.UNKNOWN_SERVER_ERROR.code))
+          fwdIdx += 1
+        }
+        idx += 1
+      }
+      requestHelper.sendResponseMaybeThrottle(request, throttleMs =>
+        new CreateAclsResponse(new CreateAclsResponseData()
+          .setThrottleTimeMs(throttleMs)
+          .setResults(merged)))
+    }
+    if (kept.isEmpty) {
+      sendResponse(None)
+    } else {
+      val newData = new CreateAclsRequestData().setCreations(kept)
+      forwardingManager.forwardRequest(request,
+        new CreateAclsRequest.Builder(newData).build(request.header.apiVersion()),
+        sendResponse)
+    }
+  }
+
+  // DELETE_ACLS — outside-in revocation/leak guard. Two threats:
+  //
+  //  1. EXPLICIT-NAME revocation: a cluster-wide admin deletes
+  //     `Topic:acme.orders` or `User:__tenant_acme.alice ALLOW ...` filters.
+  //     This silently rips tenant ACLs out from under the tenant; refuse.
+  //  2. INFORMATION LEAK: DeleteAclsResponse.MatchingAcls echoes resource and
+  //     principal names of every ACL that matched the filter. Even when the
+  //     caller submitted a wildcard filter (which we DO leave alone — that is
+  //     the inherent reach of cluster admin, not a naming attack), entries
+  //     belonging to a reserved tenant namespace must not be echoed back.
+  //
+  // Wildcard filters (null resourceNameFilter or null principalFilter) are
+  // intentionally permitted to PROCEED. Filtering them out would either lie
+  // about deletions that did happen (option C) or refuse legitimate cluster
+  // admin operations (option A). We accept that wildcard-driven deletes are
+  // cluster admin power; the leak guard scrubs the matching ACLs from the
+  // response so the cluster admin doesn't get a free enumeration of tenant
+  // ACLs via wildcard probes.
+  def handleDeleteAclsRequest(request: RequestChannel.Request): Unit = {
+    val original = request.body[DeleteAclsRequest]
+    val filters = original.data.filters
+    val rejections = new util.HashMap[Integer, DeleteAclsResponseData.DeleteAclsFilterResult]()
+    val onClusterListener = !tenantContextFor(request).effectiveTenant.isPresent
+    if (onClusterListener) {
+      var i = 0
+      while (i < filters.size) {
+        val f = filters.get(i)
+        val topicRefuse = f.resourceTypeFilter == ResourceType.TOPIC.code &&
+          f.resourceNameFilter != null && isReservedTenantNamespace(f.resourceNameFilter)
+        val principalRefuse = f.principalFilter != null &&
+          isReservedUserPrincipalLiteral(f.principalFilter)
+        if (topicRefuse || principalRefuse) {
+          val what = if (topicRefuse) "Resource filter '" + f.resourceNameFilter + "'"
+            else "Principal filter '" + f.principalFilter + "'"
+          rejections.put(i, new DeleteAclsResponseData.DeleteAclsFilterResult()
+            .setErrorCode(Errors.INVALID_REQUEST.code)
+            .setErrorMessage(what + " names a reserved tenant namespace"))
+        }
+        i += 1
+      }
+    }
+    val kept = new util.ArrayList[DeleteAclsRequestData.DeleteAclsFilter](filters.size - rejections.size)
+    var k = 0
+    while (k < filters.size) {
+      if (!rejections.containsKey(k)) kept.add(filters.get(k))
+      k += 1
+    }
+    def scrubMatchingAcls(fr: DeleteAclsResponseData.DeleteAclsFilterResult): Unit = {
+      if (!onClusterListener) return
+      if (fr.matchingAcls == null || fr.matchingAcls.isEmpty) return
+      val out = new util.ArrayList[DeleteAclsResponseData.DeleteAclsMatchingAcl](fr.matchingAcls.size)
+      fr.matchingAcls.forEach { m =>
+        val tenantOwned =
+          (m.resourceType == ResourceType.TOPIC.code && isReservedTenantNamespace(m.resourceName)) ||
+            isReservedUserPrincipalLiteral(m.principal)
+        if (!tenantOwned) out.add(m)
+      }
+      fr.setMatchingAcls(out)
+    }
+    def sendResponse(controllerResponseOpt: Option[AbstractResponse]): Unit = {
+      val controllerResults: util.List[DeleteAclsResponseData.DeleteAclsFilterResult] = controllerResponseOpt match {
+        case Some(r: DeleteAclsResponse) => r.data.filterResults
+        case _ => Collections.emptyList()
+      }
+      controllerResults.forEach(scrubMatchingAcls)
+      val merged = new util.ArrayList[DeleteAclsResponseData.DeleteAclsFilterResult](filters.size)
+      var idx = 0
+      var fwdIdx = 0
+      while (idx < filters.size) {
+        if (rejections.containsKey(idx)) {
+          merged.add(rejections.get(idx))
+        } else {
+          if (fwdIdx < controllerResults.size) merged.add(controllerResults.get(fwdIdx))
+          else merged.add(new DeleteAclsResponseData.DeleteAclsFilterResult()
+            .setErrorCode(Errors.UNKNOWN_SERVER_ERROR.code))
+          fwdIdx += 1
+        }
+        idx += 1
+      }
+      requestHelper.sendResponseMaybeThrottle(request, throttleMs =>
+        new DeleteAclsResponse(
+          new DeleteAclsResponseData()
+            .setThrottleTimeMs(throttleMs)
+            .setFilterResults(merged),
+          request.header.apiVersion))
+    }
+    if (kept.isEmpty && !rejections.isEmpty) {
+      sendResponse(None)
+    } else if (rejections.isEmpty) {
+      // No explicit-name rejections, but we still need to scrub matchingAcls
+      // from the response on the cluster-wide listener (leak guard for
+      // wildcard filters).
+      def responseCallback(responseOpt: Option[AbstractResponse]): Unit = {
+        responseOpt match {
+          case Some(r: DeleteAclsResponse) =>
+            r.data.filterResults.forEach(scrubMatchingAcls)
+            requestHelper.sendForwardedResponse(request, r)
+          case Some(other) => requestHelper.sendForwardedResponse(request, other)
+          case None => handleInvalidVersionsDuringForwarding(request)
+        }
+      }
+      forwardingManager.forwardRequest(request, responseCallback)
+    } else {
+      val newData = new DeleteAclsRequestData().setFilters(kept)
+      forwardingManager.forwardRequest(request,
+        new DeleteAclsRequest.Builder(newData).build(request.header.apiVersion()),
+        sendResponse)
+    }
+  }
+
+  // True iff `principalStr` is in the legacy `User:<name>` form AND the
+  // <name> portion is a tenant-prefixed principal naming a KNOWN tenant.
+  // ACL bindings serialize the principal as `User:foo`; the tenant-encoded
+  // form is `User:__tenant_<id>.<user>`. Unknown tenant ids are opaque and
+  // not refused here — the cluster admin can still ACL their own users
+  // even if `__tenant_x.y` happens to look tenant-shaped, as long as `x`
+  // isn't a configured tenant on this broker.
+  private def isReservedUserPrincipalLiteral(principalStr: String): Boolean = {
+    if (principalStr == null) return false
+    val userPrefix = "User:"
+    if (!principalStr.startsWith(userPrefix)) return false
+    isReservedTenantPrincipalNamespace(principalStr.substring(userPrefix.length))
   }
 
   def handleDescribeConfigsRequest(request: RequestChannel.Request): Unit = {
