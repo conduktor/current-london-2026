@@ -1476,6 +1476,169 @@ class ControllerApisTest {
       any(classOf[CreateDelegationTokenRequestData]))
   }
 
+  // ---------------------------------------------------------------------------
+  // AlterUserScramCredentials — controller-side identity-laundering guard
+  //
+  // Mirrors the broker-side test block in KafkaApisTest. The controller listener
+  // is reachable directly (the SCRAM request schema declares listeners=
+  // [broker,controller]) and via Envelope re-dispatch from CLUSTER_ACTION
+  // holders. Without the controller-side guard, an attacker could bypass the
+  // broker by either routing directly to the controller or by wrapping the
+  // SCRAM request in an Envelope and asking a CLUSTER_ACTION holder to forward
+  // it. MockController throws UnsupportedOperationException from
+  // alterUserScramCredentials, so any reach-through is a hard test failure —
+  // these tests double as proof that the guard refuses BEFORE the controller
+  // layer is invoked.
+  // ---------------------------------------------------------------------------
+
+  @Test
+  def testControllerAlterUserScramCredentialsRefusesTenantPrefixedUpsertionFromClusterCaller(): Unit = {
+    val upsertions = new util.ArrayList[AlterUserScramCredentialsRequestData.ScramCredentialUpsertion]()
+    upsertions.add(new AlterUserScramCredentialsRequestData.ScramCredentialUpsertion()
+      .setName("__tenant_acme.alice")
+      .setMechanism(1.toByte)
+      .setIterations(8192)
+      .setSalt(Array.emptyByteArray)
+      .setSaltedPassword(Array.emptyByteArray))
+    val alterRequest = new AlterUserScramCredentialsRequest.Builder(
+      new AlterUserScramCredentialsRequestData().setUpsertions(upsertions)).build()
+    val request = buildTokenRequest(alterRequest, new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = new MockController.Builder().build(),
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    controllerApis.handle(request, RequestLocal.noCaching())
+
+    val response = captureSentResponse(request).asInstanceOf[AlterUserScramCredentialsResponse]
+    assertEquals(1, response.data.results.size)
+    val result = response.data.results.get(0)
+    assertEquals("__tenant_acme.alice", result.user)
+    assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED.code, result.errorCode,
+      "controller must refuse a non-tenant caller minting a SCRAM credential for a tenant principal")
+  }
+
+  @Test
+  def testControllerAlterUserScramCredentialsRefusesTenantPrefixedDeletionFromClusterCaller(): Unit = {
+    val deletions = new util.ArrayList[AlterUserScramCredentialsRequestData.ScramCredentialDeletion]()
+    deletions.add(new AlterUserScramCredentialsRequestData.ScramCredentialDeletion()
+      .setName("__tenant_acme.alice")
+      .setMechanism(1.toByte))
+    val alterRequest = new AlterUserScramCredentialsRequest.Builder(
+      new AlterUserScramCredentialsRequestData().setDeletions(deletions)).build()
+    val request = buildTokenRequest(alterRequest, new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = new MockController.Builder().build(),
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    controllerApis.handle(request, RequestLocal.noCaching())
+
+    val response = captureSentResponse(request).asInstanceOf[AlterUserScramCredentialsResponse]
+    assertEquals(1, response.data.results.size)
+    val result = response.data.results.get(0)
+    assertEquals("__tenant_acme.alice", result.user)
+    assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED.code, result.errorCode,
+      "controller must refuse a non-tenant caller deleting a tenant principal's SCRAM credential")
+  }
+
+  @Test
+  def testControllerAlterUserScramCredentialsAtomicMixedBatchRefused(): Unit = {
+    // All-or-nothing: a mixed batch containing one foreign-tenant entry must
+    // refuse every entry, mirroring the broker.
+    val upsertions = new util.ArrayList[AlterUserScramCredentialsRequestData.ScramCredentialUpsertion]()
+    upsertions.add(new AlterUserScramCredentialsRequestData.ScramCredentialUpsertion()
+      .setName("regular-user")
+      .setMechanism(1.toByte)
+      .setIterations(8192)
+      .setSalt(Array.emptyByteArray)
+      .setSaltedPassword(Array.emptyByteArray))
+    upsertions.add(new AlterUserScramCredentialsRequestData.ScramCredentialUpsertion()
+      .setName("__tenant_acme.alice")
+      .setMechanism(1.toByte)
+      .setIterations(8192)
+      .setSalt(Array.emptyByteArray)
+      .setSaltedPassword(Array.emptyByteArray))
+    val alterRequest = new AlterUserScramCredentialsRequest.Builder(
+      new AlterUserScramCredentialsRequestData().setUpsertions(upsertions)).build()
+    val request = buildTokenRequest(alterRequest, new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = new MockController.Builder().build(),
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    controllerApis.handle(request, RequestLocal.noCaching())
+
+    val response = captureSentResponse(request).asInstanceOf[AlterUserScramCredentialsResponse]
+    assertEquals(2, response.data.results.size)
+    response.data.results.forEach { r =>
+      assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED.code, r.errorCode,
+        s"all entries (including `${r.user}`) must be refused atomically when the batch contains a foreign-tenant entry")
+    }
+  }
+
+  @Test
+  def testControllerAlterUserScramCredentialsAllowsRegularUserForClusterCaller(): Unit = {
+    // Control: a non-tenant caller altering an ordinary user reaches the
+    // controller. The guard must not over-refuse.
+    val upsertions = new util.ArrayList[AlterUserScramCredentialsRequestData.ScramCredentialUpsertion]()
+    upsertions.add(new AlterUserScramCredentialsRequestData.ScramCredentialUpsertion()
+      .setName("regular-user")
+      .setMechanism(1.toByte)
+      .setIterations(8192)
+      .setSalt(Array.emptyByteArray)
+      .setSaltedPassword(Array.emptyByteArray))
+    val alterRequest = new AlterUserScramCredentialsRequest.Builder(
+      new AlterUserScramCredentialsRequestData().setUpsertions(upsertions)).build()
+    val request = buildTokenRequest(alterRequest, new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    val controller = mock(classOf[Controller])
+    when(controller.alterUserScramCredentials(any(classOf[ControllerRequestContext]),
+      any(classOf[AlterUserScramCredentialsRequestData])))
+      .thenReturn(CompletableFuture.completedFuture(new AlterUserScramCredentialsResponseData()))
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    controllerApis.handle(request, RequestLocal.noCaching())
+
+    verify(controller).alterUserScramCredentials(
+      any(classOf[ControllerRequestContext]),
+      any(classOf[AlterUserScramCredentialsRequestData]))
+  }
+
+  @Test
+  def testControllerAlterUserScramCredentialsAllowsSameTenantCallerForOwnUser(): Unit = {
+    // Legitimate tenant flow: tenant principal __tenant_acme.alice asks the
+    // controller (directly or via Envelope re-dispatch) to alter a SCRAM
+    // credential for its own tenant's user. The guard must let it through.
+    val upsertions = new util.ArrayList[AlterUserScramCredentialsRequestData.ScramCredentialUpsertion]()
+    upsertions.add(new AlterUserScramCredentialsRequestData.ScramCredentialUpsertion()
+      .setName("__tenant_acme.alice")
+      .setMechanism(1.toByte)
+      .setIterations(8192)
+      .setSalt(Array.emptyByteArray)
+      .setSaltedPassword(Array.emptyByteArray))
+    val alterRequest = new AlterUserScramCredentialsRequest.Builder(
+      new AlterUserScramCredentialsRequestData().setUpsertions(upsertions)).build()
+    val callerPrincipal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_acme.alice")
+    val request = buildTokenRequest(alterRequest, callerPrincipal)
+
+    val controller = mock(classOf[Controller])
+    when(controller.alterUserScramCredentials(any(classOf[ControllerRequestContext]),
+      any(classOf[AlterUserScramCredentialsRequestData])))
+      .thenReturn(CompletableFuture.completedFuture(new AlterUserScramCredentialsResponseData()))
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    controllerApis.handle(request, RequestLocal.noCaching())
+
+    verify(controller).alterUserScramCredentials(
+      any(classOf[ControllerRequestContext]),
+      any(classOf[AlterUserScramCredentialsRequestData]))
+  }
+
   @AfterEach
   def tearDown(): Unit = {
     quotasNeverThrottleControllerMutations.shutdown()

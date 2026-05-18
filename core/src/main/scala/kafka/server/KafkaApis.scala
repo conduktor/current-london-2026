@@ -773,7 +773,7 @@ class KafkaApis(val requestChannel: RequestChannel,
         case ApiKeys.DESCRIBE_CLIENT_QUOTAS => handleDescribeClientQuotasRequest(request)
         case ApiKeys.ALTER_CLIENT_QUOTAS => forwardToController(request)
         case ApiKeys.DESCRIBE_USER_SCRAM_CREDENTIALS => handleDescribeUserScramCredentialsRequest(request)
-        case ApiKeys.ALTER_USER_SCRAM_CREDENTIALS => forwardToController(request)
+        case ApiKeys.ALTER_USER_SCRAM_CREDENTIALS => handleAlterUserScramCredentialsRequest(request)
         case ApiKeys.UPDATE_FEATURES => forwardToController(request)
         case ApiKeys.DESCRIBE_CLUSTER => handleDescribeCluster(request)
         case ApiKeys.DESCRIBE_PRODUCERS => handleDescribeProducersRequest(request)
@@ -4615,6 +4615,63 @@ class KafkaApis(val requestChannel: RequestChannel,
       .setThrottleTimeMs(throttleTimeMs)
       .setResults(logDirInfos.asJava)
       .setErrorCode(error.code)))
+  }
+
+  // Identity-laundering guard for SCRAM credential alteration. A cluster
+  // super-user (or any CLUSTER_ACTION holder) can otherwise mint a SCRAM
+  // credential for `__tenant_<id>.<user>`, then connect via SASL/SCRAM as
+  // that username and have TenantPrincipalBuilder preserve the prefix on
+  // the tenant's bound listener — giving them the tenant's identity. The
+  // mirror attack via deletion can revoke a tenant user out from under the
+  // tenant. Rule: a caller whose own principal is not within tenant T may
+  // not name `__tenant_T.*` in any Upsertion.Name or Deletion.Name.
+  // Atomic batch refusal: if any single entry is foreign-tenant, the whole
+  // request is refused (one Result per affected user with
+  // CLUSTER_AUTHORIZATION_FAILED). This avoids a partial-application
+  // surface on a security-critical credential store and mirrors the
+  // mint-time guard's all-or-nothing posture for delegation tokens.
+  def handleAlterUserScramCredentialsRequest(request: RequestChannel.Request): Unit = {
+    val alterRequest = request.body[AlterUserScramCredentialsRequest]
+    val callerTenant = tenantContextFor(request).effectiveTenant
+    def belongsToCallerTenant(name: String): Boolean =
+      name != null && callerTenant.isPresent &&
+        name.startsWith(TenantNamespace.PRINCIPAL_PREFIX + callerTenant.get + ".")
+    def isForeignTenantPrincipal(name: String): Boolean =
+      isReservedTenantPrincipalNamespace(name) && !belongsToCallerTenant(name)
+
+    val foreignTenantPrincipal =
+      alterRequest.data.upsertions.asScala.exists(u => isForeignTenantPrincipal(u.name)) ||
+      alterRequest.data.deletions.asScala.exists(d => isForeignTenantPrincipal(d.name))
+
+    if (foreignTenantPrincipal) {
+      // One Result per affected user, error CLUSTER_AUTHORIZATION_FAILED.
+      // We emit Results for every user named in the request (foreign or not)
+      // so the client sees the whole batch refused, not a partial answer.
+      val results = new util.ArrayList[AlterUserScramCredentialsResponseData.AlterUserScramCredentialsResult]()
+      val seen = new util.HashSet[String]()
+      alterRequest.data.deletions.forEach { d =>
+        if (seen.add(d.name)) {
+          results.add(new AlterUserScramCredentialsResponseData.AlterUserScramCredentialsResult()
+            .setUser(d.name)
+            .setErrorCode(Errors.CLUSTER_AUTHORIZATION_FAILED.code)
+            .setErrorMessage(null))
+        }
+      }
+      alterRequest.data.upsertions.forEach { u =>
+        if (seen.add(u.name)) {
+          results.add(new AlterUserScramCredentialsResponseData.AlterUserScramCredentialsResult()
+            .setUser(u.name)
+            .setErrorCode(Errors.CLUSTER_AUTHORIZATION_FAILED.code)
+            .setErrorMessage(null))
+        }
+      }
+      requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
+        new AlterUserScramCredentialsResponse(new AlterUserScramCredentialsResponseData()
+          .setThrottleTimeMs(requestThrottleMs)
+          .setResults(results)))
+    } else {
+      forwardToController(request)
+    }
   }
 
   def handleCreateTokenRequest(request: RequestChannel.Request): Unit = {

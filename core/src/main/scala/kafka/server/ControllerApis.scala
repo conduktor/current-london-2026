@@ -888,16 +888,63 @@ class ControllerApis(
       }
   }
 
-  private def handleAlterUserScramCredentials(request: RequestChannel.Request): CompletableFuture[Unit] = {
+  private[server] def handleAlterUserScramCredentials(request: RequestChannel.Request): CompletableFuture[Unit] = {
     val alterRequest = request.body[AlterUserScramCredentialsRequest]
     authHelper.authorizeClusterOperation(request, ALTER)
-    val context = new ControllerRequestContext(request.context.header.data, request.context.principal,
-      OptionalLong.empty())
-    controller.alterUserScramCredentials(context, alterRequest.data)
-      .thenApply[Unit] { response =>
-         requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
-           new AlterUserScramCredentialsResponse(response.setThrottleTimeMs(requestThrottleMs)))
+
+    // Defence in depth for the identity-laundering guard the broker applies
+    // in KafkaApis.handleAlterUserScramCredentialsRequest. The controller is
+    // reachable directly (the schema declares listeners=[broker,controller])
+    // and via Envelope re-dispatch from any CLUSTER_ACTION holder — both
+    // routes bypass the broker-side check. Tenant identity on the controller
+    // is derived purely from the principal name (no per-listener binding
+    // here). Rule: a caller not within tenant T may not Upsert or Delete
+    // SCRAM credentials whose User is in `__tenant_T.*`. Atomic batch
+    // refusal mirrors the broker.
+    val callerTenant = callerTenantFromPrincipal(request.context.principal.getName)
+    def belongsToCallerTenant(name: String): Boolean =
+      name != null && callerTenant.isDefined &&
+        name.startsWith(TenantNamespace.PRINCIPAL_PREFIX + callerTenant.get + ".")
+    def isForeignTenantPrincipal(name: String): Boolean =
+      isReservedTenantPrincipalNamespace(name) && !belongsToCallerTenant(name)
+
+    val foreignTenantPrincipal =
+      alterRequest.data.upsertions.asScala.exists(u => isForeignTenantPrincipal(u.name)) ||
+      alterRequest.data.deletions.asScala.exists(d => isForeignTenantPrincipal(d.name))
+
+    if (foreignTenantPrincipal) {
+      val results = new util.ArrayList[AlterUserScramCredentialsResponseData.AlterUserScramCredentialsResult]()
+      val seen = new util.HashSet[String]()
+      alterRequest.data.deletions.forEach { d =>
+        if (seen.add(d.name)) {
+          results.add(new AlterUserScramCredentialsResponseData.AlterUserScramCredentialsResult()
+            .setUser(d.name)
+            .setErrorCode(Errors.CLUSTER_AUTHORIZATION_FAILED.code)
+            .setErrorMessage(null))
+        }
       }
+      alterRequest.data.upsertions.forEach { u =>
+        if (seen.add(u.name)) {
+          results.add(new AlterUserScramCredentialsResponseData.AlterUserScramCredentialsResult()
+            .setUser(u.name)
+            .setErrorCode(Errors.CLUSTER_AUTHORIZATION_FAILED.code)
+            .setErrorMessage(null))
+        }
+      }
+      requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
+        new AlterUserScramCredentialsResponse(new AlterUserScramCredentialsResponseData()
+          .setThrottleTimeMs(requestThrottleMs)
+          .setResults(results)))
+      CompletableFuture.completedFuture(())
+    } else {
+      val context = new ControllerRequestContext(request.context.header.data, request.context.principal,
+        OptionalLong.empty())
+      controller.alterUserScramCredentials(context, alterRequest.data)
+        .thenApply[Unit] { response =>
+           requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
+             new AlterUserScramCredentialsResponse(response.setThrottleTimeMs(requestThrottleMs)))
+        }
+    }
   }
 
   // The principal is carried through in the forwarded case.

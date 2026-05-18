@@ -16707,4 +16707,222 @@ class KafkaApisTest extends Logging {
       any[Option[AbstractResponse] => Unit]())
   }
 
+  // ---------------------------------------------------------------------------
+  // AlterUserScramCredentials — multi-tenancy identity-laundering guard
+  //
+  // A cluster super-user can otherwise mint a SCRAM credential whose user is
+  // `__tenant_<id>.<user>`, then SASL/SCRAM-authenticate as that username and
+  // have TenantPrincipalBuilder preserve the prefix on the tenant's bound
+  // listener — full tenant access. The mirror attack via deletion can revoke
+  // a tenant user. Rule: a caller whose own principal is not within tenant T
+  // cannot Upsert or Delete a SCRAM credential whose user is in
+  // `__tenant_T.*`. Atomic batch refusal (every Result carries
+  // CLUSTER_AUTHORIZATION_FAILED) mirrors the delegation-token mint guard.
+  // ---------------------------------------------------------------------------
+
+  @Test
+  def testAlterUserScramCredentialsClusterWideCallerRefusesTenantPrefixedUpsertion(): Unit = {
+    val upsertions = new util.ArrayList[AlterUserScramCredentialsRequestData.ScramCredentialUpsertion]()
+    upsertions.add(new AlterUserScramCredentialsRequestData.ScramCredentialUpsertion()
+      .setName("__tenant_acme.alice")
+      .setMechanism(1.toByte)
+      .setIterations(8192)
+      .setSalt(Array.emptyByteArray)
+      .setSaltedPassword(Array.emptyByteArray))
+    val alterRequest = new AlterUserScramCredentialsRequest.Builder(
+      new AlterUserScramCredentialsRequestData().setUpsertions(upsertions)).build()
+    val request = buildRequest(
+      alterRequest,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleAlterUserScramCredentialsRequest(request)
+
+    val response = verifyNoThrottling[AlterUserScramCredentialsResponse](request)
+    assertEquals(1, response.data.results.size)
+    val result = response.data.results.get(0)
+    assertEquals("__tenant_acme.alice", result.user)
+    assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED.code, result.errorCode,
+      "minting a SCRAM credential whose user is in a tenant principal namespace must be refused for a non-tenant caller")
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
+  def testAlterUserScramCredentialsClusterWideCallerRefusesTenantPrefixedDeletion(): Unit = {
+    val deletions = new util.ArrayList[AlterUserScramCredentialsRequestData.ScramCredentialDeletion]()
+    deletions.add(new AlterUserScramCredentialsRequestData.ScramCredentialDeletion()
+      .setName("__tenant_acme.alice")
+      .setMechanism(1.toByte))
+    val alterRequest = new AlterUserScramCredentialsRequest.Builder(
+      new AlterUserScramCredentialsRequestData().setDeletions(deletions)).build()
+    val request = buildRequest(
+      alterRequest,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleAlterUserScramCredentialsRequest(request)
+
+    val response = verifyNoThrottling[AlterUserScramCredentialsResponse](request)
+    assertEquals(1, response.data.results.size)
+    val result = response.data.results.get(0)
+    assertEquals("__tenant_acme.alice", result.user)
+    assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED.code, result.errorCode,
+      "deleting a SCRAM credential for a tenant principal from a non-tenant caller must be refused (no silent eviction of tenant users)")
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
+  def testAlterUserScramCredentialsAtomicMixedBatchRefused(): Unit = {
+    // The whole batch is refused (every named user gets CLUSTER_AUTHORIZATION_FAILED)
+    // if any single entry targets a foreign tenant — no partial application on a
+    // security-critical credential store.
+    val upsertions = new util.ArrayList[AlterUserScramCredentialsRequestData.ScramCredentialUpsertion]()
+    upsertions.add(new AlterUserScramCredentialsRequestData.ScramCredentialUpsertion()
+      .setName("regular-user")
+      .setMechanism(1.toByte)
+      .setIterations(8192)
+      .setSalt(Array.emptyByteArray)
+      .setSaltedPassword(Array.emptyByteArray))
+    upsertions.add(new AlterUserScramCredentialsRequestData.ScramCredentialUpsertion()
+      .setName("__tenant_acme.alice")
+      .setMechanism(1.toByte)
+      .setIterations(8192)
+      .setSalt(Array.emptyByteArray)
+      .setSaltedPassword(Array.emptyByteArray))
+    val alterRequest = new AlterUserScramCredentialsRequest.Builder(
+      new AlterUserScramCredentialsRequestData().setUpsertions(upsertions)).build()
+    val request = buildRequest(
+      alterRequest,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleAlterUserScramCredentialsRequest(request)
+
+    val response = verifyNoThrottling[AlterUserScramCredentialsResponse](request)
+    assertEquals(2, response.data.results.size,
+      "every user in the batch must be reflected in the refusal response so the client cannot infer which entry was foreign")
+    response.data.results.forEach { r =>
+      assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED.code, r.errorCode,
+        s"all entries (including the benign `${r.user}`) must be refused atomically when the batch contains a foreign-tenant entry")
+    }
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
+  def testAlterUserScramCredentialsClusterWideCallerKeepsRegularUserForwarded(): Unit = {
+    // Control: a non-tenant caller altering an ordinary user must still be
+    // forwarded — the guard targets the tenant namespace only.
+    val upsertions = new util.ArrayList[AlterUserScramCredentialsRequestData.ScramCredentialUpsertion]()
+    upsertions.add(new AlterUserScramCredentialsRequestData.ScramCredentialUpsertion()
+      .setName("regular-user")
+      .setMechanism(1.toByte)
+      .setIterations(8192)
+      .setSalt(Array.emptyByteArray)
+      .setSaltedPassword(Array.emptyByteArray))
+    val alterRequest = new AlterUserScramCredentialsRequest.Builder(
+      new AlterUserScramCredentialsRequestData().setUpsertions(upsertions)).build()
+    val request = buildRequest(
+      alterRequest,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleAlterUserScramCredentialsRequest(request)
+
+    verify(forwardingManager).forwardRequest(
+      ArgumentMatchers.eq(request),
+      any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
+  def testAlterUserScramCredentialsSameTenantCallerForOwnUserForwarded(): Unit = {
+    // Legitimate path: tenant principal alters a SCRAM credential for its own
+    // tenant on its own listener. The user matches the caller's effective
+    // tenant, so the guard must let it through.
+    val upsertions = new util.ArrayList[AlterUserScramCredentialsRequestData.ScramCredentialUpsertion]()
+    upsertions.add(new AlterUserScramCredentialsRequestData.ScramCredentialUpsertion()
+      .setName("__tenant_acme.alice")
+      .setMechanism(1.toByte)
+      .setIterations(8192)
+      .setSalt(Array.emptyByteArray)
+      .setSaltedPassword(Array.emptyByteArray))
+    val alterRequest = new AlterUserScramCredentialsRequest.Builder(
+      new AlterUserScramCredentialsRequestData().setUpsertions(upsertions)).build()
+    val request = buildRequest(
+      alterRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleAlterUserScramCredentialsRequest(request)
+
+    verify(forwardingManager).forwardRequest(
+      ArgumentMatchers.eq(request),
+      any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
+  def testAlterUserScramCredentialsUnknownTenantPrefixedUserForwarded(): Unit = {
+    // An unknown `__tenant_xyz.*` prefix is opaque to the broker (xyz is not a
+    // registered tenant). Per the mint-guard convention, the broker does not
+    // refuse here — the request is forwarded and the controller's own
+    // validation lands the rejection if the user is itself malformed.
+    val upsertions = new util.ArrayList[AlterUserScramCredentialsRequestData.ScramCredentialUpsertion]()
+    upsertions.add(new AlterUserScramCredentialsRequestData.ScramCredentialUpsertion()
+      .setName("__tenant_xyz.dave")
+      .setMechanism(1.toByte)
+      .setIterations(8192)
+      .setSalt(Array.emptyByteArray)
+      .setSaltedPassword(Array.emptyByteArray))
+    val alterRequest = new AlterUserScramCredentialsRequest.Builder(
+      new AlterUserScramCredentialsRequestData().setUpsertions(upsertions)).build()
+    val request = buildRequest(
+      alterRequest,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleAlterUserScramCredentialsRequest(request)
+
+    verify(forwardingManager).forwardRequest(
+      ArgumentMatchers.eq(request),
+      any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
+  def testAlterUserScramCredentialsCrossTenantCallerRefused(): Unit = {
+    // Two-tenant fixture: acme caller cannot touch a beta-tenant user, even
+    // though the caller is itself a tenant principal. The "same tenant"
+    // exemption is strict — it does not extend to OTHER tenants.
+    val upsertions = new util.ArrayList[AlterUserScramCredentialsRequestData.ScramCredentialUpsertion]()
+    upsertions.add(new AlterUserScramCredentialsRequestData.ScramCredentialUpsertion()
+      .setName("__tenant_beta.bob")
+      .setMechanism(1.toByte)
+      .setIterations(8192)
+      .setSalt(Array.emptyByteArray)
+      .setSaltedPassword(Array.emptyByteArray))
+    val alterRequest = new AlterUserScramCredentialsRequest.Builder(
+      new AlterUserScramCredentialsRequestData().setUpsertions(upsertions)).build()
+    val request = buildRequest(
+      alterRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    val props = new util.HashMap[String, Object]()
+    props.put(s"listener.name.${TENANT_LISTENER.value.toLowerCase}.tenant.id", "acme")
+    props.put("listener.name.tenant_beta.tenant.id", "beta")
+    kafkaApis = createKafkaApis(tenantConfig = TenantConfig.from(props))
+    kafkaApis.handleAlterUserScramCredentialsRequest(request)
+
+    val response = verifyNoThrottling[AlterUserScramCredentialsResponse](request)
+    assertEquals(1, response.data.results.size)
+    val result = response.data.results.get(0)
+    assertEquals("__tenant_beta.bob", result.user)
+    assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED.code, result.errorCode,
+      "an acme caller cannot alter a beta-tenant SCRAM credential")
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[Option[AbstractResponse] => Unit]())
+  }
+
 }
