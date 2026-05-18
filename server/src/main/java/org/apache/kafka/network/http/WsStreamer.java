@@ -82,6 +82,12 @@ public final class WsStreamer {
     private final Queue<FetchResponseFormatter.FetchedRecord> buffer = new ConcurrentLinkedQueue<>();
     private final AtomicBoolean closed = new AtomicBoolean();
     private final AtomicBoolean drainScheduled = new AtomicBoolean();
+    // Mutual-exclusion gate around the body of drainAndMaybeFetch. The executor is potentially
+    // multi-threaded (Jetty's server thread pool, which is shared with the produce/fetch path), so
+    // simply resetting drainScheduled before doing the work would let a concurrent grant schedule a
+    // second drain that races us — both drains would call drainBufferWhileCredited and step on
+    // currentOffset, producing out-of-order frames or a stale next-fetch offset.
+    private final AtomicBoolean draining = new AtomicBoolean();
     private final AtomicBoolean fetchInFlight = new AtomicBoolean();
 
     private volatile long currentOffset;
@@ -180,19 +186,40 @@ public final class WsStreamer {
     }
 
     private void drainAndMaybeFetch() {
-        // Reset before the work so a concurrent grant that arrives mid-drain re-arms us cleanly.
-        drainScheduled.set(false);
-        if (closed.get()) {
+        if (!draining.compareAndSet(false, true)) {
+            // Another worker is already inside the drain body. drainScheduled was just CAS'd to
+            // true by the scheduleDrain that queued *this* invocation; the running drain will see
+            // it at its next do-while check and re-iterate, so any state changes we were about to
+            // process WILL be picked up. Returning here without clearing drainScheduled is what
+            // makes that handoff race-free: the running drain's `while (drainScheduled.get())`
+            // observes our set and loops. There is at most one extra executor task queued per
+            // burst of grants and it short-circuits here, so this is bounded.
             return;
         }
-        if (!drainBufferWhileCredited()) {
-            // drainBuffer signalled a send failure; stream is already closed.
-            return;
+        try {
+            // Loop until no new drain requests are pending. Clearing drainScheduled INSIDE the
+            // loop (and re-checking it at the bottom) creates a see-and-act handoff with
+            // scheduleDrain: a scheduleDrain that arrives between our `set(false)` and the next
+            // `get()` re-arms us and we loop; one that arrives after the `get() == false` exit
+            // queues a fresh executor task which will succeed on the `draining` CAS and pick up
+            // the state we just released.
+            do {
+                drainScheduled.set(false);
+                if (closed.get()) {
+                    return;
+                }
+                if (!drainBufferWhileCredited()) {
+                    // drainBuffer signalled a send failure; stream is already closed.
+                    return;
+                }
+                if (closed.get()) {
+                    return;
+                }
+                maybeKickFetch();
+            } while (drainScheduled.get());
+        } finally {
+            draining.set(false);
         }
-        if (closed.get()) {
-            return;
-        }
-        maybeKickFetch();
     }
 
     /**
