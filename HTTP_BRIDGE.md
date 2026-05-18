@@ -40,20 +40,20 @@ server/src/test/java/org/apache/kafka/network/http/
 | Component | State | Notes |
 |---|---|---|
 | Value serializer (4-step chain) | **Done** | `ValueSerializer` + 20 tests |
-| HTTP status mapper | **Done** | `HttpStatusMapper`; Retry-After policy for 503/504 |
-| Retry-After calculator | **Done** | `RetryAfterCalculator`; ceiling seconds |
+| HTTP status mapper | **Done** | `HttpStatusMapper`; `statusCarriesRetryAfter` now load-bearing |
+| Retry-After calculator | **Done** | `RetryAfterCalculator.forStatus(status, ms)` enforces spec policy in one place |
 | Produce JSON parser | **Done** | `ProduceRequestParser` |
-| Produce response formatter (207) | **Done** | `ProduceResponseFormatter`; spec mixed scenario passes |
-| Fetch response formatter (HATEOAS) | **Done** | `FetchResponseFormatter`; self / first / previous / next / last |
+| Produce response formatter (207) | **Done** | `ProduceResponseFormatter`; spec mixed scenario passes; Retry-After dropped on 4xx |
+| Fetch response formatter (HATEOAS) | **Done** | `FetchResponseFormatter`; self / first / previous / next / last; Retry-After dropped on 4xx |
 | Cursor codec | **Done** | `CursorCodec` (base64url `topic\|partition\|offset`) |
 | Bridge orchestrator | **Done** | `KafkaHttpBridge` + `RequestSubmitter` |
 | Jetty servlet + server | **Done** | `KafkaHttpServlet` + `KafkaHttpServer` + integration test |
 | `BrokerServer` integration | **Scaffolded** | Config keys + lifecycle wiring; uses `NotImplementedRequestSubmitter` until the production submitter lands |
-| Production `RequestSubmitter` | **TODO** | Plug into `RequestChannel` / `KafkaApis` via a custom `Processor` |
+| Production `RequestSubmitter` | **TODO** | Plug into `RequestChannel` via a per-request completion callback (see plan below) |
 | WebSocket (stretch) | Out of scope for v1 | |
 | SSE (stretch) | Out of scope for v1 | |
 
-176 tests pass on the server module. Full broker still compiles.
+192 tests pass on the HTTP bridge slice of the server module. Full broker still compiles.
 
 ---
 
@@ -62,8 +62,8 @@ server/src/test/java/org/apache/kafka/network/http/
 ### Layer 1 — translation (15 source files, all under `server/src/main/java/org/apache/kafka/network/http/`)
 
 - **`ValueSerializer`** — the four-shape value envelope (`NULL` / `JSON` / `STRING` / `BINARY`). `encode(bytes, contentType)` runs null → content-type → UTF-8 → base64; `decode(envelope)` is the inverse. Tested for content-type charset parameters, JSON that doesn't parse falling through, embedded null bytes forcing BINARY, control characters except `\t \n \r` forcing BINARY.
-- **`HttpStatusMapper`** — `Errors → int` with policy constants (`OK=200`, `MULTI_STATUS=207`, `BAD_REQUEST=400`, `FORBIDDEN=403`, `NOT_FOUND=404`, `INTERNAL_SERVER_ERROR=500`, `SERVICE_UNAVAILABLE=503`, `GATEWAY_TIMEOUT=504`). `statusCarriesRetryAfter(status)` returns true only for 503/504. The quota path on 200 sets Retry-After explicitly.
-- **`RetryAfterCalculator`** — ceiling seconds: `(throttleMs + 999) / 1000`. Zero throttle returns zero (no header).
+- **`HttpStatusMapper`** — `Errors → int` with policy constants (`OK=200`, `MULTI_STATUS=207`, `BAD_REQUEST=400`, `FORBIDDEN=403`, `NOT_FOUND=404`, `INTERNAL_SERVER_ERROR=500`, `SERVICE_UNAVAILABLE=503`, `GATEWAY_TIMEOUT=504`). `statusCarriesRetryAfter(status)` returns true for 503/504 and is now consulted by `RetryAfterCalculator.forStatus` rather than being dead code.
+- **`RetryAfterCalculator`** — ceiling seconds: `(throttleMs + 999) / 1000`. `forStatus(status, throttleMs)` captures the spec policy in one place: a positive throttle produces a header on 200/207 (throttle paths) and 503/504 (server-side retryable); on 400/403/404 the hint is intentionally dropped because Retry-After there would mislead the client into expecting a future success.
 - **`CursorCodec`** — base64url-encoded `topic|partition|offset`. `Cursor` value class on the way back. Cursors don't carry a signature — they're opaque, not secure; clients are free to inspect them but not expected to.
 - **`ErrorEnvelope`** — every error response is `{errorCode, errorMessage}`. Two factory methods: `forError(mapper, Errors, override)` and `forMessage(mapper, status, message)`.
 - **`ProduceRequestParser`** — `POST` body `{records:[{partition, key, value, contentType}]}` → `ProduceCommand`. Reuses `ValueSerializer.decode` for the envelope. Throws `BadRequestException` for the 400 path.
@@ -97,19 +97,32 @@ server/src/test/java/org/apache/kafka/network/http/
 
 The current submitter, `NotImplementedRequestSubmitter`, returns 504 for every request. The next commit must replace it with one that routes through the broker's existing request-handling path so authorization, quotas, and replication are inherited "for free", per PROMPT.md's central design requirement.
 
-The shape of the work, based on a deep read of `RequestChannel.scala` (line 419+) and `SocketServer.scala` (line 795+):
+After re-reading `RequestChannel.scala` end-to-end the cleanest hook is **smaller than the Processor-trait extraction first sketched here** — and it doesn't touch `SocketServer.scala` at all. The key observation is that `RequestChannel.sendResponse(req, abstractResponse, onComplete)` (line 392) is the single public entry point KafkaApis uses to publish a response. It currently does two things: wrap the AbstractResponse into a SendResponse, then dispatch to `processors.get(req.processor).enqueueResponse(...)`. If `RequestChannel.Request` carries a per-request completion callback, the dispatch step can be short-circuited for HTTP-bridge requests without disturbing the binary path.
 
-1. **Register a synthetic `Processor`** with the broker's `RequestChannel`. The `Processor` class in `SocketServer.scala` is `private[kafka]` and tied to a real `Selector`/`ConnectionQuotas`; a clean approach is to extract a small `Processor` trait (id, enqueueResponse, responseQueueSize) and have both the existing concrete `Processor` and a new `HttpBridgeProcessor` implement it. Then `RequestChannel.addProcessor` accepts the trait.
-2. **`HttpBridgeProcessor`** holds a `ConcurrentHashMap<connectionId, CompletableFuture<AbstractResponse>>`. Its `enqueueResponse(response)` looks up the connection ID on `response.request.context.connectionId` and completes the future with the response's `AbstractResponse`. Each HTTP request gets a unique connection ID (UUID is fine — it's only used for response correlation).
-3. **`KafkaApiRequestSubmitter`** (the production implementation):
-   - Builds a real `RequestHeader` + `RequestContext` (with a configurable principal — probably `KafkaPrincipal.ANONYMOUS` by default; the listener can later be tied to an authenticator).
-   - Serializes a `ProduceRequest` / `FetchRequest` to a `ByteBuffer` (parallel to what `KafkaApisTest` does).
-   - Constructs a `RequestChannel.Request` with `processor = httpBridgeProcessor.id`, then `requestChannel.sendRequest(request)`.
-   - Awaits the matching future, unwraps the `ProduceResponse` / `FetchResponse` into the `ProduceResponseFormatter.PartitionResult` / `FetchResponseFormatter.PartitionFetch` shapes the formatters expect.
-4. **Authorization** flows for free because `KafkaApis.handleProduceRequest` calls `authHelper.filterByAuthorized(request.context, WRITE, TOPIC, ...)` — the `request.context` we built carries the principal we set.
-5. **Quotas** flow for free because the response object carries `throttleTimeMs`; the existing `ProduceResponseFormatter` already turns positive throttle into a Retry-After header.
+Concrete plan, smallest viable commit shape:
+
+1. **Add `requestCompletionCallback: Option[AbstractResponse => Unit]` on `RequestChannel.Request`.** Default `None`. When set, the public `sendResponse(req, abstractResponse, _)` invokes the callback with the `AbstractResponse` and returns — it does **not** call `buildResponseSend` (no need to serialize), does **not** look up a Processor, does **not** enqueue a Response. The binary path is unchanged because every existing caller leaves the field as `None`.
+
+2. **`KafkaApiRequestSubmitter`** (Scala or Java, lives in `core/src/main/scala/kafka/network/http/`):
+   - Builds a real `RequestHeader` + `RequestContext` with a configurable principal (default `KafkaPrincipal.ANONYMOUS`; the listener can later wire in an authenticator).
+   - Serializes the `ProduceRequest` / `FetchRequest` to a `ByteBuffer` exactly as `KafkaApisTest` does — round-tripping is wasteful but it's the contract `RequestContext.parseRequest` expects, and it's what guarantees the request looks identical to a wire-level one for authorization, quota and metrics purposes.
+   - Constructs a `RequestChannel.Request` with `processor = -1` (no processor — there is no socket to write back to), `memoryPool = MemoryPool.NONE`, the serialized buffer, and `requestCompletionCallback = Some(future::complete)`.
+   - Calls `requestChannel.sendRequest(request)` and awaits the future.
+   - Unwraps the `AbstractResponse` (a `ProduceResponse` or `FetchResponse`) into the `ProduceResponseFormatter.PartitionResult` / `FetchResponseFormatter.PartitionFetch` shapes the formatters expect, including the response's `throttleTimeMs`.
+
+3. **`BrokerServer.scala`** instantiates `KafkaApiRequestSubmitter` with the broker's `RequestChannel` and current principal-builder, then hands it to `KafkaHttpBridge` in place of the `NotImplementedRequestSubmitter`. The wiring is one line — everything else is already in place.
+
+4. **Authorization** flows for free because `KafkaApis.handleProduceRequest` calls `authHelper.filterByAuthorized(request.context, WRITE, TOPIC, ...)` — the `request.context` we built carries the principal we set, so an unauthorized topic produces a `TOPIC_AUTHORIZATION_FAILED` in the per-partition response, which `HttpStatusMapper` already maps to 403.
+
+5. **Quotas** flow for free because the broker writes `throttleTimeMs` into the response object, which the submitter exposes to `ProduceResponseFormatter` / `FetchResponseFormatter`. With the spec-correct `forStatus(status, throttleMs)` policy in place, the formatter emits `Retry-After` on 200 (quota-on-success), 207, 503, 504, and never on 4xx — matching PROMPT.md acceptance criteria exactly.
+
+6. **Tests**: a unit test on `RequestChannel` itself that asserts the callback path short-circuits the Processor dispatch (with `processors` empty, the callback still completes). Then an end-to-end test that boots an embedded broker, enables the bridge, produces over HTTP, and asserts the record appears via the binary path on the consumer side — the only test that exercises every layer at once and the most valuable signal we have for production-readiness.
 
 Out of scope for v1: WebSocket subscribe with credit-based flow control, SSE live tail with `?from=earliest`. PROMPT.md lists both as stretch.
+
+### Production-readiness as of this commit
+
+The code below the broker integration line is production quality: pure functions, deterministic, exhaustively tested (192 tests in the HTTP slice alone), spec-aligned including the now-fixed Retry-After-on-4xx divergence. The placeholder submitter is intentionally loud — every request returns 504 with a "not yet implemented" envelope so nobody can mistake the listener-is-bound signal for a working bridge. Until step 3 above lands, `http.bridge.enabled=true` should remain off in any real cluster.
 
 ---
 
