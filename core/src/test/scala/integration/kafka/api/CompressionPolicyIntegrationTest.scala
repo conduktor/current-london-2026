@@ -19,7 +19,7 @@ package kafka.api
 import kafka.server.{KafkaBroker, KafkaConfig, QuorumTestHarness}
 import kafka.utils.TestUtils
 import org.apache.kafka.clients.admin.AlterConfigOp.OpType
-import org.apache.kafka.clients.admin.{AlterConfigOp, ConfigEntry, NewTopic}
+import org.apache.kafka.clients.admin.{AlterConfigOp, AlterConfigsOptions, ConfigEntry, NewTopic}
 import org.apache.kafka.clients.producer.{KafkaProducer, ProducerConfig, ProducerRecord}
 import org.apache.kafka.common.InvalidRecordException
 import org.apache.kafka.common.config.ConfigResource
@@ -30,6 +30,8 @@ import org.apache.kafka.common.serialization.ByteArraySerializer
 import org.apache.kafka.storage.internals.log.LogConfig
 import org.junit.jupiter.api.Assertions._
 import org.junit.jupiter.api.{AfterEach, BeforeEach, Test, TestInfo}
+import org.junit.jupiter.params.ParameterizedTest
+import org.junit.jupiter.params.provider.ValueSource
 
 import java.util.{Collections, Properties}
 import java.util.concurrent.ExecutionException
@@ -227,12 +229,259 @@ class CompressionPolicyIntegrationTest extends QuorumTestHarness {
     }
   }
 
+  /**
+   * Broker-matrix coverage of the produce-side contract: every non-NONE codec the wire
+   * format supports must satisfy `compression.policy=required`. The matrix axis here is
+   * the compression byte the broker observes on the produce path, which is what the
+   * policy actually inspects (it does not look at the producer config string, only at
+   * the per-batch compression header). The `lz4` case is also covered by the smoke test
+   * above; running every codec here pins that no codec is silently rejected by the
+   * enforcement check (i.e. no false positives).
+   */
+  @ParameterizedTest
+  @ValueSource(strings = Array("gzip", "snappy", "lz4", "zstd"))
+  def testCompressionPolicyRequiredAcceptsEveryCompressedCodec(codec: String): Unit = {
+    val topic = s"required-codec-$codec"
+    val admin = TestUtils.createAdminClient(Seq(broker),
+      ListenerName.forSecurityProtocol(SecurityProtocol.PLAINTEXT))
+    try {
+      val cfg = new Properties()
+      cfg.put(LogConfig.COMPRESSION_POLICY_CONFIG, "required")
+      TestUtils.createTopicWithAdmin(admin, topic, Seq(broker), controllerServers, topicConfig = cfg)
+    } finally {
+      admin.close()
+    }
+
+    val producer = newProducer(TestUtils.plaintextBootstrapServers(Seq(broker)), codec)
+    try {
+      val meta = producer.send(new ProducerRecord(topic, "v".getBytes)).get()
+      assertEquals(0L, meta.offset(),
+        s"codec=$codec must satisfy compression.policy=required and append at offset 0")
+    } finally {
+      producer.close()
+    }
+  }
+
+  /**
+   * Pins the alter-then-relax lifecycle: a topic created with `compression.policy=required`
+   * rejects an uncompressed batch; after AlterConfig flips it back to `none`, the same
+   * producer succeeds against the same topic. This is the operator-facing escape hatch —
+   * a policy applied in error must be reversible without recreating the topic.
+   */
+  @Test
+  def testReverseAlterRelaxesRequiredBackToNone(): Unit = {
+    val topic = "reverse-alter"
+    val admin = TestUtils.createAdminClient(Seq(broker),
+      ListenerName.forSecurityProtocol(SecurityProtocol.PLAINTEXT))
+    try {
+      val cfg = new Properties()
+      cfg.put(LogConfig.COMPRESSION_POLICY_CONFIG, "required")
+      TestUtils.createTopicWithAdmin(admin, topic, Seq(broker), controllerServers, topicConfig = cfg)
+
+      val producer = newProducer(TestUtils.plaintextBootstrapServers(Seq(broker)), "none")
+      try {
+        val rejected = assertThrows(classOf[ExecutionException],
+          () => producer.send(new ProducerRecord(topic, "v".getBytes)).get())
+        assertTrue(rejected.getCause.isInstanceOf[InvalidRecordException],
+          s"required policy must reject uncompressed batch up front")
+
+        val topicResource = new ConfigResource(ConfigResource.Type.TOPIC, topic)
+        val alterOps = Collections.singletonList(
+          new AlterConfigOp(new ConfigEntry(LogConfig.COMPRESSION_POLICY_CONFIG, "none"), OpType.SET))
+        admin.incrementalAlterConfigs(Collections.singletonMap(topicResource, alterOps)).all().get()
+
+        // AlterConfig propagates through the controller's metadata commit; poll until the
+        // broker's view actually reflects the change rather than racing the first produce.
+        TestUtils.waitUntilTrue(() => {
+          val meta = producer.send(new ProducerRecord(topic, "v".getBytes))
+          try { meta.get(); true } catch { case _: ExecutionException => false }
+        }, "policy relaxation did not propagate to the broker in time")
+      } finally {
+        producer.close()
+      }
+    } finally {
+      admin.close()
+    }
+  }
+
+  /**
+   * Pins the DELETE-op semantics on `compression.policy`: removing the override resets the
+   * topic to the default (`none`), matching the documented behaviour of every other dynamic
+   * topic config. Without this test, a future refactor could regress to "DELETE is a no-op"
+   * or "DELETE leaves the prior value cached on the broker" without anyone noticing.
+   */
+  @Test
+  def testAlterConfigDeleteResetsCompressionPolicyToDefault(): Unit = {
+    val topic = "delete-policy"
+    val admin = TestUtils.createAdminClient(Seq(broker),
+      ListenerName.forSecurityProtocol(SecurityProtocol.PLAINTEXT))
+    try {
+      val cfg = new Properties()
+      cfg.put(LogConfig.COMPRESSION_POLICY_CONFIG, "required")
+      TestUtils.createTopicWithAdmin(admin, topic, Seq(broker), controllerServers, topicConfig = cfg)
+
+      val topicResource = new ConfigResource(ConfigResource.Type.TOPIC, topic)
+      val deleteOps = Collections.singletonList(
+        new AlterConfigOp(new ConfigEntry(LogConfig.COMPRESSION_POLICY_CONFIG, null), OpType.DELETE))
+      admin.incrementalAlterConfigs(Collections.singletonMap(topicResource, deleteOps)).all().get()
+
+      // describeConfigs must reflect the default after DELETE. The broker can lag the
+      // controller's metadata commit by a few ms; wait for the eventual state.
+      TestUtils.waitUntilTrue(() => {
+        val configs = admin.describeConfigs(Collections.singletonList(topicResource)).all().get()
+        configs.get(topicResource).get(LogConfig.COMPRESSION_POLICY_CONFIG).value() ==
+          LogConfig.DEFAULT_COMPRESSION_POLICY
+      }, "DELETE op did not reset compression.policy to the default value")
+
+      // The behavioural test: an uncompressed producer must now succeed.
+      val producer = newProducer(TestUtils.plaintextBootstrapServers(Seq(broker)), "none")
+      try {
+        TestUtils.waitUntilTrue(() => {
+          val meta = producer.send(new ProducerRecord(topic, "v".getBytes))
+          try { meta.get(); true } catch { case _: ExecutionException => false }
+        }, "uncompressed producer should succeed after compression.policy was DELETE-reset to default")
+      } finally {
+        producer.close()
+      }
+    } finally {
+      admin.close()
+    }
+  }
+
+  /**
+   * Pins the operator-visibility contract: `compression.policy` is round-trippable through
+   * `describeConfigs`. A configured topic returns the explicit value; an unconfigured topic
+   * returns the default. Operators rely on this to audit which topics carry a non-default
+   * policy without reading log files.
+   */
+  @Test
+  def testDescribeConfigsRoundTripsCompressionPolicy(): Unit = {
+    val configuredTopic = "describe-required"
+    val defaultTopic = "describe-default"
+    val admin = TestUtils.createAdminClient(Seq(broker),
+      ListenerName.forSecurityProtocol(SecurityProtocol.PLAINTEXT))
+    try {
+      val cfg = new Properties()
+      cfg.put(LogConfig.COMPRESSION_POLICY_CONFIG, "required")
+      TestUtils.createTopicWithAdmin(admin, configuredTopic, Seq(broker), controllerServers, topicConfig = cfg)
+      TestUtils.createTopicWithAdmin(admin, defaultTopic, Seq(broker), controllerServers)
+
+      val configuredResource = new ConfigResource(ConfigResource.Type.TOPIC, configuredTopic)
+      val defaultResource = new ConfigResource(ConfigResource.Type.TOPIC, defaultTopic)
+      val described = admin.describeConfigs(
+        java.util.Arrays.asList(configuredResource, defaultResource)).all().get()
+
+      val configuredValue = described.get(configuredResource).get(LogConfig.COMPRESSION_POLICY_CONFIG)
+      assertEquals("required", configuredValue.value(),
+        "configured topic must round-trip the explicit compression.policy value")
+
+      val defaultValue = described.get(defaultResource).get(LogConfig.COMPRESSION_POLICY_CONFIG)
+      assertEquals(LogConfig.DEFAULT_COMPRESSION_POLICY, defaultValue.value(),
+        "unconfigured topic must report the default compression.policy through describeConfigs")
+    } finally {
+      admin.close()
+    }
+  }
+
+  /**
+   * Pins the `validateOnly=true` AlterConfig semantics: the validator must run even when the
+   * change is not committed. A bad value reported via `validateOnly` shields operators from
+   * pushing a misconfiguration into the live state and tools (e.g. CI gates) rely on this
+   * shape — a silently-accepted dry-run would hand a false green to a deploy pipeline.
+   */
+  @Test
+  def testValidateOnlyAlterConfigRejectsBadValueAndPreservesState(): Unit = {
+    val topic = "validate-only-bad"
+    val admin = TestUtils.createAdminClient(Seq(broker),
+      ListenerName.forSecurityProtocol(SecurityProtocol.PLAINTEXT))
+    try {
+      TestUtils.createTopicWithAdmin(admin, topic, Seq(broker), controllerServers)
+
+      val topicResource = new ConfigResource(ConfigResource.Type.TOPIC, topic)
+      val alterOps = Collections.singletonList(
+        new AlterConfigOp(new ConfigEntry(LogConfig.COMPRESSION_POLICY_CONFIG, "bogus"), OpType.SET))
+      val result = admin.incrementalAlterConfigs(
+        Collections.singletonMap(topicResource, alterOps),
+        new AlterConfigsOptions().validateOnly(true))
+
+      val ee = assertThrows(classOf[ExecutionException], () => result.all().get())
+      assertTrue(ee.getCause.isInstanceOf[InvalidConfigurationException],
+        s"validateOnly must surface InvalidConfigurationException for unknown value, got " +
+          s"${ee.getCause.getClass.getName}: ${ee.getCause.getMessage}")
+
+      // State must remain at the default after a rejected dry-run.
+      val described = admin.describeConfigs(Collections.singletonList(topicResource)).all().get()
+      val entry = described.get(topicResource).get(LogConfig.COMPRESSION_POLICY_CONFIG)
+      assertEquals(LogConfig.DEFAULT_COMPRESSION_POLICY, entry.value(),
+        "validateOnly rejection must not mutate the topic's compression.policy")
+    } finally {
+      admin.close()
+    }
+  }
+
+  /**
+   * Pins the idempotent producer path against `compression.policy=required`. Idempotent
+   * producers attach a `ProducerId/Epoch/Sequence` header and are handled by the same
+   * `handleProduceRequest` codepath as non-idempotent ones, so they should observe the
+   * exact same policy: an uncompressed batch is rejected with `INVALID_RECORD`; a
+   * compressed batch is accepted. This pins that nothing in the idempotent path silently
+   * bypasses the check (e.g. via a different verification branch).
+   */
+  @Test
+  def testIdempotentProducerHonoursCompressionPolicy(): Unit = {
+    val topic = "idempotent-required"
+    val admin = TestUtils.createAdminClient(Seq(broker),
+      ListenerName.forSecurityProtocol(SecurityProtocol.PLAINTEXT))
+    try {
+      val cfg = new Properties()
+      cfg.put(LogConfig.COMPRESSION_POLICY_CONFIG, "required")
+      TestUtils.createTopicWithAdmin(admin, topic, Seq(broker), controllerServers, topicConfig = cfg)
+    } finally {
+      admin.close()
+    }
+
+    val bootstrap = TestUtils.plaintextBootstrapServers(Seq(broker))
+
+    val idempotentUncompressed = newIdempotentProducer(bootstrap, "none")
+    try {
+      val ee = assertThrows(classOf[ExecutionException],
+        () => idempotentUncompressed.send(new ProducerRecord(topic, "v".getBytes)).get())
+      assertTrue(ee.getCause.isInstanceOf[InvalidRecordException],
+        s"idempotent + compression.type=none must be rejected the same way as a vanilla producer, " +
+          s"got ${ee.getCause.getClass.getName}: ${ee.getCause.getMessage}")
+    } finally {
+      idempotentUncompressed.close()
+    }
+
+    val idempotentCompressed = newIdempotentProducer(bootstrap, "lz4")
+    try {
+      val meta = idempotentCompressed.send(new ProducerRecord(topic, "v".getBytes)).get()
+      assertEquals(0L, meta.offset(),
+        "idempotent + compression.type=lz4 must satisfy compression.policy=required")
+    } finally {
+      idempotentCompressed.close()
+    }
+  }
+
   private def newProducer(bootstrap: String, compression: String): KafkaProducer[Array[Byte], Array[Byte]] = {
     val props = new Properties()
     props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrap)
     props.put(ProducerConfig.COMPRESSION_TYPE_CONFIG, compression)
     // Disable retries so an INVALID_RECORD surfaces fast to the caller; the broker classifies it as non-retriable.
     props.put(ProducerConfig.RETRIES_CONFIG, "0")
+    props.put(ProducerConfig.MAX_BLOCK_MS_CONFIG, "10000")
+    new KafkaProducer(props, new ByteArraySerializer, new ByteArraySerializer)
+  }
+
+  private def newIdempotentProducer(bootstrap: String, compression: String): KafkaProducer[Array[Byte], Array[Byte]] = {
+    val props = new Properties()
+    props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrap)
+    props.put(ProducerConfig.COMPRESSION_TYPE_CONFIG, compression)
+    props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true")
+    props.put(ProducerConfig.ACKS_CONFIG, "all")
+    // We intentionally do NOT set retries=0: idempotent producers reject that at construction
+    // time. INVALID_RECORD is non-retriable, so the first attempt surfaces directly through the
+    // future regardless of how high the producer's internal retry budget is.
     props.put(ProducerConfig.MAX_BLOCK_MS_CONFIG, "10000")
     new KafkaProducer(props, new ByteArraySerializer, new ByteArraySerializer)
   }
