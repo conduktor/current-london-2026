@@ -11,8 +11,14 @@ branch toward the feature described in `PROMPT.md`.
 | `ConcentrationKernel` facade (single broker-facing surface) | **Done.** 21 facade tests. | `storage/src/main/java/.../concentration/ConcentrationKernel.java` |
 | Kernel-level integration tests | **Done.** Six PROMPT scenarios covered. | `storage/src/test/java/.../concentration/ConcentrationKernelIntegrationTest.java` |
 | Production-readiness audit fixes | **Done.** Four blocking findings closed: facade-vs-close race, descriptorsFor immutability, sidecar-constructor FD leak, unbounded growth (added `removeLogicalPartition`). | — |
-| Broker glue (produce/fetch/admin/DeleteRecords hooks) | **Not started.** Kernel facade ready; seam map below. | — |
-| End-to-end test with a real broker | **Not started.** Depends on broker glue. | — |
+| Broker glue — kernel construction & shutdown | **Done.** `BrokerServer` constructs one kernel per broker rooted at `<logDir>/_concentration_sidecars/`, closes it before `LogManager.shutdown`. | `core/src/main/scala/kafka/server/BrokerServer.scala`, `KafkaApisBuilder.java`, `KafkaApis.scala` constructor |
+| Broker glue — hook #1 (backing-topic produce rejection) | **Done.** Direct produce to a backing physical name short-circuits with `INVALID_TOPIC_EXCEPTION` before reaching `ReplicaManager`. | `KafkaApis.handleProduceRequest` |
+| Broker glue — hook #4 (DeleteRecords scoped to logical partition) | **Done.** Logical-topic DeleteRecords advances only that partition's start offset via the kernel; backing log is not truncated. Sentinel `HIGH_WATERMARK` (-1) resolves to `nextLogicalOffset`. `IllegalArgumentException` maps to `OFFSET_OUT_OF_RANGE`. | `KafkaApis.handleDeleteRecordsRequest` |
+| Broker glue — hook #2 (logical→backing routing + offset assignment) | **Not started.** Biggest functional hook; seam map below. | — |
+| Broker glue — hook #3 (fetch translation) | **Not started.** | — |
+| Broker glue — hook #5 (recovery wiring at broker startup) | **Not started.** Depends on hook #6 producing a declared-partitions list. | — |
+| Broker glue — hook #6 (admin: declare a logical topic) | **Not started.** Largest unimplemented chunk; requires KRaft metadata-record schema. | — |
+| End-to-end test with a real broker | **Not started.** Depends on hooks #2 + #3 + #6. | — |
 | Audit fleet (Codex + Gemini) per PROMPT §"After every major phase" | **Partially.** In-fleet sub-agents have audited the kernel twice; Codex/Gemini are unreachable from this CLI environment and that limitation is recorded in commit bodies rather than fabricated. | — |
 
 ## What v1 ships
@@ -86,7 +92,8 @@ ConcentrationKernel          facade — single broker-facing surface, lifecycle-
 | DeleteRecords scoped to one logical partition | `ConcentrationKernelIntegrationTest#deleteRecordsAdvancesOnlyOneLogicalPartitionStart` + `ConcentrationKernelTest#advanceStartOffsetMovesLowWaterOnlyForOneLogicalPartition` |
 | Restart with intact sidecars → cheap startup | `ConcentrationKernelIntegrationTest#restartWithIntactSidecarsRehydratesTracker` + `ConcentrationKernelTest#recoveryFromSidecarsRebuildsTrackerStateAfterRestart` |
 | Restart without sidecars → full scan rebuild | `ConcentrationKernelIntegrationTest#restartWithoutSidecarsReconstructsFromBackingScan` + `ConcentrationKernelTest#recoveryFromBackingScanReplaysHeadersIntoSidecarsAndTracker` |
-| Direct produce to backing-topic name rejected | `ConcentrationKernelTest#directProduceToBackingTopicNameIsSignalled` (kernel signal); full broker rejection in `KafkaApis.handleProduceRequest` — **not yet wired** |
+| Direct produce to backing-topic name rejected | `ConcentrationKernelTest#directProduceToBackingTopicNameIsSignalled` (kernel signal) + `KafkaApisTest#testProduceToBackingTopicIsRejectedWithInvalidTopicException` (broker hook #1). |
+| DeleteRecords on a logical topic at the broker | `KafkaApisTest#testDeleteRecordsOnLogicalTopicAdvancesKernelStartOffsetAndBypassesReplicaManager` + sentinel and error-mapping variants (broker hook #4). |
 | Idempotent producer retry, no duplicates | **Not addressable at kernel layer.** Depends on broker-level producer-id / epoch state preserved across the logical→physical translation. The kernel does not bypass `analyzeAndValidateProducerState` because the kernel is not on the producer-state codepath at all; idempotence is preserved by virtue of running before the kernel-driven offset assignment. |
 
 ## What v1 does **not** ship
@@ -99,17 +106,18 @@ Explicitly out of scope per PROMPT (stretch goals):
 - **Concurrent produce-failure cascade rollback.** Single in-flight reservation per partition
   is enough for the "no gaps" criterion.
 
-Pending broker integration (not started, not out-of-scope, the remaining v1 work):
+Pending broker integration (some landed; the remaining v1 work):
 
 ### Broker-integration seam map
 
 Each PROMPT acceptance criterion that requires broker-side wiring, with the exact call site:
 
-1. **Backing-topic produce rejection** —
-   `core/src/main/scala/kafka/server/KafkaApis.scala:378` (`handleProduceRequest`),
-   around line 399 inside `produceRequest.data.topicData.forEach { … }`. Inject:
-   `kernel.isBackingTopic(topicPartition.topic())` → if true, populate
-   `invalidRequestResponses` with `Errors.INVALID_TOPIC_EXCEPTION` and skip the partition.
+1. **Backing-topic produce rejection** — ✅ **Done** in commit `6564e483a4`.
+   `core/src/main/scala/kafka/server/KafkaApis.scala:408` (`handleProduceRequest`),
+   inside `produceRequest.data.topicData.forEach { … }`. The branch sits before
+   `metadataCache.contains` so a backing name that happens to also be in the metadata cache is
+   still rejected. Pinned by `KafkaApisTest#testProduceToBackingTopicIsRejectedWithInvalid-
+   TopicException`.
 
 2. **Logical→backing routing + per-logical-topic offset assignment** —
    `core/src/main/scala/kafka/server/KafkaApis.scala:378` (after step 1): rewrite each
@@ -131,11 +139,13 @@ Each PROMPT acceptance criterion that requires broker-side wiring, with the exac
    record's offset to its logical value. The filter step is the v1 cost — records of other
    logical topics on the same backing partition are dropped on the read path.
 
-4. **DeleteRecords on a logical topic** —
-   `core/src/main/scala/kafka/server/KafkaApis.scala` (`handleDeleteRecordsRequest`).
-   For partitions whose topic is logical, call
-   `kernel.advanceStartOffset(logicalTopic, logicalPartition, newStart)` and bypass the
-   `ReplicaManager.deleteRecords` call entirely — the backing log is not truncated.
+4. **DeleteRecords on a logical topic** — ✅ **Done** in commit `23d1441741`.
+   `core/src/main/scala/kafka/server/KafkaApis.scala` (`handleDeleteRecordsRequest`). A
+   `logicalTopicResponses` bucket sits alongside `unauthorizedTopicResponses` /
+   `nonExistingTopicResponses`. The logical-topic branch sits before `metadataCache.contains`
+   (logical topics aren't in the metadata cache yet). Sentinel `HIGH_WATERMARK` (-1) resolves
+   via `kernel.nextLogicalOffset`; `IllegalArgumentException` from the tracker maps to
+   `OFFSET_OUT_OF_RANGE`. Pinned by three `testDeleteRecordsOnLogicalTopic*` tests.
 
 5. **Recovery wiring at broker startup** —
    `core/src/main/scala/kafka/server/BrokerServer.scala` (broker startup sequence,
@@ -161,12 +171,14 @@ Each PROMPT acceptance criterion that requires broker-side wiring, with the exac
    originated as logical or direct, and idempotence is preserved because the producer-id /
    epoch / sequence triple is record-level and travels through the translation unchanged.
 
-### Constructor injection sites for the kernel
+### Constructor injection sites for the kernel — ✅ done
 
-When you add `ConcentrationKernel` to `KafkaApis`, three call sites need updating:
-- `core/src/main/scala/kafka/server/BrokerServer.scala:448` — production construction
-- `core/src/main/java/kafka/server/builders/KafkaApisBuilder.java:202` — builder
-- `core/src/test/scala/unit/kafka/server/KafkaApisTest.scala:189` — test construction
+All three call sites updated in commit `6564e483a4`:
+- `core/src/main/scala/kafka/server/BrokerServer.scala` — production construction at
+  `<logDir>/_concentration_sidecars/`; close-before-LogManager-shutdown.
+- `core/src/main/java/kafka/server/builders/KafkaApisBuilder.java` — builder.
+- `core/src/test/scala/unit/kafka/server/KafkaApisTest.scala` — test construction (mock; default
+  `isBackingTopic/isLogicalTopic` return false so existing tests keep passing).
 
 ## How to run
 
@@ -175,7 +187,7 @@ JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 \
   ./gradlew :storage:test --tests 'org.apache.kafka.storage.internals.concentration.*'
 ```
 
-91 tests, all green at HEAD.
+92 tests, all green at HEAD. (Was 91; +1 for `isLogicalTopic` facade method test added with broker hook #4.)
 
 ## File layout
 
@@ -226,10 +238,23 @@ It has been audited three times by in-fleet sub-agents. Audit fixes landed so fa
 What the kernel does **not** yet give you is an end-to-end broker that stock clients can
 produce to. That work — wiring per the seam map above — is multi-week per PROMPT's own
 warning ("multi-week with multi-day debugging sessions"), and `v1 must stay narrow or it
-does not ship`. The next focused commits will land the broker hooks one at a time, starting
-with the smallest standalone wiring (the backing-topic-rejection check at hook point 1),
-which exercises one PROMPT acceptance criterion in isolation without touching the metadata
-schema or the fetch translation.
+does not ship`. Progress so far:
+
+- ✅ Kernel construction in `BrokerServer` and shutdown ordering.
+- ✅ Hook #1: backing-topic produce rejection.
+- ✅ Hook #4: DeleteRecords scoped to one logical partition.
+- ⏳ Hook #2: produce routing + offset assignment (biggest functional value; needs record-
+  header stamping for backing-scan recovery, two-phase reserve→commit/rollback driven by the
+  `ReplicaManager.appendRecords` callback, and request-rewriting from logical to backing
+  topic-partition coordinates).
+- ⏳ Hook #3: fetch translation (logical offset → backing offset via sidecar; per-logical-
+  topic filtering on the read path; offset rewrite on the response).
+- ⏳ Hook #5: recovery wiring at broker startup (depends on hook #6 producing a declared-
+  partitions list to seed `kernel.recoverFromSidecars`).
+- ⏳ Hook #6: admin declaration of a logical topic. Largest unimplemented chunk because it
+  requires a KRaft metadata-record schema (`LogicalTopicRecord`) and replay logic. A
+  config-based shortcut (`concentration.logical.topics` broker config) could ship a narrower
+  v1 faster, at the cost of full controller-replicated declarations.
 
 Codex and Gemini consultations are mandated by PROMPT §"After every major phase". Neither
 external app is reachable from this CLI environment, and that limitation is recorded plainly
