@@ -340,6 +340,92 @@ public class ConcentrationKernelIntegrationTest {
     }
 
     /**
+     * Regression test for the latent bug surfaced by the audit fleet (DeleteRecords + restart):
+     * before persisted startOffset existed, {@link BackingScanRecoverer#recoverFromSidecars} and
+     * {@link BackingScanRecoverer#recoverFromScan} both hard-coded {@code startOffset = 0L}. The
+     * tracker's in-memory advance from DeleteRecords would silently regress on every broker
+     * bounce — "deleted" records would re-appear to consumers, violating PROMPT scenario 3 ("the
+     * sibling logical topic on the same backing still reads its full range; the backing log is
+     * not truncated") AND the post-restart contract for acceptance criterion 3.
+     *
+     * <p>This test exercises both recovery paths. We deliberately advance startOffset on topicA
+     * via the kernel facade (which now persists), then restart twice: once via sidecars (cheap
+     * path), once via a backing-log scan (full rebuild). In both cases the startOffset must
+     * survive. Without the fix, both assertions land at 0L.
+     */
+    @Test
+    public void advanceStartOffsetSurvivesBothRecoveryPaths() throws IOException {
+        // Drive everything through the kernel facade so that advanceStartOffset goes through the
+        // new persistence path. The kernel needs declared topics before recoverFromDisk will
+        // include them in the cheap-path scan.
+        LogicalTopicDescriptor descA = new LogicalTopicDescriptor("topicA", 1, "shared", 1);
+        LogicalTopicDescriptor descB = new LogicalTopicDescriptor("topicB", 1, "shared", 1);
+
+        try (ConcentrationKernel kernel = new ConcentrationKernel(sidecarDir)) {
+            kernel.declare(descA);
+            kernel.declare(descB);
+            // Produce 100 records to A and 100 to B, interleaved on a shared backing partition.
+            // commitProduceBatch requires the exact same array reference returned by reserve —
+            // wrap-then-pass is rejected because the tracker checks outstandingBatch == batch.
+            AtomicLong backing = new AtomicLong(0);
+            for (int i = 0; i < 100; i++) {
+                Reservation[] batchA = kernel.reserveProduceBatch("topicA", 0, 1);
+                kernel.commitProduceBatch(batchA, backing.getAndIncrement());
+                Reservation[] batchB = kernel.reserveProduceBatch("topicB", 0, 1);
+                kernel.commitProduceBatch(batchB, backing.getAndIncrement());
+            }
+            // Advance A's start to 50 — the bug: in-memory the tracker advances, but pre-fix this
+            // did NOT touch disk.
+            kernel.advanceStartOffset("topicA", 0, 50L);
+            assertEquals(50L, kernel.startLogicalOffset("topicA", 0));
+            assertEquals(0L, kernel.startLogicalOffset("topicB", 0));
+        }
+
+        // Cheap-path recovery: sidecars are intact, just rebuild from them. Before the fix this
+        // would silently load startOffset=0 for topicA, resurrecting offsets 0..49 to any
+        // consumer — exactly the regression we're guarding against.
+        try (ConcentrationKernel rebuilt = new ConcentrationKernel(sidecarDir)) {
+            rebuilt.declare(descA);
+            rebuilt.declare(descB);
+            rebuilt.recoverFromDisk();
+            assertEquals(50L, rebuilt.startLogicalOffset("topicA", 0),
+                "cheap-path recovery must load the persisted startOffset, not default to 0 — "
+                    + "otherwise DeleteRecords silently regresses on every broker restart");
+            assertEquals(100L, rebuilt.nextLogicalOffset("topicA", 0),
+                "nextLogicalOffset must still match the pre-restart sidecar size");
+            // Sibling untouched, as on the original tracker.
+            assertEquals(0L, rebuilt.startLogicalOffset("topicB", 0));
+            assertEquals(100L, rebuilt.nextLogicalOffset("topicB", 0));
+        }
+
+        // Full-rebuild recovery: simulate corrupt/missing sidecars by feeding a synthetic scan
+        // stream. The .startoffset file must still be honoured even though the sidecar is being
+        // reconstructed from scratch — losing it here would re-expose deleted records the moment
+        // the broker decided to take the scan path (e.g. after detecting a torn sidecar tail).
+        File topicAdir = new File(sidecarDir, "topicA");
+        for (File f : topicAdir.listFiles((d, name) -> name.endsWith(".sidecar"))) {
+            assertTrue(f.delete(), "could not delete sidecar to simulate full-scan recovery");
+        }
+        List<RecoveryRecord> scanStream = new ArrayList<>();
+        for (int i = 0; i < 100; i++) {
+            // Re-stage 100 records as if read off the backing log in backing-offset order. Only
+            // topicA is in scope here (we kept topicB's sidecar) — the scan path is partition-by-
+            // partition under real conditions too.
+            scanStream.add(new RecoveryRecord("topicA", 0, i, 2L * i));
+        }
+        try (ConcentrationKernel rebuilt2 = new ConcentrationKernel(sidecarDir)) {
+            rebuilt2.declare(descA);
+            rebuilt2.declare(descB);
+            rebuilt2.recoverFromBackingScan(scanStream.iterator());
+            assertEquals(50L, rebuilt2.startLogicalOffset("topicA", 0),
+                "full-scan recovery must also honour the persisted startOffset — the .startoffset "
+                    + "file lives next to the sidecar but is independent of it, so it survives a "
+                    + "sidecar wipe");
+            assertEquals(100L, rebuilt2.nextLogicalOffset("topicA", 0));
+        }
+    }
+
+    /**
      * PROMPT scenario 5. Produce to a backing-topic name (bypassing the logical-topic routing
      * front-door) is rejected. The kernel-level signal that the broker glue inverts on is
      * {@link LogicalTopicRegistry#isBackingTopic(String)}; verify it lights up for backings and

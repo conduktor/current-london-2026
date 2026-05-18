@@ -335,9 +335,48 @@ public final class ConcentrationKernel implements AutoCloseable {
 
     // ------------------ DeleteRecords ------------------
 
-    public void advanceStartOffset(String logicalTopic, int logicalPartition, long newStartOffset) {
+    public void advanceStartOffset(String logicalTopic, int logicalPartition, long newStartOffset) throws IOException {
         ensureOpen();
+        // Order: tracker first, then persist. If persist throws, the tracker advance is rolled
+        // back so the broker's in-memory view stays consistent with what's on disk. The reverse
+        // order would leave a tracker that has NOT advanced but a .startoffset file that claims it
+        // did — on the next restart, the persisted (higher) value would be loaded and consumers
+        // would see records disappear "spontaneously".
+        long previousStart = tracker.startOffset(logicalTopic, logicalPartition);
         tracker.advanceStartOffset(logicalTopic, logicalPartition, newStartOffset);
+        try {
+            recoverer.persistStartOffset(logicalTopic, logicalPartition, newStartOffset);
+        } catch (IOException | RuntimeException e) {
+            // Best-effort rollback: re-seat the tracker at the previous startOffset so a retry can
+            // succeed. advanceStartOffset rejects newStartOffset < currentStartOffset, so we use
+            // tracker.restorePartition (which has no monotonicity guard) to undo. The sidecar
+            // size component is unchanged because DeleteRecords doesn't touch the sidecar.
+            tracker.restorePartition(logicalTopic, logicalPartition, previousStart,
+                tracker.nextLogicalOffset(logicalTopic, logicalPartition));
+            throw e;
+        }
+        // Also evict any idempotent-cache entries whose logicalLastOffset is now below
+        // newStartOffset. A retry of one of those batches would otherwise hit the cache, get back
+        // logical offsets in the deleted range, and surface OFFSET_OUT_OF_RANGE to the consumer
+        // on the subsequent fetch — a silent correctness drift (audit H2). Eviction happens
+        // AFTER successful persistence so a rollback above doesn't lose un-replayed cache state.
+        evictIdempotentEntriesBelow(logicalTopic, logicalPartition, newStartOffset);
+    }
+
+    private void evictIdempotentEntriesBelow(String logicalTopic, int logicalPartition, long minLogicalLast) {
+        LogicalPartition partitionKey = new LogicalPartition(logicalTopic, logicalPartition);
+        ConcurrentHashMap<Long, ArrayDeque<Map.Entry<IdempotentBatchKey, IdempotentBatchResult>>> perProducer =
+            idempotentCache.get(partitionKey);
+        if (perProducer == null) return;
+        // perProducer is a ConcurrentHashMap; iterating its values is weakly consistent which is
+        // fine — a concurrent recordIdempotentBatch with an entry > minLogicalLast is safe to keep,
+        // and an entry that's about to be added is by definition for a logical offset >= current
+        // nextLogicalOffset (the batch must commit before being recorded), which is >= startOffset.
+        for (ArrayDeque<Map.Entry<IdempotentBatchKey, IdempotentBatchResult>> deque : perProducer.values()) {
+            synchronized (deque) {
+                deque.removeIf(e -> e.getValue().logicalLastOffset() < minLogicalLast);
+            }
+        }
     }
 
     // ------------------ Partition teardown ------------------
@@ -395,6 +434,16 @@ public final class ConcentrationKernel implements AutoCloseable {
             // from the in-memory state.
             if (!sidecarFile.delete()) {
                 throw new IOException("failed to delete sidecar file " + sidecarFile);
+            }
+            removedAny = true;
+        }
+        // Same teardown contract for the .startoffset sibling: leaving it on disk would mean a
+        // re-declared partition starts at the previously-deleted offset, even though the sidecar
+        // was wiped — silent data loss to the consumer of the recreated partition.
+        File startOffsetFile = recoverer.startOffsetFile(logicalTopic, logicalPartition);
+        if (startOffsetFile.exists()) {
+            if (!startOffsetFile.delete()) {
+                throw new IOException("failed to delete startOffset file " + startOffsetFile);
             }
             removedAny = true;
         }

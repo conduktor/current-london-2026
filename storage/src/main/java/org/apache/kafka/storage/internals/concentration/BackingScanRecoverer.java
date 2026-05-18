@@ -18,6 +18,11 @@ package org.apache.kafka.storage.internals.concentration;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -60,18 +65,121 @@ public final class BackingScanRecoverer {
         return new File(topicDir, logicalPartition + ".sidecar");
     }
 
+    /**
+     * Sibling file to the sidecar carrying the partition's logical {@code startOffset}. Written by
+     * {@link #persistStartOffset} on DeleteRecords (so the advance is durable) and read on restart
+     * by {@link #recoverFromSidecars} / {@link #recoverFromScan} (so the advance survives a bounce).
+     *
+     * <p>Why a separate file rather than a sidecar header: the sidecar's binary format is "8-byte
+     * backing offset, positionally indexed by logical offset", and a header would shift every entry
+     * by the header size — every existing test and the on-the-wire fetch translator's offset math
+     * would have to be reworked. A tiny sibling file keeps the sidecar shape pristine and isolates
+     * the durability fix to one new code path. The two files do not need to be coherent in real
+     * time: the sidecar grows on every produce, the start-offset file mutates only on DeleteRecords.
+     */
+    public File startOffsetFile(String logicalTopic, int logicalPartition) {
+        File topicDir = new File(sidecarDir, logicalTopic);
+        if (!topicDir.isDirectory() && !topicDir.mkdirs()) {
+            throw new IllegalStateException("could not create topic dir " + topicDir);
+        }
+        return new File(topicDir, logicalPartition + ".startoffset");
+    }
+
     public LogicalSidecarIndex openSidecar(String logicalTopic, int logicalPartition) throws IOException {
         return new LogicalSidecarIndex(sidecarFile(logicalTopic, logicalPartition), logicalTopic, logicalPartition);
     }
 
     /**
+     * Atomically persist the new logical {@code startOffset} for a partition. Writes 8 big-endian
+     * bytes to a temp file, fsyncs, then renames over the real file with {@link
+     * StandardCopyOption#ATOMIC_MOVE}. After this call returns, a crash + restart will read the
+     * same value — without it, DeleteRecords would silently regress on every broker bounce.
+     *
+     * <p>fsync on this path is acceptable per PROMPT line 10 ("Do not fsync per-append on small
+     * segments — throughput collapses"). DeleteRecords is a rare, low-volume admin operation, not
+     * the hot produce path. Mirroring an offset-index flush cadence here would be incorrect — we
+     * MUST be durable before returning success to the operator, otherwise a crash between
+     * acknowledgement and disk-write leaves the cluster reporting "records deleted" while the
+     * tracker says otherwise on the next restart.
+     */
+    public void persistStartOffset(String logicalTopic, int logicalPartition, long startOffset) throws IOException {
+        if (startOffset < 0) {
+            throw new IllegalArgumentException("startOffset must be non-negative, got " + startOffset);
+        }
+        File target = startOffsetFile(logicalTopic, logicalPartition);
+        File tmp = new File(target.getPath() + ".tmp");
+        try (FileChannel ch = FileChannel.open(tmp.toPath(),
+                StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
+            ByteBuffer buf = ByteBuffer.allocate(8).putLong(startOffset);
+            buf.flip();
+            while (buf.hasRemaining()) {
+                ch.write(buf);
+            }
+            // Force file contents AND metadata before rename so the post-rename file is durable on
+            // crash. Without this the rename can land in the directory entry while the 8 bytes are
+            // still in the page cache; recovery would then read whatever zero-pad the filesystem
+            // chose, which is exactly the bug we're trying to prevent.
+            ch.force(true);
+        }
+        Files.move(tmp.toPath(), target.toPath(),
+            StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+    }
+
+    /**
+     * Read the persisted startOffset for a partition, or return 0 if the file does not exist.
+     * "Not existing" means "DeleteRecords was never called on this partition" — the default of 0
+     * matches an in-memory tracker that's never seen advanceStartOffset.
+     */
+    public long readStartOffset(String logicalTopic, int logicalPartition) throws IOException {
+        File f = startOffsetFile(logicalTopic, logicalPartition);
+        if (!f.isFile()) return 0L;
+        try (FileChannel ch = FileChannel.open(f.toPath(), StandardOpenOption.READ)) {
+            ByteBuffer buf = ByteBuffer.allocate(8);
+            int read = 0;
+            while (read < 8) {
+                int n = ch.read(buf);
+                if (n < 0) {
+                    // Truncated. A torn write here is a recovery problem we cannot resolve safely
+                    // — the partition's true startOffset is now ambiguous. Surface as IOException
+                    // so the operator sees the corruption rather than the broker silently regressing
+                    // to a stale value.
+                    throw new IOException("truncated startOffset file " + f + " (read " + read + " of 8)");
+                }
+                read += n;
+            }
+            buf.flip();
+            long value = buf.getLong();
+            if (value < 0) {
+                throw new IOException("invalid startOffset " + value + " in " + f);
+            }
+            return value;
+        }
+    }
+
+    /**
      * Cheap startup. Open each sidecar, read its size, seed the tracker. No backing-log scan.
+     *
+     * <p>The persisted {@code startOffset} from {@link #readStartOffset} is forwarded into the
+     * tracker — without this, a broker bounce after DeleteRecords would silently regress the
+     * partition's start offset back to 0 and re-expose every "deleted" record to consumers.
      */
     public void recoverFromSidecars(Collection<LogicalPartition> partitions, LogicalOffsetTracker tracker) throws IOException {
         Objects.requireNonNull(tracker, "tracker");
         for (LogicalPartition p : partitions) {
             try (LogicalSidecarIndex sidecar = openSidecar(p.logicalTopic(), p.logicalPartition())) {
-                tracker.restorePartition(p.logicalTopic(), p.logicalPartition(), 0L, sidecar.size());
+                long persistedStart = readStartOffset(p.logicalTopic(), p.logicalPartition());
+                long size = sidecar.size();
+                // A startOffset persisted past the sidecar's last entry would violate
+                // restorePartition's invariant (startOffset <= nextOffset). Clamp to the sidecar
+                // size and surface as an exception rather than silently corrupting — this case
+                // only happens if the .startoffset and .sidecar files are mutually inconsistent
+                // (e.g. the sidecar was truncated by a concurrent recovery while .startoffset
+                // wasn't). The operator should investigate, not have us paper over it.
+                if (persistedStart > size) {
+                    throw new IOException("startOffset " + persistedStart + " > sidecar size "
+                        + size + " for " + p);
+                }
+                tracker.restorePartition(p.logicalTopic(), p.logicalPartition(), persistedStart, size);
             }
         }
     }
@@ -123,7 +231,18 @@ public final class BackingScanRecoverer {
             for (Map.Entry<LogicalPartition, LogicalSidecarIndex> e : open.entrySet()) {
                 LogicalPartition key = e.getKey();
                 LogicalSidecarIndex sidecar = e.getValue();
-                tracker.restorePartition(key.logicalTopic(), key.logicalPartition(), 0L, sidecar.size());
+                // Same rationale as recoverFromSidecars: a persisted startOffset must survive a
+                // full backing-log scan too. The scan rebuilds the sidecar from records on disk
+                // but the start-offset file is independent — losing it here would re-expose
+                // "deleted" records the moment the broker decided to take the scan path
+                // (e.g. corrupt sidecar triggered a rebuild).
+                long persistedStart = readStartOffset(key.logicalTopic(), key.logicalPartition());
+                long size = sidecar.size();
+                if (persistedStart > size) {
+                    throw new IOException("startOffset " + persistedStart + " > rebuilt sidecar "
+                        + "size " + size + " for " + key);
+                }
+                tracker.restorePartition(key.logicalTopic(), key.logicalPartition(), persistedStart, size);
             }
         } finally {
             for (LogicalSidecarIndex sidecar : open.values()) {

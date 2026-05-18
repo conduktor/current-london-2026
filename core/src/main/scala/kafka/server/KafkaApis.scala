@@ -1832,6 +1832,15 @@ class KafkaApis(val requestChannel: RequestChannel,
               logicalTopicResponses += topicPartition -> new DeleteRecordsPartitionResult()
                 .setLowWatermark(DeleteRecordsResponse.INVALID_LOW_WATERMARK)
                 .setErrorCode(Errors.KAFKA_STORAGE_ERROR.code)
+            case _: java.io.IOException =>
+              // advanceStartOffset persists the new start to a sibling .startoffset file (so the
+              // advance survives a broker restart — audit confirmed otherwise it silently regresses
+              // to zero on bounce). An I/O failure here is a storage-layer error, retriable by the
+              // client. The tracker has already been rolled back to the previous startOffset by the
+              // kernel, so a retry will not see a half-applied advance.
+              logicalTopicResponses += topicPartition -> new DeleteRecordsPartitionResult()
+                .setLowWatermark(DeleteRecordsResponse.INVALID_LOW_WATERMARK)
+                .setErrorCode(Errors.KAFKA_STORAGE_ERROR.code)
           }
         }
       }
