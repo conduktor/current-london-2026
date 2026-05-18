@@ -128,4 +128,23 @@ public final class GovernanceLoader {
     public void commit() {
         engine.install(working.build());
     }
+
+    /**
+     * Drop all in-flight rules from the working set. Used by the broker
+     * bootstrap when it detects that the underlying {@code __governance}
+     * log was truncated below the cursor it had already advanced past
+     * (e.g. after a leader-election with epoch divergence). Without a
+     * reset, the working set retains zombie rules that no longer exist
+     * on the topic and re-installs them on every {@link #commit}; with a
+     * reset, the next drain re-reads the log from scratch and reaches a
+     * fresh-and-correct working state.
+     *
+     * <p>Does not touch the engine's currently-installed {@link RuleSet}:
+     * the caller is expected to follow up with the re-drain and a single
+     * {@link #commit}, so the request path's view never goes through an
+     * intermediate "empty" state.
+     */
+    public void reset() {
+        working.from(RuleSet.EMPTY);
+    }
 }

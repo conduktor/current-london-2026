@@ -224,7 +224,6 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
         }
 
       case Some(log) =>
-        val startOffset = math.max(log.logStartOffset, nextOffset.get())
         // Bound the drain by the high-watermark, not the local log-end offset.
         // On a follower, LEO may be ahead of HW (records replicated locally but
         // not yet acknowledged by enough replicas to advance the cluster-wide
@@ -233,6 +232,26 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
         // rule that no other broker enforces. The matching FetchIsolation in
         // replay() must agree, so this bound and that isolation move together.
         val endOffset = log.highWatermark
+        // Truncation guard: if our cursor is ahead of the current HW, the
+        // log has been truncated below records we already applied. That
+        // happens on a leader-election with epoch divergence — a follower
+        // truncates back to the new leader's offset, removing records this
+        // bootstrap had already replayed. Without a reset, the loader's
+        // working set retains zombie rules that no longer exist on the
+        // topic and re-installs them on every commit. Reset the loader
+        // and rewind the cursor so the next iteration re-reads the log
+        // from the current log-start offset. The engine's currently
+        // installed RuleSet stays in place until the re-drain commits,
+        // honouring the "fail-stale-not-empty" posture.
+        if (nextOffset.get() > endOffset) {
+          warn(s"governance partition $tp truncated: cursor was at " +
+            s"${nextOffset.get()} but HW is now $endOffset. Resetting " +
+            s"loader and re-draining from log-start offset " +
+            s"${log.logStartOffset}.")
+          loader.reset()
+          nextOffset.set(log.logStartOffset)
+        }
+        val startOffset = math.max(log.logStartOffset, nextOffset.get())
         if (startOffset >= endOffset) {
           // Up to date — commit once so the engine reflects the working state
           // even when nothing new arrived (idempotent install).

@@ -822,6 +822,128 @@ class BrokerGovernanceBootstrapTest {
   }
 
   @Test
+  def drainOnceDetectsTruncationAndResetsLoaderWorkingState(): Unit = {
+    // Adversarial M3: on a leader-election with epoch divergence, a follower
+    // can truncate its local log back to the new leader's offset, removing
+    // records this broker had already replayed. Without a reset, the
+    // loader's working set keeps the zombie rules and re-installs them on
+    // every subsequent commit — even though the topic has revoked them.
+    //
+    // Scenario: drain three records, advancing nextOffset to 3. Then the
+    // log truncates to HW=1 (records at offsets 1 and 2 are gone — the
+    // tombstone for r1 written in the new epoch lives at offset 0 now).
+    // The next drainOnce must detect cursor>HW, reset the loader's working
+    // state, rewind to log-start, and re-drain. The final RuleSet must
+    // reflect only the post-truncation log content (a single rule, r-new).
+    val rm = mock(classOf[ReplicaManager])
+    val log = mock(classOf[UnifiedLog])
+    val engine = new RuleEngine()
+    when(rm.getLog(tp)).thenReturn(Some(log))
+
+    // First drain: HW=3, three rules installed.
+    when(log.logStartOffset).thenReturn(0L)
+    when(log.highWatermark).thenReturn(3L)
+    when(log.read(0L, 1024 * 1024, FetchIsolation.HIGH_WATERMARK, true)).thenReturn(
+      recordsAt(0L,
+        new SimpleRecord("r1".getBytes(StandardCharsets.UTF_8),
+          envelope("true", ApiKeys.METADATA, 7)),
+        new SimpleRecord("r2".getBytes(StandardCharsets.UTF_8),
+          envelope("true", ApiKeys.FETCH, 11)),
+        new SimpleRecord("r3".getBytes(StandardCharsets.UTF_8),
+          envelope("true", ApiKeys.CREATE_TOPICS, 13))))
+
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp)
+    val first = boot.drainOnce()
+    assertEquals(3L, first)
+    assertEquals(3, engine.active().size(), "all three rules installed")
+
+    // Truncation: HW now back to 1, log content reduced to a single fresh
+    // rule. The cursor (3) is past HW (1), so drainOnce must reset the
+    // loader and re-drain from log-start.
+    when(log.highWatermark).thenReturn(1L)
+    when(log.read(0L, 1024 * 1024, FetchIsolation.HIGH_WATERMARK, true)).thenReturn(
+      recordsAt(0L,
+        new SimpleRecord("r-new".getBytes(StandardCharsets.UTF_8),
+          envelope("true", ApiKeys.LIST_OFFSETS, 23))))
+
+    val second = boot.drainOnce()
+    assertEquals(1L, second, "one new record replayed after truncation")
+    assertEquals(1, engine.active().size(),
+      "post-truncation RuleSet must contain exactly the surviving record — " +
+        "the three pre-truncation rules must have been dropped from working state")
+    assertTrue(engine.evaluate(ApiKeys.LIST_OFFSETS, "c", false,
+      () => Collections.emptyMap()).denied,
+      "the surviving rule must be enforced")
+    // The pre-truncation rules must NOT still be enforced (would prove the
+    // loader's working state was not reset).
+    assertSame(RuleDecision.ALLOW,
+      engine.evaluate(ApiKeys.METADATA, "c", false, () => Collections.emptyMap()),
+      "pre-truncation rule on METADATA must NOT survive — loader reset required")
+    assertSame(RuleDecision.ALLOW,
+      engine.evaluate(ApiKeys.FETCH, "c", false, () => Collections.emptyMap()),
+      "pre-truncation rule on FETCH must NOT survive — loader reset required")
+    assertSame(RuleDecision.ALLOW,
+      engine.evaluate(ApiKeys.CREATE_TOPICS, "c", false, () => Collections.emptyMap()),
+      "pre-truncation rule on CREATE_TOPICS must NOT survive — loader reset required")
+  }
+
+  @Test
+  def drainOnceProceedsEvenWhenADenyAllFetchRuleIsActive(): Unit = {
+    // Adversarial M4: PROMPT.md requires the broker to keep enforcing the
+    // governance topic itself even if an operator publishes a deny-all rule
+    // covering FETCH. The bootstrap uses ReplicaManager.getLog (local log
+    // read) — not a Kafka client over the wire — so the drain path does
+    // not enter RuleEngine.evaluate at all. This test pins that structural
+    // invariant by installing a deny-all FETCH rule BEFORE drainOnce runs
+    // and verifying the drain still applies the next record.
+    val rm = mock(classOf[ReplicaManager])
+    val log = mock(classOf[UnifiedLog])
+    val engine = new RuleEngine()
+    when(rm.getLog(tp)).thenReturn(Some(log))
+    when(log.logStartOffset).thenReturn(0L)
+    when(log.highWatermark).thenReturn(1L)
+    when(log.read(0L, 1024 * 1024, FetchIsolation.HIGH_WATERMARK, true)).thenReturn(
+      recordsAt(0L,
+        new SimpleRecord("after-deny".getBytes(StandardCharsets.UTF_8),
+          envelope("true", ApiKeys.METADATA, 42))))
+
+    // Install a deny-all FETCH rule directly. If the bootstrap were
+    // routing its drain reads through RuleEngine.evaluate (or any path
+    // that consulted the active RuleSet for FETCH), this rule would
+    // block its own delivery and the second-rule install would never
+    // happen — a classic chicken-and-egg failure mode for security-
+    // critical topics.
+    val denyAllFetch = org.apache.kafka.server.rules.json.RuleJsonCodec.decode(
+      "deny-fetch", envelope("true", ApiKeys.FETCH, 1))
+    val preInstalled = new org.apache.kafka.server.rules.RuleSetBuilder()
+      .put(denyAllFetch).build()
+    engine.install(preInstalled)
+    assertTrue(engine.evaluate(ApiKeys.FETCH, "c", false,
+      () => Collections.emptyMap()).denied,
+      "precondition: deny-all FETCH must be in force before drain runs")
+
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp)
+    val n = boot.drainOnce()
+    // The structural proof is n == 1: the bootstrap successfully consumed
+    // the record from the local log. If the drain path had any dependency
+    // on RuleEngine.evaluate(FETCH, ...) it would have been short-circuited
+    // by the pre-installed deny-all-FETCH rule and n would be 0. The
+    // post-commit engine state (1 rule, replacing the manually pre-installed
+    // one) is a side-effect of loader.commit() installing working.build()
+    // wholesale — in production no path other than the loader writes to the
+    // engine, so this replace-on-commit semantics is correct.
+    assertEquals(1L, n,
+      "drain must succeed despite the deny-all FETCH rule — proves the bootstrap " +
+        "uses local log read, not a wire FETCH gated by RuleEngine.evaluate")
+    assertEquals(1, engine.active().size(),
+      "loader.commit() installs the working set wholesale; the manually " +
+        "pre-installed deny-FETCH is replaced by the freshly-drained rule")
+    assertTrue(engine.evaluate(ApiKeys.METADATA, "c", false,
+      () => Collections.emptyMap()).denied,
+      "the newly-drained METADATA rule must be enforced")
+  }
+
+  @Test
   def drainStartupFailsClosedIfDrainMakesNoProgressBeforeDeadline(): Unit = {
     // Codex final-audit P0 fail-closed branch: if drainOnce never advances
     // the cursor (a persistent zero-byte read suggesting log-dir / pager
