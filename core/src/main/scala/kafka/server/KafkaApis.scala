@@ -33,9 +33,10 @@ import org.apache.kafka.common.errors._
 import org.apache.kafka.common.internals.Topic.{GROUP_METADATA_TOPIC_NAME, SHARE_GROUP_STATE_TOPIC_NAME, TRANSACTION_STATE_TOPIC_NAME, isInternal}
 import org.apache.kafka.common.internals.{FatalExitError, Topic}
 import org.apache.kafka.common.message.AddPartitionsToTxnResponseData.{AddPartitionsToTxnResult, AddPartitionsToTxnResultCollection}
+import org.apache.kafka.common.message.DeleteRecordsRequestData.DeleteRecordsTopic
 import org.apache.kafka.common.message.DeleteRecordsResponseData.{DeleteRecordsPartitionResult, DeleteRecordsTopicResult}
 import org.apache.kafka.common.message.ListClientMetricsResourcesResponseData.ClientMetricsResource
-import org.apache.kafka.common.message.ListOffsetsRequestData.ListOffsetsPartition
+import org.apache.kafka.common.message.ListOffsetsRequestData.{ListOffsetsPartition, ListOffsetsTopic}
 import org.apache.kafka.common.message.ListOffsetsResponseData.{ListOffsetsPartitionResponse, ListOffsetsTopicResponse}
 import org.apache.kafka.common.message.MetadataResponseData.{MetadataResponsePartition, MetadataResponseTopic}
 import org.apache.kafka.common.message.OffsetForLeaderEpochRequestData.OffsetForLeaderTopic
@@ -1551,6 +1552,66 @@ class KafkaApis(val requestChannel: RequestChannel,
         .setOffset(ListOffsetsResponse.UNKNOWN_OFFSET)
     }
 
+    val tenantCtx = tenantContextFor(request)
+    val tenantScoped = tenantCtx.effectiveTenant.isPresent
+
+    // Refuse any unsafe request — every topic gets TOPIC_AUTHORIZATION_FAILED
+    // carrying the wire (logical) name; replicaManager is never consulted.
+    if (tenantCtx.isUnsafe) {
+      val refused = offsetRequest.topics.asScala.map { topic =>
+        new ListOffsetsTopicResponse()
+          .setName(topic.name)
+          .setPartitions(topic.partitions.asScala.map(p =>
+            buildErrorResponse(Errors.TOPIC_AUTHORIZATION_FAILED, p)).asJava)
+      }.toSeq
+      requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
+        new ListOffsetsResponse(new ListOffsetsResponseData()
+          .setThrottleTimeMs(requestThrottleMs)
+          .setTopics(refused.asJava)))
+      return
+    }
+
+    // Reserved-form / overlong / invalid-logical-form guards (tenant path) and
+    // outside-in pollution guard (non-tenant path). Same shape as Produce; the
+    // rejected topics surface as INVALID_TOPIC_EXCEPTION at the partition level,
+    // their LOGICAL names preserved on the wire, and they never reach
+    // authorization or replicaManager. The accepted topics continue into the
+    // normal flow below.
+    val invalidLogicalResponses = new ArrayBuffer[ListOffsetsTopicResponse]()
+    if (tenantScoped) {
+      val rejected = new util.ArrayList[ListOffsetsTopic]()
+      offsetRequest.topics.forEach { t =>
+        if (tenantCtx.isReservedPhysicalForm(t.name)
+            || tenantCtx.isOverlongLogicalForm(t.name)
+            || tenantCtx.isInvalidLogicalForm(t.name)) {
+          rejected.add(t)
+          invalidLogicalResponses += new ListOffsetsTopicResponse()
+            .setName(t.name)
+            .setPartitions(t.partitions.asScala.map(p =>
+              buildErrorResponse(Errors.INVALID_TOPIC_EXCEPTION, p)).asJava)
+        }
+      }
+      rejected.forEach(t => offsetRequest.topics.remove(t))
+    } else if (!tenantConfig.allTenants.isEmpty) {
+      val rejected = new util.ArrayList[ListOffsetsTopic]()
+      offsetRequest.topics.forEach { t =>
+        if (isReservedTenantNamespace(t.name)) {
+          rejected.add(t)
+          invalidLogicalResponses += new ListOffsetsTopicResponse()
+            .setName(t.name)
+            .setPartitions(t.partitions.asScala.map(p =>
+              buildErrorResponse(Errors.INVALID_TOPIC_EXCEPTION, p)).asJava)
+        }
+      }
+      rejected.forEach(t => offsetRequest.topics.remove(t))
+    }
+
+    // IN rewrite — logical → physical for the surviving topics. Auth and
+    // replicaManager both key on physical names from here on.
+    if (tenantScoped) {
+      offsetRequest.topics.forEach(t => t.setName(tenantCtx.toPhysical(t.name)))
+    }
+
     val (authorizedRequestInfo, unauthorizedRequestInfo) = authHelper.partitionSeqByAuthorized(request.context,
         DESCRIBE, TOPIC, offsetRequest.topics.asScala.toSeq)(_.name)
 
@@ -1563,10 +1624,19 @@ class KafkaApis(val requestChannel: RequestChannel,
 
     def sendResponseCallback(response: Seq[ListOffsetsTopicResponse]): Unit = {
       val mergedResponses = response ++ unauthorizedResponseStatus
+      // OUT rewrite — each topic name on the wire is physical; rewrite back to
+      // logical before the response goes out. The invalid-logical-form entries
+      // already carry the logical name the client sent, so they are merged
+      // after the toLogical pass to avoid stripping the prefix the caller
+      // intentionally typed.
+      if (tenantScoped) {
+        mergedResponses.foreach(r => r.setName(tenantCtx.toLogical(r.name)))
+      }
+      val finalResponses = mergedResponses ++ invalidLogicalResponses
       requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
         new ListOffsetsResponse(new ListOffsetsResponseData()
           .setThrottleTimeMs(requestThrottleMs)
-          .setTopics(mergedResponses.asJava)))
+          .setTopics(finalResponses.asJava)))
     }
 
     if (authorizedRequestInfo.isEmpty) {
@@ -2590,6 +2660,69 @@ class KafkaApis(val requestChannel: RequestChannel,
   def handleDeleteRecordsRequest(request: RequestChannel.Request): Unit = {
     val deleteRecordsRequest = request.body[DeleteRecordsRequest]
 
+    val tenantCtx = tenantContextFor(request)
+    val tenantScoped = tenantCtx.effectiveTenant.isPresent
+
+    // Refuse any unsafe request — every partition gets TOPIC_AUTHORIZATION_FAILED
+    // keyed by the LOGICAL name the client sent; replicaManager is never consulted.
+    if (tenantCtx.isUnsafe) {
+      val refused = deleteRecordsRequest.data.topics.asScala.flatMap { topic =>
+        topic.partitions.asScala.map(p =>
+          new TopicPartition(topic.name, p.partitionIndex) ->
+            new DeleteRecordsPartitionResult()
+              .setPartitionIndex(p.partitionIndex)
+              .setLowWatermark(DeleteRecordsResponse.INVALID_LOW_WATERMARK)
+              .setErrorCode(Errors.TOPIC_AUTHORIZATION_FAILED.code))
+      }.toMap
+      sendDeleteRecordsResponse(request, refused)
+      return
+    }
+
+    // Reserved-form / overlong / invalid-logical-form guards (tenant path) and
+    // outside-in pollution guard (non-tenant path). Rejected partitions surface
+    // as INVALID_TOPIC_EXCEPTION keyed by the LOGICAL name the client sent —
+    // they never reach authorization or replicaManager.
+    val invalidLogicalResponses = mutable.Map[TopicPartition, DeleteRecordsPartitionResult]()
+    if (tenantScoped) {
+      val rejected = new util.ArrayList[DeleteRecordsTopic]()
+      deleteRecordsRequest.data.topics.forEach { t =>
+        if (tenantCtx.isReservedPhysicalForm(t.name)
+            || tenantCtx.isOverlongLogicalForm(t.name)
+            || tenantCtx.isInvalidLogicalForm(t.name)) {
+          rejected.add(t)
+          t.partitions.forEach { p =>
+            invalidLogicalResponses += new TopicPartition(t.name, p.partitionIndex) ->
+              new DeleteRecordsPartitionResult()
+                .setPartitionIndex(p.partitionIndex)
+                .setLowWatermark(DeleteRecordsResponse.INVALID_LOW_WATERMARK)
+                .setErrorCode(Errors.INVALID_TOPIC_EXCEPTION.code)
+          }
+        }
+      }
+      rejected.forEach(t => deleteRecordsRequest.data.topics.remove(t))
+    } else if (!tenantConfig.allTenants.isEmpty) {
+      val rejected = new util.ArrayList[DeleteRecordsTopic]()
+      deleteRecordsRequest.data.topics.forEach { t =>
+        if (isReservedTenantNamespace(t.name)) {
+          rejected.add(t)
+          t.partitions.forEach { p =>
+            invalidLogicalResponses += new TopicPartition(t.name, p.partitionIndex) ->
+              new DeleteRecordsPartitionResult()
+                .setPartitionIndex(p.partitionIndex)
+                .setLowWatermark(DeleteRecordsResponse.INVALID_LOW_WATERMARK)
+                .setErrorCode(Errors.INVALID_TOPIC_EXCEPTION.code)
+          }
+        }
+      }
+      rejected.forEach(t => deleteRecordsRequest.data.topics.remove(t))
+    }
+
+    // IN rewrite — logical → physical for surviving topics. Auth and
+    // replicaManager both key on physical names from here on.
+    if (tenantScoped) {
+      deleteRecordsRequest.data.topics.forEach(t => t.setName(tenantCtx.toPhysical(t.name)))
+    }
+
     val unauthorizedTopicResponses = mutable.Map[TopicPartition, DeleteRecordsPartitionResult]()
     val nonExistingTopicResponses = mutable.Map[TopicPartition, DeleteRecordsPartitionResult]()
     val authorizedForDeleteTopicOffsets = mutable.Map[TopicPartition, Long]()
@@ -2616,8 +2749,8 @@ class KafkaApis(val requestChannel: RequestChannel,
 
     // the callback for sending a DeleteRecordsResponse
     def sendResponseCallback(authorizedTopicResponses: Map[TopicPartition, DeleteRecordsPartitionResult]): Unit = {
-      val mergedResponseStatus = authorizedTopicResponses ++ unauthorizedTopicResponses ++ nonExistingTopicResponses
-      mergedResponseStatus.foreachEntry { (topicPartition, status) =>
+      val physicalResponseStatus = authorizedTopicResponses ++ unauthorizedTopicResponses ++ nonExistingTopicResponses
+      physicalResponseStatus.foreachEntry { (topicPartition, status) =>
         if (status.errorCode != Errors.NONE.code) {
           debug("DeleteRecordsRequest with correlation id %d from client %s on partition %s failed due to %s".format(
             request.header.correlationId,
@@ -2627,18 +2760,17 @@ class KafkaApis(val requestChannel: RequestChannel,
         }
       }
 
-      requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
-        new DeleteRecordsResponse(new DeleteRecordsResponseData()
-          .setThrottleTimeMs(requestThrottleMs)
-          .setTopics(new DeleteRecordsResponseData.DeleteRecordsTopicResultCollection(mergedResponseStatus.groupBy(_._1.topic).map { case (topic, partitionMap) =>
-            new DeleteRecordsTopicResult()
-              .setName(topic)
-              .setPartitions(new DeleteRecordsResponseData.DeleteRecordsPartitionResultCollection(partitionMap.map { case (topicPartition, partitionResult) =>
-                new DeleteRecordsPartitionResult().setPartitionIndex(topicPartition.partition)
-                  .setLowWatermark(partitionResult.lowWatermark)
-                  .setErrorCode(partitionResult.errorCode)
-              }.toList.asJava.iterator()))
-          }.toList.asJava.iterator()))))
+      // OUT rewrite — physical → logical on the TopicPartition keys. The
+      // invalidLogicalResponses entries are already keyed by the LOGICAL name
+      // the client sent; merge after the toLogical pass so the prefix the
+      // caller intentionally typed is not stripped from them.
+      val rewrittenLogical: Map[TopicPartition, DeleteRecordsPartitionResult] =
+        if (tenantScoped) physicalResponseStatus.map { case (tp, pr) =>
+          new TopicPartition(tenantCtx.toLogical(tp.topic), tp.partition) -> pr
+        }.toMap
+        else physicalResponseStatus.toMap
+      val mergedResponseStatus = rewrittenLogical ++ invalidLogicalResponses
+      sendDeleteRecordsResponse(request, mergedResponseStatus)
     }
 
     if (authorizedForDeleteTopicOffsets.isEmpty)
@@ -2650,6 +2782,22 @@ class KafkaApis(val requestChannel: RequestChannel,
         authorizedForDeleteTopicOffsets,
         sendResponseCallback)
     }
+  }
+
+  private def sendDeleteRecordsResponse(request: RequestChannel.Request,
+                                        mergedResponseStatus: Map[TopicPartition, DeleteRecordsPartitionResult]): Unit = {
+    requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
+      new DeleteRecordsResponse(new DeleteRecordsResponseData()
+        .setThrottleTimeMs(requestThrottleMs)
+        .setTopics(new DeleteRecordsResponseData.DeleteRecordsTopicResultCollection(mergedResponseStatus.groupBy(_._1.topic).map { case (topic, partitionMap) =>
+          new DeleteRecordsTopicResult()
+            .setName(topic)
+            .setPartitions(new DeleteRecordsResponseData.DeleteRecordsPartitionResultCollection(partitionMap.map { case (topicPartition, partitionResult) =>
+              new DeleteRecordsPartitionResult().setPartitionIndex(topicPartition.partition)
+                .setLowWatermark(partitionResult.lowWatermark)
+                .setErrorCode(partitionResult.errorCode)
+            }.toList.asJava.iterator()))
+        }.toList.asJava.iterator()))))
   }
 
   def handleInitProducerIdRequest(request: RequestChannel.Request, requestLocal: RequestLocal): Unit = {
@@ -4669,8 +4817,17 @@ object KafkaApis {
   // JOIN_GROUP/SYNC_GROUP/HEARTBEAT/LEAVE_GROUP drive the rebalance protocol;
   // OFFSET_COMMIT/OFFSET_FETCH persist and read committed offsets. Each
   // handler rewrites the group id (and topic names where present) on the way
-  // in and back on the way out. Transactional / share / consumer-group v2
-  // APIs remain refused at this dispatch boundary.
+  // in and back on the way out.
+  //
+  // Phase 3a admits ListOffsets and DeleteRecords — both are pure topic-name
+  // rewrites that key on physical names for authorization and replicaManager
+  // and restore logical names on the response. The functional scenario for
+  // "logical offsets are tenant-local" and "DeleteRecords advances only the
+  // tenant's logical low-water mark" requires these handlers to be tenant-
+  // aware rather than refused.
+  //
+  // Transactional / share / consumer-group v2 APIs remain refused at this
+  // dispatch boundary.
   private[server] val TENANT_ALLOWED_APIS: Set[ApiKeys] = Set(
     ApiKeys.PRODUCE,
     ApiKeys.FETCH,
@@ -4685,6 +4842,8 @@ object KafkaApis {
     ApiKeys.LEAVE_GROUP,
     ApiKeys.OFFSET_COMMIT,
     ApiKeys.OFFSET_FETCH,
+    ApiKeys.LIST_OFFSETS,
+    ApiKeys.DELETE_RECORDS,
     ApiKeys.SASL_HANDSHAKE,
     ApiKeys.SASL_AUTHENTICATE,
     ApiKeys.API_VERSIONS

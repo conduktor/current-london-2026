@@ -43,6 +43,8 @@ import org.apache.kafka.common.message.ApiMessageType.ListenerType
 import org.apache.kafka.common.message.ConsumerGroupDescribeResponseData.{DescribedGroup, TopicPartitions}
 import org.apache.kafka.common.message.CreateTopicsRequestData.CreatableTopic
 import org.apache.kafka.common.message.CreateTopicsResponseData.CreatableTopicResult
+import org.apache.kafka.common.message.DeleteRecordsRequestData.{DeleteRecordsPartition => DRPartition, DeleteRecordsTopic => DRTopic}
+import org.apache.kafka.common.message.DeleteRecordsResponseData.DeleteRecordsPartitionResult
 import org.apache.kafka.common.message.IncrementalAlterConfigsRequestData.{AlterConfigsResource => IAlterConfigsResource, AlterConfigsResourceCollection => IAlterConfigsResourceCollection, AlterableConfig => IAlterableConfig, AlterableConfigCollection => IAlterableConfigCollection}
 import org.apache.kafka.common.message.IncrementalAlterConfigsResponseData.{AlterConfigsResourceResponse => IAlterConfigsResourceResponse}
 import org.apache.kafka.common.message.LeaveGroupRequestData.MemberIdentity
@@ -11943,18 +11945,15 @@ class KafkaApisTest extends Logging {
   @Test
   def testNonV1ApiFromTenantPrincipalIsRefusedAtDispatch(): Unit = {
     // PROMPT.md fixes v1 to {Produce, Fetch, Metadata, CreateTopics, DeleteTopics,
-    // ListTopics}. A tenant principal calling any other API (here ListOffsets)
-    // has no tenant-aware handler to rewrite their request — passing through
-    // would leak physical names or pollute another tenant's namespace. The
-    // dispatch-level gate refuses the request without ever entering the handler.
-    val targetTimes = util.Arrays.asList(new ListOffsetsTopic()
-      .setName("orders")
-      .setPartitions(util.Arrays.asList(new ListOffsetsPartition()
-        .setPartitionIndex(0)
-        .setTimestamp(ListOffsetsRequest.EARLIEST_TIMESTAMP))))
-    val listOffsetsRequest = ListOffsetsRequest.Builder.forConsumer(true, IsolationLevel.READ_UNCOMMITTED)
-      .setTargetTimes(targetTimes).build()
-    val request = buildRequest(listOffsetsRequest,
+    // ListTopics} plus the APIs admitted in later phases (consumer-coordination,
+    // ListOffsets, DeleteRecords). A tenant principal calling any API still
+    // outside that allow-list (here DescribeGroups) has no tenant-aware handler
+    // to rewrite their request — passing through would leak physical names or
+    // pollute another tenant's namespace. The dispatch-level gate refuses the
+    // request without ever entering the handler.
+    val describeGroupsRequest = new DescribeGroupsRequest.Builder(
+      new DescribeGroupsRequestData().setGroups(util.Arrays.asList("any-group"))).build()
+    val request = buildRequest(describeGroupsRequest,
       listenerName = TENANT_LISTENER,
       principal = tenantPrincipal("acme", "alice"))
 
@@ -11963,11 +11962,12 @@ class KafkaApisTest extends Logging {
     kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
     kafkaApis.handle(request, RequestLocal.withThreadConfinedCaching)
 
-    val response = verifyNoThrottling[ListOffsetsResponse](request)
-    val errorCodes = response.data.topics.asScala.flatMap(_.partitions.asScala.map(_.errorCode))
-    assertTrue(errorCodes.nonEmpty, "expected at least one partition in the synthesized error response")
-    assertTrue(errorCodes.forall(_ == Errors.TOPIC_AUTHORIZATION_FAILED.code),
-      "tenant principal calling a non-v1 API must be refused with TOPIC_AUTHORIZATION_FAILED")
+    val response = verifyNoThrottling[DescribeGroupsResponse](request)
+    val errorCodes = response.data.groups.asScala.map(_.errorCode)
+    assertTrue(errorCodes.nonEmpty, "expected at least one group in the synthesized error response")
+    assertTrue(errorCodes.forall(c => c != Errors.NONE.code),
+      "tenant principal calling a non-v1 API must be refused at dispatch without reaching the handler")
+    verify(groupCoordinator, never()).describeGroups(any[RequestContext](), any[util.List[String]]())
   }
 
   // ---------------------------------------------------------------------------
@@ -12650,20 +12650,19 @@ class KafkaApisTest extends Logging {
 
   @Test
   def testNonV1ApiFromPrivilegedCallerOnTenantBoundListenerIsRefusedAtDispatch(): Unit = {
-    // The silent-pollution trap extends to every non-v1 API: a super-user on a
-    // tenant-bound listener without a `__tenant_` prefix in their principal
-    // would otherwise reach the handler with a tenant-bound listener context.
-    // The dispatch-level gate refuses before ListOffsets / DeleteRecords /
-    // AlterConfigs / DescribeAcls can read or mutate cluster state under the
-    // implicit tenant binding.
-    val targetTimes = util.Arrays.asList(new ListOffsetsTopic()
-      .setName("orders")
-      .setPartitions(util.Arrays.asList(new ListOffsetsPartition()
-        .setPartitionIndex(0)
-        .setTimestamp(ListOffsetsRequest.EARLIEST_TIMESTAMP))))
-    val listOffsetsRequest = ListOffsetsRequest.Builder.forConsumer(true, IsolationLevel.READ_UNCOMMITTED)
-      .setTargetTimes(targetTimes).build()
-    val request = buildRequest(listOffsetsRequest,
+    // The silent-pollution trap extends to every API still outside the
+    // tenant allow-list: a super-user on a tenant-bound listener without a
+    // `__tenant_` prefix in their principal would otherwise reach the
+    // handler with a tenant-bound listener context. The dispatch-level
+    // gate refuses before DescribeGroups / AlterConfigs / DescribeAcls
+    // can read or mutate cluster state under the implicit tenant binding.
+    // (APIs admitted to the allow-list — Produce, Fetch, Metadata,
+    // ListOffsets, DeleteRecords, consumer-coordination — each carry an
+    // equivalent `tenantCtx.isUnsafe` guard at the head of the handler;
+    // tested separately for each handler.)
+    val describeGroupsRequest = new DescribeGroupsRequest.Builder(
+      new DescribeGroupsRequestData().setGroups(util.Arrays.asList("any-group"))).build()
+    val request = buildRequest(describeGroupsRequest,
       listenerName = TENANT_LISTENER,
       principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "Alice")) // no tenant prefix
 
@@ -12672,11 +12671,12 @@ class KafkaApisTest extends Logging {
     kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
     kafkaApis.handle(request, RequestLocal.withThreadConfinedCaching)
 
-    val response = verifyNoThrottling[ListOffsetsResponse](request)
-    val errorCodes = response.data.topics.asScala.flatMap(_.partitions.asScala.map(_.errorCode))
-    assertTrue(errorCodes.nonEmpty, "expected at least one partition in the synthesized error response")
-    assertTrue(errorCodes.forall(_ == Errors.TOPIC_AUTHORIZATION_FAILED.code),
-      "privileged caller on tenant listener must be refused on non-v1 APIs without ever reaching the handler")
+    val response = verifyNoThrottling[DescribeGroupsResponse](request)
+    val errorCodes = response.data.groups.asScala.map(_.errorCode)
+    assertTrue(errorCodes.nonEmpty, "expected at least one group in the synthesized error response")
+    assertTrue(errorCodes.forall(c => c != Errors.NONE.code),
+      "privileged caller on tenant listener must be refused on disallowed APIs without reaching the handler")
+    verify(groupCoordinator, never()).describeGroups(any[RequestContext](), any[util.List[String]]())
   }
 
   @Test
@@ -13258,6 +13258,306 @@ class KafkaApisTest extends Logging {
       ArgumentMatchers.eq(request.context),
       ArgumentMatchers.eq(expectedCoordinatorRequest),
       ArgumentMatchers.eq(false))
+  }
+
+  @Test
+  def testListOffsetsTenantRewritesTopicNameInAndOut(): Unit = {
+    // PROMPT.md functional scenario: tenant A's logical offsets are tenant-local
+    // and independent of another tenant's traffic on the same backing.
+    // The IN-rewrite sends the physical name to replicaManager (so authorization
+    // and the local log lookup both key on physical); the OUT-rewrite restores
+    // the logical name before the response goes out so the tenant never sees
+    // its prefix.
+    val targetTimes = util.Arrays.asList(new ListOffsetsTopic()
+      .setName("orders")
+      .setPartitions(util.Arrays.asList(new ListOffsetsPartition()
+        .setPartitionIndex(0)
+        .setTimestamp(ListOffsetsRequest.EARLIEST_TIMESTAMP))))
+    val listOffsetsRequest = ListOffsetsRequest.Builder.forConsumer(true, IsolationLevel.READ_UNCOMMITTED)
+      .setTargetTimes(targetTimes).build()
+    val request = buildRequest(listOffsetsRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    val topicsCaptor: ArgumentCaptor[Seq[ListOffsetsTopic]] =
+      ArgumentCaptor.forClass(classOf[Seq[ListOffsetsTopic]])
+    when(replicaManager.fetchOffset(
+      topicsCaptor.capture(),
+      ArgumentMatchers.eq(Set.empty[TopicPartition]),
+      ArgumentMatchers.eq(IsolationLevel.READ_UNCOMMITTED),
+      anyInt(),
+      any[String](),
+      anyInt(),
+      anyShort(),
+      any[(Errors, ListOffsetsPartition) => ListOffsetsPartitionResponse](),
+      any[List[ListOffsetsTopicResponse] => Unit](),
+      anyInt()
+    )).thenAnswer(ans => {
+      val captured = ans.getArgument[Seq[ListOffsetsTopic]](0)
+      val callback = ans.getArgument[List[ListOffsetsTopicResponse] => Unit](8)
+      callback(captured.map(t => new ListOffsetsTopicResponse()
+        .setName(t.name)
+        .setPartitions(t.partitions.asScala.map(p =>
+          new ListOffsetsPartitionResponse()
+            .setPartitionIndex(p.partitionIndex)
+            .setErrorCode(Errors.NONE.code)
+            .setTimestamp(0L)
+            .setOffset(42L)).asJava)).toList)
+    })
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleListOffsetRequest(request)
+
+    // IN-side: replicaManager sees the physical topic name.
+    assertEquals(Set("acme.orders"), topicsCaptor.getValue.map(_.name).toSet,
+      "IN rewrite must hand the physical topic name to replicaManager")
+
+    // OUT-side: client sees only the logical name.
+    val response = verifyNoThrottling[ListOffsetsResponse](request)
+    val byName = response.topics.asScala.map(t => t.name -> t).toMap
+    assertTrue(byName.contains("orders"),
+      "OUT rewrite must restore the logical name on the response")
+    assertFalse(byName.contains("acme.orders"),
+      "physical topic name must never leak to the tenant on the wire")
+    assertEquals(42L, byName("orders").partitions.asScala.head.offset)
+  }
+
+  @Test
+  def testListOffsetsTenantRefusesReservedPhysicalFormTopic(): Unit = {
+    // A tenant submitting `acme.orders` (the reserved physical form) is either
+    // confused or probing the storage namespace. Refuse INVALID_TOPIC_EXCEPTION
+    // at the partition level with the LITERAL name the tenant sent; never
+    // reach replicaManager.
+    val targetTimes = util.Arrays.asList(new ListOffsetsTopic()
+      .setName("acme.orders")
+      .setPartitions(util.Arrays.asList(new ListOffsetsPartition()
+        .setPartitionIndex(0)
+        .setTimestamp(ListOffsetsRequest.EARLIEST_TIMESTAMP))))
+    val listOffsetsRequest = ListOffsetsRequest.Builder.forConsumer(true, IsolationLevel.READ_UNCOMMITTED)
+      .setTargetTimes(targetTimes).build()
+    val request = buildRequest(listOffsetsRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleListOffsetRequest(request)
+
+    val response = verifyNoThrottling[ListOffsetsResponse](request)
+    val topics = response.topics.asScala
+    assertEquals(1, topics.size)
+    assertEquals("acme.orders", topics.head.name,
+      "reserved-form rejection must echo back the LITERAL name the tenant sent")
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code,
+      topics.head.partitions.asScala.head.errorCode)
+    verify(replicaManager, never()).fetchOffset(
+      any[Seq[ListOffsetsTopic]](), any[Set[TopicPartition]](), any[IsolationLevel](),
+      anyInt(), any[String](), anyInt(), anyShort(),
+      any[(Errors, ListOffsetsPartition) => ListOffsetsPartitionResponse](),
+      any[List[ListOffsetsTopicResponse] => Unit](),
+      anyInt())
+  }
+
+  @Test
+  def testListOffsetsPrivilegedCallerOnTenantBoundListenerIsRefused(): Unit = {
+    // A super-user on a tenant-bound listener without a `__tenant_` prefix
+    // would otherwise reach replicaManager with the listener-derived tenant
+    // binding and read offsets in the tenant's namespace under their own
+    // principal. The handler-level isUnsafe guard refuses every partition.
+    val targetTimes = util.Arrays.asList(new ListOffsetsTopic()
+      .setName("orders")
+      .setPartitions(util.Arrays.asList(new ListOffsetsPartition()
+        .setPartitionIndex(0)
+        .setTimestamp(ListOffsetsRequest.EARLIEST_TIMESTAMP))))
+    val listOffsetsRequest = ListOffsetsRequest.Builder.forConsumer(true, IsolationLevel.READ_UNCOMMITTED)
+      .setTargetTimes(targetTimes).build()
+    val request = buildRequest(listOffsetsRequest,
+      listenerName = TENANT_LISTENER,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "Alice")) // no tenant prefix
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleListOffsetRequest(request)
+
+    val response = verifyNoThrottling[ListOffsetsResponse](request)
+    val topics = response.topics.asScala
+    assertEquals(Set("orders"), topics.map(_.name).toSet,
+      "wire name must be the LOGICAL name the caller submitted, not the physical form")
+    assertTrue(topics.head.partitions.asScala.forall(_.errorCode == Errors.TOPIC_AUTHORIZATION_FAILED.code),
+      "every partition must carry TOPIC_AUTHORIZATION_FAILED on unsafe context")
+    verify(replicaManager, never()).fetchOffset(
+      any[Seq[ListOffsetsTopic]](), any[Set[TopicPartition]](), any[IsolationLevel](),
+      anyInt(), any[String](), anyInt(), anyShort(),
+      any[(Errors, ListOffsetsPartition) => ListOffsetsPartitionResponse](),
+      any[List[ListOffsetsTopicResponse] => Unit](),
+      anyInt())
+  }
+
+  @Test
+  def testListOffsetsClusterWideListenerRejectsTenantPrefixedNames(): Unit = {
+    // Outside-in pollution guard. A non-tenant principal on a non-tenant
+    // listener naming `acme.orders` would otherwise probe the tenant's
+    // physical log directly. Refuse it with INVALID_TOPIC_EXCEPTION before
+    // it can reach authorization or replicaManager.
+    val targetTimes = util.Arrays.asList(new ListOffsetsTopic()
+      .setName("acme.orders")
+      .setPartitions(util.Arrays.asList(new ListOffsetsPartition()
+        .setPartitionIndex(0)
+        .setTimestamp(ListOffsetsRequest.EARLIEST_TIMESTAMP))))
+    val listOffsetsRequest = ListOffsetsRequest.Builder.forConsumer(true, IsolationLevel.READ_UNCOMMITTED)
+      .setTargetTimes(targetTimes).build()
+    val request = buildRequest(listOffsetsRequest)  // default plaintext listener, plain principal
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleListOffsetRequest(request)
+
+    val response = verifyNoThrottling[ListOffsetsResponse](request)
+    val topics = response.topics.asScala
+    assertEquals(1, topics.size)
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code,
+      topics.head.partitions.asScala.head.errorCode,
+      "outside-in pollution guard must refuse the tenant-prefixed name")
+    verify(replicaManager, never()).fetchOffset(
+      any[Seq[ListOffsetsTopic]](), any[Set[TopicPartition]](), any[IsolationLevel](),
+      anyInt(), any[String](), anyInt(), anyShort(),
+      any[(Errors, ListOffsetsPartition) => ListOffsetsPartitionResponse](),
+      any[List[ListOffsetsTopicResponse] => Unit](),
+      anyInt())
+  }
+
+  @Test
+  def testDeleteRecordsTenantRewritesTopicNameInAndOut(): Unit = {
+    // PROMPT.md functional scenario: DeleteRecords from tenant A advances only
+    // its logical low-water mark. IN rewrites logical → physical so the
+    // replicaManager keys on the physical log; OUT rewrites physical → logical
+    // so the tenant sees only its own name.
+    addTopicToMetadataCache("acme.orders", numPartitions = 1)
+    val deleteRequest = new DeleteRecordsRequest.Builder(new DeleteRecordsRequestData()
+      .setTimeoutMs(1000)
+      .setTopics(util.Arrays.asList(new DRTopic()
+        .setName("orders")
+        .setPartitions(util.Arrays.asList(new DRPartition()
+          .setPartitionIndex(0)
+          .setOffset(50L)))))).build()
+    val request = buildRequest(deleteRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    val offsetsCaptor: ArgumentCaptor[Map[TopicPartition, Long]] =
+      ArgumentCaptor.forClass(classOf[Map[TopicPartition, Long]])
+    when(replicaManager.deleteRecords(
+      anyLong(),
+      offsetsCaptor.capture(),
+      any[Map[TopicPartition, DeleteRecordsPartitionResult] => Unit](),
+      anyBoolean()
+    )).thenAnswer(ans => {
+      val captured = ans.getArgument[Map[TopicPartition, Long]](1)
+      val callback = ans.getArgument[Map[TopicPartition, DeleteRecordsPartitionResult] => Unit](2)
+      callback(captured.map { case (tp, _) =>
+        tp -> new DeleteRecordsPartitionResult()
+          .setPartitionIndex(tp.partition)
+          .setLowWatermark(50L)
+          .setErrorCode(Errors.NONE.code)
+      }.toMap)
+    })
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDeleteRecordsRequest(request)
+
+    // IN-side: replicaManager sees the physical topic name.
+    assertEquals(Set("acme.orders"), offsetsCaptor.getValue.keys.map(_.topic).toSet,
+      "IN rewrite must hand the physical topic name to replicaManager")
+
+    // OUT-side: client sees only the logical name.
+    val response = verifyNoThrottling[DeleteRecordsResponse](request)
+    val byName = response.data.topics.asScala.map(t => t.name -> t).toMap
+    assertTrue(byName.contains("orders"),
+      "OUT rewrite must restore the logical name on the response")
+    assertFalse(byName.contains("acme.orders"),
+      "physical topic name must never leak to the tenant on the wire")
+    assertEquals(50L, byName("orders").partitions.asScala.head.lowWatermark)
+    assertEquals(Errors.NONE.code, byName("orders").partitions.asScala.head.errorCode)
+  }
+
+  @Test
+  def testDeleteRecordsTenantRefusesReservedPhysicalFormTopic(): Unit = {
+    val deleteRequest = new DeleteRecordsRequest.Builder(new DeleteRecordsRequestData()
+      .setTimeoutMs(1000)
+      .setTopics(util.Arrays.asList(new DRTopic()
+        .setName("acme.orders")
+        .setPartitions(util.Arrays.asList(new DRPartition()
+          .setPartitionIndex(0)
+          .setOffset(10L)))))).build()
+    val request = buildRequest(deleteRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDeleteRecordsRequest(request)
+
+    val response = verifyNoThrottling[DeleteRecordsResponse](request)
+    val topics = response.data.topics.asScala
+    assertEquals(1, topics.size)
+    assertEquals("acme.orders", topics.head.name,
+      "reserved-form rejection must echo back the LITERAL name the tenant sent")
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code,
+      topics.head.partitions.asScala.head.errorCode)
+    verify(replicaManager, never()).deleteRecords(
+      anyLong(), any[Map[TopicPartition, Long]](),
+      any[Map[TopicPartition, DeleteRecordsPartitionResult] => Unit](),
+      anyBoolean())
+  }
+
+  @Test
+  def testDeleteRecordsPrivilegedCallerOnTenantBoundListenerIsRefused(): Unit = {
+    val deleteRequest = new DeleteRecordsRequest.Builder(new DeleteRecordsRequestData()
+      .setTimeoutMs(1000)
+      .setTopics(util.Arrays.asList(new DRTopic()
+        .setName("orders")
+        .setPartitions(util.Arrays.asList(new DRPartition()
+          .setPartitionIndex(0)
+          .setOffset(10L)))))).build()
+    val request = buildRequest(deleteRequest,
+      listenerName = TENANT_LISTENER,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "Alice")) // no tenant prefix
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDeleteRecordsRequest(request)
+
+    val response = verifyNoThrottling[DeleteRecordsResponse](request)
+    val topics = response.data.topics.asScala
+    assertEquals(Set("orders"), topics.map(_.name).toSet,
+      "wire name must be the LOGICAL name the caller submitted, not the physical form")
+    assertTrue(topics.head.partitions.asScala.forall(_.errorCode == Errors.TOPIC_AUTHORIZATION_FAILED.code),
+      "every partition must carry TOPIC_AUTHORIZATION_FAILED on unsafe context")
+    verify(replicaManager, never()).deleteRecords(
+      anyLong(), any[Map[TopicPartition, Long]](),
+      any[Map[TopicPartition, DeleteRecordsPartitionResult] => Unit](),
+      anyBoolean())
+  }
+
+  @Test
+  def testDeleteRecordsClusterWideListenerRejectsTenantPrefixedNames(): Unit = {
+    val deleteRequest = new DeleteRecordsRequest.Builder(new DeleteRecordsRequestData()
+      .setTimeoutMs(1000)
+      .setTopics(util.Arrays.asList(new DRTopic()
+        .setName("acme.orders")
+        .setPartitions(util.Arrays.asList(new DRPartition()
+          .setPartitionIndex(0)
+          .setOffset(10L)))))).build()
+    val request = buildRequest(deleteRequest)  // default plaintext listener, plain principal
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDeleteRecordsRequest(request)
+
+    val response = verifyNoThrottling[DeleteRecordsResponse](request)
+    val topics = response.data.topics.asScala
+    assertEquals(1, topics.size)
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code,
+      topics.head.partitions.asScala.head.errorCode,
+      "outside-in pollution guard must refuse the tenant-prefixed name")
+    verify(replicaManager, never()).deleteRecords(
+      anyLong(), any[Map[TopicPartition, Long]](),
+      any[Map[TopicPartition, DeleteRecordsPartitionResult] => Unit](),
+      anyBoolean())
   }
 
 }
