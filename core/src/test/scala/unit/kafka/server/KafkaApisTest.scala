@@ -15204,4 +15204,217 @@ class KafkaApisTest extends Logging {
       any(), any(), any(), any(), any(), any())
   }
 
+  @Test
+  def testDeleteGroupsOutsideInRefusesTenantPrincipalNamespace(): Unit = {
+    // Non-tenant cluster-wide caller asks to delete `__tenant_acme.consumer`.
+    // The dispatch gate doesn't fire (DELETE_GROUPS isn't in TENANT_ALLOWED_APIS,
+    // but the caller is non-tenant); without an outside-in guard the call would
+    // reach groupCoordinator.deleteGroups and drop acme's coordinator record.
+    val req = new DeleteGroupsRequest.Builder(new DeleteGroupsRequestData()
+      .setGroupsNames(List("__tenant_acme.consumer", "regular-group").asJava)).build()
+    val request = buildRequest(req)
+
+    val future = new CompletableFuture[DeleteGroupsResponseData.DeletableGroupResultCollection]()
+    when(groupCoordinator.deleteGroups(
+      request.context,
+      List("regular-group").asJava,
+      RequestLocal.noCaching.bufferSupplier
+    )).thenReturn(future)
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDeleteGroupsRequest(request, RequestLocal.noCaching)
+
+    future.complete(new DeleteGroupsResponseData.DeletableGroupResultCollection(List(
+      new DeleteGroupsResponseData.DeletableGroupResult()
+        .setGroupId("regular-group").setErrorCode(Errors.NONE.code)
+    ).iterator.asJava))
+
+    val response = verifyNoThrottling[DeleteGroupsResponse](request)
+    val results = response.data.results.asScala.map(r => r.groupId -> r.errorCode).toMap
+    assertEquals(Errors.GROUP_AUTHORIZATION_FAILED.code, results("__tenant_acme.consumer"),
+      "reserved-form group must be refused before the coordinator call")
+    assertEquals(Errors.NONE.code, results("regular-group"),
+      "non-reserved groups in the same batch must still be processed")
+  }
+
+  @Test
+  def testOffsetDeleteOutsideInRefusesTenantPrincipalNamespace(): Unit = {
+    val req = new OffsetDeleteRequest.Builder(new OffsetDeleteRequestData()
+      .setGroupId("__tenant_acme.consumer")
+      .setTopics(new OffsetDeleteRequestTopicCollection(List(
+        new OffsetDeleteRequestTopic().setName("topic").setPartitions(List(
+          new OffsetDeleteRequestPartition().setPartitionIndex(0)).asJava)
+      ).iterator.asJava))).build()
+    val request = buildRequest(req)
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleOffsetDeleteRequest(request, RequestLocal.noCaching)
+
+    val response = verifyNoThrottling[OffsetDeleteResponse](request)
+    assertEquals(Errors.GROUP_AUTHORIZATION_FAILED.code, response.data.errorCode,
+      "reserved-form groupId must be refused before reaching the coordinator")
+    verify(groupCoordinator, never()).deleteOffsets(any(), any(), any())
+  }
+
+  @Test
+  def testConsumerGroupHeartbeatOutsideInRefusesTenantPrincipalNamespace(): Unit = {
+    metadataCache = mock(classOf[KRaftMetadataCache])
+    val req = new ConsumerGroupHeartbeatRequest.Builder(
+      new ConsumerGroupHeartbeatRequestData().setGroupId("__tenant_acme.consumer")).build()
+    val request = buildRequest(req)
+
+    kafkaApis = createKafkaApis(
+      featureVersions = Seq(GroupVersion.GV_1),
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleConsumerGroupHeartbeat(request)
+
+    val response = verifyNoThrottling[ConsumerGroupHeartbeatResponse](request)
+    assertEquals(Errors.GROUP_AUTHORIZATION_FAILED.code, response.data.errorCode,
+      "reserved-form groupId must be refused before the new group coordinator")
+    verify(groupCoordinator, never()).consumerGroupHeartbeat(any(), any())
+  }
+
+  @Test
+  def testConsumerGroupDescribeOutsideInRefusesTenantPrincipalNamespace(): Unit = {
+    metadataCache = mock(classOf[KRaftMetadataCache])
+    val req = new ConsumerGroupDescribeRequest.Builder(
+      new ConsumerGroupDescribeRequestData().setGroupIds(
+        List("__tenant_acme.consumer", "regular-group").asJava)).build()
+    val request = buildRequest(req)
+
+    when(groupCoordinator.consumerGroupDescribe(any(), any()))
+      .thenReturn(CompletableFuture.completedFuture(List(
+        new ConsumerGroupDescribeResponseData.DescribedGroup()
+          .setGroupId("regular-group").setErrorCode(Errors.NONE.code)
+      ).asJava))
+
+    kafkaApis = createKafkaApis(
+      featureVersions = Seq(GroupVersion.GV_1),
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleConsumerGroupDescribe(request)
+
+    val response = verifyNoThrottling[ConsumerGroupDescribeResponse](request)
+    val results = response.data.groups.asScala.map(g => g.groupId -> g.errorCode).toMap
+    assertEquals(Errors.GROUP_AUTHORIZATION_FAILED.code, results("__tenant_acme.consumer"),
+      "reserved-form group must be refused per-entry")
+    assertEquals(Errors.NONE.code, results("regular-group"),
+      "non-reserved groups in the same batch must still be processed")
+  }
+
+  @Test
+  def testDescribeGroupsOutsideInRefusesTenantPrincipalNamespace(): Unit = {
+    val req = new DescribeGroupsRequest.Builder(new DescribeGroupsRequestData()
+      .setGroups(List("__tenant_acme.consumer", "regular-group").asJava)).build()
+    val request = buildRequest(req)
+
+    when(groupCoordinator.describeGroups(any(), any()))
+      .thenReturn(CompletableFuture.completedFuture(List(
+        new DescribeGroupsResponseData.DescribedGroup()
+          .setGroupId("regular-group").setErrorCode(Errors.NONE.code)
+      ).asJava))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDescribeGroupsRequest(request)
+
+    val response = verifyNoThrottling[DescribeGroupsResponse](request)
+    val results = response.data.groups.asScala.map(g => g.groupId -> g.errorCode).toMap
+    assertEquals(Errors.GROUP_AUTHORIZATION_FAILED.code, results("__tenant_acme.consumer"),
+      "reserved-form group must be refused per-entry")
+    assertEquals(Errors.NONE.code, results("regular-group"))
+  }
+
+  @Test
+  def testShareGroupHeartbeatOutsideInRefusesTenantPrincipalNamespace(): Unit = {
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
+    val req = new ShareGroupHeartbeatRequest.Builder(
+      new ShareGroupHeartbeatRequestData().setGroupId("__tenant_acme.consumer"), true).build()
+    val request = buildRequest(req)
+
+    kafkaApis = createKafkaApis(
+      overrideProperties = Map(ShareGroupConfig.SHARE_GROUP_ENABLE_CONFIG -> "true"),
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleShareGroupHeartbeat(request)
+
+    val response = verifyNoThrottling[ShareGroupHeartbeatResponse](request)
+    assertEquals(Errors.GROUP_AUTHORIZATION_FAILED.code, response.data.errorCode,
+      "reserved-form groupId must be refused before reaching the share-group coordinator")
+    verify(groupCoordinator, never()).shareGroupHeartbeat(any(), any())
+  }
+
+  @Test
+  def testShareGroupDescribeOutsideInRefusesTenantPrincipalNamespace(): Unit = {
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
+    val req = new ShareGroupDescribeRequest.Builder(
+      new ShareGroupDescribeRequestData().setGroupIds(
+        List("__tenant_acme.consumer", "regular-group").asJava), true).build()
+    val request = buildRequest(req)
+
+    when(groupCoordinator.shareGroupDescribe(any(), any()))
+      .thenReturn(CompletableFuture.completedFuture(List(
+        new ShareGroupDescribeResponseData.DescribedGroup()
+          .setGroupId("regular-group").setErrorCode(Errors.NONE.code)
+      ).asJava))
+
+    kafkaApis = createKafkaApis(
+      overrideProperties = Map(ShareGroupConfig.SHARE_GROUP_ENABLE_CONFIG -> "true"),
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleShareGroupDescribe(request)
+
+    val response = verifyNoThrottling[ShareGroupDescribeResponse](request)
+    val results = response.data.groups.asScala.map(g => g.groupId -> g.errorCode).toMap
+    assertEquals(Errors.GROUP_AUTHORIZATION_FAILED.code, results("__tenant_acme.consumer"),
+      "reserved-form group must be refused per-entry on share-group describe")
+    assertEquals(Errors.NONE.code, results("regular-group"))
+  }
+
+  @Test
+  def testShareFetchOutsideInRefusesTenantPrincipalNamespace(): Unit = {
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val req = new ShareFetchRequest.Builder(new ShareFetchRequestData()
+      .setGroupId("__tenant_acme.consumer")
+      .setMemberId(Uuid.ZERO_UUID.toString)
+      .setShareSessionEpoch(1)).build(ApiKeys.SHARE_FETCH.latestVersion)
+    val request = buildRequest(req)
+
+    kafkaApis = createKafkaApis(
+      overrideProperties = Map(
+        ServerConfigs.UNSTABLE_API_VERSIONS_ENABLE_CONFIG -> "true",
+        ShareGroupConfig.SHARE_GROUP_ENABLE_CONFIG -> "true"),
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleShareFetchRequest(request)
+
+    val response = verifyNoThrottling[ShareFetchResponse](request)
+    assertEquals(Errors.GROUP_AUTHORIZATION_FAILED.code, response.data.errorCode,
+      "reserved-form groupId must be refused before share-fetch context is built")
+    verify(sharePartitionManager, never()).newContext(anyString(), any(), any(), any(), anyBoolean())
+  }
+
+  @Test
+  def testShareAcknowledgeOutsideInRefusesTenantPrincipalNamespace(): Unit = {
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val req = new ShareAcknowledgeRequest.Builder(new ShareAcknowledgeRequestData()
+      .setGroupId("__tenant_acme.consumer")
+      .setMemberId(Uuid.ZERO_UUID.toString)
+      .setShareSessionEpoch(1)).build(ApiKeys.SHARE_ACKNOWLEDGE.latestVersion)
+    val request = buildRequest(req)
+
+    kafkaApis = createKafkaApis(
+      overrideProperties = Map(
+        ServerConfigs.UNSTABLE_API_VERSIONS_ENABLE_CONFIG -> "true",
+        ShareGroupConfig.SHARE_GROUP_ENABLE_CONFIG -> "true"),
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleShareAcknowledgeRequest(request)
+
+    val response = verifyNoThrottling[ShareAcknowledgeResponse](request)
+    assertEquals(Errors.GROUP_AUTHORIZATION_FAILED.code, response.data.errorCode,
+      "reserved-form groupId must be refused before share-acknowledge proceeds")
+    verify(sharePartitionManager, never()).acknowledgeSessionUpdate(anyString(), any())
+  }
+
 }

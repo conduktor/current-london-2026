@@ -2496,7 +2496,14 @@ class KafkaApis(val requestChannel: RequestChannel,
     val authorizedGroups = new ArrayBuffer[String]()
 
     describeRequest.data.groups.forEach { groupId =>
-      if (!authHelper.authorize(request.context, DESCRIBE, GROUP, groupId)) {
+      // Outside-in guard: refuse a cluster-wide caller naming `__tenant_<known>.*`
+      // before it reaches the coordinator. See handleDeleteGroupsRequest.
+      if (isReservedTenantPrincipalNamespace(groupId)) {
+        response.groups.add(DescribeGroupsResponse.groupError(
+          groupId,
+          Errors.GROUP_AUTHORIZATION_FAILED
+        ))
+      } else if (!authHelper.authorize(request.context, DESCRIBE, GROUP, groupId)) {
         response.groups.add(DescribeGroupsResponse.groupError(
           groupId,
           Errors.GROUP_AUTHORIZATION_FAILED
@@ -2692,8 +2699,16 @@ class KafkaApis(val requestChannel: RequestChannel,
     val deleteGroupsRequest = request.body[DeleteGroupsRequest]
     val groups = deleteGroupsRequest.data.groupsNames.asScala.distinct
 
+    // Outside-in guard: a privileged caller on a non-tenant listener naming
+    // `__tenant_<known>.foo` would directly delete that tenant's coordinator
+    // record. The dispatch gate above only refuses tenant-scoped principals;
+    // a cluster-wide admin who types the physical prefix would otherwise pass
+    // straight through. Refuse reserved-form names with the same error code
+    // the regular authz path uses so the wire shape stays uniform.
+    val (reservedGroups, eligibleGroups) = groups.partition(isReservedTenantPrincipalNamespace)
+
     val (authorizedGroups, unauthorizedGroups) =
-      authHelper.partitionSeqByAuthorized(request.context, DELETE, GROUP, groups)(identity)
+      authHelper.partitionSeqByAuthorized(request.context, DELETE, GROUP, eligibleGroups)(identity)
 
     groupCoordinator.deleteGroups(
       request.context,
@@ -2714,6 +2729,12 @@ class KafkaApis(val requestChannel: RequestChannel,
       }
 
       unauthorizedGroups.foreach { groupId =>
+        response.results.add(new DeleteGroupsResponseData.DeletableGroupResult()
+          .setGroupId(groupId)
+          .setErrorCode(Errors.GROUP_AUTHORIZATION_FAILED.code))
+      }
+
+      reservedGroups.foreach { groupId =>
         response.results.add(new DeleteGroupsResponseData.DeletableGroupResult()
           .setGroupId(groupId)
           .setErrorCode(Errors.GROUP_AUTHORIZATION_FAILED.code))
@@ -4158,7 +4179,12 @@ class KafkaApis(val requestChannel: RequestChannel,
   ): CompletableFuture[Unit] = {
     val offsetDeleteRequest = request.body[OffsetDeleteRequest]
 
-    if (!authHelper.authorize(request.context, DELETE, GROUP, offsetDeleteRequest.data.groupId)) {
+    // Outside-in guard: refuse a cluster-wide caller naming `__tenant_<known>.*`
+    // before it reaches the coordinator. See handleDeleteGroupsRequest.
+    if (isReservedTenantPrincipalNamespace(offsetDeleteRequest.data.groupId)) {
+      requestHelper.sendMaybeThrottle(request, offsetDeleteRequest.getErrorResponse(Errors.GROUP_AUTHORIZATION_FAILED.exception))
+      CompletableFuture.completedFuture[Unit](())
+    } else if (!authHelper.authorize(request.context, DELETE, GROUP, offsetDeleteRequest.data.groupId)) {
       requestHelper.sendMaybeThrottle(request, offsetDeleteRequest.getErrorResponse(Errors.GROUP_AUTHORIZATION_FAILED.exception))
       CompletableFuture.completedFuture[Unit](())
     } else {
@@ -4403,6 +4429,11 @@ class KafkaApis(val requestChannel: RequestChannel,
       // new one is not enabled, we fail directly here.
       requestHelper.sendMaybeThrottle(request, consumerGroupHeartbeatRequest.getErrorResponse(Errors.UNSUPPORTED_VERSION.exception))
       CompletableFuture.completedFuture[Unit](())
+    } else if (isReservedTenantPrincipalNamespace(consumerGroupHeartbeatRequest.data.groupId)) {
+      // Outside-in guard: refuse a cluster-wide caller naming `__tenant_<known>.*`
+      // before it touches the group coordinator. See handleDeleteGroupsRequest.
+      requestHelper.sendMaybeThrottle(request, consumerGroupHeartbeatRequest.getErrorResponse(Errors.GROUP_AUTHORIZATION_FAILED.exception))
+      CompletableFuture.completedFuture[Unit](())
     } else if (!authHelper.authorize(request.context, READ, GROUP, consumerGroupHeartbeatRequest.data.groupId)) {
       requestHelper.sendMaybeThrottle(request, consumerGroupHeartbeatRequest.getErrorResponse(Errors.GROUP_AUTHORIZATION_FAILED.exception))
       CompletableFuture.completedFuture[Unit](())
@@ -4449,7 +4480,14 @@ class KafkaApis(val requestChannel: RequestChannel,
 
       val authorizedGroups = new ArrayBuffer[String]()
       consumerGroupDescribeRequest.data.groupIds.forEach { groupId =>
-        if (!authHelper.authorize(request.context, DESCRIBE, GROUP, groupId)) {
+        // Outside-in guard: refuse a cluster-wide caller naming `__tenant_<known>.*`
+        // before it reaches the coordinator. See handleDeleteGroupsRequest.
+        if (isReservedTenantPrincipalNamespace(groupId)) {
+          response.groups.add(new ConsumerGroupDescribeResponseData.DescribedGroup()
+            .setGroupId(groupId)
+            .setErrorCode(Errors.GROUP_AUTHORIZATION_FAILED.code)
+          )
+        } else if (!authHelper.authorize(request.context, DESCRIBE, GROUP, groupId)) {
           response.groups.add(new ConsumerGroupDescribeResponseData.DescribedGroup()
             .setGroupId(groupId)
             .setErrorCode(Errors.GROUP_AUTHORIZATION_FAILED.code)
@@ -4561,6 +4599,11 @@ class KafkaApis(val requestChannel: RequestChannel,
     if (!isShareGroupProtocolEnabled) {
       requestHelper.sendMaybeThrottle(request, shareGroupHeartbeatRequest.getErrorResponse(Errors.UNSUPPORTED_VERSION.exception))
       CompletableFuture.completedFuture[Unit](())
+    } else if (isReservedTenantPrincipalNamespace(shareGroupHeartbeatRequest.data.groupId)) {
+      // Outside-in guard: refuse a cluster-wide caller naming `__tenant_<known>.*`
+      // before it touches the share-group coordinator. See handleDeleteGroupsRequest.
+      requestHelper.sendMaybeThrottle(request, shareGroupHeartbeatRequest.getErrorResponse(Errors.GROUP_AUTHORIZATION_FAILED.exception))
+      CompletableFuture.completedFuture[Unit](())
     } else if (!authHelper.authorize(request.context, READ, GROUP, shareGroupHeartbeatRequest.data.groupId)) {
       requestHelper.sendMaybeThrottle(request, shareGroupHeartbeatRequest.getErrorResponse(Errors.GROUP_AUTHORIZATION_FAILED.exception))
       CompletableFuture.completedFuture[Unit](())
@@ -4591,7 +4634,14 @@ class KafkaApis(val requestChannel: RequestChannel,
 
       val authorizedGroups = new ArrayBuffer[String]()
       shareGroupDescribeRequest.data.groupIds.forEach { groupId =>
-        if (!authHelper.authorize(request.context, DESCRIBE, GROUP, groupId)) {
+        // Outside-in guard: refuse a cluster-wide caller naming `__tenant_<known>.*`
+        // before it reaches the share-group coordinator. See handleDeleteGroupsRequest.
+        if (isReservedTenantPrincipalNamespace(groupId)) {
+          response.groups.add(new ShareGroupDescribeResponseData.DescribedGroup()
+            .setGroupId(groupId)
+            .setErrorCode(Errors.GROUP_AUTHORIZATION_FAILED.code)
+          )
+        } else if (!authHelper.authorize(request.context, DESCRIBE, GROUP, groupId)) {
           response.groups.add(new ShareGroupDescribeResponseData.DescribedGroup()
             .setGroupId(groupId)
             .setErrorCode(Errors.GROUP_AUTHORIZATION_FAILED.code)
@@ -4645,6 +4695,13 @@ class KafkaApis(val requestChannel: RequestChannel,
     }
 
     val groupId = shareFetchRequest.data.groupId
+
+    // Outside-in guard: refuse a cluster-wide caller naming `__tenant_<known>.*`
+    // before it reaches the share-group coordinator. See handleDeleteGroupsRequest.
+    if (isReservedTenantPrincipalNamespace(groupId)) {
+      requestHelper.sendMaybeThrottle(request, shareFetchRequest.getErrorResponse(AbstractResponse.DEFAULT_THROTTLE_TIME, Errors.GROUP_AUTHORIZATION_FAILED.exception))
+      return
+    }
 
     // Share Fetch needs permission to perform the READ action on the named group resource (groupId)
     if (!authHelper.authorize(request.context, READ, GROUP, groupId)) {
@@ -4956,6 +5013,14 @@ class KafkaApis(val requestChannel: RequestChannel,
     }
 
     val groupId = shareAcknowledgeRequest.data.groupId
+
+    // Outside-in guard: refuse a cluster-wide caller naming `__tenant_<known>.*`
+    // before it reaches the share-group coordinator. See handleDeleteGroupsRequest.
+    if (isReservedTenantPrincipalNamespace(groupId)) {
+      requestHelper.sendMaybeThrottle(request,
+        shareAcknowledgeRequest.getErrorResponse(AbstractResponse.DEFAULT_THROTTLE_TIME, Errors.GROUP_AUTHORIZATION_FAILED.exception))
+      return
+    }
 
     // Share Acknowledge needs permission to perform READ action on the named group resource (groupId)
     if (!authHelper.authorize(request.context, READ, GROUP, groupId)) {
