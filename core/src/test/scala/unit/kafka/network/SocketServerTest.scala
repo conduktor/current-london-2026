@@ -2022,7 +2022,7 @@ class SocketServerTest {
                               listenerName: ListenerName,
                               securityProtocol: SecurityProtocol,
                               connectionDisconnectListeners: scala.collection.Seq[ConnectionDisconnectListener] = Seq.empty): Processor = {
-      new TestableProcessor(id, time, requestChannel, listenerName, securityProtocol, cfg, connectionQuotas, connectionQueueSize, isPrivilegedListener, socketServer.connectionDisconnectListeners)
+      new TestableProcessor(id, time, requestChannel, listenerName, securityProtocol, endPoint, cfg, connectionQuotas, connectionQueueSize, isPrivilegedListener, socketServer.connectionDisconnectListeners)
     }
 
     def isOpen: Boolean = serverChannel.isOpen
@@ -2033,6 +2033,7 @@ class SocketServerTest {
                           requestChannel: RequestChannel,
                           listenerName: ListenerName,
                           securityProtocol: SecurityProtocol,
+                          endPoint: EndPoint,
                           config: KafkaConfig,
                           connectionQuotas: ConnectionQuotas,
                           connectionQueueSize: Int,
@@ -2047,6 +2048,7 @@ class SocketServerTest {
                     0,
                     listenerName,
                     securityProtocol,
+                    endPoint,
                     config,
                     new Metrics(),
                     credentialProvider,

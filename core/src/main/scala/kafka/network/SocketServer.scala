@@ -540,7 +540,12 @@ private[kafka] abstract class Acceptor(val socketServer: SocketServer,
       if (!shouldRun.get()) {
         throw new ClosedChannelException()
       }
-      if (serverChannel == null) {
+      // io_uring listeners bind via the per-Processor IoUringServerListener (SO_REUSEPORT),
+      // so the Acceptor must NOT open a NIO ServerSocketChannel on the same address — doing
+      // so would either fail with EADDRINUSE (if the Processor bound first) or steal accepts
+      // away from the io_uring path. The Acceptor thread still starts, but its run loop
+      // skips the NIO accept work for io_uring listeners.
+      if (serverChannel == null && !usesIoUring) {
         serverChannel = openServerSocket(endPoint.host, endPoint.port, listenBacklogSize)
         debug(s"Opened endpoint ${endPoint.host}:${endPoint.port}")
       }
@@ -595,14 +600,25 @@ private[kafka] abstract class Acceptor(val socketServer: SocketServer,
   }
 
   /**
-   * Accept loop that checks for new connection attempts
+   * Accept loop that checks for new connection attempts. For io_uring listeners the per-
+   * Processor IoUringServerListener owns the accept loop via Netty, so the Acceptor thread
+   * has nothing to dispatch — it just blocks on the nioSelector with a timeout so wakeup()
+   * during shutdown still returns promptly.
    */
   override def run(): Unit = {
-    serverChannel.register(nioSelector, SelectionKey.OP_ACCEPT)
+    val ioUring = usesIoUring
+    if (!ioUring) {
+      serverChannel.register(nioSelector, SelectionKey.OP_ACCEPT)
+    }
     try {
       while (shouldRun.get()) {
         try {
-          acceptNewConnections()
+          if (ioUring) {
+            nioSelector.select(500)
+            nioSelector.selectedKeys().clear()
+          } else {
+            acceptNewConnections()
+          }
           closeThrottledConnections()
         }
         catch {
@@ -617,6 +633,10 @@ private[kafka] abstract class Acceptor(val socketServer: SocketServer,
       closeAll()
     }
   }
+
+  /** Whether this Acceptor's listener is served by the io_uring backend. */
+  private[network] def usesIoUring: Boolean =
+    config.usesIoUring(endPoint.securityProtocol)
 
   private def closeAll(): Unit = {
     debug("Closing server socket, selector, and any throttled sockets.")
@@ -780,6 +800,7 @@ private[kafka] abstract class Acceptor(val socketServer: SocketServer,
                   config.failedAuthenticationDelayMs,
                   listenerName,
                   securityProtocol,
+                  endPoint,
                   config,
                   metrics,
                   credentialProvider,
@@ -790,6 +811,22 @@ private[kafka] abstract class Acceptor(val socketServer: SocketServer,
                   apiVersionManager,
                   name,
                   connectionDisconnectListeners)
+  }
+}
+
+/**
+ * The pair of I/O objects a Processor owns. For NIO listeners {@code listener} is None and
+ * the Acceptor binds the server socket. For io_uring listeners {@code listener} is Some and
+ * holds the per-Processor IoUringServerListener (bound on the same address via
+ * SO_REUSEPORT). Closing the bundle tears the listener down before the selector so accepted
+ * channels still flow through {@code onDisconnect} before the selector is gone.
+ */
+private[network] case class ProcessorIoBundle(
+  selector: BrokerSelector,
+  listener: Option[org.apache.kafka.network.iouring.IoUringServerListener]) {
+  def close(): Unit = {
+    listener.foreach(l => try l.close() catch { case _: Throwable => /* logged downstream */ })
+    selector.close()
   }
 }
 
@@ -831,6 +868,10 @@ private[kafka] class Processor(
   failedAuthenticationDelayMs: Int,
   listenerName: ListenerName,
   securityProtocol: SecurityProtocol,
+  // Bind address for this listener — used by the io_uring path so each Processor can stand
+  // up its own IoUringServerListener on the configured port via SO_REUSEPORT. Unused on the
+  // NIO path (where the Acceptor binds once and hands SocketChannels to register()).
+  endPoint: EndPoint,
   config: KafkaConfig,
   metrics: Metrics,
   credentialProvider: CredentialProvider,
@@ -875,19 +916,49 @@ private[kafka] class Processor(
   // can be swapped in without modifying clients/. The default path keeps using the Java-NIO
   // KSelector — we just wrap it in a thin NioBrokerSelector adapter so Processor talks to a
   // single broker-side type.
-  private[network] val selector: BrokerSelector = new NioBrokerSelector(createSelector(
-    ChannelBuilders.serverChannelBuilder(
-      listenerName,
-      listenerName == config.interBrokerListenerName,
-      securityProtocol,
-      config,
-      credentialProvider.credentialCache,
-      credentialProvider.tokenCache,
-      time,
-      logContext,
-      version => apiVersionManager.apiVersionResponse(throttleTimeMs = 0, version < 4)
-    )
-  ))
+  //
+  // For listeners resolved to io_uring (Linux + PLAINTEXT + config knob), we construct an
+  // IoUringSelector + IoUringServerListener pair instead. The listener binds the same address
+  // as the Acceptor's endPoint via SO_REUSEPORT (the kernel shards accepts across all
+  // io_uring Processors on this listener), and the Acceptor's own NIO bind+accept is skipped
+  // — see Acceptor.start()/run() guards.
+  private[network] val ioBundle: ProcessorIoBundle = buildIoBundle()
+  private[network] val selector: BrokerSelector = ioBundle.selector
+
+  private def buildIoBundle(): ProcessorIoBundle = {
+    if (config.usesIoUring(securityProtocol)) {
+      if (endPoint.port == 0) {
+        throw new KafkaException(
+          s"io_uring listener ${endPoint.listenerName} requires an explicit port " +
+          "(SO_REUSEPORT sharding needs every Processor to bind on the same configured port; " +
+          "wildcard port 0 is not supported in this version)")
+      }
+      val ioUringSelector = new org.apache.kafka.network.iouring.IoUringSelector(
+        listenerName,
+        maxRequestSize,
+        memoryPool,
+        java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(connectionsMaxIdleMs),
+        time)
+      val bindAddress = new java.net.InetSocketAddress(endPoint.host, endPoint.port)
+      val listener = new org.apache.kafka.network.iouring.IoUringServerListener(
+        bindAddress, ioUringSelector, config.socketListenBacklogSize)
+      ProcessorIoBundle(ioUringSelector, Some(listener))
+    } else {
+      ProcessorIoBundle(new NioBrokerSelector(createSelector(
+        ChannelBuilders.serverChannelBuilder(
+          listenerName,
+          listenerName == config.interBrokerListenerName,
+          securityProtocol,
+          config,
+          credentialProvider.credentialCache,
+          credentialProvider.tokenCache,
+          time,
+          logContext,
+          version => apiVersionManager.apiVersionResponse(throttleTimeMs = 0, version < 4)
+        )
+      )), None)
+    }
+  }
 
   // Visible to override for testing. Returns the underlying Java-NIO KSelector so existing
   // TestableSelector overrides keep working unchanged — the Processor wraps it above.
@@ -1207,9 +1278,15 @@ private[kafka] class Processor(
   }
 
   /**
-   * Close the selector and all open connections
+   * Close the selector and all open connections. For io_uring listeners we tear down the
+   * IoUringServerListener first so no new accepts surface mid-shutdown, then drain pending
+   * channels through the usual selector.close(id) path, then close the selector itself.
    */
   private def closeAll(): Unit = {
+    ioBundle.listener.foreach { l =>
+      try l.close()
+      catch { case t: Throwable => error("Error closing IoUringServerListener", t) }
+    }
     while (!newConnections.isEmpty) {
       newConnections.poll().close()
     }

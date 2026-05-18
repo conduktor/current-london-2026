@@ -315,6 +315,21 @@ class KafkaConfig private(doLog: Boolean, val props: util.Map[_, _])
   val socketSelectorImplementation: org.apache.kafka.network.iouring.SelectorImplementation =
     org.apache.kafka.network.iouring.SelectorImplementation.fromConfig(
       getString(SocketServerConfigs.SOCKET_SELECTOR_IMPLEMENTATION_CONFIG))
+
+  /**
+   * Whether a listener with the given security protocol should be served by the io_uring
+   * backend. Delegates to {@code BrokerSelectorFactory.resolve} so v1 PLAINTEXT-only and
+   * non-Linux fallback rules live in exactly one place. Callers MUST NOT assume that an
+   * io_uring listener can be served by the NIO Acceptor/Processor wiring — see Acceptor and
+   * Processor for the path that diverges when this returns {@code true}.
+   */
+  def usesIoUring(securityProtocol: org.apache.kafka.common.security.auth.SecurityProtocol): Boolean = {
+    val effective = org.apache.kafka.network.iouring.BrokerSelectorFactory.resolve(
+      socketSelectorImplementation,
+      securityProtocol,
+      org.apache.kafka.network.iouring.IoUringSupport.isAvailable())
+    effective == org.apache.kafka.network.iouring.SelectorImplementation.IO_URING
+  }
   val maxConnectionsPerIp = getInt(SocketServerConfigs.MAX_CONNECTIONS_PER_IP_CONFIG)
   val maxConnectionsPerIpOverrides: Map[String, Int] =
     getMap(SocketServerConfigs.MAX_CONNECTIONS_PER_IP_OVERRIDES_CONFIG, getString(SocketServerConfigs.MAX_CONNECTIONS_PER_IP_OVERRIDES_CONFIG)).map { case (k, v) => (k, v.toInt)}
