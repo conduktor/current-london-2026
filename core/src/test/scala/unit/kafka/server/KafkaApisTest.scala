@@ -2444,6 +2444,72 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testCompressionPolicyForbiddenRejectsCompressedBatchAsInvalidRecord(): Unit = {
+    // FORBIDDEN is the mirror image of REQUIRED: any batch whose compression.type is NOT
+    // NONE must be rejected with INVALID_RECORD, per-partition, and never reach the
+    // replica/log layer.
+    val topic = "topic"
+    addTopicToMetadataCache(topic, numPartitions = 1)
+    val tp = new TopicPartition(topic, 0)
+
+    when(replicaManager.compressionPolicy(ArgumentMatchers.eq(tp)))
+      .thenReturn(CompressionPolicy.FORBIDDEN)
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](), any[Long])).thenReturn(0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val perTopicMeter = brokerTopicStats.topicStats(topic).batchesRejectedByCompressionPolicyRate
+    val allTopicsMeter = brokerTopicStats.allTopicsStats.batchesRejectedByCompressionPolicyRate
+    val perTopicBefore = perTopicMeter.count
+    val allTopicsBefore = allTopicsMeter.count
+
+    val produceRequest = buildSingleTopicProduceRequest(tp,
+      MemoryRecords.withRecords(Compression.lz4().build(), new SimpleRecord("v".getBytes)),
+      ApiKeys.PRODUCE.latestVersion)
+    val request = buildRequest(produceRequest)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[ProduceResponse](request)
+    val partitionResponse = response.data.responses.asScala.head.partitionResponses.asScala.head
+    assertEquals(Errors.INVALID_RECORD, Errors.forCode(partitionResponse.errorCode))
+    verify(replicaManager, never()).handleProduceAppend(anyLong, anyShort, anyBoolean, any(), any(), any(), any(), any(), any(), any())
+    assertEquals(perTopicBefore + 1, perTopicMeter.count,
+      "per-topic rejection meter must increment for FORBIDDEN rejections too")
+    assertEquals(allTopicsBefore + 1, allTopicsMeter.count,
+      "all-topics rejection meter must increment for FORBIDDEN rejections too")
+  }
+
+  @Test
+  def testCompressionPolicyForbiddenAcceptsUncompressedBatch(): Unit = {
+    // FORBIDDEN must let NONE-compressed batches through unchanged: the policy semantics
+    // are "raw payloads only", not "reject everything".
+    val topic = "topic"
+    addTopicToMetadataCache(topic, numPartitions = 1)
+    val tp = new TopicPartition(topic, 0)
+
+    when(replicaManager.compressionPolicy(ArgumentMatchers.eq(tp)))
+      .thenReturn(CompressionPolicy.FORBIDDEN)
+    val responseCallback: ArgumentCaptor[Map[TopicPartition, PartitionResponse] => Unit] =
+      ArgumentCaptor.forClass(classOf[Map[TopicPartition, PartitionResponse] => Unit])
+    when(replicaManager.handleProduceAppend(anyLong, anyShort, ArgumentMatchers.eq(false), any(), any(),
+      responseCallback.capture(), any(), any(), any(), any())
+    ).thenAnswer(_ => responseCallback.getValue.apply(Map(tp -> new PartitionResponse(Errors.NONE))))
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](), any[Long])).thenReturn(0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val produceRequest = buildSingleTopicProduceRequest(tp,
+      MemoryRecords.withRecords(Compression.NONE, new SimpleRecord("v".getBytes)),
+      ApiKeys.PRODUCE.latestVersion)
+    val request = buildRequest(produceRequest)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[ProduceResponse](request)
+    val partitionResponse = response.data.responses.asScala.head.partitionResponses.asScala.head
+    assertEquals(Errors.NONE, Errors.forCode(partitionResponse.errorCode))
+  }
+
+  @Test
   def testCompressionPolicyDoesNotMaskDownstreamRecordCorruption(): Unit = {
     // PROMPT.md functional scenario: "A produce request to a configured topic where the
     // batch is correctly compressed but one record inside the batch is corrupted hits the

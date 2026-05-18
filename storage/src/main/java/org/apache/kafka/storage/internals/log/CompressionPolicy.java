@@ -28,8 +28,13 @@ import java.util.stream.Stream;
  *
  * Registered as the topic config {@code compression.policy}. The default {@link #NONE}
  * preserves vanilla Kafka behaviour: no per-batch enforcement happens on the produce
- * path. Setting it to {@link #REQUIRED} causes the broker to reject batches whose
+ * path. {@link #REQUIRED} causes the broker to reject batches whose
  * {@link CompressionType} is {@code NONE}, per-partition, with {@code INVALID_RECORD}.
+ * {@link #FORBIDDEN} is the mirror image: it rejects any batch whose
+ * {@link CompressionType} is <em>not</em> {@code NONE}, with the same per-partition
+ * {@code INVALID_RECORD} response. {@code FORBIDDEN} is the right value when a topic
+ * must hold raw payloads (e.g. for downstream tools that read the on-disk batch format
+ * directly and cannot perform per-codec decompression).
  *
  * Enforcement runs in the produce request handler, ahead of the replication and log
  * layers. Replication, transaction state, and group-coordinator appends therefore
@@ -47,6 +52,12 @@ public enum CompressionPolicy {
         @Override
         public boolean isViolatedBy(CompressionType batchCompression) {
             return batchCompression == CompressionType.NONE;
+        }
+    },
+    FORBIDDEN("forbidden") {
+        @Override
+        public boolean isViolatedBy(CompressionType batchCompression) {
+            return batchCompression != CompressionType.NONE;
         }
     };
 

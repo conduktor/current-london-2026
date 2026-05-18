@@ -461,7 +461,7 @@ class LogConfigTest {
   }
 
   @ParameterizedTest
-  @ValueSource(strings = Array("none", "required"))
+  @ValueSource(strings = Array("none", "required", "forbidden"))
   def testCompressionPolicyConfigAcceptsKnownValues(value: String): Unit = {
     val props = new Properties()
     props.setProperty(LogConfig.COMPRESSION_POLICY_CONFIG, value)

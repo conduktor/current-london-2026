@@ -463,6 +463,49 @@ class CompressionPolicyIntegrationTest extends QuorumTestHarness {
     }
   }
 
+  /**
+   * Pins the `compression.policy=forbidden` end-to-end contract. The mirror image of the
+   * `required` contract: any non-NONE codec must be rejected with `InvalidRecordException`,
+   * and a NONE-codec producer must succeed. The codec axis (lz4 / gzip) protects against
+   * accidentally special-casing a single codec on the rejection path.
+   */
+  @ParameterizedTest
+  @ValueSource(strings = Array("gzip", "snappy", "lz4", "zstd"))
+  def testCompressionPolicyForbiddenRejectsEveryCompressedCodec(codec: String): Unit = {
+    val topic = s"compression-forbidden-$codec"
+    val admin = TestUtils.createAdminClient(Seq(broker),
+      ListenerName.forSecurityProtocol(SecurityProtocol.PLAINTEXT))
+    try {
+      val cfg = new Properties()
+      cfg.put(LogConfig.COMPRESSION_POLICY_CONFIG, "forbidden")
+      TestUtils.createTopicWithAdmin(admin, topic, Seq(broker), controllerServers, topicConfig = cfg)
+    } finally {
+      admin.close()
+    }
+
+    val bootstrap = TestUtils.plaintextBootstrapServers(Seq(broker))
+
+    val compressed = newProducer(bootstrap, codec)
+    try {
+      val ee = assertThrows(classOf[ExecutionException],
+        () => compressed.send(new ProducerRecord(topic, "v".getBytes)).get())
+      assertTrue(ee.getCause.isInstanceOf[InvalidRecordException],
+        s"codec=$codec must be rejected by compression.policy=forbidden with " +
+          s"InvalidRecordException, got ${ee.getCause.getClass.getName}: ${ee.getCause.getMessage}")
+    } finally {
+      compressed.close()
+    }
+
+    val uncompressed = newProducer(bootstrap, "none")
+    try {
+      val meta = uncompressed.send(new ProducerRecord(topic, "v".getBytes)).get()
+      assertEquals(0L, meta.offset(),
+        "uncompressed producer must succeed against compression.policy=forbidden")
+    } finally {
+      uncompressed.close()
+    }
+  }
+
   private def newProducer(bootstrap: String, compression: String): KafkaProducer[Array[Byte], Array[Byte]] = {
     val props = new Properties()
     props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrap)

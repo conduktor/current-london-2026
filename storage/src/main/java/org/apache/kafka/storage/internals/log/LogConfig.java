@@ -132,7 +132,10 @@ public class LogConfig extends AbstractConfig {
             "Server-side policy for the compression of producer batches. " +
             "<code>none</code> (default) preserves vanilla behaviour. " +
             "<code>required</code> rejects produce requests whose batches carry " +
-            "<code>compression.type=none</code> with INVALID_RECORD on a per-partition basis. " +
+            "<code>compression.type=none</code>; <code>forbidden</code> is the mirror image and " +
+            "rejects produce requests whose batches carry any non-<code>none</code> " +
+            "<code>compression.type</code>. Both rejections surface as INVALID_RECORD on a " +
+            "per-partition basis. " +
             "Enforced in the produce request handler, so replication, transaction-state, " +
             "and group-coordinator appends bypass the check by construction.";
     public static final String DEFAULT_COMPRESSION_POLICY = CompressionPolicy.NONE.value();
