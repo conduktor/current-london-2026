@@ -49,6 +49,7 @@ import org.apache.kafka.server.config.ConfigType
 import org.apache.kafka.server.log.remote.storage.RemoteLogManagerConfig
 import org.apache.kafka.server.metrics.{ClientMetricsReceiverPlugin, KafkaYammerMetrics}
 import org.apache.kafka.server.network.{EndpointReadyFutures, KafkaAuthorizerServerInfo}
+import org.apache.kafka.server.rules.{GovernanceTopic, RuleEngine}
 import org.apache.kafka.server.share.persister.{DefaultStatePersister, NoOpShareStatePersister, Persister, PersisterStateManager}
 import org.apache.kafka.server.share.session.ShareSessionCache
 import org.apache.kafka.server.util.timer.{SystemTimer, SystemTimerReaper}
@@ -67,6 +68,17 @@ import scala.collection.Map
 import scala.jdk.CollectionConverters._
 import scala.jdk.OptionConverters.RichOption
 
+
+object BrokerServer {
+  /**
+   * Polling interval, in milliseconds, for the broker's periodic re-read of
+   * the local `__governance` log. Sub-second cadence keeps rule propagation
+   * latency low while staying cheap when the log is idle (a single
+   * [[ReplicaManager.getLog]] + offset compare per tick when there are no
+   * new records to replay).
+   */
+  val GovernanceDrainIntervalMs: Long = 200L
+}
 
 /**
  * A Kafka broker that runs in KRaft (Kafka Raft) mode.
@@ -101,6 +113,17 @@ class BrokerServer(
   var status: ProcessStatus = SHUTDOWN
 
   @volatile var dataPlaneRequestProcessor: KafkaApis = _
+
+  /**
+   * Engine that evaluates CEL DENY rules against every request in
+   * [[KafkaApis.handle]]. Created early — before [[dataPlaneRequestProcessor]]
+   * — so that its [[org.apache.kafka.server.rules.RuleSet]] is already
+   * installed by the time [[SocketServer.enableRequestProcessing]] opens the
+   * listeners. The drain itself is performed by [[governanceBootstrap]].
+   */
+  @volatile var ruleEngine: RuleEngine = _
+
+  @volatile var governanceBootstrap: BrokerGovernanceBootstrap = _
 
   var authorizer: Option[Authorizer] = None
   @volatile var socketServer: SocketServer = _
@@ -445,6 +468,13 @@ class BrokerServer(
         metrics
       )
 
+      // Build the RuleEngine before KafkaApis so the request gate has a real
+      // (initially empty) RuleSet to consult from the very first request.
+      // The actual drain from the __governance log happens below, before
+      // SocketServer.enableRequestProcessing — see governanceBootstrap.
+      ruleEngine = new RuleEngine()
+      governanceBootstrap = new BrokerGovernanceBootstrap(replicaManager, ruleEngine)
+
       dataPlaneRequestProcessor = new KafkaApis(
         requestChannel = socketServer.dataPlaneRequestChannel,
         forwardingManager = forwardingManager,
@@ -467,7 +497,8 @@ class BrokerServer(
         time = time,
         tokenManager = tokenManager,
         apiVersionManager = apiVersionManager,
-        clientMetricsManager = clientMetricsManager)
+        clientMetricsManager = clientMetricsManager,
+        ruleEngine = ruleEngine)
 
       dataPlaneRequestHandlerPool = new KafkaRequestHandlerPool(config.nodeId,
         socketServer.dataPlaneRequestChannel, dataPlaneRequestProcessor, time,
@@ -597,6 +628,30 @@ class BrokerServer(
             config.earlyStartListeners.map(_.value()).asJava))
       }
       val authorizerFutures = endpointReadyFutures.futures().asScala.toMap
+
+      // Drain __governance from the local log into the RuleEngine BEFORE
+      // opening the SocketServer to client connections. Direct-log read via
+      // ReplicaManager.getLog bypasses the network entirely, so this works
+      // without the chicken-and-egg of a KafkaConsumer needing the socket
+      // open in order to fetch from this very broker. If the log doesn't
+      // exist locally yet (fresh cluster, or this broker isn't a replica),
+      // drainOnce is a no-op and the engine stays at the empty RuleSet —
+      // which is the correct enforcement state when no rules have been
+      // published.
+      try {
+        val drained = governanceBootstrap.drainOnce()
+        info(s"governance bootstrap drained $drained rule record(s) from " +
+          s"${GovernanceTopic.NAME} before opening request processing")
+      } catch {
+        case t: Throwable =>
+          warn(s"governance bootstrap failed; engine remains at the empty RuleSet: " +
+            s"${t.getMessage}", t)
+      }
+      // Schedule ongoing re-drain so rule updates published after startup
+      // are picked up without restart.
+      governanceBootstrap.scheduleOngoing(kafkaScheduler,
+        BrokerServer.GovernanceDrainIntervalMs)
+
       val enableRequestProcessingFuture = socketServer.enableRequestProcessing(authorizerFutures)
 
       // Block here until all the authorizer futures are complete.
