@@ -826,6 +826,32 @@ class CompiledPredicateTest {
     }
 
     @Test
+    void skipsRecordWhenJsonFractionalFloatRoundsToInteger() {
+        // 1.0000000000000001 is exact-fractional, so the round-6 BigDecimal integer-valued check
+        // skips it. Jackson still parses it to the integral double 1.0, and the evaluator's safe
+        // Long/Double equality then admits it through an integer gate (`body.x == 1`). The record
+        // author wrote a non-integer value; treating it as integer 1 is the same silent admission
+        // class as the 2^53 integer precision-loss cases.
+        CompiledPredicate p = compiler.compile("body.x == 1");
+        Optional<Boolean> r = p.evaluate(jsonRecord("{\"x\":1.0000000000000001}"));
+        assertTrue(r.isEmpty() || !r.get(),
+                () -> "fractional JSON float rounded to integer must be unusable, got " + r);
+    }
+
+    @Test
+    void rejectsFractionalFloatLiteralThatRoundsToIntegerAtCompileTime() {
+        // Symmetric predicate-side alias: the literal is exact-fractional but Double.parseDouble
+        // turns it into 1.0, so `body.x == 1.0000000000000001` currently matches records with
+        // body.x = 1.0 / 1. It should be rejected instead of silently changing the equality target.
+        org.apache.kafka.server.views.PredicateValidationException ex =
+                org.junit.jupiter.api.Assertions.assertThrows(
+                        org.apache.kafka.server.views.PredicateValidationException.class,
+                        () -> compiler.compile("body.x == 1.0000000000000001"));
+        assertTrue(ex.getMessage().contains("precision-loss"),
+                () -> "expected precision-loss message, got: " + ex.getMessage());
+    }
+
+    @Test
     void skipsRecordWhenJsonBodyUnderflowsToZero() {
         // body.x = 1e-324 parses to 0.0 — a `body.x == 0` predicate must NOT admit it, otherwise
         // an attacker can encode "tiny non-zero" payloads that pass zero-equality checks.

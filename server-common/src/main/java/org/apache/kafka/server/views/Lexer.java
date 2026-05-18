@@ -202,7 +202,7 @@ final class Lexer {
      *       a confident match against zero.
      * </ol>
      *
-     * <p>Decimal-shaped literals like {@code 0.1} or {@code 1.5e20} whose exact value is not
+     * <p>Decimal-shaped literals like {@code 0.1} or {@code 1.5} whose exact value is not
      * integral are NOT rejected — those carry inherent representation error users expect from
      * IEEE-754 and are not a silent-equality bypass vector.
      */
@@ -224,6 +224,11 @@ final class Lexer {
                 throw new PredicateValidationException(
                         "unsafe numeric literal (precision-loss territory) at " + start + ": " + text);
             }
+        } else if (d == Math.rint(d)) {
+            // Exact-fractional aliases like 1.0000000000000001 parse to integral 1.0 and
+            // would compare equal to Long 1 under the evaluator's safe mixed numeric equality.
+            throw new PredicateValidationException(
+                    "unsafe numeric literal (precision-loss territory) at " + start + ": " + text);
         }
     }
 

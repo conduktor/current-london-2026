@@ -529,6 +529,10 @@ public final class RecordContexts {
             if (magnitude.compareTo(BigInteger.valueOf(IEEE_SAFE_INTEGER)) > 0) {
                 return RecordContext.BODY_UNUSABLE;
             }
+        } else if (d == Math.rint(d)) {
+            // Exact-fractional aliases like 1.0000000000000001 parse to integral 1.0 and
+            // would compare equal to Long 1 under the evaluator's safe mixed numeric equality.
+            return RecordContext.BODY_UNUSABLE;
         }
         return d;
     }
