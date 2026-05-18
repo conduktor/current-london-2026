@@ -232,6 +232,13 @@ class CachedPartition(var topic: String,
   * @param lastUsedMs         The last used time in milliseconds.  This should only be updated by
   *                           FetchSessionCache#touch.
   * @param epoch              The fetch session sequence number.
+  * @param principalName      The serialized name of the principal that created the session, if
+  *                           known. The lookup path in [[FetchManager.newContext]] refuses an
+  *                           incremental fetch whose request principal does not match — without
+  *                           this binding the session cache is keyed by sessionId only and a
+  *                           tenant could disrupt another tenant's session (FINAL_EPOCH close,
+  *                           epoch-bump DoS) just by guessing or observing a sessionId. `None`
+  *                           means legacy/test path where no principal was captured.
   */
 class FetchSession(val id: Int,
                    val privileged: Boolean,
@@ -239,7 +246,8 @@ class FetchSession(val id: Int,
                    val usesTopicIds: Boolean,
                    val creationMs: Long,
                    var lastUsedMs: Long,
-                   var epoch: Int) {
+                   var epoch: Int,
+                   val principalName: Option[String] = None) {
   // This is used by the FetchSessionCache to store the last known size of this session.
   // If this is -1, the Session is not in the cache.
   var cachedSize = -1
@@ -407,7 +415,8 @@ class FullFetchContext(private val time: Time,
                        private val reqMetadata: JFetchMetadata,
                        private val fetchData: util.Map[TopicIdPartition, FetchRequest.PartitionData],
                        private val usesTopicIds: Boolean,
-                       private val isFromFollower: Boolean) extends FetchContext {
+                       private val isFromFollower: Boolean,
+                       private val principalName: Option[String] = None) extends FetchContext {
 
   def this(time: Time,
            cacheShard: FetchSessionCacheShard,
@@ -415,7 +424,7 @@ class FullFetchContext(private val time: Time,
            fetchData: util.Map[TopicIdPartition, FetchRequest.PartitionData],
            usesTopicIds: Boolean,
            isFromFollower: Boolean
-          ) = this(time, new FetchSessionCache(Seq(cacheShard)), reqMetadata, fetchData, usesTopicIds, isFromFollower)
+          ) = this(time, new FetchSessionCache(Seq(cacheShard)), reqMetadata, fetchData, usesTopicIds, isFromFollower, None)
 
   override lazy val logger = FullFetchContext.logger
 
@@ -441,7 +450,7 @@ class FullFetchContext(private val time: Time,
     }
     val cacheShard = cache.getNextCacheShard
     val responseSessionId = cacheShard.maybeCreateSession(time.milliseconds(), isFromFollower,
-        updates.size, usesTopicIds, () => createNewSession)
+        updates.size, usesTopicIds, () => createNewSession, principalName)
     debug(s"Full fetch context with session id $responseSessionId returning " +
       s"${partitionsToLogString(updates.keySet)}")
     FetchResponse.of(Errors.NONE, 0, responseSessionId, updates, nodeEndpoints)
@@ -676,14 +685,15 @@ class FetchSessionCacheShard(private val maxEntries: Int,
                          privileged: Boolean,
                          size: Int,
                          usesTopicIds: Boolean,
-                         createPartitions: () => FetchSession.CACHE_MAP): Int =
+                         createPartitions: () => FetchSession.CACHE_MAP,
+                         principalName: Option[String] = None): Int =
   synchronized {
     // If there is room, create a new session entry.
     if ((sessions.size < maxEntries) ||
         tryEvict(privileged, EvictableKey(privileged, size, 0), now)) {
       val partitionMap = createPartitions()
       val session = new FetchSession(newSessionId(), privileged, partitionMap, usesTopicIds,
-          now, now, JFetchMetadata.nextEpoch(INITIAL_EPOCH))
+          now, now, JFetchMetadata.nextEpoch(INITIAL_EPOCH), principalName)
       debug(s"Created fetch session ${session.toString}")
       sessions.put(session.id, session)
       touch(session, now)
@@ -840,14 +850,31 @@ class FetchManager(private val time: Time,
                  isFollower: Boolean,
                  fetchData: FetchSession.REQ_MAP,
                  toForget: util.List[TopicIdPartition],
-                 topicNames: FetchSession.TOPIC_NAME_MAP): FetchContext = {
+                 topicNames: FetchSession.TOPIC_NAME_MAP,
+                 reqPrincipalName: Option[String] = None): FetchContext = {
     val context = if (reqMetadata.isFull) {
       var removedFetchSessionStr = ""
       if (reqMetadata.sessionId != INVALID_SESSION_ID) {
         val cacheShard = cache.getCacheShard(reqMetadata.sessionId())
-        // Any session specified in a FULL fetch request will be closed.
-        if (cacheShard.remove(reqMetadata.sessionId).isDefined) {
-          removedFetchSessionStr = s" Removed fetch session ${reqMetadata.sessionId}."
+        // Any session specified in a FULL fetch request will be closed — but
+        // ONLY if the requester is the principal that opened it. Without this
+        // check, a tenant could close another tenant's session (FINAL_EPOCH
+        // close, or any FULL fetch carrying a guessed sessionId) and disrupt
+        // its consumer just by knowing the sessionId. The session is
+        // unbound only when no principal was captured (legacy callers; see
+        // FetchSession.principalName).
+        cacheShard.synchronized {
+          cacheShard.get(reqMetadata.sessionId) match {
+            case Some(session) if principalMatches(session, reqPrincipalName) =>
+              if (cacheShard.remove(session).isDefined) {
+                removedFetchSessionStr = s" Removed fetch session ${reqMetadata.sessionId}."
+              }
+            case _ =>
+              // Either no such session (already gone), or the requester is
+              // not the owner. In both cases we silently skip the close so
+              // that an attacker cannot probe presence by observing whether
+              // a session was reported as removed.
+          }
         }
       }
       var suffix = ""
@@ -856,7 +883,7 @@ class FetchManager(private val time: Time,
         suffix = " Will not try to create a new session."
         new SessionlessFetchContext(fetchData)
       } else {
-        new FullFetchContext(time, cache, reqMetadata, fetchData, reqVersion >= 13, isFollower)
+        new FullFetchContext(time, cache, reqMetadata, fetchData, reqVersion >= 13, isFollower, reqPrincipalName)
       }
       debug(s"Created a new full FetchContext with ${partitionsToLogString(fetchData.keySet)}."+
         s"$removedFetchSessionStr$suffix")
@@ -869,6 +896,14 @@ class FetchManager(private val time: Time,
             debug(s"Session error for ${reqMetadata.sessionId}: no such session ID found.")
             new SessionErrorContext(Errors.FETCH_SESSION_ID_NOT_FOUND, reqMetadata)
           }
+          case Some(session) if !principalMatches(session, reqPrincipalName) =>
+            // Return the same error as a non-existent session so a foreign
+            // requester cannot distinguish "session does not exist" from
+            // "session exists but belongs to someone else". An epoch check
+            // here would let an attacker bump the victim's epoch to abort
+            // its next fetch even without owning the session.
+            debug(s"Session error for ${reqMetadata.sessionId}: principal mismatch.")
+            new SessionErrorContext(Errors.FETCH_SESSION_ID_NOT_FOUND, reqMetadata)
           case Some(session) => session.synchronized {
             if (session.epoch != reqMetadata.epoch) {
               debug(s"Session error for ${reqMetadata.sessionId}: expected epoch " +
@@ -906,4 +941,18 @@ class FetchManager(private val time: Time,
 
   private def partitionsToLogString(partitions: util.Collection[TopicIdPartition]): String =
     FetchSession.partitionsToLogString(partitions, isTraceEnabled)
+
+  // The principal binding policy:
+  //   - session.principalName == None  → legacy / test path; no check, anyone matches.
+  //                                       Production traffic from KafkaApis always sets it.
+  //   - reqPrincipalName    == None    → caller did not pass a principal (only tests do this).
+  //                                       Reject: a real connection must be associated with
+  //                                       an authenticated identity.
+  //   - both Some           → must be the same string.
+  private def principalMatches(session: FetchSession, reqPrincipalName: Option[String]): Boolean = {
+    session.principalName match {
+      case None => true
+      case Some(owner) => reqPrincipalName.contains(owner)
+    }
+  }
 }

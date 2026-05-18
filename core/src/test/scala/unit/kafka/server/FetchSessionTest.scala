@@ -1989,6 +1989,214 @@ class FetchSessionTest {
       assertEquals(cacheShards(shardNum % numShards), cache.getNextCacheShard)
     }
   }
+
+  // ----- Principal-binding tests (CRITICAL #84) ----------------------------
+  //
+  // Each FetchSession captures the principal that created it. A foreign
+  // principal that guesses or observes the sessionId must not be able to:
+  //   - close the victim's session via FULL fetch
+  //   - bump or read the victim's session via incremental fetch
+  // The lookup error for a foreign incremental fetch is the same as for a
+  // non-existent session (FETCH_SESSION_ID_NOT_FOUND) so an attacker cannot
+  // distinguish presence — distinguishability would let them probe for the
+  // existence of another tenant's consumer.
+
+  private def openSessionWithPrincipal(fetchManager: FetchManager,
+                                       cacheShard: FetchSessionCacheShard,
+                                       topicIds: java.util.Map[String, Uuid],
+                                       principalName: String): Int = {
+    val tp = new TopicIdPartition(topicIds.get("foo"), new TopicPartition("foo", 0))
+    val topicNames = topicIds.asScala.map(_.swap).asJava
+    val requestData = new util.LinkedHashMap[TopicPartition, FetchRequest.PartitionData]
+    requestData.put(tp.topicPartition, new FetchRequest.PartitionData(tp.topicId, 0, 0, 100, Optional.empty()))
+    val request = createRequest(JFetchMetadata.INITIAL, requestData, EMPTY_PART_LIST, isFromFollower = false)
+    val context = fetchManager.newContext(
+      request.version,
+      request.metadata,
+      request.isFromFollower,
+      request.fetchData(topicNames),
+      request.forgottenTopics(topicNames),
+      topicNames,
+      Some(principalName))
+    val response = new util.LinkedHashMap[TopicIdPartition, FetchResponseData.PartitionData]
+    response.put(tp, new FetchResponseData.PartitionData()
+      .setPartitionIndex(tp.partition)
+      .setHighWatermark(100)
+      .setLastStableOffset(100)
+      .setLogStartOffset(100))
+    context.updateAndGenerateResponseData(response, Seq.empty.asJava).sessionId()
+  }
+
+  @Test
+  def testFetchSessionIncrementalFetchRefusesForeignPrincipal(): Unit = {
+    // Attacker on tenant B guesses tenant A's incremental sessionId. The
+    // lookup must return FETCH_SESSION_ID_NOT_FOUND — same error as a
+    // non-existent session, so attacker cannot use the error to confirm
+    // the session exists. Critically the victim's session epoch is NOT
+    // touched (no synchronized session block reached).
+    val time = new MockTime()
+    val cacheShard = new FetchSessionCacheShard(10, 1000)
+    val fetchManager = new FetchManager(time, cacheShard)
+    val topicIds = Map("foo" -> Uuid.randomUuid()).asJava
+    val topicNames = topicIds.asScala.map(_.swap).asJava
+
+    val tenantASessionId = openSessionWithPrincipal(fetchManager, cacheShard, topicIds,
+      "User:__tenant_a.alice")
+    val sessionBefore = cacheShard.get(tenantASessionId).get
+    val epochBefore = sessionBefore.epoch
+
+    val req = createRequest(new JFetchMetadata(tenantASessionId, epochBefore),
+      new util.LinkedHashMap[TopicPartition, FetchRequest.PartitionData],
+      EMPTY_PART_LIST, isFromFollower = false)
+    val ctx = fetchManager.newContext(
+      req.version, req.metadata, req.isFromFollower,
+      req.fetchData(topicNames), req.forgottenTopics(topicNames), topicNames,
+      Some("User:__tenant_b.bob"))
+
+    assertTrue(ctx.isInstanceOf[SessionErrorContext],
+      s"expected SessionErrorContext, got ${ctx.getClass.getSimpleName}")
+    val response = ctx.updateAndGenerateResponseData(
+      new util.LinkedHashMap[TopicIdPartition, FetchResponseData.PartitionData], Seq.empty.asJava)
+    assertEquals(Errors.FETCH_SESSION_ID_NOT_FOUND, response.error)
+    // Victim's session is still in the cache with epoch unchanged.
+    assertEquals(epochBefore, cacheShard.get(tenantASessionId).get.epoch)
+  }
+
+  @Test
+  def testFetchSessionFullFetchRefusesToCloseForeignSession(): Unit = {
+    // The classic disrupt vector: attacker sends a FULL fetch with the
+    // victim's sessionId. Pre-fix, that unconditionally removed the
+    // session. Post-fix, the cache only removes a session whose principal
+    // matches the requester — the foreign FULL fetch silently establishes
+    // its own new session, victim's session remains untouched.
+    val time = new MockTime()
+    val cacheShard = new FetchSessionCacheShard(10, 1000)
+    val fetchManager = new FetchManager(time, cacheShard)
+    val topicIds = Map("foo" -> Uuid.randomUuid()).asJava
+    val topicNames = topicIds.asScala.map(_.swap).asJava
+
+    val victimSessionId = openSessionWithPrincipal(fetchManager, cacheShard, topicIds,
+      "User:__tenant_a.alice")
+    assertTrue(cacheShard.get(victimSessionId).isDefined, "victim session must exist before attack")
+
+    val tp = new TopicIdPartition(topicIds.get("foo"), new TopicPartition("foo", 0))
+    val attackerFetch = new util.LinkedHashMap[TopicPartition, FetchRequest.PartitionData]
+    attackerFetch.put(tp.topicPartition, new FetchRequest.PartitionData(tp.topicId, 0, 0, 100, Optional.empty()))
+    // FULL fetch carrying the victim's sessionId; epoch is INITIAL_EPOCH so
+    // the path tries to "remove old session, create new". The remove must
+    // be refused.
+    val attackerReq = createRequest(new JFetchMetadata(victimSessionId, JFetchMetadata.INITIAL_EPOCH),
+      attackerFetch, EMPTY_PART_LIST, isFromFollower = false)
+    fetchManager.newContext(
+      attackerReq.version, attackerReq.metadata, attackerReq.isFromFollower,
+      attackerReq.fetchData(topicNames), attackerReq.forgottenTopics(topicNames), topicNames,
+      Some("User:__tenant_b.bob"))
+
+    assertTrue(cacheShard.get(victimSessionId).isDefined,
+      "victim session must NOT have been removed by foreign FULL fetch")
+  }
+
+  @Test
+  def testFetchSessionFinalEpochCloseRefusedForForeignPrincipal(): Unit = {
+    // Variation: attacker uses FINAL_EPOCH on victim's sessionId. The intent
+    // of FINAL_EPOCH is "close my session"; with the principal binding it
+    // can only close MY session, not a foreign one.
+    val time = new MockTime()
+    val cacheShard = new FetchSessionCacheShard(10, 1000)
+    val fetchManager = new FetchManager(time, cacheShard)
+    val topicIds = Map("foo" -> Uuid.randomUuid()).asJava
+    val topicNames = topicIds.asScala.map(_.swap).asJava
+
+    val victimSessionId = openSessionWithPrincipal(fetchManager, cacheShard, topicIds,
+      "User:__tenant_a.alice")
+    assertTrue(cacheShard.get(victimSessionId).isDefined)
+
+    val req = createRequest(new JFetchMetadata(victimSessionId, FINAL_EPOCH),
+      new util.LinkedHashMap[TopicPartition, FetchRequest.PartitionData],
+      EMPTY_PART_LIST, isFromFollower = false)
+    fetchManager.newContext(
+      req.version, req.metadata, req.isFromFollower,
+      req.fetchData(topicNames), req.forgottenTopics(topicNames), topicNames,
+      Some("User:__tenant_b.bob"))
+
+    assertTrue(cacheShard.get(victimSessionId).isDefined,
+      "FINAL_EPOCH from foreign principal must NOT close victim's session")
+  }
+
+  @Test
+  def testFetchSessionAcceptsSamePrincipalIncrementalAndClose(): Unit = {
+    // Legitimate path: same principal can incremental-fetch and close its
+    // own session. Ensures the new check does not break the happy path.
+    val time = new MockTime()
+    val cacheShard = new FetchSessionCacheShard(10, 1000)
+    val fetchManager = new FetchManager(time, cacheShard)
+    val topicIds = Map("foo" -> Uuid.randomUuid()).asJava
+    val topicNames = topicIds.asScala.map(_.swap).asJava
+
+    val sid = openSessionWithPrincipal(fetchManager, cacheShard, topicIds,
+      "User:__tenant_a.alice")
+    val epochAfterOpen = cacheShard.get(sid).get.epoch
+
+    // Same principal: incremental fetch accepted.
+    val incReq = createRequest(new JFetchMetadata(sid, epochAfterOpen),
+      new util.LinkedHashMap[TopicPartition, FetchRequest.PartitionData],
+      EMPTY_PART_LIST, isFromFollower = false)
+    val incCtx = fetchManager.newContext(
+      incReq.version, incReq.metadata, incReq.isFromFollower,
+      incReq.fetchData(topicNames), incReq.forgottenTopics(topicNames), topicNames,
+      Some("User:__tenant_a.alice"))
+    assertTrue(incCtx.isInstanceOf[IncrementalFetchContext],
+      s"expected IncrementalFetchContext, got ${incCtx.getClass.getSimpleName}")
+
+    // Same principal: FINAL_EPOCH close accepted.
+    val closeReq = createRequest(new JFetchMetadata(sid, FINAL_EPOCH),
+      new util.LinkedHashMap[TopicPartition, FetchRequest.PartitionData],
+      EMPTY_PART_LIST, isFromFollower = false)
+    fetchManager.newContext(
+      closeReq.version, closeReq.metadata, closeReq.isFromFollower,
+      closeReq.fetchData(topicNames), closeReq.forgottenTopics(topicNames), topicNames,
+      Some("User:__tenant_a.alice"))
+    assertTrue(cacheShard.get(sid).isEmpty, "session must be closed by owner's FINAL_EPOCH")
+  }
+
+  @Test
+  def testFetchSessionLegacyCallerWithoutPrincipalStillWorks(): Unit = {
+    // Back-compat: a caller that did not pass a principal at creation time
+    // (legacy / pre-fix code) yields a session whose principalName is None.
+    // Any lookup against that session must succeed regardless of the
+    // requester's principal — otherwise upgrading the broker would invalidate
+    // every existing session and disrupt every in-flight consumer.
+    val time = new MockTime()
+    val cacheShard = new FetchSessionCacheShard(10, 1000)
+    val fetchManager = new FetchManager(time, cacheShard)
+    val topicIds = Map("foo" -> Uuid.randomUuid()).asJava
+    val topicNames = topicIds.asScala.map(_.swap).asJava
+    val tp = new TopicIdPartition(topicIds.get("foo"), new TopicPartition("foo", 0))
+
+    val requestData = new util.LinkedHashMap[TopicPartition, FetchRequest.PartitionData]
+    requestData.put(tp.topicPartition, new FetchRequest.PartitionData(tp.topicId, 0, 0, 100, Optional.empty()))
+    // Create with the LEGACY 6-arg signature (no principal).
+    val createReq = createRequest(JFetchMetadata.INITIAL, requestData, EMPTY_PART_LIST, isFromFollower = false)
+    val createCtx = fetchManager.newContext(
+      createReq.version, createReq.metadata, createReq.isFromFollower,
+      createReq.fetchData(topicNames), createReq.forgottenTopics(topicNames), topicNames)
+    val response = new util.LinkedHashMap[TopicIdPartition, FetchResponseData.PartitionData]
+    response.put(tp, new FetchResponseData.PartitionData().setPartitionIndex(tp.partition)
+      .setHighWatermark(100).setLastStableOffset(100).setLogStartOffset(100))
+    val sid = createCtx.updateAndGenerateResponseData(response, Seq.empty.asJava).sessionId()
+    assertEquals(None, cacheShard.get(sid).get.principalName)
+
+    val epoch = cacheShard.get(sid).get.epoch
+    val incReq = createRequest(new JFetchMetadata(sid, epoch),
+      new util.LinkedHashMap[TopicPartition, FetchRequest.PartitionData],
+      EMPTY_PART_LIST, isFromFollower = false)
+    // Some principal looking it up: works because session.principalName is None.
+    val ctxWithPrincipal = fetchManager.newContext(
+      incReq.version, incReq.metadata, incReq.isFromFollower,
+      incReq.fetchData(topicNames), incReq.forgottenTopics(topicNames), topicNames,
+      Some("User:whoever"))
+    assertTrue(ctxWithPrincipal.isInstanceOf[IncrementalFetchContext])
+  }
 }
 
 object FetchSessionTest {

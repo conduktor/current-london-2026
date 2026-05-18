@@ -1368,7 +1368,11 @@ class KafkaApis(val requestChannel: RequestChannel,
       fetchRequest.isFromFollower,
       fetchData,
       forgottenTopics,
-      topicNames)
+      topicNames,
+      // Pass the requester's principal name so the session cache can refuse
+      // cross-principal lookups (foreign sessionId can't disrupt or read
+      // another tenant's session). See FetchSession.principalName.
+      Some(request.context.principal.toString))
 
     val erroneous = mutable.ArrayBuffer[(TopicIdPartition, FetchResponseData.PartitionData)]()
     val interesting = mutable.ArrayBuffer[(TopicIdPartition, FetchRequest.PartitionData)]()
