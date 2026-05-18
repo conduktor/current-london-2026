@@ -543,13 +543,17 @@ public class ConcentrationKernelTest {
 
     // ---- Idempotent retry cache (v1 fix for PROMPT scenario 6) ----
 
+    // All existing idempotent tests use a fixed test epoch (LEADER_EPOCH = 5) on both record and
+    // lookup — leader-epoch behaviour is exercised in its own focused tests further below.
+    private static final int LEADER_EPOCH = 5;
+
     @Test
     public void lookupIdempotentBatchReturnsEmptyBeforeAnyRecord() {
         // Cache miss on a never-seen producerId. The broker reads "empty" as "go down the
         // reserve+stamp+append path" — there's no shortcut to take.
         kernel.declare(descriptor("orders", 4, "shared", 1));
         IdempotentBatchKey key = new IdempotentBatchKey(42L, (short) 0, 0, 2);
-        assertTrue(kernel.lookupIdempotentBatch("orders", 0, key).isEmpty());
+        assertTrue(kernel.lookupIdempotentBatch("orders", 0, key, LEADER_EPOCH).isEmpty());
     }
 
     @Test
@@ -558,14 +562,15 @@ public class ConcentrationKernelTest {
         // retry sees a hit and returns the SAME logical offsets — never reserving new ones.
         kernel.declare(descriptor("orders", 4, "shared", 1));
         IdempotentBatchKey key = new IdempotentBatchKey(42L, (short) 0, 0, 2);
-        IdempotentBatchResult result = new IdempotentBatchResult(500L, 502L, 0L, 1700000000000L);
+        IdempotentBatchResult result = new IdempotentBatchResult(500L, 502L, 0L, 1700000000000L, LEADER_EPOCH);
         kernel.recordIdempotentBatch("orders", 0, key, result);
 
-        IdempotentBatchResult hit = kernel.lookupIdempotentBatch("orders", 0, key).orElseThrow();
+        IdempotentBatchResult hit = kernel.lookupIdempotentBatch("orders", 0, key, LEADER_EPOCH).orElseThrow();
         assertEquals(500L, hit.logicalBaseOffset());
         assertEquals(502L, hit.logicalLastOffset());
         assertEquals(0L, hit.logStartOffset());
         assertEquals(1700000000000L, hit.logAppendTime());
+        assertEquals(LEADER_EPOCH, hit.leaderEpoch());
     }
 
     @Test
@@ -577,10 +582,10 @@ public class ConcentrationKernelTest {
         kernel.declare(descriptor("orders", 4, "shared", 1));
         IdempotentBatchKey original = new IdempotentBatchKey(42L, (short) 0, 0, 2);
         kernel.recordIdempotentBatch("orders", 0, original,
-            new IdempotentBatchResult(500L, 502L, 0L, 1L));
+            new IdempotentBatchResult(500L, 502L, 0L, 1L, LEADER_EPOCH));
 
         IdempotentBatchKey newEpoch = new IdempotentBatchKey(42L, (short) 1, 0, 2);
-        assertTrue(kernel.lookupIdempotentBatch("orders", 0, newEpoch).isEmpty(),
+        assertTrue(kernel.lookupIdempotentBatch("orders", 0, newEpoch, LEADER_EPOCH).isEmpty(),
             "epoch bump must invalidate the cache hit");
     }
 
@@ -592,10 +597,10 @@ public class ConcentrationKernelTest {
         kernel.declare(descriptor("orders", 4, "shared", 1));
         kernel.recordIdempotentBatch("orders", 0,
             new IdempotentBatchKey(42L, (short) 0, 0, 2),
-            new IdempotentBatchResult(500L, 502L, 0L, 1L));
+            new IdempotentBatchResult(500L, 502L, 0L, 1L, LEADER_EPOCH));
 
         assertTrue(kernel.lookupIdempotentBatch("orders", 0,
-            new IdempotentBatchKey(42L, (short) 0, 1, 3)).isEmpty(),
+            new IdempotentBatchKey(42L, (short) 0, 1, 3), LEADER_EPOCH).isEmpty(),
             "different sequence range must be a cache miss");
     }
 
@@ -608,16 +613,16 @@ public class ConcentrationKernelTest {
         for (int i = 0; i < 6; i++) {
             IdempotentBatchKey key = new IdempotentBatchKey(42L, (short) 0, i, i);
             kernel.recordIdempotentBatch("orders", 0, key,
-                new IdempotentBatchResult(500L + i, 500L + i, 0L, 1L));
+                new IdempotentBatchResult(500L + i, 500L + i, 0L, 1L, LEADER_EPOCH));
         }
         // Oldest (seq=0) evicted; seq=1..5 retained.
         assertTrue(kernel.lookupIdempotentBatch("orders", 0,
-            new IdempotentBatchKey(42L, (short) 0, 0, 0)).isEmpty(),
+            new IdempotentBatchKey(42L, (short) 0, 0, 0), LEADER_EPOCH).isEmpty(),
             "FIFO eviction must drop the oldest entry once the 6th lands");
         for (int i = 1; i <= 5; i++) {
             assertEquals(500L + i,
                 kernel.lookupIdempotentBatch("orders", 0,
-                    new IdempotentBatchKey(42L, (short) 0, i, i))
+                    new IdempotentBatchKey(42L, (short) 0, i, i), LEADER_EPOCH)
                     .orElseThrow().logicalBaseOffset(),
                 "seq=" + i + " must still be cached");
         }
@@ -630,14 +635,14 @@ public class ConcentrationKernelTest {
         kernel.declare(descriptor("orders", 4, "shared", 1));
         kernel.recordIdempotentBatch("orders", 0,
             new IdempotentBatchKey(42L, (short) 0, 0, 0),
-            new IdempotentBatchResult(500L, 500L, 0L, 1L));
+            new IdempotentBatchResult(500L, 500L, 0L, 1L, LEADER_EPOCH));
         kernel.recordIdempotentBatch("orders", 0,
             new IdempotentBatchKey(99L, (short) 0, 0, 0),
-            new IdempotentBatchResult(501L, 501L, 0L, 1L));
+            new IdempotentBatchResult(501L, 501L, 0L, 1L, LEADER_EPOCH));
         assertEquals(500L, kernel.lookupIdempotentBatch("orders", 0,
-            new IdempotentBatchKey(42L, (short) 0, 0, 0)).orElseThrow().logicalBaseOffset());
+            new IdempotentBatchKey(42L, (short) 0, 0, 0), LEADER_EPOCH).orElseThrow().logicalBaseOffset());
         assertEquals(501L, kernel.lookupIdempotentBatch("orders", 0,
-            new IdempotentBatchKey(99L, (short) 0, 0, 0)).orElseThrow().logicalBaseOffset());
+            new IdempotentBatchKey(99L, (short) 0, 0, 0), LEADER_EPOCH).orElseThrow().logicalBaseOffset());
     }
 
     @Test
@@ -648,8 +653,8 @@ public class ConcentrationKernelTest {
         kernel.declare(descriptor("orders", 4, "shared", 1));
         IdempotentBatchKey key = new IdempotentBatchKey(42L, (short) 0, 0, 0);
         kernel.recordIdempotentBatch("orders", 0, key,
-            new IdempotentBatchResult(500L, 500L, 0L, 1L));
-        assertTrue(kernel.lookupIdempotentBatch("orders", 1, key).isEmpty(),
+            new IdempotentBatchResult(500L, 500L, 0L, 1L, LEADER_EPOCH));
+        assertTrue(kernel.lookupIdempotentBatch("orders", 1, key, LEADER_EPOCH).isEmpty(),
             "partition scoping must isolate cache entries");
     }
 
@@ -661,11 +666,104 @@ public class ConcentrationKernelTest {
         kernel.commitProduce(kernel.reserveProduce("orders", 0), 100L);
         IdempotentBatchKey key = new IdempotentBatchKey(42L, (short) 0, 0, 0);
         kernel.recordIdempotentBatch("orders", 0, key,
-            new IdempotentBatchResult(0L, 0L, 0L, 1L));
-        assertTrue(kernel.lookupIdempotentBatch("orders", 0, key).isPresent());
+            new IdempotentBatchResult(0L, 0L, 0L, 1L, LEADER_EPOCH));
+        assertTrue(kernel.lookupIdempotentBatch("orders", 0, key, LEADER_EPOCH).isPresent());
         assertTrue(kernel.removeLogicalPartition("orders", 0));
-        assertTrue(kernel.lookupIdempotentBatch("orders", 0, key).isEmpty(),
+        assertTrue(kernel.lookupIdempotentBatch("orders", 0, key, LEADER_EPOCH).isEmpty(),
             "removeLogicalPartition must drop the idempotent cache for that partition");
+    }
+
+    @Test
+    public void lookupAtNewerLeaderEpochEvictsStaleEntryAndMisses() {
+        // Codex HIGH #7: broker was leader at epoch 5 and cached batch X. Leadership flapped
+        // away and back; now the broker is leader at epoch 7. A retry of batch X under the new
+        // epoch must NOT hit the stale cache entry, because the logical offsets the cache holds
+        // belong to a tracker state that the intervening leader may have invalidated. Lookup
+        // returns empty AND evicts the stale entry so the second lookup at the new epoch is
+        // already O(deque depth) instead of paying the eviction cost again.
+        kernel.declare(descriptor("orders", 4, "shared", 1));
+        IdempotentBatchKey key = new IdempotentBatchKey(42L, (short) 0, 0, 0);
+        kernel.recordIdempotentBatch("orders", 0, key,
+            new IdempotentBatchResult(500L, 500L, 0L, 1L, /*leaderEpoch*/ 5));
+
+        assertTrue(kernel.lookupIdempotentBatch("orders", 0, key, /*current*/ 7).isEmpty(),
+            "newer-epoch lookup must miss to avoid false-positive duplicate ACK");
+        // Stale entry has been evicted — even a lookup at the ORIGINAL recording epoch must now
+        // miss. This is the strong eviction guarantee that prevents zombie hits from a broker
+        // that briefly re-saw its old epoch.
+        assertTrue(kernel.lookupIdempotentBatch("orders", 0, key, /*current*/ 5).isEmpty(),
+            "evicted stale entry must stay evicted on subsequent lookups");
+    }
+
+    @Test
+    public void lookupAtOlderLeaderEpochAlsoEvictsAsStale() {
+        // Symmetric to the newer-epoch case: an OLDER epoch lookup against a NEWER cache entry
+        // is equally untrustworthy. The lookup must not hit, and the eviction lets a subsequent
+        // newer-epoch lookup take the cold path. This shouldn't happen under correct broker
+        // behaviour (epochs only advance), but a defensive evict-on-any-mismatch is robust to
+        // the broker passing -1 (NO_PARTITION_LEADER_EPOCH) on the lookup when the cache holds
+        // a real epoch.
+        kernel.declare(descriptor("orders", 4, "shared", 1));
+        IdempotentBatchKey key = new IdempotentBatchKey(42L, (short) 0, 0, 0);
+        kernel.recordIdempotentBatch("orders", 0, key,
+            new IdempotentBatchResult(500L, 500L, 0L, 1L, /*leaderEpoch*/ 5));
+
+        assertTrue(kernel.lookupIdempotentBatch("orders", 0, key, /*current*/ -1).isEmpty(),
+            "mismatched epoch on lookup must evict regardless of direction");
+    }
+
+    @Test
+    public void invalidateIdempotentCacheForBackingDropsEntriesAcrossSharedLogicalTopics() {
+        // Two logical topics share one backing. A leadership change on the backing partition
+        // means BOTH logical topics' idempotent caches need to be cleared — neither is safe to
+        // trust until the new leader has rebuilt its state. The kernel method exists to give
+        // a future Partition.makeLeader/makeFollower hook a single call to make.
+        kernel.declare(descriptor("orders", 4, "shared", 1));
+        kernel.declare(descriptor("payments", 4, "shared", 1));
+        IdempotentBatchKey key = new IdempotentBatchKey(42L, (short) 0, 0, 0);
+        kernel.recordIdempotentBatch("orders", 0, key,
+            new IdempotentBatchResult(500L, 500L, 0L, 1L, LEADER_EPOCH));
+        kernel.recordIdempotentBatch("payments", 0, key,
+            new IdempotentBatchResult(700L, 700L, 0L, 1L, LEADER_EPOCH));
+
+        kernel.invalidateIdempotentCacheForBacking("shared");
+
+        assertTrue(kernel.lookupIdempotentBatch("orders", 0, key, LEADER_EPOCH).isEmpty(),
+            "invalidation must drop entries on every logical topic backed by 'shared'");
+        assertTrue(kernel.lookupIdempotentBatch("payments", 0, key, LEADER_EPOCH).isEmpty(),
+            "invalidation must drop entries on every logical topic backed by 'shared'");
+    }
+
+    @Test
+    public void invalidateIdempotentCacheForBackingDoesNotAffectOtherBackings() {
+        // A leadership change on 'shared-A' must not flush cache state for logical topics whose
+        // backing is 'shared-B' — the two backings are independent partitions and one's leader
+        // transition says nothing about the other's correctness.
+        kernel.declare(descriptor("orders", 4, "shared-A", 1));
+        kernel.declare(descriptor("inventory", 4, "shared-B", 1));
+        IdempotentBatchKey key = new IdempotentBatchKey(42L, (short) 0, 0, 0);
+        kernel.recordIdempotentBatch("orders", 0, key,
+            new IdempotentBatchResult(500L, 500L, 0L, 1L, LEADER_EPOCH));
+        kernel.recordIdempotentBatch("inventory", 0, key,
+            new IdempotentBatchResult(900L, 900L, 0L, 1L, LEADER_EPOCH));
+
+        kernel.invalidateIdempotentCacheForBacking("shared-A");
+
+        assertTrue(kernel.lookupIdempotentBatch("orders", 0, key, LEADER_EPOCH).isEmpty(),
+            "shared-A invalidation must drop orders cache");
+        assertEquals(900L, kernel.lookupIdempotentBatch("inventory", 0, key, LEADER_EPOCH)
+            .orElseThrow().logicalBaseOffset(),
+            "shared-A invalidation must NOT touch shared-B-backed logical topics");
+    }
+
+    @Test
+    public void invalidateIdempotentCacheForBackingIsNoOpForUnknownBacking() {
+        // Hooking this from a leadership-transition path is going to fire for backing topics
+        // that have no logical topic declared on them (the broker hosts many partitions). The
+        // call must be a cheap no-op in that case, not an exception.
+        kernel.declare(descriptor("orders", 4, "shared", 1));
+        kernel.invalidateIdempotentCacheForBacking("unrelated-physical-topic");
+        // No assertion: the test passes if no exception is thrown.
     }
 
     @Test
@@ -681,7 +779,7 @@ public class ConcentrationKernelTest {
         assertThrows(IllegalStateException.class,
             () -> kernel.recordIdempotentBatch("orders", 0,
                 new IdempotentBatchKey(42L, (short) 0, 0, 0),
-                new IdempotentBatchResult(0L, 0L, 0L, 1L)));
+                new IdempotentBatchResult(0L, 0L, 0L, 1L, LEADER_EPOCH)));
         kernel = null;
     }
 

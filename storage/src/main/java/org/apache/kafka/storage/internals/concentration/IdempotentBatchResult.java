@@ -33,15 +33,18 @@ public final class IdempotentBatchResult {
     private final long logicalLastOffset;
     private final long logStartOffset;
     private final long logAppendTime;
+    private final int leaderEpoch;
 
     public IdempotentBatchResult(long logicalBaseOffset,
                                  long logicalLastOffset,
                                  long logStartOffset,
-                                 long logAppendTime) {
+                                 long logAppendTime,
+                                 int leaderEpoch) {
         this.logicalBaseOffset = logicalBaseOffset;
         this.logicalLastOffset = logicalLastOffset;
         this.logStartOffset = logStartOffset;
         this.logAppendTime = logAppendTime;
+        this.leaderEpoch = leaderEpoch;
     }
 
     public long logicalBaseOffset() {
@@ -60,11 +63,23 @@ public final class IdempotentBatchResult {
         return logAppendTime;
     }
 
+    /**
+     * Leader epoch at which the recording broker accepted this batch. Used by
+     * {@code ConcentrationKernel.lookupIdempotentBatch} to drop stale cache entries when a
+     * broker that previously cached a result has since lost and regained leadership — without
+     * this scope, a retry would receive logical offsets that no longer correspond to the
+     * post-flap leader's tracker state.
+     */
+    public int leaderEpoch() {
+        return leaderEpoch;
+    }
+
     @Override
     public String toString() {
         return "IdempotentBatchResult(logicalBaseOffset=" + logicalBaseOffset
             + ", logicalLastOffset=" + logicalLastOffset
             + ", logStartOffset=" + logStartOffset
-            + ", logAppendTime=" + logAppendTime + ")";
+            + ", logAppendTime=" + logAppendTime
+            + ", leaderEpoch=" + leaderEpoch + ")";
     }
 }

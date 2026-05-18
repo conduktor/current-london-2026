@@ -399,13 +399,15 @@ class KafkaApis(val requestChannel: RequestChannel,
     val invalidRequestResponses = mutable.Map[TopicPartition, PartitionResponse]()
     val authorizedRequestInfo = mutable.Map[TopicPartition, MemoryRecords]()
     // Concentration hook #2 side-map. Each entry pins one logical-topic produce that has been
-    // rewritten in authorizedRequestInfo to its backing-topic key. We need four pieces at
+    // rewritten in authorizedRequestInfo to its backing-topic key. We need five pieces at
     // response time: the original logical TopicPartition (to remap the response back so the
     // producer sees its own topic+partition), the Reservation[] (to commit on success / roll back
-    // on error), and an optional IdempotentBatchKey (to record on successful commit so a future
-    // retry hits the kernel cache and short-circuits before reservation — see PROMPT scenario 6).
+    // on error), an optional IdempotentBatchKey (to record on successful commit so a future
+    // retry hits the kernel cache and short-circuits before reservation — see PROMPT scenario 6),
+    // and the backing-partition leader epoch at lookup time (used to scope the cache entry so a
+    // leadership flap on this broker does not yield false-positive duplicate ACKs — Codex HIGH #7).
     // Kept empty unless any logical topic appears in this request.
-    val logicalByBacking = mutable.Map[TopicPartition, (TopicPartition, Array[Reservation], IdempotentBatchKey)]()
+    val logicalByBacking = mutable.Map[TopicPartition, (TopicPartition, Array[Reservation], IdempotentBatchKey, Int)]()
     // cache the result to avoid redundant authorization calls
     val authorizedTopics = authHelper.filterByAuthorized(request.context, WRITE, TOPIC,
       produceRequest.data().topicData().asScala)(_.name())
@@ -494,10 +496,24 @@ class KafkaApis(val requestChannel: RequestChannel,
                       firstBatch.baseSequence, firstBatch.lastSequence)
                   else null
 
+                // Read the broker's authoritative current leader epoch for the backing partition.
+                // Used to scope the idempotent cache (Codex HIGH #7): if this broker lost and
+                // later regained leadership of the backing partition, the cache entry recorded
+                // under the previous epoch must NOT short-circuit a retry — the intervening
+                // leader may have advanced the tracker differently and the cached logical
+                // offsets are no longer correct. Client-supplied partitionLeaderEpoch is
+                // unsuitable here because a slow client may pass a stale epoch matching a stale
+                // cache entry. Falls back to NO_PARTITION_LEADER_EPOCH (-1) when the partition
+                // is not hosted on this broker — the subsequent ReplicaManager append will
+                // reject with NOT_LEADER_OR_FOLLOWER anyway, so the cache miss is correct.
+                val currentLeaderEpoch: Int = replicaManager.onlinePartition(backingTp)
+                  .map(_.getLeaderEpoch)
+                  .getOrElse(RecordBatch.NO_PARTITION_LEADER_EPOCH)
+
                 val cachedResult: java.util.Optional[IdempotentBatchResult] =
                   if (idempotentKey != null)
                     concentrationKernel.lookupIdempotentBatch(
-                      topicPartition.topic, topicPartition.partition, idempotentKey)
+                      topicPartition.topic, topicPartition.partition, idempotentKey, currentLeaderEpoch)
                   else
                     java.util.Optional.empty[IdempotentBatchResult]()
 
@@ -540,7 +556,7 @@ class KafkaApis(val requestChannel: RequestChannel,
                       val stamped = LogicalProduceStamper.stamp(
                         memoryRecords, topicPartition.topic, topicPartition.partition, logicalOffsets)
                       authorizedRequestInfo += (backingTp -> stamped)
-                      logicalByBacking += (backingTp -> (topicPartition, reservations, idempotentKey))
+                      logicalByBacking += (backingTp -> (topicPartition, reservations, idempotentKey, currentLeaderEpoch))
                       stored = true
                     } finally {
                       if (!stored) {
@@ -590,7 +606,7 @@ class KafkaApis(val requestChannel: RequestChannel,
         if (logicalByBacking.isEmpty) responseStatus
         else responseStatus.map { case (tp, status) =>
           logicalByBacking.get(tp) match {
-            case Some((logicalTp, reservations, idempotentKey)) =>
+            case Some((logicalTp, reservations, idempotentKey, recordedLeaderEpoch)) =>
               if (status.error == Errors.NONE) {
                 try {
                   concentrationKernel.commitProduceBatch(reservations, status.baseOffset)
@@ -615,10 +631,18 @@ class KafkaApis(val requestChannel: RequestChannel,
                   // crash here just means the retry takes the slow path (backing dedup) the next
                   // time — correct, only slower.
                   if (idempotentKey != null) {
+                    // Record the cache entry under the leader epoch we OBSERVED at lookup time
+                    // (Codex HIGH #7). If the broker had lost-and-regained leadership between
+                    // lookup and now, ReplicaManager would already have failed the append with
+                    // NOT_LEADER_OR_FOLLOWER (or the new-epoch produce would have been gated by
+                    // the existing epoch mismatch), so on the success path the recorded value
+                    // is the epoch this broker is currently serving. A subsequent retry under a
+                    // higher epoch will then miss + evict via the leader-epoch check in
+                    // lookupIdempotentBatch.
                     concentrationKernel.recordIdempotentBatch(
                       logicalTp.topic, logicalTp.partition, idempotentKey,
                       new IdempotentBatchResult(logicalBase, logicalLast, logicalStart,
-                        status.logAppendTime))
+                        status.logAppendTime, recordedLeaderEpoch))
                   }
                   logicalTp -> status
                 } catch {
@@ -750,7 +774,7 @@ class KafkaApis(val requestChannel: RequestChannel,
           transactionSupportedOperation = transactionSupportedOperation)
       } catch {
         case t: Throwable =>
-          logicalByBacking.foreach { case (_, (logicalTp, reservations, _)) =>
+          logicalByBacking.foreach { case (_, (logicalTp, reservations, _, _)) =>
             try concentrationKernel.rollbackProduceBatch(reservations)
             catch { case rbe: Throwable =>
               warn(s"Concentration rollback failed after handleProduceAppend threw for $logicalTp", rbe)

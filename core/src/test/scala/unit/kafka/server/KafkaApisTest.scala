@@ -2573,8 +2573,18 @@ class KafkaApisTest extends Logging {
     val baseSeq = 0
     val lastSeq = 2
     val cachedKey = new IdempotentBatchKey(producerId, producerEpoch, baseSeq, lastSeq)
-    val cachedResult = new IdempotentBatchResult(500L, 502L, 42L, 1234567890L)
-    when(concentrationKernel.lookupIdempotentBatch(logicalTopic, 0, cachedKey))
+    // Scope the cached entry to a concrete backing-partition leader epoch (HIGH #7). The kernel
+    // resolves currentLeaderEpoch via ReplicaManager.onlinePartition(backingTp).getLeaderEpoch,
+    // so we mock the backing Partition to return the same epoch the cache was recorded at —
+    // matching epochs ⇒ cache HIT. The mismatched-epoch eviction path is covered by the kernel
+    // unit tests (lookupAtNewerLeaderEpochEvictsStaleEntryAndMisses); here we only need the
+    // happy path so the existing retry contract still passes through.
+    val cachedLeaderEpoch = 5
+    val backingPartition = mock(classOf[Partition])
+    when(backingPartition.getLeaderEpoch).thenReturn(cachedLeaderEpoch)
+    when(replicaManager.onlinePartition(any[TopicPartition])).thenReturn(Some(backingPartition))
+    val cachedResult = new IdempotentBatchResult(500L, 502L, 42L, 1234567890L, cachedLeaderEpoch)
+    when(concentrationKernel.lookupIdempotentBatch(logicalTopic, 0, cachedKey, cachedLeaderEpoch))
       .thenReturn(Optional.of(cachedResult))
 
     val tp = new TopicPartition(logicalTopic, 0)
@@ -2621,7 +2631,7 @@ class KafkaApisTest extends Logging {
     // logical sequence has either advanced (reserveProduceBatch) or we've sent stamped records
     // to be deduped by the backing's ProducerStateManager (handleProduceAppend), both of which
     // are the bugs this cache is here to prevent.
-    verify(concentrationKernel).lookupIdempotentBatch(logicalTopic, 0, cachedKey)
+    verify(concentrationKernel).lookupIdempotentBatch(logicalTopic, 0, cachedKey, cachedLeaderEpoch)
     verify(concentrationKernel, never()).reserveProduceBatch(any[String], anyInt, anyInt)
     verify(concentrationKernel, never()).commitProduceBatch(any(), anyLong)
     verify(concentrationKernel, never()).rollbackProduceBatch(any())

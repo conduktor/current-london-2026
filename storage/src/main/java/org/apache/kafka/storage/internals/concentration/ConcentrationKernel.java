@@ -310,7 +310,8 @@ public final class ConcentrationKernel implements AutoCloseable {
      */
     public Optional<IdempotentBatchResult> lookupIdempotentBatch(String logicalTopic,
                                                                   int logicalPartition,
-                                                                  IdempotentBatchKey key) {
+                                                                  IdempotentBatchKey key,
+                                                                  int currentLeaderEpoch) {
         Objects.requireNonNull(logicalTopic, "logicalTopic");
         Objects.requireNonNull(key, "key");
         ConcurrentHashMap<Long, ArrayDeque<Map.Entry<IdempotentBatchKey, IdempotentBatchResult>>> perProducer =
@@ -319,8 +320,24 @@ public final class ConcentrationKernel implements AutoCloseable {
         ArrayDeque<Map.Entry<IdempotentBatchKey, IdempotentBatchResult>> deque = perProducer.get(key.producerId());
         if (deque == null) return Optional.empty();
         synchronized (deque) {
-            for (Map.Entry<IdempotentBatchKey, IdempotentBatchResult> e : deque) {
-                if (e.getKey().equals(key)) return Optional.of(e.getValue());
+            Iterator<Map.Entry<IdempotentBatchKey, IdempotentBatchResult>> it = deque.iterator();
+            while (it.hasNext()) {
+                Map.Entry<IdempotentBatchKey, IdempotentBatchResult> e = it.next();
+                if (e.getKey().equals(key)) {
+                    // Leader-epoch scope: a cache entry only counts as a hit when it was
+                    // recorded at the SAME leader epoch the broker is now serving. If this
+                    // broker lost leadership of the backing partition and later regained it
+                    // (epoch bumps each time), the cached logical offsets are stale — the
+                    // intervening leader appended different records under that logical
+                    // partition, and our offsets no longer map to anything real. Returning
+                    // them would be a false-positive duplicate ACK (Codex HIGH #7). Evict the
+                    // stale entry on access so the lookup is the only path that pays the cost.
+                    if (e.getValue().leaderEpoch() == currentLeaderEpoch) {
+                        return Optional.of(e.getValue());
+                    }
+                    it.remove();
+                    return Optional.empty();
+                }
             }
         }
         return Optional.empty();
@@ -363,6 +380,29 @@ public final class ConcentrationKernel implements AutoCloseable {
             deque.addLast(Map.entry(key, result));
             while (deque.size() > MAX_BATCHES_PER_PRODUCER) {
                 deque.pollFirst();
+            }
+        }
+    }
+
+    /**
+     * Drop every idempotent-batch cache entry for logical partitions whose declared backing is
+     * {@code backingTopic}. Intended hook for the broker's leadership-change paths
+     * ({@code Partition.makeLeader}/{@code makeFollower}): a transition implies the local cache
+     * may now diverge from the partition's authoritative state, and any retry that hits a stale
+     * entry would produce a false-positive duplicate ACK on the new leader (Codex HIGH #7).
+     *
+     * <p>Eager invalidation here is a complement, not a replacement, for the per-lookup
+     * leader-epoch check in {@link #lookupIdempotentBatch}: the leader-epoch check is the
+     * correctness floor (it will catch a stale entry even if the broker forgot to call this
+     * method), while this method exists so that a clean, observable invalidation can be wired
+     * from the leadership transition once that hook is plumbed end-to-end. No-op if no logical
+     * topic is declared on the given backing.
+     */
+    public void invalidateIdempotentCacheForBacking(String backingTopic) {
+        Objects.requireNonNull(backingTopic, "backingTopic");
+        for (LogicalTopicDescriptor descriptor : registry.descriptorsFor(backingTopic)) {
+            for (int p = 0; p < descriptor.numLogicalPartitions(); p++) {
+                idempotentCache.remove(new LogicalPartition(descriptor.logicalName(), p));
             }
         }
     }
