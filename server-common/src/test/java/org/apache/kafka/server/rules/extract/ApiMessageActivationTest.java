@@ -30,7 +30,14 @@ import org.apache.kafka.common.message.CreateTopicsRequestData.CreatableTopicCon
 import org.apache.kafka.common.message.CreateTopicsRequestData.CreatableTopicConfigCollection;
 import org.apache.kafka.common.message.IncrementalAlterConfigsRequestData;
 import org.apache.kafka.common.message.MetadataRequestData;
+import org.apache.kafka.common.message.ProduceRequestData;
+import org.apache.kafka.common.message.ProduceRequestData.PartitionProduceData;
+import org.apache.kafka.common.message.ProduceRequestData.TopicProduceData;
+import org.apache.kafka.common.message.ProduceRequestData.TopicProduceDataCollection;
 import org.apache.kafka.common.message.SaslAuthenticateRequestData;
+import org.apache.kafka.common.compress.Compression;
+import org.apache.kafka.common.record.MemoryRecords;
+import org.apache.kafka.common.record.SimpleRecord;
 import org.apache.kafka.server.rules.cel.CelCompiler;
 import org.apache.kafka.server.rules.cel.CelProgram;
 
@@ -836,6 +843,66 @@ public class ApiMessageActivationTest {
         Map<?, ?> cfg = (Map<?, ?>) ((List<?>) ((Map<?, ?>) ((List<?>) m.get("resources")).get(0)).get("configs")).get(0);
         assertNull(cfg.get("value"),
             "case-shifted variants of credential names must still redact (no trivial casing bypass)");
+    }
+
+    @Test
+    public void produceRequestRecordsAreOpaqueToTheActivationWalker() {
+        // Round-3 DoS adversary P0. The activation walker must NOT decompress
+        // a PRODUCE request's record payload to feed it into CEL rules:
+        //
+        //   1. Decompression on the request path is unbounded cost — a single
+        //      max.message.bytes payload can decompress to many MiB of inner
+        //      records and force the walker through every one of them.
+        //   2. Record values carry application-level secrets (tokens, PII,
+        //      credentials). Surfacing them via the activation map would let
+        //      any operator with rule-write access exfiltrate payload bytes
+        //      with a rule of the form `request...records....value.startsWith(...)`.
+        //
+        // Pin both: the records field must come back as a tiny descriptor
+        // containing sizeInBytes only — no batches, no records, no value bytes.
+        // sizeInBytes is harmless and lets a rule deny on request-size patterns
+        // without decompressing anything.
+        SimpleRecord secret = new SimpleRecord("k".getBytes(), "TOPSECRET".getBytes());
+        MemoryRecords payload = MemoryRecords.withRecords(Compression.NONE, secret);
+
+        PartitionProduceData partition = new PartitionProduceData()
+            .setIndex(0)
+            .setRecords(payload);
+        TopicProduceData topic = new TopicProduceData()
+            .setName("audit-events")
+            .setPartitionData(java.util.Collections.singletonList(partition));
+        TopicProduceDataCollection topics = new TopicProduceDataCollection();
+        topics.add(topic);
+        ProduceRequestData req = new ProduceRequestData().setTopicData(topics);
+
+        Map<String, Object> m = ApiMessageActivation.from(req);
+        @SuppressWarnings("unchecked")
+        List<Object> topicData = (List<Object>) m.get("topicData");
+        Map<?, ?> firstTopic = (Map<?, ?>) topicData.get(0);
+        @SuppressWarnings("unchecked")
+        List<Object> partitionData = (List<Object>) firstTopic.get("partitionData");
+        Map<?, ?> firstPartition = (Map<?, ?>) partitionData.get(0);
+
+        Object recordsField = firstPartition.get("records");
+        assertNotNull(recordsField, "records key must be present so size-based rules can target it");
+        assertTrue(recordsField instanceof Map,
+            "records value must be an opaque descriptor map, got: " + recordsField.getClass());
+        Map<?, ?> descriptor = (Map<?, ?>) recordsField;
+        assertEquals(1, descriptor.size(),
+            "descriptor must expose sizeInBytes only — got: " + descriptor);
+        assertTrue(descriptor.get("sizeInBytes") instanceof Long,
+            "sizeInBytes must be CEL-friendly Long, got: " + descriptor.get("sizeInBytes"));
+        assertEquals((long) payload.sizeInBytes(), descriptor.get("sizeInBytes"));
+
+        // Defense in depth: the secret bytes must not appear ANYWHERE in the
+        // string form of the activation. If a future refactor accidentally
+        // re-walked the records, this check would catch it even if the per-
+        // field assertions above were rewritten incorrectly.
+        String full = m.toString();
+        assertFalse(full.contains("TOPSECRET"),
+            "record payload bytes must never reach the activation map: " + full);
+        assertFalse(full.contains("batches"),
+            "batches accessor must not be invoked on a records field: " + full);
     }
 
     @Test

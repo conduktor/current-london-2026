@@ -17,6 +17,7 @@
 package org.apache.kafka.server.rules.extract;
 
 import org.apache.kafka.common.protocol.ApiMessage;
+import org.apache.kafka.common.record.BaseRecords;
 
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
@@ -389,6 +390,38 @@ public final class ApiMessageActivation {
         Object scalar = convertScalar(v);
         if (scalar != null) {
             return scalar;
+        }
+        // Record payloads (PRODUCE request body, FETCH response body, etc.) are
+        // intentionally opaque to the activation walker. Surfacing them via
+        // reflection would have two problems:
+        //
+        //   1. Cost — MemoryRecords/FileRecords expose accessors like
+        //      batches() and records() that iterate every RecordBatch and
+        //      every Record, and reading a compressed batch decompresses it
+        //      eagerly. A single max-size PRODUCE request can carry millions
+        //      of inner records; walking them per rule evaluation would
+        //      multiply request-path CPU by orders of magnitude.
+        //   2. Sensitivity — Record.value() returns the raw application
+        //      payload bytes. Producers routinely write credentials, tokens,
+        //      PII, and other secrets into record values. A rule of the form
+        //      `request.partitionData.exists(p, p.records.batches.exists(b,
+        //      b.iterator.exists(r, r.value.startsWith("<guessed prefix>"))))`
+        //      would let any operator with rule-write access exfiltrate
+        //      application payloads via the rule-engine audit channel, the
+        //      same way SENSITIVE_NAMES protects authBytes / SCRAM salt /
+        //      delegation HMAC at the protocol layer.
+        //
+        // We surface only sizeInBytes() — large enough to write usefully
+        // size-bounded DENY rules (e.g. "deny PRODUCE requests over N MiB to
+        // a specific topic") but not granular enough to leak any byte of the
+        // payload itself. The result is a tiny fixed-shape map so CEL rules
+        // that probe r.value / r.batches / r.records observe null instead of
+        // a walkable subtree.
+        if (v instanceof BaseRecords) {
+            BaseRecords records = (BaseRecords) v;
+            Map<String, Object> descriptor = new LinkedHashMap<>(1);
+            descriptor.put("sizeInBytes", (long) records.sizeInBytes());
+            return descriptor;
         }
         if (v instanceof Iterable) {
             return convertIterable((Iterable<?>) v, depth, invocations);
