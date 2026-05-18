@@ -28,6 +28,11 @@ import org.eclipse.jetty.client.Request;
 import org.eclipse.jetty.client.Response;
 import org.eclipse.jetty.client.StringRequestContent;
 import org.eclipse.jetty.http.HttpMethod;
+import org.eclipse.jetty.websocket.api.Callback;
+import org.eclipse.jetty.websocket.api.Session;
+import org.eclipse.jetty.websocket.api.StatusCode;
+import org.eclipse.jetty.websocket.api.exceptions.UpgradeException;
+import org.eclipse.jetty.websocket.client.WebSocketClient;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -35,12 +40,16 @@ import org.junit.jupiter.api.Test;
 import java.io.BufferedReader;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -535,6 +544,252 @@ class KafkaHttpServerIntegrationTest {
             JsonNode payload = asJson(errorData.getBytes(StandardCharsets.UTF_8));
             assertEquals("NOT_LEADER_OR_FOLLOWER", payload.get("errorCode").asText());
             assertEquals("moved", payload.get("errorMessage").asText());
+        }
+    }
+
+    // ----- WebSocket -----
+
+    @Test
+    void wsSubscribeDeliversInitialCreditsThenFlowDeliversMore() throws Exception {
+        // PROMPT.md FS2: subscribe with initial credits N, broker has more than N records buffered, server delivers
+        // exactly N, then a `flow` grant of M delivers M more. Proves the credit-gated streamer threads through the
+        // real WebSocket upgrade and that subscribe/flow frames are parsed off the wire. Also asserts the WS metrics
+        // (WsSubscriptionsOpened, ActiveWsSubscriptions) increment through the real upgrade path — Codex flagged this
+        // explicitly: a unit-test-only proof leaves the upgrade-time creator unverified.
+        com.yammer.metrics.core.Meter opened = (com.yammer.metrics.core.Meter)
+            org.apache.kafka.server.metrics.KafkaYammerMetrics.defaultRegistry().allMetrics()
+                .get(bridgeMetricName("WsSubscriptionsOpened"));
+        com.yammer.metrics.core.Gauge<?> activeGauge = (com.yammer.metrics.core.Gauge<?>)
+            org.apache.kafka.server.metrics.KafkaYammerMetrics.defaultRegistry().allMetrics()
+                .get(bridgeMetricName("ActiveWsSubscriptions"));
+        assertNotNull(opened, "WsSubscriptionsOpened must be registered");
+        assertNotNull(activeGauge, "ActiveWsSubscriptions must be registered");
+        long openedBefore = opened.count();
+
+        // One batch with 20 records starting at offset 5 — initialCredits=5 will deliver 5 and buffer 15; flow=10
+        // will then deliver 10 more. The drain logic only kicks a new fetch when the buffer empties AND credits>0,
+        // so a single seeded batch is sufficient — the streamer stays parked on the buffer thereafter.
+        ConcurrentLinkedQueue<RequestSubmitter.FetchResult> queue = new ConcurrentLinkedQueue<>();
+        List<FetchResponseFormatter.FetchedRecord> records = new ArrayList<>();
+        for (int i = 0; i < 20; i++) {
+            records.add(new FetchResponseFormatter.FetchedRecord(
+                5 + i, null, ("v" + i).getBytes(StandardCharsets.UTF_8), null, 1000L + i));
+        }
+        queue.add(new RequestSubmitter.FetchResult(
+            new FetchResponseFormatter.PartitionFetch(0, Errors.NONE, null, 5, 0, 25, records), 0L));
+        submitter.fetchResultQueue = queue;
+
+        WebSocketClient wsClient = new WebSocketClient();
+        wsClient.start();
+        try {
+            CapturingWsListener listener = new CapturingWsListener();
+            URI uri = URI.create(wsUrl("/v1/topics/orders/subscribe"));
+            Session session = wsClient.connect(listener, uri).get(5, TimeUnit.SECONDS);
+            try {
+                listener.openLatch.await(5, TimeUnit.SECONDS);
+                session.sendText(
+                    "{\"type\":\"subscribe\",\"partition\":0,\"offset\":5,\"maxBytes\":200000,\"initialCredits\":5}",
+                    Callback.NOOP);
+                listener.awaitMessages(5, 5, TimeUnit.SECONDS);
+                // Five records delivered, buffer is sitting on the remaining 15 — verify no over-delivery before the
+                // flow frame goes out. A small wait is the only honest way to detect "stream is paused" because the
+                // absence of further records is silent.
+                Thread.sleep(150);
+                assertEquals(5, listener.messages.size(),
+                    "initialCredits=5 must cap delivery at 5 records until a flow frame extends credit");
+                // Verify the ActiveWsSubscriptions gauge sees the open connection while it is in fact open.
+                Number active = (Number) activeGauge.value();
+                assertEquals(1, active.intValue(),
+                    "ActiveWsSubscriptions gauge must report 1 while a subscription is in progress");
+
+                session.sendText("{\"type\":\"flow\",\"credits\":10}", Callback.NOOP);
+                listener.awaitMessages(15, 5, TimeUnit.SECONDS);
+                assertEquals(15, listener.messages.size(),
+                    "after flow=10 the total delivered must be 15 — 5 initial + 10 granted");
+            } finally {
+                session.close(StatusCode.NORMAL, "test done", Callback.NOOP);
+                listener.closeLatch.await(5, TimeUnit.SECONDS);
+            }
+            // Verify the record envelopes are well-formed JSON with the expected discriminator + offsets.
+            for (int i = 0; i < 15; i++) {
+                JsonNode envelope = asJson(listener.messages.get(i).getBytes(StandardCharsets.UTF_8));
+                assertEquals("record", envelope.get("type").asText());
+                assertEquals(5L + i, envelope.get("offset").asLong());
+            }
+        } finally {
+            wsClient.stop();
+        }
+
+        assertEquals(openedBefore + 1L, opened.count(),
+            "WsSubscriptionsOpened must increment exactly once per accepted upgrade");
+    }
+
+    @Test
+    void wsReturns503WhenSubscriptionCapReached() throws Exception {
+        // Restart with a WS cap of 1 so the first subscription consumes all capacity. The second upgrade attempt must
+        // be refused with HTTP 503 + Retry-After at the upgrade gate, NOT a half-opened WS that immediately errors —
+        // a runaway client otherwise pins a Jetty I/O slot per attempt. Also asserts RejectedAtWsCap increments, which
+        // is the metric operators alert on for "WS bridge is saturated".
+        tearDown();
+        startServer(DEFAULT_TEST_MAX_BODY_BYTES, DEFAULT_TEST_MAX_SSE_STREAMS, 1);
+        com.yammer.metrics.core.Meter opened = (com.yammer.metrics.core.Meter)
+            org.apache.kafka.server.metrics.KafkaYammerMetrics.defaultRegistry().allMetrics()
+                .get(bridgeMetricName("WsSubscriptionsOpened"));
+        com.yammer.metrics.core.Meter rejected = (com.yammer.metrics.core.Meter)
+            org.apache.kafka.server.metrics.KafkaYammerMetrics.defaultRegistry().allMetrics()
+                .get(bridgeMetricName("RejectedAtWsCap"));
+        assertNotNull(opened, "WsSubscriptionsOpened must be registered after restart");
+        assertNotNull(rejected, "RejectedAtWsCap must be registered after restart");
+        long openedBefore = opened.count();
+        long rejectedBefore = rejected.count();
+
+        // Seed a single record so the first subscription receives something — proves the slot is actually held, not
+        // released mid-handshake. Subsequent fetches will block (never-completing future); that's fine because we
+        // only need the slot to stay taken for the duration of the cap-rejection check.
+        ConcurrentLinkedQueue<RequestSubmitter.FetchResult> queue = new ConcurrentLinkedQueue<>();
+        queue.add(new RequestSubmitter.FetchResult(
+            new FetchResponseFormatter.PartitionFetch(
+                0, Errors.NONE, null, 5, 0, 6,
+                List.of(new FetchResponseFormatter.FetchedRecord(
+                    5, null, "v0".getBytes(StandardCharsets.UTF_8), null, 1L))),
+            0L));
+        submitter.fetchResultQueue = queue;
+
+        WebSocketClient wsClient = new WebSocketClient();
+        wsClient.start();
+        try {
+            CapturingWsListener firstListener = new CapturingWsListener();
+            Session first = wsClient.connect(firstListener, URI.create(wsUrl("/v1/topics/orders/subscribe")))
+                .get(5, TimeUnit.SECONDS);
+            try {
+                firstListener.openLatch.await(5, TimeUnit.SECONDS);
+                first.sendText(
+                    "{\"type\":\"subscribe\",\"partition\":0,\"offset\":5,\"maxBytes\":200000,\"initialCredits\":1}",
+                    Callback.NOOP);
+                firstListener.awaitMessages(1, 5, TimeUnit.SECONDS);
+
+                // Second upgrade attempt — limiter is at capacity, must fail with 503.
+                CapturingWsListener secondListener = new CapturingWsListener();
+                ExecutionException ex = org.junit.jupiter.api.Assertions.assertThrows(
+                    ExecutionException.class,
+                    () -> wsClient.connect(secondListener, URI.create(wsUrl("/v1/topics/orders/subscribe")))
+                        .get(5, TimeUnit.SECONDS));
+                Throwable cause = ex.getCause();
+                assertTrue(cause instanceof UpgradeException,
+                    "second connect must surface as UpgradeException, got: " + cause);
+                assertEquals(503, ((UpgradeException) cause).getResponseStatusCode(),
+                    "second connect must fail with HTTP 503 — the upgrade-time admission gate fired");
+            } finally {
+                first.close(StatusCode.NORMAL, "test done", Callback.NOOP);
+                firstListener.closeLatch.await(5, TimeUnit.SECONDS);
+            }
+        } finally {
+            wsClient.stop();
+        }
+
+        assertEquals(openedBefore + 1L, opened.count(),
+            "exactly one upgrade was accepted; WsSubscriptionsOpened must increment by 1");
+        assertEquals(rejectedBefore + 1L, rejected.count(),
+            "exactly one upgrade was refused at cap; RejectedAtWsCap must increment by 1");
+    }
+
+    @Test
+    void wsClosesWith1003WhenFirstFrameIsNotSubscribe() throws Exception {
+        // The endpoint's state machine requires the first text frame to be a `subscribe`. A client that opens the
+        // socket and immediately sends `flow` (or any other shape) is in protocol violation; the server must respond
+        // with an error envelope and close 1003 (Unsupported Data) rather than silently swallow the frame or attempt
+        // to recover. This proves the close code makes it over the wire — unit tests assert the local close call.
+        WebSocketClient wsClient = new WebSocketClient();
+        wsClient.start();
+        try {
+            CapturingWsListener listener = new CapturingWsListener();
+            Session session = wsClient.connect(listener, URI.create(wsUrl("/v1/topics/orders/subscribe")))
+                .get(5, TimeUnit.SECONDS);
+            listener.openLatch.await(5, TimeUnit.SECONDS);
+
+            // First frame is `flow`, not `subscribe` — protocol violation.
+            session.sendText("{\"type\":\"flow\",\"credits\":5}", Callback.NOOP);
+            // The endpoint sends an error envelope first, then the close frame. Wait for both.
+            listener.awaitMessages(1, 5, TimeUnit.SECONDS);
+            assertTrue(listener.closeLatch.await(5, TimeUnit.SECONDS),
+                "server must close the session after a protocol violation, not just swallow the bad frame");
+
+            JsonNode envelope = asJson(listener.messages.get(0).getBytes(StandardCharsets.UTF_8));
+            assertEquals("error", envelope.get("type").asText());
+            assertEquals("BAD_MESSAGE", envelope.get("errorCode").asText());
+            assertTrue(envelope.get("errorMessage").asText().contains("subscribe"),
+                "error message should name the missing 'subscribe' frame, got: "
+                    + envelope.get("errorMessage").asText());
+            assertEquals(StatusCode.BAD_DATA, listener.closeStatus,
+                "WebSocket close code must be 1003 (Unsupported Data) for protocol violations");
+        } finally {
+            wsClient.stop();
+        }
+    }
+
+    @Test
+    void extractSubscribeTopicHandlesGoodAndBadPaths() {
+        // Defence-in-depth: the WS filter already path-matches WS_PATH_SPEC before this method is consulted, but a
+        // future Jetty-version change to path-matching semantics (e.g. trailing slashes, double slashes) must not
+        // silently route to an empty-topic subscription. Mirror the SSE-side unit tests for extractTopic.
+        assertEquals("orders", KafkaHttpServer.extractSubscribeTopic("/v1/topics/orders/subscribe", "/v1"));
+        assertEquals("o-r-d-e-r-s",
+            KafkaHttpServer.extractSubscribeTopic("/v1/topics/o-r-d-e-r-s/subscribe", "/v1"));
+        // No context-path stripping when the request path is already context-relative — the production code passes
+        // contextPath="/v1" so this branch is defensive, not the hot path. Still want it to behave.
+        assertEquals("orders", KafkaHttpServer.extractSubscribeTopic("/topics/orders/subscribe", ""));
+        assertNull(KafkaHttpServer.extractSubscribeTopic(null, "/v1"));
+        assertNull(KafkaHttpServer.extractSubscribeTopic("/v1/topics/orders", "/v1"));                // missing suffix
+        assertNull(KafkaHttpServer.extractSubscribeTopic("/v1/topics//subscribe", "/v1"));            // empty topic
+        // slash inside topic
+        assertNull(KafkaHttpServer.extractSubscribeTopic("/v1/topics/orders/extra/subscribe", "/v1"));
+        // wrong prefix
+        assertNull(KafkaHttpServer.extractSubscribeTopic("/v1/other/orders/subscribe", "/v1"));
+    }
+
+    private String wsUrl(String path) {
+        return "ws://127.0.0.1:" + server.boundPort() + path;
+    }
+
+    /**
+     * Captures text frames and the close status for assertion. {@link CountDownLatch}-based gates let tests await
+     * specific milestones (open, N messages, close) without sleeping on arbitrary deadlines.
+     */
+    public static final class CapturingWsListener implements Session.Listener.AutoDemanding {
+        final CountDownLatch openLatch = new CountDownLatch(1);
+        final CountDownLatch closeLatch = new CountDownLatch(1);
+        final CopyOnWriteArrayList<String> messages = new CopyOnWriteArrayList<>();
+        volatile int closeStatus = -1;
+        volatile String closeReason;
+
+        @Override
+        public void onWebSocketOpen(Session session) {
+            openLatch.countDown();
+        }
+
+        @Override
+        public void onWebSocketText(String message) {
+            messages.add(message);
+        }
+
+        @Override
+        public void onWebSocketClose(int statusCode, String reason) {
+            this.closeStatus = statusCode;
+            this.closeReason = reason;
+            closeLatch.countDown();
+        }
+
+        /** Wait until {@code messages.size() >= target} or the deadline expires. Asserts that the target was
+         * actually reached — otherwise downstream assertions that read messages.size() would silently mask a
+         * subscription that never delivered anything (the latch and the size check are independent signals). */
+        void awaitMessages(int target, long timeout, TimeUnit unit) throws InterruptedException {
+            long deadline = System.nanoTime() + unit.toNanos(timeout);
+            while (messages.size() < target && System.nanoTime() < deadline) {
+                Thread.sleep(10);
+            }
+            org.junit.jupiter.api.Assertions.assertTrue(messages.size() >= target,
+                "expected to receive at least " + target + " WS messages within " + timeout + " " + unit
+                    + " — only received " + messages.size() + ": " + messages);
         }
     }
 

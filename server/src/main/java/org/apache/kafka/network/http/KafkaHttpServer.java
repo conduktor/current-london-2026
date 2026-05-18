@@ -20,6 +20,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 
 import org.eclipse.jetty.ee10.servlet.ServletContextHandler;
 import org.eclipse.jetty.ee10.servlet.ServletHolder;
+import org.eclipse.jetty.ee10.websocket.server.config.JettyWebSocketServletContainerInitializer;
 import org.eclipse.jetty.server.Server;
 import org.eclipse.jetty.server.ServerConnector;
 import org.slf4j.Logger;
@@ -51,6 +52,13 @@ public final class KafkaHttpServer {
     // If we mounted the servlet at "/topics/*", Jetty would strip "/topics" before exposing pathInfo, breaking the
     // expected layout of /topics/{topic}/records that extractTopic enforces.
     private static final String SERVLET_PATTERN = "/*";
+    // WebSocket upgrade mapping for /v1/topics/{topic}/subscribe. The path is context-relative — the WS filter
+    // installed by JettyWebSocketServletContainerInitializer is scoped to this ServletContextHandler, so
+    // /topics/{topic}/subscribe under the /v1 context resolves to /v1/topics/{topic}/subscribe on the wire.
+    // The "uri-template|" prefix is load-bearing: WebSocketMappings.parsePathSpec routes any spec starting with
+    // "/" through ServletPathSpec, which treats "{topic}" as a literal segment rather than a named capture. The
+    // explicit prefix forces a UriTemplatePathSpec so "{topic}" actually matches a topic segment.
+    private static final String WS_PATH_SPEC = "uri-template|/topics/{topic}/subscribe";
 
     private final String host;
     private final int port;
@@ -114,6 +122,53 @@ public final class KafkaHttpServer {
         holder.setAsyncSupported(true);
         context.addServlet(holder, SERVLET_PATTERN);
 
+        // Install the Jetty 12 native WebSocket container alongside the servlet. The container initializer
+        // registers a filter ahead of the servlet that intercepts upgrade requests against
+        // /v1/topics/{topic}/subscribe and routes them to KafkaWebSocketEndpoint via the creator below.
+        // Non-upgrade requests against the same path fall through to the servlet, which returns 404 (the
+        // servlet's extractTopic enforces /topics/{topic}/records — /subscribe does not match).
+        JettyWebSocketServletContainerInitializer.configure(context, (servletContext, container) -> {
+            // Upgrade-time admission gate: extract the topic, acquire a limiter slot, and either return a
+            // freshly-constructed endpoint (counts as one accepted subscription) or send a 503 (counts as
+            // a cap rejection). The endpoint owns the token from that point onward; cleanup in onClose/onError
+            // is idempotent.
+            container.addMapping(WS_PATH_SPEC, (req, resp) -> {
+                String topic = extractSubscribeTopic(req.getRequestPath(), context.getContextPath());
+                if (topic == null) {
+                    // The path-spec was already matched by the WS filter, so this branch should be unreachable
+                    // in practice — but defending against future spec changes (e.g. trailing slashes) by
+                    // returning a sane error is cheap insurance.
+                    resp.sendError(404, "topic path did not match /v1/topics/{topic}/subscribe");
+                    return null;
+                }
+                WsStreamLimiter.Token token = wsLimiter.tryAcquire();
+                if (token == null) {
+                    metrics.recordWsCapRejection();
+                    // 503 + Retry-After is the right shape for a transient-capacity error at upgrade time;
+                    // distinct from the SSE 429 because 429 means "you are rate-limited" while 503 means
+                    // "this listener is full right now". Operator alerting reads them differently.
+                    resp.setHeader("Retry-After", "5");
+                    resp.sendError(503, "WebSocket subscription cap reached; try again shortly");
+                    return null;
+                }
+                // Wrap endpoint construction so a throw between tryAcquire() and the returned endpoint does not
+                // leak the limiter slot. The token is meant to transfer to the endpoint (and from there to the
+                // streamer); if construction fails we must release it before propagating the failure as 500.
+                // Also: record the "opened" meter only after successful construction so accepted+rejected meters
+                // sum to exactly the offered load — a half-constructed endpoint that never reaches the client
+                // is neither.
+                KafkaWebSocketEndpoint endpoint;
+                try {
+                    endpoint = new KafkaWebSocketEndpoint(topic, submitter, mapper, token, httpExecutor);
+                } catch (RuntimeException e) {
+                    token.close();
+                    throw e;
+                }
+                metrics.recordWsSubscriptionOpened();
+                return endpoint;
+            });
+        });
+
         jetty.setHandler(context);
         jetty.start();
 
@@ -141,5 +196,31 @@ public final class KafkaHttpServer {
 
     public int boundPort() {
         return boundPort;
+    }
+
+    /**
+     * Pull the topic out of a WebSocket upgrade request path of the form {@code <contextPath>/topics/{topic}/subscribe}.
+     * Returns {@code null} if the shape doesn't match — the caller emits 404 in that case rather than guessing. The
+     * Jetty WS filter already path-matched against {@link #WS_PATH_SPEC}, so this is defence-in-depth, not the primary
+     * validation.
+     */
+    static String extractSubscribeTopic(String requestPath, String contextPath) {
+        if (requestPath == null) {
+            return null;
+        }
+        String inner = requestPath;
+        if (contextPath != null && !contextPath.isEmpty() && inner.startsWith(contextPath)) {
+            inner = inner.substring(contextPath.length());
+        }
+        final String prefix = "/topics/";
+        final String suffix = "/subscribe";
+        if (!inner.startsWith(prefix) || !inner.endsWith(suffix)) {
+            return null;
+        }
+        String topic = inner.substring(prefix.length(), inner.length() - suffix.length());
+        if (topic.isEmpty() || topic.indexOf('/') >= 0) {
+            return null;
+        }
+        return topic;
     }
 }
