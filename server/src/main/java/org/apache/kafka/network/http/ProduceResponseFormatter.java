@@ -33,8 +33,10 @@ import java.util.Objects;
  *   <li>every partition failed with the same Kafka error code → that error's mapped HTTP status (one true uniform failure)</li>
  *   <li>anything else (mixed success/failure, or multiple distinct error codes) → {@code 207 Multi-Status}</li>
  * </ul>
- * {@code throttleTimeMs} is orthogonal: when positive, a {@code Retry-After} header is set regardless of status.
- * That includes the quota-exhaustion case where the produce succeeded ({@code 200}) but the caller should still slow down.
+ * {@code throttleTimeMs} is filtered through {@link RetryAfterCalculator#forStatus(int, long)}: a positive value
+ * produces a {@code Retry-After} header on {@code 200} (the quota-exhaustion case where the produce succeeded but the
+ * caller should slow down), on {@code 207}, and on {@code 503}/{@code 504}; on {@code 400}/{@code 403}/{@code 404} the
+ * throttle hint is intentionally dropped because the spec forbids advertising a retry deadline on those statuses.
  */
 public final class ProduceResponseFormatter {
 
@@ -63,9 +65,7 @@ public final class ProduceResponseFormatter {
         }
 
         int status = resolveStatus(results);
-        int retryAfter = RetryAfterCalculator.shouldSet(throttleTimeMs)
-            ? RetryAfterCalculator.seconds(throttleTimeMs)
-            : 0;
+        int retryAfter = RetryAfterCalculator.forStatus(status, throttleTimeMs);
         return new HttpBridgeResponse(status, body, retryAfter);
     }
 
@@ -79,9 +79,7 @@ public final class ProduceResponseFormatter {
         ObjectNode body = ErrorEnvelope.forError(mapper, error, overrideMessage);
         body.put("topic", topic);
         int status = HttpStatusMapper.toHttpStatus(error);
-        int retryAfter = RetryAfterCalculator.shouldSet(throttleTimeMs)
-            ? RetryAfterCalculator.seconds(throttleTimeMs)
-            : 0;
+        int retryAfter = RetryAfterCalculator.forStatus(status, throttleTimeMs);
         return new HttpBridgeResponse(status, body, retryAfter);
     }
 

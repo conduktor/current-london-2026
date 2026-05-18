@@ -74,4 +74,51 @@ class RetryAfterCalculatorTest {
         assertEquals(60, RetryAfterCalculator.seconds(60_000));
         assertEquals(61, RetryAfterCalculator.seconds(60_001));
     }
+
+    // ----- forStatus(status, throttleMs): the spec policy combining throttle hint with status -----
+
+    @Test
+    void forStatusEmitsOnOkWhenThrottled() {
+        // Quota path: produce succeeded (200) but throttle should slow caller down.
+        assertEquals(2, RetryAfterCalculator.forStatus(HttpStatusMapper.OK, 1500));
+    }
+
+    @Test
+    void forStatusEmitsOnMultiStatusWhenThrottled() {
+        // Mixed result still propagates the throttle hint.
+        assertEquals(1, RetryAfterCalculator.forStatus(HttpStatusMapper.MULTI_STATUS, 1));
+    }
+
+    @Test
+    void forStatusEmitsOnServiceUnavailable() {
+        assertEquals(3, RetryAfterCalculator.forStatus(HttpStatusMapper.SERVICE_UNAVAILABLE, 2500));
+    }
+
+    @Test
+    void forStatusEmitsOnGatewayTimeout() {
+        assertEquals(1, RetryAfterCalculator.forStatus(HttpStatusMapper.GATEWAY_TIMEOUT, 1));
+    }
+
+    @Test
+    void forStatusDropsHintOn400() {
+        // PROMPT.md: 400 must not carry Retry-After even if throttle is observed.
+        assertEquals(0, RetryAfterCalculator.forStatus(HttpStatusMapper.BAD_REQUEST, 5000));
+    }
+
+    @Test
+    void forStatusDropsHintOn403() {
+        assertEquals(0, RetryAfterCalculator.forStatus(HttpStatusMapper.FORBIDDEN, 5000));
+    }
+
+    @Test
+    void forStatusDropsHintOn404() {
+        assertEquals(0, RetryAfterCalculator.forStatus(HttpStatusMapper.NOT_FOUND, 5000));
+    }
+
+    @Test
+    void forStatusEmitsNothingWhenThrottleIsZero() {
+        // No throttle observed → no header even on permitted statuses.
+        assertEquals(0, RetryAfterCalculator.forStatus(HttpStatusMapper.OK, 0));
+        assertEquals(0, RetryAfterCalculator.forStatus(HttpStatusMapper.SERVICE_UNAVAILABLE, 0));
+    }
 }

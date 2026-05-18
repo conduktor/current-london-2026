@@ -68,8 +68,9 @@ import java.util.Objects;
  * </ul>
  *
  * <p>Status: success → {@code 200}; per-partition failure → {@link HttpStatusMapper#toHttpStatus(Errors)} with an
- * {@link ErrorEnvelope} body. A positive {@code throttleTimeMs} always sets {@code Retry-After} regardless of status,
- * matching the quota semantics from {@link ProduceResponseFormatter}.
+ * {@link ErrorEnvelope} body. {@code Retry-After} follows {@link RetryAfterCalculator#forStatus(int, long)}: a positive
+ * {@code throttleTimeMs} produces a header on {@code 200}, {@code 207}, {@code 503} and {@code 504}; the hint is
+ * dropped on {@code 400}, {@code 403} and {@code 404} per the spec, where suggesting a retry would mislead the client.
  */
 public final class FetchResponseFormatter {
 
@@ -90,15 +91,12 @@ public final class FetchResponseFormatter {
         Objects.requireNonNull(topic, "topic must not be null");
         Objects.requireNonNull(partition, "partition must not be null");
 
-        int retryAfter = RetryAfterCalculator.shouldSet(throttleTimeMs)
-            ? RetryAfterCalculator.seconds(throttleTimeMs)
-            : 0;
-
         if (partition.error != Errors.NONE) {
             ObjectNode body = ErrorEnvelope.forError(mapper, partition.error, partition.errorMessage);
             body.put("topic", topic);
             body.put("partition", partition.partition);
-            return new HttpBridgeResponse(HttpStatusMapper.toHttpStatus(partition.error), body, retryAfter);
+            int errorStatus = HttpStatusMapper.toHttpStatus(partition.error);
+            return new HttpBridgeResponse(errorStatus, body, RetryAfterCalculator.forStatus(errorStatus, throttleTimeMs));
         }
 
         ObjectNode body = mapper.createObjectNode();
@@ -106,7 +104,8 @@ public final class FetchResponseFormatter {
         ArrayNode partitions = body.putArray("partitions");
         partitions.add(renderPartition(topic, partition));
         body.set("_links", renderRootLinks(topic, partition));
-        return new HttpBridgeResponse(HttpStatusMapper.OK, body, retryAfter);
+        return new HttpBridgeResponse(HttpStatusMapper.OK, body,
+            RetryAfterCalculator.forStatus(HttpStatusMapper.OK, throttleTimeMs));
     }
 
     /**
@@ -118,10 +117,7 @@ public final class FetchResponseFormatter {
         ObjectNode body = ErrorEnvelope.forError(mapper, error, overrideMessage);
         body.put("topic", topic);
         int status = HttpStatusMapper.toHttpStatus(error);
-        int retryAfter = RetryAfterCalculator.shouldSet(throttleTimeMs)
-            ? RetryAfterCalculator.seconds(throttleTimeMs)
-            : 0;
-        return new HttpBridgeResponse(status, body, retryAfter);
+        return new HttpBridgeResponse(status, body, RetryAfterCalculator.forStatus(status, throttleTimeMs));
     }
 
     private ObjectNode renderPartition(String topic, PartitionFetch p) {

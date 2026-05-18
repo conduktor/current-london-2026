@@ -41,4 +41,26 @@ public final class RetryAfterCalculator {
         long ceil = (throttleMs + MILLIS_PER_SECOND - 1) / MILLIS_PER_SECOND;
         return Math.toIntExact(ceil);
     }
+
+    /**
+     * Applies the spec-level policy that combines the throttle hint with the resolved HTTP status:
+     * a {@code Retry-After} header is emitted only when the broker reported a positive throttle delay
+     * <em>and</em> the status code is one that the spec permits to carry it — i.e. {@code 200} (quota throttle on a
+     * successful produce), {@code 207} (mixed multi-status with throttle), or any status for which
+     * {@link HttpStatusMapper#statusCarriesRetryAfter(int)} returns true ({@code 503}/{@code 504}). For any other
+     * status (notably {@code 400}, {@code 403}, {@code 404}) the throttle hint is dropped — emitting Retry-After
+     * there would mislead the client into expecting that retrying eventually succeeds.
+     *
+     * @return the seconds value to advertise, or {@code 0} to indicate no header should be set
+     */
+    public static int forStatus(int status, long throttleMs) {
+        if (throttleMs <= 0) {
+            return 0;
+        }
+        boolean isOkOrMultiStatus = status == HttpStatusMapper.OK || status == HttpStatusMapper.MULTI_STATUS;
+        if (isOkOrMultiStatus || HttpStatusMapper.statusCarriesRetryAfter(status)) {
+            return seconds(throttleMs);
+        }
+        return 0;
+    }
 }

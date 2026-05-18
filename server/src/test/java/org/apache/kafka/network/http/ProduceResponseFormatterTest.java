@@ -206,6 +206,55 @@ class ProduceResponseFormatterTest {
         assertEquals(1, f.retryAfterSeconds());
     }
 
+    @Test
+    void throttleOn403IsSuppressed() {
+        // Spec (PROMPT.md, "Acceptance criteria"): 403 must NOT carry Retry-After. If a broker response ever pairs a
+        // uniform TOPIC_AUTHORIZATION_FAILED with a positive throttle (the request was both unauthorized AND throttled),
+        // the bridge must drop the Retry-After header rather than confuse the client about whether retrying will help.
+        List<ProduceResponseFormatter.PartitionResult> results = new ArrayList<>();
+        results.add(err(0, Errors.TOPIC_AUTHORIZATION_FAILED));
+        results.add(err(1, Errors.TOPIC_AUTHORIZATION_FAILED));
+
+        HttpBridgeResponse f = formatter.format("orders", results, 1500);
+
+        assertEquals(403, f.status());
+        assertFalse(f.hasRetryAfter());
+    }
+
+    @Test
+    void throttleOn404IsSuppressed() {
+        List<ProduceResponseFormatter.PartitionResult> results = new ArrayList<>();
+        results.add(err(0, Errors.UNKNOWN_TOPIC_OR_PARTITION));
+
+        HttpBridgeResponse f = formatter.format("orders", results, 1500);
+
+        assertEquals(404, f.status());
+        assertFalse(f.hasRetryAfter());
+    }
+
+    @Test
+    void topLevelErrorOn400DropsRetryAfter() {
+        // A parse-time 400 must not carry Retry-After even if some throttle was somehow observed at the call site.
+        HttpBridgeResponse f =
+            formatter.topLevelError("orders", Errors.INVALID_REQUEST, "topic must not be empty", 9999);
+
+        assertEquals(400, f.status());
+        assertFalse(f.hasRetryAfter());
+    }
+
+    @Test
+    void throttleOn503IsEmitted() {
+        // 503 (LEADER_NOT_AVAILABLE et al) always carries Retry-After when a throttle hint is available.
+        List<ProduceResponseFormatter.PartitionResult> results = new ArrayList<>();
+        results.add(err(0, Errors.LEADER_NOT_AVAILABLE));
+
+        HttpBridgeResponse f = formatter.format("orders", results, 2000);
+
+        assertEquals(503, f.status());
+        assertTrue(f.hasRetryAfter());
+        assertEquals(2, f.retryAfterSeconds());
+    }
+
     // ----- empty / degenerate -----
 
     @Test

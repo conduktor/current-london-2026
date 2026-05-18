@@ -280,6 +280,49 @@ class FetchResponseFormatterTest {
         assertFalse(formatter.format("orders", p, 0).hasRetryAfter());
     }
 
+    @Test
+    void throttleOn403IsSuppressed() {
+        // Spec (PROMPT.md, "Acceptance criteria"): 403 must NOT carry Retry-After. A fetch that's both throttled and
+        // unauthorized still produces a 403, but the throttle hint is dropped — Retry-After on a 403 would mislead
+        // the client into expecting retries to eventually succeed.
+        FetchResponseFormatter.PartitionFetch p = err(0, Errors.TOPIC_AUTHORIZATION_FAILED);
+
+        HttpBridgeResponse f = formatter.format("orders", p, 1500);
+
+        assertEquals(403, f.status());
+        assertFalse(f.hasRetryAfter());
+    }
+
+    @Test
+    void throttleOn404IsSuppressed() {
+        FetchResponseFormatter.PartitionFetch p = err(0, Errors.UNKNOWN_TOPIC_OR_PARTITION);
+
+        HttpBridgeResponse f = formatter.format("orders", p, 1500);
+
+        assertEquals(404, f.status());
+        assertFalse(f.hasRetryAfter());
+    }
+
+    @Test
+    void topLevelErrorOn400DropsRetryAfter() {
+        HttpBridgeResponse f =
+            formatter.topLevelError("orders", Errors.INVALID_REQUEST, "missing partition param", 9999);
+
+        assertEquals(400, f.status());
+        assertFalse(f.hasRetryAfter());
+    }
+
+    @Test
+    void throttleOn503IsEmitted() {
+        FetchResponseFormatter.PartitionFetch p = err(0, Errors.LEADER_NOT_AVAILABLE);
+
+        HttpBridgeResponse f = formatter.format("orders", p, 2000);
+
+        assertEquals(503, f.status());
+        assertTrue(f.hasRetryAfter());
+        assertEquals(2, f.retryAfterSeconds());
+    }
+
     // ----- failure body -----
 
     @Test
