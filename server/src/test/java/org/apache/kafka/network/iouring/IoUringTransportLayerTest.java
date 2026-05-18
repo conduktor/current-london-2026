@@ -264,4 +264,65 @@ class IoUringTransportLayerTest {
         TransportLayer iface = newLayer();
         assertNotNull(iface);
     }
+
+    @Test
+    void offerInboundAfterCloseReleasesTheBufImmediately() {
+        // Once close() has set the closed flag, any Netty channelRead that races through
+        // offerInbound must release its buf instead of leaking it into a queue nobody owns.
+        IoUringTransportLayer l = newLayer();
+        l.close();
+
+        ByteBuf buf = Unpooled.buffer(4).writeBytes(new byte[]{1, 2, 3, 4});
+        assertEquals(1, buf.refCnt(), "fresh buf starts with refCnt 1");
+        l.offerInbound(buf);
+        assertEquals(0, buf.refCnt(),
+            "offer-after-close must release — otherwise pooled direct memory bleeds on every disconnect");
+        assertFalse(l.hasBytesBuffered(), "the buf must not have landed in the queue");
+    }
+
+    @Test
+    void concurrentOfferAndCloseNeverLeaksBufs() throws Exception {
+        // Reproduces the race the double-check in offerInbound is there to close:
+        // the Netty event-loop thread may be mid-channelRead (about to offer) while the
+        // Processor thread runs close() (drains the queue). A single read of `closed`
+        // before offer() lets a buf slip into the queue *after* the drain, leaking forever.
+        // We run many iterations to exercise the window deterministically enough to catch
+        // a regression that would re-open the gap.
+        int iterations = 200;
+        java.util.List<ByteBuf> witnesses = new java.util.ArrayList<>(iterations);
+        for (int i = 0; i < iterations; i++) {
+            IoUringTransportLayer l = new IoUringTransportLayer(new EmbeddedChannel(), REMOTE, LOCAL);
+            ByteBuf buf = Unpooled.buffer(4).writeBytes(new byte[]{1, 2, 3, 4});
+            witnesses.add(buf);
+
+            // Two threads, one offering, one closing. Start gate to maximize contention.
+            java.util.concurrent.CountDownLatch start = new java.util.concurrent.CountDownLatch(1);
+            Thread offerer = new Thread(() -> {
+                try {
+                    start.await();
+                } catch (InterruptedException ignored) {
+                    return;
+                }
+                l.offerInbound(buf);
+            });
+            Thread closer = new Thread(() -> {
+                try {
+                    start.await();
+                } catch (InterruptedException ignored) {
+                    return;
+                }
+                l.close();
+            });
+            offerer.start();
+            closer.start();
+            start.countDown();
+            offerer.join();
+            closer.join();
+        }
+
+        for (int i = 0; i < witnesses.size(); i++) {
+            assertEquals(0, witnesses.get(i).refCnt(),
+                "iteration " + i + ": buf must be released regardless of offer/close interleaving");
+        }
+    }
 }

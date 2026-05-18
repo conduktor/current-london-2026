@@ -90,6 +90,13 @@ final class IoUringTransportLayer implements TransportLayer {
     /**
      * Called from the Netty event-loop thread on every {@code channelRead}. The buffer
      * is consumed by subsequent {@link #read(ByteBuffer)} calls on the Processor thread.
+     *
+     * <p>The closed-check is repeated <em>after</em> the offer to close a leak window
+     * with the Processor's {@link #close()}: if Processor sets {@code closed=true} and
+     * drains the queue in between our read of {@code closed} and our {@code offer()},
+     * the buf we just queued would never be released. Re-checking and draining ourselves
+     * keeps the contract that every {@code offerInbound} either delivers the buf or
+     * releases it.
      */
     void offerInbound(ByteBuf buf) {
         if (closed) {
@@ -97,6 +104,12 @@ final class IoUringTransportLayer implements TransportLayer {
             return;
         }
         inbound.offer(buf);
+        if (closed) {
+            ByteBuf b;
+            while ((b = inbound.poll()) != null) {
+                b.release();
+            }
+        }
     }
 
     /**
@@ -246,9 +259,19 @@ final class IoUringTransportLayer implements TransportLayer {
         // direct intermediate copy. The buffer is released by Netty after the channel has
         // flushed it; we only own the writeAndFlush completion listener.
         ByteBuf buf = nettyChannel.alloc().directBuffer(remaining);
-        buf.writeBytes(src);
-        pendingWriteBytes.addAndGet(remaining);
-        nettyChannel.writeAndFlush(buf).addListener(f -> pendingWriteBytes.addAndGet(-remaining));
+        // Anything between allocation and writeAndFlush taking ownership must release the
+        // buf on failure — otherwise the pooled allocator slowly bleeds direct memory.
+        boolean handedOff = false;
+        try {
+            buf.writeBytes(src);
+            pendingWriteBytes.addAndGet(remaining);
+            nettyChannel.writeAndFlush(buf).addListener(f -> pendingWriteBytes.addAndGet(-remaining));
+            handedOff = true;
+        } finally {
+            if (!handedOff) {
+                buf.release();
+            }
+        }
         return remaining;
     }
 
