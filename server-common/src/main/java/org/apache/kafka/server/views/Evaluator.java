@@ -103,20 +103,40 @@ final class Evaluator {
     }
 
     private Object evalLogical(Ast.Binary b, RecordContext ctx) {
+        // PROMPT.md acceptance: "silently skips those records without hiding valid records from
+        // unrelated predicates." Applied inside a single predicate, this means a SKIP coming from
+        // ONE branch must not poison a result the OTHER branch could have answered definitively.
+        // Concretely: `body.bad == "x" || true` is `true`, not SKIP; `body.bad == "x" && false`
+        // is `false`, not SKIP. We achieve that by evaluating both branches and only returning
+        // SKIP when no determinate short-circuit answer is available.
         boolean isAnd = b.op == Ast.Binary.Op.AND;
         Object l = evaluate(b.left, ctx);
-        if (l == SKIP) {
-            return SKIP;
-        }
-        boolean leftTruthy = truthy(l);
-        if (isAnd && !leftTruthy) {
-            return Boolean.FALSE;
-        }
-        if (!isAnd && leftTruthy) {
-            return Boolean.TRUE;
+        // Determinate left-side short-circuit: don't evaluate the right side at all.
+        if (l != SKIP) {
+            boolean leftTruthy = truthy(l);
+            if (isAnd && !leftTruthy) {
+                return Boolean.FALSE;
+            }
+            if (!isAnd && leftTruthy) {
+                return Boolean.TRUE;
+            }
         }
         Object r = evaluate(b.right, ctx);
-        if (r == SKIP) {
+        // Determinate right-side short-circuit: cover the case where left was SKIP. For OR a
+        // truthy right rescues the predicate; for AND a falsy right rescues it.
+        if (r != SKIP) {
+            boolean rightTruthy = truthy(r);
+            if (isAnd && !rightTruthy) {
+                return Boolean.FALSE;
+            }
+            if (!isAnd && rightTruthy) {
+                return Boolean.TRUE;
+            }
+        }
+        // Neither side gave a short-circuit rescue. If either side SKIPped, the combined result
+        // is SKIP (we can't decide); otherwise both sides are determinate non-rescuing values
+        // (AND with both truthy, OR with both falsy) so the right value's truthiness wins.
+        if (l == SKIP || r == SKIP) {
             return SKIP;
         }
         return Boolean.valueOf(truthy(r));

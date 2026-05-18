@@ -540,4 +540,83 @@ class CompiledPredicateTest {
         assertTrue(r.isEmpty(),
                 () -> "out-of-long-range integer must yield SKIP, got " + r);
     }
+
+    // ---------- logical short-circuit symmetry across SKIP (Codex Finding 1) ----------
+
+    /**
+     * Pre-fix the evaluator was asymmetric: {@code true OR (SKIP)} short-circuited to TRUE
+     * because the LEFT operand was determinate-truthy, but {@code (SKIP) OR true} returned SKIP
+     * because evaluation of the left short-circuited the whole operator. CEL/SQL three-valued
+     * logic say both should be TRUE — the operator is commutative on a determinate-true operand.
+     * The asymmetry is fixed by evaluating both branches and letting a determinate-true RIGHT
+     * operand rescue an OR whose left is SKIP.
+     */
+    @Test
+    void orWithSkipLeftAndDeterminateTrueRightShortCircuitsToTrue() {
+        // Left side SKIPs because of out-of-range integer; right side is determinately true.
+        // Per CEL/SQL semantics, OR with a true operand is true regardless of the other side.
+        CompiledPredicate p = compiler.compile("body.bad == 1 || partition == 0");
+        RecordContext ctx = RecordContexts.builder()
+                .body("{\"bad\":999999999999999999999}".getBytes())
+                .partition(0)
+                .build();
+        Optional<Boolean> r = p.evaluate(ctx);
+        assertTrue(r.isPresent() && r.get(),
+                () -> "OR with determinate-true rescue must return TRUE, got " + r);
+    }
+
+    @Test
+    void andWithSkipLeftAndDeterminateFalseRightShortCircuitsToFalse() {
+        // Mirror case for AND: left SKIPs, right is determinately false → result is FALSE.
+        CompiledPredicate p = compiler.compile("body.bad == 1 && partition == 1");
+        RecordContext ctx = RecordContexts.builder()
+                .body("{\"bad\":999999999999999999999}".getBytes())
+                .partition(0)
+                .build();
+        Optional<Boolean> r = p.evaluate(ctx);
+        assertTrue(r.isPresent() && !r.get(),
+                () -> "AND with determinate-false rescue must return FALSE, got " + r);
+    }
+
+    @Test
+    void orWithSkipLeftAndDeterminateFalseRightStillSkips() {
+        // SKIP on the left, determinate FALSE on the right: nothing rescues the OR — result must
+        // be SKIP, not silently false. This guards against the previous test accidentally
+        // becoming "right-side always wins".
+        CompiledPredicate p = compiler.compile("body.bad == 1 || partition == 1");
+        RecordContext ctx = RecordContexts.builder()
+                .body("{\"bad\":999999999999999999999}".getBytes())
+                .partition(0)
+                .build();
+        Optional<Boolean> r = p.evaluate(ctx);
+        assertTrue(r.isEmpty(),
+                () -> "OR with no rescue must remain SKIP, got " + r);
+    }
+
+    @Test
+    void andWithSkipLeftAndDeterminateTrueRightStillSkips() {
+        // AND with determinate-TRUE right doesn't rescue; result stays SKIP.
+        CompiledPredicate p = compiler.compile("body.bad == 1 && partition == 0");
+        RecordContext ctx = RecordContexts.builder()
+                .body("{\"bad\":999999999999999999999}".getBytes())
+                .partition(0)
+                .build();
+        Optional<Boolean> r = p.evaluate(ctx);
+        assertTrue(r.isEmpty(),
+                () -> "AND with no rescue must remain SKIP, got " + r);
+    }
+
+    @Test
+    void leftDeterminateTrueStillShortCircuitsOrWithoutEvaluatingRight() {
+        // Pre-existing behaviour preserved: a determinate-TRUE left makes OR return TRUE without
+        // touching the (possibly-SKIPpy) right side.
+        CompiledPredicate p = compiler.compile("partition == 0 || body.bad == 1");
+        RecordContext ctx = RecordContexts.builder()
+                .body("{\"bad\":999999999999999999999}".getBytes())
+                .partition(0)
+                .build();
+        Optional<Boolean> r = p.evaluate(ctx);
+        assertTrue(r.isPresent() && r.get(),
+                () -> "OR with determinate-true LEFT must short-circuit to TRUE, got " + r);
+    }
 }
