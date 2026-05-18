@@ -827,9 +827,11 @@ class KafkaHttpServerIntegrationTest {
         assertNotNull(active, "ActiveSseStreams gauge must be registered");
 
         // Fire several HEAD probes — each must return 200 with SSE headers and zero body.
+        // Query must be valid (partition + offset) so the parse step preceding the HEAD short-circuit
+        // does not reject it — see RFC 9110 §9.3.2: HEAD response must match equivalent GET.
         for (int i = 0; i < 5; i++) {
             org.eclipse.jetty.client.ContentResponse head = client.newRequest(
-                    url("/v1/topics/orders/records?partition=0"))
+                    url("/v1/topics/orders/records?partition=0&offset=0"))
                 .method(HttpMethod.HEAD)
                 .headers(h -> h.put("Accept", "text/event-stream"))
                 .timeout(5, TimeUnit.SECONDS)
@@ -1189,6 +1191,25 @@ class KafkaHttpServerIntegrationTest {
         assertFalse(allow.contains("TRACE"), "Allow header must not advertise TRACE, got: " + allow);
         assertTrue(allow.contains("GET"), "Allow header must advertise GET, got: " + allow);
         assertTrue(allow.contains("POST"), "Allow header must advertise POST, got: " + allow);
+    }
+
+    @Test
+    void headOnSseWithMalformedQueryReturns400LikeEquivalentGet() throws Exception {
+        // RFC 9110 §9.3.2: HEAD response is identical to equivalent GET except no payload body. A malformed
+        // `?partition=foo` on the SSE branch must return 400 for HEAD just as it does for GET — otherwise a
+        // monitoring tool that uses HEAD as a cheap probe sees 200 even when the URI is invalid.
+        ContentResponse get = client.newRequest(url("/v1/topics/orders/records?stream=true&partition=foo"))
+            .method(HttpMethod.GET)
+            .headers(h -> h.put("Accept", "text/event-stream"))
+            .send();
+        ContentResponse head = client.newRequest(url("/v1/topics/orders/records?stream=true&partition=foo"))
+            .method(HttpMethod.HEAD)
+            .headers(h -> h.put("Accept", "text/event-stream"))
+            .send();
+
+        assertEquals(400, get.getStatus());
+        assertEquals(get.getStatus(), head.getStatus(),
+            "HEAD must return the same status as GET on malformed SSE query (RFC 9110 §9.3.2)");
     }
 
     @Test
