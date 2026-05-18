@@ -989,6 +989,12 @@ project(':server') {
     implementation (libs.jettyServlet) {
       exclude module: 'slf4j-api'
     }
+    implementation (libs.jettyWebSocketServer) {
+      exclude module: 'slf4j-api'
+    }
+    implementation (libs.jettyWebSocketApi) {
+      exclude module: 'slf4j-api'
+    }
 
     testImplementation project(':clients').sourceSets.test.output
 
@@ -996,6 +1002,9 @@ project(':server') {
     testImplementation libs.junitJupiter
     testImplementation testLog4j2Libs
     testImplementation libs.jettyClient
+    testImplementation (libs.jettyWebSocketClient) {
+      exclude module: 'slf4j-api'
+    }
 
     testRuntimeOnly runtimeTestLibs
   }
