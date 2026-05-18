@@ -117,9 +117,14 @@ public final class RuleEngine {
             boolean matched;
             try {
                 matched = rule.compiled().evalBoolean(activation::get);
-            } catch (RuntimeException e) {
+            } catch (Throwable t) {
+                // Catch Throwable, not just RuntimeException: a pathological CEL
+                // expression can raise StackOverflowError (deep comprehensions),
+                // OutOfMemoryError (huge string ops), or other Error subclasses.
+                // The request thread must never die because of a buggy rule —
+                // log loudly and treat the rule as ALLOW, then move to the next.
                 LOG.warn("rule '{}' failed open due to evaluation error on apiKey {}: {}",
-                    rule.id(), apiKey, e.toString());
+                    rule.id(), apiKey, t.toString());
                 continue;
             }
             if (matched) {
@@ -127,5 +132,29 @@ public final class RuleEngine {
             }
         }
         return RuleDecision.ALLOW;
+    }
+
+    /**
+     * Cheap fast-path guard: returns {@code true} only if the active snapshot
+     * has at least one DENY rule that <em>could</em> apply to this request.
+     * Callers use this to skip allocating an activation supplier closure on
+     * the request hot path when there is no possible deny outcome.
+     *
+     * <p>Specifically, returns {@code false} when either:
+     * <ul>
+     *   <li>the {@code clientId} is the broker-internal exemption prefix
+     *       (see {@link #INTERNAL_CLIENT_ID_PREFIX}), or</li>
+     *   <li>no DENY rule in the active snapshot targets this API key.</li>
+     * </ul>
+     *
+     * <p>This method makes no allocations and does no reflection. Wire it
+     * directly into {@code KafkaApis.handle()} as the gate around the
+     * activation-supplier lambda.
+     */
+    public boolean mayDeny(ApiKeys apiKey, String clientId) {
+        if (clientId != null && !clientId.isEmpty() && clientId.startsWith(INTERNAL_CLIENT_ID_PREFIX)) {
+            return false;
+        }
+        return active.get().hasDenyRuleFor(apiKey.id);
     }
 }

@@ -167,18 +167,21 @@ class KafkaApis(val requestChannel: RequestChannel,
       }
 
       // CEL rule gate. Sits before any per-api handler so a single interception point covers every
-      // ApiKey. The fast path (no DENY rule targets this api key) is one bitset bit-test inside
-      // RuleEngine.evaluate; the activation supplier is only invoked when a rule actually fires.
-      val ruleDecision = ruleEngine.evaluate(
-        request.header.apiKey,
-        request.header.clientId,
-        () => ApiMessageActivation.from(request.body[AbstractRequest].data()))
-      if (ruleDecision.denied) {
-        val denyError = Errors.forCode(ruleDecision.errorCode.toShort)
-        info(s"CEL rule '${ruleDecision.denyingRuleId}' denied ${request.header.apiKey} from " +
-          s"clientId='${request.header.clientId}' with ${denyError.name}")
-        requestHelper.sendErrorResponseMaybeThrottle(request, denyError.exception)
-        return
+      // ApiKey. The fast path on a request with no targeting rule (the common case) is
+      // RuleEngine.mayDeny — one bitset bit-test, no closure allocation, no body decode. The
+      // activation supplier closure is constructed only when mayDeny returns true.
+      if (ruleEngine.mayDeny(request.header.apiKey, request.header.clientId)) {
+        val ruleDecision = ruleEngine.evaluate(
+          request.header.apiKey,
+          request.header.clientId,
+          () => ApiMessageActivation.from(request.body[AbstractRequest].data()))
+        if (ruleDecision.denied) {
+          val denyError = Errors.forCode(ruleDecision.errorCode.toShort)
+          info(s"CEL rule '${ruleDecision.denyingRuleId}' denied ${request.header.apiKey} from " +
+            s"clientId='${request.header.clientId}' with ${denyError.name}")
+          requestHelper.sendErrorResponseMaybeThrottle(request, denyError.exception)
+          return
+        }
       }
 
       request.header.apiKey match {

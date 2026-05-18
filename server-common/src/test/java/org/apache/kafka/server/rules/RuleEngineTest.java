@@ -307,6 +307,65 @@ public class RuleEngineTest {
     }
 
     @Test
+    public void buggyPredicateThrowingErrorAlsoFailsOpenAndDoesNotKillRequestThread() {
+        // CEL is hand-rolled and a pathological program could in principle raise
+        // an Error (e.g. StackOverflowError on a deep comprehension), not just a
+        // RuntimeException. The engine must catch Throwable so the request
+        // thread is never killed by a buggy rule. We simulate via a CelProgram
+        // Mockito mock that raises an Error inside evalBoolean.
+        org.apache.kafka.server.rules.cel.CelProgram crashy =
+            org.mockito.Mockito.mock(org.apache.kafka.server.rules.cel.CelProgram.class);
+        org.mockito.Mockito.when(crashy.evalBoolean(org.mockito.ArgumentMatchers.any()))
+            .thenThrow(new StackOverflowError("simulated runaway recursion"));
+        Rule throwing = new Rule(
+            "throwy",
+            Collections.singletonList(ApiKeys.METADATA),
+            RuleAction.DENY,
+            "true",
+            7,
+            crashy);
+        RuleEngine engine = new RuleEngine();
+        engine.install(new RuleSetBuilder()
+            .put(throwing)
+            .put(denyRule("after", ApiKeys.METADATA, "true", 99))
+            .build());
+        RuleDecision d = engine.evaluate(
+            ApiKeys.METADATA, "x", () -> Collections.singletonMap("request", Collections.emptyMap()));
+        assertTrue(d.denied());
+        assertEquals(99, d.errorCode());
+        assertEquals("after", d.denyingRuleId());
+    }
+
+    @Test
+    public void mayDenyIsFalseWhenNoRuleTargetsTheApiKey() {
+        RuleEngine engine = new RuleEngine();
+        engine.install(new RuleSetBuilder()
+            .put(denyRule("fetch-only", ApiKeys.FETCH, "true", 7))
+            .build());
+        assertFalse(engine.mayDeny(ApiKeys.METADATA, "client"),
+            "no rule targets METADATA — gate must not allocate on the request path");
+        assertTrue(engine.mayDeny(ApiKeys.FETCH, "client"),
+            "rule targets FETCH — gate opens the slow path");
+    }
+
+    @Test
+    public void mayDenyIsFalseForInternalClientIdEvenWhenRuleTargetsApiKey() {
+        RuleEngine engine = new RuleEngine();
+        engine.install(new RuleSetBuilder()
+            .put(denyRule("deny-all", ApiKeys.METADATA, "true", 7))
+            .build());
+        assertFalse(engine.mayDeny(ApiKeys.METADATA,
+                RuleEngine.INTERNAL_CLIENT_ID_PREFIX + "self"),
+            "the internal-client bypass must short-circuit the gate too");
+    }
+
+    @Test
+    public void mayDenyIsFalseOnEmptyEngine() {
+        assertFalse(new RuleEngine().mayDeny(ApiKeys.METADATA, "client"));
+        assertFalse(new RuleEngine().mayDeny(ApiKeys.METADATA, null));
+    }
+
+    @Test
     public void buggyPredicateFailsOpenAndDoesNotBlockSubsequentRules() {
         // A predicate that throws at evaluation (e.g. divide-by-zero) must
         // not crash the request path. The engine treats the throwing rule

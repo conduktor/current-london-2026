@@ -70,10 +70,15 @@ import java.util.concurrent.atomic.AtomicLong
 class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
                                 ruleEngine: RuleEngine,
                                 topicPartition: TopicPartition =
-                                  new TopicPartition(GovernanceTopic.NAME, 0))
+                                  new TopicPartition(GovernanceTopic.NAME, 0),
+                                injectedLoader: GovernanceLoader = null)
   extends Logging {
 
-  private val loader = new GovernanceLoader(ruleEngine)
+  // Visible for tests so a Mockito spy/mock can simulate a poisoned record.
+  // Production callers leave this null and get the default loader.
+  private[server] val loader: GovernanceLoader =
+    if (injectedLoader != null) injectedLoader
+    else new GovernanceLoader(ruleEngine)
 
   // Per-partition cursor of the last offset we already replayed. Records at
   // offsets <= this cursor are skipped. Starts at -1 so a brand-new log
@@ -166,12 +171,25 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
           val recIt = batch.iterator()
           while (recIt.hasNext) {
             val rec = recIt.next()
-            val key = bytes(rec.key())
-            val value = bytes(rec.value())
-            val keyStr =
-              if (key == null) null
-              else new String(key, StandardCharsets.UTF_8)
-            loader.apply(keyStr, value)
+            // Per-record fault isolation: a single corrupt record must not halt
+            // the drain. If loader.apply (or key/value extraction) throws, log
+            // the failure and advance past the record — otherwise nextOffset
+            // never moves past the bad record and the scheduler busy-loops on
+            // the same poison forever. The next drain picks up records after
+            // it. The previously-installed RuleSet is unaffected: GovernanceLoader
+            // only commits on the outer drainOnce, not per-record.
+            try {
+              val key = bytes(rec.key())
+              val value = bytes(rec.value())
+              val keyStr =
+                if (key == null) null
+                else new String(key, StandardCharsets.UTF_8)
+              loader.apply(keyStr, value)
+            } catch {
+              case t: Throwable =>
+                warn(s"skipping poisoned __governance record at offset " +
+                  s"${rec.offset()}: ${t.toString}")
+            }
             replayed += 1
           }
         }

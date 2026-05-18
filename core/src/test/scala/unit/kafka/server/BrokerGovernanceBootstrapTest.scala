@@ -22,13 +22,14 @@ import org.apache.kafka.common.TopicPartition
 import org.apache.kafka.common.compress.Compression
 import org.apache.kafka.common.protocol.ApiKeys
 import org.apache.kafka.common.record.{MemoryRecords, SimpleRecord}
-import org.apache.kafka.server.rules.{GovernanceTopic, RuleDecision, RuleEngine}
+import org.apache.kafka.server.rules.{GovernanceLoader, GovernanceTopic, RuleDecision, RuleEngine}
 import org.apache.kafka.server.storage.log.FetchIsolation
 import org.apache.kafka.storage.internals.log.{FetchDataInfo, LogOffsetMetadata}
 
 import org.junit.jupiter.api.Assertions._
 import org.junit.jupiter.api.Test
-import org.mockito.Mockito.{mock, when}
+import org.mockito.ArgumentMatchers.{any, anyString}
+import org.mockito.Mockito.{doAnswer, doThrow, mock, when}
 
 import java.nio.charset.StandardCharsets
 import java.util.Collections
@@ -141,6 +142,48 @@ class BrokerGovernanceBootstrapTest {
     val second = boot.drainOnce()
     assertEquals(0L, second, "second drain must not double-count records already replayed")
     assertEquals(1, engine.active().size(), "rule set unchanged")
+  }
+
+  @Test
+  def drainOncePoisonedRecordIsSkippedAndDrainProceeds(): Unit = {
+    // If loader.apply throws (e.g. an unexpected RuntimeException slips past
+    // the loader's own envelope catch, or the record extraction itself blows
+    // up), the bootstrap MUST skip the bad record and continue. Otherwise
+    // nextOffset stalls and every subsequent drainOnce re-reads — and re-
+    // throws on — the same poison forever.
+    val rm = mock(classOf[ReplicaManager])
+    val log = mock(classOf[UnifiedLog])
+    val engine = new RuleEngine()
+    val spyLoader = mock(classOf[GovernanceLoader])
+    // Default to a no-op (instead of calling-real-method, which would NPE
+    // because the spy is not constructed with a backing engine).
+    doAnswer(_ => null).when(spyLoader).apply(anyString(), any())
+    doAnswer(_ => null).when(spyLoader).commit()
+    // Second record poisons the loader; first and third are fine.
+    doThrow(new RuntimeException("poison"))
+      .when(spyLoader).apply(org.mockito.ArgumentMatchers.eq("r2"), any())
+
+    when(rm.getLog(tp)).thenReturn(Some(log))
+    when(log.logStartOffset).thenReturn(0L)
+    when(log.logEndOffset).thenReturn(3L)
+    when(log.read(0L, 1024 * 1024, FetchIsolation.LOG_END, true)).thenReturn(
+      recordsAt(0L,
+        new SimpleRecord("r1".getBytes(StandardCharsets.UTF_8), envelope("true", ApiKeys.METADATA, 7)),
+        new SimpleRecord("r2".getBytes(StandardCharsets.UTF_8), envelope("true", ApiKeys.FETCH, 11)),
+        new SimpleRecord("r3".getBytes(StandardCharsets.UTF_8), envelope("true", ApiKeys.CREATE_TOPICS, 13))))
+
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp, spyLoader)
+    val n = boot.drainOnce()
+
+    // All three records were *visited* (one threw, two applied) — the loop
+    // does not bail on the throw; replayed count includes the poison.
+    assertEquals(3L, n, "the poisoned record must not stall replay")
+
+    // A second drainOnce on the same log MUST be a no-op: the cursor advanced
+    // past the poison, so the bug doesn't loop forever.
+    when(log.logEndOffset).thenReturn(3L)
+    val second = boot.drainOnce()
+    assertEquals(0L, second, "cursor must have advanced past the poison")
   }
 
   @Test
