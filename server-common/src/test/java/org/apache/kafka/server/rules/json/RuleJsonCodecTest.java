@@ -229,12 +229,24 @@ public class RuleJsonCodecTest {
         // surfaces to the client). Reject at the parse boundary so the
         // operator sees the misconfiguration replayed as a clear envelope
         // error rather than as a silent fail-open at request time.
+        //
+        // Round-8 task #99 strengthens this: the rejection must name
+        // Errors.NONE specifically — pinning the *semantic* axis ("NONE means
+        // fail-open"), not the *syntactic* coincidence ("the wire range
+        // happens to start at 1"). If a future refactor ever relaxes the
+        // lower bound (e.g. to allow signed Kafka error codes), this test
+        // pins the NONE-identity check that prevents 0 from slipping
+        // through the known-Errors equality check (which would happily
+        // round-trip Errors.NONE).
         String json = "{\"apiKeys\":[\"METADATA\"],\"action\":\"DENY\","
             + "\"when\":\"true\",\"errorCode\":0}";
         RuleEnvelopeException ex = assertThrows(RuleEnvelopeException.class,
             () -> RuleJsonCodec.decode("k", json.getBytes(StandardCharsets.UTF_8)));
         assertTrue(ex.getMessage().contains("errorCode"),
             "error must name the offending field: " + ex.getMessage());
+        assertTrue(ex.getMessage().contains("NONE"),
+            "error must name Errors.NONE so the rejection is anchored on the "
+                + "semantic axis, not the syntactic range bound: " + ex.getMessage());
     }
 
     @Test

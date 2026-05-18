@@ -341,6 +341,25 @@ public final class RuleJsonCodec {
             throw new RuleEnvelopeException("'" + FIELD_ERROR_CODE + "' must be an integer");
         }
         int code = n.asInt();
+        // Reject Errors.NONE explicitly, before the range bound, on its own
+        // semantic axis. Today the `code < 1` bound below also rejects 0, but
+        // that conflates "0 is Errors.NONE" (the actual reason) with "the
+        // wire-protocol range starts at 1" (a coincidence at the lower bound).
+        // The known-Errors equality check at the tail of this method does NOT
+        // catch 0 — Errors.forCode((short) 0) returns Errors.NONE which round-
+        // trips cleanly through `code() != code`. So if a future refactor ever
+        // relaxes the lower bound (e.g. to allow signed Kafka error codes for
+        // some controller-only API), 0 would silently pass and we'd be back to
+        // the original silent fail-open hazard. Pin the rejection on the NONE
+        // identity so it survives that refactor.
+        if (code == Errors.NONE.code()) {
+            throw new RuleEnvelopeException(
+                "'" + FIELD_ERROR_CODE + "' must not be " + Errors.NONE.code()
+                    + " (Errors.NONE) — a DENY rule that returns \"no error\" "
+                    + "fires the rule but fails the request open (no exception "
+                    + "surfaces to the client). Pick a non-NONE code from "
+                    + "org.apache.kafka.common.protocol.Errors.");
+        }
         if (code < 1 || code > Short.MAX_VALUE) {
             throw new RuleEnvelopeException(
                 "'" + FIELD_ERROR_CODE + "' must be in [1, " + Short.MAX_VALUE
