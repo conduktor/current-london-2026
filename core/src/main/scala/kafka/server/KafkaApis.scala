@@ -62,6 +62,8 @@ import org.apache.kafka.coordinator.share.ShareCoordinator
 import org.apache.kafka.server.ClientMetricsManager
 import org.apache.kafka.server.authorizer._
 import org.apache.kafka.server.common.{GroupVersion, RequestLocal, TransactionVersion}
+import org.apache.kafka.server.rules.RuleEngine
+import org.apache.kafka.server.rules.extract.ApiMessageActivation
 import org.apache.kafka.server.share.context.ShareFetchContext
 import org.apache.kafka.server.share.{ErroneousAndValidPartitionData, SharePartitionKey}
 import org.apache.kafka.server.share.acknowledge.ShareAcknowledgementBatch
@@ -104,7 +106,8 @@ class KafkaApis(val requestChannel: RequestChannel,
                 time: Time,
                 val tokenManager: DelegationTokenManager,
                 val apiVersionManager: ApiVersionManager,
-                val clientMetricsManager: ClientMetricsManager
+                val clientMetricsManager: ClientMetricsManager,
+                val ruleEngine: RuleEngine = new RuleEngine()
 ) extends ApiRequestHandler with Logging {
 
   type FetchResponseStats = Map[TopicPartition, RecordValidationStats]
@@ -161,6 +164,21 @@ class KafkaApis(val requestChannel: RequestChannel,
         // The socket server will reject APIs which are not exposed in this scope and close the connection
         // before handing them to the request handler, so this path should not be exercised in practice
         throw new IllegalStateException(s"API ${request.header.apiKey} with version ${request.header.apiVersion} is not enabled")
+      }
+
+      // CEL rule gate. Sits before any per-api handler so a single interception point covers every
+      // ApiKey. The fast path (no DENY rule targets this api key) is one bitset bit-test inside
+      // RuleEngine.evaluate; the activation supplier is only invoked when a rule actually fires.
+      val ruleDecision = ruleEngine.evaluate(
+        request.header.apiKey,
+        request.header.clientId,
+        () => ApiMessageActivation.from(request.body[AbstractRequest].data()))
+      if (ruleDecision.denied) {
+        val denyError = Errors.forCode(ruleDecision.errorCode.toShort)
+        info(s"CEL rule '${ruleDecision.denyingRuleId}' denied ${request.header.apiKey} from " +
+          s"clientId='${request.header.clientId}' with ${denyError.name}")
+        requestHelper.sendErrorResponseMaybeThrottle(request, denyError.exception)
+        return
       }
 
       request.header.apiKey match {

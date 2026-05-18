@@ -86,6 +86,8 @@ import org.apache.kafka.server.authorizer.{Action, AuthorizationResult, Authoriz
 import org.apache.kafka.server.common.{FeatureVersion, FinalizedFeatures, GroupVersion, KRaftVersion, MetadataVersion, RequestLocal, TransactionVersion}
 import org.apache.kafka.server.config.{KRaftConfigs, ReplicationConfigs, ServerConfigs, ServerLogConfigs}
 import org.apache.kafka.server.metrics.ClientMetricsTestUtils
+import org.apache.kafka.server.rules.{Rule, RuleAction, RuleEngine, RuleSetBuilder}
+import org.apache.kafka.server.rules.cel.CelCompiler
 import org.apache.kafka.server.share.{CachedSharePartition, ErroneousAndValidPartitionData}
 import org.apache.kafka.server.quota.ThrottleCallback
 import org.apache.kafka.server.share.acknowledge.ShareAcknowledgementBatch
@@ -161,7 +163,8 @@ class KafkaApisTest extends Logging {
     authorizer: Option[Authorizer] = None,
     configRepository: ConfigRepository = new MockConfigRepository(),
     overrideProperties: Map[String, String] = Map.empty,
-    featureVersions: Seq[FeatureVersion] = Seq.empty
+    featureVersions: Seq[FeatureVersion] = Seq.empty,
+    ruleEngine: RuleEngine = new RuleEngine()
   ): KafkaApis = {
 
     val properties = TestUtils.createBrokerConfig(brokerId)
@@ -208,7 +211,8 @@ class KafkaApisTest extends Logging {
       time = time,
       tokenManager = null,
       apiVersionManager = apiVersionManager,
-      clientMetricsManager = clientMetricsManager)
+      clientMetricsManager = clientMetricsManager,
+      ruleEngine = ruleEngine)
   }
 
   private def setupFeatures(featureVersions: Seq[FeatureVersion]): Unit = {
@@ -229,6 +233,44 @@ class KafkaApisTest extends Logging {
 
       case _ => throw new IllegalStateException("Test must set an instance of KRaftMetadataCache")
     }
+  }
+
+  @Test
+  def testCelRuleGateDeniesMatchedRequestBeforeApiHandler(): Unit = {
+    // End-to-end gate test: install a DENY rule whose CEL expression evaluates to true on a
+    // MetadataRequest carrying a topic, hand the request to KafkaApis.handle(), and assert that
+    // (1) a response is sent on the request channel — the gate short-circuited, (2) it is a
+    // MetadataResponse, and (3) the topic's errorCode reflects the rule's configured errorCode.
+    // The errorCode path goes: ruleEngine.evaluate → RuleDecision.deny(errorCode, ruleId) →
+    // Errors.forCode(...).exception → AbstractRequest.getErrorResponse → MetadataResponse.
+    val engine = new RuleEngine()
+    // Use a simple top-level boolean field to keep the test independent of CEL stdlib
+    // breadth — every MetadataRequestData carries allowAutoTopicCreation, which defaults true.
+    val whenSrc = "allowAutoTopicCreation == true"
+    val compiled = CelCompiler.compile(whenSrc)
+    val rule = new Rule(
+      "deny-metadata-when-topics-present",
+      Collections.singletonList(ApiKeys.METADATA),
+      RuleAction.DENY,
+      whenSrc,
+      Errors.POLICY_VIOLATION.code.toInt,
+      compiled)
+    val ruleSet = new RuleSetBuilder().put(rule).build()
+    engine.install(ruleSet)
+
+    val metadataRequestData = new MetadataRequestData().setTopics(
+      Collections.singletonList(new MetadataRequestData.MetadataRequestTopic().setName("t1")))
+    val metadataRequest = new MetadataRequest(metadataRequestData, ApiKeys.METADATA.latestVersion)
+    val request = buildRequest(metadataRequest)
+
+    kafkaApis = createKafkaApis(ruleEngine = engine)
+    kafkaApis.handle(request, RequestLocal.noCaching)
+
+    val response = verifyNoThrottling[MetadataResponse](request)
+    val topics = response.data.topics
+    assertEquals(1, topics.size)
+    assertEquals(Errors.POLICY_VIOLATION.code, topics.iterator.next.errorCode,
+      "Topic in response should carry the rule's configured errorCode")
   }
 
   @Test
