@@ -266,22 +266,25 @@ class ViewFilterTest {
     }
 
     @Test
-    void commitAbortControlBatchesPassThroughAsEmptyBatchesForLsoAdvance() {
+    void commitAbortControlBatchesPassThroughIntactSoReadCommittedConsumersTrackTransactions() {
         // PROMPT.md acceptance criterion (line 40) and functional test scenario (line 48):
-        // READ_COMMITTED view consumers must observe correct isolation — COMMIT/ABORT control
-        // batches are emitted as empty batches so the consumer's LSO advances past the
-        // transaction boundary. ViewFilter implements this by returning RETAIN_EMPTY for every
-        // batch (including control) and never running predicates against control records.
-        // Test both COMMIT and ABORT to cover the two isolation outcomes.
+        // READ_COMMITTED view consumers must observe correct isolation. Control batches
+        // (COMMIT/ABORT end-transaction markers) MUST propagate through the filter with their
+        // marker RECORD intact — not just the batch header. The consumer's READ_COMMITTED logic
+        // (CompletedFetch.containsAbortMarker) iterates the control batch's records and parses
+        // the first record's key for ControlRecordType.ABORT to clear aborted-producer state.
+        // Stripping the record (e.g. via RETAIN_EMPTY + shouldRetainRecord=false) leaves the
+        // consumer unable to distinguish ABORT from "no terminator yet", which leaks aborted
+        // records to applications. Test both COMMIT and ABORT to cover both isolation outcomes.
         CompiledPredicate p = compiler.compile("body.color == 'red'");
         for (ControlRecordType type : List.of(ControlRecordType.COMMIT, ControlRecordType.ABORT)) {
             MemoryRecords output = ViewFilter.apply(p, withDataAndControlMarker(type), 0);
 
             // The transactional data batch had one "red" record at offset 0 plus a "blue" at 1;
-            // only the red one survives the predicate. The control batch at offset 2 carries no
-            // user data so it produces zero records but the batch header itself must remain.
-            assertEquals(List.of(0L), offsetsOf(output),
-                    "only red data record survives predicate (type=" + type + ")");
+            // only the red one survives the predicate. The control batch at offset 2 carries a
+            // single COMMIT/ABORT marker record that must ride through filtering unchanged.
+            assertEquals(List.of(0L, 2L), offsetsOf(output),
+                    "red data record + control marker record both survive (type=" + type + ")");
 
             long maxLastOffset = -1L;
             boolean sawControlBatch = false;
@@ -290,13 +293,25 @@ class ViewFilterTest {
                 maxLastOffset = Math.max(maxLastOffset, batch.lastOffset());
                 if (batch.isControlBatch()) {
                     sawControlBatch = true;
-                    // Control batch must remain empty after filtering (filterTo writes the header
-                    // through; no records).
-                    assertFalse(batch.iterator().hasNext(),
-                            "control batch must carry no user records (type=" + type + ")");
-                    // Producer-id / producer-epoch must round-trip — the consumer's
-                    // OffsetForLeaderEpoch and LSO logic both key off these. If the filter
-                    // accidentally rewrote them the consumer would mis-track the transaction.
+                    // The marker record itself must survive so the consumer can read it. This
+                    // mirrors the iteration in CompletedFetch.containsAbortMarker:
+                    //   Iterator<Record> it = batch.iterator();
+                    //   assert it.hasNext();
+                    //   ControlRecordType.parse(it.next().key())  -> COMMIT or ABORT
+                    Iterator<Record> it = batch.iterator();
+                    assertTrue(it.hasNext(),
+                            "control batch must retain its marker record so the consumer can "
+                                    + "detect transaction outcome (type=" + type + ")");
+                    Record marker = it.next();
+                    assertEquals(type, ControlRecordType.parse(marker.key()),
+                            "control record key must round-trip to original marker type (type="
+                                    + type + ")");
+                    assertFalse(it.hasNext(),
+                            "control batch carries exactly one marker record (type=" + type + ")");
+                    // Producer-id / producer-epoch / transactional flag must round-trip — the
+                    // consumer's READ_COMMITTED state machine keys off these to scope ABORTs to
+                    // the right producer. A filter that rewrites them would silently corrupt
+                    // every consumer's aborted-producers set.
                     assertEquals(73L, batch.producerId(),
                             "control batch producerId must survive filter (type=" + type + ")");
                     assertEquals((short) 0, batch.producerEpoch(),

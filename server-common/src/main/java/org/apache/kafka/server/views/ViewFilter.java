@@ -145,18 +145,26 @@ public final class ViewFilter {
 
         @Override
         protected BatchRetentionResult checkBatchRetention(RecordBatch batch) {
-            // RETAIN_EMPTY for every batch — data and control. The header carries the source
-            // (baseOffset, lastOffset) so the consumer advances even through a fully-filtered
-            // span. Control batches are not record-evaluated; filterTo simply writes their
-            // empty header through.
+            // RETAIN_EMPTY for every batch — data and control. For data batches, an empty header
+            // carries the source (baseOffset, lastOffset) so the consumer advances even through a
+            // fully-filtered span. For control batches we *also* retain the marker record inside
+            // via shouldRetainRecord — see the comment there for why an empty control header
+            // breaks READ_COMMITTED isolation.
             return new BatchRetentionResult(BatchRetention.RETAIN_EMPTY, false);
         }
 
         @Override
         protected boolean shouldRetainRecord(RecordBatch batch, Record record) {
-            // Never evaluate predicates against control batches (they carry no user payload).
+            // Control batches (COMMIT/ABORT end-transaction markers) must propagate through the
+            // filter with their record payload intact. The consumer's READ_COMMITTED logic walks
+            // the first record of a control batch and parses its key for ControlRecordType.ABORT
+            // (see CompletedFetch.containsAbortMarker); a stripped marker is indistinguishable
+            // from "no transaction terminator", so aborted producer-ids leak as committed and
+            // their records are surfaced to applications. Predicates are still never evaluated
+            // against control records — they carry no user payload — but the record itself rides
+            // through unchanged.
             if (batch.isControlBatch()) {
-                return false;
+                return true;
             }
             RecordContext ctx = contextFor(batch, record, partition);
             Optional<Boolean> verdict = predicate.evaluate(ctx);
