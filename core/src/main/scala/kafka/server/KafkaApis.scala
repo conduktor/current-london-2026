@@ -1612,6 +1612,27 @@ class KafkaApis(val requestChannel: RequestChannel,
       offsetRequest.topics.forEach(t => t.setName(tenantCtx.toPhysical(t.name)))
     }
 
+    // duplicatePartitions was computed once in the ListOffsetsRequest
+    // constructor over the *logical* names the client sent. After the IN
+    // rewrite the topic names in the request body no longer match those keys,
+    // so ReplicaManager.fetchOffset (which compares against the post-rewrite
+    // names) would never flag a tenant's duplicate partition and the request
+    // would slip past INVALID_REQUEST. Recompute the set from the current
+    // (physical) shape when a rewrite happened; otherwise keep the cached one.
+    val duplicatePartitions: Set[TopicPartition] = if (tenantScoped) {
+      val seen = scala.collection.mutable.Set[TopicPartition]()
+      val dups = scala.collection.mutable.Set[TopicPartition]()
+      offsetRequest.topics.forEach { t =>
+        t.partitions.forEach { p =>
+          val tp = new TopicPartition(t.name, p.partitionIndex)
+          if (!seen.add(tp)) dups.add(tp)
+        }
+      }
+      dups.toSet
+    } else {
+      offsetRequest.duplicatePartitions().asScala.toSet
+    }
+
     val (authorizedRequestInfo, unauthorizedRequestInfo) = authHelper.partitionSeqByAuthorized(request.context,
         DESCRIBE, TOPIC, offsetRequest.topics.asScala.toSeq)(_.name)
 
@@ -1642,7 +1663,7 @@ class KafkaApis(val requestChannel: RequestChannel,
     if (authorizedRequestInfo.isEmpty) {
       sendResponseCallback(Seq.empty)
     } else {
-      replicaManager.fetchOffset(authorizedRequestInfo, offsetRequest.duplicatePartitions().asScala,
+      replicaManager.fetchOffset(authorizedRequestInfo, duplicatePartitions,
         offsetRequest.isolationLevel(), offsetRequest.replicaId(), clientId, correlationId, version,
         buildErrorResponse, sendResponseCallback, offsetRequest.timeoutMs())
     }

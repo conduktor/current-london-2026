@@ -11965,8 +11965,8 @@ class KafkaApisTest extends Logging {
     val response = verifyNoThrottling[DescribeGroupsResponse](request)
     val errorCodes = response.data.groups.asScala.map(_.errorCode)
     assertTrue(errorCodes.nonEmpty, "expected at least one group in the synthesized error response")
-    assertTrue(errorCodes.forall(c => c != Errors.NONE.code),
-      "tenant principal calling a non-v1 API must be refused at dispatch without reaching the handler")
+    assertTrue(errorCodes.forall(_ == Errors.TOPIC_AUTHORIZATION_FAILED.code),
+      "tenant principal calling a non-v1 API must be refused at dispatch with TOPIC_AUTHORIZATION_FAILED")
     verify(groupCoordinator, never()).describeGroups(any[RequestContext](), any[util.List[String]]())
   }
 
@@ -12674,8 +12674,8 @@ class KafkaApisTest extends Logging {
     val response = verifyNoThrottling[DescribeGroupsResponse](request)
     val errorCodes = response.data.groups.asScala.map(_.errorCode)
     assertTrue(errorCodes.nonEmpty, "expected at least one group in the synthesized error response")
-    assertTrue(errorCodes.forall(c => c != Errors.NONE.code),
-      "privileged caller on tenant listener must be refused on disallowed APIs without reaching the handler")
+    assertTrue(errorCodes.forall(_ == Errors.TOPIC_AUTHORIZATION_FAILED.code),
+      "privileged caller on tenant listener must be refused with TOPIC_AUTHORIZATION_FAILED on disallowed APIs")
     verify(groupCoordinator, never()).describeGroups(any[RequestContext](), any[util.List[String]]())
   }
 
@@ -13320,6 +13320,55 @@ class KafkaApisTest extends Logging {
     assertFalse(byName.contains("acme.orders"),
       "physical topic name must never leak to the tenant on the wire")
     assertEquals(42L, byName("orders").partitions.asScala.head.offset)
+  }
+
+  @Test
+  def testListOffsetsTenantDuplicatePartitionsFlaggedAfterRewrite(): Unit = {
+    // The ListOffsetsRequest constructor caches duplicatePartitions over the
+    // ORIGINAL (logical) names the client sent. The handler then rewrites topic
+    // names in place to physical before passing them to ReplicaManager, which
+    // checks each post-rewrite TopicPartition against that cached set. Without
+    // recomputation the set never matches and tenant duplicates silently slip
+    // past the INVALID_REQUEST contract that stock clients see. This test
+    // pins the recomputed-on-physical behaviour.
+    val targetTimes = util.Arrays.asList(new ListOffsetsTopic()
+      .setName("orders")
+      .setPartitions(util.Arrays.asList(
+        new ListOffsetsPartition()
+          .setPartitionIndex(0)
+          .setTimestamp(ListOffsetsRequest.EARLIEST_TIMESTAMP),
+        new ListOffsetsPartition()
+          .setPartitionIndex(0)
+          .setTimestamp(ListOffsetsRequest.LATEST_TIMESTAMP))))
+    val listOffsetsRequest = ListOffsetsRequest.Builder.forConsumer(true, IsolationLevel.READ_UNCOMMITTED)
+      .setTargetTimes(targetTimes).build()
+    val request = buildRequest(listOffsetsRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    val duplicatesCaptor: ArgumentCaptor[Set[TopicPartition]] =
+      ArgumentCaptor.forClass(classOf[Set[TopicPartition]])
+    when(replicaManager.fetchOffset(
+      any[Seq[ListOffsetsTopic]](),
+      duplicatesCaptor.capture(),
+      any[IsolationLevel](),
+      anyInt(),
+      any[String](),
+      anyInt(),
+      anyShort(),
+      any[(Errors, ListOffsetsPartition) => ListOffsetsPartitionResponse](),
+      any[List[ListOffsetsTopicResponse] => Unit](),
+      anyInt()
+    )).thenAnswer(_ => ())
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleListOffsetRequest(request)
+
+    // The duplicate set passed to ReplicaManager must carry the PHYSICAL key
+    // ReplicaManager will see when it scans the topics it just received,
+    // otherwise the set acts as if empty for tenant requests.
+    assertEquals(Set(new TopicPartition("acme.orders", 0)), duplicatesCaptor.getValue,
+      "duplicate detection must operate on the same (physical) key space ReplicaManager sees")
   }
 
   @Test
