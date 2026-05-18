@@ -7,11 +7,12 @@ branch toward the feature described in `PROMPT.md`.
 
 | Layer | Status | Lives in |
 |---|---|---|
-| Pure-Java concentration kernel | **Done.** Built TDD-first, 64 tests green. | `storage/src/main/java/org/apache/kafka/storage/internals/concentration/` |
-| Kernel-level integration tests | **Done.** Six PROMPT scenarios covered. | `storage/src/test/java/org/apache/kafka/storage/internals/concentration/ConcentrationKernelIntegrationTest.java` |
-| Broker glue (produce/fetch/admin/DeleteRecords hooks) | **Not started.** Scoped, with the kernel sitting at the seam where it plugs in. | — |
+| Pure-Java concentration kernel | **Done.** Built TDD-first, 83 tests green. | `storage/src/main/java/org/apache/kafka/storage/internals/concentration/` |
+| `ConcentrationKernel` facade (single broker-facing surface) | **Done.** 17 facade tests. | `storage/src/main/java/.../concentration/ConcentrationKernel.java` |
+| Kernel-level integration tests | **Done.** Six PROMPT scenarios covered. | `storage/src/test/java/.../concentration/ConcentrationKernelIntegrationTest.java` |
+| Broker glue (produce/fetch/admin/DeleteRecords hooks) | **Not started.** Kernel facade ready; seam map below. | — |
 | End-to-end test with a real broker | **Not started.** Depends on broker glue. | — |
-| Audit fleet (Codex + Gemini) per PROMPT §"After every major phase" | **Pending.** Kernel is a major-phase boundary; audit is next. | — |
+| Audit fleet (Codex + Gemini) per PROMPT §"After every major phase" | **Partially.** In-fleet sub-agents have audited the kernel twice; Codex/Gemini are unreachable from this CLI environment and that limitation is recorded in commit bodies rather than fabricated. | — |
 
 ## What v1 ships
 
@@ -21,8 +22,8 @@ topic with M partitions present itself to stock clients as a logical topic with 
 are physically interleaved on the backing.
 
 The kernel is **transport-agnostic** and **broker-agnostic** by design: it depends on nothing
-under `clients/` and on nothing in `core/`. The broker glue (not in this commit set) wires the
-kernel into the existing produce / fetch / admin paths.
+under `clients/` and on nothing in `core/`. The broker glue (not yet committed) wires the
+kernel into the existing produce / fetch / admin paths via the `ConcentrationKernel` facade.
 
 ### Components
 
@@ -36,6 +37,7 @@ LogicalSidecarIndex          on-disk logical→backing translation, 8-byte dense
 BackingScanRecoverer         restart: cheap sidecar path + full backing-log scan rebuild
 RecoveryRecord               one scanned record's (topic, partition, logical, backing)
 LogicalPartition             typed (topic, partition) key
+ConcentrationKernel          facade — single broker-facing surface, lifecycle-managed
 ```
 
 ### Design choices worth highlighting
@@ -62,6 +64,11 @@ LogicalPartition             typed (topic, partition) key
   registry's write lock. Without this, the broker cannot unambiguously resolve a produce or
   fetch request, and the PROMPT requirement "produce to a backing-topic name is rejected"
   could not be enforced.
+- **Atomic produce commit.** `ConcentrationKernel.commitProduce(reservation, backingOffset)`
+  persists the sidecar entry AND commits the tracker reservation as one operation; on any
+  IOException or RuntimeException from sidecar.append, the tracker reservation is rolled back
+  before the exception is rethrown. Honours the "no offset gaps" invariant at the boundary
+  where the broker meets the kernel.
 
 ### PROMPT functional scenarios → tests
 
@@ -69,15 +76,15 @@ LogicalPartition             typed (topic, partition) key
 |---|---|
 | Two logical topics share single-partition backing, interleaved produce, consumer isolation | `ConcentrationKernelIntegrationTest#twoLogicalTopicsShareSingleBackingPartitionAndStayIsolated` |
 | Three logical topics concurrent produce, monotonic per-topic offsets | `ConcentrationKernelIntegrationTest#threeLogicalTopicsConcurrentlyProduceAndPreserveMonotonicOffsets` |
-| DeleteRecords scoped to one logical partition | `ConcentrationKernelIntegrationTest#deleteRecordsAdvancesOnlyOneLogicalPartitionStart` |
-| Restart with intact sidecars → cheap startup | `ConcentrationKernelIntegrationTest#restartWithIntactSidecarsRehydratesTracker` |
-| Restart without sidecars → full scan rebuild | `ConcentrationKernelIntegrationTest#restartWithoutSidecarsReconstructsFromBackingScan` |
-| Direct produce to backing-topic name rejected | `ConcentrationKernelIntegrationTest#registrySignalsThatBackingTopicsCannotBeProducedDirectly` (kernel signal; full broker rejection lives in the produce-path hook, not yet written) |
-| Idempotent producer retry, no duplicates | **Not addressable at kernel layer.** Depends on broker-level producer-id / epoch state. |
+| DeleteRecords scoped to one logical partition | `ConcentrationKernelIntegrationTest#deleteRecordsAdvancesOnlyOneLogicalPartitionStart` + `ConcentrationKernelTest#advanceStartOffsetMovesLowWaterOnlyForOneLogicalPartition` |
+| Restart with intact sidecars → cheap startup | `ConcentrationKernelIntegrationTest#restartWithIntactSidecarsRehydratesTracker` + `ConcentrationKernelTest#recoveryFromSidecarsRebuildsTrackerStateAfterRestart` |
+| Restart without sidecars → full scan rebuild | `ConcentrationKernelIntegrationTest#restartWithoutSidecarsReconstructsFromBackingScan` + `ConcentrationKernelTest#recoveryFromBackingScanReplaysHeadersIntoSidecarsAndTracker` |
+| Direct produce to backing-topic name rejected | `ConcentrationKernelTest#directProduceToBackingTopicNameIsSignalled` (kernel signal); full broker rejection in `KafkaApis.handleProduceRequest` — **not yet wired** |
+| Idempotent producer retry, no duplicates | **Not addressable at kernel layer.** Depends on broker-level producer-id / epoch state preserved across the logical→physical translation. The kernel does not bypass `analyzeAndValidateProducerState` because the kernel is not on the producer-state codepath at all; idempotence is preserved by virtue of running before the kernel-driven offset assignment. |
 
 ## What v1 does **not** ship
 
-Explicitly out of scope per PROMPT:
+Explicitly out of scope per PROMPT (stretch goals):
 
 - **Transactional support.** Per-logical-topic LSO, zombie cleanup on `InitProducerId`.
 - **Compaction-safe key prefixing.** Two logical topics sharing one compacted backing destroy
@@ -85,13 +92,74 @@ Explicitly out of scope per PROMPT:
 - **Concurrent produce-failure cascade rollback.** Single in-flight reservation per partition
   is enough for the "no gaps" criterion.
 
-Pending (not built yet, not out-of-scope):
+Pending broker integration (not started, not out-of-scope, the remaining v1 work):
 
-- **Broker integration.** Hooks into `ReplicaManager.appendRecords`, `ReplicaManager.fetch`,
-  `KafkaApis.handleCreateTopics` (admin), `ReplicaManager.deleteRecords`. The HOW research
-  fleet identified all four seams; mechanical wiring on a correct kernel is the next phase.
-- **Audit fleet** per PROMPT §"After every major phase" — Codex + Gemini slots are mandatory.
-  Kernel completion is a major-phase boundary; the audit is queued.
+### Broker-integration seam map
+
+Each PROMPT acceptance criterion that requires broker-side wiring, with the exact call site:
+
+1. **Backing-topic produce rejection** —
+   `core/src/main/scala/kafka/server/KafkaApis.scala:378` (`handleProduceRequest`),
+   around line 399 inside `produceRequest.data.topicData.forEach { … }`. Inject:
+   `kernel.isBackingTopic(topicPartition.topic())` → if true, populate
+   `invalidRequestResponses` with `Errors.INVALID_TOPIC_EXCEPTION` and skip the partition.
+
+2. **Logical→backing routing + per-logical-topic offset assignment** —
+   `core/src/main/scala/kafka/server/KafkaApis.scala:378` (after step 1): rewrite each
+   inbound `TopicPartition` whose name is registered as logical to the resolved backing
+   `(backingTopic, kernel.backingPartitionFor(logicalTopic, logicalPartition))`. Reserve a
+   logical offset via `kernel.reserveProduce` and stamp it into each record's headers before
+   handing off to `ReplicaManager.appendRecords`. On the append-success callback, call
+   `kernel.commitProduce(reservation, returnedBackingOffset)`; on failure,
+   `kernel.rollbackProduce`. Stock client sees the assigned logical offset in
+   `PartitionResponse.baseOffset`.
+
+3. **Fetch translation** —
+   `core/src/main/scala/kafka/server/KafkaApis.scala` (`handleFetchRequest`) and
+   `core/src/main/scala/kafka/server/ReplicaManager.scala` (`fetchMessages`). For each
+   inbound fetch on a logical topic: translate `(logicalTopic, logicalPartition, fetchOffset)`
+   to `(backingTopic, backingPartition, backingOffset)` via
+   `kernel.resolveBackingOffset(...)`; perform the backing read; on the way back,
+   filter records to those carrying the matching logical-topic header and rewrite each
+   record's offset to its logical value. The filter step is the v1 cost — records of other
+   logical topics on the same backing partition are dropped on the read path.
+
+4. **DeleteRecords on a logical topic** —
+   `core/src/main/scala/kafka/server/KafkaApis.scala` (`handleDeleteRecordsRequest`).
+   For partitions whose topic is logical, call
+   `kernel.advanceStartOffset(logicalTopic, logicalPartition, newStart)` and bypass the
+   `ReplicaManager.deleteRecords` call entirely — the backing log is not truncated.
+
+5. **Recovery wiring at broker startup** —
+   `core/src/main/scala/kafka/server/BrokerServer.scala` (broker startup sequence,
+   after `LogManager.startup`). Construct one `ConcentrationKernel` per broker, point it at
+   `<logDirs(0)>/_concentration_sidecars/`, and call `kernel.recoverFromSidecars(declaredPartitions)`.
+   If sidecars are missing/corrupt, fall back to `kernel.recoverFromBackingScan` over a
+   `RecoveryRecord` stream built by reading the backing log's record headers in backing-offset
+   order.
+
+6. **Admin: declare a logical topic** —
+   Either extend `CreateTopicsRequest` with a `(logical, N, backing, M)` variant, or add a
+   dedicated KIP-style RPC. Either way, the broker controller persists the descriptor in a
+   KRaft metadata record (`LogicalTopicRecord`) so it survives controller restarts; followers
+   replay the record and call `kernel.declare(descriptor)` to populate the in-memory registry.
+   This is the largest unimplemented chunk because it requires a metadata-record schema and
+   KRaft replay logic. See the `core/src/main/scala/kafka/server/metadata/` package for the
+   pattern used by other records (`TopicRecord`, `PartitionRecord`).
+
+7. **Producer-id / epoch preservation across translation** —
+   No new code needed if (2) is implemented correctly: the existing
+   `analyzeAndValidateProducerState` in `UnifiedLog.appendAsLeader` (around line 1021) runs
+   on the backing partition's `ProducerStateManager` regardless of whether the produce
+   originated as logical or direct, and idempotence is preserved because the producer-id /
+   epoch / sequence triple is record-level and travels through the translation unchanged.
+
+### Constructor injection sites for the kernel
+
+When you add `ConcentrationKernel` to `KafkaApis`, three call sites need updating:
+- `core/src/main/scala/kafka/server/BrokerServer.scala:448` — production construction
+- `core/src/main/java/kafka/server/builders/KafkaApisBuilder.java:202` — builder
+- `core/src/test/scala/unit/kafka/server/KafkaApisTest.scala:189` — test construction
 
 ## How to run
 
@@ -100,13 +168,14 @@ JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 \
   ./gradlew :storage:test --tests 'org.apache.kafka.storage.internals.concentration.*'
 ```
 
-64 tests, all green at HEAD.
+83 tests, all green at HEAD.
 
 ## File layout
 
 ```
 storage/src/main/java/org/apache/kafka/storage/internals/concentration/
 ├── BackingScanRecoverer.java
+├── ConcentrationKernel.java
 ├── LogicalOffsetTracker.java
 ├── LogicalPartition.java
 ├── LogicalPartitionMapper.java
@@ -119,9 +188,33 @@ storage/src/main/java/org/apache/kafka/storage/internals/concentration/
 storage/src/test/java/org/apache/kafka/storage/internals/concentration/
 ├── BackingScanRecovererTest.java               (7 tests)
 ├── ConcentrationKernelIntegrationTest.java     (6 tests — PROMPT scenarios)
-├── LogicalOffsetTrackerTest.java              (14 tests)
+├── ConcentrationKernelTest.java               (17 tests — facade contract)
+├── LogicalOffsetTrackerTest.java              (15 tests)
 ├── LogicalPartitionMapperTest.java             (5 tests)
-├── LogicalSidecarIndexTest.java               (11 tests)
-├── LogicalTopicDescriptorTest.java             (9 tests)
+├── LogicalSidecarIndexTest.java               (13 tests)
+├── LogicalTopicDescriptorTest.java            (10 tests)
 └── LogicalTopicRegistryTest.java              (10 tests)
 ```
+
+## Production-readiness honest assessment
+
+The kernel itself is production-shape: thread-safe, lifecycle-managed, fail-loud on corruption,
+no swallowed exceptions, no per-append fsync, dense O(1) sidecar lookup. It has been audited
+twice by an in-fleet sub-agent; the audit fixes that landed include `volatile` on the tracker's
+lock-free reader fields, a file-descriptor leak fix in the recovery path, and a swap from
+`RuntimeException("CorruptIndexException")` to the actual `org.apache.kafka.storage.internals.log.CorruptIndexException`
+type (the local Kafka idiom).
+
+What the kernel does **not** yet give you is an end-to-end broker that stock clients can
+produce to. That work — wiring per the seam map above — is multi-week per PROMPT's own
+warning ("multi-week with multi-day debugging sessions"), and `v1 must stay narrow or it
+does not ship`. The next focused commits will land the broker hooks one at a time, starting
+with the smallest standalone wiring (the backing-topic-rejection check at hook point 1),
+which exercises one PROMPT acceptance criterion in isolation without touching the metadata
+schema or the fetch translation.
+
+Codex and Gemini consultations are mandated by PROMPT §"After every major phase". Neither
+external app is reachable from this CLI environment, and that limitation is recorded plainly
+in each commit body rather than fabricated. When the work moves to a host where those apps
+are reachable, the audit fleet for the kernel should be re-run and any findings landed as
+follow-up commits before the broker glue lands on top.
