@@ -27,7 +27,6 @@ import org.apache.kafka.server.rules.cel.CelProgram;
 
 import org.junit.jupiter.api.Test;
 
-import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 
@@ -177,17 +176,61 @@ public class ApiMessageActivationTest {
     @Test
     public void integratesWithCelExpressionOverRequest() {
         // The acceptance-criterion shape: a CEL rule speaks `request.<field>`.
+        // Uses requestActivation() — the helper KafkaApis itself calls in
+        // production — so the integration test and the production call site
+        // share the same activation-shape contract. If the helper ever drops
+        // the "request" envelope, this test fails AND the broker silently
+        // stops applying request.* rules; updating both at once keeps them
+        // in lockstep.
         CreatableTopic topic = new CreatableTopic().setName("audit-events").setNumPartitions(8);
         CreatableTopicCollection topics = new CreatableTopicCollection();
         topics.add(topic);
         CreateTopicsRequestData req = new CreateTopicsRequestData().setTopics(topics);
 
-        Map<String, Object> activation = Collections.singletonMap("request", ApiMessageActivation.from(req));
+        Map<String, Object> activation = ApiMessageActivation.requestActivation(req);
         CelProgram prog = CelCompiler.compile("request.topics.exists(t, t.name.startsWith(\"audit-\"))");
         assertTrue(prog.evalBoolean(activation::get));
 
         CelProgram negative = CelCompiler.compile("request.topics.exists(t, t.name == \"missing\")");
         assertFalse(negative.evalBoolean(activation::get));
+    }
+
+    @Test
+    public void requestActivationWrapsExtractedMapUnderRequestKey() {
+        // Direct unit test for the helper: regardless of what from() produces,
+        // requestActivation MUST place it under the single top-level key
+        // "request". This is the broker's documented envelope shape (see
+        // RuleJsonCodec class javadoc) and the contract a rule author relies
+        // on. Locking it down here means callers can't drift the shape.
+        CreateTopicsRequestData req = new CreateTopicsRequestData().setTimeoutMs(7_000);
+
+        Map<String, Object> activation = ApiMessageActivation.requestActivation(req);
+
+        assertEquals(1, activation.size(), "envelope must expose exactly one top-level key");
+        assertTrue(activation.containsKey("request"), "top-level key must be \"request\"");
+
+        Object inner = activation.get("request");
+        assertTrue(inner instanceof Map, "value under \"request\" must be the extracted Map");
+        @SuppressWarnings("unchecked")
+        Map<String, Object> innerMap = (Map<String, Object>) inner;
+        // Numeric scalars are normalised to Long by from(); see that contract.
+        assertEquals(7_000L, innerMap.get("timeoutMs"));
+    }
+
+    @Test
+    public void requestActivationOfNullMessageStillProducesValidEnvelope() {
+        // Defensive: even with a null ApiMessage, the helper must produce a
+        // map that resolves "request" without NPE — the broker request path
+        // must never crash because someone wired a null message into the
+        // activation supplier (e.g. a test seam mock). The inner map will be
+        // empty, which is the same fail-open posture as from(null).
+        Map<String, Object> activation = ApiMessageActivation.requestActivation(null);
+
+        assertEquals(1, activation.size());
+        assertTrue(activation.containsKey("request"));
+        Object inner = activation.get("request");
+        assertTrue(inner instanceof Map);
+        assertTrue(((Map<?, ?>) inner).isEmpty(), "from(null) returns the empty map");
     }
 
     @Test

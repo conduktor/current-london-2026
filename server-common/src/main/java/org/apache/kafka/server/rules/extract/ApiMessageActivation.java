@@ -103,6 +103,26 @@ public final class ApiMessageActivation {
         return toMap(msg);
     }
 
+    /**
+     * Build the activation map the broker actually feeds to CEL: the
+     * extracted message wrapped under the top-level key {@code "request"}, so
+     * rules authored as {@code request.topics.exists(...)} (the documented
+     * envelope shape — see {@link org.apache.kafka.server.rules.json.RuleJsonCodec}'s
+     * class javadoc) can resolve {@code request} to the message tree.
+     *
+     * <p>Without this wrap, a rule referencing {@code request.*} would fail to
+     * resolve {@code request} and either evaluate to false or raise a CEL
+     * evaluation error — silently bypassing the rule on the broker's request
+     * path. That regression is locked in by KafkaApisTest's request-shape
+     * tests; do not inline this method back into the engine call site without
+     * preserving the {@code "request"} envelope.
+     */
+    public static Map<String, Object> requestActivation(ApiMessage msg) {
+        Map<String, Object> m = new LinkedHashMap<>(2);
+        m.put("request", from(msg));
+        return m;
+    }
+
     static Map<String, Object> toMap(Object o) {
         Map<String, Object> out = new LinkedHashMap<>();
         for (Accessor a : accessorsFor(o.getClass())) {

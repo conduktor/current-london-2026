@@ -238,18 +238,20 @@ class KafkaApisTest extends Logging {
   @Test
   def testCelRuleGateDeniesMatchedRequestBeforeApiHandler(): Unit = {
     // End-to-end gate test: install a DENY rule whose CEL expression evaluates to true on a
-    // MetadataRequest carrying a topic, hand the request to KafkaApis.handle(), and assert that
-    // (1) a response is sent on the request channel — the gate short-circuited, (2) it is a
-    // MetadataResponse, and (3) the topic's errorCode reflects the rule's configured errorCode.
-    // The errorCode path goes: ruleEngine.evaluate → RuleDecision.deny(errorCode, ruleId) →
-    // Errors.forCode(...).exception → AbstractRequest.getErrorResponse → MetadataResponse.
+    // MetadataRequest, hand the request to KafkaApis.handle(), and assert that (1) a response
+    // is sent on the request channel — the gate short-circuited, (2) it is a MetadataResponse,
+    // and (3) the topic's errorCode reflects the rule's configured errorCode.
+    //
+    // The CEL expression goes through the broker's documented envelope shape — `request.<field>`
+    // (see RuleJsonCodec class javadoc, which gives `request.topics.exists(...)` as the canonical
+    // example). KafkaApis.maybeDenyByRules is responsible for wrapping the ApiMessageActivation
+    // under the top-level "request" key; if it ever stops doing that, this test fails because
+    // the predicate cannot resolve `request`.
     val engine = new RuleEngine()
-    // Use a simple top-level boolean field to keep the test independent of CEL stdlib
-    // breadth — every MetadataRequestData carries allowAutoTopicCreation, which defaults true.
-    val whenSrc = "allowAutoTopicCreation == true"
+    val whenSrc = "request.allowAutoTopicCreation == true"
     val compiled = CelCompiler.compile(whenSrc)
     val rule = new Rule(
-      "deny-metadata-when-topics-present",
+      "deny-metadata-via-request-shape",
       Collections.singletonList(ApiKeys.METADATA),
       RuleAction.DENY,
       whenSrc,
@@ -271,6 +273,80 @@ class KafkaApisTest extends Logging {
     assertEquals(1, topics.size)
     assertEquals(Errors.POLICY_VIOLATION.code, topics.iterator.next.errorCode,
       "Topic in response should carry the rule's configured errorCode")
+  }
+
+  @Test
+  def testCelRuleGateMatchesDocumentedRequestTopicsExistsExample(): Unit = {
+    // Locks in the example from RuleJsonCodec class javadoc:
+    //   "when": "request.topics.exists(t, t.name.startsWith(\"audit-\"))"
+    // If KafkaApis ever stops wrapping the activation under the "request" envelope, this CEL
+    // expression cannot resolve `request.topics` and the deny rule silently stops applying —
+    // a critical, hard-to-spot regression. The earlier test
+    // (testCelRuleGateDeniesMatchedRequestBeforeApiHandler) used a top-level field name and
+    // would have passed even without the wrapper, masking the bug. This test exercises a
+    // realistic collection-traversal rule against the documented envelope shape.
+    val engine = new RuleEngine()
+    val whenSrc = "request.topics.exists(t, t.name.startsWith(\"audit-\"))"
+    val compiled = CelCompiler.compile(whenSrc)
+    val rule = new Rule(
+      "deny-create-topics-audit-prefix",
+      Collections.singletonList(ApiKeys.METADATA),
+      RuleAction.DENY,
+      whenSrc,
+      Errors.POLICY_VIOLATION.code.toInt,
+      compiled)
+    engine.install(new RuleSetBuilder().put(rule).build())
+
+    val metadataRequestData = new MetadataRequestData().setTopics(
+      Collections.singletonList(new MetadataRequestData.MetadataRequestTopic().setName("audit-trail")))
+    val metadataRequest = new MetadataRequest(metadataRequestData, ApiKeys.METADATA.latestVersion)
+    val request = buildRequest(metadataRequest)
+
+    kafkaApis = createKafkaApis(ruleEngine = engine)
+    kafkaApis.handle(request, RequestLocal.noCaching)
+
+    val response = verifyNoThrottling[MetadataResponse](request)
+    val topics = response.data.topics
+    assertEquals(1, topics.size)
+    assertEquals(Errors.POLICY_VIOLATION.code, topics.iterator.next.errorCode,
+      "request.topics.exists(...) on the documented envelope must fire on a matching topic name")
+  }
+
+  @Test
+  def testCelRuleGateAllowsWhenRequestTopicsDoesNotMatch(): Unit = {
+    // Companion of testCelRuleGateMatchesDocumentedRequestTopicsExistsExample. The same
+    // request.topics.exists(...) predicate must NOT fire on a topic name that doesn't match.
+    // Together they exercise both branches of the predicate against the documented envelope.
+    val engine = new RuleEngine()
+    val whenSrc = "request.topics.exists(t, t.name.startsWith(\"audit-\"))"
+    val compiled = CelCompiler.compile(whenSrc)
+    val rule = new Rule(
+      "deny-create-topics-audit-prefix",
+      Collections.singletonList(ApiKeys.METADATA),
+      RuleAction.DENY,
+      whenSrc,
+      Errors.POLICY_VIOLATION.code.toInt,
+      compiled)
+    engine.install(new RuleSetBuilder().put(rule).build())
+
+    val metadataRequestData = new MetadataRequestData().setTopics(
+      Collections.singletonList(new MetadataRequestData.MetadataRequestTopic().setName("metrics")))
+    val metadataRequest = new MetadataRequest(metadataRequestData, ApiKeys.METADATA.latestVersion)
+    val request = buildRequest(metadataRequest)
+
+    kafkaApis = createKafkaApis(ruleEngine = engine)
+    kafkaApis.handle(request, RequestLocal.noCaching)
+
+    val response = verifyNoThrottling[MetadataResponse](request)
+    val topics = response.data.topics
+    assertEquals(1, topics.size)
+    // No deny → real Metadata handler ran. The 'metrics' topic does not exist, so the
+    // canonical error from the actual handler is UNKNOWN_TOPIC_OR_PARTITION. The point of
+    // this assertion is "NOT the rule's POLICY_VIOLATION" — i.e., the gate let the request
+    // through.
+    val errCode = topics.iterator.next.errorCode
+    assertTrue(errCode != Errors.POLICY_VIOLATION.code,
+      s"non-matching topic must not trip the rule (got errorCode=$errCode)")
   }
 
   @Test

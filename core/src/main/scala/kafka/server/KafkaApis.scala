@@ -181,7 +181,7 @@ class KafkaApis(val requestChannel: RequestChannel,
           request.header.apiKey,
           request.header.clientId,
           fromPrivilegedListener,
-          () => ApiMessageActivation.from(request.body[AbstractRequest].data()))
+          () => ApiMessageActivation.requestActivation(request.body[AbstractRequest].data()))
         if (ruleDecision.denied) {
           val denyError = Errors.forCode(ruleDecision.errorCode.toShort)
           info(s"CEL rule '${ruleDecision.denyingRuleId}' denied ${request.header.apiKey} from " +
