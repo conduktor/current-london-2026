@@ -19,6 +19,7 @@ package org.apache.kafka.server.rules;
 import org.apache.kafka.common.protocol.ApiKeys;
 import org.apache.kafka.server.rules.cel.CelCompiler;
 import org.apache.kafka.server.rules.cel.CelProgram;
+
 import org.junit.jupiter.api.Test;
 
 import java.util.Arrays;

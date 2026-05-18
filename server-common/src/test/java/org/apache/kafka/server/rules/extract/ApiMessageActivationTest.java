@@ -24,6 +24,7 @@ import org.apache.kafka.common.message.CreateTopicsRequestData.CreatableTopicCon
 import org.apache.kafka.common.message.MetadataRequestData;
 import org.apache.kafka.server.rules.cel.CelCompiler;
 import org.apache.kafka.server.rules.cel.CelProgram;
+
 import org.junit.jupiter.api.Test;
 
 import java.util.Collections;
