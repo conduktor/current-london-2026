@@ -1501,6 +1501,164 @@ class BrokerGovernanceBootstrapTest {
       "absent log must not emit a drift WARN")
   }
 
+  // ── Round-15 BLOCKER-2: __governance partition-count runtime drift ──────
+
+  @Test
+  def maybeWarnIfPartitionCountDriftedIsSilentOnSinglePartition(): Unit = {
+    // Happy path: live partition count is 1, no drift to warn about.
+    val rm = mock(classOf[ReplicaManager])
+    val engine = new RuleEngine()
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp,
+      partitionCountProbe = () => 1)
+    boot.maybeWarnIfPartitionCountDrifted()
+    assertEquals(0L, boot.warnEmissions.get(),
+      "partitionCount=1 must not emit a partition-count drift WARN")
+  }
+
+  @Test
+  def maybeWarnIfPartitionCountDriftedIsSilentOnAbsentTopic(): Unit = {
+    // Probe convention: returns 1 when the topic does not yet exist in the
+    // metadata image, so the operator does not see a false-positive WARN
+    // before the topic is even created. The check fires only on a real
+    // > 1 observation.
+    val rm = mock(classOf[ReplicaManager])
+    val engine = new RuleEngine()
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp,
+      partitionCountProbe = () => 1)
+    boot.maybeWarnIfPartitionCountDrifted()
+    assertEquals(0L, boot.warnEmissions.get(),
+      "absent-topic probe response of 1 must not WARN")
+  }
+
+  @Test
+  def maybeWarnIfPartitionCountDriftedFiresOnGrowToThree(): Unit = {
+    // Hot-reload regression: operator AlterPartitions to grow __governance
+    // from 1 to 3 partitions. The drift check must surface a WARN — the
+    // broker can't abort startup anymore, but it can give the operator a
+    // positive signal during the window before any rule on partition 1 or 2
+    // is silently dropped.
+    val rm = mock(classOf[ReplicaManager])
+    val engine = new RuleEngine()
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp,
+      partitionCountProbe = () => 3)
+    boot.maybeWarnIfPartitionCountDrifted()
+    assertEquals(1L, boot.warnEmissions.get(),
+      "partitionCount>1 must emit exactly one partition-count drift WARN")
+  }
+
+  @Test
+  def maybeWarnIfPartitionCountDriftedFiresOnGrowToTwo(): Unit = {
+    // Two partitions is the minimum-impact misconfig (roughly half the
+    // rules silently dropped) but still fail-OPEN. No exemption for the
+    // "small" case — exactly mirrors the startup gate's posture.
+    val rm = mock(classOf[ReplicaManager])
+    val engine = new RuleEngine()
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp,
+      partitionCountProbe = () => 2)
+    boot.maybeWarnIfPartitionCountDrifted()
+    assertEquals(1L, boot.warnEmissions.get(),
+      "even partitionCount=2 must WARN — no minimum-impact exemption")
+  }
+
+  @Test
+  def maybeWarnIfPartitionCountDriftedDedupesRepeatedDrifts(): Unit = {
+    // The drift detector runs on every drain tick. A sustained 3-partition
+    // condition must NOT spam the log — the partition-count throttle dedupes
+    // by message identical to the cleanup-policy throttle's behaviour.
+    val rm = mock(classOf[ReplicaManager])
+    val engine = new RuleEngine()
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp,
+      partitionCountProbe = () => 3)
+    for (_ <- 0 until 50) {
+      boot.maybeWarnIfPartitionCountDrifted()
+    }
+    assertEquals(1L, boot.warnEmissions.get(),
+      "repeated identical partition-count drift must emit one WARN, not one per tick")
+  }
+
+  // ── Round-15 HIGH-1: drift WARN namespace separation ────────────────────
+
+  @Test
+  def cleanupPolicyDriftDoesNotInterfereWithPartitionCountDriftDedupe(): Unit = {
+    // The throttles must keep independent ledgers. Before round-15 HIGH-1
+    // both categories shared a single dedup ledger keyed on the message
+    // string, so a cleanup-policy drift WARN would burn the dedupe slot
+    // that a subsequent partition-count drift WARN should have taken — the
+    // second message would still fire (it's a distinct string) but the
+    // shared ledger contaminated cross-category dedupe state. Worse, the
+    // hard-coded "governance rules drain failed" prefix on the shared
+    // helper labelled every drift WARN as a drain failure.
+    //
+    // Independence check: a single cleanup-policy drift WARN followed by
+    // 10 partition-count drift WARNs must produce exactly two emissions
+    // (one of each), with the partition-count throttle deduping internally
+    // across the 10 repeats. If the throttles were shared, the partition-
+    // count WARN would fire once (distinct message), THEN dedupe, but the
+    // shared lastWarnedMessage would have been clobbered → cross-category
+    // bleed when the cleanup-policy drift WARN re-runs. We model that
+    // round-trip explicitly below.
+    val rm = mock(classOf[ReplicaManager])
+    val log = mock(classOf[UnifiedLog])
+    val engine = new RuleEngine()
+    when(rm.getLog(tp)).thenReturn(Some(log))
+    val props = new java.util.HashMap[String, Object]()
+    props.put(org.apache.kafka.common.config.TopicConfig.CLEANUP_POLICY_CONFIG, "delete")
+    when(log.config).thenReturn(new org.apache.kafka.storage.internals.log.LogConfig(props))
+
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp,
+      partitionCountProbe = () => 3)
+
+    // First tick: both drifts fire (2 emissions).
+    boot.maybeWarnIfCleanupPolicyDrifted()
+    boot.maybeWarnIfPartitionCountDrifted()
+    assertEquals(2L, boot.warnEmissions.get(),
+      "first observation of each independent drift category must each WARN once")
+
+    // Subsequent ticks: each category dedupes within its own ledger.
+    // 49 more ticks of each → still 2 emissions total.
+    for (_ <- 0 until 49) {
+      boot.maybeWarnIfCleanupPolicyDrifted()
+      boot.maybeWarnIfPartitionCountDrifted()
+    }
+    assertEquals(2L, boot.warnEmissions.get(),
+      "each category's throttle dedupes independently; interleaving must not " +
+        "spuriously refire either category — round-15 HIGH-1 namespace " +
+        "separation invariant")
+  }
+
+  @Test
+  def drainFailureDedupeIsIndependentOfDriftDedupe(): Unit = {
+    // The legacy maybeWarnSuppressed code path is reserved for actual drain
+    // failures (drainOnce threw). It must NOT share a ledger with the drift
+    // WARNs — an operator reassigning a broker mid-runtime sees the drain
+    // throw once per tick, but in parallel the cleanup-policy may also have
+    // drifted. The two events are independent diagnoses and must each
+    // surface a separate steady-state WARN.
+    val rm = mock(classOf[ReplicaManager])
+    val log = mock(classOf[UnifiedLog])
+    val engine = new RuleEngine()
+    when(rm.getLog(tp)).thenReturn(Some(log))
+    val props = new java.util.HashMap[String, Object]()
+    props.put(org.apache.kafka.common.config.TopicConfig.CLEANUP_POLICY_CONFIG, "delete")
+    when(log.config).thenReturn(new org.apache.kafka.storage.internals.log.LogConfig(props))
+
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp)
+
+    boot.maybeWarnSuppressed("reassigned away")
+    boot.maybeWarnIfCleanupPolicyDrifted()
+    assertEquals(2L, boot.warnEmissions.get(),
+      "a drain-failure WARN and a cleanup-policy drift WARN are distinct categories " +
+        "and must each emit once on first observation, not collapse via a shared ledger")
+
+    // Sustained: 20 more ticks of each — still 2.
+    for (_ <- 0 until 20) {
+      boot.maybeWarnSuppressed("reassigned away")
+      boot.maybeWarnIfCleanupPolicyDrifted()
+    }
+    assertEquals(2L, boot.warnEmissions.get(),
+      "each category dedupes inside its own ledger")
+  }
+
   @Test
   def drainStartupFailsClosedIfDrainMakesNoProgressBeforeDeadline(): Unit = {
     // Codex final-audit P0 fail-closed branch: if drainOnce never advances

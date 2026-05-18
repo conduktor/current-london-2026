@@ -27,7 +27,7 @@ import org.apache.kafka.server.util.KafkaScheduler
 
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
-import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.{AtomicLong, AtomicReference}
 
 /**
  * Three-state classification of this broker's relationship to the governance
@@ -116,7 +116,8 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
                                 localReplicaStatus: () => LocalReplicaStatus =
                                   () => LocalReplicaStatus.TopicAbsent,
                                 requireLocalReplica: Boolean = true,
-                                caughtUpProbe: () => Boolean = () => true)
+                                caughtUpProbe: () => Boolean = () => true,
+                                partitionCountProbe: () => Int = () => 1)
   extends Logging {
 
   // Visible for tests so a Mockito spy/mock can simulate a poisoned record.
@@ -663,6 +664,12 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
         // retention-window grace period to revert the config change before
         // the rule set begins eroding.
         maybeWarnIfCleanupPolicyDrifted()
+        // Round-15 BLOCKER-2 (recent-changes sub-agent): catch runtime
+        // AlterPartitions that grows __governance past one partition, which
+        // would otherwise silently drop every rule that hashes to a non-0
+        // partition. Like the cleanup-policy drift check this is non-fatal —
+        // a throttled WARN gives the operator a positive signal.
+        maybeWarnIfPartitionCountDrifted()
         drainOnce()
       } catch {
         case t: Throwable =>
@@ -725,7 +732,7 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
           case (true, false) => "compact"        // unreachable given guard
           case _             => "(none)"
         }
-        maybeWarnSuppressed(
+        cleanupPolicyDriftThrottle.emit(
           s"cleanup.policy drift detected on ${topicPartition.topic}: " +
             s"effective policy is '$effective', expected 'compact'. " +
             s"This is a runtime divergence from the broker-startup contract " +
@@ -739,41 +746,133 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
     }
   }
 
+  /**
+   * Round-15 BLOCKER-2 (recent-changes sub-agent): runtime drift detector for
+   * the {@code __governance} partition count.
+   *
+   * <p>The startup gate
+   * {@link BrokerServer#requireGovernanceTopicSinglePartition} runs once and
+   * aborts startup if {@code __governance} has more than one partition. After
+   * startup an operator {@code kafka-topics.sh --alter --partitions N} on
+   * {@code __governance} would otherwise slip through silently —
+   * {@link BrokerGovernanceBootstrap} hardcodes its cursor on partition 0,
+   * so rules whose key hashes to any other partition disappear from this
+   * broker's view of the rule set. That is a fail-OPEN of the entire DENY
+   * engine for the affected rules, with no operator-visible signal.
+   *
+   * <p>Unlike the cleanup-policy drift detector, this check is metadata-based
+   * rather than local-log-based: a fresh metadata image lists the topic's
+   * partition count from the controller's authoritative view, which lets a
+   * non-replica broker also catch the drift (HIGH-3 from the same audit).
+   * The {@code partitionCountProbe} constructor parameter is wired by
+   * {@link BrokerServer} to read from {@code metadataCache.currentImage()};
+   * the default {@code () => 1} is silent-by-default for tests that don't
+   * opt in to the check.
+   *
+   * <p>Non-fatal by design, mirroring the cleanup-policy drift detector: a
+   * runtime check on the live drain tick should never throw because the
+   * blast radius of a false positive on a security-critical surface is far
+   * worse than a delayed remediation on a true positive. The throttled WARN
+   * is the operator signal; the partitions on the rules topic are still
+   * silently dropped until the operator either repartitions the topic to 1
+   * (which Kafka does not natively support — they would need to delete +
+   * recreate) or accepts the new partitioning by extending
+   * {@link BrokerGovernanceBootstrap} to fan out across partitions.
+   */
+  private[server] def maybeWarnIfPartitionCountDrifted(): Unit = {
+    val count = partitionCountProbe()
+    if (count > 1) {
+      partitionCountDriftThrottle.emit(
+        s"partition-count drift detected on ${topicPartition.topic}: " +
+          s"the topic now has $count partitions but this broker drains " +
+          s"only partition 0. Rules whose key hashes to partitions 1..${count - 1} " +
+          s"are invisible to this broker — every DENY rule on those partitions " +
+          s"is silently fail-OPEN. The startup gate " +
+          s"(BrokerServer.requireGovernanceTopicSinglePartition) caught this " +
+          s"shape at boot; an operator AlterPartitions to grow the partition " +
+          s"count post-startup bypassed it. Recovery is destructive: delete " +
+          s"and recreate ${topicPartition.topic} with --partitions 1 " +
+          s"(rules will need to be republished). " +
+          s"(round-15 BLOCKER-2).")
+    }
+  }
+
   private val FailureWarnIntervalMs: Long = 60_000L
   // Visible for tests so the suppression window can be advanced synthetically.
   private[server] var failureWarnNowMs: () => Long = () => System.currentTimeMillis()
-  private val lastWarnedMessage = new java.util.concurrent.atomic.AtomicReference[String](null)
-  private val lastWarnAtMs = new AtomicLong(0L)
-  private val suppressedSinceLastWarn = new AtomicLong(0L)
   // Visible for tests so they can assert how many WARNs actually fired —
-  // capturing SLF4J output across the codebase is heavy and brittle.
+  // capturing SLF4J output across the codebase is heavy and brittle. Shared
+  // across all three throttles (drain failures, cleanup-policy drift,
+  // partition-count drift) so a single test assertion captures the total
+  // emission count regardless of which category fired.
   private[server] val warnEmissions = new AtomicLong(0L)
 
-  private[server] def maybeWarnSuppressed(message: String): Unit = {
-    val msg = if (message == null) "<null>" else message
-    val previous = lastWarnedMessage.get()
-    val now = failureWarnNowMs()
-    if (previous == null || previous != msg) {
-      val suppressed = suppressedSinceLastWarn.getAndSet(0L)
-      lastWarnedMessage.set(msg)
-      lastWarnAtMs.set(now)
-      if (suppressed > 0L && previous != null) {
-        warn(s"governance rules drain failed: $msg (previous failure '$previous' " +
-          s"repeated and was suppressed $suppressed time(s) before this new message)")
+  /**
+   * Round-15 HIGH-1 (recent-changes sub-agent): each WARN category has its
+   * own dedup ledger so dedupe state does not leak across distinct concerns.
+   * Before this split, drain failures, cleanup-policy drift, and
+   * partition-count drift all routed through one
+   * {@code maybeWarnSuppressed} ledger — a cleanup-policy drift WARN would
+   * silence a subsequent partition-count drift WARN (different concern but
+   * same "previous != msg" check evaluates true → first WARN fires, but the
+   * cross-category collision still wasted one slot of the dedupe window for
+   * an unrelated category). Worse, the legacy {@code maybeWarnSuppressed}
+   * hard-coded the prefix {@code "governance rules drain failed"} — every
+   * drift WARN announced itself as a drain failure, which an operator
+   * scanning logs would naturally interpret as "the topic is unreadable",
+   * not "the topic is misconfigured but draining fine".
+   *
+   * <p>Three throttle instances, one per category, each with its own prefix:
+   * {@code drainFailureThrottle}, {@code cleanupPolicyDriftThrottle},
+   * {@code partitionCountDriftThrottle}. They share only
+   * {@link #warnEmissions} (a cumulative counter that tests assert against)
+   * and {@link #failureWarnNowMs} (the time source that tests inject).
+   */
+  private class WarnThrottle(prefix: String) {
+    private val lastWarnedMessage = new AtomicReference[String](null)
+    private val lastWarnAtMs = new AtomicLong(0L)
+    private val suppressedSinceLastWarn = new AtomicLong(0L)
+
+    def emit(message: String): Unit = {
+      val msg = if (message == null) "<null>" else message
+      val previous = lastWarnedMessage.get()
+      val now = failureWarnNowMs()
+      if (previous == null || previous != msg) {
+        val suppressed = suppressedSinceLastWarn.getAndSet(0L)
+        lastWarnedMessage.set(msg)
+        lastWarnAtMs.set(now)
+        if (suppressed > 0L && previous != null) {
+          warn(s"$prefix: $msg (previous '$previous' " +
+            s"repeated and was suppressed $suppressed time(s) before this new message)")
+        } else {
+          warn(s"$prefix: $msg")
+        }
+        warnEmissions.incrementAndGet()
+      } else if (now - lastWarnAtMs.get() >= FailureWarnIntervalMs) {
+        val rolled = suppressedSinceLastWarn.getAndSet(0L)
+        lastWarnAtMs.set(now)
+        warn(s"$prefix: $msg (same condition repeated $rolled " +
+          s"time(s) in the last ${FailureWarnIntervalMs}ms)")
+        warnEmissions.incrementAndGet()
       } else {
-        warn(s"governance rules drain failed: $msg")
+        suppressedSinceLastWarn.incrementAndGet()
       }
-      warnEmissions.incrementAndGet()
-    } else if (now - lastWarnAtMs.get() >= FailureWarnIntervalMs) {
-      val rolled = suppressedSinceLastWarn.getAndSet(0L)
-      lastWarnAtMs.set(now)
-      warn(s"governance rules drain failed: $msg (same failure repeated $rolled " +
-        s"time(s) in the last ${FailureWarnIntervalMs}ms)")
-      warnEmissions.incrementAndGet()
-    } else {
-      suppressedSinceLastWarn.incrementAndGet()
     }
   }
+
+  // The drain-failure throttle keeps the legacy "governance rules drain
+  // failed" prefix so log-watchers that grep on that text continue to fire.
+  private val drainFailureThrottle = new WarnThrottle("governance rules drain failed")
+  // Drift throttles use distinct prefixes that name the actual concern.
+  // Operator searching for "drift detected" finds both categories; searching
+  // for "partition-count drift" or "cleanup.policy drift" narrows by category.
+  private val cleanupPolicyDriftThrottle =
+    new WarnThrottle("governance config drift detected")
+  private val partitionCountDriftThrottle =
+    new WarnThrottle("governance partitioning drift detected")
+
+  private[server] def maybeWarnSuppressed(message: String): Unit =
+    drainFailureThrottle.emit(message)
 
   /**
    * Result of a single [[replay]] pass. Carries three numbers:

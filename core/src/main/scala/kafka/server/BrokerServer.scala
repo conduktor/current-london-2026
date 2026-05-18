@@ -767,12 +767,32 @@ class BrokerServer(
           }
         }
       }
+      // Round-15 BLOCKER-2 (recent-changes sub-agent): live partition-count
+      // probe sourced from the controller-published metadata image. Works on
+      // every broker — replica or not — so a broker that never holds a
+      // __governance replica still detects an operator AlterPartitions that
+      // grew the topic past one partition and surfaces the silent-fail-OPEN.
+      // Defaults to 1 when the topic is absent (no drift to flag yet) and
+      // when the metadata image has no partitions map (catastrophic — log
+      // the absence loudly via the bootstrap's WARN throttle anyway by
+      // reporting 0 so the > 1 guard stays silent but a later partitions()
+      // anomaly is still caught by the > 1 check the next time around).
+      val partitionCountProbe: () => Int = () => {
+        val image = metadataCache.currentImage()
+        val topicImage = image.topics().getTopic(GovernanceTopic.NAME)
+        if (topicImage == null) 1
+        else {
+          val parts = topicImage.partitions()
+          if (parts == null) 1 else parts.size()
+        }
+      }
       governanceBootstrap = new BrokerGovernanceBootstrap(
         replicaManager = replicaManager,
         ruleEngine = ruleEngine,
         localReplicaStatus = localReplicaProbe,
         requireLocalReplica = requireLocalReplica,
-        caughtUpProbe = caughtUpProbe)
+        caughtUpProbe = caughtUpProbe,
+        partitionCountProbe = partitionCountProbe)
 
       dataPlaneRequestProcessor = new KafkaApis(
         requestChannel = socketServer.dataPlaneRequestChannel,
