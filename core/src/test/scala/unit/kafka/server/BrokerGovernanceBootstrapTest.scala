@@ -102,12 +102,14 @@ class BrokerGovernanceBootstrapTest {
   }
 
   @Test
-  def drainOnceWarnsAndCommitsEmptyWhenNonReplicaAndKnobIsOff(): Unit = {
+  def drainOnceWarnsAndDoesNotOverwriteActiveWhenNonReplicaAndKnobIsOff(): Unit = {
     // With require.local.replica=false the operator has explicitly opted into
-    // fail-open. drainOnce must NOT throw — it must commit an empty RuleSet
-    // and let the broker accept traffic. The loud-warning side is best
-    // verified at logging-config level; here we just verify the path
-    // doesn't throw and the engine reflects the empty install.
+    // fail-open. drainOnce must NOT throw — and must NOT install empty over a
+    // prior good RuleSet, which would be a hidden second fail-open vector when
+    // a previously-replica broker loses its replica via reassignment. The
+    // expected behaviour is "keep the last-known active": at startup that's
+    // RuleSet.EMPTY (no commit ever made), at runtime that's whatever the
+    // previous drain committed.
     val rm = mock(classOf[ReplicaManager])
     val engine = new RuleEngine()
     when(rm.getLog(tp)).thenReturn(None)
@@ -121,7 +123,7 @@ class BrokerGovernanceBootstrapTest {
     val n = boot.drainOnce()
     assertEquals(0L, n)
     assertEquals(0, engine.active().size(),
-      "non-replica fail-open path must install empty RuleSet without throwing")
+      "at startup, no-log path leaves engine at RuleSet.EMPTY initial state")
   }
 
   @Test
@@ -129,9 +131,9 @@ class BrokerGovernanceBootstrapTest {
     // Metadata says we ARE a replica but ReplicaManager has no log object
     // yet (startup race: log dir not opened, or reassignment in flight). This
     // must NOT abort startup — the periodic re-drain will pick up records
-    // once the log opens. Until then, an empty RuleSet is the correct state
-    // (there can't be any rules on a partition whose log isn't open yet on
-    // this broker).
+    // once the log opens. Until then, the engine's prior active RuleSet stays
+    // in force; at startup that's RuleSet.EMPTY (no commit ever made), and at
+    // runtime that's the last-known-good set (verified in a separate test).
     val rm = mock(classOf[ReplicaManager])
     val engine = new RuleEngine()
     when(rm.getLog(tp)).thenReturn(None)
@@ -145,6 +147,60 @@ class BrokerGovernanceBootstrapTest {
     val n = boot.drainOnce()
     assertEquals(0L, n)
     assertEquals(0, engine.active().size())
+  }
+
+  @Test
+  def drainOnceNoLogBranchesPreserveLastKnownActiveRuleSet(): Unit = {
+    // Codex P0 audit regression-lock: when this broker had previously drained
+    // a non-empty RuleSet from a healthy log and then loses access to the log
+    // (reassignment-away, transient log-dir failure, or metadata flicker), the
+    // engine.active() MUST keep enforcing the prior rules — installing an
+    // empty RuleSet would silently fail-open every rule until the next
+    // successful drain. This test exercises all three reachable no-log
+    // branches (TopicAbsent, NonReplica-opt-out, LocalReplica-no-log) and
+    // asserts the engine's active() is byte-identical to what was installed
+    // before drainOnce ran.
+    val cases = Seq(
+      ("TopicAbsent", LocalReplicaStatus.TopicAbsent, true),
+      ("NonReplica-opt-out", LocalReplicaStatus.NonReplica, false),
+      ("LocalReplica-no-log", LocalReplicaStatus.LocalReplica, true)
+    )
+
+    for ((label, status, requireReplica) <- cases) {
+      val rm = mock(classOf[ReplicaManager])
+      val engine = new RuleEngine()
+      when(rm.getLog(tp)).thenReturn(None)
+
+      // Pre-install a non-empty RuleSet directly, simulating "we already
+      // drained the log successfully at some point in the past".
+      val r = org.apache.kafka.server.rules.json.RuleJsonCodec.decode(
+        "preserved", envelope("true", ApiKeys.METADATA, 42))
+      val builder = new org.apache.kafka.server.rules.RuleSetBuilder()
+      builder.put(r)
+      val preInstalled = builder.build()
+      engine.install(preInstalled)
+      assertSame(preInstalled, engine.active(),
+        s"$label: precondition — non-empty RuleSet must be installed before drain")
+
+      val probe: () => LocalReplicaStatus = () => status
+      val boot = new BrokerGovernanceBootstrap(rm, engine, tp,
+        injectedLoader = null,
+        localReplicaStatus = probe,
+        requireLocalReplica = requireReplica)
+
+      val n = boot.drainOnce()
+      assertEquals(0L, n, s"$label: no-log branch must report 0 replayed")
+      // The exact same RuleSet reference must still be active — drainOnce
+      // must not have called loader.commit(), which would install a new
+      // (empty) snapshot from the loader's working state.
+      assertSame(preInstalled, engine.active(),
+        s"$label: active RuleSet must be preserved — a no-log drain must " +
+          s"NEVER overwrite the engine's prior active with empty")
+      // The pre-installed deny rule is still enforced end-to-end.
+      assertTrue(engine.evaluate(ApiKeys.METADATA, "c", false,
+        () => Collections.emptyMap()).denied,
+        s"$label: prior rule must still deny after no-log drain")
+    }
   }
 
   @Test

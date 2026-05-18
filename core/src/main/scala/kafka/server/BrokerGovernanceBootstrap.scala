@@ -137,12 +137,23 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
         // the legacy code conflated both into an empty-RuleSet fall-through,
         // which silently fail-opened on every non-replica broker. Codex
         // flagged this on audit; see [[LocalReplicaStatus]] javadoc.
+        //
+        // Invariant across every no-log branch: NEVER call loader.commit()
+        // here. The previously-installed RuleSet (or RuleSet.EMPTY if we have
+        // never committed) remains active. This is the fix for Codex's P0
+        // audit finding "LocalReplica + no-log committing empty is fail-open":
+        // if we have ever successfully drained a non-empty RuleSet and we then
+        // lose the local log (reassignment, disk fault, transient race), the
+        // engine must keep enforcing the last-known-good rules — installing
+        // empty would silently bypass every rule until the next drain reads
+        // the log. Strict "fail-stale-not-empty" is the safe posture for a
+        // security-critical surface.
         localReplicaStatus() match {
           case LocalReplicaStatus.TopicAbsent =>
-            // Topic genuinely does not exist anywhere in the cluster — there
-            // are no rules to enforce. Install the empty/unchanged snapshot
-            // so the engine has a well-defined state.
-            loader.commit()
+            // Topic does not exist in this broker's metadata view — there are
+            // no rules to enforce from this topic. Engine stays at its prior
+            // active() (RuleSet.EMPTY at startup, the last-good set at
+            // runtime). No commit.
             0L
 
           case LocalReplicaStatus.NonReplica if requireLocalReplica =>
@@ -171,13 +182,15 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
             // Operator has explicitly opted into fail-open. Log it at ERROR
             // every drain — this is a security-critical posture and an
             // operator scanning logs must see it on every drain pass, not
-            // just at startup.
+            // just at startup. The engine retains its prior active(); at
+            // startup that is RuleSet.EMPTY (the opt-out's intent), at
+            // runtime it is whatever rules we had last drained — strictly
+            // safer than installing empty over a known-good set.
             error(s"governance topic ${tp.topic} exists but this broker is " +
               s"not a replica of partition ${tp.partition}; " +
-              s"governance.bootstrap.require.local.replica=false — " +
-              s"proceeding with EMPTY RuleSet, every governance rule is " +
-              s"being silently bypassed on this broker")
-            loader.commit()
+              s"governance.bootstrap.require.local.replica=false — keeping " +
+              s"the last-known active RuleSet (initially empty); every new " +
+              s"or tombstoned rule on this topic is invisible to this broker")
             0L
 
           case LocalReplicaStatus.LocalReplica =>
@@ -185,11 +198,12 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
             // no log object yet. This is a startup-time race (the log dir
             // hasn't been opened) or a transient state during reassignment;
             // either way, the next scheduled drain will retry. Don't fail
-            // startup — there are no rules to enforce until the log opens.
+            // startup — and crucially, don't replace the prior active RuleSet
+            // with an empty one: a fluky "log object briefly disappeared"
+            // must not be a fail-open window.
             warn(s"governance partition $tp reports this broker as a replica " +
-              s"but the local log is not yet available — proceeding with " +
-              s"empty RuleSet; next periodic drain will retry")
-            loader.commit()
+              s"but the local log is not yet available — keeping the prior " +
+              s"active RuleSet; next periodic drain will retry")
             0L
         }
 
