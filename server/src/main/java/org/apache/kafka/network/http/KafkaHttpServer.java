@@ -82,8 +82,13 @@ public final class KafkaHttpServer {
     // instead of an orderly close. Production wiring (BrokerServer) passes the configured value.
     private final long shutdownGraceMs;
 
-    private Server server;
-    private int boundPort = -1;
+    // volatile: written inside synchronized start()/stop(), read by boundPort() without holding the lock.
+    // The synchronized writer publishes through the monitor, but unsynchronized readers (test threads and
+    // anyone observing the boot state via the accessor below) need a happens-before edge of their own.
+    // Without volatile the JMM permits the reader to observe -1 indefinitely on a weak memory architecture,
+    // even after start() has returned. Same publication pattern as RequestChannel.requestCompletionCallback.
+    private volatile Server server;
+    private volatile int boundPort = -1;
 
     /**
      * Legacy 8-arg constructor preserved for tests that explicitly want a fast, ungraceful teardown
