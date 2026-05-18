@@ -18,9 +18,11 @@ package kafka.api
 
 import kafka.server.{KafkaBroker, KafkaConfig, QuorumTestHarness}
 import kafka.utils.TestUtils
-import org.apache.kafka.clients.admin.NewTopic
+import org.apache.kafka.clients.admin.AlterConfigOp.OpType
+import org.apache.kafka.clients.admin.{AlterConfigOp, ConfigEntry, NewTopic}
 import org.apache.kafka.clients.producer.{KafkaProducer, ProducerConfig, ProducerRecord}
 import org.apache.kafka.common.InvalidRecordException
+import org.apache.kafka.common.config.ConfigResource
 import org.apache.kafka.common.errors.InvalidConfigurationException
 import org.apache.kafka.common.network.ListenerName
 import org.apache.kafka.common.security.auth.SecurityProtocol
@@ -184,6 +186,42 @@ class CompressionPolicyIntegrationTest extends QuorumTestHarness {
       val listed = admin.listTopics().names().get()
       assertFalse(listed.contains(topic),
         s"topic $topic must not exist after CreateTopic rejected its compression.policy value")
+    } finally {
+      admin.close()
+    }
+  }
+
+  /**
+   * Pins the `compression.policy` validator at the IncrementalAlterConfigs API boundary.
+   * The acceptance criteria call out both CreateTopic *and* AlterConfig as the points where
+   * unknown values must be rejected. The `LogConfigDef.in(...)` validator covers both, but
+   * we exercise the AlterConfig path here separately to catch any wiring regression where
+   * alter-time validation could diverge from create-time validation.
+   */
+  @Test
+  def testIncrementalAlterConfigRejectsUnknownCompressionPolicyValue(): Unit = {
+    val topic = "compression-alter-bad-policy"
+    val admin = TestUtils.createAdminClient(Seq(broker),
+      ListenerName.forSecurityProtocol(SecurityProtocol.PLAINTEXT))
+    try {
+      // Create the topic with the default (none) policy so we can attempt to alter it.
+      TestUtils.createTopicWithAdmin(admin, topic, Seq(broker), controllerServers)
+
+      val topicResource = new ConfigResource(ConfigResource.Type.TOPIC, topic)
+      val alterOps = Collections.singletonList(
+        new AlterConfigOp(new ConfigEntry(LogConfig.COMPRESSION_POLICY_CONFIG, "always"), OpType.SET))
+      val alterResult = admin.incrementalAlterConfigs(Collections.singletonMap(topicResource, alterOps))
+
+      val ee = assertThrows(classOf[ExecutionException], () => alterResult.all().get())
+      assertTrue(ee.getCause.isInstanceOf[InvalidConfigurationException],
+        s"expected InvalidConfigurationException for unknown compression.policy value on AlterConfig, got " +
+          s"${ee.getCause.getClass.getName}: ${ee.getCause.getMessage}")
+
+      // The topic's compression.policy must remain at its prior (default) value.
+      val configs = admin.describeConfigs(Collections.singletonList(topicResource)).all().get()
+      val policyEntry = configs.get(topicResource).get(LogConfig.COMPRESSION_POLICY_CONFIG)
+      assertEquals(LogConfig.DEFAULT_COMPRESSION_POLICY, policyEntry.value(),
+        s"compression.policy must remain at its prior value after AlterConfig was rejected")
     } finally {
       admin.close()
     }

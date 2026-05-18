@@ -2444,6 +2444,55 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testCompressionPolicyDoesNotMaskDownstreamRecordCorruption(): Unit = {
+    // PROMPT.md functional scenario: "A produce request to a configured topic where the
+    // batch is correctly compressed but one record inside the batch is corrupted hits the
+    // existing validation path; the compression-policy check does not change the error
+    // reported in that case."
+    //
+    // Our enforcement runs at the request-handler level on the *batch's* compression type.
+    // A compressed batch satisfies the policy regardless of whether individual records
+    // inside the batch are corrupted — per-record corruption is detected downstream by
+    // the storage layer (LogValidator) and surfaces as the existing storage-layer error
+    // (e.g. CORRUPT_MESSAGE). This test pins that wiring: a compressed batch on a REQUIRED
+    // topic flows through our check unchanged, and the downstream error from the append
+    // path wins. The compression-policy code path adds nothing to the response in this case.
+    val topic = "topic"
+    addTopicToMetadataCache(topic, numPartitions = 1)
+    val tp = new TopicPartition(topic, 0)
+
+    when(replicaManager.compressionPolicy(ArgumentMatchers.eq(tp)))
+      .thenReturn(CompressionPolicy.REQUIRED)
+
+    // Simulate the downstream validation path rejecting the partition with CORRUPT_MESSAGE,
+    // as LogValidator does when a record inside an otherwise well-formed compressed batch is
+    // corrupted (bad CRC, bad payload).
+    val responseCallback: ArgumentCaptor[Map[TopicPartition, PartitionResponse] => Unit] =
+      ArgumentCaptor.forClass(classOf[Map[TopicPartition, PartitionResponse] => Unit])
+    when(replicaManager.handleProduceAppend(anyLong, anyShort, ArgumentMatchers.eq(false), any(), any(),
+      responseCallback.capture(), any(), any(), any(), any())
+    ).thenAnswer(_ => responseCallback.getValue.apply(Map(tp -> new PartitionResponse(Errors.CORRUPT_MESSAGE))))
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](), any[Long])).thenReturn(0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val produceRequest = buildSingleTopicProduceRequest(tp,
+      MemoryRecords.withRecords(Compression.lz4().build(), new SimpleRecord("v".getBytes)),
+      ApiKeys.PRODUCE.latestVersion)
+    val request = buildRequest(produceRequest)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[ProduceResponse](request)
+    val partitionResponse = response.data.responses.asScala.head.partitionResponses.asScala.head
+    // The downstream storage-layer error survives — compression.policy does not mask or
+    // replace it.
+    assertEquals(Errors.CORRUPT_MESSAGE, Errors.forCode(partitionResponse.errorCode),
+      "the existing storage-layer corruption error must win; compression.policy must not mask it")
+    // The partition still reached the append path (our check passed on the compressed batch).
+    verify(replicaManager).handleProduceAppend(anyLong, anyShort, anyBoolean, any(), any(), any(), any(), any(), any(), any())
+  }
+
+  @Test
   def testCompressionPolicyAppliesPerPartitionAcrossMixedTopics(): Unit = {
     // Acceptance criterion: a single produce request targeting partitions on two topics —
     // one with policy=required, one without — succeeds for the unconfigured topic's
