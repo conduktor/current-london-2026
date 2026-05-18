@@ -403,6 +403,153 @@ class KafkaHttpServerIntegrationTest {
     }
 
     @Test
+    void sseFromEarliestPropagatesFlagToSubmitter() throws Exception {
+        // PROMPT.md AC6 regression: ?from=earliest must reach the submitter as fromEarliest=true so the
+        // submitter's OFFSET_OUT_OF_RANGE retry-at-logStartOffset fires for retained/compacted topics. The
+        // bug we are pinning here was that SseStreamer.scheduleNextFetch built every FetchCommand via the
+        // 4-arg constructor (which hardcodes fromEarliest=false), dropping the flag between parser and
+        // submitter. A retained topic with logStartOffset > 0 would then close every SSE stream with an
+        // OFFSET_OUT_OF_RANGE error frame instead of replaying the earliest retained record.
+        //
+        // The ControllableSubmitter does not replicate the broker's OOR-retry; the assertion is on the
+        // bridge contract (flag is propagated) rather than the broker behaviour (retry succeeds). The
+        // broker side is exercised by KafkaApiRequestSubmitter's own unit tests.
+        ConcurrentLinkedQueue<RequestSubmitter.FetchResult> queue = new ConcurrentLinkedQueue<>();
+        queue.add(new RequestSubmitter.FetchResult(
+            new FetchResponseFormatter.PartitionFetch(
+                0, Errors.NONE, null, 0, 50, 51,
+                List.of(new FetchResponseFormatter.FetchedRecord(
+                    50, null, "from-earliest".getBytes(StandardCharsets.UTF_8), null, 1L))),
+            0L));
+        submitter.fetchResultQueue = queue;
+
+        InputStreamResponseListener listener = new InputStreamResponseListener();
+        client.newRequest(url("/v1/topics/orders/records?partition=0&from=earliest"))
+            .method(HttpMethod.GET)
+            .headers(h -> h.put("Accept", "text/event-stream"))
+            .send(listener);
+        Response response = listener.get(5, TimeUnit.SECONDS);
+        assertEquals(200, response.getStatus());
+
+        // Read past the connected-comment and at least one data event so the first fetch is guaranteed
+        // to have been issued by the time we inspect fetchCommandLog.
+        try (InputStream body = listener.getInputStream();
+             BufferedReader reader = new BufferedReader(new InputStreamReader(body, StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (line.startsWith("data: ")) {
+                    break;
+                }
+            }
+        }
+
+        assertFalse(submitter.fetchCommandLog.isEmpty(), "expected at least one fetch to have been submitted");
+        FetchRequestParser.FetchCommand firstCmd = submitter.fetchCommandLog.get(0);
+        assertTrue(firstCmd.fromEarliest(),
+            "first SSE fetch must propagate fromEarliest=true to the submitter — "
+                + "the submitter's OFFSET_OUT_OF_RANGE retry depends on it");
+        assertEquals(0L, firstCmd.offset(),
+            "from=earliest initial offset must be 0L; submitter retries at logStartOffset on OOR");
+    }
+
+    @Test
+    void sseExplicitOffsetDoesNotSetFromEarliestFlag() throws Exception {
+        // Mirror of sseFromEarliestPropagatesFlagToSubmitter: an explicit ?offset=N request must NOT set
+        // fromEarliest=true. The flag exists so the submitter can rewrite an unrequested 0L to the actual
+        // logStartOffset; for an explicit offset the client knows what they asked for and any OOR is a real
+        // error the client should see, not silently snapped to logStartOffset.
+        ConcurrentLinkedQueue<RequestSubmitter.FetchResult> queue = new ConcurrentLinkedQueue<>();
+        queue.add(new RequestSubmitter.FetchResult(
+            new FetchResponseFormatter.PartitionFetch(
+                0, Errors.NONE, null, 7, 0, 8,
+                List.of(new FetchResponseFormatter.FetchedRecord(
+                    7, null, "explicit".getBytes(StandardCharsets.UTF_8), null, 1L))),
+            0L));
+        submitter.fetchResultQueue = queue;
+
+        InputStreamResponseListener listener = new InputStreamResponseListener();
+        client.newRequest(url("/v1/topics/orders/records?partition=0&offset=7"))
+            .method(HttpMethod.GET)
+            .headers(h -> h.put("Accept", "text/event-stream"))
+            .send(listener);
+        Response response = listener.get(5, TimeUnit.SECONDS);
+        assertEquals(200, response.getStatus());
+
+        try (InputStream body = listener.getInputStream();
+             BufferedReader reader = new BufferedReader(new InputStreamReader(body, StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (line.startsWith("data: ")) {
+                    break;
+                }
+            }
+        }
+
+        assertFalse(submitter.fetchCommandLog.isEmpty(), "expected at least one fetch to have been submitted");
+        FetchRequestParser.FetchCommand firstCmd = submitter.fetchCommandLog.get(0);
+        assertFalse(firstCmd.fromEarliest(), "explicit ?offset= must not set fromEarliest");
+        assertEquals(7L, firstCmd.offset(), "explicit ?offset=7 must reach submitter unchanged");
+    }
+
+    @Test
+    void sseFromEarliestKeepsFlagWhileCurrentOffsetIsZero() throws Exception {
+        // Once the bridge handed fromEarliest=true to the submitter on fetch #1, we still need fromEarliest
+        // on fetch #2 if currentOffset hasn't advanced — e.g. the first fetch returned an empty page. The
+        // submitter's retry is the only thing that snaps an offset=0 request to logStartOffset, and the
+        // SSE long-poll has no other escape from an unreachable offset. Once any record arrives and
+        // currentOffset > 0, the flag becomes meaningless and must NOT be set on subsequent calls.
+        ConcurrentLinkedQueue<RequestSubmitter.FetchResult> queue = new ConcurrentLinkedQueue<>();
+        // First fetch: empty page from a quiet topic where logStartOffset==0 (the from=earliest hint is
+        // still useful because if logStartOffset later moves, we want the submitter to handle that).
+        queue.add(new RequestSubmitter.FetchResult(
+            new FetchResponseFormatter.PartitionFetch(
+                0, Errors.NONE, null, 0, 0, 0, Collections.emptyList()),
+            0L));
+        // Second fetch: a record at offset 0 arrives.
+        queue.add(new RequestSubmitter.FetchResult(
+            new FetchResponseFormatter.PartitionFetch(
+                0, Errors.NONE, null, 0, 0, 1,
+                List.of(new FetchResponseFormatter.FetchedRecord(
+                    0, null, "first".getBytes(StandardCharsets.UTF_8), null, 1L))),
+            0L));
+        submitter.fetchResultQueue = queue;
+
+        InputStreamResponseListener listener = new InputStreamResponseListener();
+        client.newRequest(url("/v1/topics/orders/records?partition=0&from=earliest"))
+            .method(HttpMethod.GET)
+            .headers(h -> h.put("Accept", "text/event-stream"))
+            .send(listener);
+        Response response = listener.get(5, TimeUnit.SECONDS);
+        assertEquals(200, response.getStatus());
+
+        try (InputStream body = listener.getInputStream();
+             BufferedReader reader = new BufferedReader(new InputStreamReader(body, StandardCharsets.UTF_8))) {
+            // Read until we get a real data event from the second fetch — proves both fetches ran.
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (line.startsWith("data: ")) {
+                    break;
+                }
+            }
+        }
+
+        // The streamer may have issued a third (queue-drained, never-completing) fetch before the test
+        // tears the connection down — that's expected. Assert what we know about the first two.
+        assertTrue(submitter.fetchCommandLog.size() >= 2,
+            "expected at least two fetches recorded, got " + submitter.fetchCommandLog.size());
+        assertTrue(submitter.fetchCommandLog.get(0).fromEarliest(),
+            "fetch #1 (currentOffset == 0) must carry fromEarliest=true");
+        assertTrue(submitter.fetchCommandLog.get(1).fromEarliest(),
+            "fetch #2 must still carry fromEarliest=true because currentOffset hasn't advanced past 0");
+        if (submitter.fetchCommandLog.size() >= 3) {
+            assertFalse(submitter.fetchCommandLog.get(2).fromEarliest(),
+                "fetch #3 must NOT carry fromEarliest — currentOffset advanced to 1 after the record arrived");
+            assertEquals(1L, submitter.fetchCommandLog.get(2).offset(),
+                "fetch #3 must continue from offset 1 after the record at offset 0");
+        }
+    }
+
+    @Test
     void sseReturns429WhenConcurrentStreamCapReached() throws Exception {
         // Restart with a cap of 1 so the first stream consumes all capacity. The second stream attempt must be
         // refused at the admission gate with HTTP 429 + Retry-After, NOT a half-opened event-stream that then

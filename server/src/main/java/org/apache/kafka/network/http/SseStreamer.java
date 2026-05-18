@@ -82,13 +82,20 @@ final class SseStreamer {
     private final OptionalInt maxBytes;
     private final SseStreamLimiter.Token limiterToken;
     private final Executor httpExecutor;
+    // From the URL's ?from=earliest hint. Only consulted while currentOffset == 0L (the initial offset
+    // the parser hands us for from=earliest). Once any record is delivered and currentOffset advances,
+    // the flag is naturally moot. Without this propagation the bridge would drop the flag in
+    // scheduleNextFetch, the submitter's OFFSET_OUT_OF_RANGE retry would never fire, and a retained or
+    // compacted topic with logStartOffset > 0 would close every from=earliest stream with an error frame.
+    private final boolean fromEarliest;
 
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private volatile long currentOffset;
 
     private SseStreamer(AsyncContext async, RequestSubmitter submitter, ObjectMapper mapper,
                         String topic, int partition, long startOffset, OptionalInt maxBytes,
-                        SseStreamLimiter.Token limiterToken, Executor httpExecutor) throws IOException {
+                        boolean fromEarliest, SseStreamLimiter.Token limiterToken,
+                        Executor httpExecutor) throws IOException {
         this.async = Objects.requireNonNull(async);
         this.resp = (HttpServletResponse) async.getResponse();
         this.out = resp.getOutputStream();
@@ -98,6 +105,7 @@ final class SseStreamer {
         this.partition = partition;
         this.currentOffset = startOffset;
         this.maxBytes = Objects.requireNonNull(maxBytes);
+        this.fromEarliest = fromEarliest;
         this.limiterToken = Objects.requireNonNull(limiterToken);
         this.httpExecutor = Objects.requireNonNull(httpExecutor);
     }
@@ -127,7 +135,7 @@ final class SseStreamer {
             async.setTimeout(0L); // no servlet-side timeout — the broker's fetch max-wait is the only pacing
 
             streamer = new SseStreamer(async, submitter, mapper, command.topic(), command.partition(),
-                command.offset(), command.maxBytes(), limiterToken, httpExecutor);
+                command.offset(), command.maxBytes(), command.fromEarliest(), limiterToken, httpExecutor);
             // Write the framing comment so connection-buffering proxies flush the headers before any record arrives.
             streamer.out.write(CONNECTED_COMMENT);
             streamer.out.flush();
@@ -151,8 +159,13 @@ final class SseStreamer {
         if (closed.get()) {
             return;
         }
+        // Keep propagating fromEarliest while currentOffset is still at its initial value (0L). The
+        // submitter's OFFSET_OUT_OF_RANGE retry needs the flag to know that "0L" is a hint rather than
+        // an explicit offset request. Once any record arrives, currentOffset advances and the flag is
+        // automatically dropped — explicit offsets must not silently snap to logStartOffset.
+        boolean propagateFromEarliest = fromEarliest && currentOffset == 0L;
         FetchRequestParser.FetchCommand command =
-            new FetchRequestParser.FetchCommand(topic, partition, currentOffset, maxBytes);
+            new FetchRequestParser.FetchCommand(topic, partition, currentOffset, maxBytes, propagateFromEarliest);
         // whenCompleteAsync(..., httpExecutor) dispatches the next iteration off the thread that completed the
         // submitter future. That thread is the broker's request-handler thread (RequestChannel callback) — running
         // the SSE write loop there pins a Kafka API handler on a slow streaming client and can starve the binary
