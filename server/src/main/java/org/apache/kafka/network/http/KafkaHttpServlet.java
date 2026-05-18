@@ -24,6 +24,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.nio.channels.ClosedChannelException;
+import java.util.Locale;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
@@ -197,9 +199,10 @@ public final class KafkaHttpServlet extends HttpServlet {
             // no single "response status" to record at the end. Instead record the accept event in
             // SseStreamsOpened; paired with the ActiveSseStreams gauge and RejectedAtSseCap meter this gives
             // operators the full open-rate / point-in-time / reject-rate picture without contaminating
-            // RequestLatencyMs with stream-lifetime samples.
-            metrics.recordSseStreamOpened();
-            SseStreamer.start(async, submitter, mapper, command, token, httpExecutor);
+            // RequestLatencyMs with stream-lifetime samples. The meter is incremented from inside start() only
+            // after the priming comment write succeeds — otherwise a connection that died before producing any
+            // events would inflate the open counter relative to the gauge.
+            SseStreamer.start(async, submitter, mapper, command, token, httpExecutor, metrics::recordSseStreamOpened);
             return;
         }
 
@@ -246,13 +249,46 @@ public final class KafkaHttpServlet extends HttpServlet {
                 writeBridgeResponse(resp, response, contentType);
             }
         } catch (IOException e) {
-            LOG.warn("Failed to write HTTP response", e);
+            // Slow clients that disconnect mid-write are routine — Jetty surfaces this as EofException /
+            // ClosedChannelException / "broken pipe" / "connection reset". Logging every such case at WARN
+            // creates alarm fatigue on dashboards that page on bridge WARN volume. True write failures
+            // (encoding bug, runtime I/O fault on a still-open channel) stay at WARN.
+            if (isClientDisconnect(e)) {
+                LOG.debug("Client disconnected before response could be written", e);
+            } else {
+                LOG.warn("Failed to write HTTP response", e);
+            }
         } finally {
             // Read the status from the response object rather than from the bridge result — this catches the 500
             // we wrote on `throwable != null` as well as anything writeBridgeResponse set.
             metrics.recordRequest(operation, elapsedMs(startNanos), resp.getStatus());
             async.complete();
         }
+    }
+
+    /**
+     * Heuristic for distinguishing "client gone away" from "real write failure". Walks the cause chain because Jetty
+     * sometimes wraps the underlying NIO failure inside its own {@code EofException}. Matches {@link ClosedChannelException}
+     * by type, Jetty's {@code EofException} by simple name (avoids a hard dependency on Jetty's internal package), and
+     * the canonical TCP-disconnect message phrases. Lowercased for portability across JDK locales.
+     */
+    private static boolean isClientDisconnect(IOException e) {
+        for (Throwable t = e; t != null; t = t.getCause()) {
+            if (t instanceof ClosedChannelException) {
+                return true;
+            }
+            if ("EofException".equals(t.getClass().getSimpleName())) {
+                return true;
+            }
+            String msg = t.getMessage();
+            if (msg != null) {
+                String lower = msg.toLowerCase(Locale.ROOT);
+                if (lower.contains("broken pipe") || lower.contains("connection reset")) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     /**

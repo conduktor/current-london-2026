@@ -114,12 +114,17 @@ final class SseStreamer {
      * Initialize the SSE response and kick off the first fetch. The AsyncContext must already be started by the
      * caller. The streamer takes ownership: it will complete the AsyncContext when the stream terminates (client
      * disconnect, partition-level error, or unrecoverable submitter failure).
+     *
+     * <p>{@code onPrimed} runs exactly once iff the priming-comment write+flush succeeds, before the first fetch is
+     * scheduled. The caller uses it to mark the "stream opened" metric — keeping the bookkeeping aligned with the
+     * gauge: streams that fail at the priming write produced zero events and must not inflate the open counter.
      */
     static void start(AsyncContext async, RequestSubmitter submitter, ObjectMapper mapper,
                       FetchRequestParser.FetchCommand command, SseStreamLimiter.Token limiterToken,
-                      Executor httpExecutor) {
+                      Executor httpExecutor, Runnable onPrimed) {
         Objects.requireNonNull(limiterToken, "limiterToken must not be null — caller must acquire before start()");
         Objects.requireNonNull(httpExecutor, "httpExecutor must not be null");
+        Objects.requireNonNull(onPrimed, "onPrimed must not be null");
         SseStreamer streamer;
         try {
             HttpServletResponse resp = (HttpServletResponse) async.getResponse();
@@ -152,6 +157,9 @@ final class SseStreamer {
             async.complete();
             return;
         }
+        // Priming write+flush has committed the response; the connection is live. Record "opened" now so the meter
+        // matches the gauge: failures above this line never count as an open.
+        onPrimed.run();
         streamer.scheduleNextFetch();
     }
 
