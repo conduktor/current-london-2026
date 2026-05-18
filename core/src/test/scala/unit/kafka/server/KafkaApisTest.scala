@@ -11021,6 +11021,59 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testProduceTenantScrubsPhysicalPrefixFromReplicaManagerErrorMessage(): Unit = {
+    // replicaManager / log validation can embed the physical topic name in
+    // PartitionResponse.errorMessage (e.g. record validators quoting the
+    // offending topic). The OUT rewrite must scrub that string in addition to
+    // rewriting the TopicPartition key, otherwise the physical prefix leaks
+    // to the tenant client through the error-message side channel.
+    val physicalTopic = "acme.orders"
+    addTopicToMetadataCache(physicalTopic, numPartitions = 1)
+
+    val produceRequest = buildSingleTopicProduceRequest("orders")
+    val request = buildRequest(
+      produceRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    val responseCallback: ArgumentCaptor[Map[TopicPartition, PartitionResponse] => Unit] =
+      ArgumentCaptor.forClass(classOf[Map[TopicPartition, PartitionResponse] => Unit])
+
+    val leakedMessage = s"Invalid record for topic '$physicalTopic'"
+    when(replicaManager.handleProduceAppend(
+      anyLong, anyShort, ArgumentMatchers.eq(false), any(),
+      any(), responseCallback.capture(),
+      any(), any(), any(), any())
+    ).thenAnswer(_ => responseCallback.getValue.apply(
+      Map(new TopicPartition(physicalTopic, 0) ->
+        new PartitionResponse(Errors.INVALID_RECORD, leakedMessage))))
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), any[Long])).thenReturn(0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    kafkaApis = createKafkaApis(
+      authorizer = None,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[ProduceResponse](request)
+    val topicProduceResponse = response.data.responses.asScala.head
+    assertEquals("orders", topicProduceResponse.name,
+      "topic name in response must be logical")
+    val partitionProduceResponse = topicProduceResponse.partitionResponses.asScala.head
+    assertEquals(Errors.INVALID_RECORD,
+      Errors.forCode(partitionProduceResponse.errorCode))
+    val msg = partitionProduceResponse.errorMessage
+    assertNotNull(msg, "errorMessage must be propagated to the client")
+    assertFalse(msg.contains("acme.orders"),
+      s"physical prefix must be scrubbed from errorMessage but found in: $msg")
+    assertTrue(msg.contains("orders"),
+      s"logical topic name must remain in errorMessage: $msg")
+  }
+
+  @Test
   def testProducePrivilegedCallerOnTenantBoundListenerIsRejected(): Unit = {
     // Super-user without a `__tenant_` prefix produces on a tenant-bound
     // listener. The broker MUST refuse every partition rather than silently

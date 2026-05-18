@@ -864,16 +864,20 @@ class KafkaApis(val requestChannel: RequestChannel,
       // with acks=0 would get a silent no-op instead of a connection close.
       if (invalidLogicalTopicResponses.nonEmpty) errorInResponse = true
 
-      // OUT rewrite — only the response map keys (TopicPartitions) carry
-      // names; the PartitionResponse values are shared by reference, so the
-      // currentLeader info set above is preserved on the rekeyed entries.
-      // The client sees logical topic names in all paths including errors.
+      // OUT rewrite — the response map keys (TopicPartitions) carry the
+      // physical topic name and the PartitionResponse values may embed the
+      // physical name inside `errorMessage` (e.g. validators that quote the
+      // offending topic). Rewrite both: the key via toLogical, the embedded
+      // string via scrubMessage. The PartitionResponse is mutated in place
+      // because its fields are public and at this point we own the reference;
+      // currentLeader and other state set above are preserved.
       // invalidLogicalTopicResponses is already keyed by the LOGICAL name the
       // client sent; merge after the toLogical pass so it doesn't strip the
       // tenant-prefix portion the caller intentionally included.
       val mergedResponseStatus: Map[TopicPartition, PartitionResponse] = {
         val rewritten: Map[TopicPartition, PartitionResponse] =
           if (tenantScoped) physicalResponseStatus.map { case (tp, pr) =>
+            if (pr.errorMessage != null) pr.errorMessage = scrubMessage(pr.errorMessage, tenantCtx)
             new TopicPartition(tenantCtx.toLogical(tp.topic), tp.partition) -> pr
           } else physicalResponseStatus
         rewritten ++ invalidLogicalTopicResponses
