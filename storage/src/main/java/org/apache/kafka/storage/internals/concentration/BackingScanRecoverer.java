@@ -16,12 +16,12 @@
  */
 package org.apache.kafka.storage.internals.concentration;
 
+import org.apache.kafka.common.utils.Utils;
+
 import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
-import java.nio.file.Files;
-import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.Collection;
 import java.util.Collections;
@@ -93,9 +93,18 @@ public final class BackingScanRecoverer {
 
     /**
      * Atomically persist the new logical {@code startOffset} for a partition. Writes 8 big-endian
-     * bytes to a temp file, fsyncs, then renames over the real file with {@link
-     * StandardCopyOption#ATOMIC_MOVE}. After this call returns, a crash + restart will read the
-     * same value — without it, DeleteRecords would silently regress on every broker bounce.
+     * bytes to a temp file, fsyncs the file, atomically renames over the real file, then fsyncs
+     * the parent directory so the rename's directory-entry update is durable. After this call
+     * returns, a crash + restart will read the same value — without it, DeleteRecords would
+     * silently regress on every broker bounce.
+     *
+     * <p>Codex round-9 HIGH: a bare {@code Files.move(... ATOMIC_MOVE)} guarantees atomicity
+     * inside the filesystem, but POSIX does NOT guarantee the directory entry is on disk when
+     * the call returns. A crash between rename and the next filesystem checkpoint can roll the
+     * directory entry back to its pre-rename state — the old {@code .startoffset} reappears
+     * even though {@code persistStartOffset} returned success. {@link
+     * Utils#atomicMoveWithFallback(java.nio.file.Path, java.nio.file.Path)} closes that hole by
+     * flushing the parent directory after the rename.
      *
      * <p>fsync on this path is acceptable per PROMPT line 10 ("Do not fsync per-append on small
      * segments — throughput collapses"). DeleteRecords is a rare, low-volume admin operation, not
@@ -123,8 +132,7 @@ public final class BackingScanRecoverer {
             // chose, which is exactly the bug we're trying to prevent.
             ch.force(true);
         }
-        Files.move(tmp.toPath(), target.toPath(),
-            StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        Utils.atomicMoveWithFallback(tmp.toPath(), target.toPath());
     }
 
     /**
