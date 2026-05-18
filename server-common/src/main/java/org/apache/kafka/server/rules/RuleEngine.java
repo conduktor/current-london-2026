@@ -109,6 +109,37 @@ public final class RuleEngine {
      */
     public static final String ACTIVATION_BUDGET_RULE_ID = "__activation-budget-exceeded__";
 
+    /**
+     * Per-thread "currently inside evaluate()" flag — guards against re-entrant
+     * evaluation from within the activation supplier or (hypothetically) from
+     * within a rule predicate.
+     *
+     * <p>The per-request CEL step budget ({@code CelLimits.MAX_EVAL_STEPS}) is
+     * reset on the way in and again in a {@code finally} on the way out of
+     * {@link #evaluate}. A re-entrant call would call
+     * {@code CelProgram.resetEvalStepBudget()} on the inner entry, silently
+     * granting the outer evaluation a fresh 100k-step budget once the inner
+     * returned — turning the per-request DoS guarantee into a per-call
+     * guarantee with no upper bound on calls. The bound on stack depth (each
+     * frame still pays its own steps) would not save the budget; the budget
+     * is the gate.
+     *
+     * <p>Today re-entry is structurally impossible: the supported CEL subset
+     * has no user-defined functions and the production activation supplier
+     * (the {@code ApiMessageActivation} reflective walker) cannot reach back
+     * into {@code RuleEngine}. This guard is forward-looking defence-in-depth
+     * — a future contributor extending the CEL subset, adding a
+     * principal-attribute provider, or wiring in a custom activation supplier
+     * will trip it loudly with a message pointing at the cause, instead of
+     * silently breaking the budget guarantee.
+     *
+     * <p>{@link ThreadLocal#remove()} is called in the outer {@code finally}
+     * so a thread pool used by a future caller does not carry a stale
+     * {@code TRUE} into a subsequent request on the same thread.
+     */
+    private static final ThreadLocal<Boolean> IN_EVALUATE =
+        ThreadLocal.withInitial(() -> Boolean.FALSE);
+
     private final AtomicReference<RuleSet> active = new AtomicReference<>(RuleSet.EMPTY);
 
     /**
@@ -417,6 +448,23 @@ public final class RuleEngine {
                                  String principalName,
                                  boolean fromPrivilegedListener,
                                  Supplier<Map<String, Object>> activationSupplier) {
+        // Re-entry guard — see IN_EVALUATE javadoc. Checked at function entry
+        // so the throw lands BEFORE any budget reset or supplier invocation,
+        // which means an inner re-entrant call does not corrupt the outer
+        // evaluation's state. The early-return paths below (bypass, no-rule,
+        // empty-rule-list) never set IN_EVALUATE, so re-entrant short-circuits
+        // remain valid — only a re-entrant call that would actually reach the
+        // budget-reset or rule loop trips here.
+        if (Boolean.TRUE.equals(IN_EVALUATE.get())) {
+            throw new IllegalStateException(
+                "RuleEngine.evaluate must not be called recursively on the same "
+                    + "thread. The per-request CEL step budget guarantee depends "
+                    + "on a single evaluate() entry per request thread; a "
+                    + "re-entrant call would reset the outer evaluation's budget. "
+                    + "Re-entry detected on apiKey=" + apiKey + ". This usually "
+                    + "indicates an activation supplier or rule predicate that "
+                    + "calls back into the engine — neither is supported.");
+        }
         if (fromPrivilegedListener && bypassIsAuthorisedFor(principalName)) {
             return RuleDecision.ALLOW;
         }
@@ -428,107 +476,122 @@ public final class RuleEngine {
         if (rules.isEmpty()) {
             return RuleDecision.ALLOW;
         }
-        Map<String, Object> activation;
+        // Past this point we touch the per-request CEL step budget and call
+        // the activation supplier. Set the guard NOW so any re-entry from
+        // either trips the check at the top — and clear it in the outer
+        // finally so a pool thread does not carry a stale TRUE to the next
+        // request.
+        IN_EVALUATE.set(Boolean.TRUE);
         try {
-            activation = activationSupplier.get();
-        } catch (ActivationBudgetExceededException budget) {
-            // Attacker-shaped wide request: the walker exhausted its
-            // MAX_ACCESSOR_INVOCATIONS budget (e.g. an OffsetFetch with 10000+
-            // partition indexes, a CreateTopics with 10000+ topic descriptors,
-            // a JoinGroup with 5000+ protocols). Falling through to the generic
-            // Throwable branch below would fail OPEN, which is the right answer
-            // for a buggy extractor (broker bug should not 503 every request)
-            // but the wrong answer here: any external client could then evade
-            // every DENY rule on the targeted API simply by inflating a single
-            // repeated field past the budget, since the budget cap is exactly
-            // what makes worst-case walk cost bounded.
-            //
-            // Fail CLOSED with a synthetic DENY whose error code is
-            // POLICY_VIOLATION (44) and whose denyingRuleId is the reserved
-            // sentinel ACTIVATION_BUDGET_RULE_ID — codec rules forbid operator
-            // rule ids that start or end with "__", so an audit consumer can
-            // attribute this DENY to the engine's defensive posture without
-            // ambiguity. See ActivationBudgetExceededException javadoc for the
-            // full broker-bug-vs-attacker-shape policy distinction.
-            //
-            // Throttle the WARN: the request itself is fail-closed, but writing
-            // one synchronous SLF4J line per attacker request would re-open the
-            // log-spam DoS vector that the fail-closed posture is designed to
-            // shut. One line per window with the suppression count is enough
-            // for an operator to notice the event start; subsequent attacker
-            // requests in the same window only bump the counter.
-            maybeWarnBudgetExceeded(apiKey, budget);
-            return RuleDecision.deny(Errors.POLICY_VIOLATION.code(), ACTIVATION_BUDGET_RULE_ID);
-        } catch (Throwable t) {
-            // Codex deep-audit P0 fix: a throwing activation supplier MUST NOT
-            // propagate into the request thread. The most realistic failure mode
-            // is ApiMessageActivation walking a request whose accessor blows up
-            // (Optional/Stream accessor, partially-constructed protocol object,
-            // version-specific schema mismatch). Without this catch the
-            // exception escapes into KafkaApis.handle(), turning a buggy
-            // governance extractor into a request-thread crash.
-            //
-            // We catch Throwable to match the per-rule policy below: a
-            // StackOverflowError from a deeply nested ApiMessage walk or an
-            // OutOfMemoryError from a giant Records buffer must not be allowed
-            // to take the request thread with it either.
-            //
-            // Posture is "fail-open": a broken governance feature degrades to
-            // ALLOW, never to a broker request failure. This matches the
-            // per-rule fail-open below ("a buggy rule must not be able to
-            // crash the request path") and is the only outcome consistent
-            // with that policy — no rule can be evaluated without an
-            // activation map, so ALLOW is the only available safe answer.
-            //
-            // The attacker-shape exception above is caught FIRST so it never
-            // falls through this generic branch; see that catch's comment for
-            // why budget overflow needs the opposite posture.
-            LOG.warn("activation supplier failed for apiKey {} — failing open: {}",
-                apiKey, t.toString());
-            return RuleDecision.ALLOW;
-        }
-        // Round-8 audit HIGH (concurrency): the CEL eval-step budget is
-        // per-request, not per-rule. Resetting here (and not inside
-        // CelProgram.evalBoolean) means all rules targeting this api-key
-        // share the single MAX_EVAL_STEPS ceiling. With the per-api-key cap
-        // of 128 rules, the pre-fix per-rule reset gave a single request up
-        // to 128 * 100k = 12.8M CEL steps of legitimate budget — a
-        // published-rule-shaped DoS amplifier. With one reset per request,
-        // the bound is the documented 100k regardless of how many rules an
-        // operator has authored. Reset both before and after in a
-        // try/finally so a throwing evaluation (CelEvaluationException,
-        // StackOverflowError, OutOfMemoryError) cannot poison the next
-        // request's budget on the same broker thread.
-        CelProgram.resetEvalStepBudget();
-        try {
-            for (Rule rule : rules) {
-                boolean matched;
-                try {
-                    matched = rule.compiled().evalBoolean(activation::get);
-                } catch (Throwable t) {
-                    // Catch Throwable, not just RuntimeException: a pathological CEL
-                    // expression can raise StackOverflowError (deep comprehensions),
-                    // OutOfMemoryError (huge string ops), or other Error subclasses.
-                    // The request thread must never die because of a buggy rule —
-                    // log loudly and treat the rule as ALLOW, then move to the next.
-                    //
-                    // Note that after one rule trips the per-request budget, the
-                    // next rule in this loop will retrip on entry under the shared
-                    // counter and also land here as fail-open. That is the intended
-                    // DoS-defence behaviour: a request cannot multiply the step
-                    // budget by the number of rules an operator happens to have
-                    // published. See CelLimits.resetSteps javadoc.
-                    LOG.warn("rule '{}' failed open due to evaluation error on apiKey {}: {}",
-                        rule.id(), apiKey, t.toString());
-                    continue;
-                }
-                if (matched) {
-                    return RuleDecision.deny(rule.errorCode(), rule.id());
-                }
+            Map<String, Object> activation;
+            try {
+                activation = activationSupplier.get();
+            } catch (ActivationBudgetExceededException budget) {
+                // Attacker-shaped wide request: the walker exhausted its
+                // MAX_ACCESSOR_INVOCATIONS budget (e.g. an OffsetFetch with 10000+
+                // partition indexes, a CreateTopics with 10000+ topic descriptors,
+                // a JoinGroup with 5000+ protocols). Falling through to the generic
+                // Throwable branch below would fail OPEN, which is the right answer
+                // for a buggy extractor (broker bug should not 503 every request)
+                // but the wrong answer here: any external client could then evade
+                // every DENY rule on the targeted API simply by inflating a single
+                // repeated field past the budget, since the budget cap is exactly
+                // what makes worst-case walk cost bounded.
+                //
+                // Fail CLOSED with a synthetic DENY whose error code is
+                // POLICY_VIOLATION (44) and whose denyingRuleId is the reserved
+                // sentinel ACTIVATION_BUDGET_RULE_ID — codec rules forbid operator
+                // rule ids that start or end with "__", so an audit consumer can
+                // attribute this DENY to the engine's defensive posture without
+                // ambiguity. See ActivationBudgetExceededException javadoc for the
+                // full broker-bug-vs-attacker-shape policy distinction.
+                //
+                // Throttle the WARN: the request itself is fail-closed, but writing
+                // one synchronous SLF4J line per attacker request would re-open the
+                // log-spam DoS vector that the fail-closed posture is designed to
+                // shut. One line per window with the suppression count is enough
+                // for an operator to notice the event start; subsequent attacker
+                // requests in the same window only bump the counter.
+                maybeWarnBudgetExceeded(apiKey, budget);
+                return RuleDecision.deny(Errors.POLICY_VIOLATION.code(), ACTIVATION_BUDGET_RULE_ID);
+            } catch (Throwable t) {
+                // Codex deep-audit P0 fix: a throwing activation supplier MUST NOT
+                // propagate into the request thread. The most realistic failure mode
+                // is ApiMessageActivation walking a request whose accessor blows up
+                // (Optional/Stream accessor, partially-constructed protocol object,
+                // version-specific schema mismatch). Without this catch the
+                // exception escapes into KafkaApis.handle(), turning a buggy
+                // governance extractor into a request-thread crash.
+                //
+                // We catch Throwable to match the per-rule policy below: a
+                // StackOverflowError from a deeply nested ApiMessage walk or an
+                // OutOfMemoryError from a giant Records buffer must not be allowed
+                // to take the request thread with it either.
+                //
+                // Posture is "fail-open": a broken governance feature degrades to
+                // ALLOW, never to a broker request failure. This matches the
+                // per-rule fail-open below ("a buggy rule must not be able to
+                // crash the request path") and is the only outcome consistent
+                // with that policy — no rule can be evaluated without an
+                // activation map, so ALLOW is the only available safe answer.
+                //
+                // The attacker-shape exception above is caught FIRST so it never
+                // falls through this generic branch; see that catch's comment for
+                // why budget overflow needs the opposite posture.
+                LOG.warn("activation supplier failed for apiKey {} — failing open: {}",
+                    apiKey, t.toString());
+                return RuleDecision.ALLOW;
             }
-            return RuleDecision.ALLOW;
-        } finally {
+            // Round-8 audit HIGH (concurrency): the CEL eval-step budget is
+            // per-request, not per-rule. Resetting here (and not inside
+            // CelProgram.evalBoolean) means all rules targeting this api-key
+            // share the single MAX_EVAL_STEPS ceiling. With the per-api-key cap
+            // of 128 rules, the pre-fix per-rule reset gave a single request up
+            // to 128 * 100k = 12.8M CEL steps of legitimate budget — a
+            // published-rule-shaped DoS amplifier. With one reset per request,
+            // the bound is the documented 100k regardless of how many rules an
+            // operator has authored. Reset both before and after in a
+            // try/finally so a throwing evaluation (CelEvaluationException,
+            // StackOverflowError, OutOfMemoryError) cannot poison the next
+            // request's budget on the same broker thread.
             CelProgram.resetEvalStepBudget();
+            try {
+                for (Rule rule : rules) {
+                    boolean matched;
+                    try {
+                        matched = rule.compiled().evalBoolean(activation::get);
+                    } catch (Throwable t) {
+                        // Catch Throwable, not just RuntimeException: a pathological CEL
+                        // expression can raise StackOverflowError (deep comprehensions),
+                        // OutOfMemoryError (huge string ops), or other Error subclasses.
+                        // The request thread must never die because of a buggy rule —
+                        // log loudly and treat the rule as ALLOW, then move to the next.
+                        //
+                        // Note that after one rule trips the per-request budget, the
+                        // next rule in this loop will retrip on entry under the shared
+                        // counter and also land here as fail-open. That is the intended
+                        // DoS-defence behaviour: a request cannot multiply the step
+                        // budget by the number of rules an operator happens to have
+                        // published. See CelLimits.resetSteps javadoc.
+                        LOG.warn("rule '{}' failed open due to evaluation error on apiKey {}: {}",
+                            rule.id(), apiKey, t.toString());
+                        continue;
+                    }
+                    if (matched) {
+                        return RuleDecision.deny(rule.errorCode(), rule.id());
+                    }
+                }
+                return RuleDecision.ALLOW;
+            } finally {
+                CelProgram.resetEvalStepBudget();
+            }
+        } finally {
+            // Pair with IN_EVALUATE.set(TRUE) above. remove() (not set(FALSE))
+            // so the ThreadLocal slot is released back to the GC when the
+            // thread is parked between requests; a pool thread observing
+            // initialValue=FALSE on its next request is equivalent to
+            // observing the explicitly-cleared FALSE here.
+            IN_EVALUATE.remove();
         }
     }
 

@@ -993,4 +993,71 @@ public class RuleEngineTest {
             IllegalArgumentException.class,
             () -> RuleEngine.parseBypassPrincipals("User" + nbsp + ":broker"));
     }
+
+    @Test
+    public void reentrantEvaluateFromActivationSupplierIsCaughtAndFailsOpen() {
+        // Round-8 audit task #100: the per-request CEL step budget is reset
+        // on entry and again in a finally on exit. A re-entrant evaluate()
+        // call from within the activation supplier (or, hypothetically, from
+        // within a rule predicate if user-defined functions are ever added)
+        // would call resetEvalStepBudget() in the inner frame and silently
+        // grant the outer evaluation a fresh 100k-step budget on return —
+        // turning the per-request DoS guarantee into a per-call guarantee.
+        //
+        // The engine guards this with a ThreadLocal IN_EVALUATE flag that
+        // throws IllegalStateException on detected re-entry. Because the
+        // throw originates inside the supplier, the outer evaluate()'s
+        // catch(Throwable) fail-open branch catches it and returns ALLOW —
+        // the supplier "failed" from the engine's perspective, and the
+        // documented fail-open posture is the only safe outcome (no
+        // activation map ⇒ no rule can be evaluated). That posture matches
+        // the existing test invariants for every other unrecoverable
+        // supplier failure.
+        RuleEngine engine = new RuleEngine();
+        engine.install(new RuleSetBuilder()
+            .put(denyRule("r1", ApiKeys.METADATA, "true", 7))
+            .build());
+        AtomicBoolean reentryAttempted = new AtomicBoolean(false);
+        AtomicBoolean reentryThrew = new AtomicBoolean(false);
+        java.util.function.Supplier<Map<String, Object>> reentrantSupplier = () -> {
+            reentryAttempted.set(true);
+            try {
+                engine.evaluate(ApiKeys.METADATA, "c", null, false, Collections::emptyMap);
+            } catch (IllegalStateException expected) {
+                reentryThrew.set(true);
+                throw expected;
+            }
+            return Collections.emptyMap();
+        };
+        RuleDecision d = engine.evaluate(
+            ApiKeys.METADATA, "c", null, false, reentrantSupplier);
+        assertTrue(reentryAttempted.get(), "supplier must have been invoked");
+        assertTrue(reentryThrew.get(),
+            "inner evaluate() must throw IllegalStateException on re-entry");
+        assertSame(RuleDecision.ALLOW, d,
+            "outer evaluate() must fail open when the supplier throws");
+    }
+
+    @Test
+    public void reentryFlagIsClearedAfterEvaluation() {
+        // The IN_EVALUATE ThreadLocal is removed in a finally, so a thread
+        // that completes one evaluation (whether ALLOW, DENY, or fail-open)
+        // must accept a fresh evaluation on the same thread immediately
+        // after. Pin this: a pool thread serving back-to-back requests must
+        // never observe a stale TRUE on the second request.
+        RuleEngine engine = new RuleEngine();
+        engine.install(new RuleSetBuilder()
+            .put(denyRule("r1", ApiKeys.METADATA, "true", 7))
+            .build());
+        // First evaluation: lands a DENY (rule matches).
+        RuleDecision d1 = engine.evaluate(
+            ApiKeys.METADATA, "c", null, false, Collections::emptyMap);
+        assertTrue(d1.denied(), "first evaluation must DENY via r1");
+        // Second evaluation on the same thread: must run without tripping
+        // the re-entry guard.
+        RuleDecision d2 = engine.evaluate(
+            ApiKeys.METADATA, "c", null, false, Collections::emptyMap);
+        assertTrue(d2.denied(),
+            "second evaluation on the same thread must run cleanly (guard cleared)");
+    }
 }
