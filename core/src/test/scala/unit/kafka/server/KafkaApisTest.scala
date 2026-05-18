@@ -2791,11 +2791,11 @@ class KafkaApisTest extends Logging {
     // Build the backing-side records that ReplicaManager would return: three "orders" records
     // interleaved with two "events" records (events must be filtered out by the translator).
     val backingRecords = backingRecordsFromInterleaved(
-      ("orders", 100L, "k0", "ord-0"),
-      ("events", 50L,  "kx", "evt-x"),
-      ("orders", 101L, "k1", "ord-1"),
-      ("events", 51L,  "ky", "evt-y"),
-      ("orders", 102L, "k2", "ord-2"))
+      ("orders", 0, 100L, "k0", "ord-0"),
+      ("events", 0, 50L,  "kx", "evt-x"),
+      ("orders", 0, 101L, "k1", "ord-1"),
+      ("events", 0, 51L,  "ky", "evt-y"),
+      ("orders", 0, 102L, "k2", "ord-2"))
 
     val backingTip = new TopicIdPartition(backingTopicId, new TopicPartition(backingTopic, 2))
     val fetchInfoCaptor: ArgumentCaptor[Seq[(TopicIdPartition, FetchRequest.PartitionData)]] =
@@ -2873,6 +2873,134 @@ class KafkaApisTest extends Logging {
     }
     assertEquals(Seq((100L, "ord-0"), (101L, "ord-1"), (102L, "ord-2")), seen.toSeq,
       "consumer must see only orders' records with logical offsets, in order")
+  }
+
+  @Test
+  def testFetchCoalescesTwoLogicalPartitionsSharingOneBackingPartition(): Unit = {
+    // Codex audit CRIT #2. PROMPT premise is N >> M, so logical partitions of the same topic
+    // routinely share a backing partition. A stock consumer ROUTINELY puts many partitions in
+    // one fetch request — that's the whole "consumer fetches all assigned partitions in one
+    // round-trip" model. Pre-fix behaviour: two logical TIPs mapping to the same backing TIP
+    // both inserted entries into logicalByBacking keyed by the backing TIP, the second
+    // insertion overwrote the first, and the consumer's response silently dropped one logical
+    // partition.
+    //
+    // After the fix: a single backing fetch is issued (coalesced), and the one backing response
+    // is fanned out to BOTH logical TIPs with per-TIP demux. Pinned here: exactly one backing
+    // fetch issued, both logical TIPs present in the consumer's response, each with only its
+    // own demuxed records.
+    val logicalTopic = "orders"
+    val backingTopic = "concentrated"
+    val backingTopicId = Uuid.randomUuid()
+    val logicalTopicId = Uuid.randomUuid()
+    val descriptor = new LogicalTopicDescriptor(logicalTopic, 1024, backingTopic, 4)
+    addTopicToMetadataCache(backingTopic, numPartitions = 4, topicId = backingTopicId)
+    addTopicToMetadataCache(logicalTopic, numPartitions = 1024, topicId = logicalTopicId)
+
+    when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
+    when(concentrationKernel.describe(logicalTopic)).thenReturn(Optional.of(descriptor))
+    // Both logical partitions map to the SAME backing partition — the bug condition.
+    when(concentrationKernel.backingPartitionFor(logicalTopic, 0)).thenReturn(2)
+    when(concentrationKernel.backingPartitionFor(logicalTopic, 4)).thenReturn(2)
+    when(concentrationKernel.nextLogicalOffset(logicalTopic, 0)).thenReturn(10L)
+    when(concentrationKernel.nextLogicalOffset(logicalTopic, 4)).thenReturn(20L)
+    when(concentrationKernel.startLogicalOffset(logicalTopic, 0)).thenReturn(0L)
+    when(concentrationKernel.startLogicalOffset(logicalTopic, 4)).thenReturn(0L)
+    when(concentrationKernel.resolveBackingOffset(logicalTopic, 0, 0L)).thenReturn(5000L)
+    when(concentrationKernel.resolveBackingOffset(logicalTopic, 4, 0L)).thenReturn(5050L)
+
+    // Backing records interleave both logical partitions on the SHARED backing partition.
+    val backingRecords = backingRecordsFromInterleaved(
+      ("orders", 0, 0L, "k-p0-0", "p0-r0"),
+      ("orders", 4, 0L, "k-p4-0", "p4-r0"),
+      ("orders", 0, 1L, "k-p0-1", "p0-r1"),
+      ("orders", 4, 1L, "k-p4-1", "p4-r1"),
+      ("orders", 0, 2L, "k-p0-2", "p0-r2"))
+
+    val backingTip = new TopicIdPartition(backingTopicId, new TopicPartition(backingTopic, 2))
+    val fetchInfoCaptor: ArgumentCaptor[Seq[(TopicIdPartition, FetchRequest.PartitionData)]] =
+      ArgumentCaptor.forClass(classOf[Seq[(TopicIdPartition, FetchRequest.PartitionData)]])
+    when(replicaManager.fetchMessages(
+      any[FetchParams],
+      fetchInfoCaptor.capture(),
+      any[ReplicaQuota],
+      any[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]()
+    )).thenAnswer { invocation =>
+      val callback = invocation.getArgument(3).asInstanceOf[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]
+      callback(Seq(backingTip -> new FetchPartitionData(Errors.NONE, 6000L, 0L, backingRecords,
+        Optional.empty(), OptionalLong.of(6000L), Optional.empty(), OptionalInt.empty(), false)))
+    }
+
+    val logicalTipP0 = new TopicIdPartition(logicalTopicId, new TopicPartition(logicalTopic, 0))
+    val logicalTipP4 = new TopicIdPartition(logicalTopicId, new TopicPartition(logicalTopic, 4))
+    val fetchData = Map(
+      logicalTipP0 -> new FetchRequest.PartitionData(logicalTopicId, 0L, 0L, 1_000_000, Optional.empty()),
+      logicalTipP4 -> new FetchRequest.PartitionData(logicalTopicId, 0L, 0L, 500_000, Optional.empty())
+    ).asJava
+    val fetchDataBuilder = Map(
+      logicalTipP0.topicPartition -> new FetchRequest.PartitionData(logicalTopicId, 0L, 0L, 1_000_000, Optional.empty()),
+      logicalTipP4.topicPartition -> new FetchRequest.PartitionData(logicalTopicId, 0L, 0L, 500_000, Optional.empty())
+    ).asJava
+    val fetchContext = new FullFetchContext(time, new FetchSessionCacheShard(1000, 100),
+      new JFetchMetadata(0, 0), fetchData, false, false)
+    when(fetchManager.newContext(
+      any[Short], any[JFetchMetadata], any[Boolean],
+      any[util.Map[TopicIdPartition, FetchRequest.PartitionData]],
+      any[util.List[TopicIdPartition]], any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val fetchRequest = new FetchRequest.Builder(ApiKeys.FETCH.latestVersion,
+      ApiKeys.FETCH.latestVersion, -1, -1, 100, 0, fetchDataBuilder).build()
+    val request = buildRequest(fetchRequest)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleFetchRequest(request)
+
+    // EXACTLY ONE backing fetch despite TWO logical participants — this is the coalesce pin.
+    val capturedFetchInfo = fetchInfoCaptor.getValue
+    assertEquals(1, capturedFetchInfo.size,
+      s"coalesced fetch must issue ONE backing read for shared backing partition; got ${capturedFetchInfo}")
+    val (capturedTp, capturedPd) = capturedFetchInfo.head
+    assertEquals(backingTip, capturedTp, "backing fetch must target the shared backing TIP")
+    // Merged read window: earliest fetchOffset (min(5000, 5050) = 5000) and largest maxBytes.
+    assertEquals(5000L, capturedPd.fetchOffset,
+      "coalesced fetch must start at the earliest backing offset so every participant's data is reachable")
+    assertEquals(1_000_000, capturedPd.maxBytes,
+      "coalesced fetch must use the largest maxBytes so the response can fit the union of all participants")
+
+    val response = verifyNoThrottling[FetchResponse](request)
+    val responseData = response.responseData(metadataCache.topicIdsToNames(), ApiKeys.FETCH.latestVersion)
+
+    // BOTH logical TIPs present in the consumer's response — pre-fix, only the last one survived.
+    assertTrue(responseData.containsKey(logicalTipP0.topicPartition),
+      s"orders-0 must be in response; got ${responseData.keySet()}")
+    assertTrue(responseData.containsKey(logicalTipP4.topicPartition),
+      s"orders-4 must be in response; got ${responseData.keySet()}")
+
+    val p0Data = responseData.get(logicalTipP0.topicPartition)
+    val p4Data = responseData.get(logicalTipP4.topicPartition)
+    assertEquals(Errors.NONE.code, p0Data.errorCode)
+    assertEquals(Errors.NONE.code, p4Data.errorCode)
+    assertEquals(10L, p0Data.highWatermark, "orders-0 high watermark must match its own next logical offset")
+    assertEquals(20L, p4Data.highWatermark, "orders-4 high watermark must match its own next logical offset")
+
+    def collectValues(pd: FetchResponseData.PartitionData): Seq[(Long, String)] = {
+      val out = scala.collection.mutable.ArrayBuffer[(Long, String)]()
+      val iter = FetchResponse.recordsOrFail(pd).records().iterator()
+      while (iter.hasNext) {
+        val r = iter.next()
+        val bytes = new Array[Byte](r.value().remaining())
+        r.value().duplicate().get(bytes)
+        out += ((r.offset(), new String(bytes, StandardCharsets.UTF_8)))
+      }
+      out.toSeq
+    }
+    // orders-0 sees only its three records, monotonic logical offsets.
+    assertEquals(Seq((0L, "p0-r0"), (1L, "p0-r1"), (2L, "p0-r2")), collectValues(p0Data),
+      "orders-0 consumer must see only partition-0 records — no leakage from orders-4 sharing the backing")
+    // orders-4 sees only its two records, monotonic logical offsets.
+    assertEquals(Seq((0L, "p4-r0"), (1L, "p4-r1")), collectValues(p4Data),
+      "orders-4 consumer must see only partition-4 records — no leakage from orders-0 sharing the backing")
   }
 
   @Test
@@ -3035,15 +3163,14 @@ class KafkaApisTest extends Logging {
   // Helper for fetch-hook tests: build a MemoryRecords as if it had been produced through the
   // logical-topic stamper, with each record carrying ConcentrationHeaders for `logicalTopic`,
   // `logicalPartition`, and `logicalOffset`. Mirrors the wire shape the fetch hook sees coming
-  // off the backing log. The logical partition is fixed at 0 because the existing fetch tests
-  // only assert on (topic, offset) — the partition header is exercised by the recovery path.
-  private def backingRecordsFromInterleaved(records: (String, Long, String, String)*): MemoryRecords = {
+  // off the backing log.
+  private def backingRecordsFromInterleaved(records: (String, Int, Long, String, String)*): MemoryRecords = {
     val stamped = new scala.collection.mutable.ArrayBuffer[MemoryRecords]()
     var total = 0
-    records.foreach { case (logicalTopic, logicalOffset, key, value) =>
+    records.foreach { case (logicalTopic, logicalPartition, logicalOffset, key, value) =>
       val single = MemoryRecords.withRecords(Compression.NONE,
         new SimpleRecord(key.getBytes(StandardCharsets.UTF_8), value.getBytes(StandardCharsets.UTF_8)))
-      val s = LogicalProduceStamper.stamp(single, logicalTopic, 0, Array(logicalOffset))
+      val s = LogicalProduceStamper.stamp(single, logicalTopic, logicalPartition, Array(logicalOffset))
       stamped += s
       total += s.sizeInBytes()
     }

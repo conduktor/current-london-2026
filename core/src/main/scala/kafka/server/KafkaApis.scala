@@ -778,7 +778,13 @@ class KafkaApis(val requestChannel: RequestChannel,
     // ReplicaManager response from backing-TIP back to logical-TIP, translate the records
     // through LogicalFetchTranslator, and rewrite high-watermark / log-start-offset to the
     // logical-topic's offset space. Empty unless this request includes a logical-topic fetch.
-    val logicalByBacking = mutable.Map[TopicIdPartition, (TopicIdPartition, String, Int)]()
+    //
+    // The value is a BUFFER, not a single triple: PROMPT premise is N >> M, so one fetch
+    // request often contains several logical partitions/topics that all map to the same
+    // backing partition. We coalesce them into ONE backing fetch and fan out the single
+    // response back to every participating logical TIP — see the merge logic in
+    // routeLogicalFetch and the flatMap in processResponseCallback. (Codex audit CRIT #2.)
+    val logicalByBacking = mutable.Map[TopicIdPartition, mutable.Buffer[(TopicIdPartition, String, Int)]]()
     if (fetchRequest.isFromFollower) {
       // The follower must have ClusterAction on ClusterResource in order to fetch partition data.
       if (authHelper.authorize(request.context, CLUSTER_ACTION, CLUSTER, CLUSTER_NAME)) {
@@ -853,15 +859,43 @@ class KafkaApis(val requestChannel: RequestChannel,
               } else {
                 try {
                   val backingOffset = concentrationKernel.resolveBackingOffset(logicalTopic, logicalPartition, logicalFetchOffset)
-                  val backingPd = new FetchRequest.PartitionData(
-                    backingTopicId,
-                    backingOffset,
-                    data.logStartOffset,
-                    data.maxBytes,
-                    Optional.empty[Integer],
-                    Optional.empty[Integer])
-                  interesting += backingTp -> backingPd
-                  logicalByBacking += (backingTp -> (topicIdPartition, logicalTopic, logicalPartition))
+                  val existingParticipants = logicalByBacking.get(backingTp)
+                  if (existingParticipants.isEmpty) {
+                    // First logical TIP to hit this backing partition in this request. Issue a
+                    // single backing fetch for it.
+                    val backingPd = new FetchRequest.PartitionData(
+                      backingTopicId,
+                      backingOffset,
+                      data.logStartOffset,
+                      data.maxBytes,
+                      Optional.empty[Integer],
+                      Optional.empty[Integer])
+                    interesting += backingTp -> backingPd
+                    logicalByBacking += (backingTp -> mutable.Buffer((topicIdPartition, logicalTopic, logicalPartition)))
+                  } else {
+                    // Another logical TIP already routed onto this backing partition. Coalesce:
+                    // there must be EXACTLY ONE backing fetch per backing partition, otherwise
+                    // ReplicaManager returns two responses for the same key and the second
+                    // overwrites the first in the consumer-visible LinkedHashMap (Codex CRIT #2).
+                    // The merged read window must cover every participant: earliest fetchOffset
+                    // (so every participant's records are reachable) and largest maxBytes (so the
+                    // single response has room for the union of all participants' demuxed views).
+                    val idx = interesting.indexWhere(_._1 == backingTp)
+                    if (idx >= 0) {
+                      val existingPd = interesting(idx)._2
+                      val mergedOffset = math.min(existingPd.fetchOffset, backingOffset)
+                      val mergedMax = math.max(existingPd.maxBytes, data.maxBytes)
+                      val mergedLogStart = math.min(existingPd.logStartOffset, data.logStartOffset)
+                      interesting(idx) = backingTp -> new FetchRequest.PartitionData(
+                        backingTopicId,
+                        mergedOffset,
+                        mergedLogStart,
+                        mergedMax,
+                        Optional.empty[Integer],
+                        Optional.empty[Integer])
+                    }
+                    existingParticipants.get += ((topicIdPartition, logicalTopic, logicalPartition))
+                  }
                 } catch {
                   case _: java.io.IOException =>
                     // Sidecar read failed — durable index lookup is transient. KAFKA_STORAGE_ERROR
@@ -912,32 +946,37 @@ class KafkaApis(val requestChannel: RequestChannel,
       // requests that don't include any logical-topic fetch.
       val remappedResponses: Seq[(TopicIdPartition, FetchPartitionData)] =
         if (logicalByBacking.isEmpty) responsePartitionData
-        else responsePartitionData.map { case (tp, data) =>
+        else responsePartitionData.flatMap { case (tp, data) =>
           logicalByBacking.get(tp) match {
-            case Some((logicalTp, logicalTopic, logicalPartition)) =>
-              if (data.error != Errors.NONE) {
-                // Surface the underlying replication error against the logical TIP. Stock
-                // consumers will see (e.g.) NOT_LEADER_OR_FOLLOWER keyed by the logical
-                // topic+partition they actually asked for.
-                logicalTp -> data
-              } else {
-                val translated = LogicalFetchTranslator.translate(data.records, logicalTopic, logicalPartition)
-                val logicalHW = concentrationKernel.nextLogicalOffset(logicalTopic, logicalPartition)
-                val logicalStart = concentrationKernel.startLogicalOffset(logicalTopic, logicalPartition)
-                // v1 is non-transactional: LSO equals HW (no aborted writes outstanding).
-                val newData = new FetchPartitionData(
-                  data.error,
-                  logicalHW,
-                  logicalStart,
-                  translated,
-                  data.divergingEpoch,
-                  OptionalLong.of(logicalHW),
-                  data.abortedTransactions,
-                  data.preferredReadReplica,
-                  data.isReassignmentFetch)
-                logicalTp -> newData
-              }
-            case None => tp -> data
+            case Some(participants) =>
+              // Fan out the single backing response to every logical TIP that coalesced onto
+              // it. Each participant filters the SAME backing records through the translator
+              // with its own (topic, partition) so the per-partition isolation is preserved.
+              // A replication-level error against the backing fetch (NOT_LEADER_OR_FOLLOWER,
+              // KAFKA_STORAGE_ERROR, etc.) propagates to every participant — they all asked for
+              // the same backing partition, so they share the same fault.
+              participants.iterator.map { case (logicalTp, logicalTopic, logicalPartition) =>
+                if (data.error != Errors.NONE) {
+                  logicalTp -> data
+                } else {
+                  val translated = LogicalFetchTranslator.translate(data.records, logicalTopic, logicalPartition)
+                  val logicalHW = concentrationKernel.nextLogicalOffset(logicalTopic, logicalPartition)
+                  val logicalStart = concentrationKernel.startLogicalOffset(logicalTopic, logicalPartition)
+                  // v1 is non-transactional: LSO equals HW (no aborted writes outstanding).
+                  val newData = new FetchPartitionData(
+                    data.error,
+                    logicalHW,
+                    logicalStart,
+                    translated,
+                    data.divergingEpoch,
+                    OptionalLong.of(logicalHW),
+                    data.abortedTransactions,
+                    data.preferredReadReplica,
+                    data.isReassignmentFetch)
+                  logicalTp -> newData
+                }
+              }.toSeq
+            case None => Seq(tp -> data)
           }
         }
       val partitions = new util.LinkedHashMap[TopicIdPartition, FetchResponseData.PartitionData]
