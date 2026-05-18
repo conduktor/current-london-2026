@@ -28,6 +28,7 @@ import java.util.Comparator;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -138,6 +139,30 @@ public final class ApiMessageActivation {
     }
 
     /**
+     * Generated Kafka data classes that carry a credential-bearing
+     * {@code (name, value)} pair where the name decides whether the value is
+     * sensitive. The flat {@link #SENSITIVE_NAMES} denylist cannot handle
+     * these because the getter is just called {@code value} — a name we want
+     * to keep visible for non-credential configs (eg. {@code retention.ms}).
+     *
+     * <p>For each class listed here, after the walker builds the nested map
+     * for a single instance, {@link #redactSensitiveConfigValue} inspects
+     * the resulting {@code name} entry and nulls the {@code value} entry when
+     * that name matches a sensitive config-key pattern (see
+     * {@link #isSensitiveConfigName}). Codex/Gemini final-audit P1.
+     *
+     * <p>FQNs are stored as strings, not {@code Class} references, to avoid a
+     * compile-time dependency on the generated classes from server-common —
+     * the generator output lives in {@code clients} and we deliberately do
+     * not import it for the walker (the walker is type-agnostic by design).
+     */
+    private static final Set<String> CONFIG_PAIR_CLASS_NAMES = new HashSet<>(Arrays.asList(
+        "org.apache.kafka.common.message.AlterConfigsRequestData$AlterableConfig",
+        "org.apache.kafka.common.message.IncrementalAlterConfigsRequestData$AlterableConfig",
+        "org.apache.kafka.common.message.CreateTopicsRequestData$CreatableTopicConfig"
+    ));
+
+    /**
      * Maximum recursion depth for the reflection walk. Each entry into
      * {@link #toMap(Object, int, int[])} (the recursive call for a nested
      * message) counts as one level. Kafka's generated DTOs do not contain
@@ -233,7 +258,83 @@ public final class ApiMessageActivation {
             }
             out.put(a.name, convert(a.invoke(o), depth, invocations));
         }
+        redactSensitiveConfigValue(o.getClass(), out);
         return out;
+    }
+
+    /**
+     * Codex/Gemini final-audit P1: a generated config-pair class
+     * (eg. {@code AlterableConfig}) exposes a {@code value} field whose
+     * sensitivity depends on its sibling {@code name}. The flat
+     * {@link #SENSITIVE_NAMES} denylist cannot redact this because the getter
+     * is literally named {@code value} — redacting it unconditionally would
+     * blind legitimate rules that inspect non-credential configs (eg.
+     * {@code retention.ms}).
+     *
+     * <p>This method runs after the walker has built the nested map for a
+     * single instance of a class enumerated in {@link #CONFIG_PAIR_CLASS_NAMES}.
+     * If the resulting {@code name} entry matches a known credential pattern
+     * ({@code ssl.*.password}, {@code sasl.jaas.config}, etc.) the
+     * corresponding {@code value} entry is overwritten with {@code null} so a
+     * rule comparing {@code c.value} to a guessed password evaluates to
+     * {@code null} (falsy) rather than {@code true} — closing the
+     * exfiltration channel.
+     *
+     * <p>The map key is preserved (not removed) so a hostile rule cannot use
+     * {@code !c.value} or {@code c.value == null} to discover that
+     * "yes, this name was redacted" — every config-pair carries a {@code value}
+     * key, populated or null per the rules above. CEL null is falsy and safe
+     * to chain through {@code .startsWith}/{@code .matches}/etc. (see
+     * {@link CelProgram} contract).
+     */
+    private static void redactSensitiveConfigValue(Class<?> klass, Map<String, Object> out) {
+        if (!CONFIG_PAIR_CLASS_NAMES.contains(klass.getName())) {
+            return;
+        }
+        Object name = out.get("name");
+        if (name instanceof String && isSensitiveConfigName((String) name)) {
+            // Keep the key — only the value is sensitive.
+            out.put("value", null);
+        }
+    }
+
+    /**
+     * True when a Kafka config key is known to carry credential material. The
+     * patterns cover the canonical set defined by
+     * {@code org.apache.kafka.common.config.SslConfigs} /
+     * {@code SaslConfigs} (the {@code ConfigDef.Type.PASSWORD} fields in those
+     * classes) plus a defensive catch-all for operator-defined sensitive
+     * names that follow Kafka's naming convention.
+     *
+     * <p>Matching is case-insensitive against the full config key. The
+     * patterns are:
+     * <ul>
+     *   <li>ends with {@code .password} — covers
+     *       {@code ssl.key.password}, {@code ssl.keystore.password},
+     *       {@code ssl.truststore.password} (the three SSL password configs
+     *       defined in {@code SslConfigs}) plus any operator-defined
+     *       {@code *.password} entries.</li>
+     *   <li>equals {@code sasl.jaas.config} — the SASL login module configuration
+     *       carries the SASL principal's password as part of its module
+     *       options string.</li>
+     *   <li>contains {@code .keystore.key} — PEM-form private key material
+     *       (eg. {@code ssl.keystore.key}, the PEM variant of the keystore).</li>
+     *   <li>contains {@code secret} — defensive catch-all for any operator
+     *       config whose name advertises that it carries a shared secret.</li>
+     * </ul>
+     *
+     * <p>The patterns are deliberately broad. Over-redacting a value with a
+     * misleading name (eg. a user-defined config called
+     * {@code my.password.policy.enabled}) is a small CEL-usability
+     * inconvenience that the operator can rewrite around; under-redacting a
+     * real credential value is a security incident. When in doubt, redact.
+     */
+    private static boolean isSensitiveConfigName(String name) {
+        String lc = name.toLowerCase(Locale.ROOT);
+        return lc.endsWith(".password")
+            || lc.equals("sasl.jaas.config")
+            || lc.contains(".keystore.key")
+            || lc.contains("secret");
     }
 
     private static Object convert(Object v, int depth, int[] invocations) {

@@ -16,6 +16,11 @@
  */
 package org.apache.kafka.server.rules.extract;
 
+import org.apache.kafka.common.message.AlterConfigsRequestData;
+import org.apache.kafka.common.message.AlterConfigsRequestData.AlterConfigsResource;
+import org.apache.kafka.common.message.AlterConfigsRequestData.AlterConfigsResourceCollection;
+import org.apache.kafka.common.message.AlterConfigsRequestData.AlterableConfig;
+import org.apache.kafka.common.message.AlterConfigsRequestData.AlterableConfigCollection;
 import org.apache.kafka.common.message.AlterUserScramCredentialsRequestData;
 import org.apache.kafka.common.message.AlterUserScramCredentialsRequestData.ScramCredentialUpsertion;
 import org.apache.kafka.common.message.CreateTopicsRequestData;
@@ -23,6 +28,7 @@ import org.apache.kafka.common.message.CreateTopicsRequestData.CreatableTopic;
 import org.apache.kafka.common.message.CreateTopicsRequestData.CreatableTopicCollection;
 import org.apache.kafka.common.message.CreateTopicsRequestData.CreatableTopicConfig;
 import org.apache.kafka.common.message.CreateTopicsRequestData.CreatableTopicConfigCollection;
+import org.apache.kafka.common.message.IncrementalAlterConfigsRequestData;
 import org.apache.kafka.common.message.MetadataRequestData;
 import org.apache.kafka.common.message.SaslAuthenticateRequestData;
 import org.apache.kafka.server.rules.cel.CelCompiler;
@@ -520,6 +526,170 @@ public class ApiMessageActivationTest {
                                       org.apache.kafka.common.protocol.ObjectSerializationCache cache,
                                       short version) {
         }
+    }
+
+    @Test
+    public void sensitiveAlterConfigsValueIsRedactedWhenNameMatchesPasswordPattern() {
+        // Codex/Gemini final-audit P1#6: the SENSITIVE_NAMES flat denylist cannot
+        // redact AlterableConfig.value — the getter is just called `value`, and
+        // most configs (retention.ms, cleanup.policy, …) need to remain visible
+        // so legitimate operator rules can filter on them. Sensitivity is
+        // contextual: when the sibling `name` is a known credential key
+        // (ssl.*.password, sasl.jaas.config, *secret*) the value MUST be
+        // redacted, because a rule like
+        //   request.resources.exists(r, r.configs.exists(c,
+        //       c.name == "ssl.keystore.password" && c.value.startsWith("guess")))
+        // would otherwise be a per-character credential exfiltration oracle.
+        AlterableConfigCollection configs = new AlterableConfigCollection();
+        configs.add(new AlterableConfig().setName("ssl.keystore.password").setValue("super-secret-pass"));
+        configs.add(new AlterableConfig().setName("retention.ms").setValue("604800000"));
+        AlterConfigsResource resource = new AlterConfigsResource()
+            .setResourceType((byte) 2)
+            .setResourceName("audit-events")
+            .setConfigs(configs);
+        AlterConfigsResourceCollection resources = new AlterConfigsResourceCollection();
+        resources.add(resource);
+        AlterConfigsRequestData req = new AlterConfigsRequestData().setResources(resources);
+
+        Map<String, Object> m = ApiMessageActivation.from(req);
+        List<?> resourceList = (List<?>) m.get("resources");
+        Map<?, ?> resourceMap = (Map<?, ?>) resourceList.get(0);
+        List<?> configList = (List<?>) resourceMap.get("configs");
+        assertEquals(2, configList.size());
+
+        Map<?, ?> sensitiveCfg = (Map<?, ?>) configList.get(0);
+        assertEquals("ssl.keystore.password", sensitiveCfg.get("name"));
+        assertTrue(sensitiveCfg.containsKey("value"),
+            "value key MUST remain present (so a hostile rule can't probe `c.value == null` to learn redaction state); only the value itself is nulled out");
+        assertNull(sensitiveCfg.get("value"),
+            "value MUST be null for credential-bearing config keys — exfiltration vector");
+
+        Map<?, ?> benignCfg = (Map<?, ?>) configList.get(1);
+        assertEquals("retention.ms", benignCfg.get("name"));
+        assertEquals("604800000", benignCfg.get("value"),
+            "non-credential config values must remain visible so legitimate rules can filter on them");
+    }
+
+    @Test
+    public void sensitiveIncrementalAlterConfigsValueIsRedactedWhenNameMatchesPasswordPattern() {
+        // Same contract as AlterConfigsRequest but exercised through the
+        // distinct generated class IncrementalAlterConfigsRequestData$AlterableConfig.
+        // Both classes are listed in CONFIG_PAIR_CLASS_NAMES; pinning both here
+        // prevents one of the two being silently dropped on a future refactor.
+        IncrementalAlterConfigsRequestData.AlterableConfigCollection configs =
+            new IncrementalAlterConfigsRequestData.AlterableConfigCollection();
+        configs.add(new IncrementalAlterConfigsRequestData.AlterableConfig()
+            .setName("sasl.jaas.config")
+            .setConfigOperation((byte) 0)
+            .setValue("org.apache.kafka.common.security.plain.PlainLoginModule required username=\"admin\" password=\"hunter2\";"));
+        configs.add(new IncrementalAlterConfigsRequestData.AlterableConfig()
+            .setName("retention.bytes")
+            .setConfigOperation((byte) 0)
+            .setValue("1073741824"));
+        IncrementalAlterConfigsRequestData.AlterConfigsResource resource =
+            new IncrementalAlterConfigsRequestData.AlterConfigsResource()
+                .setResourceType((byte) 2)
+                .setResourceName("audit-events")
+                .setConfigs(configs);
+        IncrementalAlterConfigsRequestData.AlterConfigsResourceCollection resources =
+            new IncrementalAlterConfigsRequestData.AlterConfigsResourceCollection();
+        resources.add(resource);
+        IncrementalAlterConfigsRequestData req = new IncrementalAlterConfigsRequestData()
+            .setResources(resources);
+
+        Map<String, Object> m = ApiMessageActivation.from(req);
+        List<?> resourceList = (List<?>) m.get("resources");
+        Map<?, ?> resourceMap = (Map<?, ?>) resourceList.get(0);
+        List<?> configList = (List<?>) resourceMap.get("configs");
+
+        Map<?, ?> jaas = (Map<?, ?>) configList.get(0);
+        assertEquals("sasl.jaas.config", jaas.get("name"));
+        assertNull(jaas.get("value"),
+            "sasl.jaas.config MUST be redacted — its module-options string carries the SASL principal's password");
+
+        Map<?, ?> retention = (Map<?, ?>) configList.get(1);
+        assertEquals("retention.bytes", retention.get("name"));
+        assertEquals("1073741824", retention.get("value"));
+    }
+
+    @Test
+    public void sensitiveCreateTopicsConfigValueIsRedactedWhenNameMatchesPasswordPattern() {
+        // CreateTopicsRequest carries inline per-topic config overrides via
+        // CreatableTopicConfig. A topic created with `ssl.keystore.password=...`
+        // inline must redact the value through the same contextual path; the
+        // value field name (`value`) is identical to the AlterConfigs case.
+        // This is the third class enumerated in CONFIG_PAIR_CLASS_NAMES.
+        CreatableTopicConfigCollection configs = new CreatableTopicConfigCollection();
+        configs.add(new CreatableTopicConfig().setName("ssl.truststore.password").setValue("trust-me-bro"));
+        configs.add(new CreatableTopicConfig().setName("cleanup.policy").setValue("compact"));
+        CreatableTopic topic = new CreatableTopic()
+            .setName("audit-events")
+            .setNumPartitions(8)
+            .setReplicationFactor((short) 3)
+            .setConfigs(configs);
+        CreatableTopicCollection topics = new CreatableTopicCollection();
+        topics.add(topic);
+        CreateTopicsRequestData req = new CreateTopicsRequestData().setTopics(topics);
+
+        Map<String, Object> m = ApiMessageActivation.from(req);
+        Map<?, ?> topicMap = (Map<?, ?>) ((List<?>) m.get("topics")).get(0);
+        List<?> configList = (List<?>) topicMap.get("configs");
+
+        Map<?, ?> sensitiveCfg = (Map<?, ?>) configList.get(0);
+        assertEquals("ssl.truststore.password", sensitiveCfg.get("name"));
+        assertNull(sensitiveCfg.get("value"),
+            "value MUST be null when name is *.password");
+
+        Map<?, ?> benignCfg = (Map<?, ?>) configList.get(1);
+        assertEquals("cleanup.policy", benignCfg.get("name"));
+        assertEquals("compact", benignCfg.get("value"));
+    }
+
+    @Test
+    public void operatorDefinedSecretSuffixIsAlsoRedacted() {
+        // The pattern is intentionally broad: operators routinely define
+        // custom configs with names like `my.app.client.secret` or
+        // `tenant.shared.secret`. The `.secret` substring match catches these
+        // by convention without us needing to maintain an exhaustive list.
+        // Over-redacting an unfortunately-named non-credential config is a
+        // small CEL-rule inconvenience; under-redacting a real secret is an
+        // incident. Bias to redact.
+        AlterableConfigCollection configs = new AlterableConfigCollection();
+        configs.add(new AlterableConfig().setName("my.app.client.secret").setValue("c0ffeebabe"));
+        AlterConfigsResource resource = new AlterConfigsResource()
+            .setResourceType((byte) 2)
+            .setResourceName("audit-events")
+            .setConfigs(configs);
+        AlterConfigsResourceCollection resources = new AlterConfigsResourceCollection();
+        resources.add(resource);
+        AlterConfigsRequestData req = new AlterConfigsRequestData().setResources(resources);
+
+        Map<String, Object> m = ApiMessageActivation.from(req);
+        List<?> configList = (List<?>) ((Map<?, ?>) ((List<?>) m.get("resources")).get(0)).get("configs");
+        Map<?, ?> cfg = (Map<?, ?>) configList.get(0);
+        assertNull(cfg.get("value"),
+            "operator-defined *.secret names must be redacted by the `secret` substring match");
+    }
+
+    @Test
+    public void sensitiveValueRedactionIsCaseInsensitive() {
+        // The pattern matches lowercased input. A protocol that arrived with
+        // unusual casing (`SSL.Keystore.Password`) MUST still trigger
+        // redaction — anything else would be a trivial bypass via casing.
+        AlterableConfigCollection configs = new AlterableConfigCollection();
+        configs.add(new AlterableConfig().setName("SSL.Keystore.Password").setValue("Pa55w0rd"));
+        AlterConfigsResource resource = new AlterConfigsResource()
+            .setResourceType((byte) 2)
+            .setResourceName("audit-events")
+            .setConfigs(configs);
+        AlterConfigsResourceCollection resources = new AlterConfigsResourceCollection();
+        resources.add(resource);
+        AlterConfigsRequestData req = new AlterConfigsRequestData().setResources(resources);
+
+        Map<String, Object> m = ApiMessageActivation.from(req);
+        Map<?, ?> cfg = (Map<?, ?>) ((List<?>) ((Map<?, ?>) ((List<?>) m.get("resources")).get(0)).get("configs")).get(0);
+        assertNull(cfg.get("value"),
+            "case-shifted variants of credential names must still redact (no trivial casing bypass)");
     }
 
     @Test
