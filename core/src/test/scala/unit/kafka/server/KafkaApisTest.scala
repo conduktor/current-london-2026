@@ -4493,6 +4493,125 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testFetchFromViewPropagatesAbortedTransactionsAndLastStableOffset(): Unit = {
+    // PROMPT.md acceptance criterion (line 40 / scenario line 48): "READ_COMMITTED view
+    // consumers observe correct isolation". The view-fetch handler MUST propagate the backing
+    // fetch's `abortedTransactions` list and `lastStableOffset` (LSO) through to the view's
+    // FetchResponse partition data — both fields are what the consumer's READ_COMMITTED state
+    // machine uses to scope record visibility:
+    //
+    //   - lastStableOffset bounds how far the consumer reads ("don't surface records past LSO
+    //     until they are committed")
+    //   - abortedTransactions tells the consumer which (producerId, firstOffset) ranges to
+    //     discard — without it, aborted records would leak to applications as if committed.
+    //
+    // Both fields carry BACKING-derived data that is valid at the view's coordinate space
+    // because views use source offsets (no renumbering). Producer IDs are global and the
+    // firstOffset of each AbortedTransaction is a backing offset == source offset for the view.
+    // Passing them through unchanged is therefore correct AND load-bearing — a refactor that
+    // drops either field would silently break READ_COMMITTED isolation on views. This test
+    // pins both round-trips end-to-end through KafkaApis.handleFetchRequest, complementing the
+    // unit-level pin on control-batch passthrough in
+    // ViewFilterTest.commitAbortControlBatchesPassThroughIntactSoReadCommittedConsumersTrackTransactions.
+    val viewTopic = "txn-view"
+    val backingTopic = "txn-backing"
+    val viewTopicId = Uuid.randomUuid()
+    val backingTopicId = Uuid.randomUuid()
+
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, backingTopic)
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.color == 'red'")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+
+    addTopicToMetadataCache(viewTopic, numPartitions = 1, topicId = viewTopicId)
+    addTopicToMetadataCache(backingTopic, numPartitions = 1, topicId = backingTopicId)
+
+    val viewTpId = new TopicIdPartition(viewTopicId, new TopicPartition(viewTopic, 0))
+    val backingTpId = new TopicIdPartition(backingTopicId, new TopicPartition(backingTopic, 0))
+
+    val backingRecords = MemoryRecords.withRecords(700L, Compression.NONE,
+      new SimpleRecord("{\"color\":\"red\"}".getBytes(StandardCharsets.UTF_8)),
+      new SimpleRecord("{\"color\":\"blue\"}".getBytes(StandardCharsets.UTF_8)))
+
+    // Two aborted transactions at backing-side first offsets. The view consumer must see them
+    // verbatim — producer IDs are global (not view-specific), and the firstOffset values are
+    // source offsets which equal the view's offsets (sparse-source semantics).
+    val abortedTxns = List(
+      new FetchResponseData.AbortedTransaction().setProducerId(71L).setFirstOffset(650L),
+      new FetchResponseData.AbortedTransaction().setProducerId(73L).setFirstOffset(680L)
+    ).asJava
+    val backingLastStableOffset = 705L
+
+    when(replicaManager.fetchMessages(
+      any[FetchParams],
+      any[Seq[(TopicIdPartition, FetchRequest.PartitionData)]],
+      any[ReplicaQuota],
+      any[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]()
+    )).thenAnswer(invocation => {
+      val callback = invocation.getArgument(3).asInstanceOf[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]
+      callback(Seq(backingTpId -> new FetchPartitionData(
+        Errors.NONE,
+        800L,                                        // highWatermark
+        0L,                                          // logStartOffset
+        backingRecords,
+        Optional.empty(),                            // divergingEpoch (must be scrubbed to empty)
+        OptionalLong.of(backingLastStableOffset),    // LSO must round-trip
+        Optional.of(abortedTxns),                    // abortedTransactions must round-trip
+        OptionalInt.empty(),
+        false)))
+    })
+
+    val fetchData = Map(viewTpId -> new FetchRequest.PartitionData(viewTopicId, 0, 0, 1000, Optional.empty())).asJava
+    val fetchDataBuilder = Map(viewTpId.topicPartition -> new FetchRequest.PartitionData(viewTopicId, 0, 0, 1000, Optional.empty())).asJava
+    val fetchMetadata = new JFetchMetadata(0, 0)
+    val fetchContext = new FullFetchContext(time, new FetchSessionCacheShard(1000, 100),
+      fetchMetadata, fetchData, true, false)
+    when(fetchManager.newContext(any[Short], any[JFetchMetadata], any[Boolean],
+      any[util.Map[TopicIdPartition, FetchRequest.PartitionData]],
+      any[util.List[TopicIdPartition]],
+      any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val fetchRequest = new FetchRequest.Builder(ApiKeys.FETCH.latestVersion, ApiKeys.FETCH.latestVersion,
+      -1, -1, 100, 0, fetchDataBuilder).isolationLevel(IsolationLevel.READ_COMMITTED).build()
+    val request = buildRequest(fetchRequest)
+    stubBackingPartitionsLocal()
+    kafkaApis = createKafkaApis(configRepository = configRepository)
+    kafkaApis.handleFetchRequest(request)
+
+    val response = verifyNoThrottling[FetchResponse](request)
+    val responseData = response.responseData(metadataCache.topicIdsToNames(), ApiKeys.FETCH.latestVersion)
+    val partitionData = responseData.get(viewTpId.topicPartition)
+
+    assertEquals(Errors.NONE.code, partitionData.errorCode)
+    assertEquals(backingLastStableOffset, partitionData.lastStableOffset,
+      "view's LSO must equal the backing's LSO — view uses source offsets so the LSO coordinate " +
+        "translates 1:1. A refactor that drops or rewrites this would silently break READ_COMMITTED " +
+        "consumer visibility on views.")
+
+    val outAborted = partitionData.abortedTransactions
+    assertNotNull(outAborted,
+      "abortedTransactions must propagate from backing fetch to view response — without it, the " +
+        "consumer's READ_COMMITTED state machine cannot discard aborted records and they leak " +
+        "to applications as if committed")
+    assertEquals(2, outAborted.size, "both backing aborted-transaction entries must propagate")
+    val byProducerId = outAborted.asScala.map(at => at.producerId -> at.firstOffset).toMap
+    assertEquals(650L, byProducerId(71L),
+      "producer 71's firstOffset must round-trip unchanged — backing-side AbortedTransaction " +
+        "offsets are source offsets at the view's coordinate space")
+    assertEquals(680L, byProducerId(73L),
+      "producer 73's firstOffset must round-trip unchanged")
+
+    // Defense-in-depth: the response's HWM is also a backing-derived offset that's coherent with
+    // source offsets, so it should pass through unchanged too. Pinning here so a future change
+    // doesn't accidentally rewrite it (e.g. via a view-side leader-epoch ledger lookup).
+    assertEquals(800L, partitionData.highWatermark,
+      "high watermark from backing must propagate unchanged — sparse-source coordinate is 1:1")
+  }
+
+  @Test
   def testFollowerFetchOnViewTopicIsNotRewritten(): Unit = {
     // Views are a consumer-side concept; follower replication mirrors the physical (backing)
     // topic. A follower asking for a view topic must NOT trigger view redirect, because:
