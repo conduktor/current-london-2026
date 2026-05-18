@@ -235,6 +235,26 @@ public class LogicalSidecarIndexTest {
     }
 
     @Test
+    public void constructorFailureReleasesFileDescriptor() throws IOException {
+        // Pins the audit-fix invariant: when the constructor throws after opening the
+        // RandomAccessFile (e.g., on a torn-length file), the handle must be closed before the
+        // exception escapes. If it leaked, hammering the constructor in a tight loop would burn
+        // through the JVM's FD limit (1024 by default on Linux) and surface as either a
+        // FileSystemException("Too many open files") or an IOException from the open itself.
+        File file = new File(tempDir, "leak-probe-0.sidecar");
+        Files.write(file.toPath(), new byte[]{1, 2, 3}); // 3 bytes — not a multiple of 8
+        // 2000 iterations is well above any reasonable default soft FD limit; if even 1% leaked
+        // we would exhaust FDs before completing.
+        for (int i = 0; i < 2000; i++) {
+            RuntimeException thrown = assertThrows(RuntimeException.class,
+                () -> new LogicalSidecarIndex(file, "leak", 0));
+            assertEquals("org.apache.kafka.storage.internals.log.CorruptIndexException",
+                thrown.getClass().getName(),
+                "iteration " + (i + 1) + " threw wrong type: " + thrown.getClass());
+        }
+    }
+
+    @Test
     public void openOnTailTornFileFailsLoudly() throws IOException {
         // Simulate a crash mid-append: 2 entries written cleanly, then a 3-byte partial entry.
         // The sidecar must refuse to open and signal that a backing-log rebuild is required,

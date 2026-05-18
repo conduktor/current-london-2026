@@ -57,19 +57,32 @@ public final class LogicalSidecarIndex implements Closeable {
         this.file = Objects.requireNonNull(file, "file");
         this.logicalTopic = Objects.requireNonNull(logicalTopic, "logicalTopic");
         this.logicalPartition = logicalPartition;
-        this.raf = new RandomAccessFile(file, "rw");
-        this.channel = raf.getChannel();
-        long length = channel.size();
-        if (length % ENTRY_SIZE != 0) {
-            // Tail-torn write left a partial entry — surface this as corruption so the caller
-            // can trigger a rebuild from the backing log. CorruptIndexException is the local
-            // idiom shared with OffsetIndex / TimeIndex; the sidecar is the same flavour of
-            // artefact and should announce corruption the same way.
-            throw new CorruptIndexException(
-                "sidecar " + file + " size " + length + " is not a multiple of " + ENTRY_SIZE);
+        RandomAccessFile rafLocal = new RandomAccessFile(file, "rw");
+        try {
+            FileChannel channelLocal = rafLocal.getChannel();
+            long length = channelLocal.size();
+            if (length % ENTRY_SIZE != 0) {
+                // Tail-torn write left a partial entry — surface this as corruption so the caller
+                // can trigger a rebuild from the backing log. CorruptIndexException is the local
+                // idiom shared with OffsetIndex / TimeIndex; the sidecar is the same flavour of
+                // artefact and should announce corruption the same way.
+                throw new CorruptIndexException(
+                    "sidecar " + file + " size " + length + " is not a multiple of " + ENTRY_SIZE);
+            }
+            this.entries = length / ENTRY_SIZE;
+            // readEntryAt() touches the channel field, so commit raf/channel first; do it last so
+            // an exception above closes raf without ever publishing the handles.
+            this.raf = rafLocal;
+            this.channel = channelLocal;
+            this.lastBackingOffset = entries > 0 ? readEntryAt(entries - 1) : -1L;
+        } catch (IOException | RuntimeException e) {
+            try {
+                rafLocal.close();
+            } catch (IOException closeError) {
+                e.addSuppressed(closeError);
+            }
+            throw e;
         }
-        this.entries = length / ENTRY_SIZE;
-        this.lastBackingOffset = entries > 0 ? readEntryAt(entries - 1) : -1L;
     }
 
     public String logicalTopic() {
