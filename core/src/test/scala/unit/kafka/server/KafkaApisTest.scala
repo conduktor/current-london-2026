@@ -50,6 +50,8 @@ import org.apache.kafka.common.message.ListClientMetricsResourcesResponseData.Cl
 import org.apache.kafka.common.message.ListOffsetsRequestData.{ListOffsetsPartition, ListOffsetsTopic}
 import org.apache.kafka.common.message.ListOffsetsResponseData.{ListOffsetsPartitionResponse, ListOffsetsTopicResponse}
 import org.apache.kafka.common.message.MetadataResponseData.MetadataResponseTopic
+import org.apache.kafka.common.message.OffsetForLeaderEpochRequestData.{OffsetForLeaderPartition, OffsetForLeaderTopic, OffsetForLeaderTopicCollection}
+import org.apache.kafka.common.message.OffsetForLeaderEpochResponseData.{EpochEndOffset, OffsetForLeaderTopicResult}
 import org.apache.kafka.common.message.OffsetDeleteRequestData.{OffsetDeleteRequestPartition, OffsetDeleteRequestTopic, OffsetDeleteRequestTopicCollection}
 import org.apache.kafka.common.message.OffsetDeleteResponseData.{OffsetDeleteResponsePartition, OffsetDeleteResponsePartitionCollection, OffsetDeleteResponseTopic, OffsetDeleteResponseTopicCollection}
 import org.apache.kafka.common.message.ShareFetchRequestData.{AcknowledgementBatch, ForgottenTopic}
@@ -5481,6 +5483,108 @@ class KafkaApisTest extends Logging {
     assertEquals(0, partResps.head.partitionIndex)
     assertEquals(Errors.INVALID_REQUEST.code, partResps.head.errorCode,
       "duplicates must surface as INVALID_REQUEST, matching upstream replicaManager.fetchOffset")
+  }
+
+  @Test
+  def testOffsetForLeaderEpochOnViewTopicReturnsInvalidRequestAndDoesNotConsultReplicaManager(): Unit = {
+    // OffsetsForLeaderEpoch returns (leader_epoch, end_offset) pairs from the partition's own
+    // local-log ledger. For view topics, that ledger is meaningless: the view partition never
+    // receives records directly (produce to a view is rejected per PROMPT.md), and the records
+    // a view consumer reads carry the BACKING's leader epochs in their batch headers. Round-
+    // tripping a view-side epoch lookup back to a consumer doing KIP-320 truncation detection
+    // would either silently mismatch ledgers or — if the view's empty log is consulted — return
+    // UNDEFINED_EPOCH_OFFSET regardless. Reject up front with INVALID_REQUEST so the consumer
+    // does not silently lose truncation safety on a per-fetch basis. Pin that:
+    //   (a) view partitions surface INVALID_REQUEST with the protocol's sentinel epoch/offset,
+    //   (b) replicaManager.lastOffsetForLeaderEpoch is NOT consulted for view partitions, and
+    //   (c) non-view topics inside the SAME request still pass through to the replica layer
+    //       unchanged — the view rejection must not poison the request for unrelated topics.
+    val viewTopic = "ofl-view"
+    val backingTopic = "ofl-backing"
+    val plainTopic = "ofl-plain"
+    val viewTopicId = Uuid.randomUuid()
+    val backingTopicId = Uuid.randomUuid()
+    val plainTopicId = Uuid.randomUuid()
+
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, backingTopic)
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.x == 1")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+    addTopicToMetadataCache(viewTopic, numPartitions = 1, topicId = viewTopicId)
+    addTopicToMetadataCache(backingTopic, numPartitions = 1, topicId = backingTopicId)
+    addTopicToMetadataCache(plainTopic, numPartitions = 1, topicId = plainTopicId)
+
+    // Stub replicaManager.lastOffsetForLeaderEpoch to return a successful EpochEndOffset for the
+    // plain topic, AND to fail loudly if it is ever called for the view topic — a regression
+    // that forwarded the view path would blow up this assertion immediately.
+    val replicaCaptor: ArgumentCaptor[Seq[OffsetForLeaderTopic]] =
+      ArgumentCaptor.forClass(classOf[Seq[OffsetForLeaderTopic]])
+    when(replicaManager.lastOffsetForLeaderEpoch(replicaCaptor.capture()))
+      .thenAnswer(ans => {
+        val topicsArg = ans.getArgument[Seq[OffsetForLeaderTopic]](0)
+        assertTrue(
+          topicsArg.forall(t => t.topic != viewTopic),
+          s"replicaManager.lastOffsetForLeaderEpoch must not be invoked with view topics; got $topicsArg")
+        topicsArg.map(t => new OffsetForLeaderTopicResult()
+          .setTopic(t.topic)
+          .setPartitions(t.partitions.asScala.map(p => new EpochEndOffset()
+            .setPartition(p.partition)
+            .setErrorCode(Errors.NONE.code)
+            .setLeaderEpoch(7)
+            .setEndOffset(123L)).toList.asJava))
+      })
+
+    val epochs = new OffsetForLeaderTopicCollection()
+    epochs.add(new OffsetForLeaderTopic()
+      .setTopic(viewTopic)
+      .setPartitions(List(new OffsetForLeaderPartition()
+        .setPartition(0)
+        .setCurrentLeaderEpoch(3)
+        .setLeaderEpoch(2)).asJava))
+    epochs.add(new OffsetForLeaderTopic()
+      .setTopic(plainTopic)
+      .setPartitions(List(new OffsetForLeaderPartition()
+        .setPartition(0)
+        .setCurrentLeaderEpoch(5)
+        .setLeaderEpoch(4)).asJava))
+    val request = buildRequest(OffsetsForLeaderEpochRequest.Builder.forConsumer(epochs).build())
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+    kafkaApis = createKafkaApis(configRepository = configRepository)
+    kafkaApis.handleOffsetForLeaderEpochRequest(request)
+
+    val response = verifyNoThrottling[OffsetsForLeaderEpochResponse](request)
+    val byTopic = response.data.topics.asScala.map(t => t.topic -> t).toMap
+
+    // (a) View topic: INVALID_REQUEST with sentinel epoch + end offset.
+    val viewResult = byTopic(viewTopic)
+    assertEquals(1, viewResult.partitions.size)
+    val viewPart = viewResult.partitions.iterator.next
+    assertEquals(0, viewPart.partition)
+    assertEquals(Errors.INVALID_REQUEST.code, viewPart.errorCode,
+      "view topic must surface INVALID_REQUEST — OFLEpoch is unsupported for views")
+    assertEquals(OffsetsForLeaderEpochResponse.UNDEFINED_EPOCH, viewPart.leaderEpoch,
+      "the leader_epoch field must use the protocol's UNDEFINED sentinel for unsupported lookups")
+    assertEquals(OffsetsForLeaderEpochResponse.UNDEFINED_EPOCH_OFFSET, viewPart.endOffset,
+      "the end_offset field must use the protocol's UNDEFINED sentinel for unsupported lookups")
+
+    // (b) Replica layer must have been invoked at most once, and with NO view topics in its
+    // input. The thenAnswer block asserts on each invocation; calling verify here pins that the
+    // path was exercised (non-view passthrough still works) and not skipped.
+    verify(replicaManager).lastOffsetForLeaderEpoch(any[Seq[OffsetForLeaderTopic]])
+    val replicaArgs = replicaCaptor.getValue
+    assertTrue(replicaArgs.exists(_.topic == plainTopic),
+      "plain (non-view) topic must still reach replicaManager.lastOffsetForLeaderEpoch")
+    assertFalse(replicaArgs.exists(_.topic == viewTopic),
+      "view topic must NEVER reach replicaManager.lastOffsetForLeaderEpoch")
+
+    // (c) Non-view topic: passes through to the replica layer's response unchanged.
+    val plainResult = byTopic(plainTopic)
+    assertEquals(1, plainResult.partitions.size)
+    val plainPart = plainResult.partitions.iterator.next
+    assertEquals(Errors.NONE.code, plainPart.errorCode)
+    assertEquals(7, plainPart.leaderEpoch)
+    assertEquals(123L, plainPart.endOffset)
   }
 
   @Test

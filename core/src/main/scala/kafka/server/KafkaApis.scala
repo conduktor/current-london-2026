@@ -2645,7 +2645,48 @@ class KafkaApis(val requestChannel: RequestChannel,
         (topics, Seq.empty[OffsetForLeaderTopic])
       else authHelper.partitionSeqByAuthorized(request.context, DESCRIBE, TOPIC, topics)(_.topic)
 
-    val endOffsetsForAuthorizedPartitions = replicaManager.lastOffsetForLeaderEpoch(authorizedTopics)
+    // View topics never accept OffsetsForLeaderEpoch.
+    //
+    //   1. (epoch, end_offset) returned by `replicaManager.lastOffsetForLeaderEpoch` reflects
+    //      the VIEW partition's own leader-epoch ledger. The view's local log never receives
+    //      records directly — produce is rejected before backing-topic resolution (PROMPT.md
+    //      acceptance criterion) — so the view's epoch ledger has no meaningful end offsets
+    //      to return. Forwarding to the backing topic does not help either: a backing epoch
+    //      is not interchangeable with a view epoch (the two ledgers evolve independently;
+    //      see view-fetch and view-ListOffsets epoch fixes).
+    //
+    //   2. KIP-320 truncation detection at the consumer relies on round-tripping (epoch,
+    //      offset) pairs that ARE in the same ledger as the records the consumer is reading.
+    //      Because filtered records emitted from a view carry the backing's leader-epoch in
+    //      their batch header (we do not re-stamp them), a view consumer's KIP-320 protocol
+    //      flow is already cross-ledger and unsafe — returning a view-side epoch lookup here
+    //      would only make the inconsistency more silent.
+    //
+    //   3. Inter-broker followers never replicate from a view leader (views are read-only
+    //      virtual topics with no records of their own), so a view OFLEpoch from a follower
+    //      is never a healthy code path.
+    //
+    // Reject every partition with INVALID_REQUEST and the sentinel UNDEFINED_EPOCH /
+    // UNDEFINED_EPOCH_OFFSET values so the field semantics in the response message match a
+    // genuinely-unsatisfiable lookup. KIP-320 truncation detection is degraded on view
+    // consumers — they cannot detect log truncation across a leader change — which is an
+    // acceptable trade-off for the topic-views feature and documented in PROMPT.md as
+    // out-of-scope for stretch goals.
+    val (viewTopics, nonViewTopics) = authorizedTopics.partition(t => isViewTopic(t.topic))
+    val endOffsetsForViewPartitions = viewTopics.map { offsetForLeaderTopic =>
+      val partitions = offsetForLeaderTopic.partitions.asScala.map { offsetForLeaderPartition =>
+        new EpochEndOffset()
+          .setPartition(offsetForLeaderPartition.partition)
+          .setErrorCode(Errors.INVALID_REQUEST.code)
+          .setLeaderEpoch(OffsetsForLeaderEpochResponse.UNDEFINED_EPOCH)
+          .setEndOffset(OffsetsForLeaderEpochResponse.UNDEFINED_EPOCH_OFFSET)
+      }
+      new OffsetForLeaderTopicResult()
+        .setTopic(offsetForLeaderTopic.topic)
+        .setPartitions(partitions.toList.asJava)
+    }
+
+    val endOffsetsForAuthorizedPartitions = replicaManager.lastOffsetForLeaderEpoch(nonViewTopics)
     val endOffsetsForUnauthorizedPartitions = unauthorizedTopics.map { offsetForLeaderTopic =>
       val partitions = offsetForLeaderTopic.partitions.asScala.map { offsetForLeaderPartition =>
         new EpochEndOffset()
@@ -2659,7 +2700,8 @@ class KafkaApis(val requestChannel: RequestChannel,
     }
 
     val endOffsetsForAllTopics = new OffsetForLeaderTopicResultCollection(
-      (endOffsetsForAuthorizedPartitions ++ endOffsetsForUnauthorizedPartitions).asJava.iterator
+      (endOffsetsForAuthorizedPartitions ++ endOffsetsForViewPartitions ++ endOffsetsForUnauthorizedPartitions)
+        .asJava.iterator
     )
 
     requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
