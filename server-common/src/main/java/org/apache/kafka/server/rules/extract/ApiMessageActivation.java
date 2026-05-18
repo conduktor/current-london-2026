@@ -87,6 +87,68 @@ public final class ApiMessageActivation {
         "prev", "next"
     ));
 
+    /**
+     * Field names that are NEVER surfaced to CEL rules because their value is
+     * security-sensitive — exposing them via the activation map would let any
+     * operator with rule-write access exfiltrate credentials simply by writing
+     * a rule whose predicate compares the field against a constant (eg.
+     * {@code request.authBytes == b"\\x00admin\\x00s3cret"} → "DENY", then
+     * watch the audit log to learn which guesses matched).
+     *
+     * <p>The walker has no context about whether a given CEL expression is
+     * benign or hostile, so the safe answer is to never produce these values
+     * in the activation map at all. A rule that references
+     * {@code request.authBytes} will see a missing key (CEL's null) rather
+     * than the actual SASL bytes.
+     *
+     * <p>These names are matched case-insensitively against the Java getter
+     * name (in {@code isFieldAccessor}). Fields enumerated here:
+     * <ul>
+     *   <li>{@code authBytes} — {@link org.apache.kafka.common.message.SaslAuthenticateRequestData}
+     *       and {@link org.apache.kafka.common.message.SaslAuthenticateResponseData}:
+     *       the raw SASL bytes exchanged during authentication.</li>
+     *   <li>{@code salt} and {@code saltedPassword} — the SCRAM credential
+     *       components in {@link org.apache.kafka.common.message.AlterUserScramCredentialsRequestData}.
+     *       Either is enough to mount an offline credential-stuffing attack.</li>
+     *   <li>{@code password} / {@code passwords} — defense in depth for any
+     *       future protocol additions that carry a raw password.</li>
+     *   <li>{@code hmac} — delegation-token HMAC (the secret half of the token).</li>
+     *   <li>{@code secret} / {@code clientSecret} — defense in depth.</li>
+     * </ul>
+     *
+     * <p>If a Kafka protocol revision adds a new credential-bearing field, add
+     * its accessor name here. We deliberately use a fixed list rather than a
+     * loose pattern like "anything containing 'password'" because over-matching
+     * silently strips legitimate fields and is hard to spot in production.
+     * Add new names explicitly.
+     */
+    private static final Set<String> SENSITIVE_NAMES;
+    static {
+        // The set is matched case-insensitively, so store everything lower-case.
+        Set<String> s = new HashSet<>();
+        s.add("authbytes");
+        s.add("salt");
+        s.add("saltedpassword");
+        s.add("password");
+        s.add("passwords");
+        s.add("hmac");
+        s.add("secret");
+        s.add("clientsecret");
+        SENSITIVE_NAMES = Collections.unmodifiableSet(s);
+    }
+
+    /**
+     * Maximum recursion depth for the reflection walk. Each entry into
+     * {@link #toMap(Object, int)} (the recursive call for a nested message)
+     * counts as one level. Kafka's generated DTOs do not contain reference
+     * cycles, so any legitimate message is far shallower than this. The cap
+     * is defense in depth against a future protocol with deeper nesting than
+     * we anticipated, or a hostile request that constructed a cycle by other
+     * means — the walker cannot tell the difference and must not be allowed to
+     * blow the stack or spin forever.
+     */
+    static final int MAX_DEPTH = 32;
+
     private ApiMessageActivation() {
     }
 
@@ -124,14 +186,28 @@ public final class ApiMessageActivation {
     }
 
     static Map<String, Object> toMap(Object o) {
+        return toMap(o, 0);
+    }
+
+    /**
+     * Recursive form with depth counter. {@code depth} is incremented on each
+     * descent into a nested message. When it reaches {@link #MAX_DEPTH} we
+     * return an empty map rather than recurse further — the rule sees the
+     * upper levels intact, the bottom is truncated. See {@link #MAX_DEPTH}
+     * javadoc for why this matters.
+     */
+    private static Map<String, Object> toMap(Object o, int depth) {
+        if (depth >= MAX_DEPTH) {
+            return Collections.emptyMap();
+        }
         Map<String, Object> out = new LinkedHashMap<>();
         for (Accessor a : accessorsFor(o.getClass())) {
-            out.put(a.name, convert(a.invoke(o)));
+            out.put(a.name, convert(a.invoke(o), depth));
         }
         return out;
     }
 
-    private static Object convert(Object v) {
+    private static Object convert(Object v, int depth) {
         if (v == null) {
             return null;
         }
@@ -140,7 +216,7 @@ public final class ApiMessageActivation {
             return scalar;
         }
         if (v instanceof Iterable) {
-            return convertIterable((Iterable<?>) v);
+            return convertIterable((Iterable<?>) v, depth);
         }
         // Anything else with accessors: walk recursively. We do NOT restrict to
         // ApiMessage — nested records inside generated classes implement just
@@ -149,7 +225,7 @@ public final class ApiMessageActivation {
         // accessor at all is the signal that this is structured data we want
         // to surface, not an opaque scalar.
         if (!accessorsFor(v.getClass()).isEmpty()) {
-            return toMap(v);
+            return toMap(v, depth + 1);
         }
         return v;
     }
@@ -167,10 +243,10 @@ public final class ApiMessageActivation {
         return null;
     }
 
-    private static List<Object> convertIterable(Iterable<?> it) {
+    private static List<Object> convertIterable(Iterable<?> it, int depth) {
         List<Object> list = new ArrayList<>();
         for (Object item : it) {
-            list.add(convert(item));
+            list.add(convert(item, depth));
         }
         return list;
     }
@@ -213,7 +289,16 @@ public final class ApiMessageActivation {
         if (m.getDeclaringClass() == Object.class) {
             return false;
         }
-        return !EXCLUDED_NAMES.contains(m.getName());
+        String name = m.getName();
+        if (EXCLUDED_NAMES.contains(name)) {
+            return false;
+        }
+        // Case-insensitive match against the credential-bearing field denylist.
+        // See SENSITIVE_NAMES javadoc for the rationale and the enumerated list.
+        if (SENSITIVE_NAMES.contains(name.toLowerCase(java.util.Locale.ROOT))) {
+            return false;
+        }
+        return true;
     }
 
     static final class Accessor {
