@@ -243,6 +243,7 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
         // from the current log-start offset. The engine's currently
         // installed RuleSet stays in place until the re-drain commits,
         // honouring the "fail-stale-not-empty" posture.
+        var didTruncationResetThisDrain = false
         if (nextOffset.get() > endOffset) {
           warn(s"governance partition $tp truncated: cursor was at " +
             s"${nextOffset.get()} but HW is now $endOffset. Resetting " +
@@ -250,11 +251,42 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
             s"${log.logStartOffset}.")
           loader.reset()
           nextOffset.set(log.logStartOffset)
+          didTruncationResetThisDrain = true
         }
         val startOffset = math.max(log.logStartOffset, nextOffset.get())
         if (startOffset >= endOffset) {
-          // Up to date — commit once so the engine reflects the working state
-          // even when nothing new arrived (idempotent install).
+          // The replay range is empty. Two paths into this branch:
+          //
+          //  1. Steady state: cursor has caught up to HW. The working set
+          //     already reflects every record we've ever applied; an
+          //     idempotent commit just publishes it (no-op if nothing
+          //     changed since the previous commit).
+          //
+          //  2. Post-truncation race: the truncation guard above just ran
+          //     loader.reset() AND the post-reset range is empty
+          //     (logStartOffset >= HW). The working state is now empty,
+          //     and an unconditional commit here would install
+          //     RuleSet.EMPTY over the engine's previously-good active()
+          //     — exactly the "fail-stale-not-empty" violation the rest
+          //     of this file warns against (transient log-dir glitch,
+          //     leader-election aftermath, broker-internal observation of
+          //     a momentary empty view). The reset + empty range together
+          //     mean "we cleared our local view AND we don't yet have a
+          //     fresh one to install" — defer until a drain actually
+          //     observes records, then commit the rebuilt state.
+          //
+          // The first record landing post-truncation will exit this branch
+          // via startOffset < endOffset and a normal replay+commit cycle.
+          // No active() change happens until then; clients keep seeing the
+          // last-known-good RuleSet.
+          if (didTruncationResetThisDrain) {
+            warn(s"governance partition $tp truncated to an empty replay " +
+              s"range [$startOffset, $endOffset); deferring commit so the " +
+              s"engine keeps its last-known-good active RuleSet. Next " +
+              s"drain that observes records on this partition will rebuild " +
+              s"and install fresh state.")
+            return 0L
+          }
           loader.commit()
           return 0L
         }

@@ -889,6 +889,94 @@ class BrokerGovernanceBootstrapTest {
   }
 
   @Test
+  def drainOnceTruncationToEmptyDoesNotInstallEmptyOverPreviouslyGoodRuleSet(): Unit = {
+    // Defensive fix for the narrow but real concurrency race the adversarial
+    // audit flagged: the truncation guard runs loader.reset() and rewinds
+    // nextOffset to logStartOffset, but if the post-reset replay range is
+    // empty (logStartOffset >= HW — e.g. a leader-election that rolls HW
+    // back to logStartOffset, or a topic that was compacted to nothing
+    // moments before the truncation observation), the previous code path
+    // fell into the "up to date" branch and committed an empty working
+    // state — installing RuleSet.EMPTY over the engine's previously-good
+    // active().
+    //
+    // That is exactly the "fail-stale-not-empty" violation called out in
+    // BrokerGovernanceBootstrap's own javadoc: a momentary empty view (which
+    // a leader-election aftermath qualifies as) must NOT overwrite a
+    // known-good security state. Clients should keep seeing the last-known
+    // DENY rules until a drain actually observes a record. The first record
+    // landing on this partition after the truncation will commit a fresh
+    // RuleSet built from the (then non-empty) log.
+    val rm = mock(classOf[ReplicaManager])
+    val log = mock(classOf[UnifiedLog])
+    val engine = new RuleEngine()
+    when(rm.getLog(tp)).thenReturn(Some(log))
+
+    // First drain: install two rules (offsets 0, 1).
+    when(log.logStartOffset).thenReturn(0L)
+    when(log.highWatermark).thenReturn(2L)
+    when(log.read(0L, 1024 * 1024, FetchIsolation.HIGH_WATERMARK, true)).thenReturn(
+      recordsAt(0L,
+        new SimpleRecord("r1".getBytes(StandardCharsets.UTF_8),
+          envelope("true", ApiKeys.METADATA, 7)),
+        new SimpleRecord("r2".getBytes(StandardCharsets.UTF_8),
+          envelope("true", ApiKeys.FETCH, 11))))
+
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp)
+    assertEquals(2L, boot.drainOnce())
+    assertEquals(2, engine.active().size(), "baseline: two rules installed")
+    val previouslyGood = engine.active()
+
+    // Truncation race: cursor is at 2 (advanced past two records), but a
+    // leader-election just rolled HW back to logStartOffset=0. The
+    // truncation guard fires (cursor 2 > HW 0), resets the loader, and
+    // rewinds nextOffset to 0. The post-reset replay range
+    // [logStartOffset=0, HW=0) is empty — there's nothing to read.
+    //
+    // Pre-fix: this would commit the empty working state, replacing the
+    // engine's previously-good active() with RuleSet.EMPTY.
+    // Post-fix: the bootstrap returns 0 without committing; engine.active()
+    // is unchanged.
+    when(log.highWatermark).thenReturn(0L)
+    assertEquals(0L, boot.drainOnce(),
+      "post-truncation empty replay range must return 0 (no records replayed)")
+    assertSame(previouslyGood, engine.active(),
+      "engine.active() must NOT change when post-truncation replay range is " +
+        "empty — committing empty over previously-good rules is the exact " +
+        "fail-stale-not-empty violation this guard exists to prevent")
+    // Belt and braces: prove the previously-installed rules are still
+    // enforced post-truncation.
+    assertTrue(engine.evaluate(ApiKeys.METADATA, "c", false,
+      () => Collections.emptyMap()).denied,
+      "previously-good METADATA DENY must still be enforced after empty truncation")
+    assertTrue(engine.evaluate(ApiKeys.FETCH, "c", false,
+      () => Collections.emptyMap()).denied,
+      "previously-good FETCH DENY must still be enforced after empty truncation")
+
+    // Recovery: when the topic is repopulated (post leader-election the new
+    // leader's HW advances back above logStartOffset), the next drain
+    // commits the fresh state and the engine reflects it.
+    when(log.highWatermark).thenReturn(1L)
+    when(log.read(0L, 1024 * 1024, FetchIsolation.HIGH_WATERMARK, true)).thenReturn(
+      recordsAt(0L,
+        new SimpleRecord("r-fresh".getBytes(StandardCharsets.UTF_8),
+          envelope("true", ApiKeys.LIST_OFFSETS, 23))))
+    assertEquals(1L, boot.drainOnce())
+    assertEquals(1, engine.active().size(),
+      "post-recovery commit replaces the held-stale RuleSet with the fresh one")
+    assertTrue(engine.evaluate(ApiKeys.LIST_OFFSETS, "c", false,
+      () => Collections.emptyMap()).denied)
+    // The previously-held-stale rules are gone now — recovery installed a
+    // fresh set containing only r-fresh.
+    assertSame(RuleDecision.ALLOW,
+      engine.evaluate(ApiKeys.METADATA, "c", false, () => Collections.emptyMap()),
+      "after recovery commit, previously-held-stale METADATA rule is dropped")
+    assertSame(RuleDecision.ALLOW,
+      engine.evaluate(ApiKeys.FETCH, "c", false, () => Collections.emptyMap()),
+      "after recovery commit, previously-held-stale FETCH rule is dropped")
+  }
+
+  @Test
   def drainOnceProceedsEvenWhenADenyAllFetchRuleIsActive(): Unit = {
     // Adversarial M4: PROMPT.md requires the broker to keep enforcing the
     // governance topic itself even if an operator publishes a deny-all rule
