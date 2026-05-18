@@ -553,6 +553,63 @@ class IoUringTransportLayerTest {
     }
 
     @Test
+    void unmuteRespectsInboundWatermarkGate() throws Exception {
+        // Codex v13 BLOCKER 2 regression. Scenario: bytes accumulate past HIGH_WATERMARK so
+        // offerInbound flipped autoRead off, then the KafkaChannel self-mutes due to MemoryPool
+        // pressure (clearing OP_READ — autoRead was already off). When MemoryPool releases and
+        // KafkaChannel.maybeUnmute calls addInterestOps(OP_READ), the previous implementation
+        // unconditionally re-enabled autoRead — even though the inbound queue was still pressurized
+        // above HIGH_WATERMARK. The kernel would then resume pushing bytes past the gate before
+        // the Processor had a chance to drain anything, doubling the direct-memory headroom.
+        IoUringTransportLayer l = newLayer();
+        // Fill above HIGH so offerInbound has flipped autoRead off and the gate is engaged.
+        int chunk = 1 << 16;
+        int chunks = (IoUringTransportLayer.INBOUND_HIGH_WATERMARK_BYTES / chunk) + 4;
+        for (int i = 0; i < chunks; i++) {
+            l.offerInbound(Unpooled.buffer(chunk).writeBytes(new byte[chunk]));
+        }
+        assertFalse(channel.config().isAutoRead(),
+            "preconditions: offerInbound past HIGH must have flipped autoRead off");
+
+        // Mute the channel (mirrors KafkaChannel.mute() on MemoryPool self-mute).
+        l.removeInterestOps(SelectionKey.OP_READ);
+        assertTrue(l.isMute(), "preconditions: channel is muted");
+        assertFalse(channel.config().isAutoRead(), "preconditions: autoRead remained off across mute");
+
+        // Unmute. The queue is still above HIGH_WATERMARK so autoRead MUST stay off — the read
+        // path will flip it back on once the Processor drains the queue below LOW_WATERMARK.
+        l.addInterestOps(SelectionKey.OP_READ);
+        assertFalse(l.isMute(), "unmute restored OP_READ");
+        assertFalse(channel.config().isAutoRead(),
+            "addInterestOps(OP_READ) must respect the inbound watermark gate when inboundBytes > LOW_WATERMARK; "
+            + "re-enabling autoRead here would let the kernel push more bytes past HIGH before the queue drains, "
+            + "doubling the direct-memory headroom under a slowloris / pipelined-write DoS");
+
+        // Drain below LOW — the read-path gate is the legitimate place to re-enable autoRead.
+        int drainSize = chunks * chunk;
+        ByteBuffer dst = ByteBuffer.allocate(drainSize);
+        l.read(dst);
+        assertTrue(channel.config().isAutoRead(),
+            "once the read path drains below LOW_WATERMARK on an unmuted channel, autoRead is re-enabled");
+    }
+
+    @Test
+    void unmuteEnablesAutoReadWhenQueueAlreadyBelowLowWatermark() throws Exception {
+        // Companion to unmuteRespectsInboundWatermarkGate: when inboundBytes is BELOW LOW at the
+        // moment of unmute, autoRead must be re-enabled immediately — the read path is not going
+        // to re-enable it for us because the gate condition (was above HIGH, dropped below LOW)
+        // was never tripped. This is the steady-state happy path: mute, drain to zero while
+        // muted, then unmute.
+        IoUringTransportLayer l = newLayer();
+        l.removeInterestOps(SelectionKey.OP_READ);
+        assertFalse(channel.config().isAutoRead(), "preconditions: muted, autoRead off");
+        // inboundBytes is 0 here (no offerInbound). Unmute must enable autoRead.
+        l.addInterestOps(SelectionKey.OP_READ);
+        assertTrue(channel.config().isAutoRead(),
+            "with inboundBytes == 0 (well below LOW), addInterestOps(OP_READ) must re-enable autoRead");
+    }
+
+    @Test
     void writeChunksLargePayloadsToMaxWriteChunkBytes() throws Exception {
         // Regression for v7 BLOCKER 2: write(ByteBuffer) previously allocated a direct
         // ByteBuf of size = src.remaining() in one shot, BEFORE the isWritable()

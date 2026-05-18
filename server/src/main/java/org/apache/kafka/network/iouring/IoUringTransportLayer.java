@@ -289,12 +289,18 @@ final class IoUringTransportLayer implements TransportLayer {
         int before = selectionKey.interestOps();
         int after = before | ops;
         selectionKey.interestOps(after);
-        // Mirror the NIO contract: when OP_READ comes back in the interest mask the channel
-        // is once again accepting reads. Flip Netty autoRead on so the kernel resumes pushing
-        // bytes. This is what KafkaChannel.maybeUnmute() relies on after MemoryPool pressure
-        // releases, and it is also the symmetric counterpart of removeInterestOps below.
-        if ((after & SelectionKey.OP_READ) != 0 && (before & SelectionKey.OP_READ) == 0
-                && nettyChannel.isOpen() && !nettyChannel.config().isAutoRead()) {
+        // Mirror the NIO contract: when OP_READ comes back in the interest mask the channel is
+        // once again accepting reads. Flip Netty autoRead on so the kernel resumes pushing bytes.
+        // BUT we must still honor the inbound watermark gate — if inboundBytes is above LOW, the
+        // queue is already pressurized and re-enabling reads here would let the kernel push more
+        // bytes past HIGH_WATERMARK before the Processor drains. Leave autoRead off in that case;
+        // the read path (above, around the inboundBytes.addAndGet(-total) decrement) will flip it
+        // back on once the Processor has drained the queue below LOW_WATERMARK, matching the
+        // identical condition there.
+        boolean opReadFreshlyAdded = (after & SelectionKey.OP_READ) != 0
+                && (before & SelectionKey.OP_READ) == 0;
+        if (opReadFreshlyAdded && nettyChannel.isOpen() && !nettyChannel.config().isAutoRead()
+                && inboundBytes.get() <= INBOUND_LOW_WATERMARK_BYTES) {
             nettyChannel.config().setAutoRead(true);
         }
     }
