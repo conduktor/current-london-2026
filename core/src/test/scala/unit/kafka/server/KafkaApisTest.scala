@@ -4023,6 +4023,167 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testListOffsetsOnLogicalTopicReturnsKernelLogicalOffsets(): Unit = {
+    // Concentration ListOffsets contract (Codex HIGH): a stock consumer calling seekToBeginning
+    // / seekToEnd against a logical topic must receive offsets in LOGICAL space. Returning the
+    // backing offset — which is what handleListOffsetRequest would do without kernel awareness
+    // — would either mis-seek the consumer (silent wrong-record reads) or trigger an immediate
+    // OFFSET_OUT_OF_RANGE on the next fetch (the backing offset is invalid in logical-offset
+    // space). The hook short-circuits ReplicaManager and answers from kernel state directly.
+    val logicalTopic = "orders"
+    val backingTopic = "concentrated"
+    val descriptor = new LogicalTopicDescriptor(logicalTopic, 1024, backingTopic, 4)
+    addTopicToMetadataCache(backingTopic, numPartitions = 4)
+
+    when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
+    when(concentrationKernel.describe(logicalTopic)).thenReturn(Optional.of(descriptor))
+    // Pin three distinct values so the assertion proves we forwarded the EARLIEST→start and
+    // LATEST→next routing rather than transposing them (a transposition would still pass any
+    // "non-zero" check).
+    when(concentrationKernel.startLogicalOffset(logicalTopic, 0)).thenReturn(42L)
+    when(concentrationKernel.nextLogicalOffset(logicalTopic, 0)).thenReturn(1_000L)
+    when(concentrationKernel.startLogicalOffset(logicalTopic, 7)).thenReturn(7L)
+
+    val targetTimes = List(new ListOffsetsTopic()
+      .setName(logicalTopic)
+      .setPartitions(List(
+        new ListOffsetsPartition().setPartitionIndex(0).setTimestamp(ListOffsetsRequest.EARLIEST_TIMESTAMP),
+        new ListOffsetsPartition().setPartitionIndex(0).setTimestamp(ListOffsetsRequest.LATEST_TIMESTAMP),
+        new ListOffsetsPartition().setPartitionIndex(7).setTimestamp(ListOffsetsRequest.EARLIEST_LOCAL_TIMESTAMP)
+      ).asJava)).asJava
+    val listOffsetRequest = ListOffsetsRequest.Builder.forConsumer(true, IsolationLevel.READ_UNCOMMITTED)
+      .setTargetTimes(targetTimes).build()
+    val request = buildRequest(listOffsetRequest)
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleListOffsetRequest(request)
+
+    val response = verifyNoThrottling[ListOffsetsResponse](request)
+    val topicResp = response.topics.asScala.find(_.name == logicalTopic).get
+    val byTimestampAndPart = topicResp.partitions.asScala
+      .map(p => (p.partitionIndex, p.offset))
+      .toList
+    // Order of (index, offset) entries reflects the order of partitions in the request.
+    assertEquals(List((0, 42L), (0, 1_000L), (7, 7L)), byTimestampAndPart,
+      "EARLIEST/EARLIEST_LOCAL must resolve to kernel.startLogicalOffset and LATEST to " +
+      "kernel.nextLogicalOffset — leaking backing offsets would mis-seek stock consumers")
+    topicResp.partitions.asScala.foreach { p =>
+      assertEquals(Errors.NONE.code, p.errorCode)
+    }
+
+    // ReplicaManager must never see logical-topic requests — they're answered from kernel state.
+    verify(replicaManager, never()).fetchOffset(any(), any(), any(), anyInt, any(), anyInt, anyShort,
+      any(), any(), anyInt)
+  }
+
+  @Test
+  def testListOffsetsOnLogicalTopicRejectsTimestampLookupAsUnsupported(): Unit = {
+    // Timestamp -> logical-offset reverse lookup needs a sidecar scan that v1 does not maintain.
+    // The hook must refuse with a non-retriable error rather than return the backing offset
+    // (which would silently mis-seek). UNSUPPORTED_FOR_MESSAGE_FORMAT is non-retriable and signals
+    // "valid request, just not supported for this topic in this version" — the right shape for
+    // a feature-gated rejection.
+    val logicalTopic = "orders"
+    val backingTopic = "concentrated"
+    val descriptor = new LogicalTopicDescriptor(logicalTopic, 1024, backingTopic, 4)
+    addTopicToMetadataCache(backingTopic, numPartitions = 4)
+
+    when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
+    when(concentrationKernel.describe(logicalTopic)).thenReturn(Optional.of(descriptor))
+
+    val targetTimes = List(new ListOffsetsTopic()
+      .setName(logicalTopic)
+      .setPartitions(List(
+        new ListOffsetsPartition().setPartitionIndex(0).setTimestamp(ListOffsetsRequest.MAX_TIMESTAMP),
+        new ListOffsetsPartition().setPartitionIndex(0).setTimestamp(ListOffsetsRequest.LATEST_TIERED_TIMESTAMP),
+        new ListOffsetsPartition().setPartitionIndex(0).setTimestamp(12345L)
+      ).asJava)).asJava
+    val listOffsetRequest = ListOffsetsRequest.Builder.forConsumer(true, IsolationLevel.READ_UNCOMMITTED)
+      .setTargetTimes(targetTimes).build()
+    val request = buildRequest(listOffsetRequest)
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleListOffsetRequest(request)
+
+    val response = verifyNoThrottling[ListOffsetsResponse](request)
+    val topicResp = response.topics.asScala.find(_.name == logicalTopic).get
+    topicResp.partitions.asScala.foreach { p =>
+      assertEquals(Errors.UNSUPPORTED_FOR_MESSAGE_FORMAT.code, p.errorCode,
+        "timestamp lookups and tiered-timestamp lookups must be refused — v1 maintains no " +
+        "timestamp -> logical-offset reverse index, returning the backing offset would mis-seek")
+      assertEquals(ListOffsetsResponse.UNKNOWN_OFFSET, p.offset)
+    }
+  }
+
+  @Test
+  def testListOffsetsOnLogicalTopicRejectsOutOfRangePartitionAsUnknownTopicOrPartition(): Unit = {
+    val logicalTopic = "orders"
+    val backingTopic = "concentrated"
+    val descriptor = new LogicalTopicDescriptor(logicalTopic, 1024, backingTopic, 4)
+    addTopicToMetadataCache(backingTopic, numPartitions = 4)
+
+    when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
+    when(concentrationKernel.describe(logicalTopic)).thenReturn(Optional.of(descriptor))
+
+    val targetTimes = List(new ListOffsetsTopic()
+      .setName(logicalTopic)
+      .setPartitions(List(
+        new ListOffsetsPartition().setPartitionIndex(2048).setTimestamp(ListOffsetsRequest.LATEST_TIMESTAMP)
+      ).asJava)).asJava
+    val listOffsetRequest = ListOffsetsRequest.Builder.forConsumer(true, IsolationLevel.READ_UNCOMMITTED)
+      .setTargetTimes(targetTimes).build()
+    val request = buildRequest(listOffsetRequest)
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleListOffsetRequest(request)
+
+    val response = verifyNoThrottling[ListOffsetsResponse](request)
+    val partitionData = response.topics.asScala.find(_.name == logicalTopic).get
+      .partitions.asScala.head
+    assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION.code, partitionData.errorCode,
+      "out-of-range logical partition must surface as a client routing bug — not as a kernel " +
+      "exception leaked through ReplicaManager")
+  }
+
+  @Test
+  def testListOffsetsOnBackingTopicReturnsInvalidTopicException(): Unit = {
+    // Symmetric with the produce path: a stock client must never address the backing topic by
+    // name. ListOffsets on a backing topic would return offsets that interleave records from
+    // every logical topic mapped to that backing — meaningless to any single consumer.
+    val backingTopic = "concentrated"
+    addTopicToMetadataCache(backingTopic, numPartitions = 4)
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+
+    val targetTimes = List(new ListOffsetsTopic()
+      .setName(backingTopic)
+      .setPartitions(List(
+        new ListOffsetsPartition().setPartitionIndex(0).setTimestamp(ListOffsetsRequest.LATEST_TIMESTAMP)
+      ).asJava)).asJava
+    val listOffsetRequest = ListOffsetsRequest.Builder.forConsumer(true, IsolationLevel.READ_UNCOMMITTED)
+      .setTargetTimes(targetTimes).build()
+    val request = buildRequest(listOffsetRequest)
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleListOffsetRequest(request)
+
+    val response = verifyNoThrottling[ListOffsetsResponse](request)
+    val partitionData = response.topics.asScala.find(_.name == backingTopic).get
+      .partitions.asScala.head
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, partitionData.errorCode)
+
+    verify(replicaManager, never()).fetchOffset(any(), any(), any(), anyInt, any(), anyInt, anyShort,
+      any(), any(), anyInt)
+  }
+
+  @Test
   def testLeaderReplicaIfLocalRaisesFencedLeaderEpoch(): Unit = {
     testListOffsetFailedGetLeaderReplica(Errors.FENCED_LEADER_EPOCH)
   }

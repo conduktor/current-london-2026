@@ -1175,12 +1175,87 @@ class KafkaApis(val requestChannel: RequestChannel,
           .setTopics(mergedResponses.asJava)))
     }
 
-    if (authorizedRequestInfo.isEmpty) {
-      sendResponseCallback(Seq.empty)
+    // Concentration v1: ListOffsets must speak logical-offset space for logical topics. A stock
+    // consumer that calls seekToBeginning / seekToEnd, or an admin client that calls listOffsets,
+    // will mis-seek (or get an immediate OFFSET_OUT_OF_RANGE on the first fetch) if we hand it
+    // raw backing offsets. We answer the three sentinel timestamps the stock client actually uses
+    // (EARLIEST / EARLIEST_LOCAL / LATEST) directly from the kernel — no ReplicaManager round-trip
+    // because the backing log is the wrong source of truth for logical offsets. MAX_TIMESTAMP,
+    // LATEST_TIERED_TIMESTAMP and explicit timestamps need a timestamp -> logical-offset reverse
+    // index that v1 does not maintain; we surface UNSUPPORTED_FOR_MESSAGE_FORMAT (non-retriable)
+    // rather than silently returning a backing offset that would mis-seek the client. Direct
+    // listOffsets to a backing topic mirrors the produce path: INVALID_TOPIC_EXCEPTION, because
+    // a backing partition's offsets are not addressable by stock clients in v1.
+    val (logicalRequested, nonLogicalRequested) = authorizedRequestInfo.partition(t =>
+      concentrationKernel.isLogicalTopic(t.name))
+
+    val logicalResponses: Seq[ListOffsetsTopicResponse] = logicalRequested.map { topic =>
+      val descriptorOpt = concentrationKernel.describe(topic.name)
+      val partResponses = topic.partitions.asScala.map { part =>
+        if (descriptorOpt.isEmpty) {
+          // Declaration was revoked between isLogicalTopic() and describe(). Surface the same
+          // error a fully-unknown topic would, so the client retries against fresh metadata.
+          buildErrorResponse(Errors.UNKNOWN_TOPIC_OR_PARTITION, part)
+        } else {
+          val descriptor = descriptorOpt.get
+          if (part.partitionIndex < 0 || part.partitionIndex >= descriptor.numLogicalPartitions) {
+            buildErrorResponse(Errors.UNKNOWN_TOPIC_OR_PARTITION, part)
+          } else {
+            val kernelOffset: Option[Long] = part.timestamp match {
+              case ListOffsetsRequest.EARLIEST_TIMESTAMP | ListOffsetsRequest.EARLIEST_LOCAL_TIMESTAMP =>
+                // Logical log start advances on DeleteRecords. EARLIEST_LOCAL coincides with
+                // EARLIEST in v1: logical topics have no tiered tier — every record lives on a
+                // local backing partition.
+                Some(concentrationKernel.startLogicalOffset(topic.name, part.partitionIndex))
+              case ListOffsetsRequest.LATEST_TIMESTAMP =>
+                // Next-to-assign logical offset, equivalent to the logical high water mark.
+                Some(concentrationKernel.nextLogicalOffset(topic.name, part.partitionIndex))
+              case _ =>
+                // MAX_TIMESTAMP, LATEST_TIERED_TIMESTAMP, explicit positive timestamp: would need
+                // a timestamp -> logical-offset reverse lookup. Returning the backing offset would
+                // mis-seek; better to fail loud and non-retriable so the client surfaces a clear
+                // error rather than silently consuming the wrong record.
+                None
+            }
+            kernelOffset match {
+              case Some(off) =>
+                new ListOffsetsPartitionResponse()
+                  .setPartitionIndex(part.partitionIndex)
+                  .setErrorCode(Errors.NONE.code)
+                  .setTimestamp(ListOffsetsResponse.UNKNOWN_TIMESTAMP)
+                  .setOffset(off)
+              case None =>
+                buildErrorResponse(Errors.UNSUPPORTED_FOR_MESSAGE_FORMAT, part)
+            }
+          }
+        }
+      }
+      new ListOffsetsTopicResponse().setName(topic.name).setPartitions(partResponses.asJava)
+    }
+
+    val (backingRequested, stockRequested) = nonLogicalRequested.partition(t =>
+      concentrationKernel.isBackingTopic(t.name))
+
+    val backingResponses: Seq[ListOffsetsTopicResponse] = backingRequested.map { topic =>
+      val partResponses = topic.partitions.asScala.map { part =>
+        buildErrorResponse(Errors.INVALID_TOPIC_EXCEPTION, part)
+      }
+      new ListOffsetsTopicResponse().setName(topic.name).setPartitions(partResponses.asJava)
+    }
+
+    val concentrationResponses = logicalResponses ++ backingResponses
+
+    if (stockRequested.isEmpty) {
+      sendResponseCallback(concentrationResponses)
     } else {
-      replicaManager.fetchOffset(authorizedRequestInfo, offsetRequest.duplicatePartitions().asScala,
+      // Pass only stock (non-logical, non-backing) topics through to ReplicaManager. Concentration
+      // responses are concatenated in the stock callback so the response shape matches what the
+      // client would see if every requested topic were stock.
+      replicaManager.fetchOffset(stockRequested, offsetRequest.duplicatePartitions().asScala,
         offsetRequest.isolationLevel(), offsetRequest.replicaId(), clientId, correlationId, version,
-        buildErrorResponse, sendResponseCallback, offsetRequest.timeoutMs())
+        buildErrorResponse,
+        stockResponses => sendResponseCallback(stockResponses ++ concentrationResponses),
+        offsetRequest.timeoutMs())
     }
   }
 
