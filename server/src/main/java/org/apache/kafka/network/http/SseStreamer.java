@@ -157,7 +157,35 @@ final class SseStreamer {
         // submitter future. That thread is the broker's request-handler thread (RequestChannel callback) — running
         // the SSE write loop there pins a Kafka API handler on a slow streaming client and can starve the binary
         // protocol. Move the write + scheduleNextFetch chain onto Jetty's server thread pool instead.
-        submitter.submitFetch(command).whenCompleteAsync(this::handleFetchResult, httpExecutor);
+        // .exceptionally catches two failure modes the surrounding stage cannot: a
+        // RejectedExecutionException when httpExecutor refuses to dispatch handleFetchResult (saturated
+        // or shut-down Jetty pool — the JDK routes that to the dependent future, not the calling
+        // thread), and any RuntimeException raised inside handleFetchResult itself. Without this
+        // terminal handler the failure lands on an unobserved future, the recursive long-poll halts
+        // mid-stream, and the limiter slot leaks until JVM shutdown.
+        // Returning {@code null} satisfies the FetchResult-typed dependent stage; the value is never
+        // observed because the handler is the terminal step in the chain.
+        submitter.submitFetch(command)
+            .whenCompleteAsync(this::handleFetchResult, httpExecutor)
+            .exceptionally(t -> {
+                handleSchedulingFailure(t);
+                return null;
+            });
+    }
+
+    /**
+     * Terminal handler for failures the synchronous code cannot observe — executor rejection on the
+     * {@code whenCompleteAsync} hand-off, and unexpected throwables from inside {@link #handleFetchResult}.
+     * Sends a sanitised INTERNAL error frame (never echo {@code throwable.getMessage()} — stock JDK
+     * messages leak broker class/field names) and tears the stream down so the limiter slot is reclaimed.
+     */
+    private void handleSchedulingFailure(Throwable throwable) {
+        if (closed.get()) {
+            return;
+        }
+        LOG.warn("SSE fetch dispatch failed for {}/{} at offset {}", topic, partition, currentOffset, throwable);
+        tryWriteErrorFrame("INTERNAL", null);
+        closeStream();
     }
 
     private void handleFetchResult(RequestSubmitter.FetchResult result, Throwable throwable) {
@@ -236,8 +264,16 @@ final class SseStreamer {
             return;
         }
         try {
+            // Same shape as scheduleNextFetch: the delayedExecutor dispatches via httpExecutor when the
+            // timer fires; if that dispatch is rejected the dependent future is what carries the
+            // failure, not the calling thread. Terminal handler closes the stream so a throttled SSE
+            // session cannot leak its limiter slot on shutdown.
             CompletableFuture.runAsync(this::scheduleNextFetch,
-                CompletableFuture.delayedExecutor(delayMs, TimeUnit.MILLISECONDS, httpExecutor));
+                CompletableFuture.delayedExecutor(delayMs, TimeUnit.MILLISECONDS, httpExecutor))
+                .exceptionally(t -> {
+                    handleSchedulingFailure(t);
+                    return null;
+                });
         } catch (RuntimeException e) {
             LOG.warn("SSE delayed-fetch dispatch failed for {}/{}", topic, partition, e);
             closeStream();

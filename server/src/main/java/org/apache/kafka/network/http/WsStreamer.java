@@ -314,7 +314,22 @@ public final class WsStreamer {
         FetchRequestParser.FetchCommand command =
             new FetchRequestParser.FetchCommand(topic, partition, currentOffset, maxBytes);
         try {
-            submitter.submitFetch(command).whenCompleteAsync(this::handleFetchResult, httpExecutor);
+            // .exceptionally captures TWO failure modes the surrounding try/catch cannot see:
+            //   (a) RejectedExecutionException from httpExecutor when whenCompleteAsync tries to
+            //       dispatch handleFetchResult — the JDK routes that to the dependent future, not
+            //       the calling thread, so a saturated or shut-down Jetty pool would otherwise
+            //       leave fetchInFlight=true forever and silently wedge the stream.
+            //   (b) any RuntimeException thrown inside handleFetchResult itself (sendText through a
+            //       half-broken sink, etc.). Without this terminal handler that throwable lands on
+            //       an unobserved future and is logged only at shutdown.
+            // Returning {@code null} satisfies the FetchResult-typed dependent stage; the value is
+            // never observed because the handler is the terminal step in the chain.
+            submitter.submitFetch(command)
+                .whenCompleteAsync(this::handleFetchResult, httpExecutor)
+                .exceptionally(t -> {
+                    handleSchedulingFailure(t);
+                    return null;
+                });
         } catch (RuntimeException e) {
             fetchInFlight.set(false);
             // Log the real throwable server-side; never echo throwable.getMessage() to the client. Stock JDK
@@ -323,6 +338,24 @@ public final class WsStreamer {
             trySendErrorFrame("INTERNAL", null);
             close();
         }
+    }
+
+    /**
+     * Terminal handler for failures the synchronous try/catch around fetch dispatch cannot observe —
+     * executor rejection on the {@code whenCompleteAsync} hand-off, and unexpected throwables from inside
+     * {@link #handleFetchResult}. We mirror the catch block's behaviour: clear {@code fetchInFlight} so a
+     * future grant cannot find the stream wedged, log the throwable server-side (never echo it to the
+     * client — stock JDK messages leak broker internals), surface a sanitised INTERNAL error frame, and
+     * close. Returning {@code null} keeps the dependent future shape stable.
+     */
+    private void handleSchedulingFailure(Throwable throwable) {
+        if (closed.get()) {
+            return;
+        }
+        fetchInFlight.set(false);
+        LOG.warn("WS fetch dispatch failed for {}/{}", topic, partition, throwable);
+        trySendErrorFrame("INTERNAL", null);
+        close();
     }
 
     private void handleFetchResult(RequestSubmitter.FetchResult result, Throwable throwable) {
@@ -391,8 +424,16 @@ public final class WsStreamer {
             return;
         }
         try {
+            // Same reason as scheduleFetchAsync: the delayedExecutor dispatches via httpExecutor when
+            // the timer fires; a RejectedExecutionException at that point completes the dependent
+            // future, NOT the calling thread. Without the terminal handler the stream wedges silently
+            // — the throttle deadline arms but no drain ever runs.
             CompletableFuture.runAsync(this::scheduleDrain,
-                CompletableFuture.delayedExecutor(delayMs, TimeUnit.MILLISECONDS, httpExecutor));
+                CompletableFuture.delayedExecutor(delayMs, TimeUnit.MILLISECONDS, httpExecutor))
+                .exceptionally(t -> {
+                    handleSchedulingFailure(t);
+                    return null;
+                });
         } catch (RuntimeException e) {
             LOG.warn("WS delayed-drain dispatch failed for {}/{}", topic, partition, e);
             close();
