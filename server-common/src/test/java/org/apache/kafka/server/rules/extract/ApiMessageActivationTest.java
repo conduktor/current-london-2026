@@ -581,6 +581,36 @@ public class ApiMessageActivationTest {
     }
 
     @Test
+    public void alterConfigsValueIsRedactedWhenSiblingNameIsNull() {
+        // Round-10 audit (LOW, defence-in-depth): if a future schema revision
+        // adds nullableVersions to AlterableConfig.Name, or an in-process
+        // caller constructs an instance with setName(null), the prior
+        // `name instanceof String && isSensitive(name)` check would silently
+        // fail-OPEN — the predicate is false for null, redaction skipped,
+        // value visible. The fix biases to redact: any non-String shape
+        // means we cannot prove the name is benign, so we redact.
+        AlterableConfigCollection configs = new AlterableConfigCollection();
+        configs.add(new AlterableConfig().setName(null).setValue("could-be-any-secret"));
+        AlterConfigsResource resource = new AlterConfigsResource()
+            .setResourceType((byte) 2)
+            .setResourceName("audit-events")
+            .setConfigs(configs);
+        AlterConfigsResourceCollection resources = new AlterConfigsResourceCollection();
+        resources.add(resource);
+        AlterConfigsRequestData req = new AlterConfigsRequestData().setResources(resources);
+
+        Map<String, Object> m = ApiMessageActivation.from(req);
+        List<?> resourceList = (List<?>) m.get("resources");
+        Map<?, ?> resourceMap = (Map<?, ?>) resourceList.get(0);
+        List<?> configList = (List<?>) resourceMap.get("configs");
+        Map<?, ?> cfg = (Map<?, ?>) configList.get(0);
+        assertTrue(cfg.containsKey("value"),
+            "value key MUST remain present so a rule can't probe `c.value == null` to learn redaction state");
+        assertNull(cfg.get("value"),
+            "null sibling name MUST trigger redact-by-default — we cannot prove the name is benign, so we redact");
+    }
+
+    @Test
     public void sensitiveIncrementalAlterConfigsValueIsRedactedWhenNameMatchesPasswordPattern() {
         // Same contract as AlterConfigsRequest but exercised through the
         // distinct generated class IncrementalAlterConfigsRequestData$AlterableConfig.

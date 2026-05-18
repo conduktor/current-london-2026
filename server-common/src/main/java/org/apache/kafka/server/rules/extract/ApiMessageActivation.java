@@ -299,7 +299,21 @@ public final class ApiMessageActivation {
             return;
         }
         Object name = out.get("name");
-        if (name instanceof String && isSensitiveConfigName((String) name)) {
+        // Round-10 audit (LOW, defence-in-depth): redact-by-default when the
+        // sibling name field is null or any non-String shape. The wire path
+        // cannot produce a null Name today (none of the three schema files
+        // — AlterConfigsRequest / IncrementalAlterConfigsRequest /
+        // CreateTopicsRequest — declare nullableVersions on the Name field).
+        // But if a future schema revision adds nullableVersions, or an
+        // in-process caller constructs an instance with setName(null), the
+        // prior `name instanceof String && isSensitive(...)` check would
+        // silently fail-OPEN and leak the value. The doc on
+        // isSensitiveConfigName already states the bias-to-redact policy:
+        // "Over-redacting a value with a misleading name is a small CEL-
+        // usability inconvenience; under-redacting a real credential is a
+        // security incident. When in doubt, redact." Treat any non-String
+        // shape as in doubt.
+        if (!(name instanceof String) || isSensitiveConfigName((String) name)) {
             // Keep the key — only the value is sensitive.
             out.put("value", null);
         }
