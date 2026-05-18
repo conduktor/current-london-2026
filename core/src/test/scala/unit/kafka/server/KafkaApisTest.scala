@@ -5116,16 +5116,47 @@ class KafkaApisTest extends Logging {
     val viewTpId = new TopicIdPartition(viewTopicId, new TopicPartition(viewTopic, 0))
     val backingTpId = new TopicIdPartition(backingTopicId, new TopicPartition(backingTopic, 0))
 
-    val backingRecords = MemoryRecords.withRecords(700L, Compression.NONE,
+    // Two transactional batches, one per producer, each with a record that passes the predicate.
+    // The records must carry the producers' IDs in their batch headers because
+    // testFetchFromViewFiltersAbortedTransactionsByVisibleProducers pins the leak-closure rule:
+    // an AbortedTransaction entry only survives the view filter if its producer_id is still
+    // visible in some non-empty data batch after the predicate runs. With both producers' batches
+    // retaining at least one record, both aborted-tx entries must propagate — that's what THIS
+    // test pins (the propagation direction; the strip direction is pinned by the companion test).
+    val keepProducerId = 71L
+    val keepProducerId2 = 73L
+    val keepBatch1 = MemoryRecords.withTransactionalRecords(
+      700L, Compression.NONE,
+      keepProducerId,
+      /* producerEpoch = */ 0.toShort,
+      /* baseSequence  = */ 0,
+      /* partitionLeaderEpoch = */ 0,
       new SimpleRecord("{\"color\":\"red\"}".getBytes(StandardCharsets.UTF_8)),
       new SimpleRecord("{\"color\":\"blue\"}".getBytes(StandardCharsets.UTF_8)))
+    val keepBatch2 = MemoryRecords.withTransactionalRecords(
+      702L, Compression.NONE,
+      keepProducerId2,
+      /* producerEpoch = */ 0.toShort,
+      /* baseSequence  = */ 0,
+      /* partitionLeaderEpoch = */ 0,
+      new SimpleRecord("{\"color\":\"red\"}".getBytes(StandardCharsets.UTF_8)))
+    val combinedRecords = java.nio.ByteBuffer.allocate(
+      keepBatch1.sizeInBytes() + keepBatch2.sizeInBytes())
+    combinedRecords.put(keepBatch1.buffer().duplicate())
+    combinedRecords.put(keepBatch2.buffer().duplicate())
+    combinedRecords.flip()
+    val backingRecords = MemoryRecords.readableRecords(combinedRecords)
 
     // Two aborted transactions at backing-side first offsets. The view consumer must see them
     // verbatim — producer IDs are global (not view-specific), and the firstOffset values are
-    // source offsets which equal the view's offsets (sparse-source semantics).
+    // source offsets which equal the view's offsets (sparse-source semantics). firstOffset values
+    // (650, 680) refer to earlier offsets where each producer's aborted-transaction-region began;
+    // those records aren't part of THIS fetch's batches (which start at 700). The values still
+    // round-trip unchanged through the view layer because the filter only drops entries, never
+    // rewrites them.
     val abortedTxns = List(
-      new FetchResponseData.AbortedTransaction().setProducerId(71L).setFirstOffset(650L),
-      new FetchResponseData.AbortedTransaction().setProducerId(73L).setFirstOffset(680L)
+      new FetchResponseData.AbortedTransaction().setProducerId(keepProducerId).setFirstOffset(650L),
+      new FetchResponseData.AbortedTransaction().setProducerId(keepProducerId2).setFirstOffset(680L)
     ).asJava
     val backingLastStableOffset = 705L
 
@@ -5196,6 +5227,155 @@ class KafkaApisTest extends Logging {
     // doesn't accidentally rewrite it (e.g. via a view-side leader-epoch ledger lookup).
     assertEquals(800L, partitionData.highWatermark,
       "high watermark from backing must propagate unchanged — sparse-source coordinate is 1:1")
+  }
+
+  @Test
+  def testFetchFromViewFiltersAbortedTransactionsByVisibleProducers(): Unit = {
+    // Companion to testFetchFromViewPropagatesAbortedTransactionsAndLastStableOffset: that test
+    // pins that abortedTransactions ROUND-TRIP from backing to view for READ_COMMITTED isolation;
+    // this test pins the LEAK CLOSURE for entries whose producer has nothing left to skip after
+    // the view predicate runs.
+    //
+    // Threat model: the backing fetch's abortedTransactions list lives OUTSIDE the records, in
+    // the response payload. The round-4 empty-batch scrub (commit 2dcc1780be) clears producer_id
+    // on fully-filtered DATA batches so the records themselves no longer name the producer, but
+    // the abortedTransactions list is untouched by that scrub. Without this filter a view
+    // consumer sees `(producer_id, firstOffset)` for an aborted backing transaction even when
+    // the predicate dropped every data record of that transaction — broadcasting the existence
+    // and offset boundary of records the predicate is supposed to gate, and providing a
+    // fingerprintable signal (producer_id is global) for traffic the consumer is forbidden to
+    // read.
+    //
+    // Correctness preservation: if the predicate keeps ANY record from a producer's aborted
+    // transaction, that producer_id remains visible on the wire on the surviving batch (we do
+    // NOT scrub non-empty batches), and the consumer's READ_COMMITTED state machine needs the
+    // matching AbortedTransaction entry to mark those records aborted — otherwise the surviving
+    // aborted records would be surfaced as committed. So the filter keeps entries whose
+    // producer is still visible in the post-filter records and drops only those that aren't.
+    //
+    // This single test exercises BOTH dimensions in one shot: two transactional batches from two
+    // distinct producers; predicate retains one, filters the other; assert the matching aborted
+    // entry survives and the other is stripped. A separate test (the fully-empty case) would be
+    // redundant with the strip half of this one.
+    val viewTopic = "txn-filter-view"
+    val backingTopic = "txn-filter-backing"
+    val viewTopicId = Uuid.randomUuid()
+    val backingTopicId = Uuid.randomUuid()
+
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, backingTopic)
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.keep == true")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+
+    addTopicToMetadataCache(viewTopic, numPartitions = 1, topicId = viewTopicId)
+    addTopicToMetadataCache(backingTopic, numPartitions = 1, topicId = backingTopicId)
+
+    val viewTpId = new TopicIdPartition(viewTopicId, new TopicPartition(viewTopic, 0))
+    val backingTpId = new TopicIdPartition(backingTopicId, new TopicPartition(backingTopic, 0))
+
+    // Two transactional batches from two different producers, at distinct offset ranges.
+    //   - producer 71's batch contains a record matching the predicate → survives with data
+    //   - producer 73's batch contains records that all FAIL the predicate → empty batch with
+    //     producer_id scrubbed to NO_PRODUCER_ID by the round-4 empty-batch scrub
+    val keepProducerId = 71L
+    val dropProducerId = 73L
+    val keepProducerBatch = MemoryRecords.withTransactionalRecords(
+      0L, Compression.NONE,
+      keepProducerId,
+      /* producerEpoch = */ 0.toShort,
+      /* baseSequence  = */ 0,
+      /* partitionLeaderEpoch = */ 0,
+      new SimpleRecord("{\"keep\":true}".getBytes(StandardCharsets.UTF_8)))
+    val dropProducerBatch = MemoryRecords.withTransactionalRecords(
+      10L, Compression.NONE,
+      dropProducerId,
+      /* producerEpoch = */ 0.toShort,
+      /* baseSequence  = */ 0,
+      /* partitionLeaderEpoch = */ 0,
+      new SimpleRecord("{\"keep\":false}".getBytes(StandardCharsets.UTF_8)))
+    // Concatenate the two transactional batches into a single MemoryRecords. ViewFilter iterates
+    // batches independently so each batch carries its own producer_id through the filter — this
+    // is exactly the layout the leak depends on.
+    val combined = java.nio.ByteBuffer.allocate(
+      keepProducerBatch.sizeInBytes() + dropProducerBatch.sizeInBytes())
+    combined.put(keepProducerBatch.buffer().duplicate())
+    combined.put(dropProducerBatch.buffer().duplicate())
+    combined.flip()
+    val backingRecords = MemoryRecords.readableRecords(combined)
+
+    // Both producers have an aborted-transaction entry on the backing fetch.
+    val abortedTxns = List(
+      new FetchResponseData.AbortedTransaction().setProducerId(keepProducerId).setFirstOffset(0L),
+      new FetchResponseData.AbortedTransaction().setProducerId(dropProducerId).setFirstOffset(10L)
+    ).asJava
+
+    when(replicaManager.fetchMessages(
+      any[FetchParams],
+      any[Seq[(TopicIdPartition, FetchRequest.PartitionData)]],
+      any[ReplicaQuota],
+      any[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]()
+    )).thenAnswer(invocation => {
+      val callback = invocation.getArgument(3).asInstanceOf[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]
+      callback(Seq(backingTpId -> new FetchPartitionData(
+        Errors.NONE,
+        100L,                                  // highWatermark
+        0L,                                    // logStartOffset
+        backingRecords,
+        Optional.empty(),                      // divergingEpoch
+        OptionalLong.of(100L),                 // LSO
+        Optional.of(abortedTxns),              // abortedTransactions: BOTH producers present
+        OptionalInt.empty(),
+        false)))
+    })
+
+    val fetchData = Map(viewTpId -> new FetchRequest.PartitionData(viewTopicId, 0, 0, 1000, Optional.empty())).asJava
+    val fetchDataBuilder = Map(viewTpId.topicPartition -> new FetchRequest.PartitionData(viewTopicId, 0, 0, 1000, Optional.empty())).asJava
+    val fetchMetadata = new JFetchMetadata(0, 0)
+    val fetchContext = new FullFetchContext(time, new FetchSessionCacheShard(1000, 100),
+      fetchMetadata, fetchData, true, false)
+    when(fetchManager.newContext(any[Short], any[JFetchMetadata], any[Boolean],
+      any[util.Map[TopicIdPartition, FetchRequest.PartitionData]],
+      any[util.List[TopicIdPartition]],
+      any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val fetchRequest = new FetchRequest.Builder(ApiKeys.FETCH.latestVersion, ApiKeys.FETCH.latestVersion,
+      -1, -1, 100, 0, fetchDataBuilder).isolationLevel(IsolationLevel.READ_COMMITTED).build()
+    val request = buildRequest(fetchRequest)
+    stubBackingPartitionsLocal()
+    kafkaApis = createKafkaApis(configRepository = configRepository)
+    kafkaApis.handleFetchRequest(request)
+
+    val response = verifyNoThrottling[FetchResponse](request)
+    val responseData = response.responseData(metadataCache.topicIdsToNames(), ApiKeys.FETCH.latestVersion)
+    val partitionData = responseData.get(viewTpId.topicPartition)
+    assertEquals(Errors.NONE.code, partitionData.errorCode)
+
+    val outAborted = partitionData.abortedTransactions
+    assertNotNull(outAborted,
+      "abortedTransactions must still be present (non-null) — the filter only drops entries " +
+        "for fully-filtered producers, not the entire list")
+    val outProducerIds = outAborted.asScala.map(_.producerId).toSet
+    assertTrue(outProducerIds.contains(keepProducerId),
+      s"producer $keepProducerId retained data through the predicate; its AbortedTransaction " +
+        "entry MUST survive for READ_COMMITTED correctness — without it, surviving aborted " +
+        "records would be surfaced as committed.")
+    assertFalse(outProducerIds.contains(dropProducerId),
+      s"producer $dropProducerId had every record filtered out by the predicate; its " +
+        "AbortedTransaction entry MUST be stripped from the response — leaking it would " +
+        "broadcast (producer_id, firstOffset) for a transaction whose data the predicate " +
+        "is supposed to gate.")
+    assertEquals(1, outAborted.size,
+      "exactly one entry must survive (the retained-producer one); the filtered-producer entry " +
+        "must be the only one dropped")
+
+    // Sanity: the surviving entry still carries its original firstOffset — the filter only
+    // drops entries, it does not rewrite them. The retained producer's firstOffset is a backing
+    // offset which equals the view's source offset under source_sparse mode.
+    assertEquals(0L, outAborted.asScala.head.firstOffset,
+      "kept entry's firstOffset must round-trip unchanged — the filter is selective, not a rewriter")
   }
 
   @Test
@@ -6499,22 +6679,26 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
-  def testListOffsetsFromViewStripsResponseTimestampToProtectFilteredRecords(): Unit = {
-    // offsetsForTimes (positive query timestamp) returns the actual record TIMESTAMP of the first
-    // backing record at or after the queried time. For views in source_sparse mode that record
-    // may have been filtered out by the predicate — leaking its timestamp through the view
-    // response would disclose per-record wall-clock metadata the predicate is supposed to gate
-    // (the consumer could binary-search by time to fingerprint filtered records).
+  def testListOffsetsFromViewWithPositiveTimestampIsRejectedAsInvalidRequest(): Unit = {
+    // offsetsForTimes (positive query timestamp) returns the offset of the FIRST backing record
+    // whose timestamp is >= the queried t. For a source_sparse view, that backing record may have
+    // been filtered out by the predicate — and even with the response timestamp stripped (which
+    // testListOffsetsFromViewStripsResponseTimestampToProtectFilteredRecords pins), the returned
+    // OFFSET itself is a binary-search oracle: an adversary querying ListOffsets(t) at successive
+    // t values can use the points at which the returned offset changes to recover the timestamps
+    // of filtered backing records to arbitrary precision. Filtered-record timestamps are exactly
+    // the metadata the predicate is supposed to gate.
     //
-    // The handler must replace the response timestamp with UNKNOWN_TIMESTAMP for view responses.
-    // The offset itself is already exposed through the source_sparse Fetch path (empty batches
-    // preserve source offsets per PROMPT.md), so stripping the timestamp closes the leak while
-    // keeping offsetsForTimes useful for seek-by-time on views.
-    val viewTopic = "list-ts-strip-view"
-    val backingTopic = "list-ts-strip-backing"
+    // The only safe options on a view are EARLIEST / LATEST (cluster-coordinate offsets that
+    // don't depend on any specific record). The handler must reject ANY positive query timestamp
+    // (offsetsForTimes mode) with INVALID_REQUEST without ever invoking ReplicaManager.fetchOffset
+    // on the backing — i.e. the rejection is the first line of defence, not just a response-side
+    // timestamp scrub. View consumers can still seek by offset (offsets are preserved by
+    // source_sparse); they cannot seek by time.
+    val viewTopic = "list-pos-ts-view"
+    val backingTopic = "list-pos-ts-backing"
     val viewTopicId = Uuid.randomUuid()
     val backingTopicId = Uuid.randomUuid()
-    val backingRecordTimestamp = 1_700_000_123_456L
 
     val configRepository = new MockConfigRepository()
     configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, backingTopic)
@@ -6526,31 +6710,8 @@ class KafkaApisTest extends Logging {
     when(replicaManager.getPartitionOrError(any[TopicPartition]))
       .thenAnswer(_ => Right(mock(classOf[Partition])))
 
-    when(replicaManager.fetchOffset(
-      ArgumentMatchers.any[Seq[ListOffsetsTopic]](),
-      ArgumentMatchers.eq(Set.empty[TopicPartition]),
-      any[IsolationLevel],
-      ArgumentMatchers.eq(ListOffsetsRequest.CONSUMER_REPLICA_ID),
-      ArgumentMatchers.any[String](),
-      ArgumentMatchers.anyInt(),
-      ArgumentMatchers.anyShort(),
-      ArgumentMatchers.any[(Errors, ListOffsetsPartition) => ListOffsetsPartitionResponse](),
-      ArgumentMatchers.any[List[ListOffsetsTopicResponse] => Unit](),
-      ArgumentMatchers.anyInt()
-    )).thenAnswer(ans => {
-      val callback = ans.getArgument[List[ListOffsetsTopicResponse] => Unit](8)
-      // Simulate ReplicaManager.fetchOffset returning a real record timestamp from the backing
-      // (offsetsForTimes path on the storage layer populates this).
-      val partResp = new ListOffsetsPartitionResponse()
-        .setPartitionIndex(0)
-        .setErrorCode(Errors.NONE.code)
-        .setOffset(42L)
-        .setTimestamp(backingRecordTimestamp)
-      callback(List(new ListOffsetsTopicResponse().setName(backingTopic)
-        .setPartitions(List(partResp).asJava)))
-    })
-
-    // Positive query timestamp = offsetsForTimes mode.
+    // Positive query timestamp = offsetsForTimes mode. Pick a realistic wall-clock value to
+    // exercise the same code path a real consumer would.
     val targetTimes = List(new ListOffsetsTopic()
       .setName(viewTopic)
       .setPartitions(List(new ListOffsetsPartition()
@@ -6564,16 +6725,35 @@ class KafkaApisTest extends Logging {
     kafkaApis = createKafkaApis(configRepository = configRepository)
     kafkaApis.handleListOffsetRequest(request)
 
+    // Hardest guarantee: the handler must NEVER call into ReplicaManager.fetchOffset on the
+    // backing for a positive-timestamp query against a view. If this `never` invariant ever
+    // weakens, the response-side timestamp scrub alone is insufficient — the offset oracle
+    // described above is still live.
+    verify(replicaManager, never()).fetchOffset(
+      any[Seq[ListOffsetsTopic]](),
+      any[Set[TopicPartition]](),
+      any[IsolationLevel],
+      ArgumentMatchers.anyInt(),
+      ArgumentMatchers.any[String](),
+      ArgumentMatchers.anyInt(),
+      ArgumentMatchers.anyShort(),
+      ArgumentMatchers.any[(Errors, ListOffsetsPartition) => ListOffsetsPartitionResponse](),
+      ArgumentMatchers.any[List[ListOffsetsTopicResponse] => Unit](),
+      ArgumentMatchers.anyInt())
+
     val response = verifyNoThrottling[ListOffsetsResponse](request)
     val viewResp = response.topics.asScala.find(_.name == viewTopic)
     assertTrue(viewResp.isDefined, "view-named entry must be in the response")
+    assertTrue(response.topics.asScala.forall(_.name != backingTopic),
+      "backing topic name must NOT leak in the response")
     val partResp = viewResp.get.partitions.asScala.head
-    assertEquals(Errors.NONE.code, partResp.errorCode)
-    assertEquals(42L, partResp.offset)
+    assertEquals(Errors.INVALID_REQUEST.code, partResp.errorCode,
+      "offsetsForTimes (positive timestamp) on a view must surface INVALID_REQUEST, not proxy " +
+        "to the backing — the returned offset would be a timing oracle for filtered records")
+    assertEquals(ListOffsetsResponse.UNKNOWN_OFFSET, partResp.offset,
+      "rejected offsetsForTimes must not carry any offset payload — the offset is the leak")
     assertEquals(ListOffsetsResponse.UNKNOWN_TIMESTAMP, partResp.timestamp,
-      "backing record timestamp must NOT leak into the response under the view name — the " +
-        "record may have been filtered out by the predicate and exposing its timestamp would " +
-        "let the consumer fingerprint filtered records via seek-by-time queries.")
+      "rejected offsetsForTimes must not carry any timestamp payload")
   }
 
   @Test

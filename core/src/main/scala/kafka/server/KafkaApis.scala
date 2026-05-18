@@ -879,8 +879,8 @@ class KafkaApis(val requestChannel: RequestChannel,
                         spec: ViewSpec,
                         bufferSupplier: BufferSupplier): (TopicIdPartition, FetchPartitionData) = {
       if (data.error != Errors.NONE) {
-        // Even on a backing-side error, scrub the two response fields that would otherwise
-        // wedge or mislead a view consumer:
+        // Even on a backing-side error, scrub the response fields that would otherwise wedge
+        // or mislead a view consumer:
         //  - divergingEpoch: today no error-producing LogReadResult carries a non-empty
         //    marker (the replica layer only computes it on successful reads through
         //    Partition.readRecords), but defense-in-depth keeps the backing epoch out of the
@@ -891,8 +891,13 @@ class KafkaApis(val requestChannel: RequestChannel,
         //    rack-aware consumers exactly as in the success path. Same justification as the
         //    main applyViewFilter return below — the prior fix (e2e7a0d048) covered both
         //    Right(records) and Left(err) but missed this early-error return.
-        // highWatermark/logStartOffset/abortedTransactions pass through (source-sparse offsets
-        // are inherent to the view design per PROMPT.md).
+        //  - abortedTransactions: zero records reach the consumer on the error path (we replace
+        //    `data.records` with EMPTY below), so the abortedTransactions list carries only the
+        //    backing producer-id+firstOffset of aborts whose records the consumer never sees.
+        //    Strip to empty — symmetric with the round-4 empty-batch producer_id scrub and the
+        //    Right/Left branches of the main applyViewFilter return.
+        // highWatermark/logStartOffset pass through (source-sparse offsets are inherent to
+        // the view design per PROMPT.md).
         return (viewTpId, new FetchPartitionData(
           data.error,
           data.highWatermark,
@@ -900,7 +905,7 @@ class KafkaApis(val requestChannel: RequestChannel,
           MemoryRecords.EMPTY,
           Optional.empty[FetchResponseData.EpochEndOffset](),
           data.lastStableOffset,
-          data.abortedTransactions,
+          Optional.empty[java.util.List[FetchResponseData.AbortedTransaction]](),
           java.util.OptionalInt.empty(),
           data.isReassignmentFetch))
       }
@@ -969,6 +974,25 @@ class KafkaApis(val requestChannel: RequestChannel,
       val safePreferredReadReplica = java.util.OptionalInt.empty()
       filtered match {
         case Right(records) =>
+          // Drop abortedTransactions entries whose producer_id no longer appears in any
+          // surviving (non-empty, non-control) data batch. Two reasons:
+          //  (1) Leak closure: the round-4 empty-batch scrub (commit 2dcc1780be) clears
+          //      producer_id on fully-filtered DATA batches, but the AbortedTransaction list
+          //      lives in the response payload OUTSIDE the records, so the round-4 scrub
+          //      misses it. A view consumer otherwise sees (producer_id, firstOffset) for an
+          //      aborted backing transaction even when the predicate dropped every data
+          //      record of that transaction — broadcasting the existence and offset boundary
+          //      of records the predicate is supposed to gate.
+          //  (2) Correctness preserved: if the predicate retained ANY data record from a
+          //      producer's aborted transaction, the surviving batch's producer_id is still
+          //      visible on the wire (we do NOT scrub non-empty batches; they may be needed
+          //      to identify the producer when records are emitted), so we keep that
+          //      producer's AbortedTransaction entry. The READ_COMMITTED consumer needs
+          //      these entries to skip the still-aborted records — without them, surviving
+          //      aborted records would be surfaced as committed. Empty-batch producer-ids
+          //      are scrubbed to NO_PRODUCER_ID, so the filter naturally drops them.
+          val filteredAbortedTransactions = filterAbortedTransactionsByVisibleProducers(
+            records, data.abortedTransactions)
           (viewTpId, new FetchPartitionData(
             data.error,
             data.highWatermark,
@@ -976,10 +1000,13 @@ class KafkaApis(val requestChannel: RequestChannel,
             records,
             safeDivergingEpoch,
             data.lastStableOffset,
-            data.abortedTransactions,
+            filteredAbortedTransactions,
             safePreferredReadReplica,
             data.isReassignmentFetch))
         case Left(err) =>
+          // No records reach the consumer on the error path (we hand MemoryRecords.EMPTY back
+          // — see early-error return above for the same rationale). Strip abortedTransactions
+          // to empty.
           (viewTpId, new FetchPartitionData(
             err,
             data.highWatermark,
@@ -987,10 +1014,50 @@ class KafkaApis(val requestChannel: RequestChannel,
             MemoryRecords.EMPTY,
             safeDivergingEpoch,
             data.lastStableOffset,
-            data.abortedTransactions,
+            Optional.empty[java.util.List[FetchResponseData.AbortedTransaction]](),
             safePreferredReadReplica,
             data.isReassignmentFetch))
       }
+    }
+
+    // Filter the backing fetch's abortedTransactions list to only retain entries whose
+    // producer_id is still visible in the post-filter records. Visibility = at least one
+    // non-empty data (i.e. non-control) batch carries this producer_id. The round-4 empty-batch
+    // scrub maps the producer_id of fully-filtered batches to NO_PRODUCER_ID, so `hasProducerId`
+    // is exactly the right check. Control batches (ABORT/COMMIT markers) are intentionally
+    // excluded from "visible" because they always retain producer_id for READ_COMMITTED — the
+    // marker by itself does not justify surfacing the aborted-tx entry; only surviving data
+    // does. If the surviving record set is empty for a given producer, the consumer has nothing
+    // to skip and the list entry is pure leakage.
+    def filterAbortedTransactionsByVisibleProducers(
+        records: MemoryRecords,
+        original: Optional[java.util.List[FetchResponseData.AbortedTransaction]]
+    ): Optional[java.util.List[FetchResponseData.AbortedTransaction]] = {
+      if (!original.isPresent || original.get.isEmpty) {
+        return original
+      }
+      val survivingProducerIds = scala.collection.mutable.HashSet[Long]()
+      records.batches().forEach { batch =>
+        if (!batch.isControlBatch && batch.hasProducerId) {
+          val count = batch.countOrNull()
+          // count==null means "unknown" (legacy v0/v1, which cannot carry transactional records
+          // anyway, so the path is effectively unreachable from a transactional fetch); treat
+          // conservatively as "has surviving data" to preserve correctness if it ever happens.
+          if (count == null || count.intValue() > 0) {
+            survivingProducerIds += batch.producerId()
+          }
+        }
+      }
+      if (survivingProducerIds.isEmpty) {
+        return Optional.of(java.util.Collections.emptyList[FetchResponseData.AbortedTransaction]())
+      }
+      val filtered = new java.util.ArrayList[FetchResponseData.AbortedTransaction]()
+      original.get.forEach { tx =>
+        if (survivingProducerIds.contains(tx.producerId)) {
+          filtered.add(tx)
+        }
+      }
+      Optional.of(filtered)
     }
 
     // the callback for process a fetch response, invoked before throttling
@@ -1359,20 +1426,33 @@ class KafkaApis(val requestChannel: RequestChannel,
                 // the replica-manager's duplicate handling for ordinary topics.
               } else if (viewDuplicatePartitionIndexes.contains(p.partitionIndex)) {
                 perPartitionErrors += buildErrorResponse(Errors.INVALID_REQUEST, p)
-              } else if (p.timestamp == ListOffsetsRequest.MAX_TIMESTAMP ||
-                         p.timestamp == ListOffsetsRequest.EARLIEST_LOCAL_TIMESTAMP ||
-                         p.timestamp == ListOffsetsRequest.LATEST_TIERED_TIMESTAMP) {
-                // MAX_TIMESTAMP / offsetsForTimes return the offset+timestamp of a SPECIFIC
-                // backing record. For views in source_sparse mode that record may have been
-                // filtered out by the predicate, so returning it would leak the existence and
-                // timestamp of a record the consumer is forbidden to read. Strip the timestamp
-                // in the response below; additionally reject MAX_TIMESTAMP outright since its
-                // semantics ("offset of the record with the maximum timestamp") are inherently
-                // defined over the backing topic — a view-aware "max-timestamp record" would
-                // need to scan and run the predicate over every backing record, which violates
-                // the cost/latency contract of ListOffsets.
+              } else if (p.timestamp != ListOffsetsRequest.EARLIEST_TIMESTAMP &&
+                         p.timestamp != ListOffsetsRequest.LATEST_TIMESTAMP) {
+                // Allow only EARLIEST / LATEST on views. Everything else — MAX_TIMESTAMP,
+                // EARLIEST_LOCAL_TIMESTAMP, LATEST_TIERED_TIMESTAMP, and arbitrary positive
+                // timestamps (offsetsForTimes) — is rejected with INVALID_REQUEST. The
+                // response-side timestamp scrub below is a second line of defence; this is the
+                // first.
                 //
-                // EARLIEST_LOCAL_TIMESTAMP / LATEST_TIERED_TIMESTAMP refer to tiered-storage
+                // Positive timestamps (offsetsForTimes): ReplicaManager.fetchOffset returns the
+                // offset of the FIRST backing record whose timestamp is >= the queried t. For a
+                // source_sparse view that backing record may have been filtered by the predicate.
+                // Even with the response timestamp stripped, the OFFSET is a timing oracle: an
+                // adversary can binary-search ListOffsets(t) and use the points where the
+                // returned offset changes to recover the timestamps of filtered backing records
+                // with arbitrary precision. Filtered-record timestamps are exactly the metadata
+                // the view is supposed to gate. Predicate-aware time lookup over visible records
+                // would require scanning every backing record under the predicate, which
+                // violates the cost/latency contract of ListOffsets, so reject the query class
+                // entirely. View consumers can still seek by offset (offsets are preserved by
+                // source_sparse anyway); they cannot seek by time.
+                //
+                // MAX_TIMESTAMP: same leak class — returns the offset+timestamp of a SPECIFIC
+                // backing record (the one with maximum timestamp). Implementing a view-aware
+                // "max-timestamp visible record" would require scanning and running the
+                // predicate over every backing record.
+                //
+                // EARLIEST_LOCAL_TIMESTAMP / LATEST_TIERED_TIMESTAMP: refer to tiered-storage
                 // boundaries inside the backing log; surfacing them through a view name would
                 // reveal backing tiering state that has no meaning at the view layer.
                 perPartitionErrors += buildErrorResponse(Errors.INVALID_REQUEST, p)
