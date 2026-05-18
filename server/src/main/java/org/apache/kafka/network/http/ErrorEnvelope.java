@@ -22,11 +22,31 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.apache.kafka.common.protocol.Errors;
 
 /**
- * Builds the {@code {errorCode, errorMessage}} JSON envelope used by every error response from the HTTP bridge.
+ * Builds the {@code {errorCode, errorMessage}} JSON envelope used by every error response surface of the HTTP bridge.
  *
- * The spec mandates that {@code errorCode} be the raw Kafka {@link Errors} code, and {@code errorMessage} a
- * human-readable string. Callers may pass an override message for cases where the bridge itself rejected the request
- * (for example, a malformed JSON body) and the Kafka built-in message would be misleading.
+ * <p>PROMPT.md's "every error response carries {@code errorCode} and {@code errorMessage}" contract is on the field
+ * <em>names</em>, not their JSON types. Each transport picks the type that's natural to its envelope shape, and the two
+ * factory methods reflect that:
+ *
+ * <ul>
+ *   <li>{@link #forError(ObjectMapper, Errors, String)} — used for per-partition fetch/produce entries. {@code errorCode}
+ *       is the raw Kafka {@link Errors#code()} integer, so a binary-protocol client and the HTTP client read the same
+ *       wire-level identifier for the same broker condition. {@code errorMessage} is the broker's built-in description,
+ *       optionally overridden by the bridge when it rejected the request before it reached Kafka.</li>
+ *   <li>{@link #forMessage(ObjectMapper, int, String)} — used for top-level HTTP responses (400, 404, 413, 429, 500).
+ *       {@code errorCode} is the HTTP status code itself, an integer the client already sees on the status line; mirroring
+ *       it into the body lets a client that only logs the body still see what happened.</li>
+ * </ul>
+ *
+ * <p>The streaming surfaces ({@code SseStreamer} error events, {@code WsStreamer} close-frame payloads) deliberately do
+ * <strong>not</strong> use this builder: they emit {@code errorCode} as a Kafka error <em>name</em> ({@code String}) like
+ * {@code "NOT_LEADER_OR_FOLLOWER"} or a synthetic name like {@code "INTERNAL"} / {@code "BAD_MESSAGE"}. EventSource and
+ * WebSocket clients are typically scripted code paths that branch on a label, not the numeric protocol code, so the
+ * string form is the ergonomic choice for that audience. The field name is still {@code errorCode}, so the contract is
+ * preserved.
+ *
+ * <p>None of these are interchangeable across surfaces — tests in
+ * {@code KafkaHttpServerIntegrationTest} pin each shape, and a refactor that unified them would be a wire-format break.
  */
 public final class ErrorEnvelope {
 
