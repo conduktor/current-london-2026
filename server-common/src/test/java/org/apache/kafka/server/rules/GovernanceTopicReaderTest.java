@@ -70,7 +70,7 @@ public class GovernanceTopicReaderTest {
             envelope("true", ApiKeys.METADATA, 7)));
         int n = reader.pollOnce();
         assertEquals(1, n);
-        RuleDecision d = engine.evaluate(ApiKeys.METADATA, "c", Collections::emptyMap);
+        RuleDecision d = engine.evaluate(ApiKeys.METADATA, "c", false, Collections::emptyMap);
         assertTrue(d.denied());
         assertEquals("r1", d.denyingRuleId());
     }
@@ -86,7 +86,7 @@ public class GovernanceTopicReaderTest {
         consumer.addRecord(new ConsumerRecord<>(GovernanceTopic.NAME, 0, 1L, "r1", null));
         reader.pollOnce();
         assertSame(RuleDecision.ALLOW,
-            engine.evaluate(ApiKeys.METADATA, "c", Collections::emptyMap));
+            engine.evaluate(ApiKeys.METADATA, "c", false, Collections::emptyMap));
     }
 
     @Test
@@ -126,9 +126,9 @@ public class GovernanceTopicReaderTest {
         reader.drainToEnd();
 
         assertEquals(3, engine.active().size());
-        assertTrue(engine.evaluate(ApiKeys.METADATA, "c", Collections::emptyMap).denied());
-        assertTrue(engine.evaluate(ApiKeys.FETCH, "c", Collections::emptyMap).denied());
-        assertTrue(engine.evaluate(ApiKeys.CREATE_TOPICS, "c", Collections::emptyMap).denied());
+        assertTrue(engine.evaluate(ApiKeys.METADATA, "c", false, Collections::emptyMap).denied());
+        assertTrue(engine.evaluate(ApiKeys.FETCH, "c", false, Collections::emptyMap).denied());
+        assertTrue(engine.evaluate(ApiKeys.CREATE_TOPICS, "c", false, Collections::emptyMap).denied());
     }
 
     @Test
@@ -146,12 +146,12 @@ public class GovernanceTopicReaderTest {
         // Wait for the rule to take effect — generous timeout.
         long deadline = System.nanoTime() + Duration.ofSeconds(3).toNanos();
         while (System.nanoTime() < deadline) {
-            if (engine.evaluate(ApiKeys.METADATA, "c", Collections::emptyMap).denied()) {
+            if (engine.evaluate(ApiKeys.METADATA, "c", false, Collections::emptyMap).denied()) {
                 break;
             }
             Thread.sleep(5);
         }
-        assertTrue(engine.evaluate(ApiKeys.METADATA, "c", Collections::emptyMap).denied(),
+        assertTrue(engine.evaluate(ApiKeys.METADATA, "c", false, Collections::emptyMap).denied(),
             "runLoop should have applied the record");
 
         reader.close();
@@ -175,13 +175,13 @@ public class GovernanceTopicReaderTest {
         t.start();
         long deadline = System.nanoTime() + Duration.ofSeconds(3).toNanos();
         while (System.nanoTime() < deadline) {
-            RuleDecision d = engine.evaluate(ApiKeys.METADATA, "c", Collections::emptyMap);
+            RuleDecision d = engine.evaluate(ApiKeys.METADATA, "c", false, Collections::emptyMap);
             if (d.denied() && "good".equals(d.denyingRuleId())) {
                 break;
             }
             Thread.sleep(5);
         }
-        RuleDecision d = engine.evaluate(ApiKeys.METADATA, "c", Collections::emptyMap);
+        RuleDecision d = engine.evaluate(ApiKeys.METADATA, "c", false, Collections::emptyMap);
         assertTrue(d.denied());
         assertEquals("good", d.denyingRuleId());
         reader.close();

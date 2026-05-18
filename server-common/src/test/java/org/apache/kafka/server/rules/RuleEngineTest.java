@@ -89,7 +89,7 @@ public class RuleEngineTest {
         RuleEngine engine = new RuleEngine();
         AtomicBoolean extracted = new AtomicBoolean(false);
         RuleDecision decision = engine.evaluate(
-            ApiKeys.CREATE_TOPICS, "external-client",
+            ApiKeys.CREATE_TOPICS, "external-client", false,
             recordingSupplier(extracted));
         assertSame(RuleDecision.ALLOW, decision);
         assertFalse(extracted.get(), "no rule targets the api key — extractor must not run");
@@ -103,7 +103,7 @@ public class RuleEngineTest {
             .build());
         AtomicBoolean extracted = new AtomicBoolean(false);
         RuleDecision decision = engine.evaluate(
-            ApiKeys.METADATA, "external-client",
+            ApiKeys.METADATA, "external-client", false,
             recordingSupplier(extracted));
         assertSame(RuleDecision.ALLOW, decision);
         assertFalse(extracted.get(),
@@ -125,7 +125,7 @@ public class RuleEngineTest {
                 "request.topics.exists(t, t.name.startsWith(\"audit-\"))", 42))
             .build());
         RuleDecision decision = engine.evaluate(
-            ApiKeys.CREATE_TOPICS, "external-client",
+            ApiKeys.CREATE_TOPICS, "external-client", false,
             () -> activationFor(createTopicsRequest("audit-events", "metrics")));
         assertTrue(decision.denied());
         assertEquals(42, decision.errorCode());
@@ -140,7 +140,7 @@ public class RuleEngineTest {
                 "request.topics.exists(t, t.name.startsWith(\"audit-\"))", 42))
             .build());
         RuleDecision decision = engine.evaluate(
-            ApiKeys.CREATE_TOPICS, "external-client",
+            ApiKeys.CREATE_TOPICS, "external-client", false,
             () -> activationFor(createTopicsRequest("metrics", "events")));
         assertSame(RuleDecision.ALLOW, decision);
     }
@@ -155,7 +155,7 @@ public class RuleEngineTest {
             .put(denyRule("second", ApiKeys.CREATE_TOPICS, "true", 200))
             .build());
         RuleDecision decision = engine.evaluate(
-            ApiKeys.CREATE_TOPICS, "external-client",
+            ApiKeys.CREATE_TOPICS, "external-client", false,
             () -> Collections.singletonMap("request", Collections.emptyMap()));
         assertTrue(decision.denied());
         assertEquals(100, decision.errorCode());
@@ -173,7 +173,7 @@ public class RuleEngineTest {
             .put(denyRule("always", ApiKeys.CREATE_TOPICS, "true", 20))
             .build());
         RuleDecision decision = engine.evaluate(
-            ApiKeys.CREATE_TOPICS, "external-client",
+            ApiKeys.CREATE_TOPICS, "external-client", false,
             () -> Collections.singletonMap("request", Collections.emptyMap()));
         assertTrue(decision.denied());
         assertEquals(20, decision.errorCode());
@@ -181,10 +181,12 @@ public class RuleEngineTest {
     }
 
     @Test
-    public void internalClientPrefixIsAlwaysExemptEvenUnderDenyAll() {
+    public void privilegedListenerRequestsAreAlwaysExemptEvenUnderDenyAll() {
         // Bootstrap-safety: a "deny all" rule must not block the broker's own
-        // governance-topic reader from refilling the rule set. We identify the
-        // reader by its client-id prefix.
+        // governance-topic reader from refilling the rule set. The reader runs
+        // on the broker's inter-broker listener, which the network layer flags
+        // as a privileged listener — that bit, not any wire field, is the
+        // authoritative bypass.
         RuleEngine engine = new RuleEngine();
         engine.install(new RuleSetBuilder()
             .put(denyRule("deny-all-create-topics", ApiKeys.CREATE_TOPICS, "true", 1))
@@ -193,25 +195,48 @@ public class RuleEngineTest {
             .build());
         for (ApiKeys k : new ApiKeys[]{ApiKeys.CREATE_TOPICS, ApiKeys.FETCH, ApiKeys.METADATA}) {
             assertSame(RuleDecision.ALLOW,
-                engine.evaluate(k, RuleEngine.INTERNAL_CLIENT_ID_PREFIX + "loader",
+                engine.evaluate(k, "any-client-id-here", true,
                     () -> Collections.emptyMap()),
-                "internal client id must be exempt on api key " + k);
+                "privileged listener requests must be exempt on api key " + k);
         }
-        assertTrue(engine.evaluate(ApiKeys.FETCH, "regular-client",
+        assertTrue(engine.evaluate(ApiKeys.FETCH, "regular-client", false,
             () -> Collections.emptyMap()).denied(),
-            "non-internal client still subject to rules");
+            "non-privileged client still subject to rules");
+    }
+
+    @Test
+    public void spoofedInternalClientIdDoesNotBypassWhenNotOnPrivilegedListener() {
+        // Security regression test for the CVE that motivated the
+        // fromPrivilegedListener bypass: a hostile external client that sets
+        // client.id=__kafka-governance-attacker MUST still be subject to
+        // every deny rule. The prefix is purely a diagnostic convention now;
+        // it does NOT grant any bypass.
+        RuleEngine engine = new RuleEngine();
+        engine.install(new RuleSetBuilder()
+            .put(denyRule("deny-all", ApiKeys.METADATA, "true", 7))
+            .build());
+        RuleDecision d = engine.evaluate(
+            ApiKeys.METADATA,
+            RuleEngine.INTERNAL_CLIENT_ID_PREFIX + "attacker",
+            false,
+            () -> Collections.singletonMap("request", Collections.emptyMap()));
+        assertTrue(d.denied(),
+            "wire-string client-id must not bypass deny rules — that was the spoofable CVE");
+        assertEquals(7, d.errorCode());
     }
 
     @Test
     public void nullOrEmptyClientIdIsNotExempt() {
         // Defensive: an absent client-id must NOT bypass rules. The exemption
-        // is granted strictly via the named prefix.
+        // is granted strictly by the privileged-listener bit.
         RuleEngine engine = new RuleEngine();
         engine.install(new RuleSetBuilder()
             .put(denyRule("deny", ApiKeys.METADATA, "true", 1))
             .build());
-        assertTrue(engine.evaluate(ApiKeys.METADATA, null, () -> Collections.emptyMap()).denied());
-        assertTrue(engine.evaluate(ApiKeys.METADATA, "", () -> Collections.emptyMap()).denied());
+        assertTrue(engine.evaluate(ApiKeys.METADATA, null, false,
+            () -> Collections.singletonMap("request", Collections.emptyMap())).denied());
+        assertTrue(engine.evaluate(ApiKeys.METADATA, "", false,
+            () -> Collections.singletonMap("request", Collections.emptyMap())).denied());
     }
 
     @Test
@@ -226,7 +251,7 @@ public class RuleEngineTest {
             .put(denyRule("r3", ApiKeys.CREATE_TOPICS, "false", 3))
             .build());
         AtomicInteger supplierCalls = new AtomicInteger(0);
-        engine.evaluate(ApiKeys.CREATE_TOPICS, "client", () -> {
+        engine.evaluate(ApiKeys.CREATE_TOPICS, "client", false, () -> {
             supplierCalls.incrementAndGet();
             return Collections.singletonMap("request", Collections.emptyMap());
         });
@@ -263,7 +288,7 @@ public class RuleEngineTest {
                     start.await();
                     for (int i = 0; i < iterations; i++) {
                         RuleDecision d = engine.evaluate(
-                            ApiKeys.METADATA, "client",
+                            ApiKeys.METADATA, "client", false,
                             () -> Collections.emptyMap());
                         if (!d.denied() || (d.errorCode() != 11 && d.errorCode() != 22)) {
                             failed.set(true);
@@ -300,10 +325,10 @@ public class RuleEngineTest {
             RuleAction.DENY, "true", 7, CelCompiler.compile("true"));
         RuleEngine engine = new RuleEngine();
         engine.install(new RuleSetBuilder().put(cross).build());
-        assertTrue(engine.evaluate(ApiKeys.METADATA, "x", () -> Collections.emptyMap()).denied());
-        assertTrue(engine.evaluate(ApiKeys.FETCH, "x", () -> Collections.emptyMap()).denied());
+        assertTrue(engine.evaluate(ApiKeys.METADATA, "x", false, () -> Collections.emptyMap()).denied());
+        assertTrue(engine.evaluate(ApiKeys.FETCH, "x", false, () -> Collections.emptyMap()).denied());
         assertSame(RuleDecision.ALLOW,
-            engine.evaluate(ApiKeys.CREATE_TOPICS, "x", () -> Collections.emptyMap()));
+            engine.evaluate(ApiKeys.CREATE_TOPICS, "x", false, () -> Collections.emptyMap()));
     }
 
     @Test
@@ -330,7 +355,7 @@ public class RuleEngineTest {
             .put(denyRule("after", ApiKeys.METADATA, "true", 99))
             .build());
         RuleDecision d = engine.evaluate(
-            ApiKeys.METADATA, "x", () -> Collections.singletonMap("request", Collections.emptyMap()));
+            ApiKeys.METADATA, "x", false, () -> Collections.singletonMap("request", Collections.emptyMap()));
         assertTrue(d.denied());
         assertEquals(99, d.errorCode());
         assertEquals("after", d.denyingRuleId());
@@ -342,27 +367,32 @@ public class RuleEngineTest {
         engine.install(new RuleSetBuilder()
             .put(denyRule("fetch-only", ApiKeys.FETCH, "true", 7))
             .build());
-        assertFalse(engine.mayDeny(ApiKeys.METADATA, "client"),
+        assertFalse(engine.mayDeny(ApiKeys.METADATA, false),
             "no rule targets METADATA — gate must not allocate on the request path");
-        assertTrue(engine.mayDeny(ApiKeys.FETCH, "client"),
+        assertTrue(engine.mayDeny(ApiKeys.FETCH, false),
             "rule targets FETCH — gate opens the slow path");
     }
 
     @Test
-    public void mayDenyIsFalseForInternalClientIdEvenWhenRuleTargetsApiKey() {
+    public void mayDenyIsFalseOnPrivilegedListenerEvenWhenRuleTargetsApiKey() {
+        // Counterpart of privilegedListenerRequestsAreAlwaysExemptEvenUnderDenyAll
+        // for the fast-path gate: when the request came in on the inter-broker
+        // listener, the gate must short-circuit so KafkaApis never even
+        // allocates the activation-supplier closure.
         RuleEngine engine = new RuleEngine();
         engine.install(new RuleSetBuilder()
             .put(denyRule("deny-all", ApiKeys.METADATA, "true", 7))
             .build());
-        assertFalse(engine.mayDeny(ApiKeys.METADATA,
-                RuleEngine.INTERNAL_CLIENT_ID_PREFIX + "self"),
-            "the internal-client bypass must short-circuit the gate too");
+        assertFalse(engine.mayDeny(ApiKeys.METADATA, true),
+            "privileged listener must short-circuit the gate too");
+        assertTrue(engine.mayDeny(ApiKeys.METADATA, false),
+            "same rule must still open the slow path for external clients");
     }
 
     @Test
     public void mayDenyIsFalseOnEmptyEngine() {
-        assertFalse(new RuleEngine().mayDeny(ApiKeys.METADATA, "client"));
-        assertFalse(new RuleEngine().mayDeny(ApiKeys.METADATA, null));
+        assertFalse(new RuleEngine().mayDeny(ApiKeys.METADATA, false));
+        assertFalse(new RuleEngine().mayDeny(ApiKeys.METADATA, true));
     }
 
     @Test
@@ -377,7 +407,7 @@ public class RuleEngineTest {
             .put(denyRule("after", ApiKeys.METADATA, "true", 99))
             .build());
         RuleDecision d = engine.evaluate(
-            ApiKeys.METADATA, "x", () -> Collections.singletonMap("request", Collections.emptyMap()));
+            ApiKeys.METADATA, "x", false, () -> Collections.singletonMap("request", Collections.emptyMap()));
         assertTrue(d.denied());
         assertEquals(99, d.errorCode());
         assertEquals("after", d.denyingRuleId());

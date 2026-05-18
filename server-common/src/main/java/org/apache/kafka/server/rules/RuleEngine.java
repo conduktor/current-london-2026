@@ -35,15 +35,21 @@ import java.util.function.Supplier;
  * new snapshot — concurrent readers observe either the previous or the new
  * snapshot, never a torn intermediate state.
  *
- * <p>{@link #evaluate(ApiKeys, String, Supplier)} is on the hot path of
+ * <p>{@link #evaluate(ApiKeys, String, boolean, Supplier)} is on the hot path of
  * {@code KafkaApis.handle()} and is designed to do the absolute minimum
  * work when no rule targets the request:
  *
  * <ol>
- *   <li>If the {@code clientId} starts with {@link #INTERNAL_CLIENT_ID_PREFIX},
- *       short-circuit to ALLOW. This is the bootstrap-safety hatch: the broker's
- *       own consumer of the governance topic must never be rule-blocked, even
- *       under a misconfigured "deny everything" rule set.</li>
+ *   <li>If the request arrived on a <em>privileged listener</em>
+ *       (typically the broker's inter-broker listener), short-circuit to
+ *       ALLOW. This is the bootstrap-safety hatch: the broker's own consumer
+ *       of the governance topic must never be rule-blocked, even under a
+ *       misconfigured "deny everything" rule set. Crucially, the
+ *       {@code fromPrivilegedListener} bit is set by the network layer
+ *       based on which TCP listener accepted the connection — it is not
+ *       derived from any wire field a client controls, so external clients
+ *       cannot bypass the engine by spoofing a client-id, principal, or
+ *       any other application-level identifier.</li>
  *   <li>Bitset check: if no DENY rule in the snapshot targets the request's
  *       API key, return ALLOW without invoking the activation supplier.
  *       This keeps the cost of "rules feature enabled but no rule applies"
@@ -64,10 +70,12 @@ public final class RuleEngine {
     private static final Logger LOG = LoggerFactory.getLogger(RuleEngine.class);
 
     /**
-     * Any clientId that starts with this prefix is unconditionally exempt
-     * from rule evaluation. The broker's own governance-topic loader must
-     * use this prefix so it can refill the rule set after a "deny all"
-     * rule is installed.
+     * Naming convention for the broker's own governance-topic consumer.
+     * Purely diagnostic — the engine no longer treats this prefix as
+     * authoritative for the bypass. The actual bypass is granted by the
+     * {@code fromPrivilegedListener} flag set by the network layer, which
+     * external clients cannot forge. Use {@code GovernanceTopic.readerClientId}
+     * when constructing the broker-internal consumer.
      */
     public static final String INTERNAL_CLIENT_ID_PREFIX = "__kafka-governance-";
 
@@ -90,8 +98,13 @@ public final class RuleEngine {
      * Evaluate the request against the active rule set.
      *
      * @param apiKey the request's API key
-     * @param clientId the request's client-id (may be null/empty for clients
-     *                 that did not set one — those are still subject to rules)
+     * @param clientId the request's client-id (may be null/empty; purely
+     *                 diagnostic — used in WARN logs, never authoritative)
+     * @param fromPrivilegedListener {@code true} iff the request arrived on a
+     *                 listener the broker treats as inter-broker. This is the
+     *                 sole authoritative bypass; external clients cannot
+     *                 forge it because the network layer derives it from the
+     *                 accepting listener, not the wire payload.
      * @param activationSupplier lazy builder of the CEL activation map; only
      *                           invoked if at least one rule targets the API
      *                           key, and only once per call regardless of how
@@ -100,8 +113,9 @@ public final class RuleEngine {
      */
     public RuleDecision evaluate(ApiKeys apiKey,
                                  String clientId,
+                                 boolean fromPrivilegedListener,
                                  Supplier<Map<String, Object>> activationSupplier) {
-        if (clientId != null && !clientId.isEmpty() && clientId.startsWith(INTERNAL_CLIENT_ID_PREFIX)) {
+        if (fromPrivilegedListener) {
             return RuleDecision.ALLOW;
         }
         RuleSet snapshot = active.get();
@@ -142,8 +156,9 @@ public final class RuleEngine {
      *
      * <p>Specifically, returns {@code false} when either:
      * <ul>
-     *   <li>the {@code clientId} is the broker-internal exemption prefix
-     *       (see {@link #INTERNAL_CLIENT_ID_PREFIX}), or</li>
+     *   <li>the request arrived on a privileged (inter-broker) listener — the
+     *       network layer sets {@code fromPrivilegedListener} for those and
+     *       external clients cannot forge it; or</li>
      *   <li>no DENY rule in the active snapshot targets this API key.</li>
      * </ul>
      *
@@ -151,8 +166,8 @@ public final class RuleEngine {
      * directly into {@code KafkaApis.handle()} as the gate around the
      * activation-supplier lambda.
      */
-    public boolean mayDeny(ApiKeys apiKey, String clientId) {
-        if (clientId != null && !clientId.isEmpty() && clientId.startsWith(INTERNAL_CLIENT_ID_PREFIX)) {
+    public boolean mayDeny(ApiKeys apiKey, boolean fromPrivilegedListener) {
+        if (fromPrivilegedListener) {
             return false;
         }
         return active.get().hasDenyRuleFor(apiKey.id);

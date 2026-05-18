@@ -170,10 +170,17 @@ class KafkaApis(val requestChannel: RequestChannel,
       // ApiKey. The fast path on a request with no targeting rule (the common case) is
       // RuleEngine.mayDeny — one bitset bit-test, no closure allocation, no body decode. The
       // activation supplier closure is constructed only when mayDeny returns true.
-      if (ruleEngine.mayDeny(request.header.apiKey, request.header.clientId)) {
+      //
+      // The privileged-listener bypass is authoritative: a request landing on the broker's
+      // inter-broker listener is exempt regardless of clientId/principal. External clients
+      // cannot forge fromPrivilegedListener because the network layer derives it from the
+      // accepting listener, not the wire payload.
+      val fromPrivilegedListener = request.context.fromPrivilegedListener
+      if (ruleEngine.mayDeny(request.header.apiKey, fromPrivilegedListener)) {
         val ruleDecision = ruleEngine.evaluate(
           request.header.apiKey,
           request.header.clientId,
+          fromPrivilegedListener,
           () => ApiMessageActivation.from(request.body[AbstractRequest].data()))
         if (ruleDecision.denied) {
           val denyError = Errors.forCode(ruleDecision.errorCode.toShort)

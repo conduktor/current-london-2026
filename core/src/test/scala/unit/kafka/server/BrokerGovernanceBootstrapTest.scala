@@ -91,9 +91,9 @@ class BrokerGovernanceBootstrapTest {
 
     assertEquals(3L, n, "all three records should be replayed")
     assertEquals(3, engine.active().size())
-    assertTrue(engine.evaluate(ApiKeys.METADATA, "c", () => Collections.emptyMap()).denied)
-    assertTrue(engine.evaluate(ApiKeys.FETCH, "c", () => Collections.emptyMap()).denied)
-    assertTrue(engine.evaluate(ApiKeys.CREATE_TOPICS, "c", () => Collections.emptyMap()).denied)
+    assertTrue(engine.evaluate(ApiKeys.METADATA, "c", false, () => Collections.emptyMap()).denied)
+    assertTrue(engine.evaluate(ApiKeys.FETCH, "c", false, () => Collections.emptyMap()).denied)
+    assertTrue(engine.evaluate(ApiKeys.CREATE_TOPICS, "c", false, () => Collections.emptyMap()).denied)
   }
 
   @Test
@@ -115,7 +115,7 @@ class BrokerGovernanceBootstrapTest {
 
     assertEquals(2L, n, "both records should be replayed including the tombstone")
     assertSame(RuleDecision.ALLOW,
-      engine.evaluate(ApiKeys.METADATA, "c", () => Collections.emptyMap()),
+      engine.evaluate(ApiKeys.METADATA, "c", false, () => Collections.emptyMap()),
       "tombstone must have removed the rule")
   }
 
@@ -136,7 +136,7 @@ class BrokerGovernanceBootstrapTest {
     val boot = new BrokerGovernanceBootstrap(rm, engine, tp)
     val first = boot.drainOnce()
     assertEquals(1L, first)
-    assertTrue(engine.evaluate(ApiKeys.METADATA, "c", () => Collections.emptyMap()).denied)
+    assertTrue(engine.evaluate(ApiKeys.METADATA, "c", false, () => Collections.emptyMap()).denied)
 
     // Second call: nothing new, drainOnce should not re-read the same record.
     val second = boot.drainOnce()

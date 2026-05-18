@@ -74,7 +74,7 @@ public class GovernanceLoaderTest {
         loader.apply("r1", envelope("true", ApiKeys.METADATA, 7));
         loader.commit();
         RuleDecision d = engine.evaluate(
-            ApiKeys.METADATA, "client", Collections::emptyMap);
+            ApiKeys.METADATA, "client", false, Collections::emptyMap);
         assertTrue(d.denied());
         assertEquals(7, d.errorCode());
         assertEquals("r1", d.denyingRuleId());
@@ -88,7 +88,7 @@ public class GovernanceLoaderTest {
         loader.apply("r1", null);
         loader.commit();
         assertSame(RuleDecision.ALLOW,
-            engine.evaluate(ApiKeys.METADATA, "client", Collections::emptyMap));
+            engine.evaluate(ApiKeys.METADATA, "client", false, Collections::emptyMap));
     }
 
     @Test
@@ -112,7 +112,7 @@ public class GovernanceLoaderTest {
         // 'good' must remain active; 'bad' must have been dropped, NOT
         // halt the whole batch.
         RuleDecision d = engine.evaluate(
-            ApiKeys.METADATA, "client", Collections::emptyMap);
+            ApiKeys.METADATA, "client", false, Collections::emptyMap);
         assertTrue(d.denied());
         assertEquals("good", d.denyingRuleId());
     }
@@ -130,7 +130,7 @@ public class GovernanceLoaderTest {
         loader.commit();
         // The original r1 is still in effect.
         RuleDecision d = engine.evaluate(
-            ApiKeys.METADATA, "client", Collections::emptyMap);
+            ApiKeys.METADATA, "client", false, Collections::emptyMap);
         assertTrue(d.denied());
         assertEquals(7, d.errorCode());
     }
@@ -150,7 +150,7 @@ public class GovernanceLoaderTest {
         loader.apply("first", envelope("true", ApiKeys.METADATA, 33));
         loader.commit();
         RuleDecision d = engine.evaluate(
-            ApiKeys.METADATA, "client", Collections::emptyMap);
+            ApiKeys.METADATA, "client", false, Collections::emptyMap);
         assertTrue(d.denied());
         assertEquals("first", d.denyingRuleId());
         assertEquals(33, d.errorCode());
@@ -185,7 +185,7 @@ public class GovernanceLoaderTest {
         loader.apply("ok", envelope("true", ApiKeys.METADATA, 2));
         loader.commit();
         RuleDecision d = engine.evaluate(
-            ApiKeys.METADATA, "client", Collections::emptyMap);
+            ApiKeys.METADATA, "client", false, Collections::emptyMap);
         assertTrue(d.denied());
         assertEquals("ok", d.denyingRuleId());
     }
@@ -202,7 +202,7 @@ public class GovernanceLoaderTest {
         loader.apply(r.id(), RuleJsonCodec.encode(r));
         loader.commit();
         RuleDecision d = engine.evaluate(
-            ApiKeys.METADATA, "client", Collections::emptyMap);
+            ApiKeys.METADATA, "client", false, Collections::emptyMap);
         assertTrue(d.denied());
         assertEquals(99, d.errorCode());
     }
