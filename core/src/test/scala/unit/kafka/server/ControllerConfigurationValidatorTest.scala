@@ -24,6 +24,7 @@ import org.apache.kafka.common.config.TopicConfig.{REMOTE_LOG_STORAGE_ENABLE_CON
 import org.apache.kafka.common.errors.{InvalidConfigurationException, InvalidRequestException, InvalidTopicException}
 import org.apache.kafka.coordinator.group.GroupConfig
 import org.apache.kafka.server.metrics.ClientMetricsConfigs
+import org.apache.kafka.server.views.ViewTopicConfig
 import org.junit.jupiter.api.Assertions.{assertEquals, assertThrows}
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.params.ParameterizedTest
@@ -200,6 +201,30 @@ class ControllerConfigurationValidatorTest {
     assertEquals("Null value not supported for group configs: consumer.heartbeat.interval.ms",
       assertThrows(classOf[InvalidConfigurationException], () => validator.validate(
         new ConfigResource(GROUP, "group"), config, emptyMap())).getMessage)
+  }
+
+  @Test
+  def testViewSelfLoopRejectedAtCreateOrAlterTime(): Unit = {
+    // Without this guard, the self-loop would only surface at first-fetch when ViewSpec is
+    // constructed inside ViewRegistry — the CreateTopicResponse / AlterConfigsResponse would
+    // succeed and the operator would only see the failure when a consumer tries to read.
+    val config = new util.TreeMap[String, String]()
+    config.put(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, "view-self")
+    config.put(ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.color == 'red'")
+    config.put(ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+    val ex = assertThrows(classOf[InvalidConfigurationException], () => validator.validate(
+      new ConfigResource(TOPIC, "view-self"), config, emptyMap()))
+    assert(ex.getMessage.contains("must not equal the topic name"),
+      s"unexpected message: ${ex.getMessage}")
+  }
+
+  @Test
+  def testViewWithDistinctBackingAccepted(): Unit = {
+    val config = new util.TreeMap[String, String]()
+    config.put(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, "events-backing")
+    config.put(ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.color == 'red'")
+    config.put(ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+    validator.validate(new ConfigResource(TOPIC, "events-view"), config, emptyMap())
   }
 
   @Test

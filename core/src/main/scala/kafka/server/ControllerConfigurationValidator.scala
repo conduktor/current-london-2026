@@ -26,6 +26,7 @@ import org.apache.kafka.common.errors.{InvalidConfigurationException, InvalidReq
 import org.apache.kafka.common.internals.Topic
 import org.apache.kafka.coordinator.group.GroupConfigManager
 import org.apache.kafka.server.metrics.ClientMetricsConfigs
+import org.apache.kafka.server.views.ViewTopicConfig
 import org.apache.kafka.storage.internals.log.LogConfig
 
 import scala.collection.mutable
@@ -119,6 +120,19 @@ class ControllerConfigurationValidator(kafkaConfig: KafkaConfig) extends Configu
         }
         LogConfig.validate(oldConfigs, properties, kafkaConfig.extractLogConfigMap,
           kafkaConfig.remoteLogManagerConfig.isRemoteStorageSystemEnabled())
+        // Self-loop rejection at validation time. LogConfig.validate is name-agnostic, so it
+        // can confirm the predicate compiles and the three view configs are coherent, but it
+        // cannot see that view.backing.topic equals the topic being configured. Catching the
+        // self-loop here means CreateTopicResponse/AlterConfigsResponse surfaces a clear
+        // InvalidConfigurationException at the controller, before any cache picks up a spec
+        // that would immediately blow up on fetch. ViewSpec keeps its own assertion as a
+        // belt-and-braces safety net for direct programmatic construction.
+        val backing = newConfigs.get(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG)
+        if (backing != null && backing == resource.name()) {
+          throw new InvalidConfigurationException(
+            s"${ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG} must not equal the topic name " +
+              s"'${resource.name()}'. A view cannot back itself.")
+        }
       case BROKER => validateBrokerName(resource.name())
       case CLIENT_METRICS =>
         val properties = new Properties()
