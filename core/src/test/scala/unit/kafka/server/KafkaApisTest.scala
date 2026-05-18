@@ -13062,6 +13062,273 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testAddPartitionsToTxnTenantRewritesTransactionalIdAndTopicsToPhysical(): Unit = {
+    // Phase 3b: AddPartitionsToTxn is the producer's first contact with the
+    // txn coordinator after InitProducerId. Both the transactional id AND
+    // every topic-partition being enrolled in the transaction must reach
+    // the coordinator in physical form — otherwise the txn coordinator's
+    // per-transaction set of "fenced" partitions would record logical names
+    // and stop matching the physical names ReplicaManager writes to.
+    val physicalTopic = "acme.orders"
+    addTopicToMetadataCache(physicalTopic, numPartitions = 1)
+
+    val tp = new TopicPartition("orders", 0)
+    val addPartitionsToTxnRequest = AddPartitionsToTxnRequest.Builder.forClient(
+      "my-txn", 42L, 0.toShort, Collections.singletonList(tp)
+    ).build(3.toShort)
+    val request = buildRequest(addPartitionsToTxnRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    val responseCallback: ArgumentCaptor[Errors => Unit] =
+      ArgumentCaptor.forClass(classOf[Errors => Unit])
+    val requestLocal = RequestLocal.withThreadConfinedCaching
+    when(txnCoordinator.handleAddPartitionsToTransaction(
+      ArgumentMatchers.eq("__tenant_acme.my-txn"),
+      ArgumentMatchers.eq(42L),
+      ArgumentMatchers.eq(0.toShort),
+      ArgumentMatchers.eq(Set(new TopicPartition(physicalTopic, 0))),
+      responseCallback.capture(),
+      ArgumentMatchers.any[TransactionVersion](),
+      ArgumentMatchers.eq(requestLocal)
+    )).thenAnswer(_ => responseCallback.getValue.apply(Errors.NONE))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleAddPartitionsToTxnRequest(request, requestLocal)
+
+    val response = verifyNoThrottling[AddPartitionsToTxnResponse](request)
+    // The errors() map echoes the request transactional id (logical) and the
+    // topics named in `data.transactions().find(txnId).topics()` (also the
+    // logical names from the request data — preserved untouched).
+    val txnErrors = response.errors().get(AddPartitionsToTxnResponse.V3_AND_BELOW_TXN_ID)
+    assertEquals(Collections.singletonMap(tp, Errors.NONE), txnErrors,
+      "client must see logical TopicPartition + NONE after the rewrite reaches the coordinator")
+    verify(txnCoordinator).handleAddPartitionsToTransaction(
+      ArgumentMatchers.eq("__tenant_acme.my-txn"),
+      ArgumentMatchers.eq(42L),
+      ArgumentMatchers.eq(0.toShort),
+      ArgumentMatchers.eq(Set(new TopicPartition(physicalTopic, 0))),
+      any[Errors => Unit](),
+      ArgumentMatchers.any[TransactionVersion](),
+      ArgumentMatchers.eq(requestLocal))
+  }
+
+  @Test
+  def testAddPartitionsToTxnTenantRefusesCrossTenantPrefixedTransactionalId(): Unit = {
+    // A tenant addressing `__tenant_other.foo` is hostile or confused. The
+    // handler catches IllegalArgumentException from toPhysicalTxnId and
+    // surfaces TRANSACTIONAL_ID_AUTHORIZATION_FAILED per-transaction without
+    // touching the coordinator. The logical (foreign-prefixed) txn id is
+    // echoed back so the client sees the value it submitted.
+    addTopicToMetadataCache("acme.orders", numPartitions = 1)
+    val tp = new TopicPartition("orders", 0)
+    val addPartitionsToTxnRequest = AddPartitionsToTxnRequest.Builder.forClient(
+      "__tenant_other.foo", 42L, 0.toShort, Collections.singletonList(tp)
+    ).build(3.toShort)
+    val request = buildRequest(addPartitionsToTxnRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleAddPartitionsToTxnRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[AddPartitionsToTxnResponse](request)
+    val txnErrors = response.errors().get(AddPartitionsToTxnResponse.V3_AND_BELOW_TXN_ID)
+    assertEquals(Collections.singletonMap(tp, Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED), txnErrors)
+    verify(txnCoordinator, never()).handleAddPartitionsToTransaction(
+      anyString(), anyLong(), anyShort(), any[Set[TopicPartition]](),
+      any[Errors => Unit](), any[TransactionVersion](), any[RequestLocal]())
+  }
+
+  @Test
+  def testAddPartitionsToTxnTenantRejectsReservedPhysicalFormTopic(): Unit = {
+    // A tenant submitting `acme.foo` (the physical form already prefixed with
+    // its own tenant id) has no right to address the physical namespace
+    // directly. Without this check, toPhysical would either throw and crash
+    // the handler or — if the prefix check were skipped — silently
+    // double-prefix. The expected client-visible outcome is the per-partition
+    // failure shape, with the logical name "acme.foo" preserved on the wire.
+    addTopicToMetadataCache("acme.orders", numPartitions = 1)
+    val reserved = new TopicPartition("acme.foo", 0)
+    val addPartitionsToTxnRequest = AddPartitionsToTxnRequest.Builder.forClient(
+      "my-txn", 42L, 0.toShort, Collections.singletonList(reserved)
+    ).build(3.toShort)
+    val request = buildRequest(addPartitionsToTxnRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleAddPartitionsToTxnRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[AddPartitionsToTxnResponse](request)
+    val txnErrors = response.errors().get(AddPartitionsToTxnResponse.V3_AND_BELOW_TXN_ID)
+    assertEquals(Collections.singletonMap(reserved, Errors.TOPIC_AUTHORIZATION_FAILED), txnErrors,
+      "reserved-form logical topic name must be refused TOPIC_AUTHORIZATION_FAILED before reaching the coordinator")
+    verify(txnCoordinator, never()).handleAddPartitionsToTransaction(
+      anyString(), anyLong(), anyShort(), any[Set[TopicPartition]](),
+      any[Errors => Unit](), any[TransactionVersion](), any[RequestLocal]())
+  }
+
+  @Test
+  def testAddPartitionsToTxnPrivilegedCallerOnTenantBoundListenerIsRefused(): Unit = {
+    // Standing PROMPT.md trap: a super-user with no `__tenant_` prefix hits
+    // the tenant-bound listener. The unsafe-context guard must short-circuit
+    // before the rewrite — otherwise the listener binding alone would wrap
+    // "my-txn" into "__tenant_acme.my-txn" and the privileged caller would
+    // drive the tenant's coordinator state.
+    addTopicToMetadataCache("acme.orders", numPartitions = 1)
+    val tp = new TopicPartition("orders", 0)
+    val addPartitionsToTxnRequest = AddPartitionsToTxnRequest.Builder.forClient(
+      "my-txn", 42L, 0.toShort, Collections.singletonList(tp)
+    ).build(3.toShort)
+    val request = buildRequest(addPartitionsToTxnRequest,
+      listenerName = TENANT_LISTENER,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleAddPartitionsToTxnRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[AddPartitionsToTxnResponse](request)
+    // V<4 routes per-request errors through resultsByTopicV3AndBelow keyed by
+    // V3_AND_BELOW_TXN_ID; the error must reach the wire even though errorCode
+    // is unused on that version.
+    val txnErrors = response.errors().get(AddPartitionsToTxnResponse.V3_AND_BELOW_TXN_ID)
+    assertEquals(Collections.singletonMap(tp, Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED), txnErrors,
+      "unsafe context must short-circuit with a transaction-level refusal")
+    verify(txnCoordinator, never()).handleAddPartitionsToTransaction(
+      anyString(), anyLong(), anyShort(), any[Set[TopicPartition]](),
+      any[Errors => Unit](), any[TransactionVersion](), any[RequestLocal]())
+  }
+
+  @Test
+  def testAddOffsetsToTxnTenantRewritesTransactionalIdAndGroupIdToPhysical(): Unit = {
+    // AddOffsetsToTxn registers a group's __consumer_offsets partition with a
+    // transaction. Both keys must reach the coordinator in physical form: the
+    // transactional id (so two tenants sharing the same logical txn id resolve
+    // to different __transaction_state records) AND the group id (so the
+    // partition number partitionFor() returns is the tenant-isolated one).
+    val partition = 7
+    when(groupCoordinator.partitionFor(ArgumentMatchers.eq("__tenant_acme.orders-consumer")))
+      .thenReturn(partition)
+
+    val addOffsetsToTxnRequest = new AddOffsetsToTxnRequest.Builder(
+      new AddOffsetsToTxnRequestData()
+        .setGroupId("orders-consumer")
+        .setTransactionalId("my-txn")
+        .setProducerId(42L)
+        .setProducerEpoch(0.toShort)
+    ).build(ApiKeys.ADD_OFFSETS_TO_TXN.latestVersion)
+    val request = buildRequest(addOffsetsToTxnRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    val responseCallback: ArgumentCaptor[Errors => Unit] =
+      ArgumentCaptor.forClass(classOf[Errors => Unit])
+    val requestLocal = RequestLocal.withThreadConfinedCaching
+    when(txnCoordinator.handleAddPartitionsToTransaction(
+      ArgumentMatchers.eq("__tenant_acme.my-txn"),
+      ArgumentMatchers.eq(42L),
+      ArgumentMatchers.eq(0.toShort),
+      ArgumentMatchers.eq(Set(new TopicPartition(Topic.GROUP_METADATA_TOPIC_NAME, partition))),
+      responseCallback.capture(),
+      ArgumentMatchers.eq(TransactionVersion.TV_0),
+      ArgumentMatchers.eq(requestLocal)
+    )).thenAnswer(_ => responseCallback.getValue.apply(Errors.NONE))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleAddOffsetsToTxnRequest(request, requestLocal)
+
+    val response = verifyNoThrottling[AddOffsetsToTxnResponse](request)
+    assertEquals(Errors.NONE.code, response.data.errorCode)
+    // partitionFor saw the physical group id — proves the offsets partition
+    // selection is tenant-isolated.
+    verify(groupCoordinator).partitionFor("__tenant_acme.orders-consumer")
+    verify(txnCoordinator).handleAddPartitionsToTransaction(
+      ArgumentMatchers.eq("__tenant_acme.my-txn"),
+      ArgumentMatchers.eq(42L),
+      ArgumentMatchers.eq(0.toShort),
+      ArgumentMatchers.eq(Set(new TopicPartition(Topic.GROUP_METADATA_TOPIC_NAME, partition))),
+      any[Errors => Unit](),
+      ArgumentMatchers.eq(TransactionVersion.TV_0),
+      ArgumentMatchers.eq(requestLocal))
+  }
+
+  @Test
+  def testAddOffsetsToTxnTenantRefusesCrossTenantPrefixedTransactionalId(): Unit = {
+    val addOffsetsToTxnRequest = new AddOffsetsToTxnRequest.Builder(
+      new AddOffsetsToTxnRequestData()
+        .setGroupId("orders-consumer")
+        .setTransactionalId("__tenant_other.foo")
+        .setProducerId(42L)
+        .setProducerEpoch(0.toShort)
+    ).build(ApiKeys.ADD_OFFSETS_TO_TXN.latestVersion)
+    val request = buildRequest(addOffsetsToTxnRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleAddOffsetsToTxnRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[AddOffsetsToTxnResponse](request)
+    assertEquals(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.code, response.data.errorCode)
+    verify(groupCoordinator, never()).partitionFor(anyString())
+    verify(txnCoordinator, never()).handleAddPartitionsToTransaction(
+      anyString(), anyLong(), anyShort(), any[Set[TopicPartition]](),
+      any[Errors => Unit](), any[TransactionVersion](), any[RequestLocal]())
+  }
+
+  @Test
+  def testAddOffsetsToTxnTenantRefusesCrossTenantPrefixedGroupId(): Unit = {
+    // The txn id is fine, but the group id carries a foreign tenant prefix.
+    // Surface as GROUP_AUTHORIZATION_FAILED (not TRANSACTIONAL_ID_...) so the
+    // client can distinguish which key failed.
+    val addOffsetsToTxnRequest = new AddOffsetsToTxnRequest.Builder(
+      new AddOffsetsToTxnRequestData()
+        .setGroupId("__tenant_other.foo")
+        .setTransactionalId("my-txn")
+        .setProducerId(42L)
+        .setProducerEpoch(0.toShort)
+    ).build(ApiKeys.ADD_OFFSETS_TO_TXN.latestVersion)
+    val request = buildRequest(addOffsetsToTxnRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleAddOffsetsToTxnRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[AddOffsetsToTxnResponse](request)
+    assertEquals(Errors.GROUP_AUTHORIZATION_FAILED.code, response.data.errorCode)
+    verify(groupCoordinator, never()).partitionFor(anyString())
+    verify(txnCoordinator, never()).handleAddPartitionsToTransaction(
+      anyString(), anyLong(), anyShort(), any[Set[TopicPartition]](),
+      any[Errors => Unit](), any[TransactionVersion](), any[RequestLocal]())
+  }
+
+  @Test
+  def testAddOffsetsToTxnPrivilegedCallerOnTenantBoundListenerIsRefused(): Unit = {
+    val addOffsetsToTxnRequest = new AddOffsetsToTxnRequest.Builder(
+      new AddOffsetsToTxnRequestData()
+        .setGroupId("orders-consumer")
+        .setTransactionalId("my-txn")
+        .setProducerId(42L)
+        .setProducerEpoch(0.toShort)
+    ).build(ApiKeys.ADD_OFFSETS_TO_TXN.latestVersion)
+    val request = buildRequest(addOffsetsToTxnRequest,
+      listenerName = TENANT_LISTENER,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleAddOffsetsToTxnRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[AddOffsetsToTxnResponse](request)
+    assertEquals(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.code, response.data.errorCode)
+    verify(groupCoordinator, never()).partitionFor(anyString())
+    verify(txnCoordinator, never()).handleAddPartitionsToTransaction(
+      anyString(), anyLong(), anyShort(), any[Set[TopicPartition]](),
+      any[Errors => Unit](), any[TransactionVersion](), any[RequestLocal]())
+  }
+
+  @Test
   def testJoinGroupTenantRewritesGroupIdToPhysical(): Unit = {
     val data = new JoinGroupRequestData()
       .setGroupId("orders-consumer")

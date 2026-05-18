@@ -3139,6 +3139,21 @@ class KafkaApis(val requestChannel: RequestChannel,
     val responses = new AddPartitionsToTxnResultCollection()
     val partitionsByTransaction = addPartitionsToTxnRequest.partitionsByTransaction()
 
+    // Phase 3b: rewrite tenant-scoped transactional ids and topic names to
+    // their physical form before authorisation and coordinator dispatch. The
+    // wire-form response is built from request data (the logical id and the
+    // logical topic names), so the client sees the names it sent back. An
+    // unsafe context (privileged-on-tenant / mismatch / spoof) short-circuits
+    // before any other check because the listener binding alone cannot
+    // disambiguate which tenant the call belongs to — the guard must run
+    // before authorizeClusterOperation so we never leak cluster-auth status
+    // through this code path either.
+    val tenantCtx = tenantContextFor(request)
+    if (tenantCtx.isUnsafe) {
+      requestHelper.sendErrorResponseMaybeThrottle(request, Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.exception)
+      return
+    }
+
     // Newer versions of the request should only come from other brokers.
     if (version >= 4) authHelper.authorizeClusterOperation(request, CLUSTER_ACTION)
 
@@ -3170,34 +3185,68 @@ class KafkaApis(val requestChannel: RequestChannel,
     }
 
     txns.forEach { transaction =>
-      val transactionalId = transaction.transactionalId
+      val logicalTransactionalId = transaction.transactionalId
 
-      if (transactionalId == null)
+      if (logicalTransactionalId == null)
         throw new InvalidRequestException("Transactional ID can not be null in request.")
 
-      val partitionsToAdd = partitionsByTransaction.get(transactionalId).asScala
+      // toPhysicalTxnId is identity for non-tenant contexts (inter-broker v4+)
+      // so the same call covers both code paths. A cross-tenant prefix from a
+      // tenant client (`__tenant_other.x`) raises IllegalArgumentException →
+      // refuse this transaction with TRANSACTIONAL_ID_AUTHORIZATION_FAILED.
+      val maybePhysicalTransactionalId: Either[Errors, String] =
+        try Right(tenantCtx.toPhysicalTxnId(logicalTransactionalId))
+        catch { case _: IllegalArgumentException => Left(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED) }
+
+      val logicalPartitionsToAdd = partitionsByTransaction.get(logicalTransactionalId).asScala
 
       // Versions < 4 come from clients and must be authorized to write for the given transaction and for the given topics.
-      if (version < 4 && !authHelper.authorize(request.context, WRITE, TRANSACTIONAL_ID, transactionalId)) {
-        addResultAndMaybeSendResponse(addPartitionsToTxnRequest.errorResponseForTransaction(transactionalId, Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED))
+      // Authorisation runs against the physical transactional id so the ACL
+      // surface stays consistent with topic ACLs (which also key on physical).
+      val refuseTxn = maybePhysicalTransactionalId match {
+        case Left(error) => Some(error)
+        case Right(physical) if version < 4 && !authHelper.authorize(request.context, WRITE, TRANSACTIONAL_ID, physical) =>
+          Some(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED)
+        case _ => None
+      }
+      if (refuseTxn.isDefined) {
+        addResultAndMaybeSendResponse(addPartitionsToTxnRequest.errorResponseForTransaction(
+          logicalTransactionalId, refuseTxn.get))
       } else {
+        val physicalTransactionalId = maybePhysicalTransactionalId.toOption.get
         val unauthorizedTopicErrors = mutable.Map[TopicPartition, Errors]()
         val nonExistingTopicErrors = mutable.Map[TopicPartition, Errors]()
-        val authorizedPartitions = mutable.Set[TopicPartition]()
+        val authorizedLogicalPartitions = mutable.Set[TopicPartition]()
+
+        // A tenant addressing the physical namespace directly (`acme.foo` while
+        // already scoped to acme) has no right to do so — refuse the partition
+        // up-front as TOPIC_AUTHORIZATION_FAILED rather than rewriting twice.
+        val (reservedLogicalTps, rewriteableLogicalTps) = logicalPartitionsToAdd
+          .partition(tp => tenantCtx.isReservedPhysicalForm(tp.topic))
+        reservedLogicalTps.foreach(tp => unauthorizedTopicErrors += tp -> Errors.TOPIC_AUTHORIZATION_FAILED)
+
+        // Build a logical→physical mapping so we can authorise + check
+        // metadataCache + dispatch on physical, while preserving the logical
+        // partitions for the on-wire response.
+        val physicalByLogical: Map[TopicPartition, TopicPartition] =
+          rewriteableLogicalTps.iterator.map { tp =>
+            tp -> new TopicPartition(tenantCtx.toPhysical(tp.topic), tp.partition)
+          }.toMap
 
         // Only request versions less than 4 need write authorization since they come from clients.
-        val authorizedTopics =
+        val authorizedPhysicalTopics =
           if (version < 4)
-            authHelper.filterByAuthorized(request.context, WRITE, TOPIC, partitionsToAdd.filterNot(tp => Topic.isInternal(tp.topic)))(_.topic)
+            authHelper.filterByAuthorized(request.context, WRITE, TOPIC,
+              physicalByLogical.values.toSeq.filterNot(tp => Topic.isInternal(tp.topic)))(_.topic)
           else
-            partitionsToAdd.map(_.topic).toSet
-        for (topicPartition <- partitionsToAdd) {
-          if (!authorizedTopics.contains(topicPartition.topic))
-            unauthorizedTopicErrors += topicPartition -> Errors.TOPIC_AUTHORIZATION_FAILED
-          else if (!metadataCache.contains(topicPartition))
-            nonExistingTopicErrors += topicPartition -> Errors.UNKNOWN_TOPIC_OR_PARTITION
+            physicalByLogical.values.iterator.map(_.topic).toSet
+        for ((logicalTp, physicalTp) <- physicalByLogical) {
+          if (!authorizedPhysicalTopics.contains(physicalTp.topic))
+            unauthorizedTopicErrors += logicalTp -> Errors.TOPIC_AUTHORIZATION_FAILED
+          else if (!metadataCache.contains(physicalTp))
+            nonExistingTopicErrors += logicalTp -> Errors.UNKNOWN_TOPIC_OR_PARTITION
           else
-            authorizedPartitions.add(topicPartition)
+            authorizedLogicalPartitions.add(logicalTp)
         }
 
         if (unauthorizedTopicErrors.nonEmpty || nonExistingTopicErrors.nonEmpty) {
@@ -3205,8 +3254,9 @@ class KafkaApis(val requestChannel: RequestChannel,
           // partitions which failed, and an 'OPERATION_NOT_ATTEMPTED' error code for the partitions which succeeded
           // the authorization check to indicate that they were not added to the transaction.
           val partitionErrors = unauthorizedTopicErrors ++ nonExistingTopicErrors ++
-            authorizedPartitions.map(_ -> Errors.OPERATION_NOT_ATTEMPTED)
-          addResultAndMaybeSendResponse(AddPartitionsToTxnResponse.resultForTransaction(transactionalId, partitionErrors.asJava))
+            authorizedLogicalPartitions.map(_ -> Errors.OPERATION_NOT_ATTEMPTED)
+          addResultAndMaybeSendResponse(AddPartitionsToTxnResponse.resultForTransaction(
+            logicalTransactionalId, partitionErrors.asJava))
         } else {
           def sendResponseCallback(error: Errors): Unit = {
             val finalError = {
@@ -3218,22 +3268,25 @@ class KafkaApis(val requestChannel: RequestChannel,
                 error
               }
             }
-            addResultAndMaybeSendResponse(addPartitionsToTxnRequest.errorResponseForTransaction(transactionalId, finalError))
+            addResultAndMaybeSendResponse(addPartitionsToTxnRequest.errorResponseForTransaction(
+              logicalTransactionalId, finalError))
           }
 
+          val authorizedPhysicalPartitions = authorizedLogicalPartitions.map(physicalByLogical)
+
           if (!transaction.verifyOnly) {
-            txnCoordinator.handleAddPartitionsToTransaction(transactionalId,
+            txnCoordinator.handleAddPartitionsToTransaction(physicalTransactionalId,
               transaction.producerId,
               transaction.producerEpoch,
-              authorizedPartitions,
+              authorizedPhysicalPartitions,
               sendResponseCallback,
               TransactionVersion.transactionVersionForAddPartitionsToTxn(addPartitionsToTxnRequest),
               requestLocal)
           } else {
-            txnCoordinator.handleVerifyPartitionsInTransaction(transactionalId,
+            txnCoordinator.handleVerifyPartitionsInTransaction(physicalTransactionalId,
               transaction.producerId,
               transaction.producerEpoch,
-              authorizedPartitions,
+              authorizedPhysicalPartitions,
               addResultAndMaybeSendResponse)
           }
         }
@@ -3243,8 +3296,45 @@ class KafkaApis(val requestChannel: RequestChannel,
 
   def handleAddOffsetsToTxnRequest(request: RequestChannel.Request, requestLocal: RequestLocal): Unit = {
     val addOffsetsToTxnRequest = request.body[AddOffsetsToTxnRequest]
-    val transactionalId = addOffsetsToTxnRequest.data.transactionalId
-    val groupId = addOffsetsToTxnRequest.data.groupId
+    val logicalTransactionalId = addOffsetsToTxnRequest.data.transactionalId
+    val logicalGroupId = addOffsetsToTxnRequest.data.groupId
+
+    // Phase 3b: rewrite tenant-scoped transactional id + group id to their
+    // physical form. Both keys share the __tenant_<id>.<name> encoding (see
+    // TenantNamespace) but are independent values — same external name in
+    // different tenants must resolve to distinct coordinator state. The
+    // unsafe-context guard must run first (listener binding alone cannot
+    // disambiguate which tenant owns the call); cross-tenant prefixes from a
+    // tenant client are surfaced as TRANSACTIONAL_ID_AUTHORIZATION_FAILED /
+    // GROUP_AUTHORIZATION_FAILED rather than silently passed through.
+    val tenantCtx = tenantContextFor(request)
+    if (tenantCtx.isUnsafe) {
+      requestHelper.sendErrorResponseMaybeThrottle(request, Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.exception)
+      return
+    }
+
+    val transactionalId =
+      try tenantCtx.toPhysicalTxnId(logicalTransactionalId)
+      catch {
+        case _: IllegalArgumentException =>
+          requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
+            new AddOffsetsToTxnResponse(new AddOffsetsToTxnResponseData()
+              .setErrorCode(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.code)
+              .setThrottleTimeMs(requestThrottleMs)))
+          return
+      }
+
+    val groupId =
+      try tenantCtx.toPhysicalGroup(logicalGroupId)
+      catch {
+        case _: IllegalArgumentException =>
+          requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
+            new AddOffsetsToTxnResponse(new AddOffsetsToTxnResponseData()
+              .setErrorCode(Errors.GROUP_AUTHORIZATION_FAILED.code)
+              .setThrottleTimeMs(requestThrottleMs)))
+          return
+      }
+
     val offsetTopicPartition = new TopicPartition(GROUP_METADATA_TOPIC_NAME, groupCoordinator.partitionFor(groupId))
 
     if (!authHelper.authorize(request.context, WRITE, TRANSACTIONAL_ID, transactionalId))
@@ -3274,7 +3364,9 @@ class KafkaApis(val requestChannel: RequestChannel,
             new AddOffsetsToTxnResponseData()
               .setErrorCode(finalError.code)
               .setThrottleTimeMs(requestThrottleMs))
-          trace(s"Completed $transactionalId's AddOffsetsToTxnRequest for group $groupId on partition " +
+          // Trace logical so operators on the tenant listener see what the
+          // client actually sent; physical id is internal bookkeeping.
+          trace(s"Completed $logicalTransactionalId's AddOffsetsToTxnRequest for group $logicalGroupId on partition " +
             s"$offsetTopicPartition: errors: $error from client ${request.header.clientId}")
           responseBody
         }
@@ -4872,9 +4964,14 @@ object KafkaApis {
   // tenant's logical low-water mark" requires these handlers to be tenant-
   // aware rather than refused.
   //
-  // The remaining transactional handlers (AddPartitionsToTxn, AddOffsetsToTxn,
-  // EndTxn, TxnOffsetCommit) and the share / consumer-group v2 APIs remain
-  // refused at this dispatch boundary until later phases lift them.
+  // Phase 3b.3 admits ADD_PARTITIONS_TO_TXN and ADD_OFFSETS_TO_TXN. Both
+  // rewrite the transactional id (and topic names / group id where present)
+  // to physical for authorisation + coordinator dispatch and echo logical
+  // names on the response.
+  //
+  // The remaining transactional handlers (EndTxn, TxnOffsetCommit) and the
+  // share / consumer-group v2 APIs remain refused at this dispatch boundary
+  // until later phases lift them.
   private[server] val TENANT_ALLOWED_APIS: Set[ApiKeys] = Set(
     ApiKeys.PRODUCE,
     ApiKeys.FETCH,
@@ -4891,6 +4988,8 @@ object KafkaApis {
     ApiKeys.OFFSET_FETCH,
     ApiKeys.LIST_OFFSETS,
     ApiKeys.DELETE_RECORDS,
+    ApiKeys.ADD_PARTITIONS_TO_TXN,
+    ApiKeys.ADD_OFFSETS_TO_TXN,
     ApiKeys.SASL_HANDSHAKE,
     ApiKeys.SASL_AUTHENTICATE,
     ApiKeys.API_VERSIONS
