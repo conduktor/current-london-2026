@@ -310,11 +310,29 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
           return 0L
         }
         val result = replay(log, startOffset, endOffset)
-        // Always commit, so the engine reflects everything we DID apply this
-        // drain. The cursor advances to where replay actually got — not to
+        // Always advance the cursor to where replay actually got — not to
         // endOffset — so a defensive empty-read mid-replay does not silently
         // skip the unread range. Codex deep-audit P1 fix: prior version did
         // `nextOffset.set(endOffset)` which jumped past records we never read.
+        nextOffset.set(result.advancedTo)
+        // Audit B1: a drain that READ records but APPLIED none (every record
+        // was rejected by the loader — null key, malformed envelope, cap hit)
+        // is NOT forward progress through the topic. Committing the still-
+        // empty working state during the held-stale window would publish
+        // RuleSet.EMPTY over the engine's previously-good active(), exactly
+        // the fail-stale-to-empty regression the held-stale flag exists to
+        // prevent. Defer the commit; the next drain that successfully applies
+        // at least one record will rebuild and install fresh state. The
+        // cursor still advances so we don't busy-loop on the same poison.
+        if (holdingStalePostTruncation && result.applied == 0L) {
+          warn(s"governance partition $tp held-stale: drain read " +
+            s"${result.read} record(s) but the loader applied none — every " +
+            s"record was rejected (null key, malformed envelope, cap hit). " +
+            s"Deferring commit so the engine keeps its last-known-good " +
+            s"active RuleSet. Next drain that successfully applies a record " +
+            s"will rebuild and install fresh state.")
+          return result.read
+        }
         loader.commit()
         // A successful replay+commit means the working state is now a fresh,
         // record-derived RuleSet — the held-stale flag (if any) is cleared
@@ -323,11 +341,10 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
         // working state has not rebuilt anything from the topic, so the
         // "post-truncation, no records yet observed" condition is unchanged.
         // Codex audit follow-on, paired with the field-promotion fix above.
-        if (holdingStalePostTruncation && result.replayed > 0) {
+        if (holdingStalePostTruncation && result.applied > 0L) {
           holdingStalePostTruncation = false
         }
-        nextOffset.set(result.advancedTo)
-        result.replayed
+        result.read
     }
   }
 
@@ -647,17 +664,32 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
   }
 
   /**
-   * Result of a single [[replay]] pass. Carries BOTH the count of records
-   * applied AND the offset we actually progressed to. The caller advances
-   * [[nextOffset]] to {@code advancedTo}, not to the requested {@code endOffset},
-   * because a mid-pass empty read must NOT silently skip records we never
-   * consumed. Codex deep-audit P1 fix.
+   * Result of a single [[replay]] pass. Carries three numbers:
+   *
+   * <ul>
+   *   <li>{@code read} — total records iterated over, including ones that
+   *       the loader rejected (malformed envelopes, null keys, cap hits).
+   *       This is the count surfaced as [[drainOnce]]'s return value and
+   *       what test assertions for "records iterated" pin.</li>
+   *   <li>{@code applied} — records that successfully contributed to the
+   *       loader's working state (a decoded update was put, or a tombstone
+   *       removed/no-op'd an id). Used by the held-stale guard to decide
+   *       whether to commit: a drain that read records but applied none
+   *       is NOT forward progress through the log and must not clear a
+   *       previously-good RuleSet. Audit B1.</li>
+   *   <li>{@code advancedTo} — the offset replay actually got to. The
+   *       caller advances [[nextOffset]] to this value, not to the
+   *       requested {@code endOffset}, because a mid-pass empty read must
+   *       NOT silently skip records we never consumed. Codex deep-audit
+   *       P1 fix.</li>
+   * </ul>
    */
-  private case class ReplayResult(replayed: Long, advancedTo: Long)
+  private case class ReplayResult(read: Long, applied: Long, advancedTo: Long)
 
   private def replay(log: UnifiedLog, startOffset: Long, endOffset: Long): ReplayResult = {
     var currentOffset = startOffset
-    var replayed = 0L
+    var read = 0L
+    var applied = 0L
     val readBufferBytes = 1024 * 1024
     var readAtLeast = true
     while (currentOffset < endOffset && readAtLeast) {
@@ -681,7 +713,7 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
         // and the caller jumped nextOffset to endOffset unconditionally,
         // silently advancing past records that were never consumed. The next
         // drain will re-read this range.
-        return ReplayResult(replayed, currentOffset)
+        return ReplayResult(read, applied, currentOffset)
       }
       // The records may be FileRecords or MemoryRecords. We don't care which —
       // org.apache.kafka.common.record.Records exposes batches() for both.
@@ -701,25 +733,35 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
             // the same poison forever. The next drain picks up records after
             // it. The previously-installed RuleSet is unaffected: GovernanceLoader
             // only commits on the outer drainOnce, not per-record.
+            //
+            // Audit B1: capture the boolean return of loader.apply so the
+            // drainOnce held-stale guard can tell "read but rejected" from
+            // "read and successfully applied". A thrown exception is treated
+            // as a rejection here (didApply stays false), matching the
+            // loader.apply contract for record-level faults.
+            var didApply = false
             try {
               val key = bytes(rec.key())
               val value = bytes(rec.value())
               val keyStr =
                 if (key == null) null
                 else new String(key, StandardCharsets.UTF_8)
-              loader.apply(keyStr, value)
+              didApply = loader.apply(keyStr, value)
             } catch {
               case t: Throwable =>
                 warn(s"skipping poisoned __governance record at offset " +
                   s"${rec.offset()}: ${t.toString}")
             }
-            replayed += 1
+            if (didApply) {
+              applied += 1
+            }
+            read += 1
           }
         }
         currentOffset = batch.nextOffset()
       }
     }
-    ReplayResult(replayed, currentOffset)
+    ReplayResult(read, applied, currentOffset)
   }
 
   private def bytes(buf: ByteBuffer): Array[Byte] = {

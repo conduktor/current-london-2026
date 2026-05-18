@@ -287,6 +287,58 @@ public class GovernanceLoaderTest {
     }
 
     @Test
+    public void applyReturnsTrueForSuccessfulUpdateAndTombstoneFalseForRejection() {
+        // Audit B1 contract pin. The drain-loop in BrokerGovernanceBootstrap
+        // distinguishes "drain read records and made forward progress" from
+        // "drain read records but rejected every one" via this boolean. The
+        // distinction is what keeps a malformed-only batch after a truncation
+        // reset from publishing RuleSet.EMPTY over previously-good rules.
+        // Pin the contract directly here — if it ever regresses, every audit
+        // chain that depends on it (the held-stale defer, the per-batch
+        // accounting in replay()) breaks silently.
+        RuleEngine engine = new RuleEngine();
+        GovernanceLoader loader = new GovernanceLoader(engine);
+
+        // Successful update → true.
+        assertTrue(loader.apply("good", envelope("true", ApiKeys.METADATA, 7)),
+            "decoded + put update must signal forward progress");
+
+        // Successful tombstone (id was present) → true.
+        assertTrue(loader.apply("good", null),
+            "tombstone of a present id must signal forward progress");
+
+        // Idempotent tombstone of an absent id → true (the spec says null
+        // value means "this key is now absent"; we honoured it, so it counts
+        // as the loader making sense of the record).
+        assertTrue(loader.apply("never-existed", null),
+            "tombstone of an absent id is idempotent — still forward progress");
+
+        // Null key → false. We cannot identify the rule and dropped the
+        // record; the working state is untouched.
+        assertFalse(loader.apply(null, envelope("true", ApiKeys.METADATA, 1)),
+            "null-key record must signal no progress");
+        assertFalse(loader.apply(null, null),
+            "null-key tombstone must also signal no progress (cannot identify id)");
+
+        // Malformed envelope → false. The codec rejects; the working state
+        // is preserved; the loader signals "no progress".
+        assertFalse(loader.apply("bad", "not json".getBytes(StandardCharsets.UTF_8)),
+            "malformed envelope must signal no progress");
+
+        // Builder cap exceeded → false. Fill to the cap, then push one over.
+        // (Reuse the same loader — putting good rules in does count, the cap
+        // overflow at the end is the only rejection.)
+        for (int i = 0; i < RuleSetBuilder.MAX_RULES; i++) {
+            assertTrue(
+                loader.apply("cap-" + i, envelope("true", ApiKeys.METADATA, 1 + (i % 100))),
+                "puts up to the cap must all signal progress");
+        }
+        assertFalse(
+            loader.apply("cap-overflow", envelope("true", ApiKeys.METADATA, 1)),
+            "cap-overflow update must signal no progress (previously-good state preserved)");
+    }
+
+    @Test
     public void encodeDecodeViaCodecLinesUpWithLoader() {
         // Sanity: the loader and the codec must agree on what a record looks
         // like. We use the codec's own encode() to produce input — if a

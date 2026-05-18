@@ -95,16 +95,35 @@ public final class GovernanceLoader {
      *
      * @param key the record key (rule id); null records are dropped
      * @param value the record value (envelope JSON); null is a tombstone
+     * @return {@code true} when the record was successfully processed into the
+     *         working state (a valid update was decoded and put, or a tombstone
+     *         was applied — idempotent or not). {@code false} when the record
+     *         was rejected (null key, malformed envelope, or builder cap
+     *         exceeded) and therefore made no contribution to the working
+     *         state. Callers in {@code BrokerGovernanceBootstrap} use this
+     *         signal to decide whether the drain made forward progress past
+     *         a truncation-reset: a drain that read N records but applied
+     *         none must NOT clear the {@code holdingStalePostTruncation}
+     *         flag nor publish the still-empty working set, because doing
+     *         so would replace the engine's previously-good {@code active()}
+     *         with {@code RuleSet.EMPTY} on a topic that contains only
+     *         records this loader cannot parse — a fail-stale-to-empty
+     *         regression. Audit B1.
      */
-    public void apply(String key, byte[] value) {
+    public boolean apply(String key, byte[] value) {
         if (key == null) {
             LOG.warn("dropping __governance record with null key (value present={})", value != null);
-            return;
+            return false;
         }
         if (value == null) {
             // Tombstone — RuleSetBuilder.remove() is idempotent on an absent id.
+            // We return true even when the id was absent: the LOG said "this
+            // key is now removed" and we honoured that. From the held-stale
+            // perspective, a successful tombstone is forward progress through
+            // the log — we have a positive signal that the loader is making
+            // sense of the records it sees.
             working.remove(key);
-            return;
+            return true;
         }
         // Decode-then-mutate: a malformed envelope must not silently displace
         // the previously installed good version of this rule. Only commit the
@@ -115,7 +134,7 @@ public final class GovernanceLoader {
         } catch (RuleEnvelopeException e) {
             LOG.warn("rejecting bad __governance envelope for rule '{}': {} — " +
                 "previously installed version of this rule (if any) is preserved", key, e.getMessage());
-            return;
+            return false;
         }
         // RuleSetBuilder.put rejects new ids past its MAX_RULES cap. Treat
         // that like a malformed envelope at this level: log, preserve prior
@@ -123,9 +142,11 @@ public final class GovernanceLoader {
         // trip the cap (the set does not grow).
         try {
             working.put(rule);
+            return true;
         } catch (IllegalStateException e) {
             LOG.warn("rejecting __governance update for rule '{}': {} — " +
                 "previously installed RuleSet is preserved", key, e.getMessage());
+            return false;
         }
     }
 

@@ -1069,6 +1069,122 @@ class BrokerGovernanceBootstrapTest {
   }
 
   @Test
+  def drainOnceTruncationFollowedByAllMalformedRecordsKeepsPreviouslyGoodRuleSet(): Unit = {
+    // Audit B1 regression pin. The held-stale flag was originally cleared
+    // by ANY successful replay+commit, where "successful" only meant "the
+    // per-record loop ran without an uncaught exception". A truncation
+    // followed by a stream of malformed envelopes would therefore:
+    //
+    //   1. Truncation guard fires → loader.reset() → holdingStalePostTruncation = true.
+    //   2. Next drain reads N malformed records. Each one is rejected by
+    //      RuleJsonCodec.decode, the loader logs a WARN and DROPS the record
+    //      — the working state stays empty.
+    //   3. The drain's per-record loop returns replayed=N (>0), the old
+    //      code unconditionally called loader.commit() AND cleared the
+    //      held-stale flag — publishing RuleSet.EMPTY over the engine's
+    //      previously-good active().
+    //
+    // That is the exact fail-stale-to-empty regression the held-stale flag
+    // exists to prevent, sneaking in through "read records but applied
+    // none". The B1 fix gates the held-stale-clearance commit on a fresh
+    // `applied > 0` counter (records the loader returned true for), so a
+    // batch of poison cannot evict known-good rules.
+    val rm = mock(classOf[ReplicaManager])
+    val log = mock(classOf[UnifiedLog])
+    val engine = new RuleEngine()
+    when(rm.getLog(tp)).thenReturn(Some(log))
+
+    // Drain 1: install two good rules.
+    when(log.logStartOffset).thenReturn(0L)
+    when(log.highWatermark).thenReturn(2L)
+    when(log.read(0L, 1024 * 1024, FetchIsolation.HIGH_WATERMARK, true)).thenReturn(
+      recordsAt(0L,
+        new SimpleRecord("r1".getBytes(StandardCharsets.UTF_8),
+          envelope("true", ApiKeys.METADATA, 7)),
+        new SimpleRecord("r2".getBytes(StandardCharsets.UTF_8),
+          envelope("true", ApiKeys.FETCH, 11))))
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp)
+    assertEquals(2L, boot.drainOnce())
+    val previouslyGood = engine.active()
+    assertEquals(2, previouslyGood.size(), "baseline: two rules installed")
+
+    // Truncation race: cursor at 2, but the log has been rewound and
+    // logStartOffset is now 100; HW is now 103 with three new records, all
+    // of which are MALFORMED (the codec will reject every one of them).
+    // The truncation guard fires, loader.reset() runs, nextOffset rewinds
+    // to logStartOffset=100, and the held-stale flag is set.
+    when(log.logStartOffset).thenReturn(100L)
+    when(log.highWatermark).thenReturn(103L)
+    when(log.read(100L, 1024 * 1024, FetchIsolation.HIGH_WATERMARK, true)).thenReturn(
+      recordsAt(100L,
+        new SimpleRecord("bad-1".getBytes(StandardCharsets.UTF_8),
+          "this is not json at all".getBytes(StandardCharsets.UTF_8)),
+        new SimpleRecord("bad-2".getBytes(StandardCharsets.UTF_8),
+          "{\"apiKeys\":[\"NOT_A_REAL_API\"]}".getBytes(StandardCharsets.UTF_8)),
+        new SimpleRecord("bad-3".getBytes(StandardCharsets.UTF_8),
+          "{\"apiKeys\":[\"METADATA\"],\"action\":\"PURGE\",\"when\":\"true\",\"errorCode\":1}"
+            .getBytes(StandardCharsets.UTF_8))))
+
+    // Drain 2: cursor (2) is BEHIND new logStartOffset (100), but more
+    // importantly cursor (2) is also BEHIND HW (103) — actually wait, that
+    // misses the truncation guard. Force it by setting HW below cursor for
+    // a single observation: bump HW first, then expect the next drain to
+    // see HW < cursor, fire the guard, reset, and rewind. The robust way
+    // is two drains:
+    //
+    //   - Drain 2a: HW drops to 1 (below cursor=2) → guard fires → reset →
+    //     rewind to logStartOffset=100. Replay range [100, 1) is empty,
+    //     held-stale defer triggers, no commit.
+    //   - Drain 2b: HW now 103 with three malformed records → drain reads
+    //     3, applies 0; held-stale defer must STILL trigger because no
+    //     record successfully contributed to the working state.
+    when(log.highWatermark).thenReturn(1L)
+    assertEquals(0L, boot.drainOnce(),
+      "drain 2a: truncation guard fires, replay range is empty, defer commit")
+    assertSame(previouslyGood, engine.active(),
+      "drain 2a must preserve previously-good active() (truncation defer)")
+
+    when(log.highWatermark).thenReturn(103L)
+    val nMalformed = boot.drainOnce()
+    assertEquals(3L, nMalformed,
+      "drain 2b: read=3 (all three malformed records were iterated)")
+    assertSame(previouslyGood, engine.active(),
+      "drain 2b is the B1 regression pin: drain READ 3 records but APPLIED " +
+        "none (every envelope was rejected by the codec). Committing the still-" +
+        "empty working state here would publish RuleSet.EMPTY over previously-" +
+        "good rules — the fail-stale-to-empty regression. Engine must keep its " +
+        "last-known-good RuleSet until a drain successfully applies a record.")
+    // Belt-and-braces: prove the previously-good rules are still actively
+    // enforced post-malformed-drain.
+    assertTrue(engine.evaluate(ApiKeys.METADATA, "c", false,
+      () => Collections.emptyMap()).denied,
+      "previously-good METADATA DENY must still be enforced after all-malformed drain")
+    assertTrue(engine.evaluate(ApiKeys.FETCH, "c", false,
+      () => Collections.emptyMap()).denied,
+      "previously-good FETCH DENY must still be enforced after all-malformed drain")
+
+    // Recovery: a single good record lands. The drain reads 1, applies 1,
+    // the held-stale flag clears, and the engine swaps to the fresh set.
+    when(log.highWatermark).thenReturn(104L)
+    when(log.read(103L, 1024 * 1024, FetchIsolation.HIGH_WATERMARK, true)).thenReturn(
+      recordsAt(103L,
+        new SimpleRecord("good".getBytes(StandardCharsets.UTF_8),
+          envelope("true", ApiKeys.LIST_OFFSETS, 23))))
+    assertEquals(1L, boot.drainOnce(),
+      "recovery drain reads the one good record")
+    val fresh = engine.active()
+    assertEquals(1, fresh.size())
+    assertNotSame(previouslyGood, fresh,
+      "recovery commit must replace the held-stale RuleSet with the fresh one")
+    assertTrue(engine.evaluate(ApiKeys.LIST_OFFSETS, "c", false,
+      () => Collections.emptyMap()).denied)
+    // Previously-good rules are gone now — recovery installed only the new one.
+    assertSame(RuleDecision.ALLOW,
+      engine.evaluate(ApiKeys.METADATA, "c", false, () => Collections.emptyMap()),
+      "after recovery commit, previously-held-stale METADATA rule is dropped")
+  }
+
+  @Test
   def drainOnceProceedsEvenWhenADenyAllFetchRuleIsActive(): Unit = {
     // Adversarial M4: PROMPT.md requires the broker to keep enforcing the
     // governance topic itself even if an operator publishes a deny-all rule
