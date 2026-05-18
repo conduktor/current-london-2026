@@ -4753,6 +4753,29 @@ class KafkaApis(val requestChannel: RequestChannel,
     }
   }
 
+  // Tenant existence-oracle + HMAC-leak guard for DescribeDelegationToken.
+  // The describe path returns the full DelegationToken — TokenInformation
+  // (owner, tokenRequester, renewers, tokenId, timestamps) plus the raw HMAC
+  // bytes — for every token the caller is "authorized" to see. Without a
+  // tenant scrub a cluster-wide (non-tenant) caller can:
+  //   (a) name `__tenant_<t>.<u>` in the owner-filter and learn whether that
+  //       tenant user holds a token by presence vs. emptiness of the result;
+  //   (b) call with the implicit owner-filter (data.owners == null, "all
+  //       tokens I'm authorized for") and have tokens minted in the tenant
+  //       namespace returned in the response — including the HMAC bytes.
+  // The mint-time guard (handleCreateTokenRequest) refuses to create such
+  // tokens, but legacy, out-of-band, or pre-guard creations remain a risk.
+  // Defense in depth:
+  //   1. Atomic refusal — if any owner in the explicit owner-filter is a
+  //      foreign tenant principal, refuse the whole request with
+  //      DELEGATION_TOKEN_AUTHORIZATION_FAILED. We refuse on ANY foreign
+  //      entry (not just all-foreign) so a benign+foreign batch cannot be
+  //      used to probe existence by comparing the response size.
+  //   2. Outside-in scrub — drop every token from the response whose owner
+  //      OR tokenRequester is a foreign tenant principal. tokenRequester
+  //      matters: a tenant user can be the *requester* of a token whose
+  //      owner is regular (delegated mint with CREATE_TOKENS on the owner),
+  //      and surfacing that requester would still leak tenant identity.
   def handleDescribeTokensRequest(request: RequestChannel.Request): Unit = {
     val describeTokenRequest = request.body[DescribeDelegationTokenRequest]
 
@@ -4770,21 +4793,40 @@ class KafkaApis(val requestChannel: RequestChannel,
       sendResponseCallback(Errors.DELEGATION_TOKEN_AUTH_DISABLED, List.empty)
     else {
       val requestPrincipal = request.context.principal
+      val describeCallerTenant = tenantContextFor(request).effectiveTenant
+      def belongsToCallerTenant(name: String): Boolean =
+        name != null && describeCallerTenant.isPresent &&
+          name.startsWith(TenantNamespace.PRINCIPAL_PREFIX + describeCallerTenant.get + ".")
+      def isForeignTenantPrincipal(name: String): Boolean =
+        isReservedTenantPrincipalNamespace(name) && !belongsToCallerTenant(name)
 
       if (describeTokenRequest.ownersListEmpty()) {
         sendResponseCallback(Errors.NONE, List())
       }
       else {
-        val owners = if (describeTokenRequest.data.owners == null)
-          None
-        else
-          Some(describeTokenRequest.data.owners.asScala.map(p => new KafkaPrincipal(p.principalType(), p.principalName)).toList)
-        def authorizeToken(tokenId: String) = authHelper.authorize(request.context, DESCRIBE, DELEGATION_TOKEN, tokenId)
-        def authorizeRequester(owner: KafkaPrincipal) = authHelper.authorize(request.context, DESCRIBE_TOKENS, USER, owner.toString)
-        def eligible(token: TokenInformation) = DelegationTokenManager
-          .filterToken(requestPrincipal, owners, token, authorizeToken, authorizeRequester)
-        val tokens =  tokenManager.getTokens(eligible)
-        sendResponseCallback(Errors.NONE, tokens)
+        val ownerFilterNamesForeignTenant =
+          describeTokenRequest.data.owners != null &&
+            describeTokenRequest.data.owners.asScala.exists(o => isForeignTenantPrincipal(o.principalName))
+
+        if (ownerFilterNamesForeignTenant) {
+          sendResponseCallback(Errors.DELEGATION_TOKEN_AUTHORIZATION_FAILED, List.empty)
+        } else {
+          val owners = if (describeTokenRequest.data.owners == null)
+            None
+          else
+            Some(describeTokenRequest.data.owners.asScala.map(p => new KafkaPrincipal(p.principalType(), p.principalName)).toList)
+          def authorizeToken(tokenId: String) = authHelper.authorize(request.context, DESCRIBE, DELEGATION_TOKEN, tokenId)
+          def authorizeRequester(owner: KafkaPrincipal) = authHelper.authorize(request.context, DESCRIBE_TOKENS, USER, owner.toString)
+          def eligible(token: TokenInformation) = DelegationTokenManager
+            .filterToken(requestPrincipal, owners, token, authorizeToken, authorizeRequester)
+          val tokens = tokenManager.getTokens(eligible)
+          val scrubbed = tokens.filterNot { dt =>
+            val info = dt.tokenInfo
+            isForeignTenantPrincipal(info.owner.getName) ||
+              isForeignTenantPrincipal(info.tokenRequester.getName)
+          }
+          sendResponseCallback(Errors.NONE, scrubbed)
+        }
       }
     }
   }

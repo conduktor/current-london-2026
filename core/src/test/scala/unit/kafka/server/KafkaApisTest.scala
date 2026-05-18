@@ -72,6 +72,7 @@ import org.apache.kafka.common.requests.WriteTxnMarkersRequest.TxnMarkerEntry
 import org.apache.kafka.common.requests.{FetchMetadata => JFetchMetadata, _}
 import org.apache.kafka.common.resource.{PatternType, Resource, ResourcePattern, ResourceType}
 import org.apache.kafka.common.security.auth.{KafkaPrincipal, KafkaPrincipalSerde, SecurityProtocol}
+import org.apache.kafka.common.security.token.delegation.{DelegationToken, TokenInformation}
 import org.apache.kafka.common.utils.annotation.ApiKeyVersionsSource
 import org.apache.kafka.common.utils.{ImplicitLinkedHashCollection, ProducerIdAndEpoch, SecurityUtils, Utils}
 import org.apache.kafka.coordinator.group.GroupConfig.{CONSUMER_HEARTBEAT_INTERVAL_MS_CONFIG, CONSUMER_SESSION_TIMEOUT_MS_CONFIG, SHARE_AUTO_OFFSET_RESET_CONFIG, SHARE_HEARTBEAT_INTERVAL_MS_CONFIG, SHARE_RECORD_LOCK_DURATION_MS_CONFIG, SHARE_SESSION_TIMEOUT_MS_CONFIG}
@@ -165,7 +166,8 @@ class KafkaApisTest extends Logging {
     configRepository: ConfigRepository = new MockConfigRepository(),
     overrideProperties: Map[String, String] = Map.empty,
     featureVersions: Seq[FeatureVersion] = Seq.empty,
-    tenantConfig: TenantConfig = TenantConfig.empty()
+    tenantConfig: TenantConfig = TenantConfig.empty(),
+    tokenManager: DelegationTokenManager = null
   ): KafkaApis = {
 
     val properties = TestUtils.createBrokerConfig(brokerId)
@@ -210,7 +212,7 @@ class KafkaApisTest extends Logging {
       brokerTopicStats = brokerTopicStats,
       clusterId = clusterId,
       time = time,
-      tokenManager = null,
+      tokenManager = tokenManager,
       apiVersionManager = apiVersionManager,
       clientMetricsManager = clientMetricsManager,
       tenantConfig = tenantConfig)
@@ -16705,6 +16707,287 @@ class KafkaApisTest extends Logging {
       "a non-tenant caller cannot register a renewer inside a tenant principal namespace")
     verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
       any[Option[AbstractResponse] => Unit]())
+  }
+
+  // ---------------------------------------------------------------------------
+  // DescribeDelegationToken — tenant existence-oracle + HMAC leak guard.
+  //
+  // The handler returns DelegationToken (TokenInformation + raw HMAC bytes)
+  // for every token the caller is "authorized" to describe. Without a tenant
+  // scrub a cluster-wide (non-tenant) caller can:
+  //   (a) name `__tenant_<t>.<u>` as an owner-filter and learn whether that
+  //       tenant user holds a token by presence/emptiness in the result;
+  //   (b) call with implicit owner-filter and have any tenant-owned token
+  //       (including its raw HMAC) returned.
+  // Defense in depth:
+  //   1. Atomic refusal — owner-filter naming any foreign tenant principal
+  //      yields DELEGATION_TOKEN_AUTHORIZATION_FAILED.
+  //   2. Outside-in scrub — drop every token whose owner OR tokenRequester
+  //      is a foreign tenant principal.
+  // ---------------------------------------------------------------------------
+
+  private def newTokenInformation(
+    owner: KafkaPrincipal,
+    tokenRequester: KafkaPrincipal,
+    tokenId: String
+  ): TokenInformation = {
+    new TokenInformation(
+      tokenId,
+      owner,
+      tokenRequester,
+      java.util.Collections.emptyList[KafkaPrincipal](),
+      0L, 0L, 0L)
+  }
+
+  private def newDelegationToken(info: TokenInformation): DelegationToken =
+    new DelegationToken(info, "hmac-secret-bytes".getBytes(java.nio.charset.StandardCharsets.UTF_8))
+
+  // Token APIs early-exit with DELEGATION_TOKEN_AUTH_DISABLED unless the
+  // broker config defines a delegation-token secret key. The actual key value
+  // is irrelevant to the tenant guard — we only need tokenAuthEnabled == true.
+  private val tokenAuthEnabledProps: Map[String, String] = Map(
+    "delegation.token.secret.key" -> "test-delegation-token-secret-key")
+
+  @Test
+  def testDescribeDelegationTokenClusterWideCallerRefusesTenantOwnerFilter(): Unit = {
+    // Layer 1: a cluster-wide caller naming `__tenant_acme.alice` as an
+    // owner-filter is refused atomically. The handler never even consults the
+    // token store — refusing on the request side closes the existence-oracle
+    // before tokenManager.getTokens runs.
+    val owners = util.List.of(new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_acme.alice"))
+    val describeRequest = new DescribeDelegationTokenRequest.Builder(owners).build()
+    val tokenManagerMock = mock(classOf[DelegationTokenManager])
+    val request = buildRequest(
+      describeRequest,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    kafkaApis = createKafkaApis(
+      overrideProperties = tokenAuthEnabledProps,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER),
+      tokenManager = tokenManagerMock)
+    kafkaApis.handleDescribeTokensRequest(request)
+
+    val response = verifyNoThrottling[DescribeDelegationTokenResponse](request)
+    assertEquals(Errors.DELEGATION_TOKEN_AUTHORIZATION_FAILED.code, response.error.code,
+      "a cluster-wide caller cannot probe tenant token existence via owner-filter")
+    assertTrue(response.tokens.isEmpty,
+      "refused request must not surface any tokens at all")
+    verify(tokenManagerMock, never()).getTokens(any())
+  }
+
+  @Test
+  def testDescribeDelegationTokenAtomicRefusalWhenBenignOwnerMixedWithTenant(): Unit = {
+    // Atomic refusal: a benign + foreign-tenant batch is refused as a whole.
+    // Otherwise a caller could probe existence by comparing the response size
+    // to a control request that only contained the benign owner.
+    val owners = util.List.of(
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "regular-user"),
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_acme.alice"))
+    val describeRequest = new DescribeDelegationTokenRequest.Builder(owners).build()
+    val tokenManagerMock = mock(classOf[DelegationTokenManager])
+    val request = buildRequest(
+      describeRequest,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    kafkaApis = createKafkaApis(
+      overrideProperties = tokenAuthEnabledProps,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER),
+      tokenManager = tokenManagerMock)
+    kafkaApis.handleDescribeTokensRequest(request)
+
+    val response = verifyNoThrottling[DescribeDelegationTokenResponse](request)
+    assertEquals(Errors.DELEGATION_TOKEN_AUTHORIZATION_FAILED.code, response.error.code,
+      "a mixed batch with one foreign-tenant owner must refuse atomically — no partial response")
+    verify(tokenManagerMock, never()).getTokens(any())
+  }
+
+  @Test
+  def testDescribeDelegationTokenCrossTenantOwnerFilterRefused(): Unit = {
+    // The acme tenant's principal cannot name `__tenant_beta.*` in the filter:
+    // the same-tenant exemption is strict, it does not span tenants.
+    val owners = util.List.of(new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_beta.bob"))
+    val describeRequest = new DescribeDelegationTokenRequest.Builder(owners).build()
+    val tokenManagerMock = mock(classOf[DelegationTokenManager])
+    val request = buildRequest(
+      describeRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    val props = new util.HashMap[String, Object]()
+    props.put(s"listener.name.${TENANT_LISTENER.value.toLowerCase}.tenant.id", "acme")
+    props.put("listener.name.tenant_beta.tenant.id", "beta")
+    kafkaApis = createKafkaApis(
+      overrideProperties = tokenAuthEnabledProps,
+      tenantConfig = TenantConfig.from(props),
+      tokenManager = tokenManagerMock)
+    kafkaApis.handleDescribeTokensRequest(request)
+
+    val response = verifyNoThrottling[DescribeDelegationTokenResponse](request)
+    assertEquals(Errors.DELEGATION_TOKEN_AUTHORIZATION_FAILED.code, response.error.code,
+      "an acme tenant caller cannot probe beta tenant token existence")
+    verify(tokenManagerMock, never()).getTokens(any())
+  }
+
+  @Test
+  def testDescribeDelegationTokenScrubDropsTenantOwnedTokens(): Unit = {
+    // Layer 2: the implicit-filter path (data.owners == null) still flows
+    // through tokenManager.getTokens. The scrub drops every token whose owner
+    // sits in a foreign tenant namespace — closing the HMAC leak even if a
+    // legacy token was minted before the mint-time guard landed.
+    val tenantToken = newDelegationToken(newTokenInformation(
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_acme.alice"),
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_acme.alice"),
+      "tok-tenant"))
+    val regularToken = newDelegationToken(newTokenInformation(
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "regular-user"),
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "regular-user"),
+      "tok-regular"))
+    val tokenManagerMock = mock(classOf[DelegationTokenManager])
+    when(tokenManagerMock.getTokens(any())).thenReturn(List(tenantToken, regularToken))
+
+    val describeRequest = new DescribeDelegationTokenRequest.Builder(null).build()
+    val request = buildRequest(
+      describeRequest,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    kafkaApis = createKafkaApis(
+      overrideProperties = tokenAuthEnabledProps,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER),
+      tokenManager = tokenManagerMock)
+    kafkaApis.handleDescribeTokensRequest(request)
+
+    val response = verifyNoThrottling[DescribeDelegationTokenResponse](request)
+    assertEquals(Errors.NONE.code, response.error.code)
+    val tokens = response.tokens.asScala.toList
+    assertEquals(1, tokens.size,
+      "every token owned by a tenant principal must be scrubbed from the response")
+    assertEquals("tok-regular", tokens.head.tokenInfo.tokenId,
+      "only non-tenant tokens may surface to a cluster-wide caller")
+  }
+
+  @Test
+  def testDescribeDelegationTokenScrubDropsTokensWithForeignTokenRequester(): Unit = {
+    // The HMAC is also revealed to the tokenRequester (the delegated minter).
+    // A token whose owner is a regular user but whose tokenRequester is a
+    // tenant principal must still be scrubbed — otherwise we leak the fact
+    // that a tenant user has been delegated mint rights for that regular
+    // owner, and we leak the HMAC.
+    val mixedToken = newDelegationToken(newTokenInformation(
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "regular-user"),
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_acme.alice"),
+      "tok-mixed"))
+    val tokenManagerMock = mock(classOf[DelegationTokenManager])
+    when(tokenManagerMock.getTokens(any())).thenReturn(List(mixedToken))
+
+    val describeRequest = new DescribeDelegationTokenRequest.Builder(null).build()
+    val request = buildRequest(
+      describeRequest,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    kafkaApis = createKafkaApis(
+      overrideProperties = tokenAuthEnabledProps,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER),
+      tokenManager = tokenManagerMock)
+    kafkaApis.handleDescribeTokensRequest(request)
+
+    val response = verifyNoThrottling[DescribeDelegationTokenResponse](request)
+    assertEquals(Errors.NONE.code, response.error.code)
+    assertTrue(response.tokens.isEmpty,
+      "tokens with a foreign-tenant tokenRequester must be scrubbed (HMAC + identity leak)")
+  }
+
+  @Test
+  def testDescribeDelegationTokenSameTenantCallerSeesOwnTokens(): Unit = {
+    // Legitimate path: tenant principal asks for its own tokens on its own
+    // listener. The owner-filter resolves to the caller's effective tenant,
+    // so the gate must let it through and the scrub must not strip own-tenant
+    // tokens.
+    val ownTenantToken = newDelegationToken(newTokenInformation(
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_acme.alice"),
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_acme.alice"),
+      "tok-own"))
+    val tokenManagerMock = mock(classOf[DelegationTokenManager])
+    when(tokenManagerMock.getTokens(any())).thenReturn(List(ownTenantToken))
+
+    val owners = util.List.of(new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_acme.alice"))
+    val describeRequest = new DescribeDelegationTokenRequest.Builder(owners).build()
+    val request = buildRequest(
+      describeRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(
+      overrideProperties = tokenAuthEnabledProps,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER),
+      tokenManager = tokenManagerMock)
+    kafkaApis.handleDescribeTokensRequest(request)
+
+    val response = verifyNoThrottling[DescribeDelegationTokenResponse](request)
+    assertEquals(Errors.NONE.code, response.error.code,
+      "a same-tenant caller is not refused on its own owner-filter")
+    assertEquals(1, response.tokens.size,
+      "the scrub must not strip own-tenant tokens from the result")
+  }
+
+  @Test
+  def testDescribeDelegationTokenClusterWideCallerSeesOnlyRegularTokens(): Unit = {
+    // Regression test: a cluster-wide caller asking for a regular user gets
+    // the full unfiltered behavior (Errors.NONE) and the scrub passes only
+    // non-tenant tokens through. Pins both the no-refusal path and the
+    // scrub's pass-through.
+    val regularToken = newDelegationToken(newTokenInformation(
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "regular-user"),
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "regular-user"),
+      "tok-regular"))
+    val tokenManagerMock = mock(classOf[DelegationTokenManager])
+    when(tokenManagerMock.getTokens(any())).thenReturn(List(regularToken))
+
+    val owners = util.List.of(new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "regular-user"))
+    val describeRequest = new DescribeDelegationTokenRequest.Builder(owners).build()
+    val request = buildRequest(
+      describeRequest,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    kafkaApis = createKafkaApis(
+      overrideProperties = tokenAuthEnabledProps,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER),
+      tokenManager = tokenManagerMock)
+    kafkaApis.handleDescribeTokensRequest(request)
+
+    val response = verifyNoThrottling[DescribeDelegationTokenResponse](request)
+    assertEquals(Errors.NONE.code, response.error.code)
+    assertEquals(1, response.tokens.size)
+    assertEquals("tok-regular", response.tokens.get(0).tokenInfo.tokenId)
+  }
+
+  @Test
+  def testDescribeDelegationTokenUnknownTenantPrefixOwnerForwarded(): Unit = {
+    // Per the mint-guard convention, an unknown-tenant prefix
+    // (`__tenant_xyz.*` when xyz is not a registered tenant) is opaque to the
+    // broker: it does not represent any actual tenant principal namespace, so
+    // the broker neither refuses the lookup nor scrubs the response. The
+    // request flows through to tokenManager.getTokens, which will simply
+    // return nothing matching that opaque owner.
+    val tokenManagerMock = mock(classOf[DelegationTokenManager])
+    when(tokenManagerMock.getTokens(any())).thenReturn(List.empty[DelegationToken])
+
+    val owners = util.List.of(new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_xyz.dave"))
+    val describeRequest = new DescribeDelegationTokenRequest.Builder(owners).build()
+    val request = buildRequest(
+      describeRequest,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    kafkaApis = createKafkaApis(
+      overrideProperties = tokenAuthEnabledProps,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER),
+      tokenManager = tokenManagerMock)
+    kafkaApis.handleDescribeTokensRequest(request)
+
+    val response = verifyNoThrottling[DescribeDelegationTokenResponse](request)
+    assertEquals(Errors.NONE.code, response.error.code,
+      "unknown-tenant prefix is opaque and not refused on the request side")
+    assertTrue(response.tokens.isEmpty)
+    verify(tokenManagerMock).getTokens(any())
   }
 
   // ---------------------------------------------------------------------------
