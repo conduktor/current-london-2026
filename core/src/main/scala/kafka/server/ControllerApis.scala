@@ -58,6 +58,8 @@ import org.apache.kafka.common.security.auth.KafkaPrincipal
 import org.apache.kafka.common.security.auth.SecurityProtocol
 import org.apache.kafka.server.authorizer.Authorizer
 import org.apache.kafka.server.common.{ApiMessageAndVersion, RequestLocal}
+import org.apache.kafka.server.config.ServerConfigs
+import org.apache.kafka.storage.internals.concentration.LogicalTopicConfigParser
 
 import scala.jdk.CollectionConverters._
 
@@ -85,6 +87,28 @@ class ControllerApis(
   val requestHelper = new RequestHandlerHelper(requestChannel, quotas, time)
   val runtimeLoggerManager = new RuntimeLoggerManager(config.nodeId, logger.underlying)
   private val aclApis = new AclApis(authHelper, authorizer, requestHelper, "controller", config)
+
+  // r15 BLOCKER N3 — cluster-wide shadow gate for CreateTopics.
+  //
+  // The broker-side interceptor (KafkaApis.maybeForwardCreateTopicsRejectingLogicalShadow) is a
+  // fast path: a broker rejects requests for names it knows are logical declarations LOCALLY.
+  // It can't catch cross-broker TOCTOU — broker B without "orders" declared forwards a
+  // CreateTopics("orders") that broker A's metadata layer treats as a shadow once KRaft
+  // propagates it. By then the physical "orders" already exists in metadata; the rescue path
+  // is shadow-overlay narrowing the data-corruption window to a retriable
+  // UNKNOWN_TOPIC_OR_PARTITION, but the create itself has already succeeded.
+  //
+  // The cluster-wide fix is to enforce shadow rejection on the CONTROLLER, which is the single
+  // serialization point for topic creation. The controller parses its own
+  // concentration.logical.topics — operators are expected to configure the cluster-wide
+  // declaration set on the controller node(s); see PROMPT.md for the v1 operational model.
+  // Brokers may still hold a subset (e.g., staged rollout) without breaking the gate.
+  //
+  // Computed once at construction; declarations are static broker config in v1.
+  private val declaredLogicalTopicNames: Set[String] = {
+    val raw = config.getString(ServerConfigs.CONCENTRATION_LOGICAL_TOPICS_CONFIG)
+    LogicalTopicConfigParser.parse(raw).asScala.iterator.map(_.logicalName()).toSet
+  }
 
   def isClosed: Boolean = aclApis.isClosed
 
@@ -411,13 +435,41 @@ class ControllerApis(
     } else {
       getCreatableTopics.apply(allowedTopicNames)
     }
+    // Names that pass authorization but collide with a logical declaration configured on this
+    // controller — synthesize TOPIC_ALREADY_EXISTS so the physical topic is never created and
+    // can't shadow the logical mapping on any broker that holds the declaration. Unauthorized
+    // colliding names take the AUTHORIZATION_FAILED path below (precedence: auth wins, matches
+    // the broker-side interceptor in KafkaApis.maybeForwardCreateTopicsRejectingLogicalShadow).
+    val shadowedNames: Set[String] = if (declaredLogicalTopicNames.isEmpty) {
+      Set.empty
+    } else {
+      authorizedTopicNames.iterator.filter(declaredLogicalTopicNames.contains).toSet
+    }
+    if (shadowedNames.nonEmpty) {
+      // Charge controller mutation quota for shadow-rejected topics (r16 MEDIUM N3-followup).
+      // The controller's normal createTopics path records the quota internally; we short-circuit
+      // before reaching it, so without this an authorized client could probe the entire declared
+      // logical-topic set by sending bulk CreateTopics requests and observing TOPIC_ALREADY_EXISTS
+      // verdicts at zero quota cost (cheap DoS / declaration-enumeration oracle). Per-topic
+      // accounting matches the controller's own charge: numPartitions per topic, with -1
+      // (broker-default) treated as 1 — the minimum needed to ensure each shadow-rejected name
+      // costs something. applyPartitionChangeQuota throws ThrottlingQuotaExceededException on
+      // exhaustion, which propagates as THROTTLING_QUOTA_EXCEEDED — same surface as a normal
+      // controller-side quota hit.
+      val shadowedPartitionCharge = request.topics().asScala.iterator
+        .filter(t => shadowedNames.contains(t.name))
+        .map(t => Math.max(1, t.numPartitions))
+        .sum
+      context.applyPartitionChangeQuota(shadowedPartitionCharge)
+    }
     val describableTopicNames = getDescribableTopics.apply(allowedTopicNames).asJava
     val effectiveRequest = request.duplicate()
     val iterator = effectiveRequest.topics().iterator()
     while (iterator.hasNext) {
       val creatableTopic = iterator.next()
       if (duplicateTopicNames.contains(creatableTopic.name()) ||
-          !authorizedTopicNames.contains(creatableTopic.name())) {
+          !authorizedTopicNames.contains(creatableTopic.name()) ||
+          shadowedNames.contains(creatableTopic.name())) {
         iterator.remove()
       }
     }
@@ -439,6 +491,12 @@ class ControllerApis(
             setName(name).
             setErrorCode(TOPIC_AUTHORIZATION_FAILED.code).
             setErrorMessage("Authorization failed."))
+        } else if (shadowedNames.contains(name)) {
+          response.topics().add(new CreatableTopicResult().
+            setName(name).
+            setErrorCode(TOPIC_ALREADY_EXISTS.code).
+            setErrorMessage("Topic name collides with a declared logical topic on this " +
+              "controller; refusing to create a physical topic that would shadow it."))
         }
       }
       response

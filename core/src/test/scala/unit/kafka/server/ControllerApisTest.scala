@@ -771,6 +771,123 @@ class ControllerApisTest {
     }
   }
 
+  /**
+   * r15 BLOCKER N3 — Cross-broker TOCTOU on CreateTopics shadow.
+   *
+   * The controller is the single serialization point for topic creation. A broker that does
+   * not hold the logical declaration for "orders" forwards a CreateTopics("orders") that
+   * propagates back to a broker that DOES hold it; without controller-side enforcement, the
+   * physical topic gets created and the broker-side shadow overlay narrows the window but
+   * does not prevent the create. This test pins the controller-side rejection: authorized
+   * names that collide with a declared logical topic short-circuit to TOPIC_ALREADY_EXISTS.
+   */
+  @Test
+  def testCreateTopicsRejectsDeclaredLogicalShadow(): Unit = {
+    val controller = new MockController.Builder().build()
+    val props = new Properties()
+    props.put(ServerConfigs.CONCENTRATION_LOGICAL_TOPICS_CONFIG, "orders:100:shared:4")
+    controllerApis = createControllerApis(None, controller, props)
+    val request = new CreateTopicsRequestData().setTopics(new CreatableTopicCollection(
+      util.Arrays.asList(
+        new CreatableTopic().setName("orders").setNumPartitions(1).setReplicationFactor(3),
+        new CreatableTopic().setName("safe").setNumPartitions(1).setReplicationFactor(3),
+      ).iterator()))
+    val expectedResponse = Set(
+      new CreatableTopicResult().setName("orders").
+        setErrorCode(TOPIC_ALREADY_EXISTS.code()).
+        setErrorMessage("Topic name collides with a declared logical topic on this " +
+          "controller; refusing to create a physical topic that would shadow it."),
+      new CreatableTopicResult().setName("safe").
+        setErrorCode(NONE.code()).
+        setTopicId(new Uuid(0L, 1L)).
+        setNumPartitions(1).
+        setReplicationFactor(3).
+        setTopicConfigErrorCode(NONE.code()))
+    assertEquals(expectedResponse, controllerApis.createTopics(ANONYMOUS_CONTEXT, request,
+      hasClusterAuth = true,
+      _ => Set("orders", "safe"),
+      _ => Set("orders", "safe")).get().topics().asScala.toSet)
+  }
+
+  /**
+   * r15 BLOCKER N3 — auth precedence on the controller side.
+   *
+   * When a name is BOTH unauthorized AND a logical-shadow collider, the controller must
+   * return TOPIC_AUTHORIZATION_FAILED, not TOPIC_ALREADY_EXISTS. The shadow verdict would
+   * leak the existence of the declared logical topic to a principal with no DESCRIBE rights.
+   * This mirrors the broker-side interceptor's precedence rule.
+   */
+  @Test
+  def testCreateTopicsShadowDefersToAuthorizationFailure(): Unit = {
+    val controller = new MockController.Builder().build()
+    val props = new Properties()
+    props.put(ServerConfigs.CONCENTRATION_LOGICAL_TOPICS_CONFIG, "orders:100:shared:4,payments:50:shared:4")
+    controllerApis = createControllerApis(None, controller, props)
+    val request = new CreateTopicsRequestData().setTopics(new CreatableTopicCollection(
+      util.Arrays.asList(
+        new CreatableTopic().setName("orders").setNumPartitions(1).setReplicationFactor(3),
+        new CreatableTopic().setName("payments").setNumPartitions(1).setReplicationFactor(3),
+        new CreatableTopic().setName("neither").setNumPartitions(1).setReplicationFactor(3),
+      ).iterator()))
+    val expectedResponse = Set(
+      new CreatableTopicResult().setName("orders").
+        setErrorCode(TOPIC_ALREADY_EXISTS.code()).
+        setErrorMessage("Topic name collides with a declared logical topic on this " +
+          "controller; refusing to create a physical topic that would shadow it."),
+      new CreatableTopicResult().setName("payments").
+        setErrorCode(TOPIC_AUTHORIZATION_FAILED.code()).
+        setErrorMessage("Authorization failed."),
+      new CreatableTopicResult().setName("neither").
+        setErrorCode(NONE.code()).
+        setTopicId(new Uuid(0L, 1L)).
+        setNumPartitions(1).
+        setReplicationFactor(3).
+        setTopicConfigErrorCode(NONE.code()))
+    assertEquals(expectedResponse, controllerApis.createTopics(ANONYMOUS_CONTEXT, request,
+      hasClusterAuth = false,
+      _ => Set("orders", "neither"),
+      _ => Set("orders", "neither")).get().topics().asScala.toSet)
+  }
+
+  /**
+   * r16 MEDIUM N3-followup — shadow-rejected names must consume mutation quota.
+   *
+   * The controller's own createTopics path records the quota internally; we short-circuit
+   * before reaching it for shadowed names, so without explicit accounting an authorized
+   * client could probe the entire declared-logical-topic set at zero quota cost — a cheap
+   * DoS / declaration-enumeration oracle. Verify that the quota recorder is invoked with
+   * the sum of shadowed numPartitions.
+   */
+  @Test
+  def testCreateTopicsShadowChargesMutationQuota(): Unit = {
+    val controller = new MockController.Builder().build()
+    val props = new Properties()
+    props.put(ServerConfigs.CONCENTRATION_LOGICAL_TOPICS_CONFIG, "orders:100:shared:4,payments:50:shared:4")
+    controllerApis = createControllerApis(None, controller, props)
+    val request = new CreateTopicsRequestData().setTopics(new CreatableTopicCollection(
+      util.Arrays.asList(
+        new CreatableTopic().setName("orders").setNumPartitions(7).setReplicationFactor(3),
+        new CreatableTopic().setName("payments").setNumPartitions(3).setReplicationFactor(3),
+        new CreatableTopic().setName("safe").setNumPartitions(1).setReplicationFactor(3),
+      ).iterator()))
+    val quotaCharges = new util.ArrayList[Integer]()
+    val ctx = org.apache.kafka.controller.ControllerRequestContextUtil.anonymousContextFor(
+      ApiKeys.CREATE_TOPICS,
+      ApiKeys.CREATE_TOPICS.latestVersion(),
+      new java.util.function.Consumer[Integer]() {
+        override def accept(permits: Integer): Unit = quotaCharges.add(permits)
+      })
+    controllerApis.createTopics(ctx, request,
+      hasClusterAuth = true,
+      _ => Set("orders", "payments", "safe"),
+      _ => Set("orders", "payments", "safe")).get()
+    // Two shadow-rejected names: "orders" (7 partitions) + "payments" (3 partitions) = 10 permits.
+    // We assert containment (not equality) because the MockController inside createTopics may
+    // also invoke the recorder for the "safe" topic that it actually creates.
+    assertTrue(quotaCharges.contains(10),
+      s"expected shadow-rejection to charge 10 mutation-quota permits; got $quotaCharges")
+  }
+
   @Test
   def testDeleteTopicsByName(): Unit = {
     val fooId = Uuid.fromString("vZKYST0pSA2HO5x_6hoO2Q")
