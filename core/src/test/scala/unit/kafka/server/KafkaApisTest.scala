@@ -11754,4 +11754,66 @@ class KafkaApisTest extends Logging {
     verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
       any[AbstractRequest](), any[Option[AbstractResponse] => Unit]())
   }
+
+  @Test
+  def testNonV1ApiFromTenantPrincipalIsRefusedAtDispatch(): Unit = {
+    // PROMPT.md fixes v1 to {Produce, Fetch, Metadata, CreateTopics, DeleteTopics,
+    // ListTopics}. A tenant principal calling any other API (here ListOffsets)
+    // has no tenant-aware handler to rewrite their request — passing through
+    // would leak physical names or pollute another tenant's namespace. The
+    // dispatch-level gate refuses the request without ever entering the handler.
+    val targetTimes = util.Arrays.asList(new ListOffsetsTopic()
+      .setName("orders")
+      .setPartitions(util.Arrays.asList(new ListOffsetsPartition()
+        .setPartitionIndex(0)
+        .setTimestamp(ListOffsetsRequest.EARLIEST_TIMESTAMP))))
+    val listOffsetsRequest = ListOffsetsRequest.Builder.forConsumer(true, IsolationLevel.READ_UNCOMMITTED)
+      .setTargetTimes(targetTimes).build()
+    val request = buildRequest(listOffsetsRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handle(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[ListOffsetsResponse](request)
+    val errorCodes = response.data.topics.asScala.flatMap(_.partitions.asScala.map(_.errorCode))
+    assertTrue(errorCodes.nonEmpty, "expected at least one partition in the synthesized error response")
+    assertTrue(errorCodes.forall(_ == Errors.TOPIC_AUTHORIZATION_FAILED.code),
+      "tenant principal calling a non-v1 API must be refused with TOPIC_AUTHORIZATION_FAILED")
+  }
+
+  @Test
+  def testNonV1ApiFromPrivilegedCallerOnTenantBoundListenerIsRefusedAtDispatch(): Unit = {
+    // The silent-pollution trap extends to every non-v1 API: a super-user on a
+    // tenant-bound listener without a `__tenant_` prefix in their principal
+    // would otherwise reach the handler with a tenant-bound listener context.
+    // The dispatch-level gate refuses before ListOffsets / DeleteRecords /
+    // AlterConfigs / DescribeAcls can read or mutate cluster state under the
+    // implicit tenant binding.
+    val targetTimes = util.Arrays.asList(new ListOffsetsTopic()
+      .setName("orders")
+      .setPartitions(util.Arrays.asList(new ListOffsetsPartition()
+        .setPartitionIndex(0)
+        .setTimestamp(ListOffsetsRequest.EARLIEST_TIMESTAMP))))
+    val listOffsetsRequest = ListOffsetsRequest.Builder.forConsumer(true, IsolationLevel.READ_UNCOMMITTED)
+      .setTargetTimes(targetTimes).build()
+    val request = buildRequest(listOffsetsRequest,
+      listenerName = TENANT_LISTENER,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "Alice")) // no tenant prefix
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handle(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[ListOffsetsResponse](request)
+    val errorCodes = response.data.topics.asScala.flatMap(_.partitions.asScala.map(_.errorCode))
+    assertTrue(errorCodes.nonEmpty, "expected at least one partition in the synthesized error response")
+    assertTrue(errorCodes.forall(_ == Errors.TOPIC_AUTHORIZATION_FAILED.code),
+      "privileged caller on tenant listener must be refused on non-v1 APIs without ever reaching the handler")
+  }
+
 }

@@ -389,6 +389,27 @@ class KafkaApis(val requestChannel: RequestChannel,
         throw new IllegalStateException(s"API ${request.header.apiKey} with version ${request.header.apiVersion} is not enabled")
       }
 
+      // Refuse any non-v1 API arriving in a tenant-scoped context. The handler
+      // table below assumes per-API tenant awareness; for everything outside
+      // v1 there is no rewrite path, and a silent pass-through would either
+      // leak physical topic / group / txn names or let a privileged caller on
+      // a tenant-bound listener mutate cluster-wide state. PROMPT.md fixes v1
+      // to {Produce, Fetch, Metadata, CreateTopics, DeleteTopics, ListTopics}
+      // and ListTopics is just the all-topics variant of Metadata. See
+      // KafkaApis.TENANT_ALLOWED_APIS — the allow-list also covers connection
+      // setup (SASL/API_VERSIONS) so a tenant-bound listener stays reachable
+      // for auth.
+      if (!KafkaApis.TENANT_ALLOWED_APIS.contains(request.header.apiKey)) {
+        val tenantCtx = tenantContextFor(request)
+        if (tenantCtx.effectiveTenant.isPresent) {
+          info(s"Refusing ${request.header.apiKey} from tenant-scoped context " +
+            s"(principal=${request.context.principal}, listener=${request.context.listenerName}, " +
+            s"correlation id ${request.header.correlationId}, client id ${request.header.clientId})")
+          requestHelper.sendErrorResponseMaybeThrottle(request, Errors.TOPIC_AUTHORIZATION_FAILED.exception)
+          return
+        }
+      }
+
       request.header.apiKey match {
         case ApiKeys.PRODUCE => handleProduceRequest(request, requestLocal)
         case ApiKeys.FETCH => handleFetchRequest(request)
@@ -3919,6 +3940,27 @@ class KafkaApis(val requestChannel: RequestChannel,
 }
 
 object KafkaApis {
+  // The set of APIs a tenant-scoped context is allowed to invoke. v1 tenancy
+  // covers Produce / Fetch / Metadata / CreateTopics / DeleteTopics — every
+  // other request handler can read or mutate cluster state without going
+  // through the logical→physical rewrite, so the safest thing is to refuse
+  // them at the dispatch boundary rather than let a partially tenant-aware
+  // handler leak physical names or pollute another tenant's namespace.
+  // SASL_HANDSHAKE / SASL_AUTHENTICATE / API_VERSIONS happen during connection
+  // setup before a tenant identity is meaningful and must remain reachable.
+  // Note: ListTopics is the all-topics variant of Metadata and is covered by
+  // ApiKeys.METADATA.
+  private[server] val TENANT_ALLOWED_APIS: Set[ApiKeys] = Set(
+    ApiKeys.PRODUCE,
+    ApiKeys.FETCH,
+    ApiKeys.METADATA,
+    ApiKeys.CREATE_TOPICS,
+    ApiKeys.DELETE_TOPICS,
+    ApiKeys.SASL_HANDSHAKE,
+    ApiKeys.SASL_AUTHENTICATE,
+    ApiKeys.API_VERSIONS
+  )
+
   // Traffic from both in-sync and out of sync replicas are accounted for in replication quota to ensure total replication
   // traffic doesn't exceed quota.
   // TODO: remove resolvedResponseData method when sizeOf can take a data object.
