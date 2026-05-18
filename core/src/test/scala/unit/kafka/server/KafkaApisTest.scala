@@ -11735,6 +11735,44 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testDeleteTopicsTenantScrubsErrorMessageWhenControllerOmitsTopicName(): Unit = {
+    // Defence-in-depth: when the controller can't resolve the topic id and
+    // returns `name=null`, errorMessage may still embed a physical name like
+    // "topic acme.orders not found". The broker must scrub that string before
+    // surfacing it to the tenant — otherwise the prefix leaks through the
+    // name=null escape hatch.
+    val deleteRequest = new DeleteTopicsRequest.Builder(new DeleteTopicsRequestData()
+      .setTopics(util.Arrays.asList(new DeleteTopicsRequestData.DeleteTopicState().setName("orders")))
+      .setTimeoutMs(5000)).build()
+    val request = buildRequest(
+      deleteRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDeleteTopicsRequest(request)
+
+    val (_, callback) = captureForwardedDeleteTopics(request)
+    val controllerResponse = new DeleteTopicsResponse(new DeleteTopicsResponseData()
+      .setResponses(new DeleteTopicsResponseData.DeletableTopicResultCollection(
+        Collections.singleton(new DeleteTopicsResponseData.DeletableTopicResult()
+          .setName(null)
+          .setErrorCode(Errors.UNKNOWN_TOPIC_ID.code)
+          .setErrorMessage("Topic acme.orders could not be resolved.")).iterator)))
+    callback(Some(controllerResponse))
+
+    val response = verifyNoThrottling[DeleteTopicsResponse](request)
+    val result = response.data.responses.asScala.head
+    assertNull(result.name, "passthrough rows keep null name")
+    assertEquals(Errors.UNKNOWN_TOPIC_ID.code, result.errorCode)
+    assertNotNull(result.errorMessage)
+    assertFalse(result.errorMessage.contains("acme.orders"),
+      s"physical topic name must be scrubbed from passthrough errorMessage: ${result.errorMessage}")
+    assertTrue(result.errorMessage.contains("orders"),
+      s"logical name should remain visible to the tenant: ${result.errorMessage}")
+  }
+
+  @Test
   def testDeleteTopicsTenantBoundaryViolationByIdReturnsUnknownTopicId(): Unit = {
     // Tenant submits delete-by-id for a UUID that the broker can resolve to a
     // foreign tenant's physical topic ("beta.orders"). The broker MUST pre-

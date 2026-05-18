@@ -495,8 +495,11 @@ class KafkaApis(val requestChannel: RequestChannel,
         resp.data.responses.forEach { r =>
           val physical = r.name
           val rebuilt = if (physical == null) {
-            // controller could not resolve the id (UNKNOWN_TOPIC_ID etc); pass through.
-            r.duplicate()
+            // Controller could not resolve the id (UNKNOWN_TOPIC_ID etc). The
+            // name field is null, but errorMessage may still embed a physical
+            // topic name (e.g. "topic foo.bar was deleted") — scrub it before
+            // surfacing to the tenant.
+            r.duplicate().setErrorMessage(scrubMessage(r.errorMessage, ctx))
           } else if (ctx.belongsToTenant(physical)) {
             val logical = physicalToLogical.getOrElse(physical, ctx.toLogical(physical))
             r.duplicate().setName(logical).setErrorMessage(scrubMessage(r.errorMessage, ctx))
