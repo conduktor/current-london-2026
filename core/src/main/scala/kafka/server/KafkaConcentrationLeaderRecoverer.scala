@@ -1,0 +1,294 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package kafka.server
+
+import kafka.cluster.Partition
+import kafka.log.LogManager
+import org.apache.kafka.common.TopicPartition
+import org.apache.kafka.common.utils.KafkaThread
+import org.apache.kafka.storage.internals.concentration.{ConcentrationKernel, LogicalPartition}
+import org.slf4j.LoggerFactory
+
+import java.util.concurrent.{ExecutorService, Executors, ThreadFactory, TimeUnit}
+import java.util.concurrent.atomic.AtomicLong
+
+/**
+ * Per-partition leader-acquisition recovery for backing topics.
+ *
+ * Wires the third leg of GAP 2 from Codex's review: when this broker becomes leader of a
+ * backing topic-partition, the in-memory tracker and on-disk sidecars for every logical
+ * partition mapped onto that backing may be stale (rebuilt against a prior leader's view) or
+ * missing (the broker was never leader since startup). Until the rebuild lands, the per-backing
+ * readiness gate (B.1/B.2) keeps every logical Produce/Fetch/ListOffsets/DeleteRecords routed
+ * to that backing rejected with {@code NOT_LEADER_OR_FOLLOWER}. This recoverer is what closes
+ * the gate from "rebuilt" → "open".
+ *
+ * <h3>Lifecycle</h3>
+ *
+ * Called from {@link ReplicaManager#applyLocalLeadersDelta} immediately after a successful
+ * {@code partition.makeLeader(...)}. Per Codex Q2, that is the right seam — late enough that
+ * local partition leadership exists (so {@code logManager.getLog(tp)} is meaningful), early
+ * enough that the broker hasn't yet advertised this partition as ready to serve.
+ *
+ * Each invocation:
+ *  1. closes the gate via {@code kernel.markBackingUnready(backingTp)} — this bumps the
+ *     per-backing generation token by 1;
+ *  2. captures the new generation;
+ *  3. submits a Runnable to the recovery executor that scans the backing log from
+ *     {@code logStartOffset} to {@code logEndOffset}, applies the rebuilt sidecar state via
+ *     {@code kernel.recoverFromBackingScan}, and finally publishes by calling
+ *     {@code kernel.publishIfGenerationMatches(backingTp, generation, no-op)} which flips the
+ *     gate back to ready under the per-key lock IFF the generation is still current.
+ *
+ * If makeLeader fails or another leadership transition arrives before the scan finishes, the
+ * listener-driven {@code markBackingUnready} bumps generation again. When the scan eventually
+ * completes its {@code publishIfGenerationMatches} call returns {@code false}, the gate stays
+ * closed, and the recoverer trusts the next leader-acquisition event to retry. State written
+ * by the stale scan is hidden behind the closed gate until that next acquisition's scan
+ * overwrites it (the {@code recoverFromBackingScan} path truncates the sidecar before
+ * rebuilding it, so stale on-disk state is naturally evicted on retry).
+ *
+ * <h3>Why in-place rebuild rather than atomic snapshot</h3>
+ *
+ * Codex Q3 recommended "publish recovered sidecar state by atomic snapshot replacement, not
+ * incremental mutation visible to readers." This recoverer does {@em incremental mutation}
+ * (via {@code recoverFromBackingScan} which truncates + refills sidecar files in place) but
+ * under a {@em closed gate}: every concurrent reader sees {@code isBackingReady → false} and
+ * is rejected with {@code NOT_LEADER_OR_FOLLOWER} before consulting any tracker state. The
+ * gate-open transition is itself the atomic publish: it happens under
+ * {@code ConcurrentHashMap.compute()}'s per-key lock inside
+ * {@code publishIfGenerationMatches}, so a reader either sees gate-closed (and is rejected)
+ * or gate-open (and reads the final state).
+ *
+ * The observable contract this maintains: a gate-open backing always reflects the latest
+ * applied scan. Codex's "snapshot replacement" recommendation makes a stronger invariant
+ * ("on-disk state during scan never reflects a partial rebuild"), but the gate-closed
+ * invisibility window is sufficient for v1 correctness. A follow-up may add snapshot
+ * replacement if a partial-mutation-during-scan reader path is added (it is not currently).
+ *
+ * <h3>Threading</h3>
+ *
+ * Recoveries for different backing partitions are independent (each touches a disjoint set of
+ * sidecars; the kernel's per-(logicalTopic, logicalPartition) data structures are
+ * thread-safe). The recoverer runs them on a small dedicated thread pool — independent of the
+ * data-plane request handlers and the metadata-publishing thread — so a long scan on one
+ * backing does not block leader-acquisition for another. The pool size is small (4 by
+ * default) because the scan is I/O-bound on the backing log and the marginal speedup from a
+ * larger pool is dominated by disk contention.
+ *
+ * Recoveries for the {@em same} backing partition are NOT explicitly serialised here; the
+ * generation-token CAS in {@code publishIfGenerationMatches} is the correctness gate. If
+ * recovery N is still running when leader-acquisition N+1 schedules recovery N+1, both may
+ * mutate sidecar files concurrently. The kernel's per-(logicalTopic, logicalPartition)
+ * sidecar locks serialise their actual file writes; recovery N's publish will see a moved
+ * generation and return false; recovery N+1's publish wins.
+ *
+ * <h3>Shutdown</h3>
+ *
+ * {@link #close} drains the executor with a bounded timeout, then forcibly cancels remaining
+ * tasks. In-flight scans see a "no log" or "log closed" exception and abort cleanly — the
+ * gate stays closed so any partial state is invisible.
+ */
+class KafkaConcentrationLeaderRecoverer(
+    kernel: ConcentrationKernel,
+    logManager: LogManager,
+    executor: ExecutorService,
+    readBufferBytes: Int = 1 << 20) extends AutoCloseable {
+
+  import KafkaConcentrationLeaderRecoverer._
+
+  /**
+   * Called by ReplicaManager.applyLocalLeadersDelta after a successful makeLeader on a backing
+   * topic partition. Synchronous, fast (no I/O on the caller's thread): closes the gate,
+   * captures (epoch, generation), submits the scan. Returns immediately.
+   *
+   * If {@code backingTp.topic} is not a declared backing topic, this is a no-op. Caller is
+   * expected to filter via {@code kernel.isBackingTopic(...)} before invoking, to keep the
+   * applyLocalLeadersDelta hot path free of unnecessary work — but this method tolerates a
+   * non-backing call (returns silently rather than throwing) so it can be wired without
+   * order-of-operation surprises.
+   */
+  def onMakeLeader(backingTp: TopicPartition, partition: Partition): Unit = {
+    if (!kernel.isBackingTopic(backingTp.topic)) return
+
+    // Close the gate (bumps generation). This is the source-of-truth invalidation: every
+    // logical-topic read/write routed to this backing now sees gate-closed until the scan
+    // republishes. Done synchronously on the caller's thread so there is no observable
+    // window where a logical request can land between "the partition is locally leader" and
+    // "the gate is closed".
+    kernel.markBackingUnready(backingTp)
+    val capturedGeneration = kernel.currentGeneration(backingTp)
+    val capturedEpoch = partition.getLeaderEpoch
+    val filter = kernel.logicalPartitionsForBacking(backingTp)
+
+    if (filter.isEmpty) {
+      // No logical partitions mapped to this backing. Open the gate immediately: there is no
+      // sidecar state to rebuild, so the tracker's default (0, 0) is correct. A subsequent
+      // declare() of a new logical topic that maps onto this backing will go through the same
+      // makeLeader path the next time and trigger its own recovery.
+      val opened = kernel.publishIfGenerationMatches(backingTp, capturedGeneration, () => ())
+      if (!opened) {
+        log.info(s"Concentration recovery: gate for $backingTp at gen=$capturedGeneration not " +
+          "opened (generation changed between mark-unready and publish — another leadership " +
+          "event is in progress)")
+      }
+      return
+    }
+
+    val taskId = nextTaskId.incrementAndGet()
+    log.info(s"Concentration recovery [task=$taskId] queued for $backingTp at " +
+      s"epoch=$capturedEpoch gen=$capturedGeneration with ${filter.size} logical partition(s)")
+
+    val runnable: Runnable = () => runScan(taskId, backingTp, partition, capturedEpoch,
+      capturedGeneration, filter)
+    try {
+      executor.submit(runnable)
+    } catch {
+      case ex: java.util.concurrent.RejectedExecutionException =>
+        // Executor shut down. Gate stays closed; next leadership event will retry. We log at
+        // info, not warn — a shutting-down broker isn't a fault; logical traffic on this
+        // backing will just continue to see NOT_LEADER_OR_FOLLOWER until shutdown completes.
+        log.info(s"Concentration recovery [task=$taskId] rejected for $backingTp " +
+          s"(executor shut down); gate stays closed: ${ex.getMessage}")
+    }
+  }
+
+  private def runScan(
+      taskId: Long,
+      backingTp: TopicPartition,
+      partition: Partition,
+      capturedEpoch: Int,
+      capturedGeneration: Long,
+      filter: java.util.Set[LogicalPartition]): Unit = {
+    val started = System.nanoTime()
+    try {
+      val unifiedLogOpt = logManager.getLog(backingTp)
+      if (unifiedLogOpt.isEmpty) {
+        // No local log for this backing partition. This is legitimate if the partition was
+        // just deleted or moved off this broker between makeLeader and the recoverer running.
+        // Try to publish (no-op) under the generation fence; either it opens an empty-state
+        // gate (the partition is still locally a backing-tp leader but with no data yet) or
+        // generation has moved on and we leave the gate closed for the next event to handle.
+        log.info(s"Concentration recovery [task=$taskId] $backingTp: no local UnifiedLog; " +
+          s"attempting empty-state publish at gen=$capturedGeneration")
+        kernel.publishIfGenerationMatches(backingTp, capturedGeneration, () => ())
+        return
+      }
+      val unifiedLog = unifiedLogOpt.get
+      val startOffset = unifiedLog.logStartOffset
+      val endOffset = unifiedLog.logEndOffset
+
+      if (startOffset >= endOffset) {
+        // Empty backing log. Default tracker state (0, 0) is correct for every logical
+        // partition on this backing. Just open the gate.
+        log.info(s"Concentration recovery [task=$taskId] $backingTp empty " +
+          s"([$startOffset, $endOffset)); opening gate at gen=$capturedGeneration")
+        kernel.publishIfGenerationMatches(backingTp, capturedGeneration, () => ())
+        return
+      }
+
+      // Cheap pre-fence: if the partition is no longer leader at the captured epoch, do not
+      // bother scanning. This is an optimisation, not a correctness gate — the correctness
+      // gate is the generation CAS at publish time. The epoch read is volatile so the worst
+      // case here is a spurious scan, never an incorrect publish.
+      val currentEpoch = partition.getLeaderEpoch
+      if (currentEpoch != capturedEpoch) {
+        log.info(s"Concentration recovery [task=$taskId] $backingTp: epoch moved " +
+          s"$capturedEpoch → $currentEpoch before scan started; aborting (gate stays closed)")
+        return
+      }
+
+      log.info(s"Concentration recovery [task=$taskId] $backingTp scanning " +
+        s"[$startOffset, $endOffset) for ${filter.size} logical partition(s)")
+      // Positional args match the existing call site in BackingLogScanRecovery; the iterator's
+      // third parameter is named `nextOffset` internally (it tracks the cursor) — we hand it
+      // the captured `startOffset` to begin the scan at the live logStartOffset.
+      val iter = new BackingLogPageIterator(unifiedLog, filter, readBufferBytes, startOffset, endOffset)
+      kernel.recoverFromBackingScan(iter)
+
+      val opened = kernel.publishIfGenerationMatches(backingTp, capturedGeneration, () => ())
+      val elapsedMs = (System.nanoTime() - started) / 1_000_000L
+      if (opened) {
+        log.info(s"Concentration recovery [task=$taskId] $backingTp completed in ${elapsedMs}ms " +
+          s"at epoch=$capturedEpoch gen=$capturedGeneration; gate open")
+      } else {
+        // Generation moved on while we were scanning. The state we wrote IS on disk, but it
+        // is hidden behind the closed gate. The next leadership event will trigger a fresh
+        // scan that overwrites it (recoverFromBackingScan truncates the sidecar before
+        // rebuilding).
+        log.info(s"Concentration recovery [task=$taskId] $backingTp scan finished in " +
+          s"${elapsedMs}ms but generation moved past gen=$capturedGeneration; state hidden, " +
+          "will be rebuilt on next leader acquisition")
+      }
+    } catch {
+      case t: Throwable =>
+        // Any throw leaves the gate closed (publishIfGenerationMatches was either not reached
+        // or itself preserves the closed state on throw). The next leadership event retries.
+        // Log at warn so operators see persistent failures; the gate-closed state surfaces
+        // as visible NOT_LEADER_OR_FOLLOWER on every logical request to the backing.
+        log.warn(s"Concentration recovery [task=$taskId] $backingTp FAILED at " +
+          s"epoch=$capturedEpoch gen=$capturedGeneration; gate stays closed: ${t.getMessage}", t)
+    }
+  }
+
+  /**
+   * Drain the recovery executor. Existing in-flight scans get up to {@code timeoutMs}
+   * milliseconds to finish; remaining tasks are forcibly cancelled. The kernel itself is NOT
+   * closed here — the caller (BrokerServer.shutdown) closes it separately so logical-topic
+   * data plane requests see a clean ConcentrationKernel.ensureOpen() failure rather than
+   * dangling state.
+   */
+  override def close(): Unit = {
+    executor.shutdown()
+    try {
+      if (!executor.awaitTermination(SHUTDOWN_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+        log.warn(s"Concentration recovery executor did not drain in ${SHUTDOWN_TIMEOUT_MS}ms; " +
+          "forcing cancellation of in-flight scans (gate stays closed for those backings)")
+        executor.shutdownNow()
+      }
+    } catch {
+      case _: InterruptedException =>
+        Thread.currentThread().interrupt()
+        executor.shutdownNow()
+    }
+  }
+}
+
+object KafkaConcentrationLeaderRecoverer {
+  private val log = LoggerFactory.getLogger(classOf[KafkaConcentrationLeaderRecoverer])
+
+  private val nextTaskId = new AtomicLong(0L)
+
+  // Bounded shutdown wait. Long enough to let typical scans finish (a few hundred MB of
+  // backing log at 1 MiB per page is well under a second of I/O), short enough that a
+  // pathological scan cannot stall broker shutdown indefinitely.
+  private val SHUTDOWN_TIMEOUT_MS: Long = 10_000L
+
+  /**
+   * Default pool: 4 threads. Backing-log scans are I/O-bound; oversizing the pool hurts more
+   * than it helps because page-cache contention dominates. 4 matches the typical number of
+   * I/O threads a broker uses for similar background tasks.
+   */
+  def newDefaultExecutor(brokerId: Int): ExecutorService = {
+    val tf: ThreadFactory = (r: Runnable) => KafkaThread.daemon(
+      s"concentration-leader-recovery-broker-$brokerId-${nextThreadIdx.incrementAndGet()}",
+      r)
+    Executors.newFixedThreadPool(4, tf)
+  }
+
+  private val nextThreadIdx = new AtomicLong(0L)
+}

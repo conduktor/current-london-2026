@@ -283,7 +283,8 @@ class ReplicaManager(val config: KafkaConfig,
                      addPartitionsToTxnManager: Option[AddPartitionsToTxnManager] = None,
                      val directoryEventHandler: DirectoryEventHandler = DirectoryEventHandler.NOOP,
                      val defaultActionQueue: ActionQueue = new DelayedActionQueue,
-                     concentrationKernel: Option[ConcentrationKernel] = None
+                     concentrationKernel: Option[ConcentrationKernel] = None,
+                     concentrationLeaderRecoverer: Option[KafkaConcentrationLeaderRecoverer] = None
                      ) extends Logging {
   private val metricsGroup = new KafkaMetricsGroup(this.getClass)
 
@@ -2764,6 +2765,30 @@ class ReplicaManager(val config: KafkaConfig,
     }
   }
 
+  /**
+   * Concentration: kick off per-backing leader-acquisition recovery (Codex GAP 2, leg three).
+   *
+   * Wired into {@code applyLocalLeadersDelta} immediately after a successful
+   * {@code partition.makeLeader(...)}. The recoverer synchronously closes the per-backing
+   * readiness gate (bumping its generation token), then submits the asynchronous rebuild scan
+   * — see {@link KafkaConcentrationLeaderRecoverer#onMakeLeader} for the full lifecycle.
+   *
+   * The {@code isBackingTopic} guard mirrors {@code maybeAttachConcentrationListener} so the
+   * recoverer is not consulted for the broker's everyday non-concentration partitions, keeping
+   * leader-acquisition for the typical topic free of kernel calls.
+   *
+   * Visible for testing.
+   */
+  private[server] def maybeStartConcentrationRecovery(tp: TopicPartition, partition: Partition): Unit = {
+    concentrationLeaderRecoverer.foreach { recoverer =>
+      concentrationKernel.foreach { kernel =>
+        if (kernel.isBackingTopic(tp.topic)) {
+          recoverer.onMakeLeader(tp, partition)
+        }
+      }
+    }
+  }
+
   private def applyLocalLeadersDelta(
     changedPartitions: mutable.Set[Partition],
     delta: TopicsDelta,
@@ -2786,6 +2811,15 @@ class ReplicaManager(val config: KafkaConfig,
           // maybeAddListener is idempotent across repeated leader-epoch bumps because
           // KafkaConcentrationPartitionListener overrides equals/hashCode.
           maybeAttachConcentrationListener(tp, partition)
+
+          // Concentration: leader-acquisition is the moment the per-backing tracker and
+          // sidecars may be stale (rebuilt against a prior leader) or absent (broker never
+          // led this partition since startup). The recoverer closes the readiness gate
+          // synchronously, then asynchronously rebuilds sidecar state from the backing log
+          // and re-opens the gate under a generation CAS — see Codex GAP 2, leg three.
+          // Listener is attached first because a delete/failure event that races with the
+          // recovery scan must already be wired to bump the generation token.
+          maybeStartConcentrationRecovery(tp, partition)
 
           changedPartitions.add(partition)
         } catch {

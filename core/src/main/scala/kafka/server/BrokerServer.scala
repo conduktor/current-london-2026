@@ -113,6 +113,7 @@ class BrokerServer(
   var logManager: LogManager = _
   var remoteLogManagerOpt: Option[RemoteLogManager] = None
   var concentrationKernel: ConcentrationKernel = _
+  var concentrationLeaderRecoverer: KafkaConcentrationLeaderRecoverer = _
 
   var tokenManager: DelegationTokenManager = _
 
@@ -376,6 +377,20 @@ class BrokerServer(
       // the kernel's recoverFromBackingScan for the operator-driven recovery API.
       concentrationKernel.recoverFromDisk()
 
+      // Concentration leader-acquisition recovery (Codex GAP 2, leg three).
+      //
+      // Constructed BEFORE ReplicaManager so that ReplicaManager can hold a reference and
+      // call onMakeLeader from applyLocalLeadersDelta. The recoverer needs (a) the kernel
+      // to mark unready / publish under generation CAS, and (b) LogManager to obtain the
+      // backing partition's UnifiedLog for scanning. Lifecycle is owned here in BrokerServer
+      // rather than inside ReplicaManager so its dedicated thread pool is observable in
+      // diagnostics alongside the other broker subsystems and so shutdown ordering stays
+      // explicit (drain scans → close kernel → close LogManager).
+      concentrationLeaderRecoverer = new KafkaConcentrationLeaderRecoverer(
+        concentrationKernel,
+        logManager,
+        KafkaConcentrationLeaderRecoverer.newDefaultExecutor(config.brokerId))
+
       this._replicaManager = new ReplicaManager(
         config = config,
         metrics = metrics,
@@ -395,7 +410,8 @@ class BrokerServer(
         addPartitionsToTxnManager = Some(addPartitionsToTxnManager),
         directoryEventHandler = directoryEventHandler,
         defaultActionQueue = defaultActionQueue,
-        concentrationKernel = Some(concentrationKernel)
+        concentrationKernel = Some(concentrationKernel),
+        concentrationLeaderRecoverer = Some(concentrationLeaderRecoverer)
       )
 
       /* start token manager */
@@ -857,6 +873,17 @@ class BrokerServer(
 
       if (replicaManager != null)
         CoreUtils.swallow(replicaManager.shutdown(), this)
+
+      // Concentration leader-acquisition recovery drains AFTER ReplicaManager has stopped
+      // submitting new leader transitions but BEFORE the kernel closes. The recoverer's
+      // in-flight scans call kernel.recoverFromBackingScan / publishIfGenerationMatches, so
+      // tearing the kernel down underneath them would surface as IllegalStateException from
+      // ensureOpen() rather than the gate-closed quiescence we want. close() is bounded
+      // (10s) and will shutdownNow() any stragglers — in-flight scans see an interrupt and
+      // abandon their gate-open publish, which leaves the gate closed and the next leader
+      // event will retry.
+      if (concentrationLeaderRecoverer != null)
+        CoreUtils.swallow(concentrationLeaderRecoverer.close(), this)
 
       // Close kernel BEFORE LogManager shuts down: the kernel's sidecar files live under
       // logManager.liveLogDirs.head, so we want our FDs released while the log dirs are still
