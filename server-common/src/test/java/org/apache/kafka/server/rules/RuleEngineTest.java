@@ -584,14 +584,16 @@ public class RuleEngineTest {
         IllegalArgumentException ex1 = org.junit.jupiter.api.Assertions
             .assertThrows(IllegalArgumentException.class,
                 () -> RuleEngine.parseBypassPrincipals(":broker"));
-        assertTrue(ex1.getMessage().contains("blank principal type"),
-            "exception should name the blank-type failure mode; got: " + ex1.getMessage());
+        assertTrue(ex1.getMessage().contains("principal type"),
+            "exception should name the principal-type failure mode; got: " + ex1.getMessage());
 
-        // Whitespace-only type is the same failure mode.
+        // Whitespace-only type is the same failure mode. Note the outer
+        // entry-trim strips ASCII whitespace from the segment, so
+        // "   :broker" becomes ":broker" → empty type still triggers.
         IllegalArgumentException ex2 = org.junit.jupiter.api.Assertions
             .assertThrows(IllegalArgumentException.class,
                 () -> RuleEngine.parseBypassPrincipals("   :broker"));
-        assertTrue(ex2.getMessage().contains("blank principal type"),
+        assertTrue(ex2.getMessage().contains("principal type"),
             "whitespace-only type must also be rejected; got: " + ex2.getMessage());
     }
 
@@ -603,15 +605,17 @@ public class RuleEngineTest {
         IllegalArgumentException ex1 = org.junit.jupiter.api.Assertions
             .assertThrows(IllegalArgumentException.class,
                 () -> RuleEngine.parseBypassPrincipals("User:"));
-        assertTrue(ex1.getMessage().contains("blank principal name"),
-            "exception should name the blank-name failure mode; got: " + ex1.getMessage());
+        assertTrue(ex1.getMessage().contains("principal name"),
+            "exception should name the principal-name failure mode; got: " + ex1.getMessage());
 
         // Whitespace-only name is the same failure mode. Note: SecurityUtils
-        // splits on the FIRST ':' only, so "User:   " yields name="   ".
+        // splits on the FIRST ':' only, so "User:   " yields name="   "
+        // (which we reject via inner-whitespace check before the
+        // KafkaPrincipal constructor canonicalises it differently).
         IllegalArgumentException ex2 = org.junit.jupiter.api.Assertions
             .assertThrows(IllegalArgumentException.class,
                 () -> RuleEngine.parseBypassPrincipals("User:   "));
-        assertTrue(ex2.getMessage().contains("blank principal name"),
+        assertTrue(ex2.getMessage().contains("principal name"),
             "whitespace-only name must also be rejected; got: " + ex2.getMessage());
     }
 
@@ -623,9 +627,64 @@ public class RuleEngineTest {
         org.junit.jupiter.api.Assertions.assertThrows(
             IllegalArgumentException.class,
             () -> RuleEngine.parseBypassPrincipals(":"));
-        // Whitespace-around-colon is the same.
+        // Whitespace-around-colon is the same — outer trim turns this into
+        // ':' before the principal parse runs.
         org.junit.jupiter.api.Assertions.assertThrows(
             IllegalArgumentException.class,
             () -> RuleEngine.parseBypassPrincipals("  :  "));
+    }
+
+    @Test
+    public void parseBypassPrincipalsThrowsOnInnerWhitespace() {
+        // Codex round-4 F2: SecurityUtils.parseKafkaPrincipal splits on the
+        // first ':' but does not strip whitespace from the components. So
+        // "User :broker" parses to KafkaPrincipal(type="User ", name="broker")
+        // whose canonical form is "User :broker" — but KafkaApis canonicalises
+        // a runtime peer principal as `getPrincipalType() + ":" + getName()`,
+        // which never carries an inner space. Result: the allow-list entry
+        // is silently unreachable, the parsed set is non-empty (so the
+        // BrokerServer empty-set guard does NOT fire), and we have an
+        // effective empty-bypass that the strict-empty-rejection was
+        // designed to prevent. Reject these entries at parse.
+        IllegalArgumentException ex1 = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals("User :broker"));
+        assertTrue(ex1.getMessage().contains("whitespace"),
+            "exception should name the whitespace failure mode; got: " + ex1.getMessage());
+
+        // Space prefix on the name side.
+        IllegalArgumentException ex2 = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals("User: broker"));
+        assertTrue(ex2.getMessage().contains("whitespace"),
+            "leading-whitespace name must be rejected; got: " + ex2.getMessage());
+
+        // Tab inside the type.
+        org.junit.jupiter.api.Assertions.assertThrows(
+            IllegalArgumentException.class,
+            () -> RuleEngine.parseBypassPrincipals("User\t:broker"));
+    }
+
+    @Test
+    public void parseBypassPrincipalsThrowsOnUnicodeBlankComponent() {
+        // Codex round-4 F2: String.trim() only strips ASCII whitespace (chars
+        // <= 0x20), so a non-breaking space (U+00A0) inside a component
+        // would survive the previous trim().isEmpty() check, producing an
+        // unreachable allow-list entry. String.isBlank() / String.strip()
+        // (Java 11+) treat all Unicode whitespace consistently, so we now
+        // catch this failure mode.
+        String nbsp = " ";
+        // Name is U+00A0 only — isBlank() reports true, parse must reject.
+        IllegalArgumentException ex = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals("User:" + nbsp));
+        assertTrue(ex.getMessage().contains("principal name"),
+            "NBSP-only name must be rejected via isBlank(); got: " + ex.getMessage());
+
+        // Type embeds a U+00A0 around an otherwise-valid name — strip
+        // equality check catches it.
+        org.junit.jupiter.api.Assertions.assertThrows(
+            IllegalArgumentException.class,
+            () -> RuleEngine.parseBypassPrincipals("User" + nbsp + ":broker"));
     }
 }

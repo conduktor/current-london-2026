@@ -517,12 +517,16 @@ class BrokerServer(
       // principal is enrolled. Operators must explicitly list the broker's
       // own authenticated principal (eg. `User:ANONYMOUS` for PLAINTEXT
       // inter-broker, or the SSL/SASL-derived principal otherwise).
+      //
+      // Codex round-4 F1: use `config.getString(...)` (resolves ConfigDef
+      // defaults) NOT `config.originals().get(...)` (raw input only —
+      // returns null when the operator leaves the config unset, defeating
+      // the ConfigDef default). The chosen production default is "" so the
+      // unset case correctly fails startup; tests set this explicitly via
+      // TestUtils.createBrokerConfig.
       val bypassPrincipals: java.util.Set[String] =
         RuleEngine.parseBypassPrincipals(
-          config.originals().get(ServerConfigs.GOVERNANCE_BYPASS_PRINCIPALS_CONFIG) match {
-            case null => null
-            case v    => v.toString
-          })
+          config.getString(ServerConfigs.GOVERNANCE_BYPASS_PRINCIPALS_CONFIG))
       if (bypassPrincipals.isEmpty) {
         throw new ConfigException(
           ServerConfigs.GOVERNANCE_BYPASS_PRINCIPALS_CONFIG,

@@ -250,6 +250,12 @@ object TestUtils extends Logging {
     val props = new Properties
     props.put(ServerConfigs.UNSTABLE_FEATURE_VERSIONS_ENABLE_CONFIG, "true")
     props.put(ServerConfigs.UNSTABLE_API_VERSIONS_ENABLE_CONFIG, "true")
+    // The CEL rule engine's bypass-principals config has no production
+    // default (see ServerConfigs.GOVERNANCE_BYPASS_PRINCIPALS_DEFAULT) — an
+    // unset value fails broker startup. Test brokers use PLAINTEXT
+    // inter-broker, whose authenticated peer principal is User:ANONYMOUS,
+    // so enroll exactly that here. Individual tests can override.
+    props.put(ServerConfigs.GOVERNANCE_BYPASS_PRINCIPALS_CONFIG, "User:ANONYMOUS")
     props.setProperty(KRaftConfigs.SERVER_MAX_STARTUP_TIME_MS_CONFIG, TimeUnit.MINUTES.toMillis(10).toString)
     props.put(KRaftConfigs.NODE_ID_CONFIG, nodeId.toString)
     props.put(ServerConfigs.BROKER_ID_CONFIG, nodeId.toString)

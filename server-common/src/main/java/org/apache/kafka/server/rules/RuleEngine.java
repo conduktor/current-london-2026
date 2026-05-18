@@ -187,6 +187,23 @@ public final class RuleEngine {
      * them here so an operator typo fails startup instead of producing an
      * unreachable allow-list entry.
      *
+     * <p>Codex round-4 F2: an entry like {@code "User :broker"} or
+     * {@code "User: broker"} also parses to a non-empty principal whose
+     * canonical form (literal {@code "User :broker"} with the inner space)
+     * can never match a runtime peer principal — {@code KafkaApis}
+     * canonicalises it as {@code getPrincipalType() + ":" + getName()},
+     * which never carries surrounding whitespace inside a component. Such
+     * entries produce a non-empty allow-list (so the BrokerServer empty-set
+     * guard does NOT fire) yet are silently unreachable — an effective
+     * empty allow-list and exactly the failure mode the empty-set guard
+     * exists to prevent. We reject any component containing whitespace
+     * recognised by either {@link Character#isWhitespace(int)} or
+     * {@link Character#isSpaceChar(int)} — the union catches both
+     * ASCII whitespace and the non-breaking variants (NBSP U+00A0,
+     * NARROW NBSP U+202F, FIGURE SPACE U+2007) that the JDK's
+     * {@code isWhitespace} historically excludes, so {@code String.isBlank()}
+     * and {@code String.strip()} alone are not sufficient.
+     *
      * <p>Returns the canonical string form of each parsed principal
      * (mirroring how the network layer reports the authenticated peer
      * principal at request time) so that {@link #bypassIsAuthorisedFor(String)}
@@ -212,25 +229,65 @@ public final class RuleEngine {
             // on a missing ':' separator. We let that propagate so broker
             // startup fails loudly.
             KafkaPrincipal principal = SecurityUtils.parseKafkaPrincipal(trimmed);
-            // Codex round-3 P1: SecurityUtils does not validate that the type
-            // and name are non-empty. Reject blank components here — the
-            // runtime peer principal never carries an empty type or name, so
-            // such an entry is silently unreachable allow-listing.
-            if (principal.getPrincipalType().trim().isEmpty()) {
+            // Codex round-3 P1 + round-4 F2: SecurityUtils does not validate
+            // that the type and name are non-blank, nor that they have no
+            // inner whitespace. Reject both failure modes here — the runtime
+            // peer principal never carries a blank component, and the
+            // canonical form `getPrincipalType() + ":" + getName()` never
+            // contains inner whitespace either. So `":broker"`, `"User:"`,
+            // `"User :broker"`, `"User: broker"`, `"User: "` and
+            // similar all parse non-empty but their canonical form is
+            // unreachable, producing an effective empty allow-list that
+            // bypasses the BrokerServer empty-set guard.
+            //
+            // Use containsAnyWhitespaceChar() which considers both
+            // Character.isWhitespace AND Character.isSpaceChar; the latter
+            // adds non-breaking variants (NBSP U+00A0, NARROW NBSP U+202F,
+            // FIGURE SPACE U+2007) that the JDK's isWhitespace explicitly
+            // excludes. Neither String.isBlank() nor String.strip() catches
+            // those — they both delegate to Character.isWhitespace. NBSP
+            // is the typical copy-paste-from-docs failure mode.
+            String type = principal.getPrincipalType();
+            String name = principal.getName();
+            if (type.isEmpty() || containsAnyWhitespaceChar(type)) {
                 throw new IllegalArgumentException(
-                    "governance.bypass.principals entry has blank principal type: '"
-                    + trimmed + "'. Format is `type:name` (eg. `User:broker`); "
-                    + "both components must be non-blank.");
+                    "governance.bypass.principals entry has blank or whitespace-"
+                    + "padded principal type: '" + trimmed + "'. Format is "
+                    + "`type:name` (eg. `User:broker`); both components must be "
+                    + "non-empty with no whitespace (ASCII or Unicode).");
             }
-            if (principal.getName().trim().isEmpty()) {
+            if (name.isEmpty() || containsAnyWhitespaceChar(name)) {
                 throw new IllegalArgumentException(
-                    "governance.bypass.principals entry has blank principal name: '"
-                    + trimmed + "'. Format is `type:name` (eg. `User:broker`); "
-                    + "both components must be non-blank.");
+                    "governance.bypass.principals entry has blank or whitespace-"
+                    + "padded principal name: '" + trimmed + "'. Format is "
+                    + "`type:name` (eg. `User:broker`); both components must be "
+                    + "non-empty with no whitespace (ASCII or Unicode).");
             }
             out.add(principal.toString());
         }
         return Collections.unmodifiableSet(out);
+    }
+
+    /**
+     * True if any code point in {@code s} is recognised as whitespace by
+     * either {@link Character#isWhitespace(int)} (covers ASCII space, tab,
+     * newline, and the Unicode SPACE_SEPARATOR / LINE_SEPARATOR /
+     * PARAGRAPH_SEPARATOR categories <i>except</i> the non-breaking
+     * variants) or {@link Character#isSpaceChar(int)} (covers the
+     * non-breaking variants: NBSP U+00A0, FIGURE SPACE U+2007, NARROW
+     * NO-BREAK SPACE U+202F). The union is what an operator would call
+     * "any whitespace-looking character".
+     *
+     * <p>We need both predicates because the JDK's {@code isWhitespace}
+     * historically excluded non-breaking variants for compatibility with
+     * legacy formatting rules, so {@code String.isBlank()} and
+     * {@code String.strip()} also exclude them. An entry like
+     * {@code User:[NBSP]} would slip past those checks even though its
+     * canonical form can never match a runtime peer principal.
+     */
+    private static boolean containsAnyWhitespaceChar(String s) {
+        return s.codePoints()
+            .anyMatch(c -> Character.isWhitespace(c) || Character.isSpaceChar(c));
     }
 
     /**
