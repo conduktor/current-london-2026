@@ -19,20 +19,27 @@ package org.apache.kafka.server.views;
 import org.apache.kafka.common.compress.Compression;
 import org.apache.kafka.common.header.Header;
 import org.apache.kafka.common.header.internals.RecordHeader;
+import org.apache.kafka.common.record.ControlRecordType;
+import org.apache.kafka.common.record.EndTransactionMarker;
 import org.apache.kafka.common.record.MemoryRecords;
+import org.apache.kafka.common.record.MemoryRecordsBuilder;
 import org.apache.kafka.common.record.MutableRecordBatch;
 import org.apache.kafka.common.record.Record;
+import org.apache.kafka.common.record.RecordBatch;
 import org.apache.kafka.common.record.SimpleRecord;
+import org.apache.kafka.common.record.TimestampType;
 import org.apache.kafka.common.utils.BufferSupplier;
 
 import org.junit.jupiter.api.Test;
 
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -256,6 +263,82 @@ class ViewFilterTest {
         } finally {
             supplier.close();
         }
+    }
+
+    @Test
+    void commitAbortControlBatchesPassThroughAsEmptyBatchesForLsoAdvance() {
+        // PROMPT.md acceptance criterion (line 40) and functional test scenario (line 48):
+        // READ_COMMITTED view consumers must observe correct isolation — COMMIT/ABORT control
+        // batches are emitted as empty batches so the consumer's LSO advances past the
+        // transaction boundary. ViewFilter implements this by returning RETAIN_EMPTY for every
+        // batch (including control) and never running predicates against control records.
+        // Test both COMMIT and ABORT to cover the two isolation outcomes.
+        CompiledPredicate p = compiler.compile("body.color == 'red'");
+        for (ControlRecordType type : List.of(ControlRecordType.COMMIT, ControlRecordType.ABORT)) {
+            MemoryRecords output = ViewFilter.apply(p, withDataAndControlMarker(type), 0);
+
+            // The transactional data batch had one "red" record at offset 0 plus a "blue" at 1;
+            // only the red one survives the predicate. The control batch at offset 2 carries no
+            // user data so it produces zero records but the batch header itself must remain.
+            assertEquals(List.of(0L), offsetsOf(output),
+                    "only red data record survives predicate (type=" + type + ")");
+
+            long maxLastOffset = -1L;
+            boolean sawControlBatch = false;
+            boolean sawDataBatch = false;
+            for (MutableRecordBatch batch : output.batches()) {
+                maxLastOffset = Math.max(maxLastOffset, batch.lastOffset());
+                if (batch.isControlBatch()) {
+                    sawControlBatch = true;
+                    // Control batch must remain empty after filtering (filterTo writes the header
+                    // through; no records). The fetcher reads the marker type from the header
+                    // bytes — we don't need to re-parse here, just assert structure survives.
+                    assertFalse(batch.iterator().hasNext(),
+                            "control batch must carry no user records (type=" + type + ")");
+                } else {
+                    sawDataBatch = true;
+                }
+            }
+            assertTrue(sawDataBatch, "data batch must remain (type=" + type + ")");
+            assertTrue(sawControlBatch,
+                    "control batch must propagate through filter so LSO advances (type=" + type + ")");
+            assertEquals(2L, maxLastOffset,
+                    "lastOffset must match source so consumer's LSO advances past marker (type="
+                            + type + ")");
+        }
+    }
+
+    /** Build a MemoryRecords containing (i) a transactional data batch with two records at offsets
+     *  0 and 1, and (ii) an end-transaction control batch at offset 2 carrying the supplied
+     *  COMMIT/ABORT marker. Same shape a broker would serve when a producer commits/aborts a
+     *  transaction over a topic that becomes the backing for a view. */
+    private static MemoryRecords withDataAndControlMarker(ControlRecordType controlType) {
+        long producerId = 73L;
+        short producerEpoch = 0;
+        int partitionLeaderEpoch = 0;
+        int baseSequence = 0;
+        ByteBuffer buffer = ByteBuffer.allocate(2048);
+        MemoryRecordsBuilder builder = new MemoryRecordsBuilder(
+                buffer,
+                RecordBatch.CURRENT_MAGIC_VALUE,
+                Compression.NONE,
+                TimestampType.CREATE_TIME,
+                0L,                  // baseOffset
+                0L,                  // logAppendTime
+                producerId,
+                producerEpoch,
+                baseSequence,
+                true,                // isTransactional
+                false,               // isControlBatch
+                partitionLeaderEpoch,
+                buffer.capacity());
+        builder.append(0L, null, "{\"color\":\"red\"}".getBytes(StandardCharsets.UTF_8));
+        builder.append(0L, null, "{\"color\":\"blue\"}".getBytes(StandardCharsets.UTF_8));
+        builder.close();
+        MemoryRecords.writeEndTransactionalMarker(buffer, 2L, 0L, partitionLeaderEpoch,
+                producerId, producerEpoch, new EndTransactionMarker(controlType, 0));
+        buffer.flip();
+        return MemoryRecords.readableRecords(buffer);
     }
 
     @Test
