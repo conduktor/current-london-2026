@@ -264,6 +264,19 @@ class PredicateCompilerTest {
         assertThrows(PredicateValidationException.class, () -> compiler.compile("body.x ==="));
     }
 
+    @Test
+    void rejectsRawNulInsideStringLiteral() {
+        // The body-path accessor cache in RecordContexts uses NUL as a path-segment delimiter.
+        // A string-literal accessor carrying a raw NUL byte (e.g. body["a b"]) would alias
+        // onto a dotted path (body.a.b) inside the cache, silently returning a stale value for
+        // the second path traversed in the same record evaluation. The lexer must reject the
+        // NUL byte at compile time so the alias cannot be constructed.
+        PredicateValidationException ex = assertThrows(PredicateValidationException.class,
+                () -> compiler.compile("body[\"a b\"] == 1"));
+        assertTrue(ex.getMessage().toLowerCase(Locale.ROOT).contains("nul"),
+                () -> "expected NUL-rejection error, got: " + ex.getMessage());
+    }
+
     // ---------- top-level boolean shape ----------
 
     @Test

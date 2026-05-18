@@ -253,6 +253,17 @@ final class Lexer {
                 checkStringLength(sb);
                 continue;
             }
+            // Reject raw NUL (U+0000) inside string literals. The body-path accessor cache in
+            // RecordContexts uses NUL as a path-segment delimiter, so a string-literal accessor
+            // containing NUL would collide with a dotted path: pathCacheKey(["a\u0000b"]) equals
+            // pathCacheKey(["a","b"]) — both are "\0a\0b" — silently aliasing two distinct paths
+            // to the same cache entry within one record evaluation. Predicates are an
+            // access-control boundary; refusing the NUL byte at lex time prevents the alias
+            // entirely instead of relying on the (admin-controlled) author to avoid it.
+            if (c == '\u0000') {
+                throw new PredicateValidationException(
+                        "raw NUL (U+0000) in string literal at " + i + " (not permitted)");
+            }
             sb.append(c);
             i++;
             checkStringLength(sb);
