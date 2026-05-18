@@ -1430,6 +1430,138 @@ class ControllerApisTest {
     assertEquals(Some(Errors.TOPIC_AUTHORIZATION_FAILED), results.find(_.name == "bar").map(result => Errors.forCode(result.errorCode)))
   }
 
+  /**
+   * r19 ADV-A BLOCKER #137 — CreatePartitions on a declared-logical name must be rejected.
+   *
+   * An operator holding ALTER on a topic that shares its name with a declared logical topic
+   * could otherwise silently expand the partition count of the physical topic of the same
+   * name. That physical is meant to be hidden behind the logical declaration by the
+   * shadow-overlay on every broker; mutating it via CreatePartitions creates a divergence
+   * between controller metadata and the per-broker overlay view, breaking concentration's
+   * topology invariants. The controller is the single serialization point for partition
+   * counts; the parser is the only source of truth here (no controller-side kernel).
+   */
+  @Test
+  def testCreatePartitionsRejectsDeclaredLogicalName(): Unit = {
+    val controller = mock(classOf[Controller])
+    val props = new Properties()
+    props.put(ServerConfigs.CONCENTRATION_LOGICAL_TOPICS_CONFIG, "orders:100:shared:4")
+    controllerApis = createControllerApis(None, controller, props)
+    val request = new CreatePartitionsRequestData()
+    request.topics().add(new CreatePartitionsTopic().setName("orders").setAssignments(null).setCount(8))
+    request.topics().add(new CreatePartitionsTopic().setName("safe").setAssignments(null).setCount(2))
+
+    when(controller.createPartitions(
+      any(),
+      ArgumentMatchers.eq(
+        Collections.singletonList(
+          new CreatePartitionsTopic().setName("safe").setAssignments(null).setCount(2))),
+      ArgumentMatchers.eq(false))).thenReturn(CompletableFuture
+      .completedFuture(Collections.singletonList(
+        new CreatePartitionsTopicResult().setName("safe").
+          setErrorCode(NONE.code()).
+          setErrorMessage(null)
+      )))
+
+    val results = controllerApis.createPartitions(ANONYMOUS_CONTEXT, request,
+      _ => Set("orders", "safe")).get().asScala.toSet
+
+    assertEquals(2, results.size)
+    val ordersResult = results.find(_.name == "orders").get
+    assertEquals(INVALID_REQUEST.code, ordersResult.errorCode,
+      "CreatePartitions on a declared logical topic name must be rejected with INVALID_REQUEST")
+    assertTrue(ordersResult.errorMessage.contains("declared logical topic"),
+      s"error message must explain the rejection: ${ordersResult.errorMessage}")
+    val safeResult = results.find(_.name == "safe").get
+    assertEquals(NONE.code, safeResult.errorCode,
+      "non-shadowed topic must still pass through to the controller")
+    // The shadow rejection must NOT reach the underlying controller for the rejected name.
+    verify(controller, never()).createPartitions(
+      any(),
+      ArgumentMatchers.argThat[util.List[CreatePartitionsTopic]](topics =>
+        topics.asScala.exists(_.name == "orders")),
+      anyBoolean)
+  }
+
+  /**
+   * r19 ADV-A BLOCKER #137 (backing side) — CreatePartitions on a backing topic name must
+   * also be rejected. Expanding the backing's partition count while declarations are live
+   * would create dead partitions (no logical-to-backing mapping for the new indices) and
+   * diverge the controller's partition count from the per-descriptor count the kernel uses
+   * to map logical→backing on every broker. Same auth-first / shadow-second precedence as
+   * the logical-name guard above.
+   */
+  @Test
+  def testCreatePartitionsRejectsDeclaredBackingName(): Unit = {
+    val controller = mock(classOf[Controller])
+    val props = new Properties()
+    props.put(ServerConfigs.CONCENTRATION_LOGICAL_TOPICS_CONFIG, "orders:100:shared:4")
+    controllerApis = createControllerApis(None, controller, props)
+    val request = new CreatePartitionsRequestData()
+    request.topics().add(new CreatePartitionsTopic().setName("shared").setAssignments(null).setCount(8))
+
+    // Empty topics list still reaches the underlying controller stub; return an empty result.
+    when(controller.createPartitions(any(), any(), anyBoolean))
+      .thenReturn(CompletableFuture.completedFuture(Collections.emptyList()))
+
+    val results = controllerApis.createPartitions(ANONYMOUS_CONTEXT, request,
+      _ => Set("shared")).get().asScala.toSet
+
+    assertEquals(1, results.size)
+    val sharedResult = results.head
+    assertEquals("shared", sharedResult.name)
+    assertEquals(INVALID_REQUEST.code, sharedResult.errorCode,
+      "CreatePartitions on a backing topic of a declared logical must be rejected with INVALID_REQUEST")
+    assertTrue(sharedResult.errorMessage.contains("backing topic"),
+      s"error message must explain the rejection: ${sharedResult.errorMessage}")
+    // The shadow rejection must NOT reach the underlying controller for the rejected name.
+    verify(controller, never()).createPartitions(
+      any(),
+      ArgumentMatchers.argThat[util.List[CreatePartitionsTopic]](topics =>
+        topics.asScala.exists(_.name == "shared")),
+      anyBoolean)
+  }
+
+  /**
+   * r19 ADV-A BLOCKER #137 — auth-first / shadow-second precedence.
+   *
+   * When a CreatePartitions name is both unauthorized AND a logical-shadow collider, the
+   * controller must return TOPIC_AUTHORIZATION_FAILED, not the operator remediation message.
+   * Otherwise the declared-logical set is enumerable to any principal who can probe arbitrary
+   * names without ALTER. Mirrors the same precedence pinned for CreateTopics and DeleteTopics.
+   */
+  @Test
+  def testCreatePartitionsShadowDefersToAuthorizationFailure(): Unit = {
+    val controller = mock(classOf[Controller])
+    val props = new Properties()
+    props.put(ServerConfigs.CONCENTRATION_LOGICAL_TOPICS_CONFIG, "orders:100:shared:4")
+    controllerApis = createControllerApis(None, controller, props)
+    val request = new CreatePartitionsRequestData()
+    request.topics().add(new CreatePartitionsTopic().setName("orders").setAssignments(null).setCount(8))
+    request.topics().add(new CreatePartitionsTopic().setName("shared").setAssignments(null).setCount(8))
+
+    // Empty topics list still reaches the underlying controller stub; return an empty result.
+    when(controller.createPartitions(any(), any(), anyBoolean))
+      .thenReturn(CompletableFuture.completedFuture(Collections.emptyList()))
+
+    // Authorizer denies both the logical name and the backing name.
+    val results = controllerApis.createPartitions(ANONYMOUS_CONTEXT, request,
+      _ => Set.empty[String]).get().asScala.toSet
+
+    assertEquals(2, results.size)
+    assertEquals(TOPIC_AUTHORIZATION_FAILED.code, results.find(_.name == "orders").get.errorCode,
+      "unauthorized declared-logical name must return TOPIC_AUTHORIZATION_FAILED, " +
+        "not the operator remediation message (which would leak the declared set)")
+    assertEquals(TOPIC_AUTHORIZATION_FAILED.code, results.find(_.name == "shared").get.errorCode,
+      "unauthorized backing name must also return TOPIC_AUTHORIZATION_FAILED")
+    // Neither rejected name reaches the underlying controller.
+    verify(controller, never()).createPartitions(
+      any(),
+      ArgumentMatchers.argThat[util.List[CreatePartitionsTopic]](topics =>
+        topics.asScala.exists(t => t.name == "orders" || t.name == "shared")),
+      anyBoolean)
+  }
+
   @ParameterizedTest(name = "testCreatePartitionsMutationQuota with throttle: {0}")
   @ValueSource(booleans = Array(true, false))
   def testCreatePartitionsMutationQuota(throttle: Boolean): Unit = {

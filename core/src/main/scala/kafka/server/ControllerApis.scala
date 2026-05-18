@@ -105,10 +105,18 @@ class ControllerApis(
   // Brokers may still hold a subset (e.g., staged rollout) without breaking the gate.
   //
   // Computed once at construction; declarations are static broker config in v1.
-  private val declaredLogicalTopicNames: Set[String] = {
-    val raw = config.getString(ServerConfigs.CONCENTRATION_LOGICAL_TOPICS_CONFIG)
-    LogicalTopicConfigParser.parse(raw).asScala.iterator.map(_.logicalName()).toSet
-  }
+  // The backing-name set is surfaced alongside the logical set so non-CreateTopics paths
+  // (notably CreatePartitions; see r19 ADV-A BLOCKER #137) can reject mutations targeting
+  // either side of the declaration on the controller — there is no controller-side kernel,
+  // so the parser is the only source of truth here.
+  private val declaredDescriptors: scala.collection.Seq[org.apache.kafka.storage.internals.concentration.LogicalTopicDescriptor] =
+    LogicalTopicConfigParser.parse(config.getString(ServerConfigs.CONCENTRATION_LOGICAL_TOPICS_CONFIG)).asScala.toSeq
+
+  private val declaredLogicalTopicNames: Set[String] =
+    declaredDescriptors.iterator.map(_.logicalName()).toSet
+
+  private val declaredBackingTopicNames: Set[String] =
+    declaredDescriptors.iterator.map(_.backingTopic()).toSet
 
   def isClosed: Boolean = aclApis.isClosed
 
@@ -970,12 +978,40 @@ class ControllerApis(
     val authorizedTopicNames = getAlterAuthorizedTopics(topicNames.asScala)
     val topics = new util.ArrayList[CreatePartitionsTopic]
     topicNames.forEach { topicName =>
-      if (authorizedTopicNames.contains(topicName)) {
-        topics.add(request.topics().find(topicName))
-      } else {
+      if (!authorizedTopicNames.contains(topicName)) {
         responses.add(new CreatePartitionsTopicResult().
           setName(topicName).
           setErrorCode(TOPIC_AUTHORIZATION_FAILED.code))
+      } else if (declaredLogicalTopicNames.contains(topicName)) {
+        // r19 ADV-A BLOCKER #137: an operator with ALTER on the declared-logical name could
+        // silently expand the partition count of the physical topic of that name, breaking
+        // the shadow-overlay contract that hides physicals behind logical declarations.
+        // Mirror the auth-first / shadow-second precedence used by DeleteTopics so the
+        // declared-logical set is not enumerable by unauthorized principals.
+        responses.add(new CreatePartitionsTopicResult().
+          setName(topicName).
+          setErrorCode(INVALID_REQUEST.code).
+          setErrorMessage(s"Topic '$topicName' is a declared logical topic in " +
+            "concentration.logical.topics on this controller. Partition counts of logical " +
+            "topics are governed by the backing topology and cannot be altered via " +
+            "CreatePartitions; remove the declaration from the controller's broker config " +
+            "and restart, then any physical topic of the same name can be altered via the " +
+            "normal path."))
+      } else if (declaredBackingTopicNames.contains(topicName)) {
+        // r19 ADV-A BLOCKER #137 (backing side): expanding the backing topic's partition
+        // count while concentration is live would create dead partitions (no logical topic
+        // mapped to them) and may diverge the controller's partition count from the per-
+        // descriptor partition count the kernel uses to map logical→backing on every broker.
+        // Reject at the same precedence level as the logical-name guard.
+        responses.add(new CreatePartitionsTopicResult().
+          setName(topicName).
+          setErrorCode(INVALID_REQUEST.code).
+          setErrorMessage(s"Topic '$topicName' is the backing topic for one or more declared " +
+            "logical topics in concentration.logical.topics on this controller. Backing " +
+            "topics cannot be altered via CreatePartitions while declarations are active; " +
+            "remove the declaration(s) and restart to alter the backing's partition count."))
+      } else {
+        topics.add(request.topics().find(topicName))
       }
     }
     controller.createPartitions(context, topics, request.validateOnly).thenApply { results =>
