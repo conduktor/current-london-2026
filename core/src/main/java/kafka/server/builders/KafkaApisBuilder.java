@@ -38,6 +38,7 @@ import org.apache.kafka.coordinator.group.GroupCoordinator;
 import org.apache.kafka.coordinator.share.ShareCoordinator;
 import org.apache.kafka.server.ClientMetricsManager;
 import org.apache.kafka.server.authorizer.Authorizer;
+import org.apache.kafka.storage.internals.concentration.ConcentrationKernel;
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats;
 
 import java.util.Collections;
@@ -68,6 +69,7 @@ public class KafkaApisBuilder {
     private ApiVersionManager apiVersionManager = null;
     private ClientMetricsManager clientMetricsManager = null;
     private Optional<ShareCoordinator> shareCoordinator = Optional.empty();
+    private ConcentrationKernel concentrationKernel = null;
 
     public KafkaApisBuilder setRequestChannel(RequestChannel requestChannel) {
         this.requestChannel = requestChannel;
@@ -179,6 +181,11 @@ public class KafkaApisBuilder {
         return this;
     }
 
+    public KafkaApisBuilder setConcentrationKernel(ConcentrationKernel concentrationKernel) {
+        this.concentrationKernel = concentrationKernel;
+        return this;
+    }
+
     @SuppressWarnings({"CyclomaticComplexity"})
     public KafkaApis build() {
         if (requestChannel == null) throw new RuntimeException("you must set requestChannel");
@@ -198,6 +205,7 @@ public class KafkaApisBuilder {
         if (clientMetricsManager == null) throw new RuntimeException("You must set clientMetricsManager");
         if (brokerTopicStats == null) brokerTopicStats = new BrokerTopicStats(config.remoteLogManagerConfig().isRemoteStorageSystemEnabled());
         if (apiVersionManager == null) throw new RuntimeException("You must set apiVersionManager");
+        if (concentrationKernel == null) throw new RuntimeException("You must set concentrationKernel");
 
         return new KafkaApis(requestChannel,
                              forwardingManager,
@@ -220,6 +228,7 @@ public class KafkaApisBuilder {
                              time,
                              tokenManager,
                              apiVersionManager,
-                             clientMetricsManager);
+                             clientMetricsManager,
+                             concentrationKernel);
     }
 }

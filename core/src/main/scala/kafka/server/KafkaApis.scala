@@ -66,6 +66,7 @@ import org.apache.kafka.server.share.context.ShareFetchContext
 import org.apache.kafka.server.share.{ErroneousAndValidPartitionData, SharePartitionKey}
 import org.apache.kafka.server.share.acknowledge.ShareAcknowledgementBatch
 import org.apache.kafka.server.storage.log.{FetchIsolation, FetchParams, FetchPartitionData}
+import org.apache.kafka.storage.internals.concentration.ConcentrationKernel
 import org.apache.kafka.storage.internals.log.AppendOrigin
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats
 
@@ -104,7 +105,8 @@ class KafkaApis(val requestChannel: RequestChannel,
                 time: Time,
                 val tokenManager: DelegationTokenManager,
                 val apiVersionManager: ApiVersionManager,
-                val clientMetricsManager: ClientMetricsManager
+                val clientMetricsManager: ClientMetricsManager,
+                val concentrationKernel: ConcentrationKernel
 ) extends ApiRequestHandler with Logging {
 
   type FetchResponseStats = Map[TopicPartition, RecordValidationStats]
@@ -403,6 +405,13 @@ class KafkaApis(val requestChannel: RequestChannel,
       val memoryRecords = partition.records.asInstanceOf[MemoryRecords]
       if (!authorizedTopics.contains(topicPartition.topic))
         unauthorizedTopicResponses += topicPartition -> new PartitionResponse(Errors.TOPIC_AUTHORIZATION_FAILED)
+      else if (concentrationKernel.isBackingTopic(topicPartition.topic))
+        // Concentration v1: a "backing" topic is the physical container behind one or more
+        // declared logical topics. Stock clients must produce to the logical topic name, never
+        // to the backing name — direct produces would interleave records with logical-topic
+        // payloads and break per-logical-topic offset sequencing. Pin this as the topic-level
+        // error (INVALID_TOPIC_EXCEPTION) so the producer sees a clear, non-retriable failure.
+        invalidRequestResponses += topicPartition -> new PartitionResponse(Errors.INVALID_TOPIC_EXCEPTION)
       else if (!metadataCache.contains(topicPartition))
         nonExistingTopicResponses += topicPartition -> new PartitionResponse(Errors.UNKNOWN_TOPIC_OR_PARTITION)
       else

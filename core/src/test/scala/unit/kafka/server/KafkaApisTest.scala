@@ -93,6 +93,7 @@ import org.apache.kafka.server.share.context.{FinalContext, ShareSessionContext}
 import org.apache.kafka.server.share.session.{ShareSession, ShareSessionKey}
 import org.apache.kafka.server.storage.log.{FetchParams, FetchPartitionData}
 import org.apache.kafka.server.util.{FutureUtils, MockTime}
+import org.apache.kafka.storage.internals.concentration.ConcentrationKernel
 import org.apache.kafka.storage.internals.log.{AppendOrigin, LogConfig}
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats
 import org.junit.jupiter.api.Assertions._
@@ -141,6 +142,7 @@ class KafkaApisTest extends Logging {
   private val fetchManager: FetchManager = mock(classOf[FetchManager])
   private val sharePartitionManager: SharePartitionManager = mock(classOf[SharePartitionManager])
   private val clientMetricsManager: ClientMetricsManager = mock(classOf[ClientMetricsManager])
+  private val concentrationKernel: ConcentrationKernel = mock(classOf[ConcentrationKernel])
   private val brokerTopicStats = new BrokerTopicStats
   private val clusterId = "clusterId"
   private val time = new MockTime
@@ -208,7 +210,8 @@ class KafkaApisTest extends Logging {
       time = time,
       tokenManager = null,
       apiVersionManager = apiVersionManager,
-      clientMetricsManager = clientMetricsManager)
+      clientMetricsManager = clientMetricsManager,
+      concentrationKernel = concentrationKernel)
   }
 
   private def setupFeatures(featureVersions: Seq[FeatureVersion]): Unit = {
@@ -2057,6 +2060,52 @@ class KafkaApisTest extends Logging {
         kafkaApis.close()
       }
     }
+  }
+
+  @Test
+  def testProduceToBackingTopicIsRejectedWithInvalidTopicException(): Unit = {
+    // Concentration v1 invariant: a stock producer that names the physical backing topic
+    // bypasses the logical-offset reservation, would interleave its records with payloads from
+    // every declared logical topic on the same backing, and would corrupt per-logical-topic
+    // offset sequencing. KafkaApis#handleProduceRequest must short-circuit the partition with
+    // INVALID_TOPIC_EXCEPTION before it ever reaches ReplicaManager.
+    val backingTopic = "backing-topic"
+    addTopicToMetadataCache(backingTopic, numPartitions = 1)
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+
+    val tp = new TopicPartition(backingTopic, 0)
+    val produceRequest = ProduceRequest.builder(new ProduceRequestData()
+      .setTopicData(new ProduceRequestData.TopicProduceDataCollection(
+        Collections.singletonList(new ProduceRequestData.TopicProduceData()
+          .setName(tp.topic).setPartitionData(Collections.singletonList(
+            new ProduceRequestData.PartitionProduceData()
+              .setIndex(tp.partition)
+              .setRecords(MemoryRecords.withRecords(Compression.NONE, new SimpleRecord("payload".getBytes))))))
+          .iterator))
+      .setAcks(1.toShort)
+      .setTimeoutMs(5000))
+      .build(ApiKeys.PRODUCE.latestVersion)
+    val request = buildRequest(produceRequest)
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[ProduceResponse](request)
+    assertEquals(1, response.data.responses.size)
+    val topicProduceResponse = response.data.responses.asScala.head
+    assertEquals(1, topicProduceResponse.partitionResponses.size)
+    val partitionProduceResponse = topicProduceResponse.partitionResponses.asScala.head
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION, Errors.forCode(partitionProduceResponse.errorCode))
+
+    // The ReplicaManager append path must not have been called for the rejected partition,
+    // otherwise the rejection would be racing the real append rather than short-circuiting it.
+    verify(replicaManager, never()).handleProduceAppend(anyLong, anyShort, ArgumentMatchers.eq(false),
+      any(), any(), any(), any(), any(), any(), any())
   }
 
   @Test

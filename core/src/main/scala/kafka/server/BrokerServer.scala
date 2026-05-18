@@ -54,9 +54,11 @@ import org.apache.kafka.server.share.session.ShareSessionCache
 import org.apache.kafka.server.util.timer.{SystemTimer, SystemTimerReaper}
 import org.apache.kafka.server.util.{Deadline, FutureUtils, KafkaScheduler}
 import org.apache.kafka.server.{AssignmentsManager, BrokerFeatures, ClientMetricsManager, DelayedActionQueue}
+import org.apache.kafka.storage.internals.concentration.ConcentrationKernel
 import org.apache.kafka.storage.internals.log.LogDirFailureChannel
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats
 
+import java.io.File
 import java.time.Duration
 import java.util
 import java.util.Optional
@@ -109,6 +111,7 @@ class BrokerServer(
   var logDirFailureChannel: LogDirFailureChannel = _
   var logManager: LogManager = _
   var remoteLogManagerOpt: Option[RemoteLogManager] = None
+  var concentrationKernel: ConcentrationKernel = _
 
   var tokenManager: DelegationTokenManager = _
 
@@ -445,6 +448,14 @@ class BrokerServer(
         metrics
       )
 
+      // Concentration kernel — pure Java, broker-agnostic. The sidecar directory is rooted
+      // under the first live log dir so it travels with the broker's storage (and so a future
+      // log-dir failure handler can co-locate sidecar evacuation with log evacuation).
+      // The kernel does NOT take a reference to LogManager — it only needs a place to write
+      // its sidecar files. See storage/.../concentration/ConcentrationKernel for the API.
+      concentrationKernel = new ConcentrationKernel(
+        new File(logManager.liveLogDirs.head, "_concentration_sidecars"))
+
       dataPlaneRequestProcessor = new KafkaApis(
         requestChannel = socketServer.dataPlaneRequestChannel,
         forwardingManager = forwardingManager,
@@ -467,7 +478,8 @@ class BrokerServer(
         time = time,
         tokenManager = tokenManager,
         apiVersionManager = apiVersionManager,
-        clientMetricsManager = clientMetricsManager)
+        clientMetricsManager = clientMetricsManager,
+        concentrationKernel = concentrationKernel)
 
       dataPlaneRequestHandlerPool = new KafkaRequestHandlerPool(config.nodeId,
         socketServer.dataPlaneRequestChannel, dataPlaneRequestProcessor, time,
@@ -811,6 +823,13 @@ class BrokerServer(
 
       if (replicaManager != null)
         CoreUtils.swallow(replicaManager.shutdown(), this)
+
+      // Close kernel BEFORE LogManager shuts down: the kernel's sidecar files live under
+      // logManager.liveLogDirs.head, so we want our FDs released while the log dirs are still
+      // accessible. swallow rather than fail-fast — partial shutdown is preferable to leaving
+      // other components hanging.
+      if (concentrationKernel != null)
+        CoreUtils.swallow(concentrationKernel.close(), this)
 
       if (alterPartitionManager != null)
         CoreUtils.swallow(alterPartitionManager.shutdown(), this)
