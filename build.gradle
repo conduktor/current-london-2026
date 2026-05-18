@@ -2148,6 +2148,7 @@ project(':server-common') {
     testImplementation project(':clients').sourceSets.test.output
     testImplementation libs.jacksonDatabindYaml
     testImplementation libs.junitJupiter
+    testImplementation libs.jqwik
     testImplementation libs.mockitoCore
     testImplementation testLog4j2Libs
 
@@ -2186,6 +2187,12 @@ project(':server-common') {
 
   checkstyle {
     configProperties = checkstyleConfigProperties("import-control-server-common.xml")
+  }
+
+  test {
+    useJUnitPlatform {
+      includeEngines 'jqwik', 'junit-jupiter'
+    }
   }
 
   javadoc {
