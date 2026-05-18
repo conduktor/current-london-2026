@@ -14590,4 +14590,60 @@ class KafkaApisTest extends Logging {
     assertEquals("0", brokerResult.resourceName)
   }
 
+  @Test
+  def testDescribeConfigsTenantRefusesInvalidLogicalTopicName(): Unit = {
+    // Tenant `acme` submits `..` — invalid by Kafka's topic charset rules.
+    // Reaching ConfigHelper would run `Topic.validate("acme...")` which throws
+    // with the PHYSICAL name embedded in the message, leaking the prefix back
+    // through `errorMessage`. The handler must refuse with the LOGICAL name
+    // before ever calling `toPhysical`.
+    val describeRequest = new DescribeConfigsRequest.Builder(new DescribeConfigsRequestData()
+      .setResources(List(new DescribeConfigsRequestData.DescribeConfigsResource()
+        .setResourceName("..")
+        .setResourceType(ConfigResource.Type.TOPIC.id)).asJava))
+      .build(ApiKeys.DESCRIBE_CONFIGS.latestVersion)
+    val request = buildRequest(describeRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDescribeConfigsRequest(request)
+
+    val response = verifyNoThrottling[DescribeConfigsResponse](request)
+    val results = response.data.results.asScala
+    assertEquals(1, results.size)
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, results.head.errorCode)
+    assertEquals("..", results.head.resourceName, "literal logical name must round-trip")
+    assertNotNull(results.head.errorMessage)
+    assertFalse(results.head.errorMessage.contains("acme."),
+      "errorMessage must not echo the physical prefix")
+  }
+
+  @Test
+  def testDescribeConfigsTenantRefusesOverlongLogicalTopicName(): Unit = {
+    // The logical name fits in MAX_NAME_LENGTH (249) on its own but the
+    // physical form `acme.X` overshoots. ConfigHelper's `Topic.validate` would
+    // surface the physical name; the handler refuses pre-rewrite.
+    val overlong = "x" * 248
+    val describeRequest = new DescribeConfigsRequest.Builder(new DescribeConfigsRequestData()
+      .setResources(List(new DescribeConfigsRequestData.DescribeConfigsResource()
+        .setResourceName(overlong)
+        .setResourceType(ConfigResource.Type.TOPIC.id)).asJava))
+      .build(ApiKeys.DESCRIBE_CONFIGS.latestVersion)
+    val request = buildRequest(describeRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDescribeConfigsRequest(request)
+
+    val response = verifyNoThrottling[DescribeConfigsResponse](request)
+    val results = response.data.results.asScala
+    assertEquals(1, results.size)
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, results.head.errorCode)
+    assertEquals(overlong, results.head.resourceName)
+    assertFalse(results.head.errorMessage.contains("acme."),
+      "errorMessage must not echo the physical prefix")
+  }
+
 }

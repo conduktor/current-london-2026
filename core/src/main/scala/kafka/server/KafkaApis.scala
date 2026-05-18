@@ -3711,17 +3711,34 @@ class KafkaApis(val requestChannel: RequestChannel,
           // able to discover broker, broker-logger, or client-metrics state.
           refused += refusedDescribeConfigsResult(resource, Errors.CLUSTER_AUTHORIZATION_FAILED, null)
         case ConfigResource.Type.TOPIC =>
-          if (literalName != null && Topic.isInternal(literalName)) {
+          if (literalName == null) {
+            // Topic.isInternal would NPE on a null name (INTERNAL_TOPICS is a
+            // Set.of(...) which rejects null queries); refuse upfront with the
+            // shape an absent-required-field would carry.
+            refused += refusedDescribeConfigsResult(resource, Errors.INVALID_REQUEST,
+              "DescribeConfigs refused: topic resource must carry a name")
+          } else if (Topic.isInternal(literalName)) {
             // Internal topic configs (`__consumer_offsets`, `__transaction_state`,
             // `__share_group_state`) are broker-wide and tenant-opaque. Refuse
             // before reaching the cache so a misconfigured ACL cannot leak.
             refused += refusedDescribeConfigsResult(resource, Errors.TOPIC_AUTHORIZATION_FAILED, null)
-          } else if (literalName != null && tenantCtx.isReservedPhysicalForm(literalName)) {
+          } else if (tenantCtx.isReservedPhysicalForm(literalName)) {
             // Reserved physical form (e.g. `acme.foo` from tenant acme): refuse
             // with the LITERAL name echoed back rather than rewriting into
             // `acme.acme.foo` and silently returning UNKNOWN_TOPIC_OR_PARTITION.
             refused += refusedDescribeConfigsResult(resource, Errors.INVALID_TOPIC_EXCEPTION,
               "DescribeConfigs refused: topic name uses reserved tenant-prefix form")
+          } else if (tenantCtx.isInvalidLogicalForm(literalName)) {
+            // Pre-validate against Kafka's topic charset rules using the LOGICAL
+            // name. Letting the request reach ConfigHelper would run
+            // `Topic.validate` on the PHYSICAL name and the resulting
+            // InvalidTopicException would echo `<tenantId>.<name>` in
+            // errorMessage — leaking the prefix back to the tenant.
+            refused += refusedDescribeConfigsResult(resource, Errors.INVALID_TOPIC_EXCEPTION,
+              "Topic name '" + literalName + "' is invalid")
+          } else if (tenantCtx.isOverlongLogicalForm(literalName)) {
+            refused += refusedDescribeConfigsResult(resource, Errors.INVALID_TOPIC_EXCEPTION,
+              "Topic name '" + literalName + "' would exceed the maximum length when combined with the tenant prefix")
           } else {
             try {
               resource.setResourceName(tenantCtx.toPhysical(literalName))
@@ -3732,14 +3749,19 @@ class KafkaApis(val requestChannel: RequestChannel,
             }
           }
         case ConfigResource.Type.GROUP =>
-          try {
-            resource.setResourceName(tenantCtx.toPhysicalGroup(literalName))
-            rewriteable.add(resource)
-          } catch {
-            // Cross-tenant group prefix (`__tenant_other.group1`): refuse with
-            // the wire-shape an authz failure would produce.
-            case _: IllegalArgumentException =>
-              refused += refusedDescribeConfigsResult(resource, Errors.GROUP_AUTHORIZATION_FAILED, null)
+          if (literalName == null) {
+            refused += refusedDescribeConfigsResult(resource, Errors.INVALID_REQUEST,
+              "DescribeConfigs refused: group resource must carry a name")
+          } else {
+            try {
+              resource.setResourceName(tenantCtx.toPhysicalGroup(literalName))
+              rewriteable.add(resource)
+            } catch {
+              // Cross-tenant group prefix (`__tenant_other.group1`): refuse with
+              // the wire-shape an authz failure would produce.
+              case _: IllegalArgumentException =>
+                refused += refusedDescribeConfigsResult(resource, Errors.GROUP_AUTHORIZATION_FAILED, null)
+            }
           }
         case _ =>
           refused += refusedDescribeConfigsResult(resource, Errors.INVALID_REQUEST, null)
@@ -3750,12 +3772,30 @@ class KafkaApis(val requestChannel: RequestChannel,
     val responseData = configHelper.handleDescribeConfigsRequest(request, authHelper)
 
     // OUT-rewrite: each result echoes back the logical name the tenant submitted.
+    // We also scrub any echo of the physical name from `errorMessage`. The
+    // pre-validation above blocks the main path that would leak the prefix
+    // (Topic.validate on the rewritten name), but a downstream failure from
+    // `configRepository` or `LogConfig.fromProps` could still set
+    // `errorMessage = ApiError.fromThrowable(e).message` (ConfigHelper:170-183)
+    // with the physical name embedded.
     responseData.results.forEach { result =>
       ConfigResource.Type.forId(result.resourceType) match {
         case ConfigResource.Type.TOPIC =>
-          result.setResourceName(tenantCtx.toLogical(result.resourceName))
+          val physical = result.resourceName
+          val logical = tenantCtx.toLogical(physical)
+          result.setResourceName(logical)
+          val msg = result.errorMessage
+          if (msg != null && physical != null && physical != logical && msg.contains(physical)) {
+            result.setErrorMessage(msg.replace(physical, logical))
+          }
         case ConfigResource.Type.GROUP =>
-          result.setResourceName(tenantCtx.toLogicalGroup(result.resourceName))
+          val physical = result.resourceName
+          val logical = tenantCtx.toLogicalGroup(physical)
+          result.setResourceName(logical)
+          val msg = result.errorMessage
+          if (msg != null && physical != null && physical != logical && msg.contains(physical)) {
+            result.setErrorMessage(msg.replace(physical, logical))
+          }
         case _ =>
       }
     }
