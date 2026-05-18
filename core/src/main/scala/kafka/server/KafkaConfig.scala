@@ -761,25 +761,6 @@ class KafkaConfig private(doLog: Boolean, val props: util.Map[_, _])
       s"${BrokerSecurityConfigs.SASL_MECHANISM_INTER_BROKER_PROTOCOL_CONFIG} must be included in ${BrokerSecurityConfigs.SASL_ENABLED_MECHANISMS_CONFIG} when SASL is used for inter-broker communication")
     require(queuedMaxBytes <= 0 || queuedMaxBytes >= socketRequestMaxBytes,
       s"${SocketServerConfigs.QUEUED_MAX_BYTES_CONFIG} must be larger or equal to ${SocketServerConfigs.SOCKET_REQUEST_MAX_BYTES_CONFIG}")
-    // v1 io_uring path applies MemoryPool backpressure (autoRead=false on tryAllocate failure)
-    // but cannot complete the recovery half: KafkaChannel.maybeUnmute is package-private to
-    // org.apache.kafka.common.network, and we are forbidden from touching clients/. So when
-    // MemoryPool refills, OOM-muted io_uring channels would stay muted until they idle out.
-    // Refuse the combination at boot rather than ship a broker that silently leaks throughput.
-    // We refuse if ANY PLAINTEXT listener would resolve to io_uring — including the implicit
-    // auto-detect path on Linux — so the operator isn't surprised by behaviour depending on OS.
-    if (queuedMaxBytes > 0) {
-      val plaintextEnabled = listeners.exists(_.securityProtocol == SecurityProtocol.PLAINTEXT)
-      require(
-        !plaintextEnabled || !usesIoUring(SecurityProtocol.PLAINTEXT),
-        s"${SocketServerConfigs.QUEUED_MAX_BYTES_CONFIG} is not supported when the io_uring " +
-          s"selector is active (effective ${SocketServerConfigs.SOCKET_SELECTOR_IMPLEMENTATION_CONFIG}" +
-          s"=${socketSelectorImplementation.toString.toLowerCase}, PLAINTEXT listener present, " +
-          "Linux+io_uring kernel available). v1 cannot resume reads after MemoryPool depletion on " +
-          "the io_uring path. Leave queued.max.bytes unset, or set " +
-          s"${SocketServerConfigs.SOCKET_SELECTOR_IMPLEMENTATION_CONFIG}=nio to keep queued.max.bytes.")
-    }
-
     if (maxConnectionsPerIp == 0)
       require(maxConnectionsPerIpOverrides.nonEmpty, s"${SocketServerConfigs.MAX_CONNECTIONS_PER_IP_CONFIG} can be set to zero only if" +
         s" ${SocketServerConfigs.MAX_CONNECTIONS_PER_IP_OVERRIDES_CONFIG} property is set.")
