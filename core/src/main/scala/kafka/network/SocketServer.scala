@@ -954,7 +954,15 @@ private[kafka] class Processor(
         time,
         id,
         ioUringChannelConfigs)
-      val bindAddress = new java.net.InetSocketAddress(endPoint.host, endPoint.port)
+      // Mirror Acceptor.openServerSocket (SocketServer.scala:657-662): a wildcard listener
+      // configured as PLAINTEXT://:9092 has endPoint.host == null/blank, and
+      // InetSocketAddress(null, port) throws IllegalArgumentException. We must use the
+      // wildcard form for blank hosts so the io_uring path binds 0.0.0.0:port, matching
+      // NIO. Without this guard the default config (auto + Linux + PLAINTEXT://:9092)
+      // crashes broker startup before any connection is accepted.
+      val bindAddress =
+        if (Utils.isBlank(endPoint.host)) new java.net.InetSocketAddress(endPoint.port)
+        else new java.net.InetSocketAddress(endPoint.host, endPoint.port)
       // Apply socket.send.buffer.bytes/socket.receive.buffer.bytes so io_uring matches the
       // NIO Acceptor parity at SocketServer.scala:740-746 / openServerSocket(..., recvBuf).
       // Without this, an operator-tuned SO_SNDBUF/SO_RCVBUF silently has no effect on the
