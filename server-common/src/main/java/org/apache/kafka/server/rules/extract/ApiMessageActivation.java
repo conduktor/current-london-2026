@@ -393,6 +393,31 @@ public final class ApiMessageActivation {
         if (v == null) {
             return null;
         }
+        // Double / Float are opaque to the rule engine. Audit round-7 finding
+        // H2 (HIGH): if we passed them through as Number, CelNode.valueEquals
+        // and compareValues coerce both sides via ((Number) v).longValue(),
+        // which silently truncates fractional values. A predicate like
+        // `request.ops.exists(op, op.value == 1)` would then match
+        // OpData.value = 1.0, 1.49, 0.5, 0.9 — silent overmatch on every
+        // float64 schema field (AlterClientQuotas, DescribeClientQuotas).
+        //
+        // Surface as null (the key stays in the activation map but the value
+        // is explicitly null) so a comparison resolves to false consistently
+        // — fail-noisy-on-shape rather than fail-silent-on-truncation.
+        // Operators who genuinely need numeric float access in rules will
+        // see the predicate never match and surface that requirement
+        // explicitly, rather than discovering the truncation in production.
+        //
+        // The check sits in `convert`, NOT in `convertScalar`, because a
+        // null return from `convertScalar` means "fall through to BaseRecords
+        // / Iterable / accessorsFor descent" — and Double has a thick set of
+        // public no-arg accessors (doubleValue, floatValue, intValue, ...)
+        // that the walker would otherwise descend through, eventually
+        // reflecting into JDK-internal Stream types and failing with
+        // IllegalAccessException at request time.
+        if (v instanceof Double || v instanceof Float) {
+            return null;
+        }
         Object scalar = convertScalar(v);
         if (scalar != null) {
             return scalar;
