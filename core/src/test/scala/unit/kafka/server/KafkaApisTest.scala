@@ -2205,6 +2205,9 @@ class KafkaApisTest extends Logging {
     val res2 = mock(classOf[Reservation]); when(res2.logicalOffset).thenReturn(502L)
     val reservations = Array(res0, res1, res2)
     when(concentrationKernel.reserveProduceBatch(logicalTopic, 0, 3)).thenReturn(reservations)
+    // HIGH #7: handleProduceRequest derives currentLeaderEpoch from onlinePartition; non-idempotent
+    // producers don't hit the cache, but the lookup still runs unconditionally.
+    when(replicaManager.onlinePartition(any[TopicPartition])).thenReturn(None)
 
     val tp = new TopicPartition(logicalTopic, 0)
     val originalRecords = MemoryRecords.withRecords(Compression.NONE,
@@ -2318,6 +2321,8 @@ class KafkaApisTest extends Logging {
     val res0 = mock(classOf[Reservation]); when(res0.logicalOffset).thenReturn(7L)
     val reservations = Array(res0)
     when(concentrationKernel.reserveProduceBatch(logicalTopic, 0, 1)).thenReturn(reservations)
+    // HIGH #7: produce path always derives currentLeaderEpoch from onlinePartition.
+    when(replicaManager.onlinePartition(any[TopicPartition])).thenReturn(None)
 
     val tp = new TopicPartition(logicalTopic, 0)
     val produceRequest = ProduceRequest.builder(new ProduceRequestData()
@@ -2428,6 +2433,8 @@ class KafkaApisTest extends Logging {
 
     val resA0 = mock(classOf[Reservation]); when(resA0.logicalOffset).thenReturn(100L)
     when(concentrationKernel.reserveProduceBatch(logicalA, 0, 1)).thenReturn(Array(resA0))
+    // HIGH #7: produce path always derives currentLeaderEpoch from onlinePartition.
+    when(replicaManager.onlinePartition(any[TopicPartition])).thenReturn(None)
 
     val tpA = new TopicPartition(logicalA, 0)
     val tpB = new TopicPartition(logicalB, 0)

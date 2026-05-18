@@ -337,6 +337,45 @@ class BrokerServer(
        */
       val defaultActionQueue = new DelayedActionQueue
 
+      // Concentration kernel — pure Java, broker-agnostic. The sidecar directory is rooted
+      // under the first live log dir so it travels with the broker's storage (and so a future
+      // log-dir failure handler can co-locate sidecar evacuation with log evacuation).
+      // The kernel does NOT take a reference to LogManager — it only needs a place to write
+      // its sidecar files. See storage/.../concentration/ConcentrationKernel for the API.
+      //
+      // Constructed BEFORE ReplicaManager so ReplicaManager can subscribe a PartitionListener
+      // on backing-topic partitions and invalidate kernel state on leader-loss transitions
+      // (follower / offline / deleted). Without that listener the kernel's idempotent cache
+      // can return stale duplicate ACKs after a leader flap on a different broker, because
+      // the leader-epoch correctness floor in lookupIdempotentBatch only catches stale
+      // entries AFTER this broker has observed the epoch bump locally — see PartitionListener
+      // wiring in ReplicaManager.applyLocalLeadersDelta / applyLocalFollowersDelta.
+      concentrationKernel = new ConcentrationKernel(
+        new File(logManager.liveLogDirs.head, ConcentrationKernel.SIDECAR_DIR_NAME))
+
+      // Hook #6 (minimal): broker-config shortcut for declaring logical topics. The long-term
+      // path is a KRaft metadata record; until then, operators put their declarations in
+      // server.properties under concentration.logical.topics, e.g. "orders:100:shared:4". A
+      // malformed entry surfaces here as a ConfigException that fails broker startup — the
+      // right semantic, because we cannot serve a logical topic we cannot construct.
+      LogicalTopicConfigParser.parse(
+        config.getString(ServerConfigs.CONCENTRATION_LOGICAL_TOPICS_CONFIG)
+      ).forEach(concentrationKernel.declare(_))
+
+      // Hook #5 (cheap path): PROMPT acceptance criterion — "Broker restart with intact durable
+      // index → sub-second offset-tracker rebuild from the sidecar file." Sidecars on disk are
+      // the source of truth here; recoverFromDisk() walks the per-topic sidecar directory and
+      // seeds the tracker for every (logicalTopic, partition) with a file present. Partitions
+      // never produced to have no sidecar and are left at the default (0, 0) — they will be
+      // created at first produce.
+      //
+      // The expensive "restart without index → full log scan" recovery uses a different kernel
+      // entry point (recoverFromBackingScan), which requires reading the backing UnifiedLog —
+      // not available until logManager.startup() runs later in the metadata-publishing path.
+      // That wiring is intentionally NOT part of this hook; see PROMPT.md for the contract and
+      // the kernel's recoverFromBackingScan for the operator-driven recovery API.
+      concentrationKernel.recoverFromDisk()
+
       this._replicaManager = new ReplicaManager(
         config = config,
         metrics = metrics,
@@ -355,7 +394,8 @@ class BrokerServer(
         brokerEpochSupplier = () => lifecycleManager.brokerEpoch,
         addPartitionsToTxnManager = Some(addPartitionsToTxnManager),
         directoryEventHandler = directoryEventHandler,
-        defaultActionQueue = defaultActionQueue
+        defaultActionQueue = defaultActionQueue,
+        concentrationKernel = Some(concentrationKernel)
       )
 
       /* start token manager */
@@ -448,37 +488,6 @@ class BrokerServer(
         groupConfigManager,
         metrics
       )
-
-      // Concentration kernel — pure Java, broker-agnostic. The sidecar directory is rooted
-      // under the first live log dir so it travels with the broker's storage (and so a future
-      // log-dir failure handler can co-locate sidecar evacuation with log evacuation).
-      // The kernel does NOT take a reference to LogManager — it only needs a place to write
-      // its sidecar files. See storage/.../concentration/ConcentrationKernel for the API.
-      concentrationKernel = new ConcentrationKernel(
-        new File(logManager.liveLogDirs.head, ConcentrationKernel.SIDECAR_DIR_NAME))
-
-      // Hook #6 (minimal): broker-config shortcut for declaring logical topics. The long-term
-      // path is a KRaft metadata record; until then, operators put their declarations in
-      // server.properties under concentration.logical.topics, e.g. "orders:100:shared:4". A
-      // malformed entry surfaces here as a ConfigException that fails broker startup — the
-      // right semantic, because we cannot serve a logical topic we cannot construct.
-      LogicalTopicConfigParser.parse(
-        config.getString(ServerConfigs.CONCENTRATION_LOGICAL_TOPICS_CONFIG)
-      ).forEach(concentrationKernel.declare(_))
-
-      // Hook #5 (cheap path): PROMPT acceptance criterion — "Broker restart with intact durable
-      // index → sub-second offset-tracker rebuild from the sidecar file." Sidecars on disk are
-      // the source of truth here; recoverFromDisk() walks the per-topic sidecar directory and
-      // seeds the tracker for every (logicalTopic, partition) with a file present. Partitions
-      // never produced to have no sidecar and are left at the default (0, 0) — they will be
-      // created at first produce.
-      //
-      // The expensive "restart without index → full log scan" recovery uses a different kernel
-      // entry point (recoverFromBackingScan), which requires reading the backing UnifiedLog —
-      // not available until logManager.startup() runs later in the metadata-publishing path.
-      // That wiring is intentionally NOT part of this hook; see PROMPT.md for the contract and
-      // the kernel's recoverFromBackingScan for the operator-driven recovery API.
-      concentrationKernel.recoverFromDisk()
 
       dataPlaneRequestProcessor = new KafkaApis(
         requestChannel = socketServer.dataPlaneRequestChannel,

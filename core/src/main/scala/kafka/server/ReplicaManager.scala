@@ -58,6 +58,7 @@ import org.apache.kafka.server.share.fetch.{DelayedShareFetchKey, DelayedShareFe
 import org.apache.kafka.server.storage.log.{FetchParams, FetchPartitionData}
 import org.apache.kafka.server.util.{Scheduler, ShutdownableThread}
 import org.apache.kafka.storage.internals.checkpoint.{LazyOffsetCheckpoints, OffsetCheckpointFile, OffsetCheckpoints}
+import org.apache.kafka.storage.internals.concentration.ConcentrationKernel
 import org.apache.kafka.storage.internals.log.{AppendOrigin, FetchDataInfo, LeaderHwChange, LogAppendInfo, LogConfig, LogDirFailureChannel, LogOffsetMetadata, LogReadInfo, OffsetResultHolder, RecordValidationException, RemoteLogReadResult, RemoteStorageFetchInfo, VerificationGuard}
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats
 
@@ -281,7 +282,8 @@ class ReplicaManager(val config: KafkaConfig,
                      val brokerEpochSupplier: () => Long = () => -1,
                      addPartitionsToTxnManager: Option[AddPartitionsToTxnManager] = None,
                      val directoryEventHandler: DirectoryEventHandler = DirectoryEventHandler.NOOP,
-                     val defaultActionQueue: ActionQueue = new DelayedActionQueue
+                     val defaultActionQueue: ActionQueue = new DelayedActionQueue,
+                     concentrationKernel: Option[ConcentrationKernel] = None
                      ) extends Logging {
   private val metricsGroup = new KafkaMetricsGroup(this.getClass)
 
@@ -2740,6 +2742,28 @@ class ReplicaManager(val config: KafkaConfig,
     }
   }
 
+  /**
+   * Concentration: register a {@link KafkaConcentrationPartitionListener} on the partition
+   * if (a) a kernel is configured for this broker and (b) the partition is a backing topic.
+   * No-op otherwise.
+   *
+   * Called from both {@code applyLocalLeadersDelta} (after {@code makeLeader}) and
+   * {@code applyLocalFollowersDelta} (after {@code makeFollower}). The underlying
+   * {@code maybeAddListener} requires {@code log} to be set on the partition, which is
+   * exactly what {@code makeLeader}/{@code makeFollower} arranges; calling earlier would
+   * be a no-op. Idempotent across repeated calls because the listener overrides
+   * equals/hashCode and {@code listeners} is a {@code CopyOnWriteArraySet}.
+   *
+   * Visible for testing.
+   */
+  private[server] def maybeAttachConcentrationListener(tp: TopicPartition, partition: Partition): Unit = {
+    concentrationKernel.foreach { kernel =>
+      if (kernel.isBackingTopic(tp.topic)) {
+        partition.maybeAddListener(new KafkaConcentrationPartitionListener(tp, kernel))
+      }
+    }
+  }
+
   private def applyLocalLeadersDelta(
     changedPartitions: mutable.Set[Partition],
     delta: TopicsDelta,
@@ -2756,6 +2780,12 @@ class ReplicaManager(val config: KafkaConfig,
           val state = info.partition.toLeaderAndIsrPartitionState(tp, isNew)
           val partitionAssignedDirectoryId = directoryIds.find(_._1.topicPartition() == tp).map(_._2)
           partition.makeLeader(state, offsetCheckpoints, Some(info.topicId), partitionAssignedDirectoryId)
+
+          // Concentration: subscribe the kernel to backing-topic lifecycle events so its
+          // idempotent cache is invalidated on leader-loss (follower / offline / deleted).
+          // maybeAddListener is idempotent across repeated leader-epoch bumps because
+          // KafkaConcentrationPartitionListener overrides equals/hashCode.
+          maybeAttachConcentrationListener(tp, partition)
 
           changedPartitions.add(partition)
         } catch {
@@ -2798,6 +2828,15 @@ class ReplicaManager(val config: KafkaConfig,
           val state = info.partition.toLeaderAndIsrPartitionState(tp, isNew)
           val partitionAssignedDirectoryId = directoryIds.find(_._1.topicPartition() == tp).map(_._2)
           val isNewLeaderEpoch = partition.makeFollower(state, offsetCheckpoints, Some(info.topicId), partitionAssignedDirectoryId)
+
+          // Concentration: subscribe the kernel here too so that on the path
+          // "no-replica → follower → leader → follower", the listener registered during
+          // the leader phase isn't the only safety net. Registering on the follower path
+          // is a no-op for invalidation semantics (cache only fills while leader), and
+          // it guarantees the listener survives partition object recreation paths.
+          // Registered BEFORE invokeOnBecomingFollowerListeners below so that the
+          // current transition out of a prior leader-epoch (if any) is observed.
+          maybeAttachConcentrationListener(tp, partition)
 
           if (isInControlledShutdown && (info.partition.leader == NO_LEADER ||
               !info.partition.isr.contains(config.brokerId))) {
