@@ -135,6 +135,25 @@ class KafkaApis(val requestChannel: RequestChannel,
     TenantContext.of(request.context.principal, tenantConfig.boundTenantFor(request.context.listenerName))
   }
 
+  // Outside-in pollution guard, applied by non-tenant handlers (Produce / Fetch
+  // / DeleteTopics) before they would otherwise hit replicaManager or forward
+  // to the controller. A privileged caller on a non-tenant listener naming
+  // `<knownTenantId>.X` directly addresses tenant storage — without this guard
+  // they could overwrite, read, or delete tenant data despite the CreateTopics
+  // pollution guard refusing to create the same name in the first place.
+  // Internal Kafka topics are exempt: they are never tenant-prefixed and the
+  // cluster relies on them being addressable by name from broker code paths.
+  private def isReservedTenantNamespace(name: String): Boolean = {
+    if (name == null || Topic.isInternal(name)) return false
+    val knownTenants = tenantConfig.allTenants
+    if (knownTenants.isEmpty) return false
+    val it = knownTenants.iterator
+    while (it.hasNext) {
+      if (name.startsWith(it.next + ".")) return true
+    }
+    false
+  }
+
   // Return the PHYSICAL TopicIdPartition the tenant is allowed to fetch, or
   // None if the topic falls outside the tenant's namespace.
   //
@@ -392,7 +411,15 @@ class KafkaApis(val requestChannel: RequestChannel,
       return
     }
     if (!ctx.effectiveTenant.isPresent) {
-      forwardToController(request)
+      // Outside-in pollution guard. A non-tenant principal naming
+      // `<knownTenantId>.X` would delete the tenant's physical topic from the
+      // cluster-wide listener; refuse to forward such entries. Mirrors the
+      // CreateTopics outside-in guard so creation and deletion stay symmetric.
+      if (tenantConfig.allTenants.isEmpty) {
+        forwardToController(request)
+        return
+      }
+      handleNonTenantDeleteTopicsRequest(request, delReq, version)
       return
     }
     val physicalToLogical = mutable.Map[String, String]()
@@ -515,6 +542,81 @@ class KafkaApis(val requestChannel: RequestChannel,
           rewritten.add(rebuilt)
         }
         resp.data.setResponses(rewritten)
+        requestHelper.sendForwardedResponse(request, resp)
+      case Some(other) =>
+        requestHelper.sendForwardedResponse(request, other)
+      case None => handleInvalidVersionsDuringForwarding(request)
+    })
+  }
+
+  // Outside-in pollution guard for DeleteTopics from a non-tenant principal on
+  // a non-tenant listener. Refuse any entry whose name (or topic-id resolving
+  // to a name) begins with `<knownTenantId>.`. This is the destructive twin of
+  // the CreateTopics outside-in guard: without it, a privileged caller could
+  // delete a tenant's physical topic from the cluster-wide listener and the
+  // tenant would observe their logical topic silently vanishing.
+  private def handleNonTenantDeleteTopicsRequest(request: RequestChannel.Request,
+                                                  delReq: DeleteTopicsRequest,
+                                                  version: Short): Unit = {
+    val pollutionRejected = new util.ArrayList[DeleteTopicsResponseData.DeletableTopicResult]()
+    if (version >= 6) {
+      val topicIdToName = metadataCache.topicIdsToNames()
+      val forwardable = new util.ArrayList[DeleteTopicsRequestData.DeleteTopicState](delReq.data.topics.size)
+      delReq.data.topics.forEach { t =>
+        // Resolve by-id entries so an admin cannot bypass the guard by sending
+        // the UUID for `acme.X`. If the id is unresolvable, fall through to
+        // forwardable — the controller will surface UNKNOWN_TOPIC_ID and the
+        // existing scrub logic handles it.
+        val effectiveName =
+          if (t.name != null) t.name
+          else topicIdToName.get(t.topicId)
+        if (isReservedTenantNamespace(effectiveName)) {
+          val r = new DeleteTopicsResponseData.DeletableTopicResult()
+            .setErrorCode(Errors.INVALID_TOPIC_EXCEPTION.code)
+            .setErrorMessage("Topic name '" + effectiveName + "' is reserved (tenant namespace prefix)")
+          if (t.name != null) r.setName(t.name) else r.setName(null)
+          if (t.topicId != null && !t.topicId.equals(Uuid.ZERO_UUID)) r.setTopicId(t.topicId)
+          pollutionRejected.add(r)
+        } else {
+          forwardable.add(t.duplicate())
+        }
+      }
+      if (forwardable.isEmpty) {
+        val responses = new DeleteTopicsResponseData.DeletableTopicResultCollection(pollutionRejected.size)
+        pollutionRejected.forEach(r => responses.add(r))
+        requestChannel.sendResponse(request,
+          new DeleteTopicsResponse(new DeleteTopicsResponseData().setResponses(responses)), None)
+        return
+      }
+      delReq.data.setTopics(forwardable)
+    } else {
+      val forwardable = new util.ArrayList[String](delReq.data.topicNames.size)
+      delReq.data.topicNames.forEach { name =>
+        if (isReservedTenantNamespace(name)) {
+          pollutionRejected.add(new DeleteTopicsResponseData.DeletableTopicResult()
+            .setName(name)
+            .setErrorCode(Errors.INVALID_TOPIC_EXCEPTION.code)
+            .setErrorMessage("Topic name '" + name + "' is reserved (tenant namespace prefix)"))
+        } else {
+          forwardable.add(name)
+        }
+      }
+      if (forwardable.isEmpty) {
+        val responses = new DeleteTopicsResponseData.DeletableTopicResultCollection(pollutionRejected.size)
+        pollutionRejected.forEach(r => responses.add(r))
+        requestChannel.sendResponse(request,
+          new DeleteTopicsResponse(new DeleteTopicsResponseData().setResponses(responses)), None)
+        return
+      }
+      delReq.data.setTopicNames(forwardable)
+    }
+    forwardingManager.forwardRequest(request, delReq, {
+      case Some(resp: DeleteTopicsResponse) =>
+        val merged = new DeleteTopicsResponseData.DeletableTopicResultCollection(
+          resp.data.responses.size + pollutionRejected.size)
+        pollutionRejected.forEach(r => merged.add(r))
+        resp.data.responses.forEach(r => merged.add(r.duplicate()))
+        resp.data.setResponses(merged)
         requestHelper.sendForwardedResponse(request, resp)
       case Some(other) =>
         requestHelper.sendForwardedResponse(request, other)
@@ -830,6 +932,24 @@ class KafkaApis(val requestChannel: RequestChannel,
         if (tenantCtx.isReservedPhysicalForm(t.name)
             || tenantCtx.isOverlongLogicalForm(t.name)
             || tenantCtx.isInvalidLogicalForm(t.name)) {
+          rejected.add(t)
+          t.partitionData.forEach { p =>
+            invalidLogicalTopicResponses +=
+              new TopicPartition(t.name, p.index) -> new PartitionResponse(Errors.INVALID_TOPIC_EXCEPTION)
+          }
+        }
+      }
+      rejected.forEach(t => produceRequest.data.topicData.remove(t))
+    } else if (!tenantConfig.allTenants.isEmpty) {
+      // Outside-in pollution guard. A non-tenant principal on a non-tenant
+      // listener naming `<knownTenantId>.X` would auto-create / append into
+      // the tenant's physical log; the tenant's logical Fetch would then
+      // return foreign records as if they had produced them. Refuse such
+      // entries up front — destructive twin of the CreateTopics / DeleteTopics
+      // outside-in guards. Internal topics are exempt.
+      val rejected = new util.ArrayList[ProduceRequestData.TopicProduceData]()
+      produceRequest.data.topicData.forEach { t =>
+        if (isReservedTenantNamespace(t.name)) {
           rejected.add(t)
           t.partitionData.forEach { p =>
             invalidLogicalTopicResponses +=

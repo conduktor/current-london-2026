@@ -12432,6 +12432,223 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testProduceClusterWideListenerRejectsTenantPrefixedNames(): Unit = {
+    // Outside-in pollution via Produce: a super-user on the cluster-wide
+    // (non-tenant) listener producing to "acme.orders" would auto-create /
+    // append into tenant acme's physical log; tenant acme's logical Fetch
+    // would then return foreign records as if they had produced them. The
+    // broker refuses the entry with INVALID_TOPIC_EXCEPTION before reaching
+    // replicaManager — destructive twin of the CreateTopics outside-in guard.
+    val produceRequest = buildSingleTopicProduceRequest("acme.orders")
+    val request = buildRequest(produceRequest)
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), any[Long])).thenReturn(0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    kafkaApis = createKafkaApis(
+      authorizer = None,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[ProduceResponse](request)
+    assertEquals(1, response.data.responses.size)
+    val topicResp = response.data.responses.asScala.head
+    assertEquals("acme.orders", topicResp.name,
+      "rejection must keep the wire name the cluster-wide caller sent")
+    val partitionResp = topicResp.partitionResponses.asScala.head
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION,
+      Errors.forCode(partitionResp.errorCode),
+      "tenant-prefixed produce from a non-tenant listener must be refused")
+    verify(replicaManager, never()).handleProduceAppend(
+      anyLong, anyShort, anyBoolean, any(), any(), any(), any(), any(), any(), any())
+  }
+
+  @Test
+  def testProduceClusterWideListenerWithAcksZeroClosesConnectionOnReject(): Unit = {
+    // acks=0 + outside-in pollution: the rejection lives in
+    // invalidLogicalTopicResponses which bypasses replicaManager. Without
+    // the explicit `errorInResponse = true` signal, the acks=0 path would
+    // fall through to sendNoOpResponseExemptThrottle and the polluter would
+    // never learn the produce was refused — symmetric with the per-tenant
+    // reserved-form acks=0 trap.
+    val produceRequest = buildSingleTopicProduceRequest("acme.orders", acks = 0.toShort)
+    val request = buildRequest(produceRequest)
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), any[Long])).thenReturn(0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    kafkaApis = createKafkaApis(
+      authorizer = None,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    verify(requestChannel).closeConnection(
+      ArgumentMatchers.eq(request),
+      any[java.util.Map[Errors, Integer]]())
+    verify(requestChannel, never()).sendResponse(any(), any(), any())
+    verify(replicaManager, never()).handleProduceAppend(
+      anyLong, anyShort, anyBoolean(), any(), any(), any(), any(), any(), any(), any())
+  }
+
+  @Test
+  def testProduceClusterWideListenerForwardsTenantLookingNamesWhenNoTenantsConfigured(): Unit = {
+    // Pollution guard is gated on TenantConfig.allTenants. With no tenants
+    // configured, the broker behaves as a stock single-tenant cluster and the
+    // produce flows through normally — including topics whose names happen to
+    // contain a dot. Topic exists in metadataCache so the request reaches
+    // replicaManager (where the test stubs it to NONE).
+    val topic = "acme.orders"
+    addTopicToMetadataCache(topic, numPartitions = 1)
+
+    val produceRequest = buildSingleTopicProduceRequest(topic)
+    val request = buildRequest(produceRequest)
+
+    val responseCallback: ArgumentCaptor[Map[TopicPartition, PartitionResponse] => Unit] =
+      ArgumentCaptor.forClass(classOf[Map[TopicPartition, PartitionResponse] => Unit])
+    when(replicaManager.handleProduceAppend(
+      anyLong, anyShort, ArgumentMatchers.eq(false), any(),
+      any(), responseCallback.capture(),
+      any(), any(), any(), any())
+    ).thenAnswer(_ => responseCallback.getValue.apply(
+      Map(new TopicPartition(topic, 0) -> new PartitionResponse(Errors.NONE))))
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), any[Long])).thenReturn(0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    kafkaApis = createKafkaApis(authorizer = None)
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[ProduceResponse](request)
+    val topicResp = response.data.responses.asScala.head
+    assertEquals(topic, topicResp.name,
+      "without a tenant binding the request must surface the wire name verbatim")
+    assertEquals(Errors.NONE,
+      Errors.forCode(topicResp.partitionResponses.asScala.head.errorCode),
+      "without a tenant binding the produce must succeed verbatim")
+  }
+
+  @Test
+  def testDeleteTopicsClusterWideListenerRejectsTenantPrefixedNames(): Unit = {
+    // Outside-in pollution via DeleteTopics by-name: a super-user on the
+    // cluster-wide (non-tenant) listener deleting "acme.foo" would otherwise
+    // forward to the controller, which would happily drop the tenant's
+    // physical log; tenant acme would observe their logical `foo` silently
+    // vanishing. The broker refuses the entry before forwarding.
+    val deleteRequest = new DeleteTopicsRequest.Builder(new DeleteTopicsRequestData()
+      .setTopics(util.Arrays.asList(new DeleteTopicsRequestData.DeleteTopicState().setName("acme.foo")))
+      .setTimeoutMs(5000)).build()
+    val request = buildRequest(deleteRequest)
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDeleteTopicsRequest(request)
+
+    val response = verifyNoThrottling[DeleteTopicsResponse](request)
+    val result = response.data.responses.asScala.head
+    assertEquals("acme.foo", result.name,
+      "rejection must keep the wire name the cluster-wide caller sent")
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, result.errorCode,
+      "tenant-prefixed delete from a non-tenant listener must be refused")
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[AbstractRequest](), any[Option[AbstractResponse] => Unit]())
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
+  def testDeleteTopicsClusterWideListenerMixesAllowedAndRejectedEntries(): Unit = {
+    // Mixed batch: one tenant-prefixed name (rejected at broker), one neutral
+    // (forwarded). Mirrors the CreateTopics outside-in mixed-batch shape:
+    // refuse the polluter, forward the rest, merge responses on return.
+    val deleteRequest = new DeleteTopicsRequest.Builder(new DeleteTopicsRequestData()
+      .setTopics(util.Arrays.asList(
+        new DeleteTopicsRequestData.DeleteTopicState().setName("acme.foo"),
+        new DeleteTopicsRequestData.DeleteTopicState().setName("plain-topic")))
+      .setTimeoutMs(5000)).build()
+    val request = buildRequest(deleteRequest)
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDeleteTopicsRequest(request)
+
+    val bodyCaptor: ArgumentCaptor[AbstractRequest] = ArgumentCaptor.forClass(classOf[AbstractRequest])
+    val callbackCaptor: ArgumentCaptor[Option[AbstractResponse] => Unit] =
+      ArgumentCaptor.forClass(classOf[Option[AbstractResponse] => Unit])
+    verify(forwardingManager).forwardRequest(
+      ArgumentMatchers.eq(request),
+      bodyCaptor.capture(),
+      callbackCaptor.capture())
+    val forwarded = bodyCaptor.getValue.asInstanceOf[DeleteTopicsRequest]
+    assertEquals(Set("plain-topic"),
+      forwarded.data.topics.asScala.map(_.name).toSet,
+      "only the non-polluting entry must reach the controller")
+
+    val controllerResponse = new DeleteTopicsResponse(new DeleteTopicsResponseData()
+      .setResponses(new DeleteTopicsResponseData.DeletableTopicResultCollection(
+        Collections.singleton(new DeleteTopicsResponseData.DeletableTopicResult()
+          .setName("plain-topic").setErrorCode(Errors.NONE.code)).iterator)))
+    callbackCaptor.getValue.apply(Some(controllerResponse))
+
+    val response = verifyNoThrottling[DeleteTopicsResponse](request)
+    val byName = response.data.responses.asScala.map(r => r.name -> r.errorCode).toMap
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, byName("acme.foo"),
+      "tenant-prefixed entry must be rejected at the broker")
+    assertEquals(Errors.NONE.code, byName("plain-topic"),
+      "non-polluting entry must surface the controller's outcome unchanged")
+  }
+
+  @Test
+  def testDeleteTopicsClusterWideListenerForwardsTenantLookingNamesWhenNoTenantsConfigured(): Unit = {
+    // Pollution guard is gated on TenantConfig.allTenants. With no tenants
+    // configured, the broker behaves as a stock single-tenant cluster and the
+    // delete is forwarded verbatim — including topics whose names happen to
+    // contain a dot.
+    val deleteRequest = new DeleteTopicsRequest.Builder(new DeleteTopicsRequestData()
+      .setTopics(util.Arrays.asList(new DeleteTopicsRequestData.DeleteTopicState().setName("acme.foo")))
+      .setTimeoutMs(5000)).build()
+    val request = buildRequest(deleteRequest)
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleDeleteTopicsRequest(request)
+
+    verify(forwardingManager).forwardRequest(
+      ArgumentMatchers.eq(request),
+      any[Option[AbstractResponse] => Unit]())
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[AbstractRequest](), any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
+  def testDeleteTopicsClusterWideListenerPassesInternalTopicsThrough(): Unit = {
+    // Internal topics are never tenant-namespaced. Even with tenants
+    // configured, `__consumer_offsets` (etc.) must not be misclassified as
+    // pollution — delete-by-name must reach the controller via the standard
+    // forwarded path.
+    val deleteRequest = new DeleteTopicsRequest.Builder(new DeleteTopicsRequestData()
+      .setTopics(util.Arrays.asList(
+        new DeleteTopicsRequestData.DeleteTopicState().setName(Topic.GROUP_METADATA_TOPIC_NAME)))
+      .setTimeoutMs(5000)).build()
+    val request = buildRequest(deleteRequest)
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDeleteTopicsRequest(request)
+
+    val bodyCaptor: ArgumentCaptor[AbstractRequest] = ArgumentCaptor.forClass(classOf[AbstractRequest])
+    verify(forwardingManager).forwardRequest(
+      ArgumentMatchers.eq(request),
+      bodyCaptor.capture(),
+      any[Option[AbstractResponse] => Unit]())
+    val forwarded = bodyCaptor.getValue.asInstanceOf[DeleteTopicsRequest]
+    assertEquals(Set(Topic.GROUP_METADATA_TOPIC_NAME),
+      forwarded.data.topics.asScala.map(_.name).toSet,
+      "internal topic delete must reach the controller even with tenants configured")
+  }
+
+  @Test
   def testNonV1ApiFromPrivilegedCallerOnTenantBoundListenerIsRefusedAtDispatch(): Unit = {
     // The silent-pollution trap extends to every non-v1 API: a super-user on a
     // tenant-bound listener without a `__tenant_` prefix in their principal
