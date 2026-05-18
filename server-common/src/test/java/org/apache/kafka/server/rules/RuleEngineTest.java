@@ -1045,19 +1045,59 @@ public class RuleEngineTest {
         // must accept a fresh evaluation on the same thread immediately
         // after. Pin this: a pool thread serving back-to-back requests must
         // never observe a stale TRUE on the second request.
+        //
+        // Round-9 concurrency adversarial finding #3: the outer finally that
+        // calls IN_EVALUATE.remove() is load-bearing for THREE exit paths,
+        // not just the clean DENY return:
+        //   - clean rule-loop exit (ALLOW or DENY)
+        //   - activation supplier throws ActivationBudgetExceededException
+        //     (caught at line 489 → synthetic POLICY_VIOLATION DENY)
+        //   - activation supplier throws any other Throwable (caught at
+        //     line 517 → fail-open ALLOW)
+        // A natural-looking refactor that moves IN_EVALUATE.set(TRUE) inside
+        // the inner try would silently leak the flag across requests on the
+        // two catch paths. Exercise all three so any such regression breaks
+        // a test instead of breaking production.
         RuleEngine engine = new RuleEngine();
         engine.install(new RuleSetBuilder()
             .put(denyRule("r1", ApiKeys.METADATA, "true", 7))
             .build());
-        // First evaluation: lands a DENY (rule matches).
+        // Path 1 — clean DENY exit.
         RuleDecision d1 = engine.evaluate(
             ApiKeys.METADATA, "c", null, false, Collections::emptyMap);
         assertTrue(d1.denied(), "first evaluation must DENY via r1");
-        // Second evaluation on the same thread: must run without tripping
-        // the re-entry guard.
+        // Path 2 — supplier throws ActivationBudgetExceededException; engine
+        // catches and returns synthetic POLICY_VIOLATION DENY. The outer
+        // finally must still clear IN_EVALUATE; otherwise the next call on
+        // this thread would throw IllegalStateException from the guard.
+        java.util.function.Supplier<Map<String, Object>> abeSupplier = () -> {
+            throw new ActivationBudgetExceededException("synthetic-wide-request");
+        };
         RuleDecision d2 = engine.evaluate(
-            ApiKeys.METADATA, "c", null, false, Collections::emptyMap);
+            ApiKeys.METADATA, "c", null, false, abeSupplier);
         assertTrue(d2.denied(),
-            "second evaluation on the same thread must run cleanly (guard cleared)");
+            "ABE-throwing supplier must produce synthetic POLICY_VIOLATION DENY");
+        assertEquals(Errors.POLICY_VIOLATION.code(), d2.errorCode(),
+            "ABE path must surface POLICY_VIOLATION (44), not a fail-open");
+        // Path 3 — supplier throws an arbitrary RuntimeException; engine
+        // catches and fail-opens (ALLOW). Same flag-clear invariant.
+        java.util.function.Supplier<Map<String, Object>> throwingSupplier = () -> {
+            throw new RuntimeException("synthetic-extractor-bug");
+        };
+        RuleDecision d3 = engine.evaluate(
+            ApiKeys.METADATA, "c", null, false, throwingSupplier);
+        assertSame(RuleDecision.ALLOW, d3,
+            "Throwable-throwing supplier must fail open (no activation ⇒ ALLOW)");
+        // Final probe: a fourth evaluation on the same thread after each of
+        // the three exit paths above must still run cleanly. If any of the
+        // three outer-finally branches above had leaked IN_EVALUATE=TRUE,
+        // this call would throw IllegalStateException from the guard at
+        // function entry, not reach the rule loop.
+        RuleDecision d4 = engine.evaluate(
+            ApiKeys.METADATA, "c", null, false, Collections::emptyMap);
+        assertTrue(d4.denied(),
+            "fourth evaluation on the same thread must DENY cleanly — "
+                + "if IN_EVALUATE leaked from any of the prior three paths, "
+                + "the guard would have thrown IllegalStateException instead");
     }
 }

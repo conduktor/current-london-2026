@@ -451,10 +451,20 @@ public final class RuleEngine {
         // Re-entry guard — see IN_EVALUATE javadoc. Checked at function entry
         // so the throw lands BEFORE any budget reset or supplier invocation,
         // which means an inner re-entrant call does not corrupt the outer
-        // evaluation's state. The early-return paths below (bypass, no-rule,
-        // empty-rule-list) never set IN_EVALUATE, so re-entrant short-circuits
-        // remain valid — only a re-entrant call that would actually reach the
-        // budget-reset or rule loop trips here.
+        // evaluation's state.
+        //
+        // Note on the early-return paths below (bypass / no-rule / empty-rule-
+        // list at lines 468-477): those returns happen BEFORE the
+        // IN_EVALUATE.set(TRUE) at line 484, so an evaluation that exits via
+        // any of them never marks the flag. The invariant is "a subsequent
+        // call on the same thread starts with IN_EVALUATE=FALSE", regardless
+        // of which exit path the previous call took. This matters for two
+        // reasons: (1) a request thread that processed an ALLOW-via-bypass
+        // request is free to land on a deny-targeting api-key next without
+        // tripping the guard; (2) the per-request-budget guarantee is not
+        // weakened by short-circuit exits — the guard fires only when a
+        // re-entrant call would actually reach the budget-reset or the rule
+        // loop (i.e. when there is real state to corrupt).
         if (Boolean.TRUE.equals(IN_EVALUATE.get())) {
             throw new IllegalStateException(
                 "RuleEngine.evaluate must not be called recursively on the same "
