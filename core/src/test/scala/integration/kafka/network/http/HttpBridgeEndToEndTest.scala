@@ -504,6 +504,136 @@ class HttpBridgeEndToEndTest {
     }
   }
 
+  @Test
+  def fetchNextCursorFollowsAcrossPagesContiguously(): Unit = {
+    // PROMPT.md FS5: a client that drives navigation through the HAL+JSON `_links.next` cursor must land on a
+    // contiguous next page — no gaps, no duplicates. This proves two things end-to-end against a real broker:
+    //
+    //   (a) `next` after a caught-up fetch is idempotent — the cursor points at "the offset after the last record
+    //       we returned", and if no new records exist yet, refetching with that cursor returns an empty records
+    //       array and the same `next` again. That's the long-poll / SSE-style follow contract — a client can loop
+    //       on `next` without server-side pagination state.
+    //
+    //   (b) The cursor is a logical offset, not a server-side handle: after the caught-up fetch, we produce more
+    //       records and re-issue a GET with the SAME cursor. The new records appear (with offsets strictly greater
+    //       than the previous page's last record), proving the cursor refers to a position in the log rather than a
+    //       fragile session pointer.
+    //
+    // The unit-level cursor round-trip is already covered by FetchResponseFormatterTest + CursorCodecTest; this is
+    // the real-wire counterpart that exercises servlet + bridge + RequestChannel + KafkaApis with cursor strings the
+    // formatter itself produced and the parser then decodes.
+    val cluster = new KafkaClusterTestKit.Builder(
+      new TestKitNodes.Builder()
+        .setNumBrokerNodes(1)
+        .setNumControllerNodes(1)
+        .build())
+      .setConfigProp(SocketServerConfigs.HTTP_BRIDGE_ENABLED_CONFIG, "true")
+      .setConfigProp(SocketServerConfigs.HTTP_BRIDGE_HOST_CONFIG, "127.0.0.1")
+      .setConfigProp(SocketServerConfigs.HTTP_BRIDGE_PORT_CONFIG, "0")
+      .build()
+    val topicName = "http-bridge-cursor"
+    try {
+      cluster.format()
+      cluster.startup()
+      cluster.waitForReadyBrokers()
+
+      val broker = cluster.brokers().get(0)
+      TestUtils.waitUntilTrue(() => broker.brokerState == BrokerState.RUNNING, "Broker never reached RUNNING.")
+      TestUtils.waitUntilTrue(() => broker.httpBridgeServer != null && broker.httpBridgeServer.boundPort() > 0,
+        "HTTP bridge never bound its port.")
+      val bridgePort = broker.httpBridgeServer.boundPort()
+
+      createTopic(cluster, topicName, partitions = 1)
+
+      // Seed three records — first page.
+      val firstPageBody =
+        s"""
+           |{
+           |  "records": [
+           |    { "partition": 0, "value": { "type": "STRING", "data": "page1-r1" } },
+           |    { "partition": 0, "value": { "type": "STRING", "data": "page1-r2" } },
+           |    { "partition": 0, "value": { "type": "STRING", "data": "page1-r3" } }
+           |  ]
+           |}
+           |""".stripMargin
+      val firstPageProduce = postJson(s"http://127.0.0.1:$bridgePort/v1/topics/$topicName/records", firstPageBody)
+      assertEquals(200, firstPageProduce.statusCode(),
+        s"first-page seed produce must succeed, body=${firstPageProduce.body()}")
+
+      // First fetch: discover the page via the explicit ?partition&offset form. This is the "first call" path —
+      // the client doesn't have a cursor yet. The response carries the next cursor we'll follow.
+      val firstFetch = httpGet(s"http://127.0.0.1:$bridgePort/v1/topics/$topicName/records?partition=0&offset=0")
+      assertEquals(200, firstFetch.statusCode(), s"first fetch failed: ${firstFetch.body()}")
+      val firstJson = parseJson(firstFetch.body())
+      val firstRecords = firstJson.get("partitions").get(0).get("records")
+      assertEquals(3, firstRecords.size(), s"first fetch must see all three seeded records, body=${firstFetch.body()}")
+      // Sanity: offsets are 0, 1, 2 — contiguous from the log start.
+      val firstOffsets = (0 until firstRecords.size()).map(i => firstRecords.get(i).get("offset").asLong())
+      assertEquals(Seq(0L, 1L, 2L), firstOffsets,
+        "first-page record offsets must be the broker's actual assignments (0, 1, 2), not formatter-fabricated")
+
+      val nextCursor = firstJson.get("_links").get("next").asText()
+      assertNotNull(nextCursor, "the next cursor is mandatory on every fetch response — it's how clients page forward")
+
+      // Second fetch via the cursor — we've caught up to the high watermark, so the response must be empty AND the
+      // `next` cursor must still point at the same logical offset. That's the idempotent "no progress yet" signal a
+      // long-poll client uses.
+      val caughtUp = httpGet(s"http://127.0.0.1:$bridgePort/v1/topics/$topicName/records?cursor=" +
+        java.net.URLEncoder.encode(nextCursor, java.nio.charset.StandardCharsets.UTF_8))
+      assertEquals(200, caughtUp.statusCode(), s"cursor follow into caught-up state must succeed: ${caughtUp.body()}")
+      val caughtUpJson = parseJson(caughtUp.body())
+      val caughtUpRecords = caughtUpJson.get("partitions").get(0).get("records")
+      assertEquals(0, caughtUpRecords.size(),
+        s"caught-up fetch must return zero records, body=${caughtUp.body()}")
+      assertEquals(nextCursor, caughtUpJson.get("_links").get("next").asText(),
+        "caught-up fetch must echo back the same `next` cursor — it's the idempotent long-poll contract")
+
+      // Now seed a SECOND page after the caught-up read. Re-following the SAME cursor must see only the new
+      // records, with offsets strictly after the first page's last offset (= 2). This is the load-bearing part of
+      // FS5: the cursor is a logical offset, not a server-side pagination handle that could be invalidated by an
+      // intervening empty fetch.
+      val secondPageBody =
+        s"""
+           |{
+           |  "records": [
+           |    { "partition": 0, "value": { "type": "STRING", "data": "page2-r1" } },
+           |    { "partition": 0, "value": { "type": "STRING", "data": "page2-r2" } }
+           |  ]
+           |}
+           |""".stripMargin
+      val secondPageProduce = postJson(s"http://127.0.0.1:$bridgePort/v1/topics/$topicName/records", secondPageBody)
+      assertEquals(200, secondPageProduce.statusCode(),
+        s"second-page seed produce must succeed, body=${secondPageProduce.body()}")
+
+      val secondFetch = httpGet(s"http://127.0.0.1:$bridgePort/v1/topics/$topicName/records?cursor=" +
+        java.net.URLEncoder.encode(nextCursor, java.nio.charset.StandardCharsets.UTF_8))
+      assertEquals(200, secondFetch.statusCode(), s"second-page fetch via cursor failed: ${secondFetch.body()}")
+      val secondJson = parseJson(secondFetch.body())
+      val secondRecords = secondJson.get("partitions").get(0).get("records")
+      assertEquals(2, secondRecords.size(),
+        s"second-page fetch must see only the records produced AFTER the first cursor, body=${secondFetch.body()}")
+      val secondOffsets = (0 until secondRecords.size()).map(i => secondRecords.get(i).get("offset").asLong())
+      // Offsets must be 3 and 4 — strictly greater than the first page's last offset (2). No gaps, no duplicates.
+      assertEquals(Seq(3L, 4L), secondOffsets,
+        s"second-page offsets must be contiguous with the first page's last (no gaps, no dupes), got $secondOffsets")
+      // And the values are exactly the new ones — proving we didn't accidentally re-read the first page.
+      val secondValues = (0 until secondRecords.size())
+        .map(i => secondRecords.get(i).get("value").get("data").asText())
+      assertEquals(Seq("page2-r1", "page2-r2"), secondValues,
+        "cursor-followed fetch must return only the new records, not a re-read of the first page")
+      // The `next` cursor on the second page must have advanced past the new records (logically at offset 5 — one
+      // past the last record at offset 4). We don't decode the cursor here (CursorCodecTest covers that); we only
+      // assert it has CHANGED relative to the first response's `next`. If pagination were broken — say, the
+      // formatter handed back the same cursor regardless of records returned — a client following `next` in a loop
+      // would re-read the same records forever. This catches that class of regression cheaply.
+      val secondNextCursor = secondJson.get("_links").get("next").asText()
+      assertNotEquals(nextCursor, secondNextCursor,
+        "second page's `next` cursor must advance past the new records, not echo the first page's cursor")
+    } finally {
+      cluster.close()
+    }
+  }
+
   // ----- helpers -------------------------------------------------------------------------------------------------
 
   private def createTopic(cluster: KafkaClusterTestKit, name: String, partitions: Int): Unit = {
