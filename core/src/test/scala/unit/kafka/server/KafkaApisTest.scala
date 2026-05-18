@@ -95,7 +95,7 @@ import org.apache.kafka.server.share.context.{FinalContext, ShareSessionContext}
 import org.apache.kafka.server.share.session.{ShareSession, ShareSessionKey}
 import org.apache.kafka.server.storage.log.{FetchParams, FetchPartitionData}
 import org.apache.kafka.server.util.{FutureUtils, MockTime}
-import org.apache.kafka.storage.internals.concentration.{ConcentrationHeaders, ConcentrationKernel, LogicalTopicDescriptor, Reservation}
+import org.apache.kafka.storage.internals.concentration.{ConcentrationHeaders, ConcentrationKernel, LogicalProduceStamper, LogicalTopicDescriptor, Reservation}
 import org.apache.kafka.storage.internals.log.{AppendOrigin, LogConfig}
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats
 import org.junit.jupiter.api.Assertions._
@@ -2582,6 +2582,302 @@ class KafkaApisTest extends Logging {
     assertEquals(Errors.KAFKA_STORAGE_ERROR, Errors.forCode(partitionResult.errorCode))
     assertEquals(DeleteRecordsResponse.INVALID_LOW_WATERMARK, partitionResult.lowWatermark)
     verify(replicaManager, never()).deleteRecords(anyLong, any(), any(), anyBoolean)
+  }
+
+  @Test
+  def testFetchOnLogicalTopicRoutesToBackingAndTranslatesResponse(): Unit = {
+    // Concentration hook #3.B happy path. A stock consumer fetches logical topic "orders"
+    // partition 0 at offset 100. The hook must:
+    //   1. Resolve logical→backing partition via the kernel (backing partition 2 of "concentrated").
+    //   2. Resolve logical→backing offset via the kernel (logical 100 → backing 7777).
+    //   3. Issue ReplicaManager.fetchMessages against the backing TIP (not the logical TIP).
+    //   4. On the response, strip non-matching records (events on the same backing partition),
+    //      rewrite the surviving records' offsets back to logical (100, 101, 102), drop the
+    //      two concentration headers, and re-key the response to the logical TIP.
+    //   5. Set highWatermark / logStartOffset / lastStableOffset to logical-topic values.
+    // Pinning all five in one test mirrors the produce-side coverage and the consumer's view of
+    // the contract.
+    val logicalTopic = "orders"
+    val backingTopic = "concentrated"
+    val backingTopicId = Uuid.randomUuid()
+    val logicalTopicId = Uuid.randomUuid()
+    val descriptor = new LogicalTopicDescriptor(logicalTopic, 1024, backingTopic, 4)
+    addTopicToMetadataCache(backingTopic, numPartitions = 4, topicId = backingTopicId)
+    // The logical topic must appear in metadataCache so FetchResponse.responseData() can
+    // resolve its UUID back to a name when decoding the response. (FetchResponse at
+    // version >= 13 silently drops entries whose topicId isn't in the cache.) The hook fires
+    // on isLogicalTopic BEFORE the metadataCache.contains check, so this registration
+    // doesn't change which branch we take.
+    addTopicToMetadataCache(logicalTopic, numPartitions = 1024, topicId = logicalTopicId)
+
+    when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
+    when(concentrationKernel.describe(logicalTopic)).thenReturn(Optional.of(descriptor))
+    when(concentrationKernel.backingPartitionFor(logicalTopic, 0)).thenReturn(2)
+    when(concentrationKernel.nextLogicalOffset(logicalTopic, 0)).thenReturn(103L)
+    when(concentrationKernel.startLogicalOffset(logicalTopic, 0)).thenReturn(0L)
+    when(concentrationKernel.resolveBackingOffset(logicalTopic, 0, 100L)).thenReturn(7777L)
+
+    // Build the backing-side records that ReplicaManager would return: three "orders" records
+    // interleaved with two "events" records (events must be filtered out by the translator).
+    val backingRecords = backingRecordsFromInterleaved(
+      ("orders", 100L, "k0", "ord-0"),
+      ("events", 50L,  "kx", "evt-x"),
+      ("orders", 101L, "k1", "ord-1"),
+      ("events", 51L,  "ky", "evt-y"),
+      ("orders", 102L, "k2", "ord-2"))
+
+    val backingTip = new TopicIdPartition(backingTopicId, new TopicPartition(backingTopic, 2))
+    val fetchInfoCaptor: ArgumentCaptor[Seq[(TopicIdPartition, FetchRequest.PartitionData)]] =
+      ArgumentCaptor.forClass(classOf[Seq[(TopicIdPartition, FetchRequest.PartitionData)]])
+    when(replicaManager.fetchMessages(
+      any[FetchParams],
+      fetchInfoCaptor.capture(),
+      any[ReplicaQuota],
+      any[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]()
+    )).thenAnswer { invocation =>
+      val callback = invocation.getArgument(3).asInstanceOf[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]
+      callback(Seq(backingTip -> new FetchPartitionData(Errors.NONE, 7780L, 0L, backingRecords,
+        Optional.empty(), OptionalLong.of(7780L), Optional.empty(), OptionalInt.empty(), false)))
+    }
+
+    val logicalTip = new TopicIdPartition(logicalTopicId, new TopicPartition(logicalTopic, 0))
+    val fetchData = Map(logicalTip ->
+      new FetchRequest.PartitionData(logicalTip.topicId, 100L, 0L, 1_000_000, Optional.empty())).asJava
+    val fetchDataBuilder = Map(logicalTip.topicPartition ->
+      new FetchRequest.PartitionData(logicalTip.topicId, 100L, 0L, 1_000_000, Optional.empty())).asJava
+    val fetchMetadata = new JFetchMetadata(0, 0)
+    val fetchContext = new FullFetchContext(time, new FetchSessionCacheShard(1000, 100),
+      fetchMetadata, fetchData, false, false)
+    when(fetchManager.newContext(
+      any[Short], any[JFetchMetadata], any[Boolean],
+      any[util.Map[TopicIdPartition, FetchRequest.PartitionData]],
+      any[util.List[TopicIdPartition]], any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val fetchRequest = new FetchRequest.Builder(ApiKeys.FETCH.latestVersion,
+      ApiKeys.FETCH.latestVersion, -1, -1, 100, 0, fetchDataBuilder).build()
+    val request = buildRequest(fetchRequest)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleFetchRequest(request)
+
+    // ReplicaManager saw the BACKING TIP with the translated backing fetch offset (7777),
+    // not the logical TIP with logical fetch offset (100).
+    val capturedFetchInfo = fetchInfoCaptor.getValue.toMap
+    assertTrue(capturedFetchInfo.contains(backingTip),
+      s"expected backing TIP $backingTip in fetchInfos, got ${capturedFetchInfo.keys}")
+    assertFalse(capturedFetchInfo.contains(logicalTip),
+      "logical TIP must not leak into ReplicaManager.fetchMessages")
+    assertEquals(7777L, capturedFetchInfo(backingTip).fetchOffset,
+      "ReplicaManager must be asked for the BACKING offset, not the logical one")
+
+    // The consumer-visible response is keyed by the LOGICAL TP.
+    val response = verifyNoThrottling[FetchResponse](request)
+    val responseData = response.responseData(metadataCache.topicIdsToNames(), ApiKeys.FETCH.latestVersion)
+    assertTrue(responseData.containsKey(logicalTip.topicPartition),
+      s"response must be keyed by logical TIP $logicalTip, got ${responseData.keySet()}")
+    assertFalse(responseData.containsKey(backingTip.topicPartition),
+      "backing TIP must not leak to the consumer")
+
+    val partitionData = responseData.get(logicalTip.topicPartition)
+    assertEquals(Errors.NONE.code, partitionData.errorCode)
+    assertEquals(103L, partitionData.highWatermark, "highWatermark must be the LOGICAL next offset")
+    assertEquals(0L, partitionData.logStartOffset, "logStartOffset must be the LOGICAL start")
+    assertEquals(103L, partitionData.lastStableOffset, "v1 non-transactional: LSO == HW")
+
+    // Records: only "orders" survives (events filtered), offsets rewritten to logical, headers stripped.
+    val outRecords = FetchResponse.recordsOrFail(partitionData)
+    val iter = outRecords.records().iterator()
+    val seen = scala.collection.mutable.ArrayBuffer[(Long, String)]()
+    while (iter.hasNext) {
+      val r = iter.next()
+      val bytes = new Array[Byte](r.value().remaining())
+      r.value().duplicate().get(bytes)
+      seen += ((r.offset(), new String(bytes, StandardCharsets.UTF_8)))
+      // No concentration headers must leak to the consumer.
+      r.headers().foreach { h =>
+        assertNotEquals(ConcentrationHeaders.LOGICAL_TOPIC_HEADER, h.key())
+        assertNotEquals(ConcentrationHeaders.LOGICAL_OFFSET_HEADER, h.key())
+      }
+    }
+    assertEquals(Seq((100L, "ord-0"), (101L, "ord-1"), (102L, "ord-2")), seen.toSeq,
+      "consumer must see only orders' records with logical offsets, in order")
+  }
+
+  @Test
+  def testFetchOnLogicalTopicAtTailReturnsEmptyWithoutHittingBacking(): Unit = {
+    // A consumer fetching at the LOGICAL tail (fetchOffset == nextLogicalOffset) must get an
+    // immediate empty NONE response. The broker must NOT issue a backing fetch — at the tail
+    // every backing record belongs to OTHER logical topics, and the translator would filter it
+    // all out anyway. Pin both behaviours: empty response AND no replicaManager.fetchMessages
+    // call. v1 trades long-poll for this shortcut — documented in the production code comment.
+    val logicalTopic = "orders"
+    val backingTopic = "concentrated"
+    val backingTopicId = Uuid.randomUuid()
+    val logicalTopicId = Uuid.randomUuid()
+    val descriptor = new LogicalTopicDescriptor(logicalTopic, 1024, backingTopic, 4)
+    addTopicToMetadataCache(backingTopic, numPartitions = 4, topicId = backingTopicId)
+    addTopicToMetadataCache(logicalTopic, numPartitions = 1024, topicId = logicalTopicId)
+
+    when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
+    when(concentrationKernel.describe(logicalTopic)).thenReturn(Optional.of(descriptor))
+    when(concentrationKernel.backingPartitionFor(logicalTopic, 0)).thenReturn(2)
+    when(concentrationKernel.nextLogicalOffset(logicalTopic, 0)).thenReturn(42L)
+    when(concentrationKernel.startLogicalOffset(logicalTopic, 0)).thenReturn(0L)
+
+    val logicalTip = new TopicIdPartition(logicalTopicId, new TopicPartition(logicalTopic, 0))
+    // Consumer fetches at exactly nextLogicalOffset — the log tail.
+    val fetchData = Map(logicalTip ->
+      new FetchRequest.PartitionData(logicalTip.topicId, 42L, 0L, 1_000_000, Optional.empty())).asJava
+    val fetchDataBuilder = Map(logicalTip.topicPartition ->
+      new FetchRequest.PartitionData(logicalTip.topicId, 42L, 0L, 1_000_000, Optional.empty())).asJava
+    val fetchContext = new FullFetchContext(time, new FetchSessionCacheShard(1000, 100),
+      new JFetchMetadata(0, 0), fetchData, false, false)
+    when(fetchManager.newContext(
+      any[Short], any[JFetchMetadata], any[Boolean],
+      any[util.Map[TopicIdPartition, FetchRequest.PartitionData]],
+      any[util.List[TopicIdPartition]], any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val fetchRequest = new FetchRequest.Builder(ApiKeys.FETCH.latestVersion,
+      ApiKeys.FETCH.latestVersion, -1, -1, 100, 0, fetchDataBuilder).build()
+    val request = buildRequest(fetchRequest)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleFetchRequest(request)
+
+    verify(replicaManager, never()).fetchMessages(any[FetchParams],
+      any[Seq[(TopicIdPartition, FetchRequest.PartitionData)]],
+      any[ReplicaQuota],
+      any[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]())
+
+    val response = verifyNoThrottling[FetchResponse](request)
+    val responseData = response.responseData(metadataCache.topicIdsToNames(), ApiKeys.FETCH.latestVersion)
+    val partitionData = responseData.get(logicalTip.topicPartition)
+    assertEquals(Errors.NONE.code, partitionData.errorCode)
+    assertEquals(42L, partitionData.highWatermark)
+    assertEquals(42L, partitionData.lastStableOffset)
+    assertEquals(0L, partitionData.logStartOffset)
+    val out = FetchResponse.recordsOrFail(partitionData)
+    assertEquals(0, out.sizeInBytes, "tail fetch must yield zero-byte records")
+  }
+
+  @Test
+  def testFetchOnLogicalTopicBeyondTailReturnsOffsetOutOfRange(): Unit = {
+    // A consumer fetching at offset > nextLogicalOffset is OFFSET_OUT_OF_RANGE — same contract
+    // as a stock topic. This catches a buggy consumer that didn't reset its offset after the
+    // log was truncated by DeleteRecords or after a consumer-group rebalance lost the position.
+    val logicalTopic = "orders"
+    val backingTopic = "concentrated"
+    val backingTopicId = Uuid.randomUuid()
+    val logicalTopicId = Uuid.randomUuid()
+    val descriptor = new LogicalTopicDescriptor(logicalTopic, 1024, backingTopic, 4)
+    addTopicToMetadataCache(backingTopic, numPartitions = 4, topicId = backingTopicId)
+    addTopicToMetadataCache(logicalTopic, numPartitions = 1024, topicId = logicalTopicId)
+
+    when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
+    when(concentrationKernel.describe(logicalTopic)).thenReturn(Optional.of(descriptor))
+    when(concentrationKernel.backingPartitionFor(logicalTopic, 0)).thenReturn(2)
+    when(concentrationKernel.nextLogicalOffset(logicalTopic, 0)).thenReturn(50L)
+    when(concentrationKernel.startLogicalOffset(logicalTopic, 0)).thenReturn(10L)
+
+    val logicalTip = new TopicIdPartition(logicalTopicId, new TopicPartition(logicalTopic, 0))
+    // Consumer fetches past the tail — must be rejected, kernel.resolveBackingOffset never called.
+    val fetchData = Map(logicalTip ->
+      new FetchRequest.PartitionData(logicalTip.topicId, 9999L, 0L, 1_000_000, Optional.empty())).asJava
+    val fetchDataBuilder = Map(logicalTip.topicPartition ->
+      new FetchRequest.PartitionData(logicalTip.topicId, 9999L, 0L, 1_000_000, Optional.empty())).asJava
+    val fetchContext = new FullFetchContext(time, new FetchSessionCacheShard(1000, 100),
+      new JFetchMetadata(0, 0), fetchData, false, false)
+    when(fetchManager.newContext(
+      any[Short], any[JFetchMetadata], any[Boolean],
+      any[util.Map[TopicIdPartition, FetchRequest.PartitionData]],
+      any[util.List[TopicIdPartition]], any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val fetchRequest = new FetchRequest.Builder(ApiKeys.FETCH.latestVersion,
+      ApiKeys.FETCH.latestVersion, -1, -1, 100, 0, fetchDataBuilder).build()
+    val request = buildRequest(fetchRequest)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleFetchRequest(request)
+
+    verify(concentrationKernel, never()).resolveBackingOffset(any[String], anyInt, anyLong)
+    verify(replicaManager, never()).fetchMessages(any[FetchParams],
+      any[Seq[(TopicIdPartition, FetchRequest.PartitionData)]],
+      any[ReplicaQuota],
+      any[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]())
+
+    val response = verifyNoThrottling[FetchResponse](request)
+    val responseData = response.responseData(metadataCache.topicIdsToNames(), ApiKeys.FETCH.latestVersion)
+    val partitionData = responseData.get(logicalTip.topicPartition)
+    assertEquals(Errors.OFFSET_OUT_OF_RANGE.code, partitionData.errorCode)
+  }
+
+  @Test
+  def testFetchOnLogicalTopicWithOutOfRangePartitionReturnsUnknownTopicOrPartition(): Unit = {
+    // Partition index >= numLogicalPartitions is a client routing bug, not transient — same
+    // contract as the produce path's out-of-range rejection.
+    val logicalTopic = "orders"
+    val backingTopic = "concentrated"
+    val backingTopicId = Uuid.randomUuid()
+    val logicalTopicId = Uuid.randomUuid()
+    val descriptor = new LogicalTopicDescriptor(logicalTopic, 1024, backingTopic, 4)
+    addTopicToMetadataCache(backingTopic, numPartitions = 4, topicId = backingTopicId)
+    addTopicToMetadataCache(logicalTopic, numPartitions = 1024, topicId = logicalTopicId)
+
+    when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
+    when(concentrationKernel.describe(logicalTopic)).thenReturn(Optional.of(descriptor))
+
+    val logicalTip = new TopicIdPartition(logicalTopicId, new TopicPartition(logicalTopic, 9999))
+    val fetchData = Map(logicalTip ->
+      new FetchRequest.PartitionData(logicalTip.topicId, 0L, 0L, 1_000_000, Optional.empty())).asJava
+    val fetchDataBuilder = Map(logicalTip.topicPartition ->
+      new FetchRequest.PartitionData(logicalTip.topicId, 0L, 0L, 1_000_000, Optional.empty())).asJava
+    val fetchContext = new FullFetchContext(time, new FetchSessionCacheShard(1000, 100),
+      new JFetchMetadata(0, 0), fetchData, false, false)
+    when(fetchManager.newContext(
+      any[Short], any[JFetchMetadata], any[Boolean],
+      any[util.Map[TopicIdPartition, FetchRequest.PartitionData]],
+      any[util.List[TopicIdPartition]], any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val fetchRequest = new FetchRequest.Builder(ApiKeys.FETCH.latestVersion,
+      ApiKeys.FETCH.latestVersion, -1, -1, 100, 0, fetchDataBuilder).build()
+    val request = buildRequest(fetchRequest)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleFetchRequest(request)
+
+    verify(concentrationKernel, never()).backingPartitionFor(any[String], anyInt)
+    verify(replicaManager, never()).fetchMessages(any[FetchParams],
+      any[Seq[(TopicIdPartition, FetchRequest.PartitionData)]],
+      any[ReplicaQuota],
+      any[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]())
+
+    val response = verifyNoThrottling[FetchResponse](request)
+    val responseData = response.responseData(metadataCache.topicIdsToNames(), ApiKeys.FETCH.latestVersion)
+    val partitionData = responseData.get(logicalTip.topicPartition)
+    assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION.code, partitionData.errorCode)
+  }
+
+  // Helper for fetch-hook tests: build a MemoryRecords as if it had been produced through the
+  // logical-topic stamper, with each record carrying ConcentrationHeaders for `logicalTopic`
+  // and `logicalOffset`. Mirrors the wire shape the fetch hook sees coming off the backing log.
+  private def backingRecordsFromInterleaved(records: (String, Long, String, String)*): MemoryRecords = {
+    val stamped = new scala.collection.mutable.ArrayBuffer[MemoryRecords]()
+    var total = 0
+    records.foreach { case (logicalTopic, logicalOffset, key, value) =>
+      val single = MemoryRecords.withRecords(Compression.NONE,
+        new SimpleRecord(key.getBytes(StandardCharsets.UTF_8), value.getBytes(StandardCharsets.UTF_8)))
+      val s = LogicalProduceStamper.stamp(single, logicalTopic, Array(logicalOffset))
+      stamped += s
+      total += s.sizeInBytes()
+    }
+    val joined = java.nio.ByteBuffer.allocate(total)
+    stamped.foreach(mr => joined.put(mr.buffer().duplicate()))
+    joined.flip()
+    MemoryRecords.readableRecords(joined)
   }
 
   @Test
