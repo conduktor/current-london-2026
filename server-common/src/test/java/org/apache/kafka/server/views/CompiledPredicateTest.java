@@ -771,4 +771,85 @@ class CompiledPredicateTest {
         assertTrue(r.isPresent() && r.get(),
                 () -> "OR with determinate-true LEFT must short-circuit to TRUE, got " + r);
     }
+
+    @Test
+    void rejectsPrecisionLossViaScientificNotationAtCompileTime() {
+        // 9.007199254740993e15 == 9007199254740993, one above 2^53, but the round-3 intPart-length
+        // heuristic saw "9" (1 digit) and let the literal through. Double.parseDouble silently
+        // rounded to 9007199254740992.0; predicate `body.x == 9.007199254740993e15` then matched
+        // any body containing the rounded value. The exact-BigDecimal check now rejects.
+        org.apache.kafka.server.views.PredicateValidationException ex =
+                org.junit.jupiter.api.Assertions.assertThrows(
+                        org.apache.kafka.server.views.PredicateValidationException.class,
+                        () -> compiler.compile("body.x == 9.007199254740993e15"));
+        assertTrue(ex.getMessage().contains("precision-loss"),
+                () -> "expected precision-loss message, got: " + ex.getMessage());
+        // Same value via a different syntactic form must also reject.
+        org.apache.kafka.server.views.PredicateValidationException ex2 =
+                org.junit.jupiter.api.Assertions.assertThrows(
+                        org.apache.kafka.server.views.PredicateValidationException.class,
+                        () -> compiler.compile("body.x == 90.07199254740993e14"));
+        assertTrue(ex2.getMessage().contains("precision-loss"),
+                () -> "expected precision-loss message, got: " + ex2.getMessage());
+    }
+
+    @Test
+    void rejectsSubnormalUnderflowLiteralAtCompileTime() {
+        // 1e-324 is below Double.MIN_VALUE — parses to 0.0. A predicate `body.x == 1e-324`
+        // would otherwise match any record with body.x == 0.0, which is not what the author
+        // wrote. We reject as "underflow to zero".
+        org.apache.kafka.server.views.PredicateValidationException ex =
+                org.junit.jupiter.api.Assertions.assertThrows(
+                        org.apache.kafka.server.views.PredicateValidationException.class,
+                        () -> compiler.compile("body.x == 1e-324"));
+        assertTrue(ex.getMessage().contains("underflow"),
+                () -> "expected underflow message, got: " + ex.getMessage());
+        // Smallest representable positive double remains accepted.
+        compiler.compile("body.x == 5e-324"); // == Double.MIN_VALUE
+    }
+
+    @Test
+    void skipsRecordWhenJsonBodyHasPrecisionLossFloat() {
+        // The Lexer guards the predicate side; this test pins the JSON-body side. An attacker
+        // who writes 9.007199254740993e15 (== 9007199254740993, one above 2^53) into the backing
+        // record would have it silently rounded to 9007199254740992.0 by Jackson, then admitted
+        // by `body.x == 9007199254740992.0`. RecordContexts must mark such bodies BODY_UNUSABLE.
+        CompiledPredicate p = compiler.compile("body.x == 9007199254740992.0");
+        Optional<Boolean> r = p.evaluate(jsonRecord("{\"x\":9.007199254740993e15}"));
+        assertTrue(r.isEmpty() || !r.get(),
+                () -> "JSON body float beyond IEEE-safe range must be unusable, got " + r);
+        // And the negated form must NOT admit either.
+        CompiledPredicate q = compiler.compile("body.x != 9007199254740992.0");
+        Optional<Boolean> rq = q.evaluate(jsonRecord("{\"x\":9.007199254740993e15}"));
+        assertTrue(rq.isEmpty() || !rq.get(),
+                () -> "negated form with unusable body must not admit, got " + rq);
+    }
+
+    @Test
+    void skipsRecordWhenJsonBodyUnderflowsToZero() {
+        // body.x = 1e-324 parses to 0.0 — a `body.x == 0` predicate must NOT admit it, otherwise
+        // an attacker can encode "tiny non-zero" payloads that pass zero-equality checks.
+        CompiledPredicate p = compiler.compile("body.x == 0.0");
+        Optional<Boolean> r = p.evaluate(jsonRecord("{\"x\":1e-324}"));
+        assertTrue(r.isEmpty() || !r.get(),
+                () -> "underflowing JSON float must be unusable, got " + r);
+    }
+
+    @Test
+    void negativeZeroBodyDoesNotSimultaneouslySatisfyLessThanAndEqualToZero() {
+        // Java's Double.compare uses total ordering — Double.compare(-0.0, 0.0) == -1 — but the
+        // equality side uses IEEE == where -0.0 == +0.0. The mismatch let `body.x < 0.0` and
+        // `body.x == 0.0` BOTH evaluate TRUE for a body with x = -0.0, which breaks the
+        // partition-the-number-line invariant a predicate author relies on.
+        CompiledPredicate lt = compiler.compile("body.x < 0.0");
+        CompiledPredicate eq = compiler.compile("body.x == 0.0");
+        RecordContext ctx = jsonRecord("{\"x\":-0.0}");
+        Optional<Boolean> ltResult = lt.evaluate(ctx);
+        Optional<Boolean> eqResult = eq.evaluate(ctx);
+        // -0.0 must be EQUAL to 0.0 (IEEE), NOT less than it.
+        assertTrue(eqResult.isPresent() && eqResult.get(),
+                () -> "expected -0.0 == 0.0 to be TRUE, got " + eqResult);
+        assertTrue(ltResult.isPresent() && !ltResult.get(),
+                () -> "expected -0.0 < 0.0 to be FALSE, got " + ltResult);
+    }
 }

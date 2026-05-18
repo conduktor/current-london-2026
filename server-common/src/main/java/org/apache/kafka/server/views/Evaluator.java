@@ -287,7 +287,7 @@ final class Evaluator {
         if (r instanceof Long) {
             return compareLongDouble((Long) r, l.doubleValue(), true);
         }
-        return Double.compare(l.doubleValue(), r.doubleValue());
+        return ieeeCompare(l.doubleValue(), r.doubleValue());
     }
 
     /** Compare a Long against a Double under the IEEE-safe-integer guard. {@code longOnRight=true}
@@ -299,12 +299,27 @@ final class Evaluator {
         if (longSide > IEEE_SAFE_INTEGER || longSide < -IEEE_SAFE_INTEGER) {
             return null;
         }
-        // Swap operands rather than negating the result: Double.compare doesn't promise the
-        // {-1,0,+1} contract that would make negation safe, and SpotBugs flags negated compares
-        // (RV_NEGATING_RESULT_OF_COMPARETO).
         return longOnRight
-                ? Double.compare(doubleSide, (double) longSide)
-                : Double.compare((double) longSide, doubleSide);
+                ? ieeeCompare(doubleSide, (double) longSide)
+                : ieeeCompare((double) longSide, doubleSide);
+    }
+
+    /**
+     * IEEE-754 ordered comparison that agrees with the {@code ==} operator used by
+     * {@link #equalsValuesOrNull}. {@link Double#compare} uses Java's total ordering, under which
+     * {@code Double.compare(-0.0, +0.0) == -1}; combined with {@code -0.0 == +0.0} that gives an
+     * inconsistent comparator: a body value of {@code -0.0} would satisfy BOTH {@code body.x < 0.0}
+     * and {@code body.x == 0.0}, breaking the assumption that {@code <}, {@code ==}, {@code >}
+     * partition the number line. NaN is already rejected at literal time and at JSON-body parse
+     * time, so it cannot reach this method; if it ever did, {@code l < r} and {@code l > r} would
+     * both be {@code false} and we would fall through to returning {@code 0}, which is the same
+     * result {@link Double#compare} would yield in that edge case under IEEE-equal semantics —
+     * still preferable to total-ordering's {@code -0.0 < +0.0}.
+     */
+    private static int ieeeCompare(double l, double r) {
+        if (l < r) return -1;
+        if (l > r) return 1;
+        return 0;
     }
 
     private static Boolean matches(int cmp, int target, boolean inclusive) {

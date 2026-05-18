@@ -23,6 +23,8 @@ import com.fasterxml.jackson.core.StreamReadConstraints;
 import com.fasterxml.jackson.databind.util.TokenBuffer;
 
 import java.io.IOException;
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.StandardCharsets;
@@ -495,6 +497,12 @@ public final class RecordContexts {
         }
     }
 
+    /** 2^53 — beyond this magnitude IEEE-754 doubles cannot represent successive integers
+     *  exactly. Mirrors {@code Lexer.IEEE_SAFE_INTEGER}; the JSON path enforces the same
+     *  precision contract on incoming record bodies that the lexer enforces on predicate
+     *  literals. */
+    private static final long IEEE_SAFE_INTEGER = 1L << 53;
+
     private static Object extractDoubleOrUnusable(JsonParser p) throws IOException {
         double d = p.getDoubleValue();
         // JSON floats beyond IEEE-754 finite range parse to NaN/+Infinity/-Infinity. A predicate
@@ -505,6 +513,22 @@ public final class RecordContexts {
         // which we don't enable), but guard it for completeness — defense-in-depth.
         if (!Double.isFinite(d)) {
             return RecordContext.BODY_UNUSABLE;
+        }
+        // Mirror Lexer.rejectUnsafeFloatLiteral: a JSON literal like 9.007199254740993e15 parses
+        // silently to 9007199254740992.0; an attacker who controls the backing record and knows a
+        // predicate `body.x == 9007199254740992.0` can therefore admit records whose intended
+        // value is one above 2^53. Same for subnormal underflow (1e-324 parsing to 0.0). We use
+        // the exact BigDecimal exposed by Jackson without forcing a string round-trip.
+        BigDecimal exact = p.getDecimalValue();
+        if (d == 0.0 && exact.signum() != 0) {
+            return RecordContext.BODY_UNUSABLE;
+        }
+        BigDecimal stripped = exact.stripTrailingZeros();
+        if (stripped.scale() <= 0) {
+            BigInteger magnitude = stripped.toBigIntegerExact().abs();
+            if (magnitude.compareTo(BigInteger.valueOf(IEEE_SAFE_INTEGER)) > 0) {
+                return RecordContext.BODY_UNUSABLE;
+            }
         }
         return d;
     }

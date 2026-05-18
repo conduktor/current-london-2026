@@ -16,6 +16,8 @@
  */
 package org.apache.kafka.server.views;
 
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -177,50 +179,48 @@ final class Lexer {
         if (Double.isNaN(d) || Double.isInfinite(d)) {
             throw new PredicateValidationException("unsafe numeric literal (NaN/Infinity) at " + start);
         }
-        rejectPrecisionLossInteger(text, start);
+        rejectUnsafeFloatLiteral(text, d, start);
         return new Token(Kind.FLOAT_LITERAL, text, d, start);
     }
 
     /**
-     * Reject float literals that LOOK like an integer beyond IEEE-754 safe range. The textual
-     * integer part is the digit run before any {@code .} or exponent. {@code 9007199254740993.0}
-     * silently rounds to {@code 9007199254740992.0}; a predicate
-     * {@code body.x == 9007199254740993.0} therefore matches a body containing the rounded value,
-     * not what the author wrote. Catching this at compile time gives a clear error instead of a
-     * silent runtime bypass.
+     * Reject float literals whose exact decimal value differs from the parsed {@code double} in
+     * ways that would create a silent predicate bypass. The round-3 heuristic only inspected the
+     * textual integer part before {@code .}/{@code e} — fine for {@code 9007199254740993.0}, but
+     * blind to {@code 9.007199254740993e15} (integer part "9", 1 digit) which still parses to
+     * the rounded value. We now compute the exact {@link BigDecimal} value of the literal and
+     * apply two rules:
      *
-     * <p>Decimal-shaped literals like {@code 0.1} or {@code 1.5e20} are NOT rejected — only the
-     * "I wrote a specific integer, expected to mean that integer" case.
+     * <ol>
+     *   <li><b>Integer-valued precision loss:</b> if the exact value is integral (no non-zero
+     *       fractional component) and its absolute value exceeds {@code 2^53}, reject. A predicate
+     *       {@code body.x == 9.007199254740993e15} otherwise matches a body containing the
+     *       rounded {@code 9007199254740992}, not what the author wrote.
+     *   <li><b>Subnormal underflow:</b> if the exact value is non-zero but the parsed double is
+     *       {@code 0.0}, reject. A predicate {@code body.x == 1e-324} otherwise matches any record
+     *       with {@code body.x == 0.0} — the author meant a tiny non-zero value, the runtime sees
+     *       a confident match against zero.
+     * </ol>
+     *
+     * <p>Decimal-shaped literals like {@code 0.1} or {@code 1.5e20} whose exact value is not
+     * integral are NOT rejected — those carry inherent representation error users expect from
+     * IEEE-754 and are not a silent-equality bypass vector.
      */
-    private static void rejectPrecisionLossInteger(String text, int start) {
-        String body = text.startsWith("-") ? text.substring(1) : text;
-        int cut = body.length();
-        for (int idx = 0; idx < body.length(); idx++) {
-            char ch = body.charAt(idx);
-            if (ch == '.' || ch == 'e' || ch == 'E') {
-                cut = idx;
-                break;
-            }
+    private static void rejectUnsafeFloatLiteral(String text, double d, int start) {
+        BigDecimal exact;
+        try {
+            exact = new BigDecimal(text);
+        } catch (NumberFormatException e) {
+            throw new PredicateValidationException("invalid numeric literal at " + start + ": " + text);
         }
-        String intPart = body.substring(0, cut);
-        if (intPart.isEmpty()) {
-            return;
-        }
-        // 2^53 = 9_007_199_254_740_992 — 16 decimal digits. A 17+ digit integer part is
-        // unconditionally beyond range; for exactly 16 digits, parse and compare.
-        if (intPart.length() > 16) {
+        if (d == 0.0 && exact.signum() != 0) {
             throw new PredicateValidationException(
-                    "unsafe numeric literal (precision-loss territory) at " + start + ": " + text);
+                    "unsafe numeric literal (underflow to zero) at " + start + ": " + text);
         }
-        if (intPart.length() == 16) {
-            long magnitude;
-            try {
-                magnitude = Long.parseLong(intPart);
-            } catch (NumberFormatException e) {
-                throw new PredicateValidationException(
-                        "invalid numeric literal at " + start + ": " + text);
-            }
-            if (magnitude > IEEE_SAFE_INTEGER) {
+        BigDecimal stripped = exact.stripTrailingZeros();
+        if (stripped.scale() <= 0) {
+            BigInteger magnitude = stripped.toBigIntegerExact().abs();
+            if (magnitude.compareTo(BigInteger.valueOf(IEEE_SAFE_INTEGER)) > 0) {
                 throw new PredicateValidationException(
                         "unsafe numeric literal (precision-loss territory) at " + start + ": " + text);
             }
