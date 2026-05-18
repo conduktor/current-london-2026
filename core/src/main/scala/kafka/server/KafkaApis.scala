@@ -763,8 +763,56 @@ class KafkaApis(val requestChannel: RequestChannel,
                   s"failing the second view with INVALID_REQUEST. Issue the views in separate fetch sessions.")
                 erroneous += viewTpId -> FetchResponse.partitionResponse(viewTpId, Errors.INVALID_REQUEST)
               } else {
-                rewritten += backingTpId -> data
-                viewRewrites.put(backingTpId, (viewTpId, spec))
+                // Leader-epoch boundary (KIP-595): the consumer's `currentLeaderEpoch` reflects the
+                // VIEW's leader-epoch — view and backing topics maintain independent epoch ledgers
+                // (a view-leader change does not bump the backing's epoch, and vice versa). Passing
+                // `data` through unchanged would let the replica layer validate the view's epoch
+                // against the BACKING partition's epoch, which (except by coincidence at epoch 0)
+                // surfaces FENCED_LEADER_EPOCH or UNKNOWN_LEADER_EPOCH on every modern-consumer
+                // fetch and breaks the feature wholesale.
+                //
+                // We validate the consumer's epoch against the VIEW partition here, then strip
+                // both the leader-epoch fields before redirecting so the backing fetch sees an
+                // epoch-less request. The view-partition `localLogWithEpochOrThrow` enforces the
+                // same fenced/unknown/not-leader semantics a consumer would see against any other
+                // topic, keyed at the view's TopicIdPartition so the error is attributed correctly.
+                //
+                // `lastFetchedEpoch` is stripped on the same logic: it carries the view-epoch from
+                // which the consumer last received a record (KIP-320 divergence detection), which
+                // would also mis-validate against the backing's epoch history. View consumers
+                // therefore lose KIP-320 divergence detection on the backing path; the view leader
+                // itself rarely diverges (it is a passive predicate, not a replicated state
+                // machine), so the practical exposure is small. Document this in ViewSpec javadoc
+                // if the gap matters operationally.
+                //
+                // `viewFetchOnlyLeader` mirrors `FetchParams.fetchOnlyLeader()` for consumer
+                // fetches: pre-v11 consumers cannot read from followers (no clientMetadata path);
+                // v11+ consumers may, so don't require leader. Follower fetches are excluded by
+                // the enclosing `!fetchRequest.isFromFollower` guard.
+                val viewFetchOnlyLeader = versionId < 11
+                val epochError: Errors = replicaManager.getPartitionOrError(viewTpId.topicPartition) match {
+                  case Left(error) => error
+                  case Right(viewPartition) =>
+                    try {
+                      viewPartition.localLogWithEpochOrThrow(data.currentLeaderEpoch, viewFetchOnlyLeader)
+                      Errors.NONE
+                    } catch {
+                      case e: ApiException => Errors.forException(e)
+                    }
+                }
+                if (epochError != Errors.NONE) {
+                  erroneous += viewTpId -> FetchResponse.partitionResponse(viewTpId, epochError)
+                } else {
+                  val backingData = new FetchRequest.PartitionData(
+                    backingTpId.topicId,
+                    data.fetchOffset,
+                    data.logStartOffset,
+                    data.maxBytes,
+                    Optional.empty[Integer](),
+                    Optional.empty[Integer]())
+                  rewritten += backingTpId -> backingData
+                  viewRewrites.put(backingTpId, (viewTpId, spec))
+                }
               }
             }
           case Right(_) =>

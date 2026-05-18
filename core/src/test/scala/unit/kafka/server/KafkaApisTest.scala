@@ -32,7 +32,7 @@ import org.apache.kafka.common.acl.AclOperation
 import org.apache.kafka.common.compress.Compression
 import org.apache.kafka.common.config.ConfigResource
 import org.apache.kafka.common.config.ConfigResource.Type.{BROKER, BROKER_LOGGER}
-import org.apache.kafka.common.errors.{ClusterAuthorizationException, UnsupportedVersionException}
+import org.apache.kafka.common.errors.{ClusterAuthorizationException, FencedLeaderEpochException, UnknownLeaderEpochException, UnsupportedVersionException}
 import org.apache.kafka.common.internals.Topic
 import org.apache.kafka.common.memory.MemoryPool
 import org.apache.kafka.common.message.AddPartitionsToTxnRequestData.{AddPartitionsToTxnTopic, AddPartitionsToTxnTopicCollection, AddPartitionsToTxnTransaction, AddPartitionsToTxnTransactionCollection}
@@ -4805,6 +4805,226 @@ class KafkaApisTest extends Logging {
       "unfilterable record type must fail closed — not pass through to the consumer")
     assertEquals(MemoryRecords.EMPTY, FetchResponse.recordsOrFail(partitionData),
       "no records may reach the consumer when the filter cannot run")
+  }
+
+  @Test
+  def testFetchFromViewStripsConsumerLeaderEpochBeforeRedirectingToBacking(): Unit = {
+    // View and backing topics maintain INDEPENDENT leader-epoch ledgers (a view-leader change
+    // does not bump the backing's epoch, and vice versa). If the routing path passed the
+    // consumer's `currentLeaderEpoch` and `lastFetchedEpoch` through unchanged, the replica layer
+    // would validate the VIEW's epoch against the BACKING partition's epoch and surface FENCED
+    // or UNKNOWN on essentially every modern-consumer fetch. The handler must instead validate
+    // the consumer's epoch against the VIEW, then strip both fields before redirecting so the
+    // backing replica fetch is epoch-less.
+    val viewTopic = "epoch-strip-view"
+    val backingTopic = "epoch-strip-backing"
+    val viewTopicId = Uuid.randomUuid()
+    val backingTopicId = Uuid.randomUuid()
+    val consumerEpoch = 7 // the view's leader-epoch the consumer claims to be talking to
+
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, backingTopic)
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.x == 1")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+
+    addTopicToMetadataCache(viewTopic, numPartitions = 1, topicId = viewTopicId)
+    addTopicToMetadataCache(backingTopic, numPartitions = 1, topicId = backingTopicId)
+
+    val viewTpId = new TopicIdPartition(viewTopicId, new TopicPartition(viewTopic, 0))
+    val backingTpId = new TopicIdPartition(backingTopicId, new TopicPartition(backingTopic, 0))
+
+    // Stub the view partition so localLogWithEpochOrThrow ACCEPTS the consumer's epoch — the
+    // backing partition mock returned by stubBackingPartitionsLocal() does not need to be
+    // configured because the contract under test is that the rewritten entry never carries an
+    // epoch into the storage layer in the first place.
+    val viewPartition = mock(classOf[Partition])
+    when(viewPartition.localLogWithEpochOrThrow(any[Optional[Integer]], anyBoolean))
+      .thenReturn(mock(classOf[UnifiedLog]))
+    when(replicaManager.getPartitionOrError(viewTpId.topicPartition))
+      .thenReturn(Right(viewPartition))
+    when(replicaManager.getPartitionOrError(backingTpId.topicPartition))
+      .thenReturn(Right(mock(classOf[Partition])))
+
+    val fetchInfoCaptor: ArgumentCaptor[Seq[(TopicIdPartition, FetchRequest.PartitionData)]] =
+      ArgumentCaptor.forClass(classOf[Seq[(TopicIdPartition, FetchRequest.PartitionData)]])
+    when(replicaManager.fetchMessages(
+      any[FetchParams],
+      fetchInfoCaptor.capture(),
+      any[ReplicaQuota],
+      any[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]()
+    )).thenAnswer(invocation => {
+      val callback = invocation.getArgument(3).asInstanceOf[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]
+      callback(Seq(backingTpId -> new FetchPartitionData(Errors.NONE, 0L, 0L, MemoryRecords.EMPTY,
+        Optional.empty(), OptionalLong.empty(), Optional.empty(), OptionalInt.empty(), false)))
+    })
+
+    val fetchData = Map(viewTpId ->
+      new FetchRequest.PartitionData(viewTopicId, 0, 0, 1000, Optional.of(Integer.valueOf(consumerEpoch)), Optional.of(Integer.valueOf(consumerEpoch - 1)))).asJava
+    val fetchDataBuilder = Map(viewTpId.topicPartition ->
+      new FetchRequest.PartitionData(viewTopicId, 0, 0, 1000, Optional.of(Integer.valueOf(consumerEpoch)), Optional.of(Integer.valueOf(consumerEpoch - 1)))).asJava
+    val fetchMetadata = new JFetchMetadata(0, 0)
+    val fetchContext = new FullFetchContext(time, new FetchSessionCacheShard(1000, 100),
+      fetchMetadata, fetchData, true, false)
+    when(fetchManager.newContext(any[Short], any[JFetchMetadata], any[Boolean],
+      any[util.Map[TopicIdPartition, FetchRequest.PartitionData]],
+      any[util.List[TopicIdPartition]],
+      any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val fetchRequest = new FetchRequest.Builder(ApiKeys.FETCH.latestVersion, ApiKeys.FETCH.latestVersion,
+      -1, -1, 100, 0, fetchDataBuilder).build()
+    val request = buildRequest(fetchRequest)
+    kafkaApis = createKafkaApis(configRepository = configRepository)
+    kafkaApis.handleFetchRequest(request)
+
+    // The handler must have validated the consumer's epoch against the VIEW partition, not the
+    // backing — otherwise the view's epoch ledger would have been silently bypassed.
+    verify(viewPartition).localLogWithEpochOrThrow(
+      org.mockito.ArgumentMatchers.eq(Optional.of(Integer.valueOf(consumerEpoch))), anyBoolean)
+
+    // And the entry that reaches the storage layer must be keyed at the backing AND carry NO
+    // leader-epoch — that's the actual production fix this test exists to pin.
+    val captured = fetchInfoCaptor.getValue
+    assertEquals(1, captured.size, "exactly one partition reaches fetchMessages")
+    assertEquals(backingTpId, captured.head._1,
+      "redirect must route to the backing TopicIdPartition")
+    val backingFetchData = captured.head._2
+    assertEquals(Optional.empty[Integer](), backingFetchData.currentLeaderEpoch,
+      "consumer's view-epoch must NOT be forwarded to the backing partition — they are " +
+        "independent epoch ledgers (KIP-595) and the backing would reject every modern fetch")
+    assertEquals(Optional.empty[Integer](), backingFetchData.lastFetchedEpoch,
+      "consumer's view-lastFetchedEpoch must NOT be forwarded to the backing — KIP-320 " +
+        "truncation detection cannot meaningfully run against a different topic's epoch history")
+  }
+
+  @Test
+  def testFetchFromViewWithStaleConsumerEpochReturnsFencedLeaderEpoch(): Unit = {
+    // The view's local leader-epoch is AHEAD of the consumer's. localLogWithEpochOrThrow throws
+    // FencedLeaderEpochException; the handler must surface FENCED_LEADER_EPOCH keyed at the view
+    // and short-circuit before reaching the replica fetch path. This is the modern-consumer
+    // bug-finding scenario: prior to the fix, the consumer's view-epoch was silently validated
+    // against the backing's epoch — succeeding or failing for the wrong reason. We now want
+    // proper attribution against the view.
+    val viewTopic = "fenced-view"
+    val backingTopic = "fenced-backing"
+    val viewTopicId = Uuid.randomUuid()
+    val backingTopicId = Uuid.randomUuid()
+
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, backingTopic)
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.x == 1")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+
+    addTopicToMetadataCache(viewTopic, numPartitions = 1, topicId = viewTopicId)
+    addTopicToMetadataCache(backingTopic, numPartitions = 1, topicId = backingTopicId)
+
+    val viewTpId = new TopicIdPartition(viewTopicId, new TopicPartition(viewTopic, 0))
+    val backingTpId = new TopicIdPartition(backingTopicId, new TopicPartition(backingTopic, 0))
+
+    val viewPartition = mock(classOf[Partition])
+    when(viewPartition.localLogWithEpochOrThrow(any[Optional[Integer]], anyBoolean))
+      .thenThrow(new FencedLeaderEpochException("view's leader epoch is ahead of consumer's"))
+    when(replicaManager.getPartitionOrError(viewTpId.topicPartition))
+      .thenReturn(Right(viewPartition))
+    when(replicaManager.getPartitionOrError(backingTpId.topicPartition))
+      .thenReturn(Right(mock(classOf[Partition])))
+
+    val fetchData = Map(viewTpId ->
+      new FetchRequest.PartitionData(viewTopicId, 0, 0, 1000, Optional.of(Integer.valueOf(2)))).asJava
+    val fetchDataBuilder = Map(viewTpId.topicPartition ->
+      new FetchRequest.PartitionData(viewTopicId, 0, 0, 1000, Optional.of(Integer.valueOf(2)))).asJava
+    val fetchMetadata = new JFetchMetadata(0, 0)
+    val fetchContext = new FullFetchContext(time, new FetchSessionCacheShard(1000, 100),
+      fetchMetadata, fetchData, true, false)
+    when(fetchManager.newContext(any[Short], any[JFetchMetadata], any[Boolean],
+      any[util.Map[TopicIdPartition, FetchRequest.PartitionData]],
+      any[util.List[TopicIdPartition]],
+      any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val fetchRequest = new FetchRequest.Builder(ApiKeys.FETCH.latestVersion, ApiKeys.FETCH.latestVersion,
+      -1, -1, 100, 0, fetchDataBuilder).build()
+    val request = buildRequest(fetchRequest)
+    kafkaApis = createKafkaApis(configRepository = configRepository)
+    kafkaApis.handleFetchRequest(request)
+
+    // The view-epoch check must short-circuit the redirect.
+    verify(replicaManager, never()).fetchMessages(any[FetchParams],
+      any[Seq[(TopicIdPartition, FetchRequest.PartitionData)]],
+      any[ReplicaQuota],
+      any[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]())
+
+    val response = verifyNoThrottling[FetchResponse](request)
+    val responseData = response.responseData(metadataCache.topicIdsToNames(), ApiKeys.FETCH.latestVersion)
+    val partitionData = responseData.get(viewTpId.topicPartition)
+    assertEquals(Errors.FENCED_LEADER_EPOCH.code, partitionData.errorCode,
+      "view-side epoch validation must propagate FencedLeaderEpoch back to the consumer keyed " +
+        "at the view (NOT translated into a backing-partition error)")
+  }
+
+  @Test
+  def testFetchFromViewWithAdvancedConsumerEpochReturnsUnknownLeaderEpoch(): Unit = {
+    // The consumer believes the view is at a higher leader-epoch than the broker knows about
+    // (the consumer was talking to a future leader before metadata caught up). The view's
+    // localLogWithEpochOrThrow throws UnknownLeaderEpochException; the handler must surface
+    // UNKNOWN_LEADER_EPOCH so the consumer refreshes metadata and retries.
+    val viewTopic = "unknown-epoch-view"
+    val backingTopic = "unknown-epoch-backing"
+    val viewTopicId = Uuid.randomUuid()
+    val backingTopicId = Uuid.randomUuid()
+
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, backingTopic)
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.x == 1")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+
+    addTopicToMetadataCache(viewTopic, numPartitions = 1, topicId = viewTopicId)
+    addTopicToMetadataCache(backingTopic, numPartitions = 1, topicId = backingTopicId)
+
+    val viewTpId = new TopicIdPartition(viewTopicId, new TopicPartition(viewTopic, 0))
+    val backingTpId = new TopicIdPartition(backingTopicId, new TopicPartition(backingTopic, 0))
+
+    val viewPartition = mock(classOf[Partition])
+    when(viewPartition.localLogWithEpochOrThrow(any[Optional[Integer]], anyBoolean))
+      .thenThrow(new UnknownLeaderEpochException("consumer's epoch is ahead of view's"))
+    when(replicaManager.getPartitionOrError(viewTpId.topicPartition))
+      .thenReturn(Right(viewPartition))
+    when(replicaManager.getPartitionOrError(backingTpId.topicPartition))
+      .thenReturn(Right(mock(classOf[Partition])))
+
+    val fetchData = Map(viewTpId ->
+      new FetchRequest.PartitionData(viewTopicId, 0, 0, 1000, Optional.of(Integer.valueOf(99)))).asJava
+    val fetchDataBuilder = Map(viewTpId.topicPartition ->
+      new FetchRequest.PartitionData(viewTopicId, 0, 0, 1000, Optional.of(Integer.valueOf(99)))).asJava
+    val fetchMetadata = new JFetchMetadata(0, 0)
+    val fetchContext = new FullFetchContext(time, new FetchSessionCacheShard(1000, 100),
+      fetchMetadata, fetchData, true, false)
+    when(fetchManager.newContext(any[Short], any[JFetchMetadata], any[Boolean],
+      any[util.Map[TopicIdPartition, FetchRequest.PartitionData]],
+      any[util.List[TopicIdPartition]],
+      any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val fetchRequest = new FetchRequest.Builder(ApiKeys.FETCH.latestVersion, ApiKeys.FETCH.latestVersion,
+      -1, -1, 100, 0, fetchDataBuilder).build()
+    val request = buildRequest(fetchRequest)
+    kafkaApis = createKafkaApis(configRepository = configRepository)
+    kafkaApis.handleFetchRequest(request)
+
+    verify(replicaManager, never()).fetchMessages(any[FetchParams],
+      any[Seq[(TopicIdPartition, FetchRequest.PartitionData)]],
+      any[ReplicaQuota],
+      any[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]())
+
+    val response = verifyNoThrottling[FetchResponse](request)
+    val responseData = response.responseData(metadataCache.topicIdsToNames(), ApiKeys.FETCH.latestVersion)
+    val partitionData = responseData.get(viewTpId.topicPartition)
+    assertEquals(Errors.UNKNOWN_LEADER_EPOCH.code, partitionData.errorCode,
+      "view-side UnknownLeaderEpoch must surface keyed at the view so the consumer refreshes " +
+        "metadata and retries against the correct view leader/epoch")
   }
 
   @Test
