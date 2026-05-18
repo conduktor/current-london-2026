@@ -19,6 +19,7 @@ package org.apache.kafka.network.iouring;
 import org.apache.kafka.common.memory.MemoryPool;
 import org.apache.kafka.common.network.Authenticator;
 import org.apache.kafka.common.network.ChannelState;
+import org.apache.kafka.common.network.ClientInformation;
 import org.apache.kafka.common.network.KafkaChannel;
 import org.apache.kafka.common.network.KafkaChannelMuteBridge;
 import org.apache.kafka.common.network.ListenerName;
@@ -340,6 +341,9 @@ public final class IoUringSelector implements BrokerSelector {
         IoUringTransportLayer transport = new IoUringTransportLayer(nettyChannel, remote, local, wakeup::release);
         Authenticator authenticator = new IoUringPlaintextAuthenticator(transport, listenerName, configs);
         IoUringChannelMetadataRegistry metadata = new IoUringChannelMetadataRegistry();
+        // Mirror NIO Selector.register: seed ClientInformation.EMPTY so the first RequestContext
+        // (built before any ApiVersionsRequest is parsed) never captures null.
+        metadata.registerClientInformation(ClientInformation.EMPTY);
         KafkaChannel channel = new KafkaChannel(id, transport, () -> authenticator, maxReceiveSize, memoryPool, metadata);
 
         nettyChannel.attr(TRANSPORT_ATTR).set(transport);

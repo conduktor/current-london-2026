@@ -1112,4 +1112,33 @@ class IoUringSelectorTest {
         assertEquals(0, secondParsed.get().index(),
             "wrap target is 0 — matches NIO's SocketServer.scala 'if (... == Int.MaxValue) 0 else +1'");
     }
+
+    @Test
+    void acceptInitializesClientInformationToEmpty() throws Exception {
+        // Regression for v12 BLOCKER: NIO's Selector.register (clients/Selector.java:316-318)
+        // seeds ClientInformation.EMPTY so that any consumer dereferencing
+        // channelMetadataRegistry.clientInformation() pre-ApiVersions sees a non-null value.
+        // Without this seed on io_uring, the FIRST request on any connection — including
+        // the ApiVersionsRequest itself, since SocketServer.scala:1201-1215 constructs the
+        // RequestContext BEFORE the registry is populated — captures null. Subsequent
+        // dereferences (request-DEBUG logging at RequestConvertToJson.java:747,
+        // deprecated-request metrics at RequestMetrics.java:149-150) then NPE and close
+        // otherwise-valid connections.
+        IoUringSelector s = newSelector(IDLE_NANOS_NEVER);
+        EmbeddedChannel netty = acceptNew(s, REMOTE_A);
+        String id = netty.attr(IoUringSelector.CHANNEL_ID_ATTR).get();
+        // The KafkaChannel only appears in s.channels() after poll() promotes it out of
+        // pendingAccepts, so poll once to make the registry observable through the public
+        // accessor used by the production code.
+        s.poll(0);
+        KafkaChannel channel = s.channel(id);
+        assertNotNull(channel, "channel should be visible after the accept-draining poll");
+        org.apache.kafka.common.network.ClientInformation seeded =
+            channel.channelMetadataRegistry().clientInformation();
+        assertNotNull(seeded,
+            "ClientInformation must be seeded on accept — otherwise RequestContext on the " +
+            "first request captures null and request-logging / deprecated-request metrics NPE");
+        assertEquals(org.apache.kafka.common.network.ClientInformation.EMPTY, seeded,
+            "io_uring must seed ClientInformation.EMPTY, matching NIO Selector.register");
+    }
 }
