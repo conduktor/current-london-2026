@@ -24,10 +24,12 @@ import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 /**
  * Rebuilds tracker state and sidecar files on broker restart.
@@ -192,11 +194,88 @@ public final class BackingScanRecoverer {
      *
      * <p>Sidecar files for the partitions present in the stream are truncated to zero before
      * the scan begins so that a partial rebuild does not splice with stale tail content.
+     *
+     * <p>This 2-arg form is the "startup recovery" semantics: trust the stream, only touch
+     * what appears. It is appropriate for the boot-time rebuild path (no stale local state
+     * to worry about — sidecars either exist intact or are missing). For the leader-acquisition
+     * path use {@link #recoverFromScan(Iterator, LogicalOffsetTracker, Set)} which also
+     * resets partitions that are in the filter but absent from the stream.
      */
     public void recoverFromScan(Iterator<RecoveryRecord> stream, LogicalOffsetTracker tracker) throws IOException {
+        recoverFromScan(stream, tracker, Collections.emptySet());
+    }
+
+    /**
+     * Filter-aware rebuild for the leader-acquisition path.
+     *
+     * <p>The leader-acquisition recovery contract is stricter than the boot-time one: when a
+     * broker becomes leader for a backing partition, ALL logical partitions hosted on that
+     * backing must be reset to a known state derived from the on-disk log, even if their old
+     * sidecar+tracker entries from a previous incarnation suggest otherwise. Trusting only the
+     * stream (as the 2-arg form does) would leave stale local state intact for any logical
+     * partition that is in the filter but has zero records in the current scan window — and
+     * that stale state becomes visible the instant the readiness gate opens.
+     *
+     * <p>Behavior:
+     * <ul>
+     *   <li>Every partition in {@code filter} has its sidecar opened and truncated to 0 before
+     *       record consumption begins.</li>
+     *   <li>The stream is consumed normally; records for partitions already in {@code filter}
+     *       reuse the truncated handle. Records for partitions not in {@code filter} (defensive
+     *       case if the iterator yields beyond its declared scope) open+truncate as before.</li>
+     *   <li>At the end, every open sidecar — filter ∪ defensive — is restored into the tracker
+     *       at {@code (persistedStart, sidecar.size())}. Partitions absent from the stream end
+     *       up at {@code (persistedStart, 0)}, which is the correct "no records on the new
+     *       leader" state.</li>
+     * </ul>
+     */
+    /**
+     * Open + truncate the sidecar for every partition in {@code filter}. Returns a map of
+     * still-open handles ready for the per-record append loop to reuse. If any open or
+     * truncate fails partway through, every handle already collected is closed (best-effort)
+     * before the original exception is propagated.
+     *
+     * <p>Extracted from {@link #recoverFromScan(Iterator, LogicalOffsetTracker, Set)} to keep
+     * that method's NPath complexity below checkstyle's threshold while preserving the
+     * close-on-throw semantics the per-record path already relies on.
+     */
+    private Map<LogicalPartition, LogicalSidecarIndex> preTruncateFilter(Set<LogicalPartition> filter)
+            throws IOException {
+        Map<LogicalPartition, LogicalSidecarIndex> open = new HashMap<>();
+        for (LogicalPartition key : filter) {
+            LogicalSidecarIndex fresh = openSidecar(key.logicalTopic(), key.logicalPartition());
+            try {
+                fresh.truncateTo(0);
+            } catch (IOException | RuntimeException e) {
+                closeQuietly(fresh);
+                for (LogicalSidecarIndex prior : open.values()) {
+                    closeQuietly(prior);
+                }
+                throw e;
+            }
+            open.put(key, fresh);
+        }
+        return open;
+    }
+
+    private static void closeQuietly(LogicalSidecarIndex sidecar) {
+        try {
+            sidecar.close();
+        } catch (IOException ignored) {
+            // best-effort: the original exception (if any) takes precedence
+        }
+    }
+
+    public void recoverFromScan(Iterator<RecoveryRecord> stream, LogicalOffsetTracker tracker,
+                                 Set<LogicalPartition> filter) throws IOException {
         Objects.requireNonNull(stream, "stream");
         Objects.requireNonNull(tracker, "tracker");
-        Map<LogicalPartition, LogicalSidecarIndex> open = new HashMap<>();
+        Objects.requireNonNull(filter, "filter");
+        // Pre-truncate every filter partition. This is the "reset" step that closes BLOCKER 2:
+        // filter partitions absent from the stream have their stale local state cleared instead
+        // of surviving past the gate-open. The helper closes all opened handles on failure so
+        // the main try/finally below only deals with the steady-state cleanup.
+        Map<LogicalPartition, LogicalSidecarIndex> open = preTruncateFilter(filter);
         try {
             while (stream.hasNext()) {
                 RecoveryRecord r = stream.next();

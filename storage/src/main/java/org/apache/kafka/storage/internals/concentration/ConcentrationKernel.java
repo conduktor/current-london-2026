@@ -759,6 +759,24 @@ public final class ConcentrationKernel implements AutoCloseable {
     }
 
     /**
+     * Filter-aware backing-scan recovery for the leader-acquisition path. Differs from the
+     * 1-arg form in that every partition in {@code filter} is pre-truncated and tracker-reset
+     * to {@code (persistedStart, 0)} BEFORE the stream is consumed, then advanced for any
+     * records the stream actually yields. Partitions in the filter but absent from the stream
+     * therefore end up at {@code (persistedStart, 0)} — the correct "no records on the new
+     * leader" state — instead of retaining stale local state from a previous incarnation.
+     *
+     * <p>Called by {@code KafkaConcentrationLeaderRecoverer} on every leader-acquisition,
+     * including the degenerate cases where the backing log is missing or empty (in those
+     * cases {@code stream} is an empty iterator and the pre-truncate is the only mutation).
+     */
+    public void recoverFromBackingScan(Iterator<RecoveryRecord> stream, Set<LogicalPartition> filter)
+            throws IOException {
+        ensureOpen();
+        recoverer.recoverFromScan(stream, tracker, filter);
+    }
+
+    /**
      * Partitions declared on this broker that have NO sidecar file on disk, in registry order.
      * Used by the full-scan recovery path to decide which backing partitions to scan and which
      * (logicalTopic, logicalPartition) tuples to filter in. A partition appears here iff:

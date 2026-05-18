@@ -23,7 +23,9 @@ import org.junit.jupiter.api.Test;
 
 import java.io.File;
 import java.io.IOException;
+import java.util.Collections;
 import java.util.List;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -180,5 +182,116 @@ public class BackingScanRecovererTest {
         LogicalOffsetTracker tracker = new LogicalOffsetTracker();
         recoverer.recoverFromScan(List.<RecoveryRecord>of().iterator(), tracker);
         assertEquals(0L, tracker.nextLogicalOffset("topicA", 0));
+    }
+
+    @Test
+    public void filterAwareScanResetsPartitionsAbsentFromStream() throws IOException {
+        // BLOCKER 2 fix: when a partition is in the filter (i.e. mapped onto this backing on
+        // the new leader) but yields zero records in the scan window, its sidecar must be
+        // truncated to 0 and its tracker entry restored to (persistedStart, 0). Without this,
+        // stale local state from a previous incarnation survives past the gate-open and
+        // re-exposes ghost records to consumers/fetchers.
+
+        // Pre-seed stale sidecar + tracker state for topicA/0 — simulates "this broker was
+        // a leader for this backing in a past life and accumulated 10 logical offsets".
+        try (LogicalSidecarIndex stale = recoverer.openSidecar("topicA", 0)) {
+            for (long i = 0; i < 10; i++) {
+                stale.append(100L + i);
+            }
+        }
+        LogicalOffsetTracker tracker = new LogicalOffsetTracker();
+        tracker.restorePartition("topicA", 0, 0L, 10L);
+        assertEquals(10L, tracker.nextLogicalOffset("topicA", 0));
+
+        // Filter declares topicA/0 — and the stream is EMPTY (no records on the current
+        // leader's log window). Pre-fix behavior: tracker remains at 10, sidecar at 10 entries.
+        // Post-fix behavior: tracker reset to 0, sidecar truncated.
+        Set<LogicalPartition> filter = Set.of(new LogicalPartition("topicA", 0));
+        recoverer.recoverFromScan(List.<RecoveryRecord>of().iterator(), tracker, filter);
+
+        assertEquals(0L, tracker.nextLogicalOffset("topicA", 0));
+        try (LogicalSidecarIndex sidecar = recoverer.openSidecar("topicA", 0)) {
+            assertEquals(0L, sidecar.size());
+        }
+    }
+
+    @Test
+    public void filterAwareScanPreservesZeroPersistedStartOnAbsentPartition() throws IOException {
+        // When persistedStart=0 (no DeleteRecords history) and the partition is in the filter
+        // but absent from the stream, the rebuild ends at tracker (0, 0) and an empty sidecar.
+        // The non-zero-persistedStart case is the loud-failure variant covered by
+        // filterAwareScanThrowsIfPersistedStartExceedsRebuiltSize.
+        try (LogicalSidecarIndex stale = recoverer.openSidecar("topicA", 0)) {
+            for (long i = 0; i < 5; i++) stale.append(50L + i);
+        }
+        LogicalOffsetTracker tracker = new LogicalOffsetTracker();
+        tracker.restorePartition("topicA", 0, 0L, 5L);
+
+        Set<LogicalPartition> filter = Set.of(new LogicalPartition("topicA", 0));
+        recoverer.recoverFromScan(List.<RecoveryRecord>of().iterator(), tracker, filter);
+
+        assertEquals(0L, tracker.nextLogicalOffset("topicA", 0));
+        try (LogicalSidecarIndex sidecar = recoverer.openSidecar("topicA", 0)) {
+            assertEquals(0L, sidecar.size());
+        }
+    }
+
+    @Test
+    public void filterAwareScanThrowsIfPersistedStartExceedsRebuiltSize() throws IOException {
+        // The persistedStart > sidecar.size() guard exists for a reason: silently regressing
+        // start to 0 would re-expose "deleted" records. We want a loud failure instead.
+        try (LogicalSidecarIndex stale = recoverer.openSidecar("topicA", 0)) {
+            for (long i = 0; i < 10; i++) stale.append(100L + i);
+        }
+        recoverer.persistStartOffset("topicA", 0, 5L);
+        LogicalOffsetTracker tracker = new LogicalOffsetTracker();
+        Set<LogicalPartition> filter = Set.of(new LogicalPartition("topicA", 0));
+
+        IOException io = assertThrows(IOException.class,
+            () -> recoverer.recoverFromScan(List.<RecoveryRecord>of().iterator(), tracker, filter));
+        assertTrue(io.getMessage().contains("startOffset 5"));
+        assertTrue(io.getMessage().contains("rebuilt sidecar size 0"));
+    }
+
+    @Test
+    public void filterAwareScanAdvancesPartitionsPresentInStream() throws IOException {
+        // Cross-check: when the stream DOES yield records for a filter partition, the rebuild
+        // proceeds normally and the tracker reflects the rebuilt state.
+        LogicalOffsetTracker tracker = new LogicalOffsetTracker();
+        Set<LogicalPartition> filter = Set.of(
+            new LogicalPartition("topicA", 0),
+            new LogicalPartition("topicA", 1)  // in filter but absent from stream
+        );
+        List<RecoveryRecord> stream = List.of(
+            new RecoveryRecord("topicA", 0, 0L, 100L),
+            new RecoveryRecord("topicA", 0, 1L, 101L),
+            new RecoveryRecord("topicA", 0, 2L, 102L)
+        );
+        recoverer.recoverFromScan(stream.iterator(), tracker, filter);
+
+        // Present partition: advanced to 3 logical offsets.
+        assertEquals(3L, tracker.nextLogicalOffset("topicA", 0));
+        // Absent partition: reset to 0.
+        assertEquals(0L, tracker.nextLogicalOffset("topicA", 1));
+    }
+
+    @Test
+    public void filterAwareScanWithEmptyFilterMatchesLegacyBehavior() throws IOException {
+        // The 2-arg form delegates to the 3-arg form with Collections.emptySet(). Verify that
+        // an empty filter doesn't pre-truncate ANYTHING — partitions outside the stream's view
+        // are left alone (legacy "trust the stream" semantics).
+        try (LogicalSidecarIndex pre = recoverer.openSidecar("topicA", 0)) {
+            for (long i = 0; i < 7; i++) pre.append(200L + i);
+        }
+        LogicalOffsetTracker tracker = new LogicalOffsetTracker();
+        tracker.restorePartition("topicA", 0, 0L, 7L);
+
+        recoverer.recoverFromScan(List.<RecoveryRecord>of().iterator(), tracker, Collections.emptySet());
+
+        // No filter → no reset. Sidecar and tracker unchanged.
+        assertEquals(7L, tracker.nextLogicalOffset("topicA", 0));
+        try (LogicalSidecarIndex sidecar = recoverer.openSidecar("topicA", 0)) {
+            assertEquals(7L, sidecar.size());
+        }
     }
 }

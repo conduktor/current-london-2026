@@ -19,7 +19,7 @@ package kafka.server
 import kafka.cluster.Partition
 import kafka.log.{LogManager, UnifiedLog}
 import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.storage.internals.concentration.{ConcentrationKernel, LogicalPartition}
+import org.apache.kafka.storage.internals.concentration.{ConcentrationKernel, LogicalPartition, RecoveryRecord}
 import org.junit.jupiter.api.Assertions._
 import org.junit.jupiter.api.Test
 import org.mockito.ArgumentMatchers.{any, eq => mockEq}
@@ -176,16 +176,20 @@ class KafkaConcentrationLeaderRecovererTest {
 
     verify(kernel).markBackingUnready(backingTp)
     verify(kernel).publishIfGenerationMatches(mockEq(backingTp), mockEq(11L), any[Runnable])
-    // No scan was performed — recoverFromBackingScan must not be touched.
-    verify(kernel, never()).recoverFromBackingScan(any())
+    // BLOCKER 2 fix: even on the missing-log path we MUST reset every filter partition's
+    // local state to (persistedStart, 0) before opening the gate, otherwise stale sidecar
+    // entries from a previous incarnation as leader would survive past the publish.
+    // The recover call uses an empty iterator — only the pre-truncate side-effect matters.
+    verify(kernel).recoverFromBackingScan(any[util.Iterator[RecoveryRecord]], any[util.Set[LogicalPartition]])
   }
 
   @Test
-  def scanOnEmptyBackingLogOpensGateWithoutCallingRecover(): Unit = {
-    // Backing log has no records (logStartOffset == logEndOffset). Every logical partition
-    // on this backing should sit at the default tracker state (0, 0) — which is exactly
-    // what recoverFromDisk leaves them at when no sidecar exists — so we skip the scan
-    // entirely and open the gate.
+  def scanOnEmptyBackingLogResetsFilterAndOpensGate(): Unit = {
+    // Backing log has no records (logStartOffset == logEndOffset) but stale local state
+    // from a previous incarnation as leader may exist. BLOCKER 2 fix: pre-truncate every
+    // filter partition (via recoverFromBackingScan with an empty stream) BEFORE opening the
+    // gate. Otherwise the stale sidecar/tracker entries become visible to readers the
+    // instant publish flips the gate.
     val kernel = mock(classOf[ConcentrationKernel])
     val logManager = mock(classOf[LogManager])
     val executor = synchronousExecutor()
@@ -196,15 +200,15 @@ class KafkaConcentrationLeaderRecovererTest {
     val unifiedLog = mock(classOf[UnifiedLog])
     when(unifiedLog.logStartOffset).thenReturn(0L)
     when(unifiedLog.logEndOffset).thenReturn(0L)
-    when(logManager.getLog(backingTp)).thenReturn(Some(unifiedLog))
+    when(logManager.getLog(mockEq(backingTp), any[Boolean])).thenReturn(Some(unifiedLog))
     val partition = mock(classOf[Partition])
     when(partition.getLeaderEpoch).thenReturn(4)
     val recoverer = new KafkaConcentrationLeaderRecoverer(kernel, logManager, executor)
 
     recoverer.onMakeLeader(backingTp, partition)
 
+    verify(kernel).recoverFromBackingScan(any[util.Iterator[RecoveryRecord]], any[util.Set[LogicalPartition]])
     verify(kernel).publishIfGenerationMatches(mockEq(backingTp), mockEq(99L), any[Runnable])
-    verify(kernel, never()).recoverFromBackingScan(any())
   }
 
   @Test
@@ -235,6 +239,7 @@ class KafkaConcentrationLeaderRecovererTest {
 
     verify(kernel).markBackingUnready(backingTp)
     verify(kernel, never()).recoverFromBackingScan(any())
+    verify(kernel, never()).recoverFromBackingScan(any[util.Iterator[RecoveryRecord]], any[util.Set[LogicalPartition]])
     verify(kernel, never()).publishIfGenerationMatches(any[TopicPartition], any[Long].asInstanceOf[Long], any[Runnable])
   }
 
@@ -256,9 +261,9 @@ class KafkaConcentrationLeaderRecovererTest {
     val unifiedLog = mock(classOf[UnifiedLog])
     when(unifiedLog.logStartOffset).thenReturn(0L)
     when(unifiedLog.logEndOffset).thenReturn(100L)
-    when(logManager.getLog(backingTp)).thenReturn(Some(unifiedLog))
+    when(logManager.getLog(mockEq(backingTp), any[Boolean])).thenReturn(Some(unifiedLog))
     doThrow(new RuntimeException("simulated scan fault"))
-      .when(kernel).recoverFromBackingScan(any())
+      .when(kernel).recoverFromBackingScan(any[util.Iterator[RecoveryRecord]], any[util.Set[LogicalPartition]])
     val partition = mock(classOf[Partition])
     when(partition.getLeaderEpoch).thenReturn(1)
     val recoverer = new KafkaConcentrationLeaderRecoverer(kernel, logManager, executor)

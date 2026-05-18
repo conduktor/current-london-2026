@@ -180,11 +180,16 @@ class KafkaConcentrationLeaderRecoverer(
       if (unifiedLogOpt.isEmpty) {
         // No local log for this backing partition. This is legitimate if the partition was
         // just deleted or moved off this broker between makeLeader and the recoverer running.
-        // Try to publish (no-op) under the generation fence; either it opens an empty-state
-        // gate (the partition is still locally a backing-tp leader but with no data yet) or
-        // generation has moved on and we leave the gate closed for the next event to handle.
+        // Reset every filter partition to (persistedStart, 0) under the closed gate so any
+        // stale local sidecar/tracker state from a previous incarnation does not survive past
+        // the publish below. Then attempt the generation-fenced publish: either it opens an
+        // empty-state gate (the partition is still locally a backing-tp leader but with no
+        // data yet) or generation has moved on and we leave the gate closed for the next
+        // event to handle.
         log.info(s"Concentration recovery [task=$taskId] $backingTp: no local UnifiedLog; " +
-          s"attempting empty-state publish at gen=$capturedGeneration")
+          s"resetting ${filter.size} filter partition(s) and attempting empty-state publish " +
+          s"at gen=$capturedGeneration")
+        kernel.recoverFromBackingScan(java.util.Collections.emptyIterator(), filter)
         kernel.publishIfGenerationMatches(backingTp, capturedGeneration, () => ())
         return
       }
@@ -193,10 +198,14 @@ class KafkaConcentrationLeaderRecoverer(
       val endOffset = unifiedLog.logEndOffset
 
       if (startOffset >= endOffset) {
-        // Empty backing log. Default tracker state (0, 0) is correct for every logical
-        // partition on this backing. Just open the gate.
+        // Empty backing log. Reset every filter partition to (persistedStart, 0) under the
+        // closed gate before opening it — otherwise a logical partition that USED to host
+        // data on a previous leader of this backing (now empty) would publish stale sidecar
+        // state and re-expose ghost records to consumers.
         log.info(s"Concentration recovery [task=$taskId] $backingTp empty " +
-          s"([$startOffset, $endOffset)); opening gate at gen=$capturedGeneration")
+          s"([$startOffset, $endOffset)); resetting ${filter.size} filter partition(s) and " +
+          s"opening gate at gen=$capturedGeneration")
+        kernel.recoverFromBackingScan(java.util.Collections.emptyIterator(), filter)
         kernel.publishIfGenerationMatches(backingTp, capturedGeneration, () => ())
         return
       }
@@ -218,7 +227,11 @@ class KafkaConcentrationLeaderRecoverer(
       // third parameter is named `nextOffset` internally (it tracks the cursor) — we hand it
       // the captured `startOffset` to begin the scan at the live logStartOffset.
       val iter = new BackingLogPageIterator(unifiedLog, filter, readBufferBytes, startOffset, endOffset)
-      kernel.recoverFromBackingScan(iter)
+      // 2-arg form: pre-truncates every filter partition to (persistedStart, 0), then advances
+      // those that the stream actually yields records for. Filter partitions absent from the
+      // stream remain at (persistedStart, 0) — the correct "no records on the new leader" state.
+      // This closes Codex BLOCKER 2.
+      kernel.recoverFromBackingScan(iter, filter)
 
       val opened = kernel.publishIfGenerationMatches(backingTp, capturedGeneration, () => ())
       val elapsedMs = (System.nanoTime() - started) / 1_000_000L
