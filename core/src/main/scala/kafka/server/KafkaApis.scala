@@ -55,7 +55,7 @@ import org.apache.kafka.common.resource.ResourceType._
 import org.apache.kafka.common.resource.{Resource, ResourceType}
 import org.apache.kafka.common.security.auth.{KafkaPrincipal, SecurityProtocol}
 import org.apache.kafka.common.security.token.delegation.{DelegationToken, TokenInformation}
-import org.apache.kafka.common.utils.{ProducerIdAndEpoch, Time}
+import org.apache.kafka.common.utils.{BufferSupplier, ProducerIdAndEpoch, Time}
 import org.apache.kafka.common.{Node, TopicIdPartition, TopicPartition, Uuid}
 import org.apache.kafka.coordinator.group.{Group, GroupCoordinator}
 import org.apache.kafka.coordinator.share.ShareCoordinator
@@ -70,7 +70,6 @@ import org.apache.kafka.server.views.{ViewFilter, ViewMetrics, ViewRegistry, Vie
 import org.apache.kafka.storage.internals.log.AppendOrigin
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats
 
-import java.nio.ByteBuffer
 import java.time.Duration
 import java.util
 import java.util.concurrent.atomic.AtomicInteger
@@ -790,35 +789,51 @@ class KafkaApis(val requestChannel: RequestChannel,
     // so the fallback is defensive — but it must stay because a future read-path can ship a new
     // Records subclass and silently break the view contract otherwise.
     //
-    // TODO(views): the heap buffer below is allocated fresh per fetch and the existing
-    // ViewFilter then allocates a second buffer of the same size for the filtered output.
-    // Reuse a BufferSupplier for both to halve peak allocation under sustained view-fetch load.
+    // The FileRecords slurp and the filterTo decompression staging both go through this supplier
+    // so buffers are reused across all view partitions in a single fetch callback. The
+    // destination buffer that backs the filtered MemoryRecords cannot be pooled — it has to
+    // survive past this method until the response is serialized on the network thread — so peak
+    // per-partition allocation is still 1× input size plus the slurp buffer's high-water mark.
+    // What this supplier does eliminate is the per-batch decompression-staging churn inside
+    // filterTo (significant for compressed batches, which dominate production fetches) and the
+    // per-partition cost of re-allocating the FileRecords slurp buffer when one FetchRequest
+    // touches several view partitions.
     def applyViewFilter(backingTpId: TopicIdPartition,
                         data: FetchPartitionData,
                         viewTpId: TopicIdPartition,
-                        spec: ViewSpec): (TopicIdPartition, FetchPartitionData) = {
+                        spec: ViewSpec,
+                        bufferSupplier: BufferSupplier): (TopicIdPartition, FetchPartitionData) = {
       if (data.error != Errors.NONE) return (viewTpId, data)
       val filtered: Either[Errors, MemoryRecords] = data.records match {
         case mr: MemoryRecords =>
-          Right(ViewFilter.apply(spec.predicate(), mr, viewTpId.partition, viewMetrics))
+          Right(ViewFilter.apply(spec.predicate(), mr, viewTpId.partition, viewMetrics, bufferSupplier))
         case fr: FileRecords =>
-          // Slurp the on-disk slice into a heap buffer and reuse the MemoryRecords filter. This is
-          // O(slice) extra allocation per fetch; for non-trivial fetch.max.bytes that's the unavoidable
-          // shape of the feature. Empty slices are short-circuited because ByteBuffer.allocate(0) +
+          // Slurp the on-disk slice into a heap buffer and reuse the MemoryRecords filter. The
+          // buffer comes from the per-callback supplier so subsequent view partitions in the same
+          // fetch can reuse it. Empty slices are short-circuited because ByteBuffer.allocate(0) +
           // readInto on a closed/empty FileRecords would still hit the channel.
           val size = fr.sizeInBytes()
           if (size == 0) Right(MemoryRecords.EMPTY)
           else {
+            val buffer = bufferSupplier.get(size)
             try {
-              val buffer = ByteBuffer.allocate(size)
+              // GrowableBufferSupplier may return a buffer larger than `size`; constrain to
+              // exactly `size` so readFully fills the whole region and readableRecords sees the
+              // right limit.
+              buffer.clear()
+              buffer.limit(size)
               fr.readInto(buffer, 0)
               val materialized = MemoryRecords.readableRecords(buffer)
-              Right(ViewFilter.apply(spec.predicate(), materialized, viewTpId.partition, viewMetrics))
+              Right(ViewFilter.apply(spec.predicate(), materialized, viewTpId.partition, viewMetrics, bufferSupplier))
             } catch {
               case e: java.io.IOException =>
                 error(s"View fetch for ${viewTpId.topic} failed to materialize FileRecords for filtering; " +
                   s"returning KAFKA_STORAGE_ERROR.", e)
                 Left(Errors.KAFKA_STORAGE_ERROR)
+            } finally {
+              // Safe to release: filterTo has finished iterating the materialized records (the
+              // filtered output lives in ViewFilter's destination buffer, not in `buffer`).
+              bufferSupplier.release(buffer)
             }
           }
         case _ =>
@@ -856,10 +871,21 @@ class KafkaApis(val requestChannel: RequestChannel,
     def processResponseCallback(responsePartitionData: Seq[(TopicIdPartition, FetchPartitionData)]): Unit = {
       val translated: Seq[(TopicIdPartition, FetchPartitionData)] =
         if (viewRewrites.isEmpty) responsePartitionData
-        else responsePartitionData.map { case (backingTpId, data) =>
-          viewRewrites.get(backingTpId) match {
-            case Some((viewTpId, spec)) => applyViewFilter(backingTpId, data, viewTpId, spec)
-            case None => (backingTpId, data)
+        else {
+          // One supplier shared across every view partition in this callback. GrowableBufferSupplier
+          // keeps a single buffer that grows monotonically: cheap on single-view fetches (one alloc),
+          // amortizing across multi-view fetches (reuse). Closed in `finally` so the slot doesn't
+          // pin a buffer past the response build, which would defeat the point of pooling.
+          val bufferSupplier: BufferSupplier = new BufferSupplier.GrowableBufferSupplier()
+          try {
+            responsePartitionData.map { case (backingTpId, data) =>
+              viewRewrites.get(backingTpId) match {
+                case Some((viewTpId, spec)) => applyViewFilter(backingTpId, data, viewTpId, spec, bufferSupplier)
+                case None => (backingTpId, data)
+              }
+            }
+          } finally {
+            bufferSupplier.close()
           }
         }
       val partitions = new util.LinkedHashMap[TopicIdPartition, FetchResponseData.PartitionData]

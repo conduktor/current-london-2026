@@ -23,6 +23,7 @@ import org.apache.kafka.common.record.MemoryRecords;
 import org.apache.kafka.common.record.MutableRecordBatch;
 import org.apache.kafka.common.record.Record;
 import org.apache.kafka.common.record.SimpleRecord;
+import org.apache.kafka.common.utils.BufferSupplier;
 
 import org.junit.jupiter.api.Test;
 
@@ -231,6 +232,55 @@ class ViewFilterTest {
                         rec("{\"color\":\"blue\"}")),
                 0);
         assertNotNull(output);
+    }
+
+    @Test
+    void bufferSupplierOverloadProducesSameOutputAsNoCaching() {
+        // The 5-arg overload only changes WHERE the decompression staging buffers come from
+        // (a pooled supplier vs fresh allocations). The output records must be byte-for-byte
+        // equivalent to the simpler overload. We assert offsets which is sufficient: filterTo
+        // does not (and cannot) restructure batches when the supplier changes.
+        CompiledPredicate p = compiler.compile("body.color == 'red'");
+        MemoryRecords input = MemoryRecords.withRecords(50L, Compression.lz4().build(),
+                rec("{\"color\":\"red\"}"),
+                rec("{\"color\":\"blue\"}"),
+                rec("{\"color\":\"red\"}"));
+
+        BufferSupplier.GrowableBufferSupplier supplier = new BufferSupplier.GrowableBufferSupplier();
+        try {
+            MemoryRecords pooled = ViewFilter.apply(p, input, 0, ViewMetrics.NOOP, supplier);
+            MemoryRecords noCaching = ViewFilter.apply(p, input, 0, ViewMetrics.NOOP);
+            assertEquals(offsetsOf(noCaching), offsetsOf(pooled),
+                    "BufferSupplier choice must not change the filtered output");
+            assertEquals(List.of(50L, 52L), offsetsOf(pooled));
+        } finally {
+            supplier.close();
+        }
+    }
+
+    @Test
+    void bufferSupplierOverloadCanBeReusedAcrossCallsWithoutCorruption() {
+        // Production code re-uses one supplier across every view partition in a single fetch
+        // callback. If filterTo retained references to staging buffers between calls, the second
+        // invocation could see corrupted data. Guard against that regression here.
+        CompiledPredicate p = compiler.compile("body.color == 'red'");
+        BufferSupplier.GrowableBufferSupplier supplier = new BufferSupplier.GrowableBufferSupplier();
+        try {
+            MemoryRecords first = ViewFilter.apply(p,
+                    MemoryRecords.withRecords(0L, Compression.lz4().build(),
+                            rec("{\"color\":\"red\"}"),
+                            rec("{\"color\":\"blue\"}")),
+                    0, ViewMetrics.NOOP, supplier);
+            MemoryRecords second = ViewFilter.apply(p,
+                    MemoryRecords.withRecords(100L, Compression.snappy().build(),
+                            rec("{\"color\":\"blue\"}"),
+                            rec("{\"color\":\"red\"}")),
+                    0, ViewMetrics.NOOP, supplier);
+            assertEquals(List.of(0L), offsetsOf(first));
+            assertEquals(List.of(101L), offsetsOf(second));
+        } finally {
+            supplier.close();
+        }
     }
 
     private static SimpleRecord rec(String json) {

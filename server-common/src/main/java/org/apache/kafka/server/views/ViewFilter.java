@@ -61,19 +61,38 @@ public final class ViewFilter {
 
     /**
      * Apply {@code predicate} to {@code input}, producing a new {@link MemoryRecords} that
-     * contains only the matching records.
-     *
-     * @param predicate the compiled predicate; must not be null.
-     * @param input     the source records (typically the result of a fetch against the backing
-     *                  topic). Must not be null.
-     * @param partition the partition id, exposed to the predicate via the {@code partition}
-     *                  binding.
-     * @param metrics   meters for evaluations/skips/bytes. Pass {@link ViewMetrics#NOOP} if you
-     *                  don't have a real metrics wired in (unit tests).
-     * @return a fresh {@link MemoryRecords} owning its own buffer.
+     * contains only the matching records. Convenience overload that uses
+     * {@link BufferSupplier#NO_CACHING} for decompression staging — fine for unit tests but
+     * wasteful under sustained fetch load. Production callers (the fetch handler) should use the
+     * overload that accepts a {@link BufferSupplier}.
      */
     public static MemoryRecords apply(CompiledPredicate predicate, MemoryRecords input,
                                        int partition, ViewMetrics metrics) {
+        return apply(predicate, input, partition, metrics, BufferSupplier.NO_CACHING);
+    }
+
+    /**
+     * Apply {@code predicate} to {@code input}, producing a new {@link MemoryRecords} that
+     * contains only the matching records.
+     *
+     * @param predicate            the compiled predicate; must not be null.
+     * @param input                the source records (typically the result of a fetch against the
+     *                             backing topic). Must not be null.
+     * @param partition            the partition id, exposed to the predicate via the
+     *                             {@code partition} binding.
+     * @param metrics              meters for evaluations/skips/bytes. Pass {@link ViewMetrics#NOOP}
+     *                             if you don't have a real metrics wired in (unit tests).
+     * @param decompressionBuffers staging buffers for compressed-batch iteration; threaded into
+     *                             {@link MemoryRecords#filterTo}. Reuse one supplier across all
+     *                             view partitions in a single fetch callback so decompression
+     *                             buffers can be reused across batches. Pass
+     *                             {@link BufferSupplier#NO_CACHING} when allocation churn does not
+     *                             matter (unit tests). Must not be null.
+     * @return a fresh {@link MemoryRecords} owning its own buffer.
+     */
+    public static MemoryRecords apply(CompiledPredicate predicate, MemoryRecords input,
+                                       int partition, ViewMetrics metrics,
+                                       BufferSupplier decompressionBuffers) {
         if (predicate == null) {
             throw new IllegalArgumentException("predicate must not be null");
         }
@@ -83,12 +102,22 @@ public final class ViewFilter {
         if (metrics == null) {
             throw new IllegalArgumentException("metrics must not be null (use ViewMetrics.NOOP for none)");
         }
+        if (decompressionBuffers == null) {
+            throw new IllegalArgumentException("decompressionBuffers must not be null "
+                    + "(use BufferSupplier.NO_CACHING if you don't want pooling)");
+        }
         int inputSize = input.sizeInBytes();
+        // The destination buffer is the filtered output: its lifetime extends past this method
+        // (it backs the MemoryRecords we hand back, which is then serialized into the FetchResponse
+        // on the network thread). We cannot return it to the supplier here without coordinating
+        // a release with the response-send path, so it stays as a fresh allocation. The supplier
+        // still earns its keep on decompression staging inside filterTo and on the FileRecords
+        // slurp buffer in the caller (KafkaApis.applyViewFilter).
         ByteBuffer destination = ByteBuffer.allocate(Math.max(inputSize, 1));
         MemoryRecords.FilterResult result = input.filterTo(
                 new RecordFilterImpl(predicate, partition, metrics),
                 destination,
-                BufferSupplier.NO_CACHING);
+                decompressionBuffers);
         ByteBuffer out = result.outputBuffer();
         out.flip();
         MemoryRecords filtered = MemoryRecords.readableRecords(out);
