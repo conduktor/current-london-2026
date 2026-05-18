@@ -181,6 +181,27 @@ class KafkaApis(val requestChannel: RequestChannel,
       // is rejected at broker startup (see BrokerServer.scala), so by the time control
       // reaches here the allow-list is guaranteed non-empty — there is no listener-only
       // fallback, no fail-open, and the inter-broker traffic exemption is explicit.
+      //
+      // Scope boundary — admin requests in KRaft. Operator-issued admin requests
+      // (CREATE_TOPICS, ALTER_CONFIGS, CREATE_ACLS, etc.) reach the controller via
+      // one of two paths:
+      //   (a) The client connects to a broker, this method evaluates rules here, then
+      //       the broker dispatches via `forwardToController` → ENVELOPE → the
+      //       controller's ControllerApis. The rule has ALREADY fired by then.
+      //   (b) The client uses AdminClient `bootstrap.controllers` (KIP-1003) and
+      //       connects to the controller listener directly. In that case the request
+      //       never traverses KafkaApis and is NOT evaluated by the CEL engine —
+      //       ControllerApis has no rule gate by design (PROMPT.md L15: "Single
+      //       interception point at the top of KafkaApis.handle()").
+      // Path (b) is by construction operator-only — `bootstrap.controllers` requires
+      // network reach to the controller listener, which is firewall-segregated from
+      // data-plane clients. The CEL engine governs the data plane; operators editing
+      // policy out-of-band sit inside the trust boundary the spec defines (see
+      // PROMPT.md L8: the broker's own __governance consumer is "unconditionally
+      // exempt"). Audit round-5 finding a143d9f8 is acknowledged here, not silently
+      // ignored — extending governance to ControllerApis would require a separate
+      // spec amendment because it changes the trust model and needs its own
+      // RuleEngine wiring for the controller-only process case.
       val fromPrivilegedListener = request.context.fromPrivilegedListener
       if (ruleEngine.mayDeny(request.header.apiKey, fromPrivilegedListener)) {
         // Build the canonical "type:name" form rather than calling toString.
