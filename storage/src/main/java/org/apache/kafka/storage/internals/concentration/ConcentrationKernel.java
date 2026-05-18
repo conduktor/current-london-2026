@@ -20,6 +20,7 @@ import java.io.File;
 import java.io.IOException;
 import java.util.Collection;
 import java.util.Iterator;
+import java.util.List;
 import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.Optional;
@@ -84,10 +85,11 @@ public final class ConcentrationKernel implements AutoCloseable {
     /**
      * Returns the registry signal for broker fan-out: every logical topic whose backing is
      * {@code backingTopic}. The broker uses this on the fetch path to know which logical topics
-     * may have records on a given backing partition.
+     * may have records on a given backing partition. The returned list is an immutable snapshot
+     * — safe to iterate without holding any kernel-internal lock.
      */
-    public Collection<LogicalTopicDescriptor> descriptorsFor(String backingTopic) {
-        return registry.descriptorsFor(backingTopic);
+    public List<LogicalTopicDescriptor> descriptorsFor(String backingTopic) {
+        return List.copyOf(registry.descriptorsFor(backingTopic));
     }
 
     // ------------------ Routing ------------------
@@ -206,22 +208,26 @@ public final class ConcentrationKernel implements AutoCloseable {
 
     // ------------------ internals ------------------
 
+    /**
+     * Double-checked: the fast path (sidecar already open) is a lock-free read of the concurrent
+     * map. The slow path (first open per partition) takes the same monitor as {@link #close()},
+     * so a sidecar opened after close() began running is impossible — close() either runs to
+     * completion first and the subsequent open sees {@code closed == true} via ensureOpen(), or
+     * close() blocks until this open finishes and then closes the new handle along with the
+     * rest.
+     */
     private LogicalSidecarIndex sidecarFor(String logicalTopic, int logicalPartition) throws IOException {
         LogicalPartition key = new LogicalPartition(logicalTopic, logicalPartition);
         LogicalSidecarIndex existing = sidecars.get(key);
         if (existing != null) return existing;
-        LogicalSidecarIndex fresh = recoverer.openSidecar(logicalTopic, logicalPartition);
-        LogicalSidecarIndex previous = sidecars.putIfAbsent(key, fresh);
-        if (previous != null) {
-            // Lost the race; close the unused handle and return the winner.
-            try {
-                fresh.close();
-            } catch (IOException ignored) {
-                // best-effort
-            }
-            return previous;
+        synchronized (this) {
+            ensureOpen();
+            existing = sidecars.get(key);
+            if (existing != null) return existing;
+            LogicalSidecarIndex fresh = recoverer.openSidecar(logicalTopic, logicalPartition);
+            sidecars.put(key, fresh);
+            return fresh;
         }
-        return fresh;
     }
 
     private void ensureOpen() {

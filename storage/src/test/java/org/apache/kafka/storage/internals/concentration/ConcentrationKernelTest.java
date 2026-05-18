@@ -215,10 +215,41 @@ public class ConcentrationKernelTest {
     @Test
     public void afterCloseFurtherOperationsAreRejected() throws IOException {
         kernel.declare(descriptor("orders", 4, "shared", 1));
+        // Open a sidecar before close so we exercise both the cached-sidecar path and the
+        // first-open path post-close.
+        kernel.commitProduce(kernel.reserveProduce("orders", 0), 100L);
         kernel.close();
+
+        // Every entry point that interacts with sidecars or the tracker must reject post-close.
+        // This pins the audit-fix invariant: no operation can sneak a sidecar open past close().
         assertThrows(IllegalStateException.class,
             () -> kernel.reserveProduce("orders", 0));
+        assertThrows(IllegalStateException.class,
+            () -> kernel.resolveBackingOffset("orders", 0, 0L));
+        assertThrows(IllegalStateException.class,
+            () -> kernel.resolveBackingOffset("orders", 3, 0L));  // a never-opened partition
+        assertThrows(IllegalStateException.class,
+            () -> kernel.advanceStartOffset("orders", 0, 0L));
+        assertThrows(IllegalStateException.class,
+            () -> kernel.declare(descriptor("payments", 4, "other", 1)));
         kernel = null;
+    }
+
+    @Test
+    public void descriptorsForReturnsImmutableSnapshot() {
+        kernel.declare(descriptor("orders", 100, "shared", 4));
+        kernel.declare(descriptor("payments", 50, "shared", 4));
+        List<LogicalTopicDescriptor> snapshot = kernel.descriptorsFor("shared");
+        assertEquals(2, snapshot.size());
+        // Mutation must throw — the broker can iterate without defensive copying.
+        assertThrows(UnsupportedOperationException.class,
+            () -> snapshot.add(descriptor("more", 10, "shared", 4)));
+        // A later declare must not appear in the captured snapshot.
+        kernel.declare(descriptor("returns", 25, "shared", 4));
+        assertEquals(2, snapshot.size(),
+            "snapshot must be stable against subsequent declare() calls");
+        assertEquals(3, kernel.descriptorsFor("shared").size(),
+            "a fresh call returns the up-to-date count");
     }
 
     @Test
