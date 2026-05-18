@@ -977,6 +977,98 @@ class BrokerGovernanceBootstrapTest {
   }
 
   @Test
+  def drainOnceTruncationToEmptyHoldsStalePersistentlyAcrossDrains(): Unit = {
+    // Regression pin for an adversarial-audit finding on the first cut of
+    // the "defer commit when post-truncation range is empty" fix: that fix
+    // made the "did the truncation guard fire this drain?" flag LOCAL to
+    // drainOnce, which protected only the very first post-truncation drain.
+    // On the SECOND drain (and every subsequent one) while HW remained at
+    // logStartOffset, the truncation guard wouldn't re-fire (cursor was
+    // already at logStartOffset), the local flag would default to false,
+    // and the up-to-date branch would unconditionally call loader.commit()
+    // — installing RuleSet.EMPTY over the previously-good active(). The
+    // exact regression the fix was meant to prevent, one drain later.
+    //
+    // This test exercises THREE drains:
+    //   1. Initial drain: install 2 rules.
+    //   2. Truncation-to-empty drain: HW dropped to logStartOffset → defer
+    //      (this case was already covered by
+    //      drainOnceTruncationToEmptyDoesNotInstallEmptyOverPreviouslyGoodRuleSet).
+    //   3. Subsequent drain with HW STILL at logStartOffset: the flag must
+    //      still be set, so the engine still holds previously-good rules.
+    //      A locally-scoped flag would fail this third drain.
+    //
+    // Finally, recovery: HW advances → replay+commit fires → flag clears →
+    // a 4th drain that returns to the "up-to-date" steady state commits
+    // idempotently rather than deferring.
+    val rm = mock(classOf[ReplicaManager])
+    val log = mock(classOf[UnifiedLog])
+    val engine = new RuleEngine()
+    when(rm.getLog(tp)).thenReturn(Some(log))
+
+    // Drain 1: install two rules.
+    when(log.logStartOffset).thenReturn(0L)
+    when(log.highWatermark).thenReturn(2L)
+    when(log.read(0L, 1024 * 1024, FetchIsolation.HIGH_WATERMARK, true)).thenReturn(
+      recordsAt(0L,
+        new SimpleRecord("r1".getBytes(StandardCharsets.UTF_8),
+          envelope("true", ApiKeys.METADATA, 7)),
+        new SimpleRecord("r2".getBytes(StandardCharsets.UTF_8),
+          envelope("true", ApiKeys.FETCH, 11))))
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp)
+    assertEquals(2L, boot.drainOnce())
+    val previouslyGood = engine.active()
+    assertEquals(2, previouslyGood.size())
+
+    // Drain 2: truncation-to-empty. Guard fires; flag set; defer.
+    when(log.highWatermark).thenReturn(0L)
+    assertEquals(0L, boot.drainOnce())
+    assertSame(previouslyGood, engine.active(),
+      "drain 2 must preserve previously-good active() (truncation guard fires)")
+
+    // Drain 3 (THE REGRESSION CASE): HW STILL at logStartOffset. Truncation
+    // guard does NOT fire (cursor was already rewound to logStartOffset).
+    // If the holding-stale flag were local to drainOnce, it would default
+    // to false here and the up-to-date branch would commit the empty
+    // working state, flipping engine.active() to RuleSet.EMPTY. Pinning
+    // assertSame here proves the field-promoted flag persists.
+    assertEquals(0L, boot.drainOnce())
+    assertSame(previouslyGood, engine.active(),
+      "drain 3 must STILL preserve previously-good active() — this is the " +
+        "subsequent-drain regression the local-flag version reintroduced")
+    // Drain 4 (still empty): same invariant must hold indefinitely.
+    assertEquals(0L, boot.drainOnce())
+    assertSame(previouslyGood, engine.active(),
+      "drain 4 must STILL preserve previously-good active() — held-stale " +
+        "posture persists across arbitrarily many empty drains")
+
+    // Recovery: HW advances → replay → commit clears the flag.
+    when(log.highWatermark).thenReturn(1L)
+    when(log.read(0L, 1024 * 1024, FetchIsolation.HIGH_WATERMARK, true)).thenReturn(
+      recordsAt(0L,
+        new SimpleRecord("r-fresh".getBytes(StandardCharsets.UTF_8),
+          envelope("true", ApiKeys.LIST_OFFSETS, 23))))
+    assertEquals(1L, boot.drainOnce(),
+      "recovery drain reads the one fresh record")
+    val fresh = engine.active()
+    assertEquals(1, fresh.size())
+    assertNotSame(previouslyGood, fresh,
+      "recovery commit must replace the held-stale RuleSet")
+
+    // Drain 6 (post-recovery, steady state, no new records): the
+    // up-to-date branch now commits idempotently. The held-stale flag is
+    // clear, so engine.active() may be a fresh instance (the idempotent
+    // commit publishes a new snapshot), but it must STILL contain the
+    // single fresh rule — proving we did not slip back into defer-mode.
+    assertEquals(0L, boot.drainOnce())
+    assertEquals(1, engine.active().size(),
+      "post-recovery steady state still reflects the fresh rule (idempotent " +
+        "commit did not regress to the held-stale defer path)")
+    assertTrue(engine.evaluate(ApiKeys.LIST_OFFSETS, "c", false,
+      () => Collections.emptyMap()).denied)
+  }
+
+  @Test
   def drainOnceProceedsEvenWhenADenyAllFetchRuleIsActive(): Unit = {
     // Adversarial M4: PROMPT.md requires the broker to keep enforcing the
     // governance topic itself even if an operator publishes a deny-all rule

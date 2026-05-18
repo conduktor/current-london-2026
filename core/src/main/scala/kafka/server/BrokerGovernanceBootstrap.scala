@@ -131,6 +131,24 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
   // first drainOnce.
   private val nextOffset = new AtomicLong(0L)
 
+  // Set to true when the truncation guard clears the loader's working state
+  // (cursor was past HW → reset() + rewind). Persists across drainOnce calls
+  // until a drain successfully replays at least one record and commits a
+  // fresh RuleSet — then it is cleared.
+  //
+  // While this flag is set, the "up-to-date" branch of drainOnce MUST NOT
+  // call loader.commit() — doing so would publish the just-reset (empty)
+  // working state over the engine's previously-good active(), violating the
+  // "fail-stale-not-empty" posture established in this file's javadoc. The
+  // first drain that observes records on this partition exits the up-to-date
+  // branch via the normal replay+commit path, which clears the flag.
+  //
+  // A boolean field is sufficient (not AtomicBoolean) because drainOnce runs
+  // on a single-threaded executor (the broker's scheduler) — startup runs
+  // before the scheduler is armed, and the scheduler does not overlap calls
+  // with itself.
+  private var holdingStalePostTruncation: Boolean = false
+
   /**
    * Read every record from `nextOffset` to the current log-end offset, apply
    * each to the [[GovernanceLoader]], and atomically install the resulting
@@ -243,7 +261,6 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
         // from the current log-start offset. The engine's currently
         // installed RuleSet stays in place until the re-drain commits,
         // honouring the "fail-stale-not-empty" posture.
-        var didTruncationResetThisDrain = false
         if (nextOffset.get() > endOffset) {
           warn(s"governance partition $tp truncated: cursor was at " +
             s"${nextOffset.get()} but HW is now $endOffset. Resetting " +
@@ -251,7 +268,7 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
             s"${log.logStartOffset}.")
           loader.reset()
           nextOffset.set(log.logStartOffset)
-          didTruncationResetThisDrain = true
+          holdingStalePostTruncation = true
         }
         val startOffset = math.max(log.logStartOffset, nextOffset.get())
         if (startOffset >= endOffset) {
@@ -262,29 +279,31 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
           //     idempotent commit just publishes it (no-op if nothing
           //     changed since the previous commit).
           //
-          //  2. Post-truncation race: the truncation guard above just ran
-          //     loader.reset() AND the post-reset range is empty
-          //     (logStartOffset >= HW). The working state is now empty,
-          //     and an unconditional commit here would install
-          //     RuleSet.EMPTY over the engine's previously-good active()
-          //     — exactly the "fail-stale-not-empty" violation the rest
-          //     of this file warns against (transient log-dir glitch,
-          //     leader-election aftermath, broker-internal observation of
-          //     a momentary empty view). The reset + empty range together
-          //     mean "we cleared our local view AND we don't yet have a
-          //     fresh one to install" — defer until a drain actually
-          //     observes records, then commit the rebuilt state.
+          //  2. Holding-stale-post-truncation: a prior drain (this one OR
+          //     an earlier one) tripped the truncation guard and reset the
+          //     loader's working state, but no drain has yet observed a
+          //     record to rebuild it. holdingStalePostTruncation is set.
+          //     Committing the still-empty working state would publish
+          //     RuleSet.EMPTY over the engine's previously-good active(),
+          //     violating the "fail-stale-not-empty" posture. Defer the
+          //     commit until a drain that actually replays records hits
+          //     the path below and clears the flag.
           //
-          // The first record landing post-truncation will exit this branch
-          // via startOffset < endOffset and a normal replay+commit cycle.
-          // No active() change happens until then; clients keep seeing the
-          // last-known-good RuleSet.
-          if (didTruncationResetThisDrain) {
-            warn(s"governance partition $tp truncated to an empty replay " +
-              s"range [$startOffset, $endOffset); deferring commit so the " +
-              s"engine keeps its last-known-good active RuleSet. Next " +
-              s"drain that observes records on this partition will rebuild " +
-              s"and install fresh state.")
+          // Note: a brief adversarial-audit finding pointed out that
+          // making the flag local to drainOnce protected only the first
+          // post-truncation drain — subsequent drains while HW stayed at
+          // logStartOffset would re-enter this branch with the flag
+          // re-defaulted to false and unconditionally commit the still-
+          // empty working state. Promoting the flag to a field fixes that
+          // cross-drain regression; the test
+          // drainOnceTruncationToEmptyHoldsStalePersistentlyAcrossDrains
+          // pins the multi-drain case.
+          if (holdingStalePostTruncation) {
+            warn(s"governance partition $tp held-stale: replay range " +
+              s"[$startOffset, $endOffset) is empty post-truncation; " +
+              s"deferring commit so the engine keeps its last-known-good " +
+              s"active RuleSet. Next drain that observes records on this " +
+              s"partition will rebuild and install fresh state.")
             return 0L
           }
           loader.commit()
@@ -297,6 +316,16 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
         // skip the unread range. Codex deep-audit P1 fix: prior version did
         // `nextOffset.set(endOffset)` which jumped past records we never read.
         loader.commit()
+        // A successful replay+commit means the working state is now a fresh,
+        // record-derived RuleSet — the held-stale flag (if any) is cleared
+        // here, NOT inside the up-to-date branch. Clearing it elsewhere would
+        // be wrong: a drain that only does an idempotent commit on a stable
+        // working state has not rebuilt anything from the topic, so the
+        // "post-truncation, no records yet observed" condition is unchanged.
+        // Codex audit follow-on, paired with the field-promotion fix above.
+        if (holdingStalePostTruncation && result.replayed > 0) {
+          holdingStalePostTruncation = false
+        }
         nextOffset.set(result.advancedTo)
         result.replayed
     }

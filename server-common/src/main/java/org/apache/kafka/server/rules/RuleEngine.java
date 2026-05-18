@@ -31,6 +31,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 
@@ -107,6 +109,39 @@ public final class RuleEngine {
     public static final String ACTIVATION_BUDGET_RULE_ID = "__activation-budget-exceeded__";
 
     private final AtomicReference<RuleSet> active = new AtomicReference<>(RuleSet.EMPTY);
+
+    /**
+     * Throttle for the fail-closed budget-overflow WARN. The fail-closed
+     * posture is the right answer to attacker-shaped wide requests
+     * (see {@link ActivationBudgetExceededException}), but writing one
+     * synchronous SLF4J WARN per request gives the same attacker an
+     * unbounded log-spam channel: a few thousand pathological requests per
+     * second saturates the broker's logger appender, drives I/O on the log
+     * volume that competes with the broker's data path, and stalls the
+     * request thread on appender backpressure.
+     *
+     * <p>The pattern mirrors {@code BrokerGovernanceBootstrap.maybeWarnSuppressed}:
+     * the first event in each window emits a single WARN that includes the
+     * count of events suppressed in the previous window. Subsequent events
+     * in the same window only increment a counter. The window is one second
+     * — large enough to bound log volume to ~1 line/s even under sustained
+     * attack, small enough that an operator scanning logs sees the event
+     * promptly when it first starts.
+     *
+     * <p>{@code lastBudgetWarnNanos} is the {@link System#nanoTime} of the
+     * last emitted WARN (initialised to 0 so the very first event always
+     * fires immediately). {@code suppressedBudgetWarnings} accumulates
+     * intermediate events; it is read and zeroed atomically when a WARN
+     * does fire, so the count is exactly "what happened since the last
+     * line written to the log". Both fields use atomics because evaluate()
+     * runs on every request thread concurrently.
+     *
+     * <p>Visible for testing as package-private so test code can read the
+     * suppression counter without driving a slow real-time wall-clock test.
+     */
+    private final AtomicLong lastBudgetWarnNanos = new AtomicLong(0L);
+    final AtomicLong suppressedBudgetWarnings = new AtomicLong(0L);
+    static final long BUDGET_WARN_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(1);
 
     /**
      * Allow-list of principal strings (e.g. {@code "User:broker"}) that may
@@ -414,8 +449,14 @@ public final class RuleEngine {
             // attribute this DENY to the engine's defensive posture without
             // ambiguity. See ActivationBudgetExceededException javadoc for the
             // full broker-bug-vs-attacker-shape policy distinction.
-            LOG.warn("activation budget exceeded on apiKey {} — failing closed (POLICY_VIOLATION): {}",
-                apiKey, budget.getMessage());
+            //
+            // Throttle the WARN: the request itself is fail-closed, but writing
+            // one synchronous SLF4J line per attacker request would re-open the
+            // log-spam DoS vector that the fail-closed posture is designed to
+            // shut. One line per window with the suppression count is enough
+            // for an operator to notice the event start; subsequent attacker
+            // requests in the same window only bump the counter.
+            maybeWarnBudgetExceeded(apiKey, budget);
             return RuleDecision.deny(Errors.POLICY_VIOLATION.code(), ACTIVATION_BUDGET_RULE_ID);
         } catch (Throwable t) {
             // Codex deep-audit P0 fix: a throwing activation supplier MUST NOT
@@ -522,5 +563,31 @@ public final class RuleEngine {
             return false;
         }
         return principalName != null && trustedBypassPrincipals.contains(principalName);
+    }
+
+    /**
+     * Emit a throttled WARN for activation budget overflow. See the field
+     * comment on {@link #lastBudgetWarnNanos} for the threat model. The
+     * compareAndSet on {@code lastBudgetWarnNanos} guarantees at most one
+     * thread per window wins the emission slot — losing threads only bump
+     * the suppressed counter, never block waiting for the appender.
+     */
+    private void maybeWarnBudgetExceeded(ApiKeys apiKey, ActivationBudgetExceededException budget) {
+        long now = System.nanoTime();
+        long last = lastBudgetWarnNanos.get();
+        if (now - last >= BUDGET_WARN_INTERVAL_NANOS
+            && lastBudgetWarnNanos.compareAndSet(last, now)) {
+            long suppressed = suppressedBudgetWarnings.getAndSet(0L);
+            if (suppressed > 0) {
+                LOG.warn("activation budget exceeded on apiKey {} — failing closed (POLICY_VIOLATION), "
+                    + "suppressed {} similar events in the previous window: {}",
+                    apiKey, suppressed, budget.getMessage());
+            } else {
+                LOG.warn("activation budget exceeded on apiKey {} — failing closed (POLICY_VIOLATION): {}",
+                    apiKey, budget.getMessage());
+            }
+        } else {
+            suppressedBudgetWarnings.incrementAndGet();
+        }
     }
 }

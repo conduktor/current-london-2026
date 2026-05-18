@@ -204,6 +204,18 @@ public class RuleEngineTest {
         assertEquals(Errors.POLICY_VIOLATION.code(), d.errorCode(),
             "budget-overflow DENY must surface POLICY_VIOLATION (44) so clients see " +
                 "a clear governance-rejection error code, not the rule author's choice");
+        // Literal pin: POLICY_VIOLATION has been wire-code 44 since the API was
+        // introduced and clients (including ancient broker-protocol versions
+        // still in the field) decode that integer to construct the user-facing
+        // PolicyViolationException. If an upstream Kafka rev ever renumbered
+        // it, RuleEngine would still compile against Errors.POLICY_VIOLATION,
+        // but the wire-level error class clients see would silently shift —
+        // and PolicyViolationException is the contract a governance-aware
+        // client uses to distinguish "rule rejected my request" from a generic
+        // broker error. This assertion fires on any such drift.
+        assertEquals((short) 44, Errors.POLICY_VIOLATION.code(),
+            "POLICY_VIOLATION wire code must remain 44 — the governance contract " +
+                "depends on it");
         assertEquals(RuleEngine.ACTIVATION_BUDGET_RULE_ID, d.denyingRuleId(),
             "denyingRuleId must be the reserved sentinel so audit consumers can " +
                 "distinguish defensive engine posture from any operator-authored rule");
@@ -231,6 +243,53 @@ public class RuleEngineTest {
             });
         assertSame(RuleDecision.ALLOW, d,
             "generic exceptions must still fail open — only ActivationBudget closes");
+    }
+
+    @Test
+    public void budgetOverflowWarnIsThrottledUnderRapidFire() {
+        // DoS-P1: the fail-closed posture in
+        // activationBudgetExceededFailsClosedWithPolicyViolation correctly
+        // denies the attacker-shaped request, but a naive `LOG.warn` per
+        // request hands the same attacker a synchronous log-spam amplifier —
+        // a few thousand pathological requests/s saturates the broker's SLF4J
+        // appender, contends I/O on the log volume with the data path, and
+        // stalls the request thread on appender backpressure. The throttle
+        // bounds that to ~one WARN per second per broker, accumulating
+        // suppressed counts so the operator sees the burst start.
+        //
+        // We can't assert on log lines directly without coupling to an
+        // appender implementation, but we CAN observe the suppression counter
+        // — it's package-private exactly so this test can read it without a
+        // wall-clock sleep. After the first call grabs the emission slot, the
+        // remaining N-1 calls in the same window MUST increment the counter
+        // instead of writing to the log.
+        RuleEngine engine = new RuleEngine();
+        engine.install(new RuleSetBuilder()
+            .put(denyRule("deny-all", ApiKeys.METADATA, "true", 99))
+            .build());
+        final int rapidFireCalls = 1_000;
+        for (int i = 0; i < rapidFireCalls; i++) {
+            RuleDecision d = engine.evaluate(
+                ApiKeys.METADATA, "client", null, false,
+                () -> {
+                    throw new ActivationBudgetExceededException("wide request #" + 0);
+                });
+            assertTrue(d.denied(), "every overflow call must still fail closed, only the WARN is throttled");
+            assertEquals(Errors.POLICY_VIOLATION.code(), d.errorCode());
+        }
+        // At least rapidFireCalls-1 of those events must have been suppressed:
+        // the very first one wins the emission slot (lastBudgetWarnNanos was 0),
+        // and the rest land inside the 1-second window. We allow >=
+        // rapidFireCalls-1 (not exactly) because the counter is read+zeroed
+        // by the emitter, so if a second emission DID fit in the window the
+        // remaining suppressed count would be slightly lower — but this is a
+        // synchronous tight loop on one thread, so in practice the loop
+        // finishes inside the first window and the count is exactly
+        // rapidFireCalls-1.
+        long suppressed = engine.suppressedBudgetWarnings.get();
+        assertTrue(suppressed >= rapidFireCalls - 2,
+            "expected the throttle to suppress most rapid-fire WARNs, got " + suppressed
+                + " out of " + rapidFireCalls + " budget-overflow events");
     }
 
     @Test
