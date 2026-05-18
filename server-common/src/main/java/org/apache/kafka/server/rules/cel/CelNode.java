@@ -168,11 +168,14 @@ abstract class CelNode {
                 case "contains":
                     return r instanceof String && arg0 != null && ((String) r).contains(arg0);
                 default:
-                    // matches() is not handled here — the parser lowers
-                    // `.matches(<literal>)` into a RegexMatch node so the
-                    // pattern is pre-compiled at rule load time. Reaching
-                    // this branch means the parser failed to enforce that
-                    // contract.
+                    // Defense in depth: CelCompiler.parseDotSuffix rejects
+                    // unknown method names AND wrong-arity calls at compile
+                    // time (audit LOW-1) and lowers .matches(<literal>) to
+                    // a RegexMatch node. Reaching this branch means a
+                    // parser regression has constructed a MethodCall the
+                    // request path cannot evaluate — fail-open on the rule
+                    // (RuleEngine catches CelEvaluationException) rather
+                    // than crashing the broker thread.
                     throw new CelEvaluationException("unknown method: " + method);
             }
         }

@@ -481,6 +481,36 @@ public final class CelCompiler {
             if ("matches".equals(name.text)) {
                 return buildRegexMatch(receiver, args);
             }
+            // Audit LOW-1: reject unknown method names at compile time, not
+            // eval time. The pre-fix behaviour built a MethodCall with any
+            // identifier and threw CelEvaluationException only when the
+            // request path tried to evaluate it — at which point RuleEngine
+            // fails the rule open (logged and skipped). That is a deferred
+            // and silent failure mode: a typo like `name.startWith("audit")`
+            // (missing 's') would install successfully, never fire, and
+            // produce a misleading "this rule does nothing" diagnostic only
+            // by reading the broker logs. Catching it here at rule-load
+            // turns the typo into a CelCompilationException → the JSON
+            // codec rejects the envelope → GovernanceLoader returns false →
+            // the previously-good RuleSet is preserved. The rule submitter
+            // gets a precise, immediate diagnostic instead of silence.
+            //
+            // Arg-count is also a load-time concern: `s.startsWith()` and
+            // `s.contains(a, b)` are programming errors, not request-shape
+            // surprises, and they should be caught before any request walks
+            // an obviously-wrong rule. Each of our string methods takes
+            // exactly one argument.
+            if (!"startsWith".equals(name.text)
+                    && !"endsWith".equals(name.text)
+                    && !"contains".equals(name.text)) {
+                throw new CelCompilationException(
+                    "unknown method '" + name.text + "()' on receiver; "
+                        + "supported methods: startsWith, endsWith, contains, matches, exists, all");
+            }
+            if (args.size() != 1) {
+                throw new CelCompilationException(
+                    name.text + "() requires exactly one argument, got " + args.size());
+            }
             return account(new CelNode.MethodCall(receiver, name.text, args));
         }
 

@@ -591,6 +591,53 @@ public class CelProgramTest {
     }
 
     @Test
+    public void unknownMethodIsRejectedAtCompileTime() {
+        // Audit LOW-1: a typo like `name.startWith("audit")` (missing 's')
+        // must fail at rule load — CelCompilationException — not silently
+        // install and fail-open at request time. The whole point of
+        // compile-time validation is that the rule submitter gets an
+        // immediate, precise diagnostic instead of "this rule mysteriously
+        // does nothing in production".
+        CelCompilationException ex = assertThrows(CelCompilationException.class,
+            () -> CelCompiler.compile("name.startWith(\"audit\")"));
+        assertTrue(ex.getMessage().contains("startWith"),
+            "compile error must name the offending method: " + ex.getMessage());
+        // A genuinely-unknown method name surfaces the supported set so
+        // the operator does not have to consult source code to fix the
+        // rule.
+        CelCompilationException ex2 = assertThrows(CelCompilationException.class,
+            () -> CelCompiler.compile("name.totallyBogus(\"x\")"));
+        assertTrue(ex2.getMessage().contains("startsWith"),
+            "compile error must enumerate supported methods: " + ex2.getMessage());
+    }
+
+    @Test
+    public void wrongArityForStringMethodIsRejectedAtCompileTime() {
+        // Same posture as unknownMethodIsRejectedAtCompileTime: arity
+        // mismatches are programming errors, not request-shape surprises.
+        // They should be caught before any request walks an obviously-wrong
+        // rule, not deferred to per-request fail-open behaviour.
+        assertThrows(CelCompilationException.class,
+            () -> CelCompiler.compile("name.startsWith()"));
+        assertThrows(CelCompilationException.class,
+            () -> CelCompiler.compile("name.contains(\"a\", \"b\")"));
+        assertThrows(CelCompilationException.class,
+            () -> CelCompiler.compile("name.endsWith(\"a\", \"b\", \"c\")"));
+    }
+
+    @Test
+    public void supportedStringMethodsStillCompileCleanly() {
+        // Regression test for unknownMethodIsRejectedAtCompileTime: a
+        // tighter compile-time check could over-rotate and reject
+        // legitimate rules. Pin that the four well-known methods continue
+        // to parse without throwing.
+        CelCompiler.compile("name.startsWith(\"audit\")");
+        CelCompiler.compile("name.endsWith(\"-topic\")");
+        CelCompiler.compile("name.contains(\"foo\")");
+        CelCompiler.compile("name.matches(\"[a-z]+\")");
+    }
+
+    @Test
     public void stringConcatChargesResultLengthAgainstBudget() {
         // Audit HIGH-2: Arith.ADD on strings now charges (l.length() +
         // r.length()) per call. A comprehension that builds long strings
