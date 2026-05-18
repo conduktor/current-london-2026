@@ -74,12 +74,14 @@ final class SseStreamer {
     private final String topic;
     private final int partition;
     private final OptionalInt maxBytes;
+    private final SseStreamLimiter.Token limiterToken;
 
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private volatile long currentOffset;
 
     private SseStreamer(AsyncContext async, RequestSubmitter submitter, ObjectMapper mapper,
-                        String topic, int partition, long startOffset, OptionalInt maxBytes) throws IOException {
+                        String topic, int partition, long startOffset, OptionalInt maxBytes,
+                        SseStreamLimiter.Token limiterToken) throws IOException {
         this.async = Objects.requireNonNull(async);
         this.resp = (HttpServletResponse) async.getResponse();
         this.out = resp.getOutputStream();
@@ -89,6 +91,7 @@ final class SseStreamer {
         this.partition = partition;
         this.currentOffset = startOffset;
         this.maxBytes = Objects.requireNonNull(maxBytes);
+        this.limiterToken = Objects.requireNonNull(limiterToken);
     }
 
     /**
@@ -97,7 +100,8 @@ final class SseStreamer {
      * disconnect, partition-level error, or unrecoverable submitter failure).
      */
     static void start(AsyncContext async, RequestSubmitter submitter, ObjectMapper mapper,
-                      FetchRequestParser.FetchCommand command) {
+                      FetchRequestParser.FetchCommand command, SseStreamLimiter.Token limiterToken) {
+        Objects.requireNonNull(limiterToken, "limiterToken must not be null — caller must acquire before start()");
         SseStreamer streamer;
         try {
             HttpServletResponse resp = (HttpServletResponse) async.getResponse();
@@ -113,17 +117,20 @@ final class SseStreamer {
             async.setTimeout(0L); // no servlet-side timeout — the broker's fetch max-wait is the only pacing
 
             streamer = new SseStreamer(async, submitter, mapper, command.topic(), command.partition(),
-                command.offset(), command.maxBytes());
+                command.offset(), command.maxBytes(), limiterToken);
             // Write the framing comment so connection-buffering proxies flush the headers before any record arrives.
             streamer.out.write(CONNECTED_COMMENT);
             streamer.out.flush();
         } catch (IOException e) {
-            // Couldn't even write the priming bytes — connection's already gone. Give up.
+            // Couldn't even write the priming bytes — connection's already gone. Release the slot we reserved and
+            // give up; we never made it to scheduleNextFetch so closeStream() won't run for us.
             LOG.debug("SSE stream aborted before first fetch: {}", e.toString());
+            limiterToken.close();
             async.complete();
             return;
         } catch (RuntimeException e) {
             LOG.warn("SSE stream initialization failed", e);
+            limiterToken.close();
             async.complete();
             return;
         }
@@ -218,6 +225,9 @@ final class SseStreamer {
 
     private void closeStream() {
         if (closed.compareAndSet(false, true)) {
+            // Release the SSE slot before completing the AsyncContext. Token.close() is idempotent, so even if a
+            // future refactor pushes closeStream() through two paths the limiter count remains accurate.
+            limiterToken.close();
             try {
                 async.complete();
             } catch (RuntimeException e) {

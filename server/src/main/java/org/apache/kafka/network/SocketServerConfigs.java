@@ -184,6 +184,10 @@ public class SocketServerConfigs {
     public static final int HTTP_BRIDGE_REQUEST_TIMEOUT_MS_DEFAULT = 30_000;
     public static final String HTTP_BRIDGE_REQUEST_TIMEOUT_MS_DOC = "Upper bound in milliseconds on how long the HTTP bridge will wait for a one-shot produce or fetch request to complete before short-circuiting it with HTTP 504 Gateway Timeout. This is a safety net for the case where a response from the broker's request pipeline never lands on the bridge's completion hook — for example, if a downstream code path completes via a code path that does not invoke the hook. Without this cap the HTTP connection would hang indefinitely. Does not apply to SSE streams (Accept: text/event-stream), which intentionally long-poll and whose lifetime is bounded by the client closing. Set to a value larger than your highest expected end-to-end broker latency; the default of 30s is comfortably above Kafka's own request.timeout.ms default while still bounding the wait at a recognisable HTTP-friendly value.";
 
+    public static final String HTTP_BRIDGE_MAX_CONCURRENT_SSE_STREAMS_CONFIG = "http.bridge.max.concurrent.sse.streams";
+    public static final int HTTP_BRIDGE_MAX_CONCURRENT_SSE_STREAMS_DEFAULT = 100;
+    public static final String HTTP_BRIDGE_MAX_CONCURRENT_SSE_STREAMS_DOC = "Upper bound on the number of Server-Sent Events streams the HTTP bridge will serve concurrently (GET /v1/topics/{topic}/records with Accept: text/event-stream). Each SSE stream holds a Jetty thread for the lifetime of the connection, recursively long-polls the broker via the fetch pipeline, and is bounded only by the client closing the connection. Without this cap a hostile or runaway client can open arbitrarily many simultaneous streams until the Jetty thread pool is exhausted — at which point even one-shot produce/fetch requests stall behind it. New stream attempts past the cap are rejected with HTTP 429 Too Many Requests and a Retry-After header so clients back off cleanly. The default of 100 is conservative for a single-broker deployment; raise it if you have explicit capacity planning for streaming consumers and have sized the Jetty thread pool accordingly. Set to 0 to disable SSE entirely.";
+
     public static final ConfigDef CONFIG_DEF =  new ConfigDef()
             .define(LISTENERS_CONFIG, STRING, LISTENERS_DEFAULT, HIGH, LISTENERS_DOC)
             .define(ADVERTISED_LISTENERS_CONFIG, STRING, null, HIGH, ADVERTISED_LISTENERS_DOC)
@@ -205,7 +209,8 @@ public class SocketServerConfigs {
             .define(HTTP_BRIDGE_HOST_CONFIG, STRING, HTTP_BRIDGE_HOST_DEFAULT, LOW, HTTP_BRIDGE_HOST_DOC)
             .define(HTTP_BRIDGE_PORT_CONFIG, INT, HTTP_BRIDGE_PORT_DEFAULT, atLeast(0), LOW, HTTP_BRIDGE_PORT_DOC)
             .define(HTTP_BRIDGE_MAX_REQUEST_BODY_BYTES_CONFIG, INT, HTTP_BRIDGE_MAX_REQUEST_BODY_BYTES_DEFAULT, atLeast(0), LOW, HTTP_BRIDGE_MAX_REQUEST_BODY_BYTES_DOC)
-            .define(HTTP_BRIDGE_REQUEST_TIMEOUT_MS_CONFIG, INT, HTTP_BRIDGE_REQUEST_TIMEOUT_MS_DEFAULT, atLeast(1), LOW, HTTP_BRIDGE_REQUEST_TIMEOUT_MS_DOC);
+            .define(HTTP_BRIDGE_REQUEST_TIMEOUT_MS_CONFIG, INT, HTTP_BRIDGE_REQUEST_TIMEOUT_MS_DEFAULT, atLeast(1), LOW, HTTP_BRIDGE_REQUEST_TIMEOUT_MS_DOC)
+            .define(HTTP_BRIDGE_MAX_CONCURRENT_SSE_STREAMS_CONFIG, INT, HTTP_BRIDGE_MAX_CONCURRENT_SSE_STREAMS_DEFAULT, atLeast(0), LOW, HTTP_BRIDGE_MAX_CONCURRENT_SSE_STREAMS_DOC);
 
     private static final Pattern URI_PARSE_REGEXP = Pattern.compile(
         "^(.*)://\\[?([0-9a-zA-Z\\-%._:]*)\\]?:(-?[0-9]+)");

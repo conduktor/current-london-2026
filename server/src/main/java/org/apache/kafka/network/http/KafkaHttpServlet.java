@@ -59,9 +59,10 @@ public final class KafkaHttpServlet extends HttpServlet {
     private final RequestSubmitter submitter;
     private final ObjectMapper mapper;
     private final int maxRequestBodyBytes;
+    private final SseStreamLimiter sseLimiter;
 
     public KafkaHttpServlet(KafkaHttpBridge bridge, RequestSubmitter submitter, ObjectMapper mapper,
-                            int maxRequestBodyBytes) {
+                            int maxRequestBodyBytes, SseStreamLimiter sseLimiter) {
         this.bridge = Objects.requireNonNull(bridge, "bridge must not be null");
         this.submitter = Objects.requireNonNull(submitter, "submitter must not be null");
         this.mapper = Objects.requireNonNull(mapper, "mapper must not be null");
@@ -69,6 +70,7 @@ public final class KafkaHttpServlet extends HttpServlet {
             throw new IllegalArgumentException("maxRequestBodyBytes must be non-negative, got " + maxRequestBodyBytes);
         }
         this.maxRequestBodyBytes = maxRequestBodyBytes;
+        this.sseLimiter = Objects.requireNonNull(sseLimiter, "sseLimiter must not be null");
     }
 
     @Override
@@ -132,8 +134,22 @@ public final class KafkaHttpServlet extends HttpServlet {
                 writeBadRequest(resp, e.getMessage());
                 return;
             }
-            AsyncContext async = req.startAsync();
-            SseStreamer.start(async, submitter, mapper, command);
+            // Acquire the concurrent-stream slot BEFORE startAsync — if the cap is reached we want to emit a
+            // one-shot 429 with a Retry-After hint, not a half-opened event-stream that immediately closes. The
+            // limiter is the admission gate; without it a runaway client can exhaust the Jetty thread pool.
+            SseStreamLimiter.Token token = sseLimiter.tryAcquire();
+            if (token == null) {
+                writeTooManyStreams(resp);
+                return;
+            }
+            AsyncContext async;
+            try {
+                async = req.startAsync();
+            } catch (RuntimeException e) {
+                token.close();
+                throw e;
+            }
+            SseStreamer.start(async, submitter, mapper, command, token);
             return;
         }
 
@@ -194,6 +210,14 @@ public final class KafkaHttpServlet extends HttpServlet {
     private void writePayloadTooLarge(HttpServletResponse resp, long limit) throws IOException {
         writeEnvelope(resp, HttpStatusMapper.PAYLOAD_TOO_LARGE,
             "request body exceeds the configured limit of " + limit + " bytes");
+    }
+
+    private void writeTooManyStreams(HttpServletResponse resp) throws IOException {
+        // Set Retry-After on 429 so clients have a concrete back-off hint. Five seconds is short enough that a
+        // well-behaved consumer notices quickly when capacity frees up; long enough not to thrash a saturated server.
+        resp.setHeader(HEADER_RETRY_AFTER, "5");
+        writeEnvelope(resp, HttpStatusMapper.TOO_MANY_REQUESTS,
+            "too many concurrent SSE streams; try again later");
     }
 
     private static boolean rootCauseIsBodyTooLarge(Throwable t) {

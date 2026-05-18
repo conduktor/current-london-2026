@@ -330,6 +330,7 @@ class KafkaConfig private(doLog: Boolean, val props: util.Map[_, _])
   val httpBridgePort: Int = getInt(SocketServerConfigs.HTTP_BRIDGE_PORT_CONFIG)
   val httpBridgeMaxRequestBodyBytes: Int = getInt(SocketServerConfigs.HTTP_BRIDGE_MAX_REQUEST_BODY_BYTES_CONFIG)
   val httpBridgeRequestTimeoutMs: Int = getInt(SocketServerConfigs.HTTP_BRIDGE_REQUEST_TIMEOUT_MS_CONFIG)
+  val httpBridgeMaxConcurrentSseStreams: Int = getInt(SocketServerConfigs.HTTP_BRIDGE_MAX_CONCURRENT_SSE_STREAMS_CONFIG)
 
   /***************** rack configuration **************/
   val rack = Option(getString(ServerConfigs.BROKER_RACK_CONFIG))

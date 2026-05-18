@@ -53,6 +53,8 @@ class KafkaHttpServerIntegrationTest {
     // 1 MiB matches the production default in SocketServerConfigs — plenty of headroom for the small JSON bodies in
     // these tests, while still defending against the multi-GiB OOM scenario the cap exists to prevent.
     private static final int DEFAULT_TEST_MAX_BODY_BYTES = 1024 * 1024;
+    // 100 matches the production default. Tests that need to exercise the cap pass an explicit smaller value.
+    private static final int DEFAULT_TEST_MAX_SSE_STREAMS = 100;
 
     private final ObjectMapper mapper = new ObjectMapper();
     private final ControllableSubmitter submitter = new ControllableSubmitter();
@@ -61,12 +63,12 @@ class KafkaHttpServerIntegrationTest {
 
     @BeforeEach
     void setUp() throws Exception {
-        startServer(DEFAULT_TEST_MAX_BODY_BYTES);
+        startServer(DEFAULT_TEST_MAX_BODY_BYTES, DEFAULT_TEST_MAX_SSE_STREAMS);
     }
 
-    private void startServer(int maxRequestBodyBytes) throws Exception {
+    private void startServer(int maxRequestBodyBytes, int maxConcurrentSseStreams) throws Exception {
         server = new KafkaHttpServer("127.0.0.1", 0, new KafkaHttpBridge(mapper, submitter), submitter, mapper,
-            maxRequestBodyBytes);
+            maxRequestBodyBytes, maxConcurrentSseStreams);
         server.start();
         client = new HttpClient();
         client.start();
@@ -191,7 +193,7 @@ class KafkaHttpServerIntegrationTest {
         // broker JVM from an unbounded inbound POST: Jackson's readTree() consumes the whole stream into memory before
         // it parses, so without this cap a multi-GiB upload can OOM the broker before Kafka admission control runs.
         tearDown();
-        startServer(64);
+        startServer(64, DEFAULT_TEST_MAX_SSE_STREAMS);
 
         // The body below is 100+ bytes — well past the 64-byte cap. The exact body shape doesn't matter; the cap
         // trips before Jackson finishes building the JsonNode tree.
@@ -386,6 +388,63 @@ class KafkaHttpServerIntegrationTest {
         }
         // Closing the response stream above causes the next servlet write to fail; the streamer detects the
         // disconnect and completes the AsyncContext. We don't need an explicit teardown here.
+    }
+
+    @Test
+    void sseReturns429WhenConcurrentStreamCapReached() throws Exception {
+        // Restart with a cap of 1 so the first stream consumes all capacity. The second stream attempt must be
+        // refused at the admission gate with HTTP 429 + Retry-After, NOT a half-opened event-stream that then
+        // immediately errors. A runaway client otherwise exhausts the Jetty thread pool and stalls the bridge.
+        tearDown();
+        startServer(DEFAULT_TEST_MAX_BODY_BYTES, 1);
+
+        // Seed an indefinite stream: first fetch yields one record, subsequent fetches block (CompletableFuture
+        // that never completes). That keeps the first stream alive and the limiter at capacity for the duration
+        // of the test.
+        ConcurrentLinkedQueue<RequestSubmitter.FetchResult> queue = new ConcurrentLinkedQueue<>();
+        queue.add(new RequestSubmitter.FetchResult(
+            new FetchResponseFormatter.PartitionFetch(
+                0, Errors.NONE, null, 0, 0, 1,
+                List.of(new FetchResponseFormatter.FetchedRecord(
+                    0, null, "x".getBytes(StandardCharsets.UTF_8), null, 1L))),
+            0L));
+        submitter.fetchResultQueue = queue;
+
+        // First stream — opens, reads one event, holds the slot.
+        InputStreamResponseListener firstListener = new InputStreamResponseListener();
+        client.newRequest(url("/v1/topics/orders/records?partition=0&from=earliest"))
+            .method(HttpMethod.GET)
+            .headers(h -> h.put("Accept", "text/event-stream"))
+            .send(firstListener);
+        Response first = firstListener.get(5, TimeUnit.SECONDS);
+        assertEquals(200, first.getStatus());
+        // Wait until the first record has been written so we can be confident the limiter has counted the slot.
+        try (InputStream body = firstListener.getInputStream();
+             BufferedReader reader = new BufferedReader(new InputStreamReader(body, StandardCharsets.UTF_8))) {
+            String line;
+            boolean sawData = false;
+            while ((line = reader.readLine()) != null) {
+                if (line.startsWith("data: ")) {
+                    sawData = true;
+                    break;
+                }
+            }
+            assertTrue(sawData, "first stream must have received at least one event before we test the cap");
+
+            // Second stream attempt — limiter is at capacity, must be refused with 429 + Retry-After.
+            ContentResponse second = client.newRequest(url("/v1/topics/orders/records?partition=0&from=earliest"))
+                .method(HttpMethod.GET)
+                .headers(h -> h.put("Accept", "text/event-stream"))
+                .send();
+            assertEquals(429, second.getStatus());
+            assertEquals("5", second.getHeaders().get("Retry-After"));
+            JsonNode envelope = asJson(second.getContent());
+            assertTrue(envelope.get("errorMessage").asText().contains("concurrent"),
+                "errorMessage should mention concurrent SSE streams, got: "
+                    + envelope.get("errorMessage").asText());
+        }
+        // First stream gets torn down by closing the response above; the limiter releases when the streamer
+        // detects the disconnect on its next write attempt.
     }
 
     @Test
