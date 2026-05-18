@@ -5,15 +5,15 @@ A single broker-side rule engine that evaluates CEL `DENY` rules against any req
 
 ## Constraints (do not violate)
 - **Do not modify anything under `clients/`.** Rules are written as JSON records to a normal compacted topic — any stock producer can author them.
-- Bootstrap-safe: the broker's own consumer of `__governance` must be unconditionally exempt from rule evaluation, or you deadlock on startup.
+- Bootstrap-safe: the broker's own read of `__governance` must not traverse `KafkaApis.handle()`, or you deadlock on startup. In the implementation, the broker reads the local `__governance` log directly via `ReplicaManager.getLog` (no consumer, no network round-trip), so no rule can deny it. Operator-tooling consumers of `__governance` are gated by the privileged-listener flag plus enrolment in the `governance.bypass.principals` allow-list — the bypass is principal-based, not client-id-based; the internal-reader client-id prefix is diagnostic only.
 - Hot reload: atomic `RuleSet` swap on topic consumption; no broker restart.
 - Fast path: zero cost when no DENY rule targets the request's API key.
 
 ## Minimum viable outcome
 1. JSON rule schema: `{apiKeys: [...], action: "DENY", when: "<CEL expression>", errorCode: <int>}`.
 2. CEL compiled once at rule load; cache per-API field extractors so `request.*` works generically.
-3. Single interception point at the top of `KafkaApis.handle()`: bitset check on active deny-targeting API keys → if hit, evaluate matching rules → on DENY, short-circuit with the configured error code.
-4. Internal `__governance` consumer (marked with a sentinel client-id) that drives atomic `RuleSet` swaps.
+3. Single interception point at the top of `KafkaApis.handle()`: bitset check on active deny-targeting API keys → if hit, evaluate matching rules → on DENY, short-circuit with the configured error code. Two paths reach the controller without traversing `KafkaApis.handle()` and are by design out of scope for the engine: (a) admin clients connected via `bootstrap.controllers` (KIP-1003), and (b) broker-internal forwarding from `AutoTopicCreationManager` for `CREATE_TOPICS` triggered by METADATA / FIND_COORDINATOR auto-creation. Operators relying on `CREATE_TOPICS` rules must set `auto.create.topics.enable=false` to close path (b); path (a) is operator-only by construction.
+4. Internal `__governance` load path: the broker's bootstrap reads the local `__governance` log directly via `ReplicaManager.getLog` (no consumer, no `KafkaApis.handle()` traversal); steady-state reload then runs on the scheduler. Atomic `RuleSet` swap publishes through an `AtomicReference`.
 
 ## Stretch (only after the minimum lands)
 - `ALLOW` and `FILTER` actions.
@@ -23,17 +23,17 @@ A single broker-side rule engine that evaluates CEL `DENY` rules against any req
 
 ## Careful
 - Field extractors must be auto-generated per Kafka API type — do not hand-code them.
-- The internal `__governance` consumer must be unconditionally bypassed in the rule path, or rules block the very read that loads rules.
+- The broker's local-log read of `__governance` must not traverse `KafkaApis.handle()` — drive it via `ReplicaManager.getLog` directly. Any operator-driven consumer of `__governance` must arrive on the privileged listener AND its peer principal must be enrolled in `governance.bypass.principals`, or rules block the very read that loads them. The client-id prefix used by the internal reader is diagnostic only and is NOT authoritative for the bypass.
 - Don't pay the cost of context construction for requests with no matching rules. Bitset first; full context only on hit.
 
 ## Lessons already known (don't rediscover)
 - The fast path matters more than the slow path. Bitset of active deny-targeting API keys is O(1).
-- Self-referential bootstrap deadlock is a one-bite-fits-all trap. Mark the internal client-id and bypass unconditionally.
+- Self-referential bootstrap deadlock is a one-bite-fits-all trap. The broker reads `__governance` directly from the local log (no consumer, no `KafkaApis.handle()` traversal); operator-tooling consumers are bypassed only when authenticated on the privileged listener AND present in the `governance.bypass.principals` allow-list. Client-id sentinels are diagnostic; they are NOT the authoritative bypass.
 - Compression policy from the sibling worktree can ultimately be expressed as a single CEL rule, but for v1 keep them independent.
 
 ## Acceptance criteria
 - Rule reload is atomic — concurrent readers always observe one of the fully-published RuleSets, never null or partially-constructed state.
-- The broker's internal consumer of the rules topic (identified by a reserved client-id prefix) is unconditionally exempt from rule evaluation, even when a deny-all rule applies to the API being consumed.
+- The broker's own startup read of `__governance` does not traverse `KafkaApis.handle()` at all (direct local-log read via `ReplicaManager.getLog`) and is therefore not subject to rule evaluation even when a deny-all rule applies to the API. Operator-tooling consumers of `__governance` are exempt only when authenticated on the privileged listener AND their peer principal is enrolled in `governance.bypass.principals`; the internal-reader client-id prefix is diagnostic and NOT the authoritative bypass.
 - When no DENY rule targets a given API key, evaluation is skipped entirely — no field extraction, no principal-attribute resolution, no allocation on the fast path.
 - Rule update via tombstone is idempotent — tombstoning an absent rule succeeds, consistent with at-least-once delivery semantics from the rules topic.
 - Broker bootstrap drains all existing rules from the rules topic before accepting client connections.
@@ -43,7 +43,7 @@ A single broker-side rule engine that evaluates CEL `DENY` rules against any req
 ## Functional test scenarios
 - A DENY rule targeting CreateTopics with a CEL expression checking topic-name prefix is published. Three brokers in a cluster converge on the same offset and enforce the rule on the same name. The rule is then tombstoned; all three brokers converge and stop enforcing it without restart.
 - A good DENY rule is published; then a malformed rule (referencing a non-existent field) lands in the same batch. The loader rejects the malformed envelope per-record; the previously-good rule remains active with no corruption.
-- A DENY rule whose CEL expression matches all principals and all topics is written to the rules topic. The broker's own internal consumer (with the reserved client-id) continues to fetch the next batch of rules without being denied; other clients are immediately blocked.
+- A DENY rule whose CEL expression matches all principals and all topics is written to `__governance`. The broker's own startup read of `__governance` (direct local-log via `ReplicaManager.getLog`, no `KafkaApis.handle()` traversal) continues to load that rule and any later tombstone without being denied. An operator-tooling consumer of `__governance` connected on the privileged listener and enrolled in `governance.bypass.principals` also continues to fetch; other clients (including the same operator if not on the privileged listener) are immediately blocked.
 - Multiple rules target the same API key; the first matching DENY produces the configured error code, and subsequent rules are not evaluated.
 - A rule is published targeting Fetch only; a client sends Metadata. The metadata request returns ALLOW without invoking the field extractor or principal-attribute provider, even though the ruleset is non-empty.
 
