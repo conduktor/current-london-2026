@@ -47,7 +47,7 @@ import org.junit.jupiter.api.Assertions.{assertEquals, assertNotNull, assertTrue
 import org.junit.jupiter.api.{AfterEach, BeforeEach, Test}
 import org.mockito.ArgumentMatchers.any
 import org.mockito.Mockito
-import org.mockito.Mockito.{doThrow, inOrder, mock, verify}
+import org.mockito.Mockito.{doThrow, inOrder, mock, never, verify}
 import org.mockito.invocation.InvocationOnMock
 import org.mockito.stubbing.Answer
 
@@ -342,5 +342,65 @@ class BrokerMetadataPublisherTest {
     val order = inOrder(concentrationKernel, metadataCache)
     order.verify(concentrationKernel).applyShadowOverlay(any())
     order.verify(metadataCache).setImage(any())
+  }
+
+  @Test
+  def testShadowOverlayThrowSkipsImagePublishAndIsFatal(): Unit = {
+    // r17 N2-followup HIGH #118: if applyShadowOverlay throws, the original code logged via
+    // the non-fatal handler and FELL THROUGH to metadataCache.setImage — recreating exactly
+    // the silent cross-topic leakage window the N2 ordering was meant to prevent (some
+    // declared logical names flipped, others still un-shadowed, while the cache exposes
+    // physical topics of the same names). Required posture: treat as fatal AND short-circuit
+    // — fatalFaultHandler.handleFault is called, metadataCache.setImage is never called.
+    val config = KafkaConfig.fromProps(TestUtils.createBrokerConfig(0))
+    val metadataCache = mock(classOf[KRaftMetadataCache])
+    val logManager = mock(classOf[LogManager])
+    val replicaManager = mock(classOf[ReplicaManager])
+    val groupCoordinator = mock(classOf[GroupCoordinator])
+    val fatalFaultHandler = mock(classOf[FaultHandler])
+    val metadataPublishingFaultHandler = mock(classOf[FaultHandler])
+    val concentrationKernel = mock(classOf[ConcentrationKernel])
+
+    doThrow(new RuntimeException("simulated kernel programming bug"))
+      .when(concentrationKernel).applyShadowOverlay(any())
+
+    val metadataPublisher = new BrokerMetadataPublisher(
+      config,
+      metadataCache,
+      logManager,
+      replicaManager,
+      groupCoordinator,
+      mock(classOf[TransactionCoordinator]),
+      Some(mock(classOf[ShareCoordinator])),
+      mock(classOf[DynamicConfigPublisher]),
+      mock(classOf[DynamicClientQuotaPublisher]),
+      mock(classOf[DynamicTopicClusterQuotaPublisher]),
+      mock(classOf[ScramPublisher]),
+      mock(classOf[DelegationTokenPublisher]),
+      mock(classOf[AclPublisher]),
+      fatalFaultHandler,
+      metadataPublishingFaultHandler,
+      concentrationKernel
+    )
+
+    val image = MetadataImage.EMPTY
+    val delta = new MetadataDelta.Builder().setImage(image).build()
+
+    metadataPublisher.onMetadataUpdate(delta, image,
+      LogDeltaManifest.newBuilder()
+        .provenance(MetadataProvenance.EMPTY)
+        .leaderAndEpoch(LeaderAndEpoch.UNKNOWN)
+        .numBatches(1)
+        .elapsedNs(100)
+        .numBytes(42)
+        .build())
+
+    // Fatal handler was called for the overlay failure.
+    verify(fatalFaultHandler).handleFault(
+      org.mockito.ArgumentMatchers.contains("concentration shadow overlay"),
+      org.mockito.ArgumentMatchers.any[Throwable]())
+
+    // setImage was NEVER called — this is the invariant under test.
+    verify(metadataCache, never()).setImage(any())
   }
 }

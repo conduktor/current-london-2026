@@ -143,8 +143,20 @@ class BrokerMetadataPublisher(
       try {
         concentrationKernel.applyShadowOverlay(newImage.topics().topicsByName().keySet())
       } catch {
-        case t: Throwable => metadataPublishingFaultHandler.handleFault(
-          s"Error refreshing concentration shadow overlay in $deltaName", t)
+        case t: Throwable =>
+          // r17 N2-followup: do NOT fall through to setImage. The shadow set is now in an
+          // unknown intermediate state — some declared names may have been flipped, others
+          // not. Publishing the image atop that recreates exactly the silent cross-topic
+          // leakage window the N2 ordering was meant to prevent (isLogicalTopic still
+          // returns true for some declared names while the cache exposes a physical topic
+          // of the same name). Treat as fatal: the kernel either throws on a programming
+          // bug or a JVM-level error, neither of which is transient. Re-throw after the
+          // fatal handler to short-circuit the rest of onMetadataUpdate so the test
+          // harness (which doesn't actually halt) also skips setImage.
+          fatalFaultHandler.handleFault(
+            s"Fatal: error refreshing concentration shadow overlay in $deltaName; " +
+              "shadow state is indeterminate, refusing to publish metadata image", t)
+          throw t
       }
 
       // Publish the new metadata image to the metadata cache.
