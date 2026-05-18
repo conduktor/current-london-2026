@@ -481,4 +481,137 @@ public class CelProgramTest {
         env.put("name", 42L);
         assertFalse(evalBool("name.matches(\"[a-z]+\")", env));
     }
+
+    @Test
+    public void fatContainsInsideComprehensionTripsStepBudget() {
+        // Audit HIGH-2: before the fix, MethodCall.eval did not charge the
+        // step budget at all — only Comprehension and InList did. That meant
+        // a `request.list.exists(x, fatString.contains(otherFatString))`
+        // could do MAX_EVAL_STEPS × O(|fatString| · |otherFatString|) char
+        // compares per request, since each comprehension iteration cost
+        // exactly one step regardless of the body's actual work. The fix
+        // charges contains() work as receiver.length() × arg.length() so a
+        // single 16384×16384 contains is rejected before we walk into the
+        // JDK substring search.
+        StringBuilder big = new StringBuilder();
+        for (int n = 0; n < CelLimits.MAX_STRING_RESULT_LEN; n++) {
+            big.append('x');
+        }
+        // A single contains() with both sides at the result-length cap
+        // estimates ≈ 268M char compares — well over the per-request budget.
+        Map<String, Object> env = new HashMap<>();
+        env.put("a", big.toString());
+        env.put("b", big.toString());
+        // Bare contains, outside any comprehension: still tripped by the
+        // proportional bump because the work estimate alone is over-budget.
+        assertThrows(CelEvaluationException.class,
+            () -> evalBool("a.contains(b)", env));
+    }
+
+    @Test
+    public void stringStartsWithChargesArgLengthAgainstBudget() {
+        // Argument-length cost bound: startsWith does at most arg.length()
+        // char compares (linear in needle). The fix charges this so a
+        // comprehension over many items × needle of length L cannot exceed
+        // ~MAX_EVAL_STEPS character compares total.
+        //
+        // Construct a comprehension whose iteration count alone is well
+        // under the budget (1000 iters × per-iter bump = 1000 steps), but
+        // whose body does startsWith with a needle long enough to push the
+        // total above the cap.
+        java.util.List<String> items = new java.util.ArrayList<>();
+        for (int n = 0; n < 1000; n++) {
+            items.add("hay-" + n);
+        }
+        Map<String, Object> env = new HashMap<>();
+        env.put("xs", items);
+        // Needle of length 1000 → per-iter bump ≈ 1000 (startsWith). Plus
+        // 1 (comprehension) = ~1001 per iter × 1000 iters = ~1M bumps,
+        // over the 100k budget.
+        StringBuilder needle = new StringBuilder();
+        for (int n = 0; n < 1000; n++) {
+            needle.append('a');
+        }
+        String expr = "xs.exists(x, x.startsWith(\"" + needle + "\"))";
+        assertThrows(CelEvaluationException.class,
+            () -> evalBool(expr, env));
+    }
+
+    @Test
+    public void regexMatchChargesReceiverLengthAgainstBudget() {
+        // Audit HIGH-2: the RegexMatch node now charges receiver.length()
+        // to the step budget (RE2 is worst-case linear in input length). A
+        // comprehension over many items × matches() on a long receiver must
+        // trip the budget on total work, not only on iteration count.
+        StringBuilder big = new StringBuilder();
+        // 200 chars is well below MAX_REGEX_INPUT_LENGTH (so the receiver-
+        // length guard does NOT fire), but × 1000 iterations = 200k bumps,
+        // over the 100k budget.
+        for (int n = 0; n < 200; n++) {
+            big.append('a');
+        }
+        java.util.List<String> items = new java.util.ArrayList<>();
+        for (int n = 0; n < 1000; n++) {
+            items.add(big.toString());
+        }
+        Map<String, Object> env = new HashMap<>();
+        env.put("xs", items);
+        // Pattern that never matches (no 'b' in input) so all 1000
+        // iterations run to completion under RE2 — without the per-call
+        // bump, this would consume only 1000 comprehension steps and pass.
+        assertThrows(CelEvaluationException.class,
+            () -> evalBool("xs.exists(x, x.matches(\"a*b\"))", env));
+    }
+
+    @Test
+    public void stringEqualsInsideInListChargesPrefixLengthAgainstBudget() {
+        // Audit HIGH-2: InList's per-iteration step bump alone is not enough
+        // — for a list of long strings against a long needle, valueEquals
+        // walks shared prefix chars per element. The fix adds proportional
+        // bumping inside the loop for string == string so an attacker cannot
+        // amortise O(min(|v|,|item|)) char compares per element at one step
+        // apiece.
+        StringBuilder s = new StringBuilder();
+        // 300 chars × 1000 items = 300k bumps, over 100k budget.
+        for (int n = 0; n < 300; n++) {
+            s.append('a');
+        }
+        java.util.List<String> items = new java.util.ArrayList<>();
+        for (int n = 0; n < 1000; n++) {
+            items.add(s.toString());
+        }
+        Map<String, Object> env = new HashMap<>();
+        env.put("xs", items);
+        // Needle differs from every item only at the very last char, so
+        // valueEquals walks the full prefix on every comparison.
+        StringBuilder needle = new StringBuilder(s).append('Z');
+        env.put("needle", needle.toString());
+        assertThrows(CelEvaluationException.class,
+            () -> evalBool("needle in xs", env));
+    }
+
+    @Test
+    public void stringConcatChargesResultLengthAgainstBudget() {
+        // Audit HIGH-2: Arith.ADD on strings now charges (l.length() +
+        // r.length()) per call. A comprehension that builds long strings
+        // inside its body must trip the budget on total chars copied, not
+        // only on iteration count.
+        // Each iter concatenates two 200-char strings → 400 bumps × 300
+        // iters = 120k bumps, over 100k budget.
+        StringBuilder s = new StringBuilder();
+        for (int n = 0; n < 200; n++) {
+            s.append('a');
+        }
+        java.util.List<String> items = new java.util.ArrayList<>();
+        for (int n = 0; n < 300; n++) {
+            items.add(s.toString());
+        }
+        Map<String, Object> env = new HashMap<>();
+        env.put("xs", items);
+        env.put("suffix", s.toString());
+        // The body of exists computes (x + suffix == \"never\"), which is
+        // string concat (charged) followed by string compare (also charged).
+        assertThrows(CelEvaluationException.class,
+            () -> evalBool("xs.exists(x, x + suffix == \"never\")", env));
+    }
 }

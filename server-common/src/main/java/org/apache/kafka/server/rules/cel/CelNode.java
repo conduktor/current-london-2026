@@ -134,6 +134,32 @@ abstract class CelNode {
         Object eval(Function<String, Object> a) {
             Object r = receiver.eval(a);
             String arg0 = args.isEmpty() ? null : stringArg(args.get(0), a);
+            // Audit HIGH-2: charge proportional work to the step budget so a
+            // single fat string-op cannot escape the per-request budget — and,
+            // crucially, so that the same op inside an attacker-iterated
+            // comprehension trips the budget at the actual char-work limit
+            // rather than only at the comprehension iteration count.
+            if (r instanceof String && arg0 != null) {
+                int rl = ((String) r).length();
+                int al = arg0.length();
+                switch (method) {
+                    case "startsWith":
+                    case "endsWith":
+                        // Both algorithms scan at most arg.length() chars
+                        // (linear in the needle, the receiver length is only
+                        // relevant for the early-out anchor check).
+                        CelLimits.bumpSteps(Math.max(1, al));
+                        break;
+                    case "contains":
+                        // JDK String.contains uses naive O(n·m) substring
+                        // search. Charge worst-case work so a 16k×16k contains
+                        // is caught BEFORE we walk into the JDK implementation.
+                        CelLimits.bumpSteps(CelLimits.saturateToInt((long) rl * (long) al));
+                        break;
+                    default:
+                        // fall through to the unknown-method branch below
+                }
+            }
             switch (method) {
                 case "startsWith":
                     return r instanceof String && arg0 != null && ((String) r).startsWith(arg0);
@@ -213,6 +239,11 @@ abstract class CelNode {
                     "matches(): receiver length " + s.length() + " exceeds "
                         + CelLimits.MAX_REGEX_INPUT_LENGTH);
             }
+            // Audit HIGH-2: RE2 is worst-case linear in input length. Charge
+            // the input length to the step budget so the same matches() call
+            // inside a comprehension trips the budget at the real char-work
+            // limit rather than only at the comprehension iteration count.
+            CelLimits.bumpSteps(Math.max(1, s.length()));
             return pattern.matcher(s).matches();
         }
     }
@@ -386,6 +417,16 @@ abstract class CelNode {
         Object eval(Function<String, Object> a) {
             Object l = left.eval(a);
             Object r = right.eval(a);
+            // Audit HIGH-2: String comparisons walk both strings on equal
+            // prefixes (compareTo / equals), so a fat string == in an
+            // attacker-iterated comprehension can do millions of char compares
+            // without touching the iteration budget. Charge the linear cost
+            // for string-vs-string comparisons; numeric/boolean compare is
+            // O(1) and bounded by AST node count via MAX_NODES.
+            if (l instanceof String && r instanceof String) {
+                int len = Math.min(((String) l).length(), ((String) r).length());
+                CelLimits.bumpSteps(Math.max(1, len));
+            }
             if (op == Op.EQ) {
                 return valueEquals(l, r);
             }
@@ -429,6 +470,17 @@ abstract class CelNode {
                 // request thread. Bump per element so the runaway is killed
                 // at the budget rather than after.
                 CelLimits.bumpStep();
+                // Audit HIGH-2: when both sides are strings, valueEquals
+                // walks shared prefix chars. Charge that proportional work
+                // too — otherwise a list of long strings beats the budget
+                // by amortising O(min(|v|,|item|)) char compares per element
+                // at only one step apiece. Mirrors Compare.eval's bump.
+                if (v instanceof String && item instanceof String) {
+                    int len = Math.min(((String) v).length(), ((String) item).length());
+                    if (len > 1) {
+                        CelLimits.bumpSteps(len - 1);
+                    }
+                }
                 if (valueEquals(v, item)) {
                     return true;
                 }
@@ -471,6 +523,11 @@ abstract class CelNode {
                         "string concatenation result exceeds "
                             + CelLimits.MAX_STRING_RESULT_LEN + " chars");
                 }
+                // Audit HIGH-2: charge per-char concat cost so the same +
+                // inside an iterated comprehension trips the budget at the
+                // total chars-copied limit. Numeric arith stays O(1) and is
+                // bounded by AST node count via MAX_NODES.
+                CelLimits.bumpSteps(CelLimits.saturateToInt(total));
                 return ls + rs;
             }
             if (!(l instanceof Number) || !(r instanceof Number)) {

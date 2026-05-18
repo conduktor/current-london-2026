@@ -159,17 +159,74 @@ final class CelLimits {
     }
 
     /**
-     * Bump the per-thread step counter. Throws
+     * Bump the per-thread step counter by one. Throws
      * {@link CelEvaluationException} when the cumulative step count for the
      * current {@code evalBoolean} call exceeds {@link #MAX_EVAL_STEPS}. The
      * engine treats this as fail-open (the rule is logged and skipped); we
      * never let an over-budget rule decide the outcome of a request.
      */
     static void bumpStep() {
-        int n = ++STEPS.get()[0];
-        if (n > MAX_EVAL_STEPS) {
+        bumpSteps(1);
+    }
+
+    /**
+     * Bump the per-thread step counter by {@code n} units. Used by node
+     * evaluators whose per-call cost is proportional to a runtime input
+     * length: a single {@code s.contains(t)} on a long {@code s} and
+     * {@code t} can naive-search through millions of character compares,
+     * but only counts as one logical "step" under the unit-bump model. By
+     * charging work proportional to {@code receiver.length() * arg.length()}
+     * (for naive substring search), {@code receiver.length()} (RE2 matcher),
+     * or {@code l.length() + r.length()} (string concat), the budget caps
+     * total per-request character-compare work even when those ops appear
+     * inside an attacker-iterated comprehension. Codex audit HIGH-2.
+     *
+     * <p>Behaviour:
+     * <ul>
+     *   <li>{@code n <= 0} is a no-op — the caller has already determined
+     *       there is no work to charge.</li>
+     *   <li>Saturating add: a {@code long} estimate that exceeds
+     *       {@link Integer#MAX_VALUE} (e.g. {@code 16384 * 16384}) is
+     *       clamped to {@link Integer#MAX_VALUE} so the cumulative-step
+     *       check still trips correctly without wrapping.</li>
+     *   <li>Negative cumulative ({@code arr[0] + n} overflows {@code int})
+     *       is caught and treated as over-budget — a buggy caller passing
+     *       a colossal estimate cannot wrap the counter back below the
+     *       cap.</li>
+     * </ul>
+     */
+    static void bumpSteps(int n) {
+        if (n <= 0) {
+            return;
+        }
+        int[] arr = STEPS.get();
+        int prev = arr[0];
+        int next = prev + n;
+        if (next < prev || next > MAX_EVAL_STEPS) {
             throw new CelEvaluationException(
                 "CEL evaluation exceeded step budget of " + MAX_EVAL_STEPS);
         }
+        arr[0] = next;
+    }
+
+    /**
+     * Convert a {@code long} work estimate (e.g. {@code (long) n * m} for an
+     * O(n·m) algorithm where either factor can reach
+     * {@link #MAX_STRING_RESULT_LEN}) into a non-negative {@code int} step
+     * count, saturating at {@link Integer#MAX_VALUE}. The saturated value
+     * is then itself capped against {@link #MAX_EVAL_STEPS} by
+     * {@link #bumpSteps(int)} — a single op whose worst-case work exceeds
+     * the entire per-request budget is rejected immediately, which is the
+     * correct behaviour for an attacker-shaped contains() with both strings
+     * near the result-length cap.
+     */
+    static int saturateToInt(long work) {
+        if (work <= 0L) {
+            return 0;
+        }
+        if (work > Integer.MAX_VALUE) {
+            return Integer.MAX_VALUE;
+        }
+        return (int) work;
     }
 }
