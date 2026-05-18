@@ -395,8 +395,31 @@ class KafkaHttpServerIntegrationTest {
         // Restart with a cap of 1 so the first stream consumes all capacity. The second stream attempt must be
         // refused at the admission gate with HTTP 429 + Retry-After, NOT a half-opened event-stream that then
         // immediately errors. A runaway client otherwise exhausts the Jetty thread pool and stalls the bridge.
+        // While we're here, also assert the SseStreamsOpened + RejectedAtSseCap meters increment as expected —
+        // this is the end-to-end wiring proof for the SSE-specific metrics (which never land in ResponseCount).
         tearDown();
         startServer(DEFAULT_TEST_MAX_BODY_BYTES, 1);
+
+        com.yammer.metrics.core.Meter streamsOpened = (com.yammer.metrics.core.Meter)
+            org.apache.kafka.server.metrics.KafkaYammerMetrics.defaultRegistry().allMetrics()
+                .get(bridgeMetricName("SseStreamsOpened"));
+        com.yammer.metrics.core.Meter rejectedAtSseCap = (com.yammer.metrics.core.Meter)
+            org.apache.kafka.server.metrics.KafkaYammerMetrics.defaultRegistry().allMetrics()
+                .get(bridgeMetricName("RejectedAtSseCap"));
+        com.yammer.metrics.core.Meter fetch2xx = (com.yammer.metrics.core.Meter)
+            org.apache.kafka.server.metrics.KafkaYammerMetrics.defaultRegistry().allMetrics()
+                .get(bridgeMetricName("ResponseCount", "operation", "Fetch", "statusClass", "2xx"));
+        com.yammer.metrics.core.Meter fetch4xx = (com.yammer.metrics.core.Meter)
+            org.apache.kafka.server.metrics.KafkaYammerMetrics.defaultRegistry().allMetrics()
+                .get(bridgeMetricName("ResponseCount", "operation", "Fetch", "statusClass", "4xx"));
+        assertNotNull(streamsOpened, "SseStreamsOpened must be registered after a fresh server start");
+        assertNotNull(rejectedAtSseCap, "RejectedAtSseCap must be registered after a fresh server start");
+        assertNotNull(fetch2xx, "ResponseCount Fetch/2xx must be registered after a fresh server start");
+        assertNotNull(fetch4xx, "ResponseCount Fetch/4xx must be registered after a fresh server start");
+        long openedBefore = streamsOpened.count();
+        long rejectedBefore = rejectedAtSseCap.count();
+        long fetch2xxBefore = fetch2xx.count();
+        long fetch4xxBefore = fetch4xx.count();
 
         // Seed an indefinite stream: first fetch yields one record, subsequent fetches block (CompletableFuture
         // that never completes). That keeps the first stream alive and the limiter at capacity for the duration
@@ -445,6 +468,20 @@ class KafkaHttpServerIntegrationTest {
         }
         // First stream gets torn down by closing the response above; the limiter releases when the streamer
         // detects the disconnect on its next write attempt.
+
+        // Metrics wiring assertions: the accepted stream must increment SseStreamsOpened exactly once and must
+        // NOT pollute the ResponseCount Fetch/2xx bucket (its lifetime is not a synchronous response). The
+        // refused stream must increment RejectedAtSseCap exactly once. Without these assertions, a future
+        // refactor could disconnect the metric from its servlet call site and the gauge/dashboards would silently
+        // go cold.
+        assertEquals(openedBefore + 1L, streamsOpened.count(),
+            "the accepted SSE stream must increment SseStreamsOpened exactly once");
+        assertEquals(rejectedBefore + 1L, rejectedAtSseCap.count(),
+            "the refused SSE stream must increment RejectedAtSseCap exactly once");
+        assertEquals(fetch2xxBefore, fetch2xx.count(),
+            "accepted SSE must NOT land in ResponseCount Fetch/2xx — the SSE meter is intentionally separate");
+        assertEquals(fetch4xxBefore + 1L, fetch4xx.count(),
+            "the 429 must also land in ResponseCount Fetch/4xx so the bucketed dashboard reflects the rejection");
     }
 
     @Test
@@ -563,6 +600,147 @@ class KafkaHttpServerIntegrationTest {
 
         assertEquals(500, resp.getStatus());
         assertNotNull(asJson(resp.getContent()).get("errorMessage"));
+    }
+
+    // ----- lifecycle and metrics wiring -----
+
+    @Test
+    void metricsArePopulatedThroughTheServletWiring() throws Exception {
+        // Smoke test that proves the metrics object the server constructs is actually the one the servlet writes to.
+        // Without this end-to-end check, a wiring mistake (forgotten constructor argument, lost reference) would only
+        // show up the first time an operator queried JMX in production. We assert a small but representative slice:
+        // a 2xx Produce updates the Produce/2xx response meter exactly once, and the histogram captures one sample.
+        com.yammer.metrics.core.MetricName twoXxName = bridgeMetricName("ResponseCount", "operation", "Produce", "statusClass", "2xx");
+        com.yammer.metrics.core.MetricName latencyName = bridgeMetricName("RequestLatencyMs", "operation", "Produce");
+        com.yammer.metrics.core.Meter produce2xx = (com.yammer.metrics.core.Meter)
+            org.apache.kafka.server.metrics.KafkaYammerMetrics.defaultRegistry().allMetrics().get(twoXxName);
+        com.yammer.metrics.core.Histogram produceLatency = (com.yammer.metrics.core.Histogram)
+            org.apache.kafka.server.metrics.KafkaYammerMetrics.defaultRegistry().allMetrics().get(latencyName);
+        assertNotNull(produce2xx, "ResponseCount Produce/2xx meter should be registered while server is running");
+        assertNotNull(produceLatency, "RequestLatencyMs Produce histogram should be registered while server is running");
+        long meterBefore = produce2xx.count();
+        long histBefore = produceLatency.count();
+
+        submitter.produceResult = new RequestSubmitter.ProduceResult(
+            Collections.singletonList(
+                new ProduceResponseFormatter.PartitionResult(0, 7L, Errors.NONE, null)),
+            0L);
+        ContentResponse ok = client.newRequest(url("/v1/topics/orders/records"))
+            .method(HttpMethod.POST)
+            .body(new StringRequestContent("application/json",
+                "{\"records\":[{\"value\":{\"type\":\"STRING\",\"data\":\"hi\"}}]}"))
+            .send();
+        assertEquals(200, ok.getStatus());
+
+        // The servlet records on the async-completion thread; give the executor a brief window for the recording
+        // to land before sampling. In practice the recording completes well within a few millis on localhost; this
+        // is a deflake safety net, not a logical delay.
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        while (produce2xx.count() == meterBefore && System.nanoTime() < deadline) {
+            Thread.sleep(5);
+        }
+        assertEquals(meterBefore + 1L, produce2xx.count(),
+            "Produce 2xx meter must increment exactly once after a successful POST");
+        assertEquals(histBefore + 1L, produceLatency.count(),
+            "Produce latency histogram must record exactly one sample for the successful POST");
+    }
+
+    @Test
+    void oversizedBodyRejectionMetricIsWiredFromTheServlet() throws Exception {
+        // Restart with a tight body cap, then verify the 413 path increments both RejectedOversizedBody and
+        // the Produce/4xx response meter. This is the second half of the wiring proof: rejections at the bridge
+        // boundary (rather than the broker boundary) must land on their dedicated counter so operators can alert
+        // on bridge-side admission control without first having to read access logs.
+        tearDown();
+        startServer(64, DEFAULT_TEST_MAX_SSE_STREAMS);
+        com.yammer.metrics.core.MetricName oversizedName = bridgeMetricName("RejectedOversizedBody");
+        com.yammer.metrics.core.MetricName fourXxName = bridgeMetricName("ResponseCount", "operation", "Produce", "statusClass", "4xx");
+        com.yammer.metrics.core.Meter oversized = (com.yammer.metrics.core.Meter)
+            org.apache.kafka.server.metrics.KafkaYammerMetrics.defaultRegistry().allMetrics().get(oversizedName);
+        com.yammer.metrics.core.Meter produce4xx = (com.yammer.metrics.core.Meter)
+            org.apache.kafka.server.metrics.KafkaYammerMetrics.defaultRegistry().allMetrics().get(fourXxName);
+        assertNotNull(oversized, "RejectedOversizedBody must be registered after restart");
+        assertNotNull(produce4xx, "ResponseCount Produce/4xx must be registered after restart");
+        long oversizedBefore = oversized.count();
+        long produce4xxBefore = produce4xx.count();
+
+        ContentResponse tooBig = client.newRequest(url("/v1/topics/orders/records"))
+            .method(HttpMethod.POST)
+            .body(new StringRequestContent("application/json",
+                "{\"records\":[{\"value\":{\"type\":\"STRING\",\"data\":\"" + "x".repeat(200) + "\"}}]}"))
+            .send();
+        assertEquals(413, tooBig.getStatus());
+
+        assertEquals(oversizedBefore + 1L, oversized.count(),
+            "413 must increment RejectedOversizedBody exactly once");
+        assertEquals(produce4xxBefore + 1L, produce4xx.count(),
+            "413 must also land in ResponseCount Produce/4xx so the bucketed dashboard reflects the rejection");
+    }
+
+    @Test
+    void metricsAreUnregisteredAfterStopEvenIfStartNeverRan() throws Exception {
+        // Constructor registers metrics so the ActiveSseStreams gauge exists from the moment a KafkaHttpServer
+        // object exists (operators expect "metric present" the second the broker process is running). But that
+        // means a never-started or start-failed server still has live entries — stop() must close them even when
+        // the Jetty server itself was never started, or the next start() in the same JVM trips "duplicate metric"
+        // on the global Yammer registry.
+        // Re-use the main test's setup by tearing down the running server first.
+        tearDown();
+        KafkaHttpServer neverStarted = new KafkaHttpServer("127.0.0.1", 0,
+            new KafkaHttpBridge(mapper, submitter), submitter, mapper,
+            DEFAULT_TEST_MAX_BODY_BYTES, DEFAULT_TEST_MAX_SSE_STREAMS);
+        try {
+            com.yammer.metrics.core.MetricName gauge = bridgeMetricName("ActiveSseStreams");
+            assertNotNull(
+                org.apache.kafka.server.metrics.KafkaYammerMetrics.defaultRegistry().allMetrics().get(gauge),
+                "constructor must register the ActiveSseStreams gauge so JMX never shows a missing metric");
+        } finally {
+            neverStarted.stop();
+        }
+        com.yammer.metrics.core.MetricName gauge = bridgeMetricName("ActiveSseStreams");
+        assertNull(
+            org.apache.kafka.server.metrics.KafkaYammerMetrics.defaultRegistry().allMetrics().get(gauge),
+            "stop() must unregister even when start() never ran, or a subsequent KafkaHttpServer cannot construct");
+        // Build a second server in the same JVM to prove no stale entries leaked. Construction throws if the
+        // registry refused a duplicate.
+        KafkaHttpServer second = new KafkaHttpServer("127.0.0.1", 0,
+            new KafkaHttpBridge(mapper, submitter), submitter, mapper,
+            DEFAULT_TEST_MAX_BODY_BYTES, DEFAULT_TEST_MAX_SSE_STREAMS);
+        second.stop();
+        // Restore the @BeforeEach-style state for any later tests that follow the alphabetical execution order;
+        // tearDown() in @AfterEach handles whatever this method leaves behind.
+        startServer(DEFAULT_TEST_MAX_BODY_BYTES, DEFAULT_TEST_MAX_SSE_STREAMS);
+    }
+
+    @Test
+    void startAfterStopFailsLoudly() throws Exception {
+        // After stop() the metrics object is dead. The one-shot contract documented on KafkaHttpServer says callers
+        // must construct a new instance; defending start() with an IllegalStateException turns silent-data-loss
+        // (servlet wired to a closed metrics object that drops every recording) into a noisy boot failure.
+        tearDown();
+        KafkaHttpServer oneShot = new KafkaHttpServer("127.0.0.1", 0,
+            new KafkaHttpBridge(mapper, submitter), submitter, mapper,
+            DEFAULT_TEST_MAX_BODY_BYTES, DEFAULT_TEST_MAX_SSE_STREAMS);
+        oneShot.start();
+        oneShot.stop();
+        IllegalStateException ex = org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class, oneShot::start);
+        org.junit.jupiter.api.Assertions.assertTrue(ex.getMessage().contains("stopped"),
+            "error message should make the one-shot constraint obvious: " + ex.getMessage());
+        startServer(DEFAULT_TEST_MAX_BODY_BYTES, DEFAULT_TEST_MAX_SSE_STREAMS);
+    }
+
+    private static com.yammer.metrics.core.MetricName bridgeMetricName(String name, String... tagPairs) {
+        StringBuilder mbean = new StringBuilder("kafka.network.http:type=BridgeMetrics,name=").append(name);
+        StringBuilder scope = new StringBuilder();
+        for (int i = 0; i + 1 < tagPairs.length; i += 2) {
+            mbean.append(",").append(tagPairs[i]).append("=").append(tagPairs[i + 1]);
+            if (scope.length() > 0) scope.append(".");
+            scope.append(tagPairs[i]).append(".").append(tagPairs[i + 1]);
+        }
+        return new com.yammer.metrics.core.MetricName(
+            "kafka.network.http", "BridgeMetrics", name,
+            scope.length() == 0 ? null : scope.toString(),
+            mbean.toString());
     }
 
     // ----- extractTopic unit -----

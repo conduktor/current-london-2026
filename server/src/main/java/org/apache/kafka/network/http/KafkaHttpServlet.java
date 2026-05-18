@@ -62,9 +62,11 @@ public final class KafkaHttpServlet extends HttpServlet {
     private final int maxRequestBodyBytes;
     private final SseStreamLimiter sseLimiter;
     private final Executor httpExecutor;
+    private final HttpBridgeMetrics metrics;
 
     public KafkaHttpServlet(KafkaHttpBridge bridge, RequestSubmitter submitter, ObjectMapper mapper,
-                            int maxRequestBodyBytes, SseStreamLimiter sseLimiter, Executor httpExecutor) {
+                            int maxRequestBodyBytes, SseStreamLimiter sseLimiter, Executor httpExecutor,
+                            HttpBridgeMetrics metrics) {
         this.bridge = Objects.requireNonNull(bridge, "bridge must not be null");
         this.submitter = Objects.requireNonNull(submitter, "submitter must not be null");
         this.mapper = Objects.requireNonNull(mapper, "mapper must not be null");
@@ -74,13 +76,16 @@ public final class KafkaHttpServlet extends HttpServlet {
         this.maxRequestBodyBytes = maxRequestBodyBytes;
         this.sseLimiter = Objects.requireNonNull(sseLimiter, "sseLimiter must not be null");
         this.httpExecutor = Objects.requireNonNull(httpExecutor, "httpExecutor must not be null");
+        this.metrics = Objects.requireNonNull(metrics, "metrics must not be null");
     }
 
     @Override
     protected void doPost(HttpServletRequest req, HttpServletResponse resp) throws IOException {
+        long startNanos = System.nanoTime();
         String topic = extractTopic(req.getPathInfo());
         if (topic == null) {
             writeNotFound(resp);
+            metrics.recordRequest(HttpBridgeMetrics.Operation.PRODUCE, elapsedMs(startNanos), HttpStatusMapper.NOT_FOUND);
             return;
         }
 
@@ -92,18 +97,24 @@ public final class KafkaHttpServlet extends HttpServlet {
             body = mapper.readTree(bounded);
         } catch (BodyTooLargeException e) {
             writePayloadTooLarge(resp, e.limit());
+            metrics.recordOversizedBodyRejection();
+            metrics.recordRequest(HttpBridgeMetrics.Operation.PRODUCE, elapsedMs(startNanos), HttpStatusMapper.PAYLOAD_TOO_LARGE);
             return;
         } catch (JsonProcessingException e) {
             writeBadRequest(resp, "body is not valid JSON: " + e.getOriginalMessage());
+            metrics.recordRequest(HttpBridgeMetrics.Operation.PRODUCE, elapsedMs(startNanos), HttpStatusMapper.BAD_REQUEST);
             return;
         } catch (IOException e) {
             // Jackson wraps a BodyTooLargeException as itself (IOException → unchanged), but a deeply nested cause is
             // possible if some future Jackson revision adds buffering — check the cause chain so we still emit 413.
             if (rootCauseIsBodyTooLarge(e)) {
                 writePayloadTooLarge(resp, maxRequestBodyBytes);
+                metrics.recordOversizedBodyRejection();
+                metrics.recordRequest(HttpBridgeMetrics.Operation.PRODUCE, elapsedMs(startNanos), HttpStatusMapper.PAYLOAD_TOO_LARGE);
                 return;
             }
             writeBadRequest(resp, "could not read request body: " + e.getMessage());
+            metrics.recordRequest(HttpBridgeMetrics.Operation.PRODUCE, elapsedMs(startNanos), HttpStatusMapper.BAD_REQUEST);
             return;
         }
 
@@ -116,14 +127,17 @@ public final class KafkaHttpServlet extends HttpServlet {
         // a socket write there pins a Kafka API handler on slow-client I/O, which can starve the binary protocol.
         // Move the write onto Jetty's server thread pool instead.
         bridge.produce(topic, body).whenCompleteAsync((response, throwable) ->
-            writeResponseAndComplete(async, response, throwable, contentType), httpExecutor);
+            writeResponseAndComplete(async, response, throwable, contentType,
+                HttpBridgeMetrics.Operation.PRODUCE, startNanos), httpExecutor);
     }
 
     @Override
     protected void doGet(HttpServletRequest req, HttpServletResponse resp) throws IOException {
+        long startNanos = System.nanoTime();
         String topic = extractTopic(req.getPathInfo());
         if (topic == null) {
             writeNotFound(resp);
+            metrics.recordRequest(HttpBridgeMetrics.Operation.FETCH, elapsedMs(startNanos), HttpStatusMapper.NOT_FOUND);
             return;
         }
 
@@ -139,6 +153,7 @@ public final class KafkaHttpServlet extends HttpServlet {
                 command = FetchRequestParser.parse(topic, params);
             } catch (ProduceRequestParser.BadRequestException e) {
                 writeBadRequest(resp, e.getMessage());
+                metrics.recordRequest(HttpBridgeMetrics.Operation.FETCH, elapsedMs(startNanos), HttpStatusMapper.BAD_REQUEST);
                 return;
             }
             // Acquire the concurrent-stream slot BEFORE startAsync — if the cap is reached we want to emit a
@@ -147,6 +162,8 @@ public final class KafkaHttpServlet extends HttpServlet {
             SseStreamLimiter.Token token = sseLimiter.tryAcquire();
             if (token == null) {
                 writeTooManyStreams(resp);
+                metrics.recordSseCapRejection();
+                metrics.recordRequest(HttpBridgeMetrics.Operation.FETCH, elapsedMs(startNanos), HttpStatusMapper.TOO_MANY_REQUESTS);
                 return;
             }
             AsyncContext async;
@@ -156,6 +173,12 @@ public final class KafkaHttpServlet extends HttpServlet {
                 token.close();
                 throw e;
             }
+            // No per-request status recording for the SSE branch — the stream itself can run for hours and there is
+            // no single "response status" to record at the end. Instead record the accept event in
+            // SseStreamsOpened; paired with the ActiveSseStreams gauge and RejectedAtSseCap meter this gives
+            // operators the full open-rate / point-in-time / reject-rate picture without contaminating
+            // RequestLatencyMs with stream-lifetime samples.
+            metrics.recordSseStreamOpened();
             SseStreamer.start(async, submitter, mapper, command, token, httpExecutor);
             return;
         }
@@ -164,7 +187,8 @@ public final class KafkaHttpServlet extends HttpServlet {
         // See doPost for why this is whenCompleteAsync: the broker handler thread that completes the future must
         // not be the thread that performs the HTTP socket write — dispatch to Jetty's server thread pool.
         bridge.fetch(topic, params).whenCompleteAsync((response, throwable) ->
-            writeResponseAndComplete(async, response, throwable, contentType), httpExecutor);
+            writeResponseAndComplete(async, response, throwable, contentType,
+                HttpBridgeMetrics.Operation.FETCH, startNanos), httpExecutor);
     }
 
     /**
@@ -184,7 +208,7 @@ public final class KafkaHttpServlet extends HttpServlet {
     }
 
     private void writeResponseAndComplete(AsyncContext async, HttpBridgeResponse response, Throwable throwable,
-                                          String contentType) {
+                                          String contentType, HttpBridgeMetrics.Operation operation, long startNanos) {
         HttpServletResponse resp = (HttpServletResponse) async.getResponse();
         try {
             if (throwable != null) {
@@ -196,8 +220,15 @@ public final class KafkaHttpServlet extends HttpServlet {
         } catch (IOException e) {
             LOG.warn("Failed to write HTTP response", e);
         } finally {
+            // Read the status from the response object rather than from the bridge result — this catches the 500
+            // we wrote on `throwable != null` as well as anything writeBridgeResponse set.
+            metrics.recordRequest(operation, elapsedMs(startNanos), resp.getStatus());
             async.complete();
         }
+    }
+
+    private static long elapsedMs(long startNanos) {
+        return Math.max(0L, (System.nanoTime() - startNanos) / 1_000_000L);
     }
 
     private void writeBridgeResponse(HttpServletResponse resp, HttpBridgeResponse response, String contentType)
