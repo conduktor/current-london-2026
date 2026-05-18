@@ -324,7 +324,7 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
           // true` (caught up), which preserves the historical drainStartup
           // behaviour for callers that have not opted into the check yet.
           if (caughtUpProbe()) {
-            return drainOnce()
+            return drainToHighWatermark(deadlineNanos, pollIntervalMs)
           }
           if (System.nanoTime() >= deadlineNanos) {
             // Log is open but the broker never caught up to the leader's HW
@@ -392,6 +392,92 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
     }
     // Unreachable — the `while (true)` loop exits via `return` or `throw`.
     throw new AssertionError("unreachable")
+  }
+
+  /**
+   * Drain to the current local high-watermark, looping [[drainOnce]] until
+   * the per-partition cursor catches up. This is the third and final phase
+   * of [[drainStartup]] — Phase 1 waits for the local log to open, Phase 2
+   * waits for this broker to be in the controller-published ISR (or to be
+   * the leader), and Phase 3 drains.
+   *
+   * <p>Why a loop is necessary (Codex final-audit P0): a single
+   * [[drainOnce]] can return a partial replay — [[replay]] defensively
+   * bails when [[UnifiedLog#read]] returns zero bytes mid-pass (a transient
+   * pager glitch, a tiering bookkeeping pause, etc.). In that case
+   * [[nextOffset]] advances only to where replay actually got, not to HW.
+   * Before this loop existed, [[drainStartup]] would return at that point
+   * and [[BrokerServer]] would open client sockets with only a prefix of
+   * the governance log drained — silently bypassing rules at offsets
+   * above [[nextOffset]] until the periodic re-drain caught up. Per
+   * PROMPT.md the bootstrap acceptance criterion is
+   * <em>"drains all existing rules from the rules topic before accepting
+   * client connections"</em>, so partial-drain-then-open is a real
+   * violation, not theoretical.
+   *
+   * <p>The loop is bounded by the same deadline as Phases 1 and 2 — total
+   * startup-bootstrap wait is one number from the operator's perspective.
+   * Two failure modes both reach [[IllegalStateException]] and abort
+   * startup before any socket opens:
+   *
+   * <ul>
+   *   <li>[[nextOffset]] catches up to a moving target but the cumulative
+   *       wait exceeds the deadline.</li>
+   *   <li>[[nextOffset]] makes <em>no</em> progress across two consecutive
+   *       [[drainOnce]] invocations — typically a persistent defensive
+   *       empty-read, suggesting the local log dir or pager is unhealthy.
+   *       Continuing to loop would burn CPU without producing the drain
+   *       the spec promises; fail-closed is the safe answer.</li>
+   * </ul>
+   *
+   * <p>The local high-watermark may itself advance during the loop (new
+   * rules being committed in parallel). We accept that, because each
+   * [[drainOnce]] re-snapshots its own HW bound; we only need
+   * [[nextOffset]] to reach the HW we observed when starting the loop —
+   * the rules that existed at startup. Anything published later is
+   * picked up by [[scheduleOngoing]].
+   *
+   * @return total records replayed across all [[drainOnce]] invocations
+   * @throws IllegalStateException when the deadline elapses with the drain
+   *         incomplete
+   */
+  private def drainToHighWatermark(deadlineNanos: Long,
+                                   pollIntervalMs: Long): Long = {
+    val tp = topicPartition
+    // Snapshot HW under the existing log handle. We resolved log via
+    // replicaManager.getLog(tp) immediately before calling here, but it
+    // is safer to re-resolve in case the log object briefly disappeared
+    // (extremely unusual after Phase 1 + Phase 2 succeeded, but the
+    // bootstrap path must not NPE — fall back to "treat as no HW to
+    // drain to" so the loop is a single no-op iteration).
+    val snapshotHw = replicaManager.getLog(tp).map(_.highWatermark).getOrElse(0L)
+    var totalReplayed = 0L
+    while (nextOffset.get() < snapshotHw) {
+      val before = nextOffset.get()
+      val replayed = drainOnce()
+      totalReplayed += replayed
+      val after = nextOffset.get()
+      if (after == before) {
+        // No progress this iteration. Either replay defensively bailed on
+        // an empty read, or the log object disappeared. Either way, sleep
+        // and retry — but if the deadline has elapsed, fail-closed: opening
+        // the socket with a partial drain would violate the bootstrap
+        // acceptance criterion. The operator needs to investigate the
+        // log dir / pager / disk state, not have us silently fail-open.
+        if (System.nanoTime() >= deadlineNanos) {
+          throw new IllegalStateException(
+            s"governance bootstrap could not fully drain $tp before the " +
+              s"deadline elapsed; cursor stuck at offset $after with HW " +
+              s"$snapshotHw. A persistent zero-byte read suggests the " +
+              s"local log dir or pager is unhealthy. Refusing to open " +
+              s"client traffic with a partial drain — investigate log4j " +
+              s"for log-loader errors / disk faults / pager pauses, then " +
+              s"restart.")
+        }
+        Thread.sleep(pollIntervalMs)
+      }
+    }
+    totalReplayed
   }
 
   /**

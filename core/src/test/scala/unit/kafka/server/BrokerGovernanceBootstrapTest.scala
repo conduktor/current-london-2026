@@ -685,4 +685,84 @@ class BrokerGovernanceBootstrapTest {
     assertEquals(0, probeCalls.get(),
       "TopicAbsent path must short-circuit without consulting the catchup probe")
   }
+
+  @Test
+  def drainStartupLoopsDrainOnceUntilHighWatermarkReached(): Unit = {
+    // Codex final-audit P0: drainStartup must fully drain to HW before
+    // returning, not bail on a partial replay. replay() defensively returns
+    // early when log.read produces zero bytes mid-pass — drainOnce in that
+    // case commits and advances nextOffset only to where replay got. Before
+    // the Phase-3 loop existed, drainStartup would return at that point and
+    // BrokerServer would open client sockets with an unread suffix of the
+    // governance log still ahead of nextOffset. PROMPT.md requires
+    // "drains all existing rules from the rules topic before accepting
+    // client connections", so a partial drain + open-sockets is a real
+    // violation, not theoretical.
+    //
+    // Scenario: HW=3, first log.read returns empty (defensive bail), second
+    // returns the three records. drainStartup MUST call drainOnce twice and
+    // return 3, not 0.
+    val rm = mock(classOf[ReplicaManager])
+    val log = mock(classOf[UnifiedLog])
+    val engine = new RuleEngine()
+    when(rm.getLog(tp)).thenReturn(Some(log))
+    when(log.logStartOffset).thenReturn(0L)
+    when(log.highWatermark).thenReturn(3L)
+
+    val empty = new FetchDataInfo(new LogOffsetMetadata(0L), MemoryRecords.EMPTY)
+    when(log.read(0L, 1024 * 1024, FetchIsolation.HIGH_WATERMARK, true))
+      .thenReturn(empty)
+      .thenReturn(recordsAt(0L,
+        new SimpleRecord("r1".getBytes(StandardCharsets.UTF_8),
+          envelope("true", ApiKeys.METADATA, 7)),
+        new SimpleRecord("r2".getBytes(StandardCharsets.UTF_8),
+          envelope("true", ApiKeys.FETCH, 11)),
+        new SimpleRecord("r3".getBytes(StandardCharsets.UTF_8),
+          envelope("true", ApiKeys.CREATE_TOPICS, 13))))
+
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp)
+    val n = boot.drainStartup(deadlineMs = 5_000L, pollIntervalMs = 1L)
+    assertEquals(3L, n,
+      "drainStartup must loop drainOnce after a defensive empty-read; " +
+        "if it returned 0, sockets would open with the governance log " +
+        "still un-drained")
+    assertEquals(3, engine.active().size())
+    assertTrue(engine.evaluate(ApiKeys.METADATA, "c", false,
+      () => Collections.emptyMap()).denied)
+    assertTrue(engine.evaluate(ApiKeys.FETCH, "c", false,
+      () => Collections.emptyMap()).denied)
+    assertTrue(engine.evaluate(ApiKeys.CREATE_TOPICS, "c", false,
+      () => Collections.emptyMap()).denied)
+  }
+
+  @Test
+  def drainStartupFailsClosedIfDrainMakesNoProgressBeforeDeadline(): Unit = {
+    // Codex final-audit P0 fail-closed branch: if drainOnce never advances
+    // the cursor (a persistent zero-byte read suggesting log-dir / pager
+    // unhealthiness), drainStartup must NOT silently accept the partial
+    // drain and let BrokerServer open sockets. It must throw, leaving the
+    // broker in a fail-closed state the operator can investigate.
+    //
+    // Scenario: HW=3 but log.read ALWAYS returns empty. The loop sleeps,
+    // retries, and eventually exhausts the deadline.
+    val rm = mock(classOf[ReplicaManager])
+    val log = mock(classOf[UnifiedLog])
+    val engine = new RuleEngine()
+    when(rm.getLog(tp)).thenReturn(Some(log))
+    when(log.logStartOffset).thenReturn(0L)
+    when(log.highWatermark).thenReturn(3L)
+
+    val empty = new FetchDataInfo(new LogOffsetMetadata(0L), MemoryRecords.EMPTY)
+    when(log.read(0L, 1024 * 1024, FetchIsolation.HIGH_WATERMARK, true))
+      .thenReturn(empty)
+
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp)
+    val ex = assertThrows(classOf[IllegalStateException],
+      () => boot.drainStartup(deadlineMs = 50L, pollIntervalMs = 1L))
+    val msg = ex.getMessage
+    assertTrue(msg.contains("partial drain") || msg.contains("Refusing"),
+      s"error must signal fail-closed posture, got: $msg")
+    assertEquals(0, engine.active().size(),
+      "no rule must be installed when drainStartup throws on a partial drain")
+  }
 }
