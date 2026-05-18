@@ -276,11 +276,14 @@ public final class KafkaWebSocketEndpoint implements Session.Listener.AutoDemand
 
     /**
      * Adapter that lets the streamer write to the Jetty Session without depending on Jetty types.
-     * sendText uses {@code Callback.NOOP} — fire-and-forget — because the streamer's credit gating
-     * already bounds the in-flight delivery rate per subscription, and Jetty's outgoing-frame queue
-     * is explicitly capped via {@link #MAX_OUTGOING_FRAMES} in {@link #onWebSocketOpen}. Beyond that
-     * cap the underlying writer surfaces a send failure (Jetty 12 defaults to {@code -1} /
-     * unlimited, so the explicit cap above is what makes this code path bounded).
+     * Each {@code sendText} hands Jetty a fresh {@link Callback} whose {@code failed} path tears the
+     * subscription down. The credit gate is the primary backpressure for the fast-producer case;
+     * the explicit {@link #MAX_OUTGOING_FRAMES} cap installed in {@link #onWebSocketOpen} bounds
+     * queued frames for the slow-consumer-with-large-credit case. When that cap is exceeded Jetty
+     * does NOT throw from {@code sendText} — it signals via {@code Callback.failed(...)} (typically
+     * {@link java.nio.channels.WritePendingException}). Routing that failure into {@link #tearDown}
+     * is what actually closes the stream when the queue fills; with {@code Callback.NOOP} the
+     * overflow would be silently dropped while credit/offset accounting kept advancing.
      */
     private final class SessionFrameSink implements WsStreamer.FrameSink {
         @Override
@@ -289,7 +292,20 @@ public final class KafkaWebSocketEndpoint implements Session.Listener.AutoDemand
             if (s == null || !s.isOpen()) {
                 throw new IllegalStateException("WS session closed");
             }
-            s.sendText(text, Callback.NOOP);
+            s.sendText(text, Callback.from(
+                () -> {
+                    // succeeded — nothing to do; the streamer already accounted for credit.
+                },
+                cause -> {
+                    // Failed sends mean the outbound queue is full (over the cap), the socket is
+                    // gone, or the peer's TCP buffers are stuck. Any of those is terminal for this
+                    // subscription — tear down so credit/offset accounting cannot drift further
+                    // past frames that never reached the wire. tearDown() is idempotent so a
+                    // burst of failed callbacks collapses into a single close.
+                    LOG.debug("WS sendText failed on {}: {}", topic, cause == null ? "null" : cause.toString());
+                    tearDown();
+                }
+            ));
         }
 
         @Override
