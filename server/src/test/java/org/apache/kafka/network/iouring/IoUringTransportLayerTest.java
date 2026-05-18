@@ -620,4 +620,78 @@ class IoUringTransportLayerTest {
         l.close();
         netty.close();
     }
+
+    @Test
+    void vectoredWriteStopsAtFirstPartialBufferToPreserveOrdering() throws Exception {
+        // Regression for v8 BLOCKER 1: write(ByteBuffer[]) used to keep iterating the source
+        // array even when the previous buffer was only partially drained — e.g. when the
+        // middle buffer hit MAX_WRITE_CHUNK_BYTES. That would emit bytes from the trailer
+        // before the middle buffer was fully on the wire, corrupting any Send composed of
+        // [header, payload, trailer] (notably Fetch responses). The contract of
+        // GatheringByteChannel.write — and of every NIO socket — is "strictly in order".
+        EmbeddedChannel netty = new EmbeddedChannel();
+        netty.config().setWriteBufferWaterMark(new io.netty.channel.WriteBufferWaterMark(
+            IoUringTransportLayer.MAX_WRITE_CHUNK_BYTES * 2,
+            IoUringTransportLayer.MAX_WRITE_CHUNK_BYTES * 4));
+        IoUringTransportLayer l = new IoUringTransportLayer(netty, REMOTE, LOCAL);
+
+        byte[] headerBytes = new byte[8];
+        for (int i = 0; i < headerBytes.length; i++) headerBytes[i] = (byte) ('H' + i);
+        byte[] bigBytes = new byte[IoUringTransportLayer.MAX_WRITE_CHUNK_BYTES + 1024];
+        for (int i = 0; i < bigBytes.length; i++) bigBytes[i] = (byte) (i % 251);
+        byte[] trailerBytes = new byte[4];
+        for (int i = 0; i < trailerBytes.length; i++) trailerBytes[i] = (byte) ('T' + i);
+
+        ByteBuffer header  = ByteBuffer.wrap(headerBytes);
+        ByteBuffer payload = ByteBuffer.wrap(bigBytes);
+        ByteBuffer trailer = ByteBuffer.wrap(trailerBytes);
+        ByteBuffer[] vec = {header, payload, trailer};
+
+        long wrote = l.write(vec);
+
+        // Header drains fully; payload's per-call write is capped at MAX_WRITE_CHUNK_BYTES,
+        // leaving 1024 bytes behind; trailer MUST NOT be touched.
+        assertEquals(0, header.remaining(), "header must drain fully (smaller than the cap)");
+        assertEquals(bigBytes.length - IoUringTransportLayer.MAX_WRITE_CHUNK_BYTES,
+            payload.remaining(),
+            "payload must keep the bytes that didn't fit in this poll's chunk — the per-call " +
+            "MAX_WRITE_CHUNK_BYTES cap applies to each write(ByteBuffer) individually");
+        assertEquals(trailerBytes.length, trailer.remaining(),
+            "trailer MUST remain untouched until the payload is fully drained — vectored " +
+            "write loop must abort on the first partial buffer");
+        assertEquals((long) headerBytes.length + IoUringTransportLayer.MAX_WRITE_CHUNK_BYTES, wrote,
+            "total = header drained in full + first MAX_WRITE_CHUNK_BYTES of payload; " +
+            "trailer contributes nothing");
+
+        // Drain whatever Netty queued to keep the test hygienic.
+        ByteBuf flushed;
+        while ((flushed = netty.readOutbound()) != null) flushed.release();
+        l.close();
+        netty.close();
+    }
+
+    @Test
+    void vectoredWriteStopsWhenInnerWriteReturnsZero() throws Exception {
+        // Counterpart to vectoredWriteStopsAtFirstPartialBufferToPreserveOrdering: when the
+        // first non-empty buffer hits backpressure (write returns 0), the loop must abort
+        // even though that buffer hasn't been "partially" written — otherwise a backpressured
+        // channel would still get bytes from a later buffer in the vector.
+        EmbeddedChannel netty = new EmbeddedChannel();
+        IoUringTransportLayer l = new IoUringTransportLayer(netty, REMOTE, LOCAL);
+        netty.unsafe().outboundBuffer().setUserDefinedWritability(1, false);
+        assertFalse(netty.isWritable(), "preconditions: channel is past high water mark");
+
+        ByteBuffer first  = ByteBuffer.wrap(new byte[64]);
+        ByteBuffer second = ByteBuffer.wrap(new byte[64]);
+        ByteBuffer[] vec = {first, second};
+
+        long wrote = l.write(vec);
+
+        assertEquals(0, wrote, "must report no progress when the channel is backpressured");
+        assertEquals(64, first.remaining(),  "first buffer untouched");
+        assertEquals(64, second.remaining(), "second buffer MUST be untouched when the first " +
+            "buffer reported 0 progress — loop must abort on a zero return");
+        l.close();
+        netty.close();
+    }
 }

@@ -479,7 +479,22 @@ final class IoUringTransportLayer implements TransportLayer {
         for (int i = 0; i < length; i++) {
             ByteBuffer src = srcs[offset + i];
             if (!src.hasRemaining()) continue;
-            total += write(src);
+            // GatheringByteChannel ordering: a partial write of {@code src} (because of
+            // {@link #MAX_WRITE_CHUNK_BYTES} or {@code bytesBeforeUnwritable} pressure) must
+            // halt the loop here. Continuing to a later buffer would interleave its bytes
+            // ahead of the remainder of {@code src}, scrambling on-wire framing for any
+            // multi-buffer {@link org.apache.kafka.common.network.ByteBufferSend} —
+            // notably Fetch responses whose Send is built as
+            // {@code [header, recordSet, trailer]}: a partial write of {@code recordSet}
+            // followed by writes from {@code trailer} would emit trailer bytes inside
+            // the record set. {@link java.nio.channels.SocketChannel#write(ByteBuffer[])}
+            // never reorders, and our impl must match. A zero return (backpressured)
+            // similarly aborts the loop so the caller re-enters on the next poll.
+            int wrote = write(src);
+            total += wrote;
+            if (wrote == 0 || src.hasRemaining()) {
+                break;
+            }
         }
         return total;
     }
