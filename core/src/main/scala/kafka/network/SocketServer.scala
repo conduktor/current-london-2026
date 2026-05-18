@@ -1479,6 +1479,15 @@ private[kafka] class Processor(
 
   def start(): Unit = {
     if (!started.getAndSet(true)) {
+      // io_uring: bind the per-Processor listener here, not in the Processor constructor.
+      // Acceptor.start() is the gate that runs only after SocketServer.enableRequestProcessing's
+      // authorizerFuture resolves, so binding here means the LISTEN socket appears to the network
+      // exactly when the broker is ready to handle requests — mirroring the NIO deferred-open
+      // contract at line 552 (the NIO Acceptor opens its ServerSocketChannel here, not in its
+      // constructor, "so that systems which assume that the socket being open indicates readiness
+      // are not confused"). If start() is never called (broker shutdown between construction and
+      // enableRequestProcessing), the listener's close() handles the unbind-less cleanup path.
+      ioBundle.listener.foreach(_.start())
       thread.start()
     }
   }

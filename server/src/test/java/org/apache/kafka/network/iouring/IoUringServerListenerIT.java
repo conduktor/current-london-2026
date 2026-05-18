@@ -68,6 +68,7 @@ class IoUringServerListenerIT {
                 LISTENER, MAX_RECEIVE, MemoryPool.NONE, IDLE_NANOS_NEVER, Time.SYSTEM);
              IoUringServerListener listener = new IoUringServerListener(
                  new InetSocketAddress("127.0.0.1", 0), selector)) {
+            listener.start();
 
             int port = listener.boundPort();
             assertTrue(port > 0, "kernel must have assigned an ephemeral port");
@@ -164,6 +165,7 @@ class IoUringServerListenerIT {
                 LISTENER, MAX_RECEIVE, MemoryPool.NONE, IDLE_NANOS_NEVER, Time.SYSTEM);
              IoUringServerListener listener = new IoUringServerListener(
                  new InetSocketAddress("127.0.0.1", 0), selector)) {
+            listener.start();
 
             int port = listener.boundPort();
             try (Socket client = new Socket()) {
@@ -206,6 +208,7 @@ class IoUringServerListenerIT {
              IoUringServerListener listener = new IoUringServerListener(
                  new InetSocketAddress("127.0.0.1", 0), selector,
                  /*soBacklog*/ 128, sendBuf, recvBuf)) {
+            listener.start();
 
             int port = listener.boundPort();
             try (Socket client = new Socket()) {

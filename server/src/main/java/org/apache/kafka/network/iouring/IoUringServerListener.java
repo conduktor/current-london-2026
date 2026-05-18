@@ -59,8 +59,24 @@ import io.netty.util.ReferenceCountUtil;
  * listener. {@link #close()} closes the server socket and shuts the event loop down, but
  * does <em>not</em> close the selector; that lifecycle stays with the Processor.
  *
+ * <h3>Lifecycle</h3>
+ * Construction is cheap and does <strong>not</strong> open a kernel socket — it only
+ * validates inputs, creates the io_uring event-loop group, and stores the bootstrap
+ * configuration. The actual {@code bind(2)} happens in {@link #start()}.
+ *
+ * <p>Splitting construction from bind matches NIO's deferred-open contract
+ * ({@code Acceptor.start()} opens its {@code ServerSocketChannel}, the constructor
+ * does not — see {@code SocketServer.scala:508-520}). Kafka starts acceptors before
+ * authorizer initialization finishes; without this split, the io_uring listener would
+ * accept TCP connections in the Processor constructor — i.e. before
+ * {@code SocketServer.enableRequestProcessing} resolves and before the broker is
+ * actually ready to handle requests. External tooling that probes the listener port
+ * as a readiness signal would observe a misleading "ready" before request processing
+ * is enabled or after authorizer startup fails.
+ *
  * <h3>Thread safety</h3>
- * Construction binds synchronously and may block briefly. {@link #close()} is
+ * {@link #start()} binds synchronously and may block briefly; it is not safe to call
+ * concurrently with itself but is safe to call once per instance. {@link #close()} is
  * idempotent and safe to call from any thread; subsequent calls return immediately.
  * The internal Netty handler runs entirely on the event-loop thread and is the only
  * thread that touches the selector's event-loop callbacks.
@@ -74,10 +90,16 @@ public final class IoUringServerListener implements AutoCloseable {
     /** Netty's overall shutdown deadline. */
     private static final long SHUTDOWN_TIMEOUT_MS = 5_000;
 
-    private final EventLoopGroup eventLoopGroup;
-    private final Channel serverChannel;
+    private final InetSocketAddress bindAddress;
     private final IoUringSelector selector;
-    private final int boundPort;
+    private final int soBacklog;
+    private final int sendBufferSize;
+    private final int receiveBufferSize;
+    private final EventLoopGroup eventLoopGroup;
+
+    private volatile Channel serverChannel;
+    private volatile int boundPort = -1;
+    private volatile boolean started;
     private volatile boolean closed;
 
     /** Sentinel meaning "leave the OS default in place" — matches {@code Selectable.USE_DEFAULT_BUFFER_SIZE}. */
@@ -105,15 +127,33 @@ public final class IoUringServerListener implements AutoCloseable {
                                  int soBacklog,
                                  int sendBufferSize,
                                  int receiveBufferSize) {
-        Objects.requireNonNull(bindAddress, "bindAddress");
+        this.bindAddress = Objects.requireNonNull(bindAddress, "bindAddress");
         this.selector = Objects.requireNonNull(selector, "selector");
+        this.soBacklog = soBacklog;
+        this.sendBufferSize = sendBufferSize;
+        this.receiveBufferSize = receiveBufferSize;
         if (!IoUringSupport.isAvailable()) {
             throw new IllegalStateException(
                 "io_uring is not available on this host: " + IoUringSupport.unavailabilityReason());
         }
-
+        // The event-loop group is created up front so io_uring availability is validated at
+        // construction time (rather than deferred to start()). Binding the LISTEN socket — the
+        // operation that makes the broker visible on the network — is what start() handles.
         this.eventLoopGroup = new MultiThreadIoEventLoopGroup(1, IoUringIoHandler.newFactory());
+    }
 
+    /**
+     * Open the LISTEN socket on {@code bindAddress} and start accepting connections. Must be
+     * called exactly once per instance, after construction. See the class Javadoc on why
+     * binding is deferred from the constructor.
+     */
+    public void start() {
+        if (closed) {
+            throw new IllegalStateException("io_uring listener was closed before start()");
+        }
+        if (started) {
+            throw new IllegalStateException("io_uring listener was already started");
+        }
         try {
             // Mirror NIO Acceptor.configureAcceptedSocketChannel (SocketServer.scala:740-746):
             // every accepted broker connection gets TCP_NODELAY=true and SO_KEEPALIVE=true.
@@ -151,6 +191,7 @@ public final class IoUringServerListener implements AutoCloseable {
             ChannelFuture future = bootstrap.bind(bindAddress).sync();
             this.serverChannel = future.channel();
             this.boundPort = ((InetSocketAddress) serverChannel.localAddress()).getPort();
+            this.started = true;
             log.info("io_uring listener bound to {} (port {}, sendBufferSize={}, receiveBufferSize={})",
                 bindAddress, boundPort, sendBufferSize, receiveBufferSize);
         } catch (InterruptedException ie) {
@@ -163,8 +204,14 @@ public final class IoUringServerListener implements AutoCloseable {
         }
     }
 
-    /** Returns the actually bound port — useful when the caller passed port 0. */
+    /**
+     * Returns the actually bound port. Caller must have invoked {@link #start()} first;
+     * before start the listener has no kernel socket and no port.
+     */
     public int boundPort() {
+        if (!started) {
+            throw new IllegalStateException("io_uring listener has not been started; call start() first");
+        }
         return boundPort;
     }
 
@@ -177,12 +224,17 @@ public final class IoUringServerListener implements AutoCloseable {
     public void close() {
         if (closed) return;
         closed = true;
-        try {
-            serverChannel.close().sync();
-        } catch (InterruptedException ie) {
-            Thread.currentThread().interrupt();
-        } catch (Exception e) {
-            log.debug("error closing io_uring server channel", e);
+        // If start() never ran (broker shutdown between construct and start), there's no
+        // serverChannel to close — just shut the event-loop group down so the io_uring ring
+        // file descriptors are released.
+        if (serverChannel != null) {
+            try {
+                serverChannel.close().sync();
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            } catch (Exception e) {
+                log.debug("error closing io_uring server channel", e);
+            }
         }
         eventLoopGroup.shutdownGracefully(SHUTDOWN_QUIET_MS, SHUTDOWN_TIMEOUT_MS, TimeUnit.MILLISECONDS)
             .syncUninterruptibly();

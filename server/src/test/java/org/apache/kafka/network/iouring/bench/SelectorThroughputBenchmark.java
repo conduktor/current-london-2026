@@ -159,6 +159,7 @@ public final class SelectorThroughputBenchmark {
                 LISTENER, MAX_RECEIVE, MemoryPool.NONE, IDLE_NANOS_NEVER, Time.SYSTEM);
              IoUringServerListener listener = new IoUringServerListener(
                  new InetSocketAddress(BIND_HOST, 0), selector)) {
+            listener.start();
 
             int port = listener.boundPort();
             AtomicBoolean stop = new AtomicBoolean(false);
