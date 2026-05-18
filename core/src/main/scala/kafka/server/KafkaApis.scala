@@ -66,7 +66,7 @@ import org.apache.kafka.server.share.context.ShareFetchContext
 import org.apache.kafka.server.share.{ErroneousAndValidPartitionData, SharePartitionKey}
 import org.apache.kafka.server.share.acknowledge.ShareAcknowledgementBatch
 import org.apache.kafka.server.storage.log.{FetchIsolation, FetchParams, FetchPartitionData}
-import org.apache.kafka.storage.internals.concentration.{ConcentrationKernel, LogicalProduceStamper, Reservation}
+import org.apache.kafka.storage.internals.concentration.{ConcentrationKernel, LogicalFetchTranslator, LogicalProduceStamper, Reservation}
 import org.apache.kafka.storage.internals.log.AppendOrigin
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats
 
@@ -75,7 +75,7 @@ import java.util
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.{CompletableFuture, ConcurrentHashMap}
 import java.util.stream.Collectors
-import java.util.{Collections, Optional}
+import java.util.{Collections, Optional, OptionalLong}
 import scala.annotation.nowarn
 import scala.collection.mutable.ArrayBuffer
 import scala.collection.{Map, Seq, Set, mutable}
@@ -663,6 +663,12 @@ class KafkaApis(val requestChannel: RequestChannel,
 
     val erroneous = mutable.ArrayBuffer[(TopicIdPartition, FetchResponseData.PartitionData)]()
     val interesting = mutable.ArrayBuffer[(TopicIdPartition, FetchRequest.PartitionData)]()
+    // Concentration hook #3.B: tracks backing-TIP entries in `interesting` that were issued
+    // on behalf of a logical-topic fetch. processResponseCallback uses this map to remap the
+    // ReplicaManager response from backing-TIP back to logical-TIP, translate the records
+    // through LogicalFetchTranslator, and rewrite high-watermark / log-start-offset to the
+    // logical-topic's offset space. Empty unless this request includes a logical-topic fetch.
+    val logicalByBacking = mutable.Map[TopicIdPartition, (TopicIdPartition, String, Int)]()
     if (fetchRequest.isFromFollower) {
       // The follower must have ClusterAction on ClusterResource in order to fetch partition data.
       if (authHelper.authorize(request.context, CLUSTER_ACTION, CLUSTER, CLUSTER_NAME)) {
@@ -689,9 +695,85 @@ class KafkaApis(val requestChannel: RequestChannel,
           partitionDatas += topicIdPartition -> partitionData
       }
       val authorizedTopics = authHelper.filterByAuthorized(request.context, READ, TOPIC, partitionDatas)(_._1.topicPartition.topic)
+      // Concentration hook #3.B: a stock consumer fetched a logical topic. Route the fetch to
+      // the right backing partition, translate the offset (logical → backing), and remember
+      // the mapping so processResponseCallback can rewrite records + offsets back to logical
+      // space. Locally defined so it can close over the request-scoped erroneous / interesting
+      // / logicalByBacking buffers — those are the very things this helper mutates.
+      def routeLogicalFetch(topicIdPartition: TopicIdPartition, data: FetchRequest.PartitionData): Unit = {
+        val logicalTopic = topicIdPartition.topic
+        val logicalPartition = topicIdPartition.partition
+        val descriptorOpt = concentrationKernel.describe(logicalTopic)
+        if (descriptorOpt.isEmpty) {
+          // describe() returned empty between isLogicalTopic() and now — concentration
+          // declaration was concurrently revoked. Treat as the topic having disappeared.
+          erroneous += topicIdPartition -> FetchResponse.partitionResponse(topicIdPartition, Errors.UNKNOWN_TOPIC_OR_PARTITION)
+        } else {
+          val descriptor = descriptorOpt.get
+          if (logicalPartition < 0 || logicalPartition >= descriptor.numLogicalPartitions) {
+            erroneous += topicIdPartition -> FetchResponse.partitionResponse(topicIdPartition, Errors.UNKNOWN_TOPIC_OR_PARTITION)
+          } else {
+            val backingTopicName = descriptor.backingTopic
+            val backingTopicId = metadataCache.getTopicId(backingTopicName)
+            if (backingTopicId == Uuid.ZERO_UUID) {
+              // Backing topic not in metadata — broker mis-config or transient bootstrap. The
+              // logical topic can't be served without the backing; surface as UNKNOWN.
+              erroneous += topicIdPartition -> FetchResponse.partitionResponse(topicIdPartition, Errors.UNKNOWN_TOPIC_OR_PARTITION)
+            } else {
+              val backingPartition = concentrationKernel.backingPartitionFor(logicalTopic, logicalPartition)
+              val backingTp = new TopicIdPartition(backingTopicId, new TopicPartition(backingTopicName, backingPartition))
+              val nextLogical = concentrationKernel.nextLogicalOffset(logicalTopic, logicalPartition)
+              val startLogical = concentrationKernel.startLogicalOffset(logicalTopic, logicalPartition)
+              val logicalFetchOffset = data.fetchOffset
+              if (logicalFetchOffset < startLogical || logicalFetchOffset > nextLogical) {
+                erroneous += topicIdPartition -> FetchResponse.partitionResponse(topicIdPartition, Errors.OFFSET_OUT_OF_RANGE)
+              } else if (logicalFetchOffset == nextLogical) {
+                // At the log tail: synthesize an immediate empty NONE response. We deliberately
+                // skip the backing-fetch and the long-poll path that stock topics get — the
+                // consumer's existing retry loop covers v1, and a backing fetch here would
+                // return non-matching records that the translator would filter to empty anyway.
+                val empty = new FetchResponseData.PartitionData()
+                  .setPartitionIndex(logicalPartition)
+                  .setErrorCode(Errors.NONE.code)
+                  .setHighWatermark(nextLogical)
+                  .setLastStableOffset(nextLogical)
+                  .setLogStartOffset(startLogical)
+                  .setRecords(MemoryRecords.EMPTY)
+                erroneous += topicIdPartition -> empty
+              } else {
+                try {
+                  val backingOffset = concentrationKernel.resolveBackingOffset(logicalTopic, logicalPartition, logicalFetchOffset)
+                  val backingPd = new FetchRequest.PartitionData(
+                    backingTopicId,
+                    backingOffset,
+                    data.logStartOffset,
+                    data.maxBytes,
+                    Optional.empty[Integer],
+                    Optional.empty[Integer])
+                  interesting += backingTp -> backingPd
+                  logicalByBacking += (backingTp -> (topicIdPartition, logicalTopic, logicalPartition))
+                } catch {
+                  case _: java.io.IOException =>
+                    // Sidecar read failed — durable index lookup is transient. KAFKA_STORAGE_ERROR
+                    // surfaces this as a retriable condition; v5- consumers see it downgraded to
+                    // NOT_LEADER_OR_FOLLOWER via maybeDownConvertStorageError.
+                    erroneous += topicIdPartition -> FetchResponse.partitionResponse(topicIdPartition, Errors.KAFKA_STORAGE_ERROR)
+                  case _: IndexOutOfBoundsException =>
+                    // Race window: nextLogicalOffset changed between our read above and the
+                    // sidecar lookup. Re-check with current tracker state — if still in range,
+                    // re-throw the precondition; otherwise OFFSET_OUT_OF_RANGE is correct.
+                    erroneous += topicIdPartition -> FetchResponse.partitionResponse(topicIdPartition, Errors.OFFSET_OUT_OF_RANGE)
+                }
+              }
+            }
+          }
+        }
+      }
       partitionDatas.foreach { case (topicIdPartition, data) =>
         if (!authorizedTopics.contains(topicIdPartition.topic))
           erroneous += topicIdPartition -> FetchResponse.partitionResponse(topicIdPartition, Errors.TOPIC_AUTHORIZATION_FAILED)
+        else if (concentrationKernel.isLogicalTopic(topicIdPartition.topic))
+          routeLogicalFetch(topicIdPartition, data)
         else if (!metadataCache.contains(topicIdPartition.topicPartition))
           erroneous += topicIdPartition -> FetchResponse.partitionResponse(topicIdPartition, Errors.UNKNOWN_TOPIC_OR_PARTITION)
         else
@@ -713,10 +795,45 @@ class KafkaApis(val requestChannel: RequestChannel,
 
     // the callback for process a fetch response, invoked before throttling
     def processResponseCallback(responsePartitionData: Seq[(TopicIdPartition, FetchPartitionData)]): Unit = {
+      // Concentration hook #3.B: rewrite responses for any backing TIP whose fetch was issued
+      // on behalf of a logical-topic fetch. Strip non-matching records via LogicalFetchTranslator,
+      // rewrite high-watermark / log-start-offset / last-stable-offset to the logical-topic's
+      // offset space, and re-key the entry to the logical TIP. A no-op (and zero allocation) on
+      // requests that don't include any logical-topic fetch.
+      val remappedResponses: Seq[(TopicIdPartition, FetchPartitionData)] =
+        if (logicalByBacking.isEmpty) responsePartitionData
+        else responsePartitionData.map { case (tp, data) =>
+          logicalByBacking.get(tp) match {
+            case Some((logicalTp, logicalTopic, logicalPartition)) =>
+              if (data.error != Errors.NONE) {
+                // Surface the underlying replication error against the logical TIP. Stock
+                // consumers will see (e.g.) NOT_LEADER_OR_FOLLOWER keyed by the logical
+                // topic+partition they actually asked for.
+                logicalTp -> data
+              } else {
+                val translated = LogicalFetchTranslator.translate(data.records, logicalTopic)
+                val logicalHW = concentrationKernel.nextLogicalOffset(logicalTopic, logicalPartition)
+                val logicalStart = concentrationKernel.startLogicalOffset(logicalTopic, logicalPartition)
+                // v1 is non-transactional: LSO equals HW (no aborted writes outstanding).
+                val newData = new FetchPartitionData(
+                  data.error,
+                  logicalHW,
+                  logicalStart,
+                  translated,
+                  data.divergingEpoch,
+                  OptionalLong.of(logicalHW),
+                  data.abortedTransactions,
+                  data.preferredReadReplica,
+                  data.isReassignmentFetch)
+                logicalTp -> newData
+              }
+            case None => tp -> data
+          }
+        }
       val partitions = new util.LinkedHashMap[TopicIdPartition, FetchResponseData.PartitionData]
       val reassigningPartitions = mutable.Set[TopicIdPartition]()
       val nodeEndpoints = new mutable.HashMap[Int, Node]
-      responsePartitionData.foreach { case (tp, data) =>
+      remappedResponses.foreach { case (tp, data) =>
         val abortedTransactions = data.abortedTransactions.orElse(null)
         val lastStableOffset: Long = data.lastStableOffset.orElse(FetchResponse.INVALID_LAST_STABLE_OFFSET)
         if (data.isReassignmentFetch) reassigningPartitions.add(tp)
