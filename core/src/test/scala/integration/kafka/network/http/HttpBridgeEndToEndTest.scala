@@ -142,6 +142,77 @@ class HttpBridgeEndToEndTest {
     }
   }
 
+  @Test
+  def multiPartitionMixedResultReturns207(): Unit = {
+    // Spec scenario FS1 (PROMPT.md:42): a POST that targets 3 partitions where one fails returns HTTP 207 with a
+    // body listing each partition's outcome. We trigger the failure by writing to a partition that doesn't exist on
+    // the topic (partition 99 on a 2-partition topic); the broker surfaces UNKNOWN_TOPIC_OR_PARTITION on that
+    // partition while the other two succeed. This is the cleanest way to provoke a per-partition error from a real
+    // broker without killing replicas, and it proves that per-partition errorCode propagation flows end-to-end.
+    val cluster = new KafkaClusterTestKit.Builder(
+      new TestKitNodes.Builder()
+        .setNumBrokerNodes(1)
+        .setNumControllerNodes(1)
+        .build())
+      .setConfigProp(SocketServerConfigs.HTTP_BRIDGE_ENABLED_CONFIG, "true")
+      .setConfigProp(SocketServerConfigs.HTTP_BRIDGE_HOST_CONFIG, "127.0.0.1")
+      .setConfigProp(SocketServerConfigs.HTTP_BRIDGE_PORT_CONFIG, "0")
+      .build()
+    val topicName = "http-bridge-207"
+    try {
+      cluster.format()
+      cluster.startup()
+      cluster.waitForReadyBrokers()
+
+      val broker = cluster.brokers().get(0)
+      TestUtils.waitUntilTrue(() => broker.brokerState == BrokerState.RUNNING, "Broker never reached RUNNING.")
+      TestUtils.waitUntilTrue(() => broker.httpBridgeServer != null && broker.httpBridgeServer.boundPort() > 0,
+        "HTTP bridge never bound its port.")
+      val bridgePort = broker.httpBridgeServer.boundPort()
+
+      createTopic(cluster, topicName, partitions = 2)
+
+      val mixedBody =
+        s"""
+           |{
+           |  "records": [
+           |    { "partition": 0,  "value": { "type": "STRING", "data": "p0" } },
+           |    { "partition": 1,  "value": { "type": "STRING", "data": "p1" } },
+           |    { "partition": 99, "value": { "type": "STRING", "data": "ghost" } }
+           |  ]
+           |}
+           |""".stripMargin
+
+      val resp = postJson(s"http://127.0.0.1:$bridgePort/v1/topics/$topicName/records", mixedBody)
+      assertEquals(207, resp.statusCode(),
+        s"mixed-partition produce must surface HTTP 207 Multi-Status; got status=${resp.statusCode()}, body=${resp.body()}")
+
+      val body = parseJson(resp.body())
+      val results = body.get("results")
+      assertEquals(3, results.size(), s"expected one result per partition, body=${resp.body()}")
+
+      val byPartition = (0 until results.size()).map { i =>
+        val r = results.get(i)
+        r.get("partition").asInt() -> r
+      }.toMap
+
+      // Partitions 0 and 1 should have succeeded with offset 0 each (first write on each partition).
+      assertEquals(0, byPartition(0).get("errorCode").asInt(), s"partition 0 expected to succeed, was ${byPartition(0)}")
+      assertEquals(0L, byPartition(0).get("offset").asLong())
+      assertEquals(0, byPartition(1).get("errorCode").asInt(), s"partition 1 expected to succeed, was ${byPartition(1)}")
+      assertEquals(0L, byPartition(1).get("offset").asLong())
+
+      // Partition 99 doesn't exist on the topic; broker must report it without affecting the other two partitions.
+      // Errors.UNKNOWN_TOPIC_OR_PARTITION = 3.
+      assertEquals(3, byPartition(99).get("errorCode").asInt(),
+        s"partition 99 must surface UNKNOWN_TOPIC_OR_PARTITION (code 3), was ${byPartition(99)}")
+      assertTrue(byPartition(99).get("offset").isNull,
+        s"failed partition must surface null offset, was ${byPartition(99).get("offset")}")
+    } finally {
+      cluster.close()
+    }
+  }
+
   // ----- helpers -------------------------------------------------------------------------------------------------
 
   private def createTopic(cluster: KafkaClusterTestKit, name: String, partitions: Int): Unit = {
