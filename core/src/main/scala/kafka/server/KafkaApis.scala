@@ -448,23 +448,36 @@ class KafkaApis(val requestChannel: RequestChannel,
           else
             try {
               ProduceRequest.validateRecords(request.header.apiVersion, memoryRecords)
-              val k = LogicalProduceStamper.countRecords(memoryRecords)
-              if (k == 0) {
-                // Empty batch — pass through as NONE so the producer sees an immediate ack
-                // without us consuming any logical offsets. Mirrors stock-topic behaviour:
-                // ProduceRequest.validateRecords already accepted it, no further work needed.
-                invalidRequestResponses += topicPartition -> new PartitionResponse(Errors.NONE,
-                  -1L, RecordBatch.NO_TIMESTAMP, -1L)
+              // Concentration v1 explicitly excludes transactional produce on logical topics.
+              // A COMMIT marker on the shared backing partition commits records across every
+              // logical topic that maps to it, corrupting the per-logical-topic LSO contract
+              // (PROMPT.md "Careful" note). Fail loud with INVALID_TXN_STATE so a transactional
+              // producer sees a clear, non-retriable error rather than silently writing records
+              // the LSO machinery cannot scope. v1 does not add per-logical-topic LSO tracking.
+              val firstBatch = memoryRecords.firstBatch()
+              if (firstBatch != null && firstBatch.isTransactional) {
+                invalidRequestResponses += topicPartition -> new PartitionResponse(
+                  Errors.INVALID_TXN_STATE,
+                  "concentration v1 does not support transactional produce to logical topics")
               } else {
-                val reservations = concentrationKernel.reserveProduceBatch(
-                  topicPartition.topic, topicPartition.partition, k)
-                val logicalOffsets = new Array[Long](reservations.length)
-                var i = 0
-                while (i < reservations.length) { logicalOffsets(i) = reservations(i).logicalOffset; i += 1 }
-                val stamped = LogicalProduceStamper.stamp(
-                  memoryRecords, topicPartition.topic, topicPartition.partition, logicalOffsets)
-                authorizedRequestInfo += (backingTp -> stamped)
-                logicalByBacking += (backingTp -> (topicPartition, reservations))
+                val k = LogicalProduceStamper.countRecords(memoryRecords)
+                if (k == 0) {
+                  // Empty batch — pass through as NONE so the producer sees an immediate ack
+                  // without us consuming any logical offsets. Mirrors stock-topic behaviour:
+                  // ProduceRequest.validateRecords already accepted it, no further work needed.
+                  invalidRequestResponses += topicPartition -> new PartitionResponse(Errors.NONE,
+                    -1L, RecordBatch.NO_TIMESTAMP, -1L)
+                } else {
+                  val reservations = concentrationKernel.reserveProduceBatch(
+                    topicPartition.topic, topicPartition.partition, k)
+                  val logicalOffsets = new Array[Long](reservations.length)
+                  var i = 0
+                  while (i < reservations.length) { logicalOffsets(i) = reservations(i).logicalOffset; i += 1 }
+                  val stamped = LogicalProduceStamper.stamp(
+                    memoryRecords, topicPartition.topic, topicPartition.partition, logicalOffsets)
+                  authorizedRequestInfo += (backingTp -> stamped)
+                  logicalByBacking += (backingTp -> (topicPartition, reservations))
+                }
               }
             } catch {
               case e: ApiException =>
@@ -509,9 +522,15 @@ class KafkaApis(val requestChannel: RequestChannel,
                   concentrationKernel.commitProduceBatch(reservations, status.baseOffset)
                   // Rewrite backing-offset baseOffset/lastOffset to logical offsets — the
                   // producer's view must be anchored to the logical topic, not the shared
-                  // backing whose offsets it has no knowledge of.
+                  // backing whose offsets it has no knowledge of. logStartOffset is on the
+                  // same offset axis as baseOffset, so it also has to be remapped: idempotent
+                  // producers compare it against their session bookkeeping to detect log
+                  // truncation, and leaking the backing topic's value here makes a sibling
+                  // logical topic's DeleteRecords look like truncation under their feet.
                   status.baseOffset = reservations(0).logicalOffset
                   status.lastOffset = reservations(reservations.length - 1).logicalOffset
+                  status.logStartOffset = concentrationKernel.startLogicalOffset(
+                    logicalTp.topic, logicalTp.partition)
                   logicalTp -> status
                 } catch {
                   case e: Throwable =>

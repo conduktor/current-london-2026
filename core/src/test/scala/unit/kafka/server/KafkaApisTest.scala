@@ -2130,6 +2130,11 @@ class KafkaApisTest extends Logging {
     when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
     when(concentrationKernel.describe(logicalTopic)).thenReturn(Optional.of(descriptor))
     when(concentrationKernel.backingPartitionFor(logicalTopic, 0)).thenReturn(2)
+    // The kernel's logical start offset (advanced by past DeleteRecords) is decoupled from the
+    // backing partition's start offset: a sibling logical topic deleting records on the same
+    // backing must NOT make this producer's logStartOffset jump. Pin it to a recognisable value
+    // so the response-remap assertion below proves we forwarded *this* number, not the backing's.
+    when(concentrationKernel.startLogicalOffset(logicalTopic, 0)).thenReturn(42L)
 
     val res0 = mock(classOf[Reservation]); when(res0.logicalOffset).thenReturn(500L)
     val res1 = mock(classOf[Reservation]); when(res1.logicalOffset).thenReturn(501L)
@@ -2167,8 +2172,11 @@ class KafkaApisTest extends Logging {
     ).thenAnswer { _ =>
       // Simulate ReplicaManager succeeding with backing baseOffset=900. The hook must rewrite
       // this into the logical baseOffset (500) before the producer sees the response.
+      // logStartOffset=99L is the BACKING topic's start; the hook must NOT leak this to the
+      // producer's response (sibling-topic DeleteRecords would look like truncation otherwise).
+      // The hook is expected to overwrite it with the kernel's startLogicalOffset (42L above).
       callbackCaptor.getValue.apply(Map(backingTp -> new PartitionResponse(
-        Errors.NONE, 900L, RecordBatch.NO_TIMESTAMP, 0L)))
+        Errors.NONE, 900L, RecordBatch.NO_TIMESTAMP, 99L)))
     }
 
     when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
@@ -2219,6 +2227,14 @@ class KafkaApisTest extends Logging {
     assertEquals(Errors.NONE, Errors.forCode(partitionProduceResponse.errorCode))
     assertEquals(500L, partitionProduceResponse.baseOffset,
       "baseOffset must be the FIRST logical offset, not the backing offset (900)")
+    // lastOffset is internal to ProduceResponse.PartitionResponse and not on the wire schema,
+    // so it can't be asserted on the wire-level PartitionProduceResponse here. baseOffset
+    // remap is the producer-visible contract; the internal lastOffset rewrite is a
+    // belt-and-suspenders for callbacks that consume the internal struct.
+    assertEquals(42L, partitionProduceResponse.logStartOffset,
+      "logStartOffset must come from kernel.startLogicalOffset for THIS logical TP, not the " +
+      "backing's logStartOffset (99) — leaking the backing value would make sibling-topic " +
+      "DeleteRecords look like truncation to idempotent producers")
   }
 
   @Test
@@ -2399,6 +2415,62 @@ class KafkaApisTest extends Logging {
     // Only the first entry consumed a reservation.
     verify(concentrationKernel).reserveProduceBatch(logicalA, 0, 1)
     verify(concentrationKernel, never()).reserveProduceBatch(ArgumentMatchers.eq(logicalB), anyInt, anyInt)
+  }
+
+  @Test
+  def testProduceToLogicalTopicRejectsTransactionalBatchWithInvalidTxnState(): Unit = {
+    // PROMPT.md "Careful" note: a COMMIT marker on the shared backing partition commits records
+    // across every logical topic that maps to it, breaking per-logical-topic LSO semantics. v1
+    // explicitly excludes transactions. The broker must therefore reject transactional produce
+    // to logical topics BEFORE reserving offsets or appending — letting a transactional batch
+    // through would silently corrupt cross-topic isolation. INVALID_TXN_STATE is non-retriable
+    // on the producer side, matching the v1 contract of "transactional clients are unsupported".
+    val logicalTopic = "orders"
+    val backingTopic = "concentrated"
+    val descriptor = new LogicalTopicDescriptor(logicalTopic, 1024, backingTopic, 4)
+    addTopicToMetadataCache(backingTopic, numPartitions = 4)
+    when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
+    when(concentrationKernel.describe(logicalTopic)).thenReturn(Optional.of(descriptor))
+    when(concentrationKernel.backingPartitionFor(logicalTopic, 0)).thenReturn(2)
+
+    val tp = new TopicPartition(logicalTopic, 0)
+    val txnRecords = MemoryRecords.withTransactionalRecords(Compression.NONE,
+      4242L, 7.toShort, 0, new SimpleRecord("payload".getBytes))
+    // KafkaApis at line ~388 rejects transactional produce REQUESTS that lack an authorized
+    // transactionalId, with TRANSACTIONAL_ID_AUTHORIZATION_FAILED, before per-partition routing
+    // runs. To exercise the v1-specific INVALID_TXN_STATE branch we have to clear that gate:
+    // set a non-null transactionalId, and rely on the default no-authorizer path which auto-
+    // authorizes. Without this, the test would only verify the pre-existing global auth check.
+    val produceRequest = ProduceRequest.builder(new ProduceRequestData()
+      .setTransactionalId("test-txn-id")
+      .setTopicData(new ProduceRequestData.TopicProduceDataCollection(
+        Collections.singletonList(new ProduceRequestData.TopicProduceData()
+          .setName(tp.topic).setPartitionData(Collections.singletonList(
+            new ProduceRequestData.PartitionProduceData()
+              .setIndex(tp.partition)
+              .setRecords(txnRecords))))
+          .iterator))
+      .setAcks(1.toShort).setTimeoutMs(5000))
+      .build(ApiKeys.PRODUCE.latestVersion)
+    val request = buildRequest(produceRequest)
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[ProduceResponse](request)
+    val partitionProduceResponse = response.data.responses.asScala.head.partitionResponses.asScala.head
+    assertEquals(Errors.INVALID_TXN_STATE, Errors.forCode(partitionProduceResponse.errorCode))
+
+    // Reservation, stamping, and append path must never run on a rejected transactional batch:
+    // a half-stamped record on the backing log would survive a broker restart and re-emerge as
+    // a recoverable logical record, which is exactly the silent corruption we're guarding against.
+    verify(concentrationKernel, never()).reserveProduceBatch(any[String], anyInt, anyInt)
+    verify(replicaManager, never()).handleProduceAppend(anyLong, anyShort, ArgumentMatchers.eq(false),
+      any(), any(), any(), any(), any(), any(), any())
   }
 
   @Test
