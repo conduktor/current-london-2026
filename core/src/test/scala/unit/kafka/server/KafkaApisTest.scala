@@ -6827,11 +6827,10 @@ class KafkaApisTest extends Logging {
   def testListOffsetsFromViewWithPositiveTimestampIsRejectedAsInvalidRequest(): Unit = {
     // offsetsForTimes (positive query timestamp) returns the offset of the FIRST backing record
     // whose timestamp is >= the queried t. For a source_sparse view, that backing record may have
-    // been filtered out by the predicate — and even with the response timestamp stripped (which
-    // testListOffsetsFromViewStripsResponseTimestampToProtectFilteredRecords pins), the returned
-    // OFFSET itself is a binary-search oracle: an adversary querying ListOffsets(t) at successive
-    // t values can use the points at which the returned offset changes to recover the timestamps
-    // of filtered backing records to arbitrary precision. Filtered-record timestamps are exactly
+    // been filtered out by the predicate — and even with the response timestamp stripped, the
+    // returned OFFSET itself is a binary-search oracle: an adversary querying ListOffsets(t)
+    // at successive t values can use the points where the returned offset changes to recover
+    // timestamps of filtered backing records to arbitrary precision. Those timestamps are exactly
     // the metadata the predicate is supposed to gate.
     //
     // The only safe options on a view are EARLIEST / LATEST (cluster-coordinate offsets that

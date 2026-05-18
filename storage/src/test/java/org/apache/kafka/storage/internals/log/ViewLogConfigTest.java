@@ -116,11 +116,9 @@ class ViewLogConfigTest {
     }
 
     @Test
-    void rejectsBackingTopicEqualToOwnTopic() {
-        // A self-referential view would loop on read — reject up-front.
-        // The check uses the value in props because LogConfig.validate doesn't know the
-        // topic's own name; the broker enforces the no-loop rule at create/alter time
-        // through ReplicaManager. Here we only verify the basic non-empty / non-self constraints.
+    void rejectsEmptyBackingTopic() {
+        // LogConfig.validate has no topic-name context, so the self-loop rule is enforced by
+        // ControllerConfigurationValidator. Here we only verify the local non-empty constraint.
         Properties props = viewProps();
         props.put(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, "");
         assertThrows(InvalidConfigurationException.class, () -> LogConfig.validate(props));

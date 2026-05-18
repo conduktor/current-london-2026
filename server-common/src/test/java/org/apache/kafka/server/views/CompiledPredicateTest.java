@@ -369,14 +369,14 @@ class CompiledPredicateTest {
         // refuse to commit. Record is skipped — the safe outcome at an access-control boundary.
         CompiledPredicate p = compiler.compile("body.x != 9007199254740992.0");
         Optional<Boolean> r = p.evaluate(jsonRecord("{\"x\":9007199254740993}"));
-        assertTrue(r.isEmpty() || !r.get(),
-                () -> "unsafe Long != Double must be unknown/false, not confident true, got " + r);
+        assertTrue(r.isEmpty(),
+                () -> "unsafe Long != Double must be UNKNOWN, not false or confident true, got " + r);
         // Symmetric: equality with the same operands must not be confident TRUE either (it
         // returns null/unknown, which orElse(false) renders as false).
         CompiledPredicate q = compiler.compile("body.x == 9007199254740992.0");
         Optional<Boolean> rq = q.evaluate(jsonRecord("{\"x\":9007199254740993}"));
-        assertTrue(rq.isEmpty() || !rq.get(),
-                () -> "unsafe Long == Double must be unknown/false, not confident true, got " + rq);
+        assertTrue(rq.isEmpty(),
+                () -> "unsafe Long == Double must be UNKNOWN, not false or confident true, got " + rq);
         // Sanity: inside the safe range, NEQ still works.
         CompiledPredicate ok = compiler.compile("body.x != 42.0");
         assertTrue(ok.evaluate(jsonRecord("{\"x\":7}")).orElse(false));
@@ -827,15 +827,15 @@ class CompiledPredicateTest {
 
     @Test
     void skipsRecordWhenJsonFractionalFloatRoundsToInteger() {
-        // 1.0000000000000001 is exact-fractional, so the round-6 BigDecimal integer-valued check
+        // 1.0000000000000001 is exact-fractional, so the round-7 Math.rint(d) alias check
         // skips it. Jackson still parses it to the integral double 1.0, and the evaluator's safe
         // Long/Double equality then admits it through an integer gate (`body.x == 1`). The record
         // author wrote a non-integer value; treating it as integer 1 is the same silent admission
         // class as the 2^53 integer precision-loss cases.
         CompiledPredicate p = compiler.compile("body.x == 1");
         Optional<Boolean> r = p.evaluate(jsonRecord("{\"x\":1.0000000000000001}"));
-        assertTrue(r.isEmpty() || !r.get(),
-                () -> "fractional JSON float rounded to integer must be unusable, got " + r);
+        assertTrue(r.isEmpty(),
+                () -> "fractional JSON float rounded to integer must be BODY_UNUSABLE, got " + r);
     }
 
     @Test
