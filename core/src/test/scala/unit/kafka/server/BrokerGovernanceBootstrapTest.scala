@@ -1396,6 +1396,111 @@ class BrokerGovernanceBootstrapTest {
       "the new failure becomes subject to the same per-message suppression policy")
   }
 
+  // ── Round-14 HIGH H-1: cleanup.policy runtime drift detector ────────────
+
+  @Test
+  def maybeWarnIfCleanupPolicyDriftedIsSilentWhenLogIsCompactOnly(): Unit = {
+    // Happy path: operator follows the contract, log is cleanup.policy=compact.
+    // The drift check must NOT emit a WARN.
+    val rm = mock(classOf[ReplicaManager])
+    val log = mock(classOf[UnifiedLog])
+    val engine = new RuleEngine()
+    when(rm.getLog(tp)).thenReturn(Some(log))
+    val props = new java.util.HashMap[String, Object]()
+    props.put(org.apache.kafka.common.config.TopicConfig.CLEANUP_POLICY_CONFIG, "compact")
+    when(log.config).thenReturn(new org.apache.kafka.storage.internals.log.LogConfig(props))
+
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp)
+    boot.maybeWarnIfCleanupPolicyDrifted()
+
+    assertEquals(0L, boot.warnEmissions.get(),
+      "compact-only policy must not emit a drift WARN")
+  }
+
+  @Test
+  def maybeWarnIfCleanupPolicyDriftedFiresOnDeleteOnly(): Unit = {
+    // Hot-reload regression: operator AlterConfigs the topic to cleanup.policy
+    // = delete on a running broker (the startup gate already ran with compact).
+    // The drift check must surface a WARN — the broker can't abort startup
+    // anymore, but it can give the operator a positive audit signal during
+    // the retention-window grace period before rules begin to silently age out.
+    val rm = mock(classOf[ReplicaManager])
+    val log = mock(classOf[UnifiedLog])
+    val engine = new RuleEngine()
+    when(rm.getLog(tp)).thenReturn(Some(log))
+    val props = new java.util.HashMap[String, Object]()
+    props.put(org.apache.kafka.common.config.TopicConfig.CLEANUP_POLICY_CONFIG, "delete")
+    when(log.config).thenReturn(new org.apache.kafka.storage.internals.log.LogConfig(props))
+
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp)
+    boot.maybeWarnIfCleanupPolicyDrifted()
+
+    assertEquals(1L, boot.warnEmissions.get(),
+      "delete-only drift must emit exactly one WARN")
+  }
+
+  @Test
+  def maybeWarnIfCleanupPolicyDriftedFiresOnMixedCompactDelete(): Unit = {
+    // Round-13 HIGH-1 closed the substring-check loophole at startup. The
+    // runtime drift check must reject the same mixed policy: compact AND
+    // delete both enabled means retention.ms still deletes rule records.
+    val rm = mock(classOf[ReplicaManager])
+    val log = mock(classOf[UnifiedLog])
+    val engine = new RuleEngine()
+    when(rm.getLog(tp)).thenReturn(Some(log))
+    val props = new java.util.HashMap[String, Object]()
+    props.put(org.apache.kafka.common.config.TopicConfig.CLEANUP_POLICY_CONFIG, "compact,delete")
+    when(log.config).thenReturn(new org.apache.kafka.storage.internals.log.LogConfig(props))
+
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp)
+    boot.maybeWarnIfCleanupPolicyDrifted()
+
+    assertEquals(1L, boot.warnEmissions.get(),
+      "compact,delete mixed policy must emit a drift WARN")
+  }
+
+  @Test
+  def maybeWarnIfCleanupPolicyDriftedDedupesRepeatedDrifts(): Unit = {
+    // The drift detector runs on every drain tick (every 200ms in production).
+    // Sustained drift must NOT spam the log — maybeWarnSuppressed should
+    // dedupe by message, emitting one WARN initially and rolling up the rest
+    // until the FailureWarnIntervalMs window elapses. We don't advance the
+    // clock here; the first call wins the slot, the rest are silently
+    // suppressed.
+    val rm = mock(classOf[ReplicaManager])
+    val log = mock(classOf[UnifiedLog])
+    val engine = new RuleEngine()
+    when(rm.getLog(tp)).thenReturn(Some(log))
+    val props = new java.util.HashMap[String, Object]()
+    props.put(org.apache.kafka.common.config.TopicConfig.CLEANUP_POLICY_CONFIG, "delete")
+    when(log.config).thenReturn(new org.apache.kafka.storage.internals.log.LogConfig(props))
+
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp)
+    for (_ <- 0 until 50) {
+      boot.maybeWarnIfCleanupPolicyDrifted()
+    }
+    assertEquals(1L, boot.warnEmissions.get(),
+      "repeated identical drift must emit one WARN, not one per tick")
+  }
+
+  @Test
+  def maybeWarnIfCleanupPolicyDriftedIsNoOpWhenLogIsAbsent(): Unit = {
+    // When the local log object is not available (broker not a replica,
+    // log dir still opening, transient race), there is no LogConfig to peek
+    // at — the drift check returns silently. The NonReplica posture is
+    // already covered by drainOnce's own ERROR/throw paths; we don't want
+    // a redundant WARN here.
+    val rm = mock(classOf[ReplicaManager])
+    val engine = new RuleEngine()
+    when(rm.getLog(tp)).thenReturn(None)
+
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp)
+    boot.maybeWarnIfCleanupPolicyDrifted()
+
+    assertEquals(0L, boot.warnEmissions.get(),
+      "absent log must not emit a drift WARN")
+  }
+
   @Test
   def drainStartupFailsClosedIfDrainMakesNoProgressBeforeDeadline(): Unit = {
     // Codex final-audit P0 fail-closed branch: if drainOnce never advances

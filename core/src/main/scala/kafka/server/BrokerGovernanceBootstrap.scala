@@ -648,6 +648,21 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
                       intervalMs: Long): Unit = {
     val task: Runnable = () => {
       try {
+        // Round-14 HIGH H-1 (compaction sub-agent): peek at the local log's
+        // resolved LogConfig and emit a throttled audit WARN if cleanup.policy
+        // has drifted away from the operator contract {compact}. The startup
+        // gate in BrokerServer.requireGovernanceTopicCompactPolicy closes the
+        // fresh-boot vector, but a runtime AlterConfigs from {compact} to
+        // {delete} or {compact,delete} on a live broker would otherwise be
+        // silent: drains keep returning records, the engine keeps installing
+        // them, and once retention.ms elapses on the now-deletable segments
+        // the rules silently age out — the same fail-OPEN-after-restart the
+        // startup gate is designed to close, just on a slower timer. A WARN
+        // surfaced on every drain tick (deduped by maybeWarnSuppressed) gives
+        // an operator scanning logs a positive signal during the
+        // retention-window grace period to revert the config change before
+        // the rule set begins eroding.
+        maybeWarnIfCleanupPolicyDrifted()
         drainOnce()
       } catch {
         case t: Throwable =>
@@ -664,6 +679,64 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
       }
     }
     scheduler.schedule("governance-rules-drain", task, intervalMs, intervalMs)
+  }
+
+  /**
+   * Round-14 HIGH H-1 (compaction sub-agent): runtime drift detector for the
+   * {@code __governance} cleanup policy.
+   *
+   * <p>The startup gate {@link BrokerServer#requireGovernanceTopicCompactPolicy}
+   * runs once and aborts startup if the effective policy is not exactly
+   * {@code compact}. After startup an operator AlterConfigs to
+   * {@code delete} or {@code compact,delete} would otherwise slip through
+   * silently — the broker keeps draining records, the engine keeps installing
+   * them, and once {@code retention.ms} elapses on segments now deletable by
+   * the retention path, the rules age out one segment at a time and the
+   * broker fail-OPENs on the affected DENY rules. The hazard window is the
+   * smaller of the retention.ms and the broker uptime, both typically on the
+   * order of days — long enough that no human is watching.
+   *
+   * <p>This method peeks at {@link UnifiedLog#config} (the resolved LogConfig
+   * including topic-level overrides) and routes a WARN through
+   * {@link #maybeWarnSuppressed} whenever the effective policy is not
+   * exactly {@code {compact}}. The throttled WARN dedupes identical drift
+   * messages within {@link #FailureWarnIntervalMs} while still firing a fresh
+   * line if the operator transitions from one bad policy to a different bad
+   * policy (the dedup key is the message string). Visible for tests as a
+   * private method invoked from the scheduleOngoing task.
+   *
+   * <p>The check is intentionally non-fatal: it does not stop the drain, does
+   * not throw, and does not modify the engine. The point is to give an
+   * operator a loud, persistent audit signal during the retention-window
+   * grace period before the rules begin to actually disappear. A fatal
+   * reaction on the live request path would amplify a config-typo into an
+   * outage; a loud audit signal is the right cost-benefit trade.
+   */
+  private[server] def maybeWarnIfCleanupPolicyDrifted(): Unit = {
+    replicaManager.getLog(topicPartition).foreach { log =>
+      val cfg = log.config
+      // Exact-match {compact}: compaction enabled AND delete disabled. The
+      // mixed {compact,delete} policy sets both booleans, which is exactly
+      // the silent-erosion shape this check exists to surface.
+      if (!cfg.compact || cfg.delete) {
+        val effective = (cfg.compact, cfg.delete) match {
+          case (true, true)  => "compact,delete"
+          case (false, true) => "delete"
+          case (true, false) => "compact"        // unreachable given guard
+          case _             => "(none)"
+        }
+        maybeWarnSuppressed(
+          s"cleanup.policy drift detected on ${topicPartition.topic}: " +
+            s"effective policy is '$effective', expected 'compact'. " +
+            s"This is a runtime divergence from the broker-startup contract " +
+            s"(round-12 HIGH-1) — retention.ms will eventually delete rule " +
+            s"records and the broker will silently fail-OPEN on the affected " +
+            s"DENY rules. Revert with: bin/kafka-configs.sh --bootstrap-server " +
+            s"<broker> --alter --entity-type topics --entity-name " +
+            s"${topicPartition.topic} --add-config cleanup.policy=compact " +
+            s"(round-14 HIGH H-1).")
+      }
+    }
   }
 
   private val FailureWarnIntervalMs: Long = 60_000L
