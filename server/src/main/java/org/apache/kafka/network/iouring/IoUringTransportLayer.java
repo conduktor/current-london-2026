@@ -63,11 +63,70 @@ import io.netty.channel.Channel;
  */
 final class IoUringTransportLayer implements TransportLayer {
 
+    /**
+     * Hard upper bound on the number of bytes a single {@link #write(ByteBuffer)} call will
+     * allocate in one direct {@link ByteBuf}. Two failure modes are bounded by this cap:
+     *
+     * <ol>
+     *   <li><b>Direct-memory OOM under a single huge response.</b> A 100 MiB Fetch response
+     *       reaching a channel whose Netty outbound buffer is empty would otherwise allocate
+     *       a 100 MiB direct buffer in one shot — bypassing the high-water-mark gate, which
+     *       only flips after the queue is already past the limit. Capping each call to 1 MiB
+     *       keeps the per-call footprint bounded; the source ByteBuffer keeps its remainder
+     *       and ByteBufferSend re-enters on the next poll, mirroring how NIO returns partial
+     *       progress when {@code SO_SNDBUF} saturates.</li>
+     *   <li><b>Direct-memory exhaustion across many slow consumers.</b> Without the cap,
+     *       N concurrent in-flight big sends each allocate N * responseSize. Even with the
+     *       Netty watermark gate, a burst of slow consumers can collectively exceed direct
+     *       memory before any single channel trips the gate. The cap bounds the
+     *       worst-case per-call allocation, regardless of how many channels are writing.</li>
+     * </ol>
+     *
+     * <p>1 MiB is a deliberate balance: small enough to keep direct memory bounded under DoS,
+     * large enough that typical Kafka response sizes (Produce ack, Fetch chunk) drain in a
+     * couple of poll iterations rather than thousands.
+     */
+    static final int MAX_WRITE_CHUNK_BYTES = 1 << 20;
+
+    /**
+     * High-water mark for the per-channel inbound ByteBuf queue. When {@link #inboundBytes}
+     * exceeds this, {@link #offerInbound(ByteBuf)} flips Netty {@code autoRead} off so the
+     * kernel applies TCP-level backpressure to the peer. Without this gate, a fast malicious
+     * PLAINTEXT client (or simply a slow Processor) lets ByteBufs accumulate unbounded in
+     * the transport queue — direct memory exhaustion takes the broker down before the
+     * KafkaChannel-level MemoryPool gate (queued.max.bytes) even kicks in, because the
+     * MemoryPool only governs the destination NetworkReceive buffer, not the raw bytes
+     * still riding in Netty's inbound side.
+     */
+    static final int INBOUND_HIGH_WATERMARK_BYTES = 1 << 20;
+
+    /**
+     * Low-water mark for the per-channel inbound ByteBuf queue. Once {@link #inboundBytes}
+     * drops below this after a Processor drain, {@link #read} flips Netty {@code autoRead}
+     * back on so kernel reads resume. The HIGH-LOW gap prevents oscillation: a single
+     * fluctuation around the high water mark would otherwise trigger constant autoRead
+     * flapping. Only re-enabled when the channel is not muted ({@link #isMute()}) — an
+     * operator mute or memory-pool self-mute must keep autoRead off regardless of queue
+     * depth, otherwise the request-pipeline throttle is bypassed.
+     */
+    static final int INBOUND_LOW_WATERMARK_BYTES = 1 << 18;
+
     private final Channel nettyChannel;
     private final StubSocketChannel socketChannel;
     private final NoopSelectionKey selectionKey;
 
     private final Queue<ByteBuf> inbound = new ConcurrentLinkedQueue<>();
+    /**
+     * Total readable bytes currently sitting in {@link #inbound}. Bumped from the event-loop
+     * thread inside {@link #offerInbound}, drained from the Processor thread inside
+     * {@link #read}. Drives the autoRead watermark gate so a slow Processor (or fast/abusive
+     * peer) cannot accumulate unbounded direct memory in the transport queue.
+     *
+     * <p>The counter is also decremented in {@link #close()} when remaining ByteBufs are
+     * released, so a teardown does not leave the counter falsely positive should the
+     * channel be re-used (it is not, in v1, but the invariant is cheap to maintain).
+     */
+    private final AtomicLong inboundBytes = new AtomicLong(0);
     private volatile boolean eofSeen;
     private volatile boolean closed;
     /**
@@ -120,12 +179,34 @@ final class IoUringTransportLayer implements TransportLayer {
             buf.release();
             return;
         }
+        int size = buf.readableBytes();
         inbound.offer(buf);
         if (closed) {
+            // Race with Processor's close(): drain anything we just queued so we don't leak.
             ByteBuf b;
             while ((b = inbound.poll()) != null) {
                 b.release();
             }
+            inboundBytes.set(0);
+            return;
+        }
+        long after = inboundBytes.addAndGet(size);
+        // Inbound watermark gate. When the queue crosses the high water mark, flip Netty
+        // autoRead off so the kernel stops pushing more bytes to us — TCP's own flow
+        // control will throttle the peer. Without this gate, a fast/abusive PLAINTEXT
+        // client (or simply a slow Processor) lets ByteBufs accumulate unbounded in the
+        // inbound queue; direct-memory OOM takes the broker down before KafkaChannel's
+        // MemoryPool-based queued.max.bytes throttle even fires (that throttle governs
+        // the destination NetworkReceive buffer, not the bytes still sitting in this
+        // queue waiting to be drained).
+        //
+        // We always defer the autoRead=false to the channel's own event loop, even though
+        // offerInbound is invoked from the event loop in production. EmbeddedChannel in
+        // tests routes channelRead synchronously on the caller's thread — calling
+        // setAutoRead inline on the test path could deadlock if it tried to re-enter the
+        // pipeline. The event loop is always the right thread to flip Netty config.
+        if (after >= INBOUND_HIGH_WATERMARK_BYTES && nettyChannel.config().isAutoRead()) {
+            nettyChannel.config().setAutoRead(false);
         }
     }
 
@@ -240,6 +321,24 @@ final class IoUringTransportLayer implements TransportLayer {
                 head.release();
             }
         }
+        if (total > 0) {
+            // Inbound watermark gate (read-side): once the Processor has drained enough
+            // bytes for the queue to fall below the LOW water mark, flip autoRead back on
+            // so the kernel resumes pushing bytes. Only re-enable on an unmuted channel —
+            // an operator mute (RESPONSE_QUEUED throttling) or memory-pool self-mute
+            // (KafkaChannel.read failed to allocate) must keep autoRead off regardless of
+            // queue depth, otherwise the request-pipeline throttle is bypassed. We re-
+            // check the autoRead flag itself so we don't fight a state legitimately set
+            // by addInterestOps/removeInterestOps — only flip when we know we lowered it
+            // due to backpressure.
+            long after = inboundBytes.addAndGet(-total);
+            if (after <= INBOUND_LOW_WATERMARK_BYTES
+                    && !isMute()
+                    && nettyChannel.isOpen()
+                    && !nettyChannel.config().isAutoRead()) {
+                nettyChannel.config().setAutoRead(true);
+            }
+        }
         if (total == 0 && eofSeen && inbound.isEmpty()) return -1;
         return total;
     }
@@ -280,35 +379,58 @@ final class IoUringTransportLayer implements TransportLayer {
         }
         int remaining = src.remaining();
         if (remaining == 0) return 0;
-        // Backpressure: if Netty's outbound buffer has exceeded the high water mark,
-        // refuse to queue more bytes. Returning 0 makes ByteBufferSend.writeTo keep
-        // its source ByteBuffers intact, so the next Selector poll's write step will
-        // re-attempt — and onWritabilityChanged() will wake the poll the moment the
-        // buffer drains below the low water mark. Without this gate, each write()
-        // unconditionally allocates a fresh direct ByteBuf and hands it to Netty's
-        // unbounded outboundBuffer; a slow peer would let direct memory grow until
-        // the broker OOMs. This is the io_uring analog of NIO write() returning 0
-        // when the kernel's SO_SNDBUF is saturated.
+        // Backpressure + bounded allocation. Two failure modes have to be defended here:
         //
-        // Restrict the gate to healthy channels (isActive() = open + connected).
-        // For a closed/disconnected channel, isWritable() is also false — but we
-        // WANT those writes to proceed so writeAndFlush's promise fails and
-        // surfaces the error through asyncWriteFailure. Returning 0 here on a
-        // dead channel would silently swallow the error: ByteBufferSend.writeTo
-        // would loop forever waiting for the channel to become writable again,
-        // which it never will, while the Send is silently considered "in flight".
-        if (nettyChannel.isActive() && !nettyChannel.isWritable()) {
-            return 0;
+        //   (a) The classic "Netty outbound buffer past high water mark" case: a slow peer
+        //       isn't draining fast enough, isWritable() is false, queueing more bytes
+        //       would bloat direct memory until the broker OOMs. Return 0; the next
+        //       Selector poll re-attempts, and onWritabilityChanged() wakes the poll the
+        //       moment the buffer drains below the low water mark.
+        //
+        //   (b) The "huge response in one shot" case: a 100MB Fetch response arrives at a
+        //       channel whose outbound buffer is currently empty — isWritable() is true.
+        //       The naive implementation allocates a 100MB direct ByteBuf in a single call
+        //       BEFORE the high water mark gate kicks in. Many slow consumers in flight at
+        //       once can each spike 100MB of direct memory, bypassing the gate entirely.
+        //       The fix is to cap each write to {@code bytesBeforeUnwritable()} (Netty's
+        //       remaining headroom under the high water mark) AND to a hard
+        //       {@link #MAX_WRITE_CHUNK_BYTES} chunk so a single call cannot drown the
+        //       pooled allocator. ByteBufferSend re-enters write() on the next poll and the
+        //       source ByteBuffer keeps its remainder, so correctness for large responses
+        //       is preserved — only the per-call allocation footprint changes.
+        //
+        // Restrict (a) to healthy channels (isActive() = open + connected). For a closed/
+        // disconnected channel, isWritable() is false too — but we WANT those writes to
+        // proceed so writeAndFlush's promise fails and surfaces the error through
+        // asyncWriteFailure. Returning 0 on a dead channel would silently swallow the
+        // error: ByteBufferSend.writeTo would loop forever waiting for writability that
+        // never comes, while the Send is silently considered "in flight".
+        long room;
+        if (nettyChannel.isActive()) {
+            room = nettyChannel.bytesBeforeUnwritable();
+            if (room <= 0) return 0;
+        } else {
+            // Channel already torn down — bypass the watermark gate so the writeAndFlush
+            // failure path surfaces. Cap by MAX_WRITE_CHUNK_BYTES regardless: even on a
+            // dying channel we don't want to over-allocate before the failure surfaces.
+            room = MAX_WRITE_CHUNK_BYTES;
         }
+        int safeChunk = (int) Math.min((long) remaining, Math.min(room, (long) MAX_WRITE_CHUNK_BYTES));
         // Use a pooled direct buffer so io_uring can submit the bytes without a heap-to-
         // direct intermediate copy. The buffer is released by Netty after the channel has
         // flushed it; we only own the writeAndFlush completion listener.
-        ByteBuf buf = nettyChannel.alloc().directBuffer(remaining);
+        ByteBuf buf = nettyChannel.alloc().directBuffer(safeChunk);
         // Anything between allocation and writeAndFlush taking ownership must release the
         // buf on failure — otherwise the pooled allocator slowly bleeds direct memory.
         boolean handedOff = false;
         try {
+            // Bound src so writeBytes only consumes safeChunk bytes. ByteBufferSend.writeTo
+            // re-enters on the next poll with the remainder, mirroring how NIO's
+            // SocketChannel.write returns partial progress when SO_SNDBUF saturates.
+            int savedLimit = src.limit();
+            src.limit(src.position() + safeChunk);
             buf.writeBytes(src);
+            src.limit(savedLimit);
             // Install the dec listener BEFORE incrementing pendingWriteBytes. If the
             // listener registration itself throws synchronously (DefaultPromise can
             // throw when the executor is shut down), inc'ing first would strand the
@@ -319,7 +441,7 @@ final class IoUringTransportLayer implements TransportLayer {
             io.netty.channel.ChannelFuture future = nettyChannel.writeAndFlush(buf);
             handedOff = true;
             future.addListener(f -> {
-                pendingWriteBytes.addAndGet(-remaining);
+                pendingWriteBytes.addAndGet(-safeChunk);
                 if (!f.isSuccess()) {
                     // Record the cause so the next Processor write step can throw it
                     // synchronously and route the channel through FAILED_SEND. Without
@@ -330,13 +452,13 @@ final class IoUringTransportLayer implements TransportLayer {
                     asyncWriteFailure = f.cause();
                 }
             });
-            pendingWriteBytes.addAndGet(remaining);
+            pendingWriteBytes.addAndGet(safeChunk);
         } finally {
             if (!handedOff) {
                 buf.release();
             }
         }
-        return remaining;
+        return safeChunk;
     }
 
     @Override
@@ -412,6 +534,7 @@ final class IoUringTransportLayer implements TransportLayer {
         while ((b = inbound.poll()) != null) {
             b.release();
         }
+        inboundBytes.set(0);
         selectionKey.cancel();
     }
 }
