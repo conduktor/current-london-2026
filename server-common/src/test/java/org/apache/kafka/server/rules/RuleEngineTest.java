@@ -326,6 +326,44 @@ public class RuleEngineTest {
     }
 
     @Test
+    public void activationSupplierFailureWarnIsThrottledUnderRapidFire() {
+        // Round-15 recent-changes BLOCKER-1: the WARN emitted when
+        // RuleEngine.evaluate's activationSupplier.get() throws a non-budget
+        // exception was previously un-throttled and un-sanitised — exactly the
+        // shape that round-14 BLOCKER L-1 closed for the per-rule eval-error
+        // WARN. This test proves the new throttle holds: a sustained tight
+        // loop of evaluations where the supplier throws every call leaves at
+        // most one unsuppressed WARN per ~1-second window.
+        //
+        // The package-private suppression counter exposes the throttle state
+        // without driving a slow wall-clock test.
+        RuleEngine engine = new RuleEngine();
+        // At least one DENY rule on the target API key — otherwise the engine
+        // short-circuits at rulesFor(apiKey).isEmpty() and never invokes the
+        // activation supplier (and so never enters the throttled WARN path).
+        engine.install(new RuleSetBuilder()
+            .put(denyRule("touch", ApiKeys.METADATA, "true", 99))
+            .build());
+        final int rapidFireCalls = 1_000;
+        for (int i = 0; i < rapidFireCalls; i++) {
+            // Supplier throws a non-budget RuntimeException — the exact shape
+            // a broken ApiMessageActivation accessor would take. Engine fails
+            // open to ALLOW; only the WARN is throttled.
+            RuleDecision d = engine.evaluate(
+                ApiKeys.METADATA, "client", null, false,
+                () -> {
+                    throw new IllegalStateException("walker bug");
+                });
+            assertSame(RuleDecision.ALLOW, d,
+                "broken supplier must fail open — only the WARN is throttled");
+        }
+        long suppressed = engine.suppressedActivationFailureWarnings.get();
+        assertTrue(suppressed >= rapidFireCalls - 2,
+            "expected the activation-supplier-failure throttle to suppress most rapid-fire "
+                + "WARNs, got " + suppressed + " out of " + rapidFireCalls + " events");
+    }
+
+    @Test
     public void ruleEvaluatesWhenApiKeyMatchesAndPredicateIsTrue() {
         RuleEngine engine = new RuleEngine();
         engine.install(new RuleSetBuilder()

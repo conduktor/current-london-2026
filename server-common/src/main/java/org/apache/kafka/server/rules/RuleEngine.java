@@ -170,8 +170,18 @@ public final class RuleEngine {
      *
      * <p>Visible for testing as package-private so test code can read the
      * suppression counter without driving a slow real-time wall-clock test.
+     *
+     * <p>Round-15 recent-changes MED-1: initial value is
+     * {@code System.nanoTime() - INTERVAL_NANOS - 1} (not 0) so the very first
+     * WARN always fires even when the JVM started within the first second of
+     * host uptime — under HotSpot's CLOCK_MONOTONIC-since-boot, {@code now < INTERVAL_NANOS}
+     * at that moment makes {@code now - 0 < INTERVAL_NANOS}, which would
+     * silently suppress the first observed event. {@code nanoTime() - INTERVAL_NANOS - 1}
+     * guarantees the first {@code now - last >= INTERVAL_NANOS} check passes,
+     * regardless of the absolute nanoTime origin.
      */
-    private final AtomicLong lastBudgetWarnNanos = new AtomicLong(0L);
+    private final AtomicLong lastBudgetWarnNanos =
+        new AtomicLong(System.nanoTime() - BUDGET_WARN_INTERVAL_NANOS - 1);
     final AtomicLong suppressedBudgetWarnings = new AtomicLong(0L);
     static final long BUDGET_WARN_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(1);
 
@@ -187,9 +197,32 @@ public final class RuleEngine {
      * throttle the broker emits at most one line per window plus a
      * suppressed-count tail.
      */
-    private final AtomicLong lastEvalErrorWarnNanos = new AtomicLong(0L);
+    private final AtomicLong lastEvalErrorWarnNanos =
+        new AtomicLong(System.nanoTime() - EVAL_ERROR_WARN_INTERVAL_NANOS - 1);
     final AtomicLong suppressedEvalErrorWarnings = new AtomicLong(0L);
     static final long EVAL_ERROR_WARN_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(1);
+
+    /**
+     * Round-15 recent-changes BLOCKER-1: throttle the activation-supplier
+     * fail-open WARN. Mirrors {@link #lastEvalErrorWarnNanos} above (which
+     * fixed the per-rule eval-error path in round-14 L-1) for the structurally
+     * identical hot-path WARN emitted when {@code activationSupplier.get()}
+     * throws a non-budget exception in {@link #evaluate}.
+     *
+     * <p>Without this throttle, an attacker who can craft a request that
+     * breaks {@link org.apache.kafka.server.rules.extract.ApiMessageActivation}
+     * — a version-skew accessor, a partially-constructed protocol object, a
+     * malformed nested-collection shape — gets one synchronous SLF4J WARN per
+     * request, and {@code t.toString()} carries wire-derived strings (topic
+     * names, principal strings, accessor names, exception messages quoting
+     * request bytes). Hundreds of requests per second from a single attacker
+     * reproduce the BLOCKER-1 log-injection and BLOCKER L-1 appender-DoS
+     * vectors on a hotter code path than either of the originals.
+     */
+    private final AtomicLong lastActivationFailureWarnNanos =
+        new AtomicLong(System.nanoTime() - ACTIVATION_FAILURE_WARN_INTERVAL_NANOS - 1);
+    final AtomicLong suppressedActivationFailureWarnings = new AtomicLong(0L);
+    static final long ACTIVATION_FAILURE_WARN_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(1);
 
     /**
      * Allow-list of principal strings (e.g. {@code "User:broker"}) that may
@@ -564,8 +597,12 @@ public final class RuleEngine {
                 // The attacker-shape exception above is caught FIRST so it never
                 // falls through this generic branch; see that catch's comment for
                 // why budget overflow needs the opposite posture.
-                LOG.warn("activation supplier failed for apiKey {} — failing open: {}",
-                    apiKey, t.toString());
+                //
+                // Round-15 recent-changes BLOCKER-1: route the WARN through a
+                // throttle that mirrors maybeWarnEvalError below — same hot-path,
+                // same wire-derived-string-in-toString hazard, same need to
+                // sanitise via LogSafe before writing to SLF4J.
+                maybeWarnActivationSupplierFailed(apiKey, t);
                 return RuleDecision.ALLOW;
             }
             // Round-8 audit HIGH (concurrency): the CEL eval-step budget is
@@ -748,6 +785,38 @@ public final class RuleEngine {
             }
         } else {
             suppressedEvalErrorWarnings.incrementAndGet();
+        }
+    }
+
+    /**
+     * Round-15 recent-changes BLOCKER-1: throttled + sanitised WARN for the
+     * activation-supplier fail-open path. The recent-changes audit observed
+     * that the un-throttled, un-sanitised inline WARN at the activation catch
+     * site was the exact shape that round-14 BLOCKER L-1 closed for the
+     * per-rule eval-error WARN two lines further down — same hot path, same
+     * wire-derived-string-in-toString hazard. The fix is mechanically
+     * identical: window-based CAS for log-rate bounding, suppressed-count
+     * carried forward, LogSafe on {@code t.toString()} (which can carry
+     * accessor exception messages quoting wire-derived names).
+     *
+     * <p>{@code apiKey} is enum-typed so it does not need sanitisation.
+     */
+    private void maybeWarnActivationSupplierFailed(ApiKeys apiKey, Throwable t) {
+        long now = System.nanoTime();
+        long last = lastActivationFailureWarnNanos.get();
+        if (now - last >= ACTIVATION_FAILURE_WARN_INTERVAL_NANOS
+            && lastActivationFailureWarnNanos.compareAndSet(last, now)) {
+            long suppressed = suppressedActivationFailureWarnings.getAndSet(0L);
+            if (suppressed > 0) {
+                LOG.warn("activation supplier failed for apiKey {} — failing open "
+                    + "(suppressed {} similar events in the previous window): {}",
+                    apiKey, suppressed, LogSafe.sanitize(t.toString()));
+            } else {
+                LOG.warn("activation supplier failed for apiKey {} — failing open: {}",
+                    apiKey, LogSafe.sanitize(t.toString()));
+            }
+        } else {
+            suppressedActivationFailureWarnings.incrementAndGet();
         }
     }
 }
