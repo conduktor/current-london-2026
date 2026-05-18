@@ -26,7 +26,7 @@ import kafka.raft.KafkaRaftManager
 import kafka.server.metadata._
 import kafka.server.share.SharePartitionManager
 import kafka.utils.CoreUtils
-import org.apache.kafka.common.config.ConfigException
+import org.apache.kafka.common.config.{ConfigException, ConfigResource, TopicConfig}
 import org.apache.kafka.common.message.ApiMessageType.ListenerType
 import org.apache.kafka.common.metrics.Metrics
 import org.apache.kafka.common.network.ListenerName
@@ -827,6 +827,40 @@ class BrokerServer(
       // startup with the original exception in the broker log, which is
       // the visibility we want — an operator must intervene rather than
       // a security-critical event sliding by at WARN level.
+      //
+      // __governance compaction sanity check (audit round-5 finding
+      // a016e43dc PARTIAL). If cleanup.policy on the topic does not
+      // include "compact", retention-based deletion eventually erases
+      // older rule records. The first restart that occurs after
+      // retention.ms elapses (default 7 days) drains a truncated log,
+      // installs RuleSet.EMPTY, and the broker fail-OPENs every
+      // previously-denied request. This is a delayed, audit-invisible
+      // regression — operators only notice when unauthorized traffic
+      // shows up in request logs. We WARN rather than fail-closed
+      // because the hazard window is hours/days away and hard-failing
+      // startup over a topic config the broker doesn't own would be
+      // a heavy hammer for a config typo; the WARN includes the exact
+      // remediation command. Effective policy = topic-level override
+      // if present, otherwise the broker-default log.cleanup.policy
+      // (Kafka default: "delete"), matching how LogManager resolves
+      // the policy when opening this log.
+      val govImage = metadataCache.currentImage().topics().getTopic(GovernanceTopic.NAME)
+      if (govImage != null) {
+        val govTopicLevel = metadataCache.currentImage().configs()
+          .configMapForResource(new ConfigResource(ConfigResource.Type.TOPIC, GovernanceTopic.NAME))
+          .get(TopicConfig.CLEANUP_POLICY_CONFIG)
+        val effectivePolicy = if (govTopicLevel != null) govTopicLevel
+          else config.logCleanupPolicy.asScala.mkString(",")
+        if (!effectivePolicy.contains(TopicConfig.CLEANUP_POLICY_COMPACT)) {
+          warn(s"Topic ${GovernanceTopic.NAME} has effective cleanup.policy='$effectivePolicy' " +
+            s"which does NOT include '${TopicConfig.CLEANUP_POLICY_COMPACT}'. Rule records on " +
+            s"this topic will be deleted by retention.ms (default 7 days), causing CEL DENY " +
+            s"rules to silently disappear and the broker to fail OPEN after restart. Fix with: " +
+            s"bin/kafka-configs.sh --bootstrap-server <broker> --alter --entity-type topics " +
+            s"--entity-name ${GovernanceTopic.NAME} --add-config cleanup.policy=compact " +
+            s"(audit finding a016e43dc).")
+        }
+      }
       val drained = governanceBootstrap.drainStartup(
         BrokerServer.GovernanceStartupDrainDeadlineMs)
       info(s"governance bootstrap drained $drained rule record(s) from " +
