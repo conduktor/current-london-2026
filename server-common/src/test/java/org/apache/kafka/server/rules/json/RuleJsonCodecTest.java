@@ -1496,12 +1496,55 @@ public class RuleJsonCodecTest {
             + "}";
         Rule r = RuleJsonCodec.decode("rule-emoji",
             envelope.getBytes(StandardCharsets.UTF_8));
-        // The surrogate pair must round-trip as a 2-char Java sequence —
-        // codePointAt(start) folds it to U+1F480 in the validator's view
-        // but the storage is the original 2 chars.
-        assertTrue(r.whenSource().contains("💀"),
-            "paired surrogate U+1F480 must survive codec admission verbatim: "
+        // R35-A4 [LOW] test hardening: prior assertion `r.whenSource().contains("💀")`
+        // proves substring containment but not that the surrogate pair survived
+        // codec admission as a properly-paired UTF-16 sequence. A future refactor
+        // that ADMITS the codepoint but mangles UTF-16 storage (e.g. converts to
+        // NFC and accidentally collapses the high half, or re-encodes through a
+        // String constructor that substitutes U+FFFD) would still satisfy
+        // `contains("💀")` if the substitution happens to leave the substring
+        // intact elsewhere — only an exact codepoint-at-index assertion proves
+        // the codec actually preserved the pair byte-for-byte.
+        //
+        // 1) Pin the codepoint at the *exact* index where the source places it.
+        //    `request.topic == "` is 18 chars; index 18 is the high surrogate
+        //    U+D83D, index 19 is the low surrogate U+DC80, and codePointAt(18)
+        //    folds them to U+1F480 (Character.charCount==2).
+        int pairIndex = r.whenSource().indexOf('"') + 1;
+        // After `request.topic == "`, the first char is the high surrogate.
+        // Use indexOf('"') above to anchor without depending on whitespace.
+        // (The CEL source uses spaces around ==, but indexOf is robust.)
+        assertEquals(0x1F480, r.whenSource().codePointAt(pairIndex),
+            "paired surrogate must fold to U+1F480 SKULL at the source index — "
+                + "if the codec mangled the UTF-16 storage this assertion fails "
+                + "even if substring containment still passes: "
                 + r.whenSource());
+        assertEquals(2, Character.charCount(0x1F480),
+            "U+1F480 is supplementary plane — Character.charCount must be 2; "
+                + "if Java's UTF-16 model changed this test must be revisited");
+        // 2) Pin the storage shape: both halves must be present at the right
+        //    indices. A substitution to U+FFFD would set pairIndex to 0xFFFD
+        //    and pairIndex+1 to a different char; we check both halves.
+        assertEquals('\uD83D', r.whenSource().charAt(pairIndex),
+            "high surrogate U+D83D must be stored verbatim at index "
+                + pairIndex + ": " + r.whenSource());
+        assertEquals('\uDC80', r.whenSource().charAt(pairIndex + 1),
+            "low surrogate U+DC80 must be stored verbatim at index "
+                + (pairIndex + 1) + ": " + r.whenSource());
+
+        // 3) Round-trip test: encode(decode(env)).getWhenSource() must yield a
+        //    Rule whose whenSource is bytewise identical to r's. If a future
+        //    encode path normalises or escapes the surrogate pair, this test
+        //    catches the asymmetry.
+        byte[] reEncoded = RuleJsonCodec.encode(r);
+        Rule rTrip = RuleJsonCodec.decode("rule-emoji", reEncoded);
+        assertEquals(r.whenSource(), rTrip.whenSource(),
+            "round-trip through encode→decode must preserve surrogate pair "
+                + "byte-for-byte: original=" + r.whenSource()
+                + " round-trip=" + rTrip.whenSource());
+        assertEquals(0x1F480, rTrip.whenSource().codePointAt(pairIndex),
+            "round-trip codepoint must remain U+1F480; if encode/decode "
+                + "mangles the pair this catches it: " + rTrip.whenSource());
     }
 
     @Test
