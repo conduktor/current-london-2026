@@ -675,14 +675,23 @@ public class CelProgramTest {
 
     @Test
     public void nestedComprehensionResolvesOuterAndInnerBindingsIndependently() {
-        // R36-A pin: with the per-iteration scoped lambda hoisted out of
-        // Comprehension.eval, each comprehension now mutates its OWN
-        // Object[1] holder in place. The correctness invariant under
-        // nesting is that the outer's holder and the inner's holder are
-        // SEPARATE — a refactor that accidentally shared a single holder
-        // across nesting levels would silently corrupt `a` mid-iteration
-        // (the inner would write `b`'s value into the shared slot and the
-        // outer-name lookup would return whatever `b` last was).
+        // SCOPING CORRECTNESS pin for nested comprehensions. R38-D-1 honest
+        // re-framing: this test does NOT exclusively pin R36-A's hoist
+        // optimization — the per-iteration-alloc variant (pre-R36-A) also
+        // passes, because Java gives each Comprehension.eval invocation a
+        // fresh stack frame and therefore an independent local holder. What
+        // this test actually pins is the contract R36-A's refactor MUST
+        // preserve: outer.holder and inner.holder must be SEPARATE storage,
+        // so a future refactor that hoists the holder ONCE MORE (e.g. onto
+        // an instance field on Comprehension, or onto RuleEngine state)
+        // would catastrophically share one slot across nesting levels and
+        // cross-contaminate bindings. The hoist-the-allocation property
+        // itself (one closure per .eval, not N per iteration) is a
+        // perf/GC characteristic; pinning that would require either an
+        // allocation-rate probe (JFR / Instrumentation, flaky in a unit
+        // test) or exposing closure-identity through the AST (invasive).
+        // We accept that gap explicitly; the scoping pin is the operator-
+        // visible correctness contract.
         //
         // The expression `outer.exists(a, inner.exists(b, a == "ax" && b == "bx"))`
         // can only return true if BOTH bindings resolve correctly: there
