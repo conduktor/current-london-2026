@@ -1249,6 +1249,51 @@ class KafkaHttpServerIntegrationTest {
     }
 
     @Test
+    void lowercaseMethodOnInContextPathEmitsJsonEnvelope() throws Exception {
+        // RFC 9110 §9.1: method tokens are case-sensitive. HttpServlet.service routes "get" (lowercase) through its
+        // unknown-method branch → sendError(501). That sendError dispatches via the *servlet-context* error handler
+        // (JsonErrorHandler, not CoreJsonErrorHandler) because the path is under /v1. Without the
+        // errorPageForMethod=true override on JsonErrorHandler, the parent ee10.servlet.ErrorHandler.handle()
+        // short-circuits to callback.succeeded() with an empty body — the same defect Wave 16 sealed on the
+        // Server-level handler but not on the servlet-context one. The HttpClient API will not send lowercase
+        // method tokens, so drive the wire directly with a raw socket. Asserting the JSON envelope on a 5xx 501
+        // response gates the fix.
+        try (Socket s = new Socket("127.0.0.1", server.boundPort())) {
+            s.setSoTimeout(5000);
+            OutputStream out = s.getOutputStream();
+            String req = "get /v1/topics/orders/records HTTP/1.1\r\n"
+                + "Host: 127.0.0.1\r\n"
+                + "Connection: close\r\n"
+                + "Content-Length: 0\r\n"
+                + "\r\n";
+            out.write(req.getBytes(StandardCharsets.US_ASCII));
+            out.flush();
+
+            String raw = readAllAscii(s.getInputStream());
+            int headerEnd = raw.indexOf("\r\n\r\n");
+            assertTrue(headerEnd >= 0,
+                "lowercase-method response must terminate its headers, got: " + raw);
+            String headers = raw.substring(0, headerEnd);
+            String body = raw.substring(headerEnd + 4);
+            // Status family: 501 Not Implemented today (HttpServlet.service default) but the contract is
+            // "non-2xx with envelope", not the exact code — stay tolerant if Jetty narrows that in a future release.
+            assertTrue(raw.startsWith("HTTP/1.1 4") || raw.startsWith("HTTP/1.1 5"),
+                "lowercase method must produce a 4xx/5xx response, got status line: "
+                    + raw.split("\r\n", 2)[0]);
+            assertFalse(body.isEmpty(),
+                "lowercase method must emit a JSON envelope body, got empty body. Headers: " + headers);
+            assertTrue(headers.toLowerCase(java.util.Locale.ROOT).contains("content-type: application/json"),
+                "lowercase method must declare application/json, got headers: " + headers);
+            String json = stripChunkPrefix(body);
+            JsonNode envelope = asJson(json.getBytes(StandardCharsets.UTF_8));
+            assertNotNull(envelope.get("errorCode"),
+                "lowercase-method envelope must include errorCode, got: " + json);
+            assertNotNull(envelope.get("errorMessage"),
+                "lowercase-method envelope must include errorMessage, got: " + json);
+        }
+    }
+
+    @Test
     void preDispatchRejectionOnPutEmitsJsonEnvelope() throws Exception {
         // Jetty's parent ErrorHandler.handle short-circuits via errorPageForMethod() — by default it only returns true
         // for {GET, POST, HEAD} (ERROR_METHODS), so a PUT/DELETE/PATCH that triggers a pre-dispatch URI rejection

@@ -155,6 +155,13 @@ public final class KafkaHttpServlet extends HttpServlet {
         // async dispatch hands the response off to the callback thread.
         String contentType = ContentTypeNegotiator.resolve(req.getHeader(HEADER_ACCEPT));
         AsyncContext async = req.startAsync();
+        // Disable Jetty's default AsyncContext timeout. KafkaHttpBridge.withTimeout already wraps the submitter
+        // future with `orTimeout(http.bridge.request.timeout.ms)` — when that fires, the dependent stage writes a
+        // 504/REQUEST_TIMED_OUT envelope via HttpStatusMapper. Leaving Jetty's default (30s) in place creates a
+        // race: with the same nominal value, Jetty's timer has no dispatch-hop overhead and wins under load,
+        // routing through JsonErrorHandler with a generic 500 envelope instead of the bridge's contracted 504.
+        // setTimeout(0L) makes the bridge the single timeout authority and keeps the error code consistent.
+        async.setTimeout(0L);
         // whenCompleteAsync(..., httpExecutor) dispatches the response write off the thread that completes the
         // submitter future. That thread is the broker's request-handler thread (RequestChannel callback) — running
         // a socket write there pins a Kafka API handler on slow-client I/O, which can starve the binary protocol.
@@ -245,6 +252,10 @@ public final class KafkaHttpServlet extends HttpServlet {
         }
 
         AsyncContext async = req.startAsync();
+        // Same rationale as doPost: KafkaHttpBridge.withTimeout owns the request-timeout contract (504/REQUEST_TIMED_OUT
+        // via HttpStatusMapper). Disable Jetty's default 30s AsyncContext timeout so the two don't race and so a
+        // broker stall produces the documented 504 envelope rather than a generic 500 from JsonErrorHandler.
+        async.setTimeout(0L);
         // See doPost for why this is whenCompleteAsync, and why we attach a terminal .exceptionally:
         // the broker handler thread that completes the future must not be the thread that performs the
         // HTTP socket write, but executor rejection at the handoff completes the dependent future and

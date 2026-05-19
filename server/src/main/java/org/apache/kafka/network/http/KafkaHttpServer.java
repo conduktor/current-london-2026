@@ -332,6 +332,20 @@ public final class KafkaHttpServer {
             this.mapper = mapper;
         }
 
+        /**
+         * Mirrors the override on {@link CoreJsonErrorHandler}: the parent {@code ErrorHandler.handle} short-circuits
+         * to {@code callback.succeeded()} with no body when {@code errorPageForMethod} returns false, and the default
+         * implementation only returns true for {@code {GET, POST, HEAD}}. A lowercase method like {@code get} is
+         * rejected by {@code HttpServlet.service} (RFC 9110: method names are case-sensitive) which then calls
+         * {@code sendError(501)} — that dispatch routes through this servlet-context handler. Without the override,
+         * the parent would skip {@link #generateAcceptableResponse} and emit an empty body, breaking the
+         * "every error response includes errorCode and errorMessage" contract for any non-{GET,POST,HEAD} method.
+         */
+        @Override
+        public boolean errorPageForMethod(String method) {
+            return true;
+        }
+
         @Override
         protected void generateAcceptableResponse(ServletContextRequest request,
                                                   HttpServletRequest req,
