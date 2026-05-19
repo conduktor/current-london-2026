@@ -491,13 +491,23 @@ final class IoUringTransportLayer implements TransportLayer {
             src.limit(src.position() + safeChunk);
             buf.writeBytes(src);
             src.limit(savedLimit);
-            // Install the dec listener BEFORE incrementing pendingWriteBytes. If the
-            // listener registration itself throws synchronously (DefaultPromise can
-            // throw when the executor is shut down), inc'ing first would strand the
-            // counter positive — hasPendingWrites() then permanently reports true and
-            // KafkaChannel.maybeCompleteSend never advances. The ByteBuf itself is
-            // released by writeAndFlush's promise on either path (success or failure),
-            // so the only leak we have to defend against here is the counter.
+            // Register the decrement-listener call (line below) BEFORE the increment
+            // statement (further below). Two reasons:
+            // (1) If listener registration itself throws synchronously — DefaultPromise
+            //     can RejectedExecutionException when the executor is shut down — inc'ing
+            //     first would strand the counter positive forever: hasPendingWrites() would
+            //     read true on every subsequent poll and KafkaChannel.maybeCompleteSend
+            //     would never fire. The ByteBuf is released by writeAndFlush's promise on
+            //     either path (success or failure), so the only leak this catches is the
+            //     counter.
+            // (2) This ordering does mean that if writeAndFlush completes synchronously
+            //     (the buffer goes straight to the wire because the outbound queue is
+            //     drained and the event-loop happens to flush inline), addListener fires
+            //     the body inline — decrementing to -safeChunk briefly before the
+            //     increment below restores it to 0. That transient negative is benign:
+            //     the Processor is single-threaded for this channel, so no other observer
+            //     reads pendingWriteBytes during the window between addListener returning
+            //     and the addAndGet below executing.
             try {
                 io.netty.channel.ChannelFuture future = nettyChannel.writeAndFlush(buf);
                 handedOff = true;
