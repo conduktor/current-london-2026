@@ -453,6 +453,37 @@ public class ConfigurationControlManager {
             // ReplicationControlManager is not wired in.
             if (!newlyCreatedResource && configResource.type() == Type.TOPIC) {
                 String backing = allConfigs.get(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG);
+                String existingBacking = existingConfigsMap.get(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG);
+                boolean wasView = existingBacking != null && !existingBacking.trim().isEmpty();
+                boolean willBeView = backing != null && !backing.trim().isEmpty();
+                // R53 (Codex Finding): view-ness is immutable after topic creation. Reject
+                // AlterConfigs that transitions a non-view topic into a view by setting
+                // view.backing.topic. The exploit chain Codex traced: AddPartitionsToTxn(T-0) is
+                // accepted while T is a regular topic (txnMetadata.topicPartitions includes T-0),
+                // an alter then sets view.backing.topic on T (this path), EndTxn issues markers
+                // for T-0, the broker classifies T as a view at marker dispatch time and rejects
+                // with INVALID_TOPIC_EXCEPTION (KafkaApis.handleWriteTxnMarkers), and
+                // TransactionMarkerRequestCompletionHandler has no case for INVALID_TOPIC_EXCEPTION
+                // — it falls into the default branch and throws IllegalStateException. The marker
+                // for T-0 is then never acknowledged or cancelled, leaving the transaction wedged
+                // and any READ_COMMITTED consumer on the backing partition blocked at the LSO.
+                // Separate but reinforcing concern: any data already written to T's log (when T
+                // was a regular topic) becomes orphaned after conversion, because consumer reads
+                // on the view redirect to the backing topic and never observe the pre-conversion
+                // log. We allow create-time view configs (newlyCreatedResource above) and
+                // view-to-view changes (predicate/backing rebind where wasView==true).
+                if (willBeView && !wasView) {
+                    throw new ConfigException(
+                        "Cannot set " + ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG +
+                        " on existing non-view topic '" + configResource.name() + "': " +
+                        "view-ness is immutable after topic creation. Create the topic with " +
+                        "view configs at create time, or alter an existing view's predicate or " +
+                        "backing. Converting a regular topic into a view would wedge any " +
+                        "in-flight transactions (the broker rejects markers on views with " +
+                        "INVALID_TOPIC_EXCEPTION, blocking READ_COMMITTED consumers at the LSO) " +
+                        "and orphan any data already present in the topic's log (consumer reads " +
+                        "redirect to the backing topic).");
+                }
                 if (backing != null) {
                     String trimmedBacking = backing.trim();
                     if (!trimmedBacking.isEmpty()) {

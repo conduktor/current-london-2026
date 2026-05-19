@@ -644,4 +644,110 @@ public class ConfigurationControlManagerTest {
         assertEquals(Errors.INVALID_REQUEST, nok.response().get(MYTOPIC).error(),
             "absent-backing precondition should fail once a backing is set");
     }
+
+    /**
+     * R53 (Codex Finding): view-ness is immutable after topic creation. An
+     * incrementalAlterConfigs that sets {@code view.backing.topic} on a topic which is not
+     * already a view must be rejected with INVALID_CONFIG. The exploit chain Codex traced:
+     * AddPartitionsToTxn(T-0) is accepted while T is a regular topic, an alter then sets
+     * view.backing.topic on T, EndTxn issues markers for T-0, the broker rejects with
+     * INVALID_TOPIC_EXCEPTION, and TransactionMarkerRequestCompletionHandler throws
+     * IllegalStateException in its default case — wedging the transaction and blocking
+     * READ_COMMITTED consumers at the LSO.
+     */
+    @Test
+    public void testR53RejectIncrementalAlterTurningRegularTopicIntoView() {
+        ConfigurationControlManager manager = new ConfigurationControlManager.Builder().
+            setKafkaConfigSchema(SCHEMA).
+            build();
+
+        // mytopic exists as a regular topic (no view.backing.topic). Seed via a non-view config.
+        manager.replay(new ConfigRecord().setResourceType(TOPIC.id()).setResourceName("mytopic").
+            setName("def").setValue("regular"));
+
+        ControllerResult<Map<ConfigResource, ApiError>> result = manager.incrementalAlterConfigs(
+            toMap(entry(MYTOPIC, toMap(entry("view.backing.topic", entry(SET, "some_backing"))))),
+            false);
+
+        assertEquals(Collections.emptyList(), result.records(),
+            "no records should be emitted when the conversion is rejected");
+        ApiError err = result.response().get(MYTOPIC);
+        assertEquals(Errors.INVALID_CONFIG, err.error());
+        assertTrue(err.message().contains("immutable"),
+            "error message must explain the view-ness immutability rule, got: " + err.message());
+        assertTrue(err.message().contains("mytopic"),
+            "error message must name the topic being converted, got: " + err.message());
+    }
+
+    /**
+     * R53 companion: the legacy AlterConfigs full-replace path is the same threat surface — a
+     * legacy alter that includes view.backing.topic on a topic that did not previously have it
+     * must also be rejected.
+     */
+    @Test
+    public void testR53RejectLegacyAlterTurningRegularTopicIntoView() {
+        ConfigurationControlManager manager = new ConfigurationControlManager.Builder().
+            setKafkaConfigSchema(SCHEMA).
+            build();
+
+        manager.replay(new ConfigRecord().setResourceType(TOPIC.id()).setResourceName("mytopic").
+            setName("def").setValue("regular"));
+
+        ControllerResult<Map<ConfigResource, ApiError>> result = manager.legacyAlterConfigs(
+            toMap(entry(MYTOPIC, toMap(entry("view.backing.topic", "some_backing")))),
+            false);
+
+        assertEquals(Collections.emptyList(), result.records());
+        ApiError err = result.response().get(MYTOPIC);
+        assertEquals(Errors.INVALID_CONFIG, err.error());
+        assertTrue(err.message().contains("immutable"),
+            "legacy alter rejection must also explain immutability, got: " + err.message());
+    }
+
+    /**
+     * R53 negative: altering an existing view (view.backing.topic already set) to point to a
+     * different backing must still succeed. Without this case, a regression that blanket-rejects
+     * any view.backing.topic SET would pass the rejection tests above.
+     */
+    @Test
+    public void testR53AllowRebindOnExistingView() {
+        ConfigurationControlManager manager = new ConfigurationControlManager.Builder().
+            setKafkaConfigSchema(SCHEMA).
+            build();
+        // mytopic was created as a view (has view.backing.topic = B_old).
+        manager.replay(new ConfigRecord().setResourceType(TOPIC.id()).setResourceName("mytopic").
+            setName("view.backing.topic").setValue("B_old"));
+
+        ControllerResult<Map<ConfigResource, ApiError>> result = manager.incrementalAlterConfigs(
+            toMap(entry(MYTOPIC, toMap(entry("view.backing.topic", entry(SET, "B_new"))))),
+            false);
+
+        assertEquals(ApiError.NONE, result.response().get(MYTOPIC),
+            "view-to-view rebind on an existing view must remain allowed");
+        assertEquals(1, result.records().size());
+        ConfigRecord emitted = (ConfigRecord) result.records().get(0).message();
+        assertEquals("view.backing.topic", emitted.name());
+        assertEquals("B_new", emitted.value());
+    }
+
+    /**
+     * R53 negative: a create-time alter (newlyCreatedResource=true path) which establishes
+     * view.backing.topic as part of topic creation must NOT trip the immutability check —
+     * that path is the supported "create the topic as a view" flow used by createTopics.
+     */
+    @Test
+    public void testR53AllowViewBackingAtCreate() {
+        ConfigurationControlManager manager = new ConfigurationControlManager.Builder().
+            setKafkaConfigSchema(SCHEMA).
+            build();
+
+        // Use the internal createTopicConfigs path: newlyCreatedResource=true via the
+        // incrementalAlterConfigs(newlyCreatedResource=true) overload.
+        ControllerResult<Map<ConfigResource, ApiError>> result = manager.incrementalAlterConfigs(
+            toMap(entry(MYTOPIC, toMap(entry("view.backing.topic", entry(SET, "fresh_backing"))))),
+            true);
+
+        assertEquals(ApiError.NONE, result.response().get(MYTOPIC),
+            "create-time view.backing.topic must remain allowed");
+    }
 }
