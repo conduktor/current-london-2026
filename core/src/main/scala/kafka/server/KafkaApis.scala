@@ -3677,6 +3677,17 @@ class KafkaApis(val requestChannel: RequestChannel,
       val topicError = invalidTopicError.orElse {
         if (!authHelper.authorize(request.context, READ, TOPIC, topicRequest.name)) {
           Some(new ApiError(Errors.TOPIC_AUTHORIZATION_FAILED))
+        } else if (concentrationKernel.isBackingTopic(topicRequest.name)) {
+          // r22 BLOCKER #175 — backing topics for concentrated logical topics carry the
+          // ProducerId/Epoch/LastSequence state of EVERY co-tenant writing to them. Without
+          // this guard, a principal with READ on the backing-topic name would receive the
+          // union of every co-tenant's producer state, including in-flight transactions and
+          // idempotency keys — enough to fingerprint co-tenant traffic, predict next
+          // sequence numbers, and detect when a co-tenant's transaction is mid-commit.
+          // Rejection runs AFTER auth (auth-first / shadow-second precedence, same as
+          // #128/#137/#146/#159/#189/#205) so UNauthorized probes still see
+          // TOPIC_AUTHORIZATION_FAILED and cannot enumerate the declared-backing set.
+          Some(new ApiError(Errors.INVALID_TOPIC_EXCEPTION))
         } else if (!metadataCache.contains(topicRequest.name))
           Some(new ApiError(Errors.UNKNOWN_TOPIC_OR_PARTITION))
         else {

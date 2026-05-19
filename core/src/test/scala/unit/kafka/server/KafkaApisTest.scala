@@ -12828,6 +12828,137 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testDescribeProducersRejectsBackingTopic(): Unit = {
+    // r22 BLOCKER #175 — backing topics for concentrated logical topics carry the
+    // ProducerId/Epoch/LastSequence state of every co-tenant writing to them. Without
+    // this guard, a principal authorized on the backing-topic NAME would receive the
+    // union of every co-tenant's producer state (in-flight transactions, idempotency
+    // keys, last sequence per producer), enough to fingerprint co-tenant traffic and
+    // predict next sequence numbers. The handler MUST reject backing topics with
+    // INVALID_TOPIC_EXCEPTION and NEVER consult ReplicaManager.activeProducerState.
+    // Auth-first / shadow-second precedence: an UNauthorized probe still gets
+    // TOPIC_AUTHORIZATION_FAILED and cannot enumerate the declared-backing set.
+    val backingTopic = "backing-topic-r22-175"
+    val plainTopic = "tenant-topic-r22-175"
+    val plainTp = new TopicPartition(plainTopic, 0)
+
+    addTopicToMetadataCache(backingTopic, numPartitions = 8)
+    addTopicToMetadataCache(plainTopic, numPartitions = 2)
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+    when(concentrationKernel.isBackingTopic(plainTopic)).thenReturn(false)
+
+    val authorizer: Authorizer = mock(classOf[Authorizer])
+    def buildExpectedActions(topic: String): util.List[Action] = {
+      val pattern = new ResourcePattern(ResourceType.TOPIC, topic, PatternType.LITERAL)
+      val action = new Action(AclOperation.READ, pattern, 1, true, true)
+      Collections.singletonList(action)
+    }
+    // The principal is authorized to READ on both topics — the test exists to show that
+    // authorization alone MUST NOT unlock the substrate's producer state.
+    when(authorizer.authorize(any[RequestContext], ArgumentMatchers.eq(buildExpectedActions(backingTopic))))
+      .thenReturn(Seq(AuthorizationResult.ALLOWED).asJava)
+    when(authorizer.authorize(any[RequestContext], ArgumentMatchers.eq(buildExpectedActions(plainTopic))))
+      .thenReturn(Seq(AuthorizationResult.ALLOWED).asJava)
+
+    // Plain-topic state should still be returned as-is.
+    when(replicaManager.activeProducerState(plainTp))
+      .thenReturn(new DescribeProducersResponseData.PartitionResponse()
+        .setErrorCode(Errors.NONE.code)
+        .setPartitionIndex(plainTp.partition)
+        .setActiveProducers(List(
+          new DescribeProducersResponseData.ProducerState()
+            .setProducerId(777L)
+            .setProducerEpoch(3)
+            .setLastSequence(50)
+            .setLastTimestamp(time.milliseconds())
+            .setCurrentTxnStartOffset(-1)
+            .setCoordinatorEpoch(1)
+        ).asJava))
+
+    val data = new DescribeProducersRequestData().setTopics(List(
+      new DescribeProducersRequestData.TopicRequest()
+        .setName(backingTopic)
+        .setPartitionIndexes(List(Int.box(0), Int.box(1)).asJava),
+      new DescribeProducersRequestData.TopicRequest()
+        .setName(plainTopic)
+        .setPartitionIndexes(List(Int.box(0)).asJava)
+    ).asJava)
+    val request = buildRequest(new DescribeProducersRequest.Builder(data).build())
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    kafkaApis = createKafkaApis(authorizer = Some(authorizer))
+    kafkaApis.handleDescribeProducersRequest(request)
+
+    val response = verifyNoThrottling[DescribeProducersResponse](request)
+    val backingResp = response.data.topics.asScala.find(_.name == backingTopic).getOrElse(
+      fail("Backing topic must appear in response with rejection error").asInstanceOf[Nothing])
+    assertEquals(2, backingResp.partitions.size,
+      "Every requested backing partition must be reflected back with the rejection error")
+    backingResp.partitions.asScala.foreach { p =>
+      assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, p.errorCode,
+        s"Backing partition ${p.partitionIndex} must be rejected with INVALID_TOPIC_EXCEPTION " +
+          "— surfacing producer state would leak co-tenant identity")
+      assertTrue(p.activeProducers == null || p.activeProducers.isEmpty,
+        "activeProducers list must be empty on rejection — any populated entry would leak " +
+          "the very co-tenant producer state this fix exists to hide")
+    }
+
+    val plainResp = response.data.topics.asScala.find(_.name == plainTopic).getOrElse(
+      fail("Plain topic must appear in response with real producer state").asInstanceOf[Nothing])
+    assertEquals(Errors.NONE.code, plainResp.partitions.asScala.head.errorCode)
+    assertEquals(1, plainResp.partitions.asScala.head.activeProducers.size,
+      "Plain topic producer state must be forwarded unchanged")
+    assertEquals(777L, plainResp.partitions.asScala.head.activeProducers.asScala.head.producerId)
+
+    // ReplicaManager MUST NEVER be asked for the backing topic's producer state — that's the
+    // entire cross-tenant leak this fix prevents.
+    verify(replicaManager, never()).activeProducerState(new TopicPartition(backingTopic, 0))
+    verify(replicaManager, never()).activeProducerState(new TopicPartition(backingTopic, 1))
+    verify(replicaManager, times(1)).activeProducerState(plainTp)
+  }
+
+  @Test
+  def testDescribeProducersUnauthorizedBackingProbeReturnsAuthorizationFailedNotInvalidTopic(): Unit = {
+    // r22 BLOCKER #175 — auth-first / shadow-second precedence. An UNauthorized probe of a
+    // backing-topic name must receive TOPIC_AUTHORIZATION_FAILED, NOT INVALID_TOPIC_EXCEPTION.
+    // Otherwise an unauthorized attacker could enumerate the declared-backing set by probing
+    // names and reading response-code differences. The backing predicate MUST NOT be consulted
+    // on this path — the auth check catches the probe first.
+    val backingTopic = "backing-topic-r22-175-authfail"
+    addTopicToMetadataCache(backingTopic, numPartitions = 8)
+    // isBackingTopic must NEVER be called on this path — leave the mock unstubbed so we can
+    // assert verify(never()).
+
+    val authorizer: Authorizer = mock(classOf[Authorizer])
+    val readBacking = new Action(AclOperation.READ,
+      new ResourcePattern(ResourceType.TOPIC, backingTopic, PatternType.LITERAL), 1, true, true)
+    when(authorizer.authorize(any[RequestContext], ArgumentMatchers.eq(Collections.singletonList(readBacking))))
+      .thenReturn(Seq(AuthorizationResult.DENIED).asJava)
+
+    val data = new DescribeProducersRequestData().setTopics(List(
+      new DescribeProducersRequestData.TopicRequest()
+        .setName(backingTopic)
+        .setPartitionIndexes(List(Int.box(0)).asJava)
+    ).asJava)
+    val request = buildRequest(new DescribeProducersRequest.Builder(data).build())
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    kafkaApis = createKafkaApis(authorizer = Some(authorizer))
+    kafkaApis.handleDescribeProducersRequest(request)
+
+    val response = verifyNoThrottling[DescribeProducersResponse](request)
+    val topicResp = response.data.topics.asScala.find(_.name == backingTopic).get
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED.code,
+      topicResp.partitions.asScala.head.errorCode,
+      "Auth-first precedence — unauthorized backing probe must see TOPIC_AUTHORIZATION_FAILED, " +
+        "not INVALID_TOPIC_EXCEPTION (which would leak the declared-backing set)")
+    verify(concentrationKernel, never()).isBackingTopic(backingTopic)
+    verify(replicaManager, never()).activeProducerState(any[TopicPartition])
+  }
+
+  @Test
   def testDescribeTransactions(): Unit = {
     val authorizer: Authorizer = mock(classOf[Authorizer])
     val data = new DescribeTransactionsRequestData()
