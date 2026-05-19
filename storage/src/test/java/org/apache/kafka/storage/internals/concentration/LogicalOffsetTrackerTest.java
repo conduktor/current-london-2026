@@ -273,6 +273,88 @@ public class LogicalOffsetTrackerTest {
     }
 
     @Test
+    public void restoreStartOffsetOnlyIfStillAtAppliesWhenCurrentMatches() {
+        // r25 BLOCKER #258 — happy path. When startOffset is still at expectedCurrent (no
+        // concurrent advance has interleaved), the CAS-style restore behaves identically to
+        // restoreStartOffsetOnly: writes previousStartOffset back, leaves nextOffset alone.
+        LogicalOffsetTracker tracker = new LogicalOffsetTracker();
+        for (int i = 0; i < 10; i++) tracker.commit(tracker.reserve("orders", 0));
+        tracker.advanceStartOffset("orders", 0, 7);
+        assertEquals(7L, tracker.startOffset("orders", 0));
+
+        boolean restored = tracker.restoreStartOffsetOnlyIfStillAt("orders", 0, 7, 3);
+
+        assertTrue(restored,
+            "CAS restore must succeed when current matches expected");
+        assertEquals(3L, tracker.startOffset("orders", 0),
+            "startOffset must be rolled back to previousStartOffset");
+        assertEquals(10L, tracker.nextLogicalOffset("orders", 0),
+            "nextOffset MUST NOT be touched (mirrors restoreStartOffsetOnly contract)");
+    }
+
+    @Test
+    public void restoreStartOffsetOnlyIfStillAtSkipsWhenConcurrentAdvanceSuperseded() {
+        // r25 BLOCKER #258 race discriminator — the whole point of the CAS variant. Setup
+        // mimics two concurrent advanceStartOffset calls: thread A advanced 0→5, A's persist
+        // is about to throw, but BEFORE A's rollback runs, thread B advanced 5→9 and persisted
+        // successfully. A's rollback now calls restoreStartOffsetOnlyIfStillAt(expected=5,
+        // previousStart=0). The pre-#258 unconditional restoreStartOffsetOnly would have
+        // written 0 back, silently regressing B's committed advance. The CAS check must detect
+        // that startOffset has moved beyond A's value (it's 9, not 5) and refuse to regress.
+        LogicalOffsetTracker tracker = new LogicalOffsetTracker();
+        for (int i = 0; i < 12; i++) tracker.commit(tracker.reserve("orders", 0));
+        // Simulate "thread A advanced to 5 and persist is in flight":
+        tracker.advanceStartOffset("orders", 0, 5);
+        // Simulate "thread B advanced to 9 and persisted successfully":
+        tracker.advanceStartOffset("orders", 0, 9);
+        // Now A's persist throws and its rollback fires:
+        boolean restored = tracker.restoreStartOffsetOnlyIfStillAt("orders", 0, 5, 0);
+
+        assertFalse(restored,
+            "CAS restore must REFUSE when a concurrent advance has moved startOffset beyond "
+                + "expected — otherwise the rollback silently regresses the concurrent successful "
+                + "advance (#258)");
+        assertEquals(9L, tracker.startOffset("orders", 0),
+            "B's committed advance MUST survive — startOffset stays at 9, not regressed to 0");
+        assertEquals(12L, tracker.nextLogicalOffset("orders", 0),
+            "nextOffset untouched throughout");
+    }
+
+    @Test
+    public void restoreStartOffsetOnlyIfStillAtRejectsValueAboveNextOffset() {
+        // Same invariant guard as restoreStartOffsetOnly: previousStartOffset > nextOffset would
+        // violate startOffset <= nextOffset. The CAS variant must enforce this on the apply path.
+        LogicalOffsetTracker tracker = new LogicalOffsetTracker();
+        for (int i = 0; i < 3; i++) tracker.commit(tracker.reserve("orders", 0));
+        tracker.advanceStartOffset("orders", 0, 2);
+        assertThrows(IllegalArgumentException.class,
+            () -> tracker.restoreStartOffsetOnlyIfStillAt("orders", 0, 2, 5));
+    }
+
+    @Test
+    public void restoreStartOffsetOnlyIfStillAtRejectsNegative() {
+        LogicalOffsetTracker tracker = new LogicalOffsetTracker();
+        assertThrows(IllegalArgumentException.class,
+            () -> tracker.restoreStartOffsetOnlyIfStillAt("orders", 0, 0, -1));
+    }
+
+    @Test
+    public void restoreStartOffsetOnlyIfStillAtIsNoOpEvenIfPreviousWouldBeInvalidUnderCAS() {
+        // Belt-and-braces — the bounds check (previousStartOffset > nextOffset) must run AFTER
+        // the CAS check. If a concurrent advance has superseded us, we don't regress AND we
+        // don't throw: the caller's original exception is what we want to propagate, and a
+        // bogus previousStart on a no-op path shouldn't spawn a spurious IAE that masks it.
+        LogicalOffsetTracker tracker = new LogicalOffsetTracker();
+        for (int i = 0; i < 3; i++) tracker.commit(tracker.reserve("orders", 0));
+        // Current startOffset is 0; pass expected=99 so CAS will miss.
+        boolean restored = tracker.restoreStartOffsetOnlyIfStillAt("orders", 0, 99, 1_000_000L);
+        assertFalse(restored,
+            "CAS miss must short-circuit BEFORE the previousStart bounds check");
+        assertEquals(0L, tracker.startOffset("orders", 0),
+            "startOffset untouched on CAS miss");
+    }
+
+    @Test
     public void commitOfUnknownReservationIsRejected() {
         LogicalOffsetTracker tracker = new LogicalOffsetTracker();
         Reservation r = tracker.reserve("orders", 0);

@@ -265,6 +265,69 @@ public final class LogicalOffsetTracker {
     }
 
     /**
+     * Conditional rollback primitive — re-seat {@code startOffset} to {@code previousStartOffset}
+     * ONLY IF the current {@code startOffset} matches {@code expectedCurrent}. Returns whether
+     * the restore actually happened.
+     *
+     * <p>r25 BLOCKER #258 — the unconditional {@link #restoreStartOffsetOnly} closed the #240
+     * race against concurrent commit (nextOffset advances), but a sibling race remained against
+     * concurrent advanceStartOffset (startOffset advances). Trace:
+     * <pre>
+     *   T0: thread A reads previousStart=50 (lock-free), advances to 100, persist begins
+     *   T1: thread B advances to 200 (under tracker lock — succeeds because 200>100),
+     *       persists 200 successfully (disk = 200)
+     *   T2: A's persist throws
+     *   T3: A calls restoreStartOffsetOnly(prev=50) — pre-#258 this UNCONDITIONALLY wrote 50
+     *       back, silently regressing B's committed advance and creating a disk-vs-memory split
+     *       (disk=200, memory=50) until next restart
+     * </pre>
+     * The CAS check below makes A's rollback a no-op when a concurrent successful advance has
+     * already moved {@code startOffset} beyond A's value: B's advance survives intact, and the
+     * caller of advanceStartOffset still gets its original exception so it knows the persist
+     * failed.
+     *
+     * <p>{@code previousStartOffset} is permitted to be less than the current value (regression
+     * is the entire point of rollback). The only bounds check is {@code 0 <= previousStartOffset
+     * <= nextOffset}, mirroring {@link #restoreStartOffsetOnly}. The {@code expectedCurrent}
+     * argument is the value the caller wrote in its own preceding advance — the caller MUST pass
+     * the {@code newStartOffset} it just installed, NOT a re-read.
+     *
+     * @return {@code true} if the restore was applied (no concurrent advance interleaved);
+     *     {@code false} if a concurrent successful advance has moved {@code startOffset} past
+     *     {@code expectedCurrent} and we deliberately did not regress it.
+     * @throws IllegalArgumentException if {@code previousStartOffset < 0} or
+     *     {@code previousStartOffset > current nextOffset}.
+     */
+    boolean restoreStartOffsetOnlyIfStillAt(String logicalTopic, int logicalPartition,
+                                             long expectedCurrent, long previousStartOffset) {
+        Objects.requireNonNull(logicalTopic, "logicalTopic");
+        if (previousStartOffset < 0) {
+            throw new IllegalArgumentException(
+                "previousStartOffset must be >= 0, was " + previousStartOffset);
+        }
+        PartitionState s = stateFor(logicalTopic, logicalPartition);
+        s.lock.lock();
+        try {
+            if (s.startOffset != expectedCurrent) {
+                // A concurrent successful advance has superseded us. DO NOT regress — that would
+                // silently undo B's committed work. The caller still rethrows its original
+                // exception so it learns the operation failed; the in-memory tracker reflects the
+                // newer successful state (which matches B's persisted disk value).
+                return false;
+            }
+            if (previousStartOffset > s.nextOffset) {
+                throw new IllegalArgumentException(
+                    "previousStartOffset (" + previousStartOffset
+                        + ") > current nextOffset (" + s.nextOffset + ")");
+            }
+            s.startOffset = previousStartOffset;
+            return true;
+        } finally {
+            s.lock.unlock();
+        }
+    }
+
+    /**
      * Direct seeding of partition state, used during recovery from a sidecar or backing-log scan.
      * Atomically (under the partition lock) installs the given {@code startOffset} and
      * {@code nextOffset} as the partition's bookkeeping.

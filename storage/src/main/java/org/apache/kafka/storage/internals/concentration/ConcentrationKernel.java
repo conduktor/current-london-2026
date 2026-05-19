@@ -1181,7 +1181,21 @@ public final class ConcentrationKernel implements AutoCloseable {
             // restorePartition wrote the stale snapshot back. The new
             // restoreStartOffsetOnly takes the lock and mutates startOffset only, so any
             // concurrent commit's nextOffset advance survives the rollback intact.
-            tracker.restoreStartOffsetOnly(logicalTopic, logicalPartition, previousStart);
+            //
+            // r25 BLOCKER #258 (sibling of #240): the unconditional restoreStartOffsetOnly
+            // closed the nextOffset race but a startOffset sibling race remained. Two concurrent
+            // advanceStartOffset calls on the same partition: A captures previousStart=50, A
+            // advances tracker to 100, A's persist begins. B captures previousStart=100 (visible
+            // because A's tracker write is under-lock), B advances to 200, B persists 200
+            // successfully (disk=200). A's persist then throws. The pre-#258 rollback would
+            // unconditionally write 50 back to the tracker — silently regressing B's
+            // committed-to-disk advance and creating a disk(200) vs memory(50) split until next
+            // restart. restoreStartOffsetOnlyIfStillAt makes A's rollback a no-op when a
+            // concurrent successful advance has moved startOffset beyond A's value: B's advance
+            // survives, the disk-vs-memory state stays consistent (both at 200), and A still
+            // rethrows the original IOException so its caller learns the persist failed.
+            tracker.restoreStartOffsetOnlyIfStillAt(
+                logicalTopic, logicalPartition, newStartOffset, previousStart);
             throw e;
         }
         // Also evict any idempotent-cache entries whose logicalLastOffset is now below
