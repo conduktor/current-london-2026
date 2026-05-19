@@ -314,7 +314,23 @@ public final class ApiMessageActivation {
         // usability inconvenience; under-redacting a real credential is a
         // security incident. When in doubt, redact." Treat any non-String
         // shape as in doubt.
-        if (!(name instanceof String) || isSensitiveConfigName((String) name)) {
+        //
+        // Round-20 HIGH C-1: extend the bias-to-redact to empty and
+        // whitespace-only names. None of the patterns in
+        // isSensitiveConfigName matches an empty or whitespace-only string
+        // (".password" / ".keystore.key" / "secret" all require at least
+        // some prefix or contained substring), so the previous predicate
+        // silently failed-OPEN on `setName("")` and `setName("   ")`. No
+        // legitimate Kafka config is keyed by an empty or whitespace-only
+        // string — those shapes can only arise from a corrupted wire frame
+        // or an in-process caller constructing an instance with the empty
+        // string. Either way, we cannot prove the name is benign, so we
+        // redact. The map key is preserved for the same reason as the
+        // null branch (rule must not be able to probe `c.value == null`
+        // to discover redaction state).
+        if (!(name instanceof String)
+                || ((String) name).isBlank()
+                || isSensitiveConfigName((String) name)) {
             // Keep the key — only the value is sensitive.
             out.put("value", null);
         }

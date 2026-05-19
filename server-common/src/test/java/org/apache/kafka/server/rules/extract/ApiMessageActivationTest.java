@@ -728,6 +728,80 @@ public class ApiMessageActivationTest {
     }
 
     @Test
+    public void alterConfigsValueIsRedactedWhenSiblingNameIsEmptyOrBlank() {
+        // Round-20 HIGH C-1: redact-by-default must extend to empty and
+        // whitespace-only sibling names. None of the credential patterns
+        // in isSensitiveConfigName matches an empty string or a
+        // whitespace-only string — ".password", ".keystore.key",
+        // "secret" and the listener-prefixed forms all require at least
+        // some non-whitespace prefix or contained substring. With the
+        // pre-fix predicate `name instanceof String && isSensitive(name)`,
+        // an instance constructed via `setName("").setValue(...)` or
+        // `setName("   ").setValue(...)` was treated as a benign config
+        // and its value left visible. No legitimate Kafka config is keyed
+        // by an empty or whitespace-only string, so this shape can only
+        // arise from a corrupted wire frame or an in-process caller —
+        // either way, we cannot prove the name is benign and must redact.
+        //
+        // Pin every shape that String.isBlank() classifies as blank
+        // (empty + ASCII whitespace). The map key must remain so a hostile
+        // rule cannot probe `c.value == null` to discover the redaction
+        // state (same posture as the null-name branch above).
+        //
+        // NOTE: String.isBlank() uses Character.isWhitespace, which excludes
+        // non-breaking spaces (NBSP U+00A0, FIGURE SPACE U+2007, NARROW
+        // NBSP U+202F). A name composed solely of those codepoints is NOT
+        // caught by this fix. R20-C scope is empty/ASCII-blank; wider
+        // Unicode-blank coverage would need a helper mirroring
+        // RuleEngine#isAllWhitespace (which unions isWhitespace +
+        // isSpaceChar). Defer unless re-flagged.
+        String[] blankShapes = {
+            "",         // empty
+            "   ",      // ASCII spaces
+            "\t",       // ASCII tab
+            "\n",       // ASCII newline
+            " \t\n "    // mixed whitespace
+        };
+        for (String blank : blankShapes) {
+            AlterableConfigCollection configs = new AlterableConfigCollection();
+            configs.add(new AlterableConfig().setName(blank).setValue("could-be-any-secret"));
+            AlterConfigsResource resource = new AlterConfigsResource()
+                .setResourceType((byte) 2)
+                .setResourceName("audit-events")
+                .setConfigs(configs);
+            AlterConfigsResourceCollection resources = new AlterConfigsResourceCollection();
+            resources.add(resource);
+            AlterConfigsRequestData req = new AlterConfigsRequestData().setResources(resources);
+
+            Map<String, Object> m = ApiMessageActivation.from(req);
+            List<?> resourceList = (List<?>) m.get("resources");
+            Map<?, ?> resourceMap = (Map<?, ?>) resourceList.get(0);
+            List<?> configList = (List<?>) resourceMap.get("configs");
+            Map<?, ?> cfg = (Map<?, ?>) configList.get(0);
+            assertTrue(cfg.containsKey("value"),
+                "value key MUST remain present for blank shape " + describe(blank)
+                    + " so a rule can't probe `c.value == null` to learn redaction state");
+            assertNull(cfg.get("value"),
+                "blank sibling name " + describe(blank)
+                    + " MUST trigger redact-by-default — we cannot prove the name is benign, so we redact");
+        }
+    }
+
+    private static String describe(String s) {
+        StringBuilder out = new StringBuilder("\"");
+        for (int i = 0; i < s.length(); ) {
+            int cp = s.codePointAt(i);
+            if (cp >= 0x20 && cp < 0x7F) {
+                out.appendCodePoint(cp);
+            } else {
+                out.append(String.format("\\u%04X", cp));
+            }
+            i += Character.charCount(cp);
+        }
+        return out.append("\"").toString();
+    }
+
+    @Test
     public void sensitiveIncrementalAlterConfigsValueIsRedactedWhenNameMatchesPasswordPattern() {
         // Same contract as AlterConfigsRequest but exercised through the
         // distinct generated class IncrementalAlterConfigsRequestData$AlterableConfig.
