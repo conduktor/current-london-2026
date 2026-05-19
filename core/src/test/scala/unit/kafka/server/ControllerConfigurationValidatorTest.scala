@@ -23,8 +23,9 @@ import org.apache.kafka.common.config.ConfigResource.Type.{BROKER, BROKER_LOGGER
 import org.apache.kafka.common.config.TopicConfig.{REMOTE_LOG_STORAGE_ENABLE_CONFIG, SEGMENT_BYTES_CONFIG, SEGMENT_JITTER_MS_CONFIG, SEGMENT_MS_CONFIG}
 import org.apache.kafka.common.errors.{InvalidConfigurationException, InvalidRequestException, InvalidTopicException}
 import org.apache.kafka.coordinator.group.GroupConfig
+import org.apache.kafka.server.config.ServerConfigs
 import org.apache.kafka.server.metrics.ClientMetricsConfigs
-import org.junit.jupiter.api.Assertions.{assertEquals, assertThrows}
+import org.junit.jupiter.api.Assertions.{assertEquals, assertThrows, assertTrue}
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.ValueSource
@@ -123,6 +124,78 @@ class ControllerConfigurationValidatorTest {
     assertEquals("Invalid negative broker ID.",
       assertThrows(classOf[InvalidRequestException], () => validator.validate(
         new ConfigResource(BROKER, "-1"), config, emptyMap())). getMessage)
+  }
+
+  // R34-B-1 [HIGH] — controller-direct path (KIP-919) value-validation
+  // for governance.bypass.principals. Without these tests, the KIP-919
+  // bootstrap-controller route would silently accept any string and
+  // brick brokers at next restart.
+
+  @Test
+  def testValidGovernanceBypassPrincipalsAcceptedOnBrokerResource(): Unit = {
+    val config = new util.TreeMap[String, String]()
+    config.put(ServerConfigs.GOVERNANCE_BYPASS_PRINCIPALS_CONFIG, "User:broker;User:kafka-controller")
+    // Empty string is also a legal admin-API value — empty-set rejection
+    // is a broker-startup contract, not an admit-time contract.
+    validator.validate(new ConfigResource(BROKER, "0"), config, emptyMap())
+    val emptyConfig = new util.TreeMap[String, String]()
+    emptyConfig.put(ServerConfigs.GOVERNANCE_BYPASS_PRINCIPALS_CONFIG, "")
+    validator.validate(new ConfigResource(BROKER, "0"), emptyConfig, emptyMap())
+  }
+
+  @Test
+  def testMalformedGovernanceBypassPrincipalsRejectedOnBrokerResource(): Unit = {
+    val config = new util.TreeMap[String, String]()
+    config.put(ServerConfigs.GOVERNANCE_BYPASS_PRINCIPALS_CONFIG, "garbage-no-colon")
+    val ex = assertThrows(classOf[InvalidConfigurationException], () => validator.validate(
+      new ConfigResource(BROKER, "0"), config, emptyMap()))
+    // The validator's diagnostic embeds the config name and explains
+    // the format. Pin the substring rather than the full message to
+    // tolerate future hardening of the parser's wording.
+    assertTrue(ex.getMessage.contains(ServerConfigs.GOVERNANCE_BYPASS_PRINCIPALS_CONFIG),
+      s"diagnostic should name the offending config; got: ${ex.getMessage}")
+    assertTrue(ex.getMessage.contains("type:name"),
+      s"diagnostic should explain the expected format; got: ${ex.getMessage}")
+  }
+
+  @Test
+  def testGovernanceBypassPrincipalsCommaTypoRejectedOnBrokerResource(): Unit = {
+    val config = new util.TreeMap[String, String]()
+    // The single most common operator typo: comma instead of semicolon.
+    // R29 #270/#272 contract — must reject loudly through every admit
+    // path including the controller-direct one.
+    config.put(ServerConfigs.GOVERNANCE_BYPASS_PRINCIPALS_CONFIG, "User:broker,User:kafka-controller")
+    val ex = assertThrows(classOf[InvalidConfigurationException], () => validator.validate(
+      new ConfigResource(BROKER, "0"), config, emptyMap()))
+    assertTrue(ex.getMessage.toLowerCase.contains("comma") || ex.getMessage.contains(","),
+      s"diagnostic should mention the comma typo; got: ${ex.getMessage}")
+  }
+
+  @Test
+  def testGovernanceBypassPrincipalsValidationSkippedForUnrelatedBrokerConfigs(): Unit = {
+    // The validator gate is deliberately narrow — only the security-
+    // critical governance.bypass.principals goes through value-
+    // validation here. Other broker configs continue to be accepted
+    // without controller-side value checks, preserving the historical
+    // behavior. This test pins that scope so a future "validate every
+    // broker config" change is a conscious decision.
+    val config = new util.TreeMap[String, String]()
+    config.put("some.other.broker.config", "any-value-at-all")
+    config.put("yet.another.config", "<<also-not-validated>>")
+    validator.validate(new ConfigResource(BROKER, "0"), config, emptyMap())
+  }
+
+  @Test
+  def testGovernanceBypassPrincipalsValidatedWhenMixedWithOtherConfigs(): Unit = {
+    // Even when the bad value is one of many in a multi-config
+    // IncrementalAlterConfigs RPC, the gate still catches it.
+    val config = new util.TreeMap[String, String]()
+    config.put("some.other.broker.config", "fine")
+    config.put(ServerConfigs.GOVERNANCE_BYPASS_PRINCIPALS_CONFIG, ":blank-type-rejected")
+    val ex = assertThrows(classOf[InvalidConfigurationException], () => validator.validate(
+      new ConfigResource(BROKER, "0"), config, emptyMap()))
+    assertTrue(ex.getMessage.contains(ServerConfigs.GOVERNANCE_BYPASS_PRINCIPALS_CONFIG),
+      s"diagnostic should name the offending config; got: ${ex.getMessage}")
   }
 
   @Test

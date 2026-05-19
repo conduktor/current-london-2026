@@ -19,13 +19,15 @@ package kafka.server
 
 import java.util
 import java.util.Properties
-import org.apache.kafka.common.config.ConfigResource
+import org.apache.kafka.common.config.{ConfigException, ConfigResource}
 import org.apache.kafka.common.config.ConfigResource.Type.{BROKER, CLIENT_METRICS, GROUP, TOPIC}
 import org.apache.kafka.controller.ConfigurationValidator
 import org.apache.kafka.common.errors.{InvalidConfigurationException, InvalidRequestException}
 import org.apache.kafka.common.internals.Topic
 import org.apache.kafka.coordinator.group.GroupConfigManager
+import org.apache.kafka.server.config.ServerConfigs
 import org.apache.kafka.server.metrics.ClientMetricsConfigs
+import org.apache.kafka.server.rules.BypassPrincipalsValidator
 import org.apache.kafka.storage.internals.log.LogConfig
 
 import scala.collection.mutable
@@ -45,6 +47,49 @@ import scala.collection.mutable
  * as the others. It is not persisted to the metadata log.
  */
 class ControllerConfigurationValidator(kafkaConfig: KafkaConfig) extends ConfigurationValidator {
+  // R34-B-1 [HIGH]: the controller-direct admin path (KIP-919,
+  // `kafka-configs --bootstrap-controller`) historically validates ONLY
+  // resource.name() for BROKER resources — newConfigs values are not
+  // inspected. For most broker configs that mirror behavior of the
+  // broker-routed path's ConfigAdminManager.preprocess, but for
+  // governance.bypass.principals it opens a delayed time-bomb: a
+  // malformed value lands in KRaft metadata via the controller-direct
+  // route, and the broker refuses to start at the next restart
+  // (BrokerGovernanceBootstrap calls
+  // RuleEngine.parseBypassPrincipals). The admin who typed the bad
+  // value sees a successful ack and never associates the eventual
+  // restart failure with their change.
+  //
+  // Scope of this gate: this is a deliberately NARROW fix, not a
+  // blanket "value-validate every BROKER config at the controller"
+  // change. We only enforce the validators that protect security-
+  // critical broker startup invariants (governance.bypass.principals).
+  // Adding more configs here is a separate decision per-config.
+  private val brokerConfigValidators: Map[String, BypassPrincipalsValidator] = Map(
+    ServerConfigs.GOVERNANCE_BYPASS_PRINCIPALS_CONFIG -> new BypassPrincipalsValidator()
+  )
+
+  private def validateBrokerConfigValues(
+    newConfigs: util.Map[String, String]
+  ): Unit = {
+    newConfigs.forEach((key, value) => {
+      brokerConfigValidators.get(key).foreach { validator =>
+        try {
+          validator.ensureValid(key, value)
+        } catch {
+          case e: ConfigException =>
+            // The BypassPrincipalsValidator already LogSafe-sanitises
+            // the offending segment before embedding it in the
+            // exception message. Rewrap into the controller's expected
+            // failure type, preserving the diagnostic verbatim so the
+            // admin still sees which config and which value were
+            // rejected.
+            throw new InvalidConfigurationException(e.getMessage, e)
+        }
+      }
+    })
+  }
+
   private def validateTopicName(
     name: String
   ): Unit = {
@@ -119,7 +164,11 @@ class ControllerConfigurationValidator(kafkaConfig: KafkaConfig) extends Configu
         }
         LogConfig.validate(oldConfigs, properties, kafkaConfig.extractLogConfigMap,
           kafkaConfig.remoteLogManagerConfig.isRemoteStorageSystemEnabled())
-      case BROKER => validateBrokerName(resource.name())
+      case BROKER =>
+        validateBrokerName(resource.name())
+        // R34-B-1: gate the bypass-principals time-bomb. See the
+        // brokerConfigValidators field comment for scope rationale.
+        validateBrokerConfigValues(newConfigs)
       case CLIENT_METRICS =>
         val properties = new Properties()
         newConfigs.forEach((key, value) => properties.setProperty(key, value))
