@@ -591,23 +591,10 @@ public final class IoUringSelector implements BrokerSelector {
             madeProgress = true;
         }
 
-        // 4. Idle expiry — only against channels that haven't already been claimed by disconnect.
-        if (connectionsMaxIdleNanos > 0) {
-            Iterator<Map.Entry<String, Long>> idleIt = lastActiveNanos.entrySet().iterator();
-            while (idleIt.hasNext()) {
-                Map.Entry<String, Long> entry = idleIt.next();
-                if (nowNanos - entry.getValue() > connectionsMaxIdleNanos) {
-                    KafkaChannel channel = channels.remove(entry.getKey());
-                    nettyChannels.remove(entry.getKey());
-                    if (channel != null) {
-                        explicitlyMutedChannels.remove(channel);
-                        disconnected.put(entry.getKey(), ChannelState.EXPIRED);
-                        Utils.closeQuietly(channel, "expired channel");
-                    }
-                    idleIt.remove();
-                    madeProgress = true;
-                }
-            }
+        // 4. Idle expiry — at most one channel per poll. Helper extracted to keep poll()
+        //    under checkstyle's MethodLength limit and to mirror NIO semantics.
+        if (maybeExpireOldestIdleChannel(nowNanos)) {
+            madeProgress = true;
         }
 
         // 5. If nothing happened, wait. Drain permits on acquisition so a burst of
@@ -643,6 +630,51 @@ public final class IoUringSelector implements BrokerSelector {
             }
             outOfMemory = false;
         }
+    }
+
+    /**
+     * Evict at most ONE oldest-idle channel per poll. Mirrors NIO
+     * {@code Selector.maybeCloseOldestConnection} (clients/.../Selector.java:795-810):
+     * NIO evicts a single LRU-head entry per poll so a backlog of idle channels does
+     * not turn into a synchronous eviction storm on the Processor thread (each close
+     * walks transport + authenticator + buffer cleanup; sweeping all of them in one
+     * poll has stalled selector loops in production).
+     *
+     * <p>Round-20C F12: the previous implementation walked {@link #lastActiveNanos}
+     * and reaped every expired entry in one pass — a 10k-idle-channel host sweeping
+     * all 10k on the same poll spiked p99 poll latency by orders of magnitude. NIO
+     * does not have this problem because it evicts the head of an insertion-ordered
+     * map. We don't keep an LRU index here, so we pay an O(n) min-scan once per poll
+     * to find the oldest — same cost as the existing {@code lowestPriorityChannel}
+     * scan over the same map, and dramatically cheaper than evicting N channels in
+     * one pass.
+     *
+     * @return true iff a channel was evicted this poll
+     */
+    private boolean maybeExpireOldestIdleChannel(long nowNanos) {
+        if (connectionsMaxIdleNanos <= 0 || lastActiveNanos.isEmpty()) {
+            return false;
+        }
+        String oldestId = null;
+        long oldestNanos = Long.MAX_VALUE;
+        for (Map.Entry<String, Long> entry : lastActiveNanos.entrySet()) {
+            if (entry.getValue() < oldestNanos) {
+                oldestNanos = entry.getValue();
+                oldestId = entry.getKey();
+            }
+        }
+        if (oldestId == null || nowNanos - oldestNanos <= connectionsMaxIdleNanos) {
+            return false;
+        }
+        KafkaChannel channel = channels.remove(oldestId);
+        nettyChannels.remove(oldestId);
+        lastActiveNanos.remove(oldestId);
+        if (channel != null) {
+            explicitlyMutedChannels.remove(channel);
+            disconnected.put(oldestId, ChannelState.EXPIRED);
+            Utils.closeQuietly(channel, "expired channel");
+        }
+        return true;
     }
 
     /**

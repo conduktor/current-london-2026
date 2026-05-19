@@ -537,6 +537,62 @@ class IoUringSelectorTest {
         assertEquals(id, s.completedSends().get(0).destinationId());
     }
 
+    @Test
+    void idleExpiryReapsAtMostOneChannelPerPoll() throws Exception {
+        // Round-20C F12 regression: pre-fix the idle expiry block walked the whole
+        // lastActiveNanos map and reaped every expired entry in one pass. On a host
+        // with thousands of simultaneously-idle channels (typical after a peer subnet
+        // outage), the Processor thread spent the entire poll inside closeQuietly
+        // calls — each close walks transport+authenticator+buffer cleanup — and the
+        // event-loop fell behind on real traffic.
+        //
+        // NIO bounds this with maybeCloseOldestConnection: AT MOST ONE eviction per
+        // poll, oldest first (clients/.../Selector.java:795-810). io_uring must agree.
+        // The fix replaces the sweep loop with a single O(n) min-scan that finds the
+        // oldest entry, evicts only it, and lets the next poll handle the next-oldest.
+        // This test asserts that exact contract — N expired channels need N polls to
+        // drain, evicted strictly in oldest-first order so the Processor's per-poll
+        // wall budget stays bounded under mass idle.
+        long idle = TimeUnit.MILLISECONDS.toNanos(100);
+        IoUringSelector s = newSelector(idle);
+
+        int count = 5;
+        List<String> idsByAge = new ArrayList<>(count);
+        for (int i = 0; i < count; i++) {
+            EmbeddedChannel netty = acceptNew(s, REMOTE_A);
+            s.poll(0); // stamps lastActiveNanos for this channel at the current time
+            idsByAge.add(s.connected().get(0));
+            time.sleep(10); // stagger so the oldest-first order is unambiguous
+        }
+        assertEquals(count, s.channels().size(), "preconditions: all channels are registered");
+
+        // Push every channel past the idle deadline by the same margin so they're ALL
+        // eligible — the question is whether the selector evicts all of them in one
+        // poll (pre-fix) or strictly one per poll (post-fix).
+        time.sleep(idle / 1_000_000 + 100);
+
+        for (int evicted = 0; evicted < count; evicted++) {
+            s.poll(0);
+            // Exactly one new EXPIRED entry per poll.
+            assertEquals(1, s.disconnected().size(),
+                "poll #" + (evicted + 1) + " must evict exactly ONE expired channel, not the whole "
+                    + "backlog; pre-fix this would be " + (count - evicted) + ". "
+                    + "Disconnected: " + s.disconnected());
+            Map.Entry<String, ChannelState> only = s.disconnected().entrySet().iterator().next();
+            assertEquals(ChannelState.EXPIRED, only.getValue(),
+                "idle eviction must surface ChannelState.EXPIRED, not a generic disconnect");
+            assertEquals(idsByAge.get(evicted), only.getKey(),
+                "evictions must run oldest-first; expected " + idsByAge.get(evicted)
+                    + " on poll #" + (evicted + 1) + ", got " + only.getKey());
+            assertEquals(count - evicted - 1, s.channels().size(),
+                "after " + (evicted + 1) + " polls, " + (count - evicted - 1)
+                    + " channels must still be registered");
+        }
+        s.poll(0);
+        assertTrue(s.disconnected().isEmpty(),
+            "once the idle backlog is drained, further polls must be quiet");
+    }
+
     /**
      * KafkaPrincipalBuilder whose constructor throws a {@link LinkageError} — stands in for
      * the NoClassDefFoundError / ExceptionInInitializerError surface area the production
