@@ -12525,6 +12525,99 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testProduceTenantRefusedOnConsumerOffsetsInternalTopic(): Unit = {
+    // #91 defence-in-depth: a tenant must NEVER Produce to an internal topic
+    // (__consumer_offsets, __transaction_state, __share_group_state).
+    // TenantNamespace.toPhysical passes internal names through unchanged
+    // because Topic.isInternal short-circuits the prefix rewrite — without
+    // an explicit refusal here, a misconfigured wildcard `WRITE Topic:*`
+    // grant on the tenant principal would let the tenant corrupt the
+    // cluster's offsets log directly. TOPIC_AUTHORIZATION_FAILED keeps the
+    // wire shape indistinguishable from a regular authz refusal so the
+    // tenant cannot probe ACL configuration through the error category.
+    val produceRequest = buildSingleTopicProduceRequest(Topic.GROUP_METADATA_TOPIC_NAME)
+    val request = buildRequest(
+      produceRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), any[Long])).thenReturn(0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    kafkaApis = createKafkaApis(
+      authorizer = None,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[ProduceResponse](request)
+    val topicResp = response.data.responses.asScala.head
+    assertEquals(Topic.GROUP_METADATA_TOPIC_NAME, topicResp.name,
+      "rejection echoes the wire name unchanged (internal topics are never prefixed)")
+    val partitionResp = topicResp.partitionResponses.asScala.head
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED,
+      Errors.forCode(partitionResp.errorCode),
+      "tenant Produce to internal topic must be refused with TOPIC_AUTHORIZATION_FAILED")
+    verify(replicaManager, never()).handleProduceAppend(
+      anyLong, anyShort, anyBoolean, any(), any(), any(), any(), any(), any(), any())
+  }
+
+  @Test
+  def testProduceTenantRefusedOnTransactionStateInternalTopic(): Unit = {
+    // #91 sibling: same defence-in-depth for __transaction_state.
+    val produceRequest = buildSingleTopicProduceRequest(Topic.TRANSACTION_STATE_TOPIC_NAME)
+    val request = buildRequest(
+      produceRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), any[Long])).thenReturn(0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    kafkaApis = createKafkaApis(
+      authorizer = None,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[ProduceResponse](request)
+    val partitionResp = response.data.responses.asScala.head.partitionResponses.asScala.head
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED,
+      Errors.forCode(partitionResp.errorCode))
+    verify(replicaManager, never()).handleProduceAppend(
+      anyLong, anyShort, anyBoolean, any(), any(), any(), any(), any(), any(), any())
+  }
+
+  @Test
+  def testProduceTenantRefusedOnShareGroupStateInternalTopic(): Unit = {
+    // #91 sibling: same defence-in-depth for __share_group_state (KIP-932).
+    val produceRequest = buildSingleTopicProduceRequest(Topic.SHARE_GROUP_STATE_TOPIC_NAME)
+    val request = buildRequest(
+      produceRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), any[Long])).thenReturn(0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    kafkaApis = createKafkaApis(
+      authorizer = None,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[ProduceResponse](request)
+    val partitionResp = response.data.responses.asScala.head.partitionResponses.asScala.head
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED,
+      Errors.forCode(partitionResp.errorCode))
+    verify(replicaManager, never()).handleProduceAppend(
+      anyLong, anyShort, anyBoolean, any(), any(), any(), any(), any(), any(), any())
+  }
+
+  @Test
   def testCreateTopicsTenantRejectsReservedPhysicalFormLogicalName(): Unit = {
     // CreateTopics is the loudest auto-pollution vector — the controller would
     // happily materialise "acme.acme.orders" for tenant acme. The broker must

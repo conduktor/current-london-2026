@@ -1126,21 +1126,36 @@ class KafkaApis(val requestChannel: RequestChannel,
     if (tenantScoped) {
       val rejected = new util.ArrayList[ProduceRequestData.TopicProduceData]()
       produceRequest.data.topicData.forEach { t =>
-        // Three upstream-rejectable conditions:
+        // Four upstream-rejectable conditions:
         //   (a) reserved-physical-form (`acme.X` from tenant acme) → double-prefix
         //   (b) over-long logical form whose `<tenant>.<name>` exceeds 249 chars
         //   (c) invalid logical form (`""`, `.`, `..`, illegal chars) — would
         //       either let auto-create briefly materialise a malformed name or
         //       surface the physical form in the broker's own validation error.
-        // All share INVALID_TOPIC_EXCEPTION and bypass replicaManager; per-entry
-        // pre-rejection keeps the rest of the batch alive.
-        if (tenantCtx.isReservedPhysicalForm(t.name)
-            || tenantCtx.isOverlongLogicalForm(t.name)
-            || tenantCtx.isInvalidLogicalForm(t.name)) {
+        //   (d) #91 defence-in-depth: tenant writes to an internal topic
+        //       (__consumer_offsets, __transaction_state, __share_group_state).
+        //       toPhysical passes internal names through unchanged, so without
+        //       this guard a misconfigured wildcard `WRITE Topic:*` ACL would
+        //       let a tenant corrupt the cluster's offsets / txn / share-group
+        //       log. Tenants never legitimately Produce to internal topics —
+        //       coordinator writes go through dedicated APIs. TOPIC_AUTH_FAILED
+        //       keeps the wire shape indistinguishable from a regular authz
+        //       refusal so the tenant cannot probe ACL configuration via the
+        //       error category.
+        // (a)-(c) share INVALID_TOPIC_EXCEPTION; (d) returns TOPIC_AUTH_FAILED.
+        // All bypass replicaManager; per-entry pre-rejection keeps the rest of
+        // the batch alive.
+        val refusalError =
+          if (tenantCtx.isReservedPhysicalForm(t.name)
+              || tenantCtx.isOverlongLogicalForm(t.name)
+              || tenantCtx.isInvalidLogicalForm(t.name)) Some(Errors.INVALID_TOPIC_EXCEPTION)
+          else if (Topic.isInternal(t.name)) Some(Errors.TOPIC_AUTHORIZATION_FAILED)
+          else None
+        refusalError.foreach { err =>
           rejected.add(t)
           t.partitionData.forEach { p =>
             invalidLogicalTopicResponses +=
-              new TopicPartition(t.name, p.index) -> new PartitionResponse(Errors.INVALID_TOPIC_EXCEPTION)
+              new TopicPartition(t.name, p.index) -> new PartitionResponse(err)
           }
         }
       }
