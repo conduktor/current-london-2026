@@ -1653,6 +1653,133 @@ public class RuleEngineTest {
     }
 
     @Test
+    public void parseBypassPrincipalsRejectsBroaderCommaTypoShapes() {
+        // R29 #272 [HIGH]: an adversarial audit of the R29 #270 fix
+        // (commit 8ff2491e4f) found that the initial regex
+        // `,\s*[A-Za-z][A-Za-z0-9_]*:` was too narrow. Six common
+        // production-realistic principal-type shapes still soft-bricked
+        // the broker silently:
+        //
+        //   - hyphen:        Service-Account
+        //   - internal space: Service Account
+        //   - FQCN dot:      com.example.Principal
+        //   - empty ident:   `,:` (literal pasted separator)
+        //   - non-ASCII:     Üser  (UTF-8 locale typo)
+        //
+        // The discriminator design is right (SSL DN attribute
+        // separators use `=` before the next non-`,` token, never `:`),
+        // but the identifier character class must accept anything except
+        // `=`, `,`, and `:` — not just `[A-Za-z0-9_]`. This test makes
+        // that contract explicit: each of these strings is a typo, and
+        // each must abort startup with a comma-typo diagnostic.
+
+        // ---- 1. Hyphen in type (Service-Account is the natural Kafka
+        //      principal type for service accounts and shows up in many
+        //      KafkaPrincipalBuilder implementations).
+        IllegalArgumentException exHyphen = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals(
+                    "User:admin,Service-Account:bot"));
+        assertTrue(exHyphen.getMessage().toLowerCase().contains("comma"),
+            "Service-Account (hyphen) typo must be rejected with a "
+                + "comma-typo diagnostic; got: " + exHyphen.getMessage());
+
+        // ---- 2. Internal space in type. The existing test
+        //      `parseBypassPrincipalsAcceptsSslDnWithInternalWhitespace`
+        //      already documents that `Service Account` is an accepted
+        //      LEGITIMATE type when standalone. The typo case is when
+        //      it appears AFTER `,` instead of `;`.
+        IllegalArgumentException exSpace = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals(
+                    "User:admin,Service Account:bot"));
+        assertTrue(exSpace.getMessage().toLowerCase().contains("comma"),
+            "Service Account (space) typo must be rejected; got: "
+                + exSpace.getMessage());
+
+        // ---- 3. FQCN-style dotted type (custom KafkaPrincipalBuilders
+        //      sometimes use fully-qualified class names as the
+        //      principal type for legacy gateways).
+        IllegalArgumentException exDot = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals(
+                    "User:admin,com.example.Principal:bot"));
+        assertTrue(exDot.getMessage().toLowerCase().contains("comma"),
+            "FQCN-typed comma typo must be rejected; got: "
+                + exDot.getMessage());
+
+        // ---- 4. Multi-entry partial: one segment correct, the next
+        //      one carries the hyphen-type typo. The parser must abort
+        //      on the bad segment.
+        IllegalArgumentException exMulti = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals(
+                    "User:broker;User:admin,Service-Account:client"));
+        assertTrue(exMulti.getMessage().toLowerCase().contains("comma"),
+            "mixed-separator partial (semicolon-joined entry containing a "
+                + "hyphen-type comma typo) must be rejected; got: "
+                + exMulti.getMessage());
+
+        // ---- 5. Empty identifier `,:` — operator pasted the entry
+        //      separator literally. Not a structurally valid principal
+        //      and clearly a typo; must be rejected.
+        IllegalArgumentException exEmpty = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals(
+                    "User:admin,:broker"));
+        assertTrue(exEmpty.getMessage().toLowerCase().contains("comma"),
+            "empty-ident comma typo (`,:`) must be rejected; got: "
+                + exEmpty.getMessage());
+
+        // ---- 6. Non-ASCII type letter (`Üser`). The previous regex
+        //      hard-coded `[A-Za-z]` and so let this shape through.
+        //      Real-world: any locale where the operator's keyboard
+        //      produced a typo'd Latin-1 character.
+        IllegalArgumentException exNonAscii = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals(
+                    "User:admin,Üser:broker"));
+        assertTrue(exNonAscii.getMessage().toLowerCase().contains("comma"),
+            "non-ASCII type letter comma typo must be rejected; got: "
+                + exNonAscii.getMessage());
+
+        // ---- Regression: legitimate SSL DN with multiple `=`-bearing
+        //      RDN attributes is still accepted. This is the critical
+        //      no-false-positive assertion for the broader regex —
+        //      every X.500 attribute separator is `,<attr>=` (NEVER
+        //      `,<attr>:`), so the new regex `,[^=,:]*:` does not match.
+        String sslDn = "User:CN=Broker One,OU=Kafka Brokers,O=Example Corp,C=US";
+        java.util.Set<String> okSsl = RuleEngine.parseBypassPrincipals(sslDn);
+        assertEquals(1, okSsl.size(),
+            "SSL DN with X.500 commas must remain accepted under the "
+                + "broader regex; got: " + okSsl);
+        assertTrue(okSsl.contains(sslDn));
+
+        // ---- Regression: a single standalone Service-Account principal
+        //      is unaffected. Only the `,<type>:` shape (i.e. the typo)
+        //      is rejected; a standalone `Service-Account:bot` parses
+        //      cleanly.
+        java.util.Set<String> okStandalone = RuleEngine.parseBypassPrincipals(
+            "Service-Account:bot");
+        assertEquals(1, okStandalone.size(),
+            "standalone Service-Account principal must still parse; got: "
+                + okStandalone);
+        assertTrue(okStandalone.contains("Service-Account:bot"));
+
+        // ---- Regression: a properly-`;`-separated mix of plain User
+        //      and Service-Account principals also parses cleanly. This
+        //      pins the contract that the discriminator is about the
+        //      `,` typo, not about Service-Account specifically.
+        java.util.Set<String> okMixed = RuleEngine.parseBypassPrincipals(
+            "User:broker;Service-Account:client");
+        assertEquals(2, okMixed.size(),
+            "properly `;`-separated User + Service-Account must parse; "
+                + "got: " + okMixed);
+        assertTrue(okMixed.contains("User:broker"));
+        assertTrue(okMixed.contains("Service-Account:client"));
+    }
+
+    @Test
     public void parseBypassPrincipalsThrowsOnUnicodeBlankComponent() {
         // Codex round-4 F2: String.trim() only strips ASCII whitespace (chars
         // <= 0x20), so a non-breaking space (U+00A0) inside a component

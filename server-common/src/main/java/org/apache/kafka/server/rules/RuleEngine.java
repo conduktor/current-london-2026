@@ -592,12 +592,19 @@ public final class RuleEngine {
             //      identifiers (User/Group/Role/Service Account) and
             //      never contain commas; commas in `type` only appear
             //      via a typo of shape `"User,Group:admin"`.
-            //   2. Reject `,<ident>:` shape inside NAME. SSL DN
-            //      attribute separators use `=` (`,OU=`, `,O=`, `,C=`,
-            //      `,EMAILADDRESS=`, …) — never `:` — so legitimate DNs
-            //      with embedded commas are NOT affected. The smoking
-            //      gun for comma-typo is the colon after the identifier
-            //      (`,User:`, `,Group:`, `,Role:`, …).
+            //   2. Reject `,<chars-without-`=,:`>:` shape inside NAME.
+            //      SSL DN attribute separators use `=` (`,OU=`, `,O=`,
+            //      `,C=`, `,EMAILADDRESS=`, …) — never `:` — so
+            //      legitimate DNs with embedded commas are NOT affected:
+            //      the `=` blocks the run before it can reach a `:`.
+            //      The smoking gun for the comma-typo is the colon
+            //      after the run (`,User:`, `,Group:`, `,Role:`,
+            //      `,Service-Account:`, `,com.example.Principal:`, even
+            //      a literal `,:` from a pasted entry separator). The
+            //      identifier character class is deliberately
+            //      `[^=,:]` rather than `[A-Za-z0-9_]` so that hyphens,
+            //      dots, internal spaces, and non-ASCII letters in the
+            //      typo'd type are all caught — see R29 #272.
             if (type.indexOf(',') >= 0) {
                 throw new IllegalArgumentException(
                     "governance.bypass.principals entry contains a comma "
@@ -663,17 +670,33 @@ public final class RuleEngine {
     }
 
     /**
-     * R29 #270 [HIGH]: smoking-gun shape of a comma-as-separator typo in
-     * {@code governance.bypass.principals}: comma, optional whitespace, an
-     * identifier, then colon. Examples: {@code ",User:"}, {@code ", Group:"}.
+     * R29 #270 / #272 [HIGH]: smoking-gun shape of a comma-as-separator typo
+     * in {@code governance.bypass.principals}: comma, then any run of
+     * characters that contains no {@code =}, {@code ,}, or {@code :}, then a
+     * colon. Examples: {@code ",User:"}, {@code ", Group:"},
+     * {@code ",Service-Account:"}, {@code ",com.example.Principal:"}, even
+     * {@code ",:"} when the operator pasted the entry separator literally.
+     *
+     * <p>The character class is intentionally {@code [^=,:]} (not
+     * {@code [A-Za-z0-9_]}). An R29 #272 adversarial audit of the initial
+     * narrow regex found six production-realistic bypasses where the
+     * principal type contains a hyphen ({@code Service-Account}), a space
+     * ({@code Service Account}), a dot ({@code com.example.Principal}), an
+     * empty identifier, or a non-ASCII letter ({@code Üser}). Each shape
+     * silently soft-bricked inter-broker traffic. The signal is not "what
+     * the identifier looks like" — it is "comma, then something, then a
+     * colon, with no {@code =} in between". That discriminator is exactly
+     * what the broader class captures.
      *
      * <p>SSL DN attribute separators use {@code =} (eg. {@code ,OU=},
-     * {@code ,O=}, {@code ,C=}) — NEVER {@code :} — so legitimate SSL DNs
-     * containing commas do NOT match this pattern. See
-     * {@link #parseBypassPrincipals(String)} for the full rationale.
+     * {@code ,O=}, {@code ,C=}, {@code ,EMAILADDRESS=}) — NEVER {@code :}
+     * — so legitimate SSL DNs containing commas do NOT match this pattern:
+     * the {@code =} blocks the {@code [^=,:]*} run before it can reach a
+     * {@code :}. See {@link #parseBypassPrincipals(String)} for the full
+     * rationale.
      */
     private static final Pattern COMMA_SEPARATOR_TYPO =
-        Pattern.compile(",\\s*[A-Za-z][A-Za-z0-9_]*:");
+        Pattern.compile(",[^=,:]*:");
 
     /** True if {@code s} is non-empty and every code point is whitespace. */
     private static boolean isAllWhitespace(String s) {
