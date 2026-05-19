@@ -584,9 +584,17 @@ public final class ConcentrationKernel implements AutoCloseable {
     /**
      * Persist sidecar entries for every reservation in the batch in order
      * {@code [firstBackingOffset, firstBackingOffset+1, ..., firstBackingOffset + batch.length - 1]}
-     * and commit the batch atomically. If any sidecar append throws, the whole batch is rolled
-     * back so the slots are reusable; previously appended sidecar entries are left in place but
-     * the tracker does not advance — recovery via backing-scan repairs the sidecar.
+     * and commit the batch atomically. If any sidecar append throws, the partial sidecar tail is
+     * truncated back to the pre-batch size before the tracker is rolled back — otherwise the
+     * tracker would hand out the same logical offsets again on retry while the abandoned sidecar
+     * entries still sit at those positional indices, mapping fresh logical offsets to stale (or
+     * never-appended) backing offsets and corrupting the fetch path (Codex r20 BLOCKER #156).
+     *
+     * <p>Under v1's broker per-partition produce serialisation a single thread owns the
+     * reserve→commit window for a given (logicalTopic, logicalPartition), so {@code size()} +
+     * {@code truncateTo()} is effectively atomic relative to other writers on this sidecar; if a
+     * future revision parallelises produce per partition this snapshot/truncate must move under
+     * the sidecar's intrinsic lock.
      *
      * <p>BLOCKER 3 fence: if the reservation was stamped at reserve time (production path), the
      * current backing-gate generation must still match. A mismatch means the gate closed between
@@ -604,11 +612,17 @@ public final class ConcentrationKernel implements AutoCloseable {
         }
         checkBackingGenerationOrRollbackBatch(batch);
         LogicalSidecarIndex sidecar = sidecarFor(batch[0].logicalTopic(), batch[0].logicalPartition());
+        long sidecarSizeBefore = sidecar.size();
         try {
             for (int i = 0; i < batch.length; i++) {
                 sidecar.append(firstBackingOffset + i);
             }
         } catch (IOException | RuntimeException e) {
+            try {
+                sidecar.truncateTo(sidecarSizeBefore);
+            } catch (IOException | RuntimeException truncateFailure) {
+                e.addSuppressed(truncateFailure);
+            }
             tracker.rollbackBatch(batch);
             throw e;
         }
