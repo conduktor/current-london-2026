@@ -5579,6 +5579,217 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testOffsetForLeaderEpochRejectsBackingTopicForExternalConsumer(): Unit = {
+    // r22 BLOCKER #189 — KIP-320 OffsetsForLeaderEpoch is used by *consumers* for log-truncation
+    // detection (TOPIC.DESCRIBE auth path), and the handler responds with the BACKING partition's
+    // leader epoch + end offset. Without this guard, a consumer principal authorized on the
+    // raw backing-topic NAME would learn the substrate's leader epoch and physical LEO, which
+    // are the union of every co-tenant's logical write activity — a direct cross-tenant
+    // truncation/throughput oracle. The handler must surface INVALID_TOPIC_EXCEPTION for backing
+    // topics on the external (non-CLUSTER_ACTION) auth path and NEVER invoke ReplicaManager for
+    // them. Inter-broker callers retain access (covered by testOffsetForLeaderEpochInterBroker...).
+    val backingTopic = "backing-topic-r22-189"
+    val plainTopic = "tenant-topic-r22-189"
+    addTopicToMetadataCache(backingTopic, numPartitions = 8)
+    addTopicToMetadataCache(plainTopic, numPartitions = 2)
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+    when(concentrationKernel.isBackingTopic(plainTopic)).thenReturn(false)
+    when(concentrationKernel.isLogicalTopic(any[String])).thenReturn(false)
+
+    val authorizer: Authorizer = mock(classOf[Authorizer])
+    // CLUSTER_ACTION on CLUSTER → DENIED (external consumer path)
+    val clusterAction = new Action(AclOperation.CLUSTER_ACTION,
+      new ResourcePattern(ResourceType.CLUSTER, Resource.CLUSTER_NAME, PatternType.LITERAL),
+      1, true, false)
+    when(authorizer.authorize(any[RequestContext], ArgumentMatchers.eq(List(clusterAction).asJava)))
+      .thenReturn(List(AuthorizationResult.DENIED).asJava)
+    // DESCRIBE on TOPIC for both → ALLOWED (the consumer happens to have DESCRIBE on the backing
+    // name — that's the threat: descriptive auth alone must not unlock the substrate oracle).
+    when(authorizer.authorize(any[RequestContext], ArgumentMatchers.argThat[util.List[Action]] {
+      (a: util.List[Action]) => a != null && a.size == 2 &&
+        a.asScala.forall(act => act.operation == AclOperation.DESCRIBE &&
+          act.resourcePattern.resourceType == ResourceType.TOPIC)
+    })).thenReturn(List(AuthorizationResult.ALLOWED, AuthorizationResult.ALLOWED).asJava)
+
+    val topics = new OffsetForLeaderTopicCollection(List(
+      new OffsetForLeaderTopic()
+        .setTopic(backingTopic)
+        .setPartitions(List(
+          new OffsetForLeaderPartition().setPartition(0).setLeaderEpoch(3),
+          new OffsetForLeaderPartition().setPartition(1).setLeaderEpoch(3)).asJava),
+      new OffsetForLeaderTopic()
+        .setTopic(plainTopic)
+        .setPartitions(List(
+          new OffsetForLeaderPartition().setPartition(0).setLeaderEpoch(7)).asJava)
+    ).iterator.asJava)
+    val request = buildRequest(OffsetsForLeaderEpochRequest.Builder.forConsumer(topics).build())
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    // ReplicaManager will be called only for plainTopic; stub a NONE response so the
+    // non-backing branch produces a normal result.
+    val plainResult = new OffsetForLeaderEpochResponseData.OffsetForLeaderTopicResult()
+      .setTopic(plainTopic)
+      .setPartitions(List(
+        new OffsetForLeaderEpochResponseData.EpochEndOffset()
+          .setPartition(0).setErrorCode(Errors.NONE.code).setLeaderEpoch(7).setEndOffset(42L)
+      ).asJava)
+    when(replicaManager.lastOffsetForLeaderEpoch(any[Seq[OffsetForLeaderTopic]]))
+      .thenReturn(Seq(plainResult))
+
+    kafkaApis = createKafkaApis(authorizer = Some(authorizer))
+    kafkaApis.handleOffsetForLeaderEpochRequest(request)
+
+    val response = verifyNoThrottling[OffsetsForLeaderEpochResponse](request)
+    val backingResp = response.data.topics.asScala.find(_.topic == backingTopic).getOrElse(
+      fail("Backing topic must appear in response with rejection error").asInstanceOf[Nothing])
+    assertEquals(2, backingResp.partitions.size,
+      "All backing partitions in the request must be reflected back, each with the rejection error")
+    backingResp.partitions.asScala.foreach { p =>
+      assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, p.errorCode,
+        s"Backing partition ${p.partition} must be rejected with INVALID_TOPIC_EXCEPTION — " +
+          "exposing backing leader-epoch/LEO would leak cross-tenant write activity")
+      assertEquals(-1, p.leaderEpoch,
+        "leaderEpoch must NOT be populated on rejection (default -1) — any populated value " +
+          "would be a substrate-side leak")
+      assertEquals(-1L, p.endOffset,
+        "endOffset must NOT be populated on rejection (default -1) — populated end offset would " +
+          "be the very physical LEO oracle this fix exists to prevent")
+    }
+    val plainResp = response.data.topics.asScala.find(_.topic == plainTopic).getOrElse(
+      fail("Non-backing topic must be forwarded to ReplicaManager and appear in response")
+        .asInstanceOf[Nothing])
+    assertEquals(Errors.NONE.code, plainResp.partitions.asScala.head.errorCode)
+    assertEquals(42L, plainResp.partitions.asScala.head.endOffset,
+      "Non-backing topic must surface ReplicaManager's real end offset unchanged")
+
+    // ReplicaManager MUST NOT have been asked for the backing topic. The lastOffsetForLeaderEpoch
+    // call (if any) should have been invoked with a Seq containing only the plain topic.
+    val captor = ArgumentCaptor.forClass(classOf[Seq[OffsetForLeaderTopic]])
+    verify(replicaManager).lastOffsetForLeaderEpoch(captor.capture())
+    val forwarded = captor.getValue
+    assertTrue(forwarded.forall(_.topic != backingTopic),
+      "Backing topic MUST NOT be forwarded to ReplicaManager.lastOffsetForLeaderEpoch — that " +
+        "call would return the substrate's real leader-epoch end offset and leak co-tenant " +
+        "write activity")
+    assertTrue(forwarded.exists(_.topic == plainTopic),
+      "Non-backing topic MUST be forwarded to ReplicaManager.lastOffsetForLeaderEpoch")
+  }
+
+  @Test
+  def testOffsetForLeaderEpochUnauthorizedBackingProbeReturnsAuthorizationFailedNotInvalidTopic(): Unit = {
+    // r22 BLOCKER #189 — auth-first / shadow-second precedence. A principal lacking DESCRIBE on
+    // a backing topic name MUST see TOPIC_AUTHORIZATION_FAILED, NOT INVALID_TOPIC_EXCEPTION.
+    // The latter would let an unauthorized principal enumerate the declared-backing set by
+    // probing names and observing the response-code difference (existing-but-rejected vs
+    // unauthorized). Same precedence pattern as #128/#137/#146/#159/#205.
+    val backingTopic = "backing-topic-r22-189-authfail"
+    addTopicToMetadataCache(backingTopic, numPartitions = 8)
+    // isBackingTopic must NEVER be consulted on this path — auth catches the probe first.
+    // We do NOT stub it; mockito's default-false return is sufficient AND it lets us assert
+    // verify(never()) below.
+
+    val authorizer: Authorizer = mock(classOf[Authorizer])
+    val clusterAction = new Action(AclOperation.CLUSTER_ACTION,
+      new ResourcePattern(ResourceType.CLUSTER, Resource.CLUSTER_NAME, PatternType.LITERAL),
+      1, true, false)
+    when(authorizer.authorize(any[RequestContext], ArgumentMatchers.eq(List(clusterAction).asJava)))
+      .thenReturn(List(AuthorizationResult.DENIED).asJava)
+    // DESCRIBE on backing topic → DENIED
+    when(authorizer.authorize(any[RequestContext], ArgumentMatchers.argThat[util.List[Action]] {
+      (a: util.List[Action]) => a != null && a.size == 1 &&
+        a.get(0).operation == AclOperation.DESCRIBE &&
+        a.get(0).resourcePattern.resourceType == ResourceType.TOPIC &&
+        a.get(0).resourcePattern.name == backingTopic
+    })).thenReturn(List(AuthorizationResult.DENIED).asJava)
+
+    val topics = new OffsetForLeaderTopicCollection(List(
+      new OffsetForLeaderTopic()
+        .setTopic(backingTopic)
+        .setPartitions(List(
+          new OffsetForLeaderPartition().setPartition(0).setLeaderEpoch(3)).asJava)
+    ).iterator.asJava)
+    val request = buildRequest(OffsetsForLeaderEpochRequest.Builder.forConsumer(topics).build())
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    kafkaApis = createKafkaApis(authorizer = Some(authorizer))
+    kafkaApis.handleOffsetForLeaderEpochRequest(request)
+
+    val response = verifyNoThrottling[OffsetsForLeaderEpochResponse](request)
+    val partitionResp = response.data.topics.asScala.find(_.topic == backingTopic).get
+      .partitions.asScala.head
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED.code, partitionResp.errorCode,
+      "Auth-first precedence — unauthorized backing probe must see TOPIC_AUTHORIZATION_FAILED, " +
+        "not INVALID_TOPIC_EXCEPTION (which would leak the declared-backing set)")
+    // The backing predicate must NOT have been consulted — the unauthorized path catches the
+    // probe before backing filtering runs. If isBackingTopic were called here, an attacker who
+    // can also issue allowed probes could time-side-channel the predicate cost.
+    verify(concentrationKernel, never()).isBackingTopic(backingTopic)
+    // ReplicaManager must never see the unauthorized topic either.
+    verify(replicaManager, never()).lastOffsetForLeaderEpoch(any[Seq[OffsetForLeaderTopic]])
+  }
+
+  @Test
+  def testOffsetForLeaderEpochInterBrokerPathStillSeesBackingTopics(): Unit = {
+    // r22 BLOCKER #189 — the filter MUST be gated on the external auth path so inter-broker
+    // replication (CLUSTER_ACTION) continues to receive truthful leader-epoch end offsets for
+    // backing partitions. Without this, follower replicas could not run KIP-279 truncation
+    // detection against the backing log and the cluster would lose replication safety.
+    val backingTopic = "backing-topic-r22-189-interbroker"
+    addTopicToMetadataCache(backingTopic, numPartitions = 8)
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+    when(concentrationKernel.isLogicalTopic(any[String])).thenReturn(false)
+
+    val authorizer: Authorizer = mock(classOf[Authorizer])
+    val clusterAction = new Action(AclOperation.CLUSTER_ACTION,
+      new ResourcePattern(ResourceType.CLUSTER, Resource.CLUSTER_NAME, PatternType.LITERAL),
+      1, true, false)
+    when(authorizer.authorize(any[RequestContext], ArgumentMatchers.eq(List(clusterAction).asJava)))
+      .thenReturn(List(AuthorizationResult.ALLOWED).asJava)
+
+    val topics = new OffsetForLeaderTopicCollection(List(
+      new OffsetForLeaderTopic()
+        .setTopic(backingTopic)
+        .setPartitions(List(
+          new OffsetForLeaderPartition().setPartition(0).setLeaderEpoch(3)).asJava)
+    ).iterator.asJava)
+    val request = buildRequest(OffsetsForLeaderEpochRequest.Builder.forFollower(
+      topics, brokerId).build())
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    val backingResult = new OffsetForLeaderEpochResponseData.OffsetForLeaderTopicResult()
+      .setTopic(backingTopic)
+      .setPartitions(List(
+        new OffsetForLeaderEpochResponseData.EpochEndOffset()
+          .setPartition(0).setErrorCode(Errors.NONE.code).setLeaderEpoch(3).setEndOffset(999L)
+      ).asJava)
+    when(replicaManager.lastOffsetForLeaderEpoch(any[Seq[OffsetForLeaderTopic]]))
+      .thenReturn(Seq(backingResult))
+
+    kafkaApis = createKafkaApis(authorizer = Some(authorizer))
+    kafkaApis.handleOffsetForLeaderEpochRequest(request)
+
+    val response = verifyNoThrottling[OffsetsForLeaderEpochResponse](request)
+    val partitionResp = response.data.topics.asScala.find(_.topic == backingTopic).get
+      .partitions.asScala.head
+    assertEquals(Errors.NONE.code, partitionResp.errorCode,
+      "Inter-broker (CLUSTER_ACTION) caller must receive truthful leader-epoch end offset for " +
+        "backing partition — replication safety depends on it")
+    assertEquals(999L, partitionResp.endOffset,
+      "Inter-broker caller's end offset must come straight from ReplicaManager, unaltered")
+    // The backing-rejection filter MUST be bypassed for CLUSTER_ACTION — isBackingTopic should
+    // never be invoked on this path (we partitioned on clusterAuthorized first).
+    verify(concentrationKernel, never()).isBackingTopic(backingTopic)
+    // ReplicaManager MUST be asked for the backing topic on the inter-broker path.
+    val captor = ArgumentCaptor.forClass(classOf[Seq[OffsetForLeaderTopic]])
+    verify(replicaManager).lastOffsetForLeaderEpoch(captor.capture())
+    assertTrue(captor.getValue.exists(_.topic == backingTopic),
+      "Inter-broker path MUST forward backing topic to ReplicaManager.lastOffsetForLeaderEpoch")
+  }
+
+  @Test
   def testLeaderReplicaIfLocalRaisesFencedLeaderEpoch(): Unit = {
     testListOffsetFailedGetLeaderReplica(Errors.FENCED_LEADER_EPOCH)
   }

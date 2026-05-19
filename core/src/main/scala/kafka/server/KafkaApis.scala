@@ -3183,10 +3183,38 @@ class KafkaApis(val requestChannel: RequestChannel,
     // The OffsetsForLeaderEpoch API was initially only used for inter-broker communication and required
     // cluster permission. With KIP-320, the consumer now also uses this API to check for log truncation
     // following a leader change, so we also allow topic describe permission.
+    val clusterAuthorized = authHelper.authorize(request.context, CLUSTER_ACTION, CLUSTER, CLUSTER_NAME,
+      logIfDenied = false)
     val (authorizedTopics, unauthorizedTopics) =
-      if (authHelper.authorize(request.context, CLUSTER_ACTION, CLUSTER, CLUSTER_NAME, logIfDenied = false))
+      if (clusterAuthorized)
         (topics, Seq.empty[OffsetForLeaderTopic])
       else authHelper.partitionSeqByAuthorized(request.context, DESCRIBE, TOPIC, topics)(_.topic)
+
+    // r22 BLOCKER #189 — backing topics carry the substrate for every co-tenant logical topic.
+    // External (non-inter-broker) callers MUST NEVER receive leader-epoch end offsets for them:
+    // those offsets describe how far ANY tenant's data has reached on the backing, leaking
+    // co-tenant write activity and giving an attacker an oracle for truncation detection
+    // against the substrate. Inter-broker replication callers (CLUSTER_ACTION) legitimately need
+    // these offsets for log-truncation detection on the backing partition itself, so the filter
+    // is gated on the auth path used (same precedence as DescribeConfigs #159: auth-first /
+    // shadow-second — UNauthorized probes already got TOPIC_AUTHORIZATION_FAILED above and
+    // cannot enumerate the declared-backing set).
+    val (backingAuthorized, nonBackingAuthorized) =
+      if (clusterAuthorized)
+        (Seq.empty[OffsetForLeaderTopic], authorizedTopics)
+      else
+        authorizedTopics.partition(t => concentrationKernel.isBackingTopic(t.topic))
+
+    val backingRejected: Seq[OffsetForLeaderTopicResult] = backingAuthorized.map { topic =>
+      val partResponses = topic.partitions.asScala.map { p =>
+        new EpochEndOffset()
+          .setPartition(p.partition)
+          .setErrorCode(Errors.INVALID_TOPIC_EXCEPTION.code)
+      }
+      new OffsetForLeaderTopicResult()
+        .setTopic(topic.topic)
+        .setPartitions(partResponses.toList.asJava)
+    }
 
     // r16 BLOCKER #93-A. Logical topics are not in metadataCache, so ReplicaManager.lastOffsetForLeaderEpoch
     // returns UNKNOWN_TOPIC_OR_PARTITION for them. The consumer's OffsetsForLeaderEpochUtils (KIP-320
@@ -3200,7 +3228,7 @@ class KafkaApis(val requestChannel: RequestChannel,
     // endOffset >= clientOffset check passes and validation completes. Per-logical-epoch tracking
     // is a v2 follow-up (would let us answer the more precise "end offset of YOUR epoch" question).
     val (logicalAuthorized, nonLogicalAuthorized) =
-      authorizedTopics.partition(t => concentrationKernel.isLogicalTopic(t.topic))
+      nonBackingAuthorized.partition(t => concentrationKernel.isLogicalTopic(t.topic))
 
     val logicalResults: Seq[OffsetForLeaderTopicResult] = logicalAuthorized.map { topic =>
       val descriptorOpt = concentrationKernel.describe(topic.topic)
@@ -3272,7 +3300,8 @@ class KafkaApis(val requestChannel: RequestChannel,
     }
 
     val endOffsetsForAllTopics = new OffsetForLeaderTopicResultCollection(
-      (logicalResults ++ endOffsetsForAuthorizedPartitions ++ endOffsetsForUnauthorizedPartitions).asJava.iterator
+      (logicalResults ++ backingRejected ++ endOffsetsForAuthorizedPartitions ++ endOffsetsForUnauthorizedPartitions)
+        .asJava.iterator
     )
 
     requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
