@@ -21,7 +21,9 @@ import org.apache.kafka.server.metrics.KafkaYammerMetrics;
 import com.yammer.metrics.core.Gauge;
 import com.yammer.metrics.core.Histogram;
 import com.yammer.metrics.core.Meter;
+import com.yammer.metrics.core.Metric;
 import com.yammer.metrics.core.MetricName;
+import com.yammer.metrics.core.MetricsRegistryListener;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -33,6 +35,7 @@ import java.util.Map;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class HttpBridgeMetricsTest {
@@ -322,6 +325,58 @@ class HttpBridgeMetricsTest {
     }
 
     @Test
+    void closeUnregistersRemainingMetricsEvenWhenOneRemovalThrows() {
+        // The Yammer registry exposes a listener hook fired from `removeMetric(MetricName)` — the listener call site
+        // (`notifyMetricRemoved`) has no try/catch, so a listener that throws propagates out of `removeMetric`. In
+        // production, a JMX MBean deregistration backed by this hook can throw (`InstanceNotFoundException`,
+        // `MBeanRegistrationException`) when the platform MBean server is under stress or has been tampered with.
+        //
+        // The hardened close() must NOT abort the loop on a single failure: every metric name HttpBridgeMetrics owns
+        // must be unregistered so the next bridge generation can rebind a fresh metric. Yammer's silent dedup would
+        // otherwise let the new bridge inherit a stranded gauge whose Supplier closed over the dead limiter of the
+        // previous lifecycle — making JMX show stale `ActiveSseStreams` / `ActiveWsSubscriptions` forever.
+        //
+        // Inject a listener that throws on a single metric name during close(), verify that (a) close() rethrows the
+        // first failure to the caller (so the lifecycle layer learns close was not clean), (b) every OTHER metric this
+        // class owns has been unregistered. The stranded-metric scenario is the load-bearing contract — if it
+        // regressed, JMX gauges would silently span lifecycle boundaries again.
+        MetricName victim = name("RejectedAtSseCap", new LinkedHashMap<>());
+        ThrowingListener listener = new ThrowingListener(victim);
+        KafkaYammerMetrics.defaultRegistry().addListener(listener);
+        try {
+            RuntimeException caught = assertThrows(RuntimeException.class, () -> metrics.close());
+            assertSame(listener.injected, caught,
+                "close() must rethrow the first removal failure so the lifecycle layer learns close was not clean");
+
+            // Every other metric the bridge owns must be gone — the close loop continued past the throwing victim.
+            for (HttpBridgeMetrics.Operation op : HttpBridgeMetrics.Operation.values()) {
+                Map<String, String> latencyTags = new LinkedHashMap<>();
+                latencyTags.put("operation", op.tag);
+                assertNotRegistered("RequestLatencyMs", latencyTags);
+                for (String family : new String[] {"2xx", "4xx", "5xx", "other"}) {
+                    Map<String, String> respTags = new LinkedHashMap<>();
+                    respTags.put("operation", op.tag);
+                    respTags.put("statusClass", family);
+                    assertNotRegistered("ResponseCount", respTags);
+                }
+            }
+            assertNotRegistered("RejectedOversizedBody");
+            assertNotRegistered("SseStreamsOpened");
+            assertNotRegistered("ActiveSseStreams");
+            assertNotRegistered("RejectedAtWsCap");
+            assertNotRegistered("WsSubscriptionsOpened");
+            assertNotRegistered("ActiveWsSubscriptions");
+        } finally {
+            KafkaYammerMetrics.defaultRegistry().removeListener(listener);
+            // The listener only throws on the victim's removal; the metrics ConcurrentMap.remove() already executed
+            // (the throw is in the post-remove notify), so the victim is gone from the registry. No extra cleanup
+            // needed beyond the listener removal.
+        }
+        // Setting metrics = null prevents tearDown from double-closing.
+        metrics = null;
+    }
+
+    @Test
     void closeIsIdempotent() {
         // BrokerServer's stop sequence may be triggered from multiple paths during a crash; the second close()
         // must not blow up if every metric is already gone.
@@ -399,5 +454,31 @@ class HttpBridgeMetricsTest {
     private static void assertNotRegistered(String n, Map<String, String> tags) {
         Object metric = KafkaYammerMetrics.defaultRegistry().allMetrics().get(name(n, tags));
         assertNull(metric, "metric " + n + " " + tags + " should not be registered after close()");
+    }
+
+    /**
+     * MetricsRegistryListener that throws on a single victim removal. Used to simulate a JMX deregistration failure
+     * mid-close and prove the hardened close() loop continues past the throw.
+     */
+    private static final class ThrowingListener implements MetricsRegistryListener {
+        private final MetricName victim;
+        final RuntimeException injected = new RuntimeException("simulated JMX deregistration failure");
+
+        ThrowingListener(MetricName victim) {
+            this.victim = victim;
+        }
+
+        @Override
+        public void onMetricAdded(MetricName name, Metric metric) {
+            // The listener is installed AFTER the metrics are constructed, so add-events for those are not observed.
+            // If a stray add slips through (e.g. test-order dependency), keep silent — we only care about removes.
+        }
+
+        @Override
+        public void onMetricRemoved(MetricName name) {
+            if (name.equals(victim)) {
+                throw injected;
+            }
+        }
     }
 }

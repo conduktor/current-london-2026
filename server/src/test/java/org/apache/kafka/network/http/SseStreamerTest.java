@@ -174,6 +174,95 @@ class SseStreamerTest {
     }
 
     @Test
+    void onPrimedRunnableThrowingAfterPrimingReleasesSlotAndCompletesAsync() throws IOException {
+        // F-#5: the onPrimed Runnable is invoked AFTER (a) the streamer is fully constructed (token ownership has
+        // transferred) and (b) the priming bytes have been flushed (response is committed), but BEFORE the first
+        // scheduleNextFetch() dispatches. If onPrimed throws at that point, no code path inside the streamer would
+        // ever invoke closeStream() — scheduleNextFetch is skipped, and the priming-time IOException/RuntimeException
+        // catches sit above this line. Without the explicit try/catch in start(), the throw would propagate out to
+        // the servlet caller while the AsyncContext stays half-open and the limiter slot leaks indefinitely.
+        //
+        // Today the production onPrimed is `metrics.recordSseStreamOpened()` which is contractually no-throw (it
+        // gates on `closed` and only calls `meter.mark()` otherwise), but the Runnable type is not formally
+        // declared no-throw — a future maintainer wiring additional bookkeeping into the callback (logging,
+        // observability hooks, audit-trail emission) could trigger this leak. Pin the resource-safety invariant.
+        UncloseableOutputStream out = new UncloseableOutputStream();
+        HttpServletResponse resp = Mockito.mock(HttpServletResponse.class);
+        Mockito.when(resp.getOutputStream()).thenReturn(out);
+
+        AsyncContext async = Mockito.mock(AsyncContext.class);
+        Mockito.when(async.getResponse()).thenReturn(resp);
+
+        // The submitter would never be reached because scheduleNextFetch is skipped, but wire one anyway so a
+        // future refactor that does reach the submitter would surface a hard failure rather than NPE inside the
+        // streamer.
+        FailingSubmitter submitter =
+            new FailingSubmitter(new RuntimeException("submitter must not be reached when onPrimed throws"));
+        FetchRequestParser.FetchCommand command =
+            new FetchRequestParser.FetchCommand("t", 0, 0L, OptionalInt.empty(), false);
+
+        // Runnable that throws AFTER the priming flush has committed the response. RuntimeException — not Error —
+        // because the production onPrimed contract is at most RuntimeException; Errors are JVM-fatal and not the
+        // class of failure we're hardening against.
+        RuntimeException injected = new RuntimeException("simulated onPrimed failure");
+        Runnable onPrimed = () -> {
+            throw injected;
+        };
+
+        SseStreamer.start(async, submitter, MAPPER, command, token, Runnable::run, onPrimed);
+
+        assertTrue(out.primingWritten(),
+            "priming bytes must have been written — the test exercises the post-priming throw path, not the "
+                + "priming-failure catch above it");
+        assertEquals(0, limiter.inUse(),
+            "limiter slot must be released when onPrimed throws after the priming flush");
+        Mockito.verify(async).complete();
+    }
+
+    /**
+     * Trivial ServletOutputStream that captures whether ANY bytes were written before the priming flush. Unlike
+     * FailAfterFlushOutputStream, this stream never throws — its job is to let the priming write+flush succeed so
+     * we can then drive the onPrimed-throw path without interference.
+     */
+    private static final class UncloseableOutputStream extends ServletOutputStream {
+        private boolean primingWritten = false;
+
+        @Override
+        public void write(int b) {
+            primingWritten = true;
+        }
+
+        @Override
+        public void write(byte[] b) {
+            primingWritten = true;
+        }
+
+        @Override
+        public void write(byte[] b, int off, int len) {
+            primingWritten = true;
+        }
+
+        @Override
+        public void flush() {
+            // Nothing to do — the test only needs to observe that priming bytes were written.
+        }
+
+        @Override
+        public boolean isReady() {
+            return true;
+        }
+
+        @Override
+        public void setWriteListener(WriteListener writeListener) {
+            // Blocking IO — no WriteListener interaction.
+        }
+
+        boolean primingWritten() {
+            return primingWritten;
+        }
+    }
+
+    @Test
     void failAfterFlushHarnessBehavesAsAdvertised() {
         // Sanity check on the harness itself: the priming write+flush must succeed and arm the stream;
         // the next write must throw IllegalStateException. If this drifts the regression test silently

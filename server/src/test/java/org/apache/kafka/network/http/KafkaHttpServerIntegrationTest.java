@@ -32,6 +32,8 @@ import org.eclipse.jetty.websocket.api.Callback;
 import org.eclipse.jetty.websocket.api.Session;
 import org.eclipse.jetty.websocket.api.StatusCode;
 import org.eclipse.jetty.websocket.api.exceptions.UpgradeException;
+import org.eclipse.jetty.websocket.client.ClientUpgradeRequest;
+import org.eclipse.jetty.websocket.client.JettyUpgradeListener;
 import org.eclipse.jetty.websocket.client.WebSocketClient;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -196,6 +198,21 @@ class KafkaHttpServerIntegrationTest {
         ContentResponse resp = client.newRequest(url("/v1/topics/orders/records"))
             .method(HttpMethod.POST)
             .body(new StringRequestContent("application/json", "{}"))
+            .send();
+
+        assertEquals(400, resp.getStatus());
+    }
+
+    @Test
+    void produce400OnEmptyBodyContentLengthZero() throws Exception {
+        // G-#3 regression pin: a POST with literal Content-Length: 0 (no body bytes at all) must land on 400, not
+        // 500 or NPE. The current servlet path hands an empty stream to Jackson's readTree() which returns
+        // MissingNode.getInstance(); ProduceRequestParser then rejects it via the `body == null || !body.isObject()`
+        // branch ("request body must be a JSON object"). This test pins that contract — a future Jackson upgrade or
+        // parser refactor that lets an empty body fall through to a downstream NPE would surface here.
+        ContentResponse resp = client.newRequest(url("/v1/topics/orders/records"))
+            .method(HttpMethod.POST)
+            .body(new StringRequestContent("application/json", ""))
             .send();
 
         assertEquals(400, resp.getStatus());
@@ -1131,6 +1148,67 @@ class KafkaHttpServerIntegrationTest {
                     + envelope.get("errorMessage").asText());
             assertEquals(StatusCode.BAD_DATA, listener.closeStatus,
                 "WebSocket close code must be 1003 (Unsupported Data) for protocol violations");
+        } finally {
+            wsClient.stop();
+        }
+    }
+
+    @Test
+    void wsUpgradeStripsPermessageDeflateEvenWhenClientOffersIt() throws Exception {
+        // Wave 23 G-#8: Jetty 12 registers `permessage-deflate` in the default WebSocket ExtensionRegistry and will
+        // negotiate it whenever a client offers `Sec-WebSocket-Extensions: permessage-deflate`. The bridge has no
+        // protocol need for compression — record frames are short JSON objects, not bulk payloads — so silently
+        // negotiating it adds a per-session zlib state machine that the published wire spec does not require and
+        // makes the handshake outcome depend on which Jetty patch version ships which default extensions. The fix
+        // calls `JettyServerUpgradeResponse.setExtensions(emptyList())` in the creator so the server's handshake
+        // response never echoes an `Sec-WebSocket-Extensions` header back to the client. Pin the contract:
+        //  1. Client offers `permessage-deflate; client_max_window_bits=15` in the upgrade request.
+        //  2. The handshake completes (status 101) — the server did not refuse the upgrade.
+        //  3. The server's response carries NO `Sec-WebSocket-Extensions` header — meaning the client negotiated
+        //     no extensions, even though it offered one Jetty would otherwise have accepted.
+        ConcurrentLinkedQueue<RequestSubmitter.FetchResult> queue = new ConcurrentLinkedQueue<>();
+        // One throwaway batch so the streamer has something to chew on if the test ever starts driving frames.
+        queue.add(new RequestSubmitter.FetchResult(
+            new FetchResponseFormatter.PartitionFetch(0, Errors.NONE, null, 0, 0, 0, new ArrayList<>()), 0L));
+        submitter.fetchResultQueue = queue;
+
+        WebSocketClient wsClient = new WebSocketClient();
+        wsClient.start();
+        try {
+            CapturingWsListener listener = new CapturingWsListener();
+            URI uri = URI.create(wsUrl("/v1/topics/orders/subscribe"));
+            ClientUpgradeRequest upgrade = new ClientUpgradeRequest();
+            // Offer permessage-deflate exactly as a hostile or naive client would. window_bits=15 is the spec
+            // maximum, the typical default a client picks if it doesn't tune the parameter.
+            upgrade.addExtensions("permessage-deflate; client_max_window_bits=15");
+
+            // Capture the server's handshake response so we can inspect Sec-WebSocket-Extensions directly. The
+            // JettyUpgradeListener fires synchronously on the client side as soon as the response headers arrive.
+            CompletableFuture<org.eclipse.jetty.client.Response> handshakeResponse = new CompletableFuture<>();
+            JettyUpgradeListener upgradeListener = new JettyUpgradeListener() {
+                @Override
+                public void onHandshakeResponse(org.eclipse.jetty.client.Request request,
+                                                 org.eclipse.jetty.client.Response response) {
+                    handshakeResponse.complete(response);
+                }
+            };
+
+            Session session = wsClient.connect(listener, uri, upgrade, upgradeListener).get(5, TimeUnit.SECONDS);
+            try {
+                org.eclipse.jetty.client.Response response = handshakeResponse.get(5, TimeUnit.SECONDS);
+                assertEquals(101, response.getStatus(),
+                    "handshake must complete (101 Switching Protocols) — the bridge accepted the upgrade");
+                String negotiatedExtensions = response.getHeaders().get("Sec-WebSocket-Extensions");
+                // Per RFC 6455 §9.1, an absent or empty Sec-WebSocket-Extensions response header means no
+                // extensions were negotiated. Jetty's `setExtensions(emptyList())` causes the header to be
+                // omitted entirely on the wire, so we accept null/empty as the success contract — but we MUST
+                // NOT see `permessage-deflate` anywhere in it.
+                assertTrue(negotiatedExtensions == null || negotiatedExtensions.isEmpty(),
+                    "server must not negotiate any WebSocket extensions — got: " + negotiatedExtensions);
+            } finally {
+                session.close(StatusCode.NORMAL, "test done", Callback.NOOP);
+                listener.closeLatch.await(5, TimeUnit.SECONDS);
+            }
         } finally {
             wsClient.stop();
         }

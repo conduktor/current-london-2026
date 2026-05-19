@@ -275,6 +275,13 @@ public final class HttpBridgeMetrics implements AutoCloseable {
      * instance would share the first instance's metric objects (histograms / meters keep their accumulated samples
      * across the lifecycle boundary, gauges keep pointing at the first instance's limiters). Idempotent: a second
      * {@code close()} is a no-op.
+     *
+     * <p>Each {@code removeMetric} call is wrapped so that a JMX deregistration failure mid-loop does not strand the
+     * remaining names — Yammer's silent dedup would then let the next bridge generation inherit the stranded gauges
+     * (still pointing at this instance's now-dead limiters), and operators would see live JMX values that span two
+     * bridge lifetimes. A first failure is rethrown to the caller (with subsequent failures suppressed onto it) so
+     * the lifecycle layer sees that close was not clean, but the remaining metrics are unregistered first to keep
+     * the next bridge instance's metrics honest.
      */
     @Override
     public synchronized void close() {
@@ -282,18 +289,47 @@ public final class HttpBridgeMetrics implements AutoCloseable {
             return;
         }
         closed = true;
+        RuntimeException firstFailure = null;
         for (Operation op : Operation.values()) {
-            group.removeMetric(NAME_REQUEST_LATENCY_MS, Collections.singletonMap(OPERATION_TAG, op.tag));
+            firstFailure = tryRemoveContinuing(firstFailure, NAME_REQUEST_LATENCY_MS,
+                Collections.singletonMap(OPERATION_TAG, op.tag));
             for (String family : statusFamilies()) {
-                group.removeMetric(NAME_RESPONSE_COUNT, operationStatusTags(op, family));
+                firstFailure = tryRemoveContinuing(firstFailure, NAME_RESPONSE_COUNT,
+                    operationStatusTags(op, family));
             }
         }
-        group.removeMetric(NAME_REJECTED_OVERSIZED_BODY);
-        group.removeMetric(NAME_REJECTED_AT_SSE_CAP);
-        group.removeMetric(NAME_SSE_STREAMS_OPENED);
-        group.removeMetric(NAME_ACTIVE_SSE_STREAMS);
-        group.removeMetric(NAME_REJECTED_AT_WS_CAP);
-        group.removeMetric(NAME_WS_SUBSCRIPTIONS_OPENED);
-        group.removeMetric(NAME_ACTIVE_WS_SUBSCRIPTIONS);
+        firstFailure = tryRemoveContinuing(firstFailure, NAME_REJECTED_OVERSIZED_BODY, Collections.emptyMap());
+        firstFailure = tryRemoveContinuing(firstFailure, NAME_REJECTED_AT_SSE_CAP, Collections.emptyMap());
+        firstFailure = tryRemoveContinuing(firstFailure, NAME_SSE_STREAMS_OPENED, Collections.emptyMap());
+        firstFailure = tryRemoveContinuing(firstFailure, NAME_ACTIVE_SSE_STREAMS, Collections.emptyMap());
+        firstFailure = tryRemoveContinuing(firstFailure, NAME_REJECTED_AT_WS_CAP, Collections.emptyMap());
+        firstFailure = tryRemoveContinuing(firstFailure, NAME_WS_SUBSCRIPTIONS_OPENED, Collections.emptyMap());
+        firstFailure = tryRemoveContinuing(firstFailure, NAME_ACTIVE_WS_SUBSCRIPTIONS, Collections.emptyMap());
+        if (firstFailure != null) {
+            throw firstFailure;
+        }
+    }
+
+    /**
+     * Remove a single metric, never aborting the close loop. If the call throws, the first failure is captured and
+     * subsequent failures are suppressed onto it; the loop continues so every other name we own still gets
+     * deregistered. Mirrors the constructor's rollback rationale (see class javadoc on Yammer's silent dedup).
+     */
+    private RuntimeException tryRemoveContinuing(RuntimeException firstFailure, String metric,
+                                                  Map<String, String> tags) {
+        try {
+            if (tags.isEmpty()) {
+                group.removeMetric(metric);
+            } else {
+                group.removeMetric(metric, tags);
+            }
+            return firstFailure;
+        } catch (RuntimeException e) {
+            if (firstFailure == null) {
+                return e;
+            }
+            firstFailure.addSuppressed(e);
+            return firstFailure;
+        }
     }
 }

@@ -158,8 +158,20 @@ final class SseStreamer {
             return;
         }
         // Priming write+flush has committed the response; the connection is live. Record "opened" now so the meter
-        // matches the gauge: failures above this line never count as an open.
-        onPrimed.run();
+        // matches the gauge: failures above this line never count as an open. The Runnable contract is not formally
+        // declared no-throw, and the streamer is fully constructed by this point — token ownership has transferred,
+        // the AsyncContext is started, and the response is committed. A throw out of onPrimed.run() at this point
+        // would propagate to the servlet caller, but no path inside the streamer would ever run closeStream()
+        // (scheduleNextFetch is skipped), so the limiter slot and AsyncContext would leak. Route any throw through
+        // the streamer's own closeStream() so the cleanup is identical to a transport failure: token released,
+        // AsyncContext completed, the slot freed for the next request.
+        try {
+            onPrimed.run();
+        } catch (RuntimeException e) {
+            LOG.warn("SSE onPrimed callback failed after priming flush — closing stream to release resources", e);
+            streamer.closeStream();
+            return;
+        }
         streamer.scheduleNextFetch();
     }
 

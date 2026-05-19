@@ -200,6 +200,18 @@ public final class KafkaHttpServer {
             // a cap rejection). The endpoint owns the token from that point onward; cleanup in onClose/onError
             // is idempotent.
             container.addMapping(WS_PATH_SPEC, (req, resp) -> {
+                // Strip any negotiated WebSocket extensions before the upgrade response is sent. Jetty 12 registers
+                // `permessage-deflate` in the default ExtensionRegistry and negotiates it whenever a client offers
+                // `Sec-WebSocket-Extensions: permessage-deflate` — even when the application code is unaware. The
+                // 8 KiB inbound caps in KafkaWebSocketEndpoint apply to the DECOMPRESSED message, so heap pressure
+                // is bounded, but the bridge has no protocol need for compression (frames are tiny JSON records,
+                // not bulk payloads) and silently negotiating it: (a) adds a per-session zlib state machine that
+                // isn't required by the wire spec we publish, (b) creates a CPU-cost surface where a small
+                // compressed frame expands into more decompression work, (c) makes the negotiated handshake
+                // depend on which Jetty patch version ships which extensions by default, which is exactly the
+                // kind of implementation drift Wave 23 axis G called out. Pin the contract: no extensions.
+                resp.setExtensions(java.util.Collections.emptyList());
+
                 String topic = extractSubscribeTopic(req.getRequestPath(), context.getContextPath());
                 if (topic == null) {
                     // The path-spec was already matched by the WS filter, so this branch should be unreachable
