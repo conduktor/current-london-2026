@@ -22,6 +22,7 @@ import org.slf4j.LoggerFactory;
 import java.net.InetSocketAddress;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.buffer.ByteBuf;
@@ -77,9 +78,11 @@ import io.netty.util.ReferenceCountUtil;
  * <h3>Thread safety</h3>
  * {@link #start()} binds synchronously and may block briefly; it is not safe to call
  * concurrently with itself but is safe to call once per instance. {@link #close()} is
- * idempotent and safe to call from any thread; subsequent calls return immediately.
- * The internal Netty handler runs entirely on the event-loop thread and is the only
- * thread that touches the selector's event-loop callbacks.
+ * idempotent and safe to call from any thread: the first caller runs the close path;
+ * the {@link java.util.concurrent.atomic.AtomicBoolean#compareAndSet} on {@code closed}
+ * makes every subsequent caller return immediately (CONC-2). The internal Netty handler
+ * runs entirely on the event-loop thread and is the only thread that touches the
+ * selector's event-loop callbacks.
  */
 public final class IoUringServerListener implements AutoCloseable {
 
@@ -100,7 +103,15 @@ public final class IoUringServerListener implements AutoCloseable {
     private volatile Channel serverChannel;
     private volatile int boundPort = -1;
     private volatile boolean started;
-    private volatile boolean closed;
+    // CONC-2: AtomicBoolean rather than `volatile boolean` so close() honors the
+    // Javadoc claim that it is "idempotent and safe to call from any thread; subsequent
+    // calls return immediately". A plain volatile + check-then-set is racy: two
+    // shutdown-thread callers (broker shutdown + a Processor-failed cleanup, for
+    // instance) can both observe closed==false, both set it true, and both run the
+    // close path — duplicating the SHUTDOWN_TIMEOUT_MS awaitUninterruptibly budget,
+    // doubling the worst-case shutdown wall-clock, and emitting duplicate log lines.
+    // compareAndSet narrows the close path to a single caller.
+    private final AtomicBoolean closed = new AtomicBoolean(false);
 
     /** Sentinel meaning "leave the OS default in place" — matches {@code Selectable.USE_DEFAULT_BUFFER_SIZE}. */
     public static final int USE_DEFAULT_BUFFER_SIZE = -1;
@@ -148,7 +159,7 @@ public final class IoUringServerListener implements AutoCloseable {
      * binding is deferred from the constructor.
      */
     public void start() {
-        if (closed) {
+        if (closed.get()) {
             throw new IllegalStateException("io_uring listener was closed before start()");
         }
         if (started) {
@@ -263,7 +274,7 @@ public final class IoUringServerListener implements AutoCloseable {
             log.warn("io_uring event-loop group did not shut down within {}ms during failed-start " +
                 "cleanup; leaving it detached so the caller's start() throw isn't blocked", shutdownBudgetMs);
         }
-        closed = true;
+        closed.set(true);
     }
 
     /**
@@ -284,8 +295,10 @@ public final class IoUringServerListener implements AutoCloseable {
 
     @Override
     public void close() {
-        if (closed) return;
-        closed = true;
+        // CONC-2: compareAndSet narrows the close path to a single caller. The second
+        // and subsequent threads see the prior true and return immediately, honoring
+        // the Javadoc thread-safety claim.
+        if (!closed.compareAndSet(false, true)) return;
         // If start() never ran (broker shutdown between construct and start), there's no
         // serverChannel to close — just shut the event-loop group down so the io_uring ring
         // file descriptors are released.

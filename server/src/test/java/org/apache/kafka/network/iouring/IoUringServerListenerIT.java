@@ -414,4 +414,73 @@ class IoUringServerListenerIT {
             }
         }
     }
+
+    /**
+     * CONC-2 regression: {@link IoUringServerListener#close()} is documented as
+     * "idempotent and safe to call from any thread; subsequent calls return immediately".
+     * Pre-fix that was a check-then-set on a {@code volatile boolean closed}, which two
+     * threads could both observe false and both proceed into the close path — duplicating
+     * the SHUTDOWN_TIMEOUT_MS awaitUninterruptibly budget and producing duplicate log
+     * lines. The fix replaces it with {@code AtomicBoolean.compareAndSet}, which narrows
+     * the close path to a single caller.
+     *
+     * <p>This test drives N threads at the listener's close() simultaneously, holds them
+     * at a CountDownLatch so they all unleash at once, then asserts wall-clock <
+     * SHUTDOWN_TIMEOUT_MS budget. Pre-fix the duplicated awaits would consistently
+     * overshoot the single-call budget; post-fix the second and subsequent callers
+     * short-circuit on the AtomicBoolean and return immediately.
+     */
+    @Test
+    void concurrentCloseIsIdempotent() throws Exception {
+        assumeTrue(IoUringSupport.isAvailable(),
+            "io_uring not available (" + IoUringSupport.unavailabilityReason() + "); skipping");
+
+        IoUringSelector selector = new IoUringSelector(
+            LISTENER, MAX_RECEIVE, MemoryPool.NONE, IDLE_NANOS_NEVER, Time.SYSTEM);
+        IoUringServerListener listener = new IoUringServerListener(
+            new InetSocketAddress("127.0.0.1", 0), selector);
+        try {
+            listener.start();
+
+            int n = 8;
+            CountDownLatch start = new CountDownLatch(1);
+            CountDownLatch done = new CountDownLatch(n);
+            AtomicLong maxElapsedNanos = new AtomicLong(0);
+            for (int i = 0; i < n; i++) {
+                Thread t = new Thread(() -> {
+                    try {
+                        start.await();
+                        long t0 = System.nanoTime();
+                        listener.close();
+                        long elapsed = System.nanoTime() - t0;
+                        // Track the slowest concurrent caller. The first caller does the
+                        // real work; the rest must short-circuit on the AtomicBoolean and
+                        // see negligible wall-clock.
+                        maxElapsedNanos.updateAndGet(prev -> Math.max(prev, elapsed));
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                    } finally {
+                        done.countDown();
+                    }
+                }, "iouring-close-concurrent-" + i);
+                t.setDaemon(true);
+                t.start();
+            }
+            start.countDown();
+            assertTrue(done.await(15, TimeUnit.SECONDS),
+                "all concurrent close() callers must return within bound");
+            // Total wall-clock must not exceed the single-close budget. Pre-fix it
+            // approached n * SHUTDOWN_TIMEOUT_MS because every caller did its own
+            // awaitUninterruptibly on the event-loop group; post-fix only one caller
+            // runs the close path.
+            long maxElapsedMs = TimeUnit.NANOSECONDS.toMillis(maxElapsedNanos.get());
+            assertTrue(maxElapsedMs < 8_000,
+                "slowest concurrent close() must be under the single-call budget — " +
+                    "saw " + maxElapsedMs + "ms across " + n + " threads " +
+                    "(pre-fix would have doubled/N-tupled the await budget)");
+        } finally {
+            listener.close();
+            selector.close();
+        }
+    }
 }
