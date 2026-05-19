@@ -24,6 +24,7 @@ import org.apache.kafka.common.protocol.ApiKeys
 import org.apache.kafka.common.record.{MemoryRecords, SimpleRecord}
 import org.apache.kafka.server.rules.{GovernanceLoader, GovernanceTopic, RuleDecision, RuleEngine}
 import org.apache.kafka.server.storage.log.FetchIsolation
+import org.apache.kafka.server.util.KafkaScheduler
 import org.apache.kafka.storage.internals.log.{FetchDataInfo, LogOffsetMetadata}
 
 import org.junit.jupiter.api.Assertions._
@@ -33,7 +34,8 @@ import org.mockito.Mockito.{doAnswer, doThrow, mock, when}
 
 import java.nio.charset.StandardCharsets
 import java.util.Collections
-import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.{CountDownLatch, TimeUnit}
+import java.util.concurrent.atomic.{AtomicLong, AtomicReference}
 
 /**
  * Unit tests for [[BrokerGovernanceBootstrap]] — the direct-log-read drain
@@ -2218,5 +2220,61 @@ class BrokerGovernanceBootstrapTest {
     assertEquals(before, after,
       "thread name must be restored even when drain body throws — the finally " +
         "clause is what guarantees the scheduler thread returns to its pool identity")
+  }
+
+  // R28 #252 — pin that scheduleOngoing's Runnable actually wraps the drain
+  // body in withDrainThreadName. The three tests above exercise the helper
+  // directly, which means a refactor that drops the `withDrainThreadName { ... }`
+  // wrap at BrokerGovernanceBootstrap#scheduleOngoing would still pass them
+  // silently, regressing the operator-triage capability #249 was supposed to
+  // deliver. We need a test that observes the thread name from INSIDE the
+  // production drain path.
+  //
+  // Approach: schedule the Runnable on a real KafkaScheduler and have the
+  // mocked ReplicaManager.getLog() capture Thread.currentThread().getName()
+  // on its first call. Both maybeWarnIfCleanupPolicyDrifted() and drainOnce()
+  // call getLog(); we capture once and signal a latch. With getLog returning
+  // None and the default LocalReplicaStatus.TopicAbsent, the drain body
+  // completes cleanly without touching the engine.
+  //
+  // Discriminating power: under the negative control (remove
+  // `withDrainThreadName { ... }` from scheduleOngoing) the captured name is
+  // the bare KafkaScheduler pool name (e.g. "kafka-scheduler-0"), which does
+  // NOT start with "governance-drain-" — so this test fails. With the wrap
+  // present it captures "governance-drain-kafka-scheduler-N" and passes.
+  @Test
+  def scheduleOngoingRunnableExecutesUnderDrainPrefixedThreadName(): Unit = {
+    val rm = mock(classOf[ReplicaManager])
+    val capturedName = new AtomicReference[String](null)
+    val latch = new CountDownLatch(1)
+    doAnswer { _ =>
+      // Capture only on the first invocation; subsequent calls from the same
+      // drain tick (or later ticks if the scheduler fires again before
+      // shutdown) must not overwrite the captured name.
+      capturedName.compareAndSet(null, Thread.currentThread().getName)
+      latch.countDown()
+      None
+    }.when(rm).getLog(tp)
+
+    val boot = new BrokerGovernanceBootstrap(rm, new RuleEngine(), tp)
+    val scheduler = new KafkaScheduler(1, true, "drain-wiring-test")
+    scheduler.startup()
+    try {
+      boot.scheduleOngoing(scheduler, 10L)
+      assertTrue(latch.await(5L, TimeUnit.SECONDS),
+        "scheduled drain task must run within the test timeout — if this " +
+          "times out, scheduleOngoing did not actually schedule the task")
+    } finally {
+      scheduler.shutdown()
+    }
+
+    val name = capturedName.get()
+    assertNotNull(name, "the drain body must have captured a thread name")
+    assertTrue(name.startsWith("governance-drain-"),
+      s"scheduleOngoing MUST wrap the drain body in withDrainThreadName so an " +
+        s"operator capturing a JVM thread dump can identify the wedged drain " +
+        s"thread. Captured name was '$name' — expected prefix 'governance-drain-'. " +
+        s"A refactor that drops the wrap would silently regress this capability " +
+        s"and pass every direct withDrainThreadName test in this file.")
   }
 }
