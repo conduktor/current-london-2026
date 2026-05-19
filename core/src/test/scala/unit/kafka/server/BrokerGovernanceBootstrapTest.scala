@@ -35,7 +35,7 @@ import org.mockito.Mockito.{doAnswer, doThrow, mock, when}
 import java.nio.charset.StandardCharsets
 import java.util.Collections
 import java.util.concurrent.{CountDownLatch, TimeUnit}
-import java.util.concurrent.atomic.{AtomicLong, AtomicReference}
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Unit tests for [[BrokerGovernanceBootstrap]] — the direct-log-read drain
@@ -2232,27 +2232,40 @@ class BrokerGovernanceBootstrapTest {
   //
   // Approach: schedule the Runnable on a real KafkaScheduler and have the
   // mocked ReplicaManager.getLog() capture Thread.currentThread().getName()
-  // on its first call. Both maybeWarnIfCleanupPolicyDrifted() and drainOnce()
-  // call getLog(); we capture once and signal a latch. With getLog returning
-  // None and the default LocalReplicaStatus.TopicAbsent, the drain body
-  // completes cleanly without touching the engine.
+  // on EVERY invocation (R29 #258 strengthening: see below). With getLog
+  // returning None and the default LocalReplicaStatus.TopicAbsent, the drain
+  // body completes cleanly without touching the engine.
   //
-  // Discriminating power: under the negative control (remove
-  // `withDrainThreadName { ... }` from scheduleOngoing) the captured name is
-  // the bare KafkaScheduler pool name (e.g. "kafka-scheduler-0"), which does
-  // NOT start with "governance-drain-" — so this test fails. With the wrap
-  // present it captures "governance-drain-kafka-scheduler-N" and passes.
+  // R29 #258: the earlier implementation captured only the FIRST getLog()
+  // call (compareAndSet on AtomicReference). A partial-wrap refactor —
+  // wrapping ONE of the two getLog callsites (maybeWarnIfCleanupPolicyDrifted
+  // vs drainOnce) but not both — would land on the named thread for the
+  // captured call and on the bare pool thread for the other, passing this
+  // test silently. We now capture every Thread.currentThread().getName at
+  // every getLog() and assert that ALL of them carry the drain prefix.
+  //
+  // Discriminating power: under the original negative control (remove
+  // `withDrainThreadName { ... }` from scheduleOngoing entirely) the captured
+  // names are the bare KafkaScheduler pool name (e.g. "kafka-scheduler-0").
+  // Under the new partial-wrap negative control (wrap only one of the two
+  // callsites) at least one captured name still lacks the prefix and the
+  // assertion fails. With the full wrap, every name carries
+  // "governance-drain-kafka-scheduler-N" and the test passes.
   @Test
   def scheduleOngoingRunnableExecutesUnderDrainPrefixedThreadName(): Unit = {
     val rm = mock(classOf[ReplicaManager])
-    val capturedName = new AtomicReference[String](null)
-    val latch = new CountDownLatch(1)
+    val capturedNames = new java.util.concurrent.ConcurrentLinkedQueue[String]()
+    val firstCallLatch = new CountDownLatch(1)
     doAnswer { _ =>
-      // Capture only on the first invocation; subsequent calls from the same
-      // drain tick (or later ticks if the scheduler fires again before
-      // shutdown) must not overwrite the captured name.
-      capturedName.compareAndSet(null, Thread.currentThread().getName)
-      latch.countDown()
+      // Capture EVERY invocation — both maybeWarnIfCleanupPolicyDrifted()
+      // and drainOnce() call getLog() within a single drain tick. The
+      // partial-wrap negative control wraps one but not the other; capturing
+      // every call makes that observable. Subsequent ticks (if scheduler
+      // fires again before shutdown) are also captured, which only
+      // strengthens the assertion — a refactor that fails to re-wrap on
+      // later ticks would also be caught.
+      capturedNames.add(Thread.currentThread().getName)
+      firstCallLatch.countDown()
       None
     }.when(rm).getLog(tp)
 
@@ -2261,20 +2274,35 @@ class BrokerGovernanceBootstrapTest {
     scheduler.startup()
     try {
       boot.scheduleOngoing(scheduler, 10L)
-      assertTrue(latch.await(5L, TimeUnit.SECONDS),
+      assertTrue(firstCallLatch.await(5L, TimeUnit.SECONDS),
         "scheduled drain task must run within the test timeout — if this " +
           "times out, scheduleOngoing did not actually schedule the task")
     } finally {
+      // Shutdown to stop further scheduler ticks before we snapshot the
+      // capture set. Pending drain ticks may complete during shutdown, which
+      // is fine — every captured name still must carry the drain prefix.
       scheduler.shutdown()
     }
 
-    val name = capturedName.get()
-    assertNotNull(name, "the drain body must have captured a thread name")
-    assertTrue(name.startsWith("governance-drain-"),
+    val names = new java.util.ArrayList[String](capturedNames)
+    assertFalse(names.isEmpty,
+      "the drain body must have captured at least one thread name")
+    val unprefixed = new java.util.ArrayList[String]()
+    val it = names.iterator()
+    while (it.hasNext) {
+      val n = it.next()
+      if (n == null || !n.startsWith("governance-drain-")) {
+        unprefixed.add(n)
+      }
+    }
+    assertTrue(unprefixed.isEmpty,
       s"scheduleOngoing MUST wrap the drain body in withDrainThreadName so an " +
         s"operator capturing a JVM thread dump can identify the wedged drain " +
-        s"thread. Captured name was '$name' — expected prefix 'governance-drain-'. " +
-        s"A refactor that drops the wrap would silently regress this capability " +
-        s"and pass every direct withDrainThreadName test in this file.")
+        s"thread. R29 #258: EVERY getLog() call within the drain tick must run " +
+        s"under the named thread; a partial-wrap refactor that names one " +
+        s"callsite but not another silently regresses operator triage and is " +
+        s"exactly what this assertion guards against. Captured ${names.size} " +
+        s"call(s); ${unprefixed.size} lacked the 'governance-drain-' prefix: " +
+        s"$unprefixed (full capture: $names)")
   }
 }
