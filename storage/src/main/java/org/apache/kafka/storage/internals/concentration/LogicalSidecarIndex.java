@@ -156,15 +156,27 @@ public final class LogicalSidecarIndex implements Closeable {
         lastBackingOffset = backingOffset;
     }
 
-    public long lookup(long logicalOffset) throws IOException {
-        long entriesNow;
-        synchronized (this) {
-            ensureOpen();
-            entriesNow = entries;
-        }
-        if (logicalOffset < 0 || logicalOffset >= entriesNow) {
+    public synchronized long lookup(long logicalOffset) throws IOException {
+        // BLOCKER #206: the bounds check + readEntryAt MUST run under the same monitor that
+        // truncateTo() and close() hold. The earlier "snapshot entries, then read outside the
+        // monitor" shape left a window where a concurrent truncateTo (synchronized) could shrink
+        // the file under our channel.read, or close() could shut the channel mid-read. On a
+        // local POSIX filesystem the worst observable outcome is an "unexpected EOF" IOException
+        // (channel.read returns -1 past the new size), which the BackingScanRecoverer rebuild
+        // path handles — but on a non-coherent filesystem (NFS, kernel page-cache eviction
+        // mid-truncate) a torn read of partial bytes is possible. Folding the read into the
+        // monitor closes the gap deterministically; the entry-level CRC32C (BLOCKER #132)
+        // remains the second line of defence against on-disk bit-rot.
+        //
+        // Throughput note: lookup() now serialises with append/truncate/close on this sidecar.
+        // Each sidecar serves one (logical topic, logical partition), and Kafka's broker holds a
+        // per-partition produce-serialisation invariant, so the worst-case contention is one
+        // fetch thread vs one produce thread on the same partition — negligible relative to the
+        // network I/O the fetch is already doing.
+        ensureOpen();
+        if (logicalOffset < 0 || logicalOffset >= entries) {
             throw new IndexOutOfBoundsException(
-                "logicalOffset " + logicalOffset + " out of [0, " + entriesNow + ")");
+                "logicalOffset " + logicalOffset + " out of [0, " + entries + ")");
         }
         return readEntryAt(logicalOffset);
     }
