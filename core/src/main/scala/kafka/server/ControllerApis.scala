@@ -1071,9 +1071,12 @@ class ControllerApis(
   //    Without a structural check, every controller-side guard collapses,
   //    re-opening the identity-laundering hole this method exists to close.
   //
-  // The narrow lookup lives in `callerTenantFromPrincipal`: only callers whose
-  // tenant id is currently bound on this node are recognised, so legitimate
-  // tenant clients remain exempt via `belongsToCallerTenant`.
+  // Same-tenant exemption lives in `callerTenantFromPrincipal`: a forwarded
+  // tenant principal is recognised structurally from its name, so a tenant
+  // owning the namespace it is acting on is exempt from this guard via
+  // `belongsToCallerTenant`. Recognition is purely structural (task #114) —
+  // no `tenantConfig.allTenants` lookup — so combined-mode and split-mode
+  // controllers produce identical decisions.
   private def isReservedTenantPrincipalNamespace(name: String): Boolean = {
     if (name == null) return false
     if (!name.startsWith(TenantNamespace.PRINCIPAL_PREFIX)) return false
@@ -1089,44 +1092,82 @@ class ControllerApis(
   // state (create/delete/alter configs/reassign/elect/...) by naming
   // `<tenantId>.X` literally.
   //
-  // Principal-aware by construction: returns true when the topic name
-  // lies in a tenant namespace that does NOT belong to the caller. So the
-  // legitimate forwarded tenant flow — broker rewrites `foo` → `acme.foo`,
-  // envelopes to controller with forwarded principal `__tenant_acme.alice`
-  // — passes through untouched while a cluster-wide admin or a cross-tenant
-  // principal `__tenant_evil.X` attempting `acme.foo` is refused.
+  // STRUCTURAL CHECK — does not consult `tenantConfig.allTenants`. Task #114:
+  // in split-mode KRaft the controller node has no broker listeners and
+  // therefore an empty TenantConfig, so any guard keyed on `allTenants` is a
+  // no-op and the metadata log silently absorbs cross-tenant creates. The
+  // structural rule below works regardless of which tenants are bound on
+  // this node: a name `<x>.<rest>` is "in a tenant namespace" iff `<x>` is
+  // syntactically a valid tenant id (passes `TenantNamespace.validateTenantId`).
   //
-  // Cross-tenant case: `callerTenant = Some("evil")`, name `acme.foo`. The
-  // name's prefix matches known tenant `acme` but not the caller's tenant,
-  // so the scrub fires. This is the same semantics as
-  // `belongsToCallerTenant` in the delegation-token guards (line 1083) but
-  // expressed in topic-namespace form rather than principal form.
+  // Behavioural break for split-mode safety: a privileged caller naming a
+  // topic `foo.bar` on the controller listener — where `foo` happens to
+  // satisfy the tenant-id charset but is NOT bound to any tenant — is now
+  // refused as INVALID_TOPIC_EXCEPTION. The old combined-mode behaviour
+  // accepted it (because `foo` was not in `allTenants`). The cost is real
+  // (free-dotted names from a cluster admin are off the table when the
+  // first segment looks like a tenant id) but the alternative is silently
+  // re-opening the entire #102 / #114 hole on every split-mode cluster.
+  // Internal topics (`__consumer_offsets` and friends), single-underscore
+  // prefixes (`_confluent-*`, Connect configs), and dot-free names remain
+  // allowed.
+  //
+  // Principal-aware: returns true when the topic name lies in a tenant
+  // namespace that does NOT belong to the caller. So the legitimate
+  // forwarded tenant flow — broker rewrites `foo` → `acme.foo`, envelopes
+  // to controller with forwarded principal `__tenant_acme.alice` — passes
+  // through untouched while a cluster-wide admin (`callerTenant = None`)
+  // or a cross-tenant principal `__tenant_evil.X` attempting `acme.foo` is
+  // refused.
   private def isForeignTenantNamespace(name: String, callerTenant: Option[String]): Boolean = {
     if (name == null || Topic.isInternal(name)) return false
-    val knownTenants = tenantConfig.allTenants
-    if (knownTenants.isEmpty) return false
-    val it = knownTenants.iterator
-    while (it.hasNext) {
-      val t = it.next()
-      if (name.startsWith(t + ".")) {
-        // Topic IS in tenant `t`'s namespace. Refuse unless the caller's
-        // effective tenant is exactly `t`.
-        return !callerTenant.contains(t)
-      }
+    // Single-`_` prefix exempts `_confluent-*`, Connect connector configs,
+    // and other operator-internal conventions. `__*` is covered by the
+    // `validateTenantId` rejection below (it refuses `__`-prefixed ids).
+    if (name.startsWith("_")) return false
+    val dot = name.indexOf('.')
+    if (dot <= 0) return false
+    val prefix = name.substring(0, dot)
+    // Tenant-id-shape check. If the prefix would fail at broker startup
+    // (charset, length, reserved `__` prefix, contains a dot — impossible
+    // here but checked for symmetry), this name is not in any tenant's
+    // namespace because no broker could ever be bound to `prefix`.
+    try {
+      TenantNamespace.validateTenantId(prefix)
+    } catch {
+      case _: IllegalArgumentException => return false
     }
-    false
+    // Topic IS in a tenant-shaped namespace. Refuse unless the caller's
+    // effective tenant is exactly `prefix`.
+    !callerTenant.contains(prefix)
   }
 
-  // Derive the caller's tenant from their principal name when the principal
-  // sits in a KNOWN tenant namespace. Unknown `__tenant_*` prefixes return
-  // None — the controller treats them as foreign to every known tenant.
+  // Derive the caller's tenant from their principal name. STRUCTURAL — does
+  // not consult `tenantConfig.allTenants`. Task #114: in split-mode KRaft the
+  // controller's TenantConfig is empty, so the old `allTenants.contains`
+  // gate returned None for every forwarded tenant principal and the
+  // controller treated the legitimate `__tenant_acme.alice` → `acme.foo`
+  // flow as foreign — which made the scrub return TRUE and broke every
+  // tenant CreateTopics through the controller.
+  //
+  // The structural form pairs with `isForeignTenantNamespace`: both check
+  // the tenant-id shape independently of `allTenants`, so combined-mode
+  // and split-mode produce identical decisions for a given (principal,
+  // topic) pair. The only asymmetry that remains — unknown-but-valid
+  // tenant ids being treated as tenant-shaped — is documented in
+  // `isForeignTenantNamespace`.
   private def callerTenantFromPrincipal(principalName: String): Option[String] = {
     if (principalName == null || !principalName.startsWith(TenantNamespace.PRINCIPAL_PREFIX)) return None
     val afterPrefix = principalName.substring(TenantNamespace.PRINCIPAL_PREFIX.length)
     val dot = afterPrefix.indexOf('.')
     if (dot <= 0) return None
-    val tenant = afterPrefix.substring(0, dot)
-    if (tenantConfig.allTenants.contains(tenant)) Some(tenant) else None
+    // Empty-user envelope `__tenant_<id>.` is treated as un-bound: empty
+    // user names are forbidden on the encode side (TenantNamespace) so this
+    // shape can only arrive via a planted JAAS entry or a metadata-log
+    // write. Refusing to recognise it here forces `isForeignTenantNamespace`
+    // to treat any tenant-namespaced topic as foreign — closing #103.
+    if (dot == afterPrefix.length - 1) return None
+    Some(afterPrefix.substring(0, dot))
   }
 
   private[server] def handleCreateDelegationTokenRequest(request: RequestChannel.Request): CompletableFuture[Unit] = {

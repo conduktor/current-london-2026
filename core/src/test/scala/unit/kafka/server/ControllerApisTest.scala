@@ -2444,6 +2444,270 @@ class ControllerApisTest {
     verify(controller, never()).createPartitions(any(), any(), ArgumentMatchers.anyBoolean())
   }
 
+  // ---------------------------------------------------------------------------
+  // Split-mode KRaft / task #114 — STRUCTURAL TOPIC scrub.
+  //
+  // A controller-only node (`process.roles=controller`) has no broker
+  // listeners, so its TenantConfig is constructed from broker originals that
+  // contain ZERO `listener.name.<x>.tenant.id` keys. `allTenants` is empty.
+  // The pre-task-#114 scrub keyed on `allTenants.iterator.exists(t =>
+  // name.startsWith(t + "."))`, which collapsed to `false` for every name on
+  // every request. Result: every controller-side TOPIC scrub on a split-mode
+  // controller was a no-op and a cluster admin could create / delete / add
+  // partitions to any tenant-prefixed topic by reaching bootstrap.controllers
+  // directly.
+  //
+  // The structural fix replaces the `allTenants` lookup with a tenant-id
+  // SHAPE check (`TenantNamespace.validateTenantId(prefix)`) and derives
+  // callerTenant from the principal name structurally (no `allTenants`
+  // membership gate). Combined-mode and split-mode now produce identical
+  // decisions for any given (principal, topic) pair.
+  //
+  // Behavioural break documented in the helper comments: a cluster admin
+  // naming a topic `foo.bar` from `bootstrap.controllers` is refused when
+  // `foo` is a syntactically valid tenant id, even if `foo` is not currently
+  // bound. Internal topics, single-`_` prefixes, and dotless names remain
+  // allowed.
+  // ---------------------------------------------------------------------------
+
+  @Test
+  def testControllerSplitModeCreateTopicsRefusesTenantPrefixedName(): Unit = {
+    // Adversary on bootstrap.controllers of a SPLIT-MODE controller node.
+    // No `tenant.id` binding anywhere in this process's config, so before
+    // task #114 `allTenants.isEmpty` short-circuited the scrub to `false`
+    // and `acme.orders` flowed straight to the metadata log. With the
+    // structural check, the topic must be refused.
+    val controller = new MockController.Builder().build()
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.empty())
+    val request = new CreateTopicsRequest.Builder(
+      new CreateTopicsRequestData().setTopics(new CreatableTopicCollection(util.Arrays.asList(
+        new CreatableTopic().setName("acme.orders").setNumPartitions(1).setReplicationFactor(1)
+      ).iterator()))).build()
+    val response = handleRequest[CreateTopicsResponse](request, controllerApis)
+    val results = response.data.topics().asScala.map(t => t.name -> t.errorCode).toMap
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, results("acme.orders"),
+      "split-mode controller (empty TenantConfig) must STILL refuse tenant-prefixed names — #114")
+  }
+
+  @Test
+  def testControllerSplitModeCreateTopicsAllowsForwardedTenantPrincipal(): Unit = {
+    // Companion to the refusal above: the legitimate forwarded tenant flow
+    // (broker rewrote `foo` → `acme.foo`, envelope carries
+    // `__tenant_acme.alice`) must continue to work in split mode too. The
+    // structural `callerTenantFromPrincipal` derives tenant `acme` from the
+    // principal name alone — no `allTenants` membership required.
+    val topics = new CreatableTopicCollection()
+    topics.add(new CreatableTopic().setName("acme.foo").setNumPartitions(1).setReplicationFactor(1.toShort))
+    val createTopicsRequest = new CreateTopicsRequest.Builder(
+      new CreateTopicsRequestData().setTopics(topics)).build()
+    val tenantPrincipal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_acme.alice")
+    val envelopeRequest = kafka.utils.TestUtils.buildEnvelopeRequest(
+      createTopicsRequest, envelopePrincipalSerde, requestChannelMetrics, time.nanoseconds(),
+      forwardedPrincipal = tenantPrincipal,
+      outerPrincipal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    val controller = mock(classOf[Controller])
+    when(controller.createTopics(
+      any(classOf[ControllerRequestContext]),
+      any(classOf[CreateTopicsRequestData]),
+      any(classOf[java.util.Set[String]])))
+      .thenReturn(CompletableFuture.completedFuture(new CreateTopicsResponseData()))
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.empty())
+    controllerApis.handle(envelopeRequest, RequestLocal.noCaching())
+
+    val createCaptor: ArgumentCaptor[CreateTopicsRequestData] =
+      ArgumentCaptor.forClass(classOf[CreateTopicsRequestData])
+    verify(controller).createTopics(
+      any(classOf[ControllerRequestContext]),
+      createCaptor.capture(),
+      any(classOf[java.util.Set[String]]))
+    val forwarded = createCaptor.getValue.topics().asScala.map(_.name).toList
+    assertEquals(List("acme.foo"), forwarded,
+      "split-mode controller must STILL pass the legitimate forwarded tenant create through — #114")
+  }
+
+  @Test
+  def testControllerSplitModeDeleteTopicsAllowsForwardedTenantPrincipal(): Unit = {
+    // DELETE_TOPICS is in TENANT_ALLOWED_APIS, so a tenant client legitimately
+    // forwards a DeleteTopics request through the broker → controller route.
+    // On a split-mode controller with empty TenantConfig, the structural
+    // `callerTenantFromPrincipal` must still recognise `__tenant_acme.alice`
+    // as tenant `acme` and let `acme.orders` reach controller.deleteTopics.
+    val topics = new util.ArrayList[DeleteTopicState]()
+    topics.add(new DeleteTopicState().setName("acme.orders").setTopicId(ZERO_UUID))
+    val deleteRequest = new DeleteTopicsRequest.Builder(
+      new DeleteTopicsRequestData().setTopics(topics).setTimeoutMs(5000)).build()
+    val tenantPrincipal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_acme.alice")
+    val envelopeRequest = kafka.utils.TestUtils.buildEnvelopeRequest(
+      deleteRequest, envelopePrincipalSerde, requestChannelMetrics, time.nanoseconds(),
+      forwardedPrincipal = tenantPrincipal,
+      outerPrincipal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    val controller = mock(classOf[Controller])
+    when(controller.findTopicNames(any(classOf[ControllerRequestContext]), any(classOf[java.util.Collection[Uuid]])))
+      .thenReturn(CompletableFuture.completedFuture(java.util.Collections.emptyMap[Uuid, ResultOrError[String]]()))
+    val nameToId = new util.HashMap[String, ResultOrError[Uuid]]()
+    val topicUuid = Uuid.randomUuid()
+    nameToId.put("acme.orders", new ResultOrError(topicUuid))
+    when(controller.findTopicIds(any(classOf[ControllerRequestContext]), any(classOf[java.util.Collection[String]])))
+      .thenReturn(CompletableFuture.completedFuture(nameToId))
+    val deleteResults = new util.HashMap[Uuid, org.apache.kafka.common.requests.ApiError]()
+    deleteResults.put(topicUuid, org.apache.kafka.common.requests.ApiError.NONE)
+    when(controller.deleteTopics(any(classOf[ControllerRequestContext]), any(classOf[java.util.Set[Uuid]])))
+      .thenReturn(CompletableFuture.completedFuture(deleteResults))
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.empty())
+    controllerApis.handle(envelopeRequest, RequestLocal.noCaching())
+
+    // The scrub did not refuse: controller.deleteTopics was invoked with
+    // the resolved tenant uuid, not short-circuited to an empty set.
+    val idCaptor: ArgumentCaptor[java.util.Set[Uuid]] =
+      ArgumentCaptor.forClass(classOf[java.util.Set[Uuid]])
+    verify(controller).deleteTopics(any(classOf[ControllerRequestContext]), idCaptor.capture())
+    assertEquals(java.util.Collections.singleton(topicUuid), idCaptor.getValue,
+      "split-mode controller must pass the legitimate forwarded tenant delete through — #114")
+  }
+
+  @Test
+  def testControllerSplitModeCreateTopicsRefusesFreeDottedNameWithValidTenantShape(): Unit = {
+    // Behavioural-break test (documented in the isForeignTenantNamespace
+    // comment): a cluster admin naming a topic `cluster-metrics.frob` is now
+    // refused on bootstrap.controllers, because `cluster-metrics` is a
+    // syntactically valid tenant id (passes Topic.isValid, no `__` prefix,
+    // no dot) AND the caller has no tenant principal binding. The pre-#114
+    // combined-mode behaviour accepted this name because `cluster-metrics`
+    // was not in `allTenants`. The cost is real (free-dotted names from a
+    // cluster admin are off the table when the first segment looks like a
+    // tenant id) but the structural check is the only way to make split-mode
+    // controllers safe.
+    //
+    // Workaround for operators: name cluster-scope topics with a single-`_`
+    // prefix (`_cluster-metrics.frob`) or with no dot at all
+    // (`cluster-metrics-frob`); both remain allowed by the scrub.
+    val controller = new MockController.Builder().build()
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.empty())
+    val request = new CreateTopicsRequest.Builder(
+      new CreateTopicsRequestData().setTopics(new CreatableTopicCollection(util.Arrays.asList(
+        new CreatableTopic().setName("cluster-metrics.frob").setNumPartitions(1).setReplicationFactor(1)
+      ).iterator()))).build()
+    val response = handleRequest[CreateTopicsResponse](request, controllerApis)
+    val results = response.data.topics().asScala.map(t => t.name -> t.errorCode).toMap
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, results("cluster-metrics.frob"),
+      "structural scrub refuses any `<x>.<y>` from a cluster-wide caller when `<x>` is tenant-id-shaped — documented break")
+  }
+
+  @Test
+  def testControllerSplitModeCreateTopicsAllowsSingleUnderscorePrefixName(): Unit = {
+    // The single-`_` prefix is the documented escape hatch for cluster-scope
+    // topics that need a dot in the name (Connect connector configs like
+    // `_confluent-monitoring.frob`, operator-internal `_metrics.lag`). The
+    // structural scrub MUST allow these through even in split mode.
+    val controller = new MockController.Builder().build()
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.empty())
+    val request = new CreateTopicsRequest.Builder(
+      new CreateTopicsRequestData().setTopics(new CreatableTopicCollection(util.Arrays.asList(
+        new CreatableTopic().setName("_confluent-monitoring.frob").setNumPartitions(1).setReplicationFactor(1)
+      ).iterator()))).build()
+    val response = handleRequest[CreateTopicsResponse](request, controllerApis)
+    val results = response.data.topics().asScala.map(t => t.name -> t.errorCode).toMap
+    assertEquals(Errors.NONE.code, results("_confluent-monitoring.frob"),
+      "single-`_` prefix exempts the name from the structural tenant-namespace scrub — escape hatch")
+  }
+
+  @Test
+  def testControllerSplitModeCreateTopicsAllowsDotlessName(): Unit = {
+    // A dot-free name has no `<x>.<rest>` shape, so it can never be in any
+    // tenant's namespace. Must remain allowed.
+    val controller = new MockController.Builder().build()
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.empty())
+    val request = new CreateTopicsRequest.Builder(
+      new CreateTopicsRequestData().setTopics(new CreatableTopicCollection(util.Arrays.asList(
+        new CreatableTopic().setName("plain-topic").setNumPartitions(1).setReplicationFactor(1)
+      ).iterator()))).build()
+    val response = handleRequest[CreateTopicsResponse](request, controllerApis)
+    val results = response.data.topics().asScala.map(t => t.name -> t.errorCode).toMap
+    assertEquals(Errors.NONE.code, results("plain-topic"),
+      "dotless name has no tenant-namespace shape and must pass the structural scrub")
+  }
+
+  @Test
+  def testControllerSplitModeCreatePartitionsRefusesCrossTenantOnEmptyConfig(): Unit = {
+    // Cross-tenant pollution on split mode: a tenant principal `evil` (not
+    // bound on THIS controller but a valid forwarded identity from a peer
+    // broker) submits CreatePartitions for `acme.orders`. The structural
+    // check sees `callerTenant = Some("evil")` and `acme.orders`'s prefix
+    // `acme` is tenant-id-shaped — refused (callerTenant != prefix). Note
+    // that on this controller node, `evil` is not in any binding either —
+    // proving the check works purely on the principal structure.
+    val crossRequestData = new CreatePartitionsRequestData()
+    crossRequestData.topics().add(
+      new CreatePartitionsTopic().setName("acme.orders").setAssignments(null).setCount(10))
+    val createPartitionsRequest = new CreatePartitionsRequest.Builder(crossRequestData).build()
+    val crossTenantPrincipal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_evil.alice")
+    val envelopeRequest = kafka.utils.TestUtils.buildEnvelopeRequest(
+      createPartitionsRequest, envelopePrincipalSerde, requestChannelMetrics, time.nanoseconds(),
+      forwardedPrincipal = crossTenantPrincipal,
+      outerPrincipal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    val controller = mock(classOf[Controller])
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.empty())
+    controllerApis.handle(envelopeRequest, RequestLocal.noCaching())
+
+    verify(controller, never()).createPartitions(any(), any(), ArgumentMatchers.anyBoolean())
+  }
+
+  @Test
+  def testControllerSplitModeCreateTopicsAllowsInternalTopic(): Unit = {
+    // Must-not-regress: internal topics (`__consumer_offsets`, etc.) remain
+    // exempt from the structural scrub in split mode too.
+    val controller = mock(classOf[Controller])
+    when(controller.createTopics(
+      any(classOf[ControllerRequestContext]),
+      any(classOf[CreateTopicsRequestData]),
+      any(classOf[java.util.Set[String]])))
+      .thenReturn(CompletableFuture.completedFuture(new CreateTopicsResponseData()))
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.empty())
+    val request = new CreateTopicsRequest.Builder(
+      new CreateTopicsRequestData().setTopics(new CreatableTopicCollection(util.Arrays.asList(
+        new CreatableTopic().setName(Topic.GROUP_METADATA_TOPIC_NAME)
+          .setNumPartitions(1).setReplicationFactor(1)
+      ).iterator()))).build()
+    handleRequest[CreateTopicsResponse](request, controllerApis)
+    // controller.createTopics was invoked — the scrub did not short-circuit.
+    val createCaptor: ArgumentCaptor[CreateTopicsRequestData] =
+      ArgumentCaptor.forClass(classOf[CreateTopicsRequestData])
+    verify(controller).createTopics(
+      any(classOf[ControllerRequestContext]),
+      createCaptor.capture(),
+      any(classOf[java.util.Set[String]]))
+    val forwarded = createCaptor.getValue.topics().asScala.map(_.name).toList
+    assertEquals(List(Topic.GROUP_METADATA_TOPIC_NAME), forwarded,
+      "internal topic must reach controller.createTopics intact in split mode")
+  }
+
   @AfterEach
   def tearDown(): Unit = {
     quotasNeverThrottleControllerMutations.shutdown()
