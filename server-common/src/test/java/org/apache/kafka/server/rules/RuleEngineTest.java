@@ -422,6 +422,99 @@ public class RuleEngineTest {
     }
 
     @Test
+    public void cumulativeFailOpenAndFailClosedCountersAdvanceOnEveryEvent() {
+        // Round-15 Request-path HIGH-3: the window-bound suppressedXxxWarnings
+        // counters above are reset to 0 on every emitted WARN and therefore
+        // cannot serve as a long-term operator-sampling signal. The
+        // monotonically-increasing cumulative counters added by HIGH-3 must
+        // bump on EVERY event (including events suppressed by the throttle),
+        // never reset, and remain independent across the three event classes.
+        // An operator (or a future JMX adapter) reading the public getters
+        // sees the absolute event count since engine construction — the
+        // signal needed for rate/anomaly metrics. This test pins all three
+        // semantics on the same engine instance.
+        RuleEngine engine = new RuleEngine();
+        // Three rules so each event class fires from its own path. The
+        // bypass-listener short-circuit is off (fromPrivilegedListener=false)
+        // and no bypass principal is configured, so every call traverses the
+        // throttled WARN methods.
+        engine.install(new RuleSetBuilder()
+            .put(denyRule("explody", ApiKeys.METADATA, "1 / 0 == 0", 99))
+            .build());
+
+        // Baselines should be zero on a fresh engine.
+        assertEquals(0L, engine.activationFailureFailOpenCount(),
+            "fresh engine has not yet observed any activation-supplier failure");
+        assertEquals(0L, engine.evalErrorFailOpenCount(),
+            "fresh engine has not yet observed any rule eval error");
+        assertEquals(0L, engine.activationBudgetFailClosedCount(),
+            "fresh engine has not yet observed any activation-budget overflow");
+
+        // Drive 100 activation-supplier failures (non-budget). All but at
+        // most one are suppressed by the 1-second WARN throttle, but every
+        // call must still increment the cumulative counter.
+        final int activationFailures = 100;
+        for (int i = 0; i < activationFailures; i++) {
+            RuleDecision d = engine.evaluate(
+                ApiKeys.METADATA, "client", null, false,
+                () -> {
+                    throw new IllegalStateException("walker bug");
+                });
+            assertSame(RuleDecision.ALLOW, d,
+                "broken supplier must fail open on every call");
+        }
+        assertEquals(activationFailures, engine.activationFailureFailOpenCount(),
+            "every activation-supplier failure must bump the cumulative counter, "
+                + "including events suppressed by the WARN throttle");
+        // The other two counters must NOT have moved — events are independent.
+        assertEquals(0L, engine.evalErrorFailOpenCount(),
+            "activation-supplier failures must not bleed into the eval-error counter");
+        assertEquals(0L, engine.activationBudgetFailClosedCount(),
+            "activation-supplier failures must not bleed into the budget-closed counter");
+
+        // Drive 100 per-rule eval errors. Same throttle behaviour, same
+        // independence guarantee.
+        final int evalErrors = 100;
+        for (int i = 0; i < evalErrors; i++) {
+            RuleDecision d = engine.evaluate(
+                ApiKeys.METADATA, "client", null, false,
+                () -> Collections.singletonMap("request", Collections.emptyMap()));
+            assertSame(RuleDecision.ALLOW, d,
+                "buggy predicate must fail open on every call");
+        }
+        assertEquals(evalErrors, engine.evalErrorFailOpenCount(),
+            "every per-rule eval error must bump the cumulative counter, "
+                + "including events suppressed by the WARN throttle");
+        // activation-failure counter must not have moved further.
+        assertEquals(activationFailures, engine.activationFailureFailOpenCount(),
+            "eval errors must not bleed into the activation-supplier-failure counter");
+        assertEquals(0L, engine.activationBudgetFailClosedCount(),
+            "eval errors must not bleed into the budget-closed counter");
+
+        // Drive 100 budget-exceeded fail-closed events.
+        final int budgetTrips = 100;
+        for (int i = 0; i < budgetTrips; i++) {
+            RuleDecision d = engine.evaluate(
+                ApiKeys.METADATA, "client", null, false,
+                () -> {
+                    throw new ActivationBudgetExceededException("wide request");
+                });
+            assertTrue(d.denied(),
+                "budget overflow must fail CLOSED on every call");
+            assertEquals(Errors.POLICY_VIOLATION.code(), d.errorCode());
+        }
+        assertEquals(budgetTrips, engine.activationBudgetFailClosedCount(),
+            "every activation-budget overflow must bump the cumulative counter, "
+                + "including events suppressed by the WARN throttle");
+        // The other two counters must remain at the values left by their
+        // own loops — no cross-bleed.
+        assertEquals(activationFailures, engine.activationFailureFailOpenCount(),
+            "budget overflows must not bleed into the activation-supplier-failure counter");
+        assertEquals(evalErrors, engine.evalErrorFailOpenCount(),
+            "budget overflows must not bleed into the eval-error counter");
+    }
+
+    @Test
     public void ruleEvaluatesWhenApiKeyMatchesAndPredicateIsTrue() {
         RuleEngine engine = new RuleEngine();
         engine.install(new RuleSetBuilder()

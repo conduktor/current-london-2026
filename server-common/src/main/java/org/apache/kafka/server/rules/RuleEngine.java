@@ -225,6 +225,58 @@ public final class RuleEngine {
     static final long ACTIVATION_FAILURE_WARN_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(1);
 
     /**
+     * Round-15 Request-path HIGH-3: monotonically-increasing cumulative
+     * counters for engine fail-open / fail-closed events. These are
+     * deliberately independent of the {@code suppressedXxxWarnings} counters
+     * above — those are window-bound and reset to zero on every emitted WARN,
+     * so they can only report rate within a single 1-second window. An
+     * operator sampling them externally would see arbitrarily-zeroed values
+     * with no useful long-term signal.
+     *
+     * <p>These three fields, in contrast, accumulate one count per event for
+     * the lifetime of the engine instance, independent of throttle gating.
+     * They are the data source for any future JMX/metric adapter that wants
+     * to expose fail-open and fail-closed rates as broker telemetry —
+     * dashboards, alerts, anomaly detection. The adapter itself is not
+     * wired up in this change; it can be added later without modifying the
+     * engine, by reading the public getters
+     * {@link #activationFailureFailOpenCount()},
+     * {@link #evalErrorFailOpenCount()}, and
+     * {@link #activationBudgetFailClosedCount()}.
+     *
+     * <p>Each counter is incremented unconditionally on every event entry —
+     * BEFORE the window-based WARN gate — so events suppressed by the
+     * throttle still register in the cumulative count. The split is:
+     *
+     * <ul>
+     *   <li>{@code activationFailureFailOpenCount}: every time
+     *       {@code activationSupplier.get()} threw a non-budget exception
+     *       and the request fell open. A non-zero rate here indicates a
+     *       walker bug, a partially-constructed protocol object reaching
+     *       evaluate(), or a published rule shape that exercises a brittle
+     *       accessor.</li>
+     *   <li>{@code evalErrorFailOpenCount}: every time a rule's
+     *       {@code evalBoolean} threw and the engine moved on to the next
+     *       rule. A non-zero rate here indicates a published rule with a
+     *       bug, or a malformed activation map for an in-effect rule.</li>
+     *   <li>{@code activationBudgetFailClosedCount}: every time the walker
+     *       exhausted its budget and the request was fail-CLOSED with
+     *       POLICY_VIOLATION + {@link #ACTIVATION_BUDGET_RULE_ID}. A
+     *       sustained rate here is a deliberate-attacker-shape signal —
+     *       the engine is doing exactly what it should, but an operator
+     *       wants to see it happening.</li>
+     * </ul>
+     *
+     * <p>{@link AtomicLong} for thread safety on the request hot path. A
+     * single contended increment per request is fine — the alternative
+     * (a {@code LongAdder}) trades read cost for write cost, and these
+     * counters are written far more often than read.
+     */
+    private final AtomicLong activationFailureFailOpenCount = new AtomicLong(0L);
+    private final AtomicLong evalErrorFailOpenCount = new AtomicLong(0L);
+    private final AtomicLong activationBudgetFailClosedCount = new AtomicLong(0L);
+
+    /**
      * Allow-list of principal strings (e.g. {@code "User:broker"}) that may
      * exercise the privileged-listener bypass. Sourced from the dedicated
      * {@code governance.bypass.principals} broker config — independent of
@@ -775,6 +827,12 @@ public final class RuleEngine {
      * the suppressed counter, never block waiting for the appender.
      */
     private void maybeWarnBudgetExceeded(ApiKeys apiKey, ActivationBudgetExceededException budget) {
+        // Round-15 Request-path HIGH-3: bump the cumulative fail-closed
+        // counter on EVERY event, independent of whether the WARN actually
+        // fires in this window. This gives operators a long-term sampling
+        // signal that the window-bound suppressedBudgetWarnings counter
+        // (which resets to 0 on every emitted WARN) cannot provide.
+        activationBudgetFailClosedCount.incrementAndGet();
         long now = System.nanoTime();
         long last = lastBudgetWarnNanos.get();
         if (now - last >= BUDGET_WARN_INTERVAL_NANOS
@@ -809,6 +867,10 @@ public final class RuleEngine {
      * operators see the rate of the storm, not just one example.
      */
     private void maybeWarnEvalError(String ruleId, ApiKeys apiKey, Throwable t) {
+        // Round-15 Request-path HIGH-3: cumulative fail-open counter, see
+        // field javadoc on evalErrorFailOpenCount. Incremented BEFORE the
+        // throttle CAS so suppressed events still register.
+        evalErrorFailOpenCount.incrementAndGet();
         long now = System.nanoTime();
         long last = lastEvalErrorWarnNanos.get();
         if (now - last >= EVAL_ERROR_WARN_INTERVAL_NANOS
@@ -843,6 +905,10 @@ public final class RuleEngine {
      * <p>{@code apiKey} is enum-typed so it does not need sanitisation.
      */
     private void maybeWarnActivationSupplierFailed(ApiKeys apiKey, Throwable t) {
+        // Round-15 Request-path HIGH-3: cumulative fail-open counter, see
+        // field javadoc on activationFailureFailOpenCount. Incremented
+        // BEFORE the throttle CAS so suppressed events still register.
+        activationFailureFailOpenCount.incrementAndGet();
         long now = System.nanoTime();
         long last = lastActivationFailureWarnNanos.get();
         if (now - last >= ACTIVATION_FAILURE_WARN_INTERVAL_NANOS
@@ -859,5 +925,44 @@ public final class RuleEngine {
         } else {
             suppressedActivationFailureWarnings.incrementAndGet();
         }
+    }
+
+    /**
+     * Cumulative count of activation-supplier failures that caused this
+     * engine to fall open since construction. Monotonically non-decreasing;
+     * survives across warn-throttle windows; sampled by external operators
+     * (JMX/metric adapter, dashboards, alerting). See the field javadoc on
+     * the underlying counter for what each event means and how to interpret
+     * a sustained non-zero rate.
+     *
+     * <p>Round-15 Request-path HIGH-3.
+     */
+    public long activationFailureFailOpenCount() {
+        return activationFailureFailOpenCount.get();
+    }
+
+    /**
+     * Cumulative count of per-rule eval-error fail-open events since engine
+     * construction. See {@link #activationFailureFailOpenCount} for sampling
+     * semantics. A sustained non-zero rate indicates a published rule that
+     * throws under the current request mix.
+     *
+     * <p>Round-15 Request-path HIGH-3.
+     */
+    public long evalErrorFailOpenCount() {
+        return evalErrorFailOpenCount.get();
+    }
+
+    /**
+     * Cumulative count of activation-budget-exceeded fail-CLOSED events
+     * since engine construction. See {@link #activationFailureFailOpenCount}
+     * for sampling semantics. A sustained non-zero rate is a deliberate-
+     * attacker-shape signal — the engine is correctly fail-closing wide
+     * requests; an operator wants to see the rate and source.
+     *
+     * <p>Round-15 Request-path HIGH-3.
+     */
+    public long activationBudgetFailClosedCount() {
+        return activationBudgetFailClosedCount.get();
     }
 }
