@@ -162,4 +162,34 @@ class BrokerServerRequireLocalReplicaTest {
   def booleanObjectTrueKeepsGateEngaged(): Unit = {
     assertTrue(BrokerServer.parseRequireLocalReplica(java.lang.Boolean.TRUE))
   }
+
+  // ---------------------------------------------------------------------
+  // Hostile Unicode whitespace — Java String.trim() only strips codepoints
+  // <= U+0020. Anything above survives trimming and fails the exact match,
+  // which is the SAFE outcome. R40-F-2: pin the contract the javadoc claims.
+  // ---------------------------------------------------------------------
+
+  @Test
+  def nbspPrefixedFalseKeepsGateEngaged(): Unit = {
+    // U+00A0 NO-BREAK SPACE — not stripped by String.trim().
+    assertTrue(BrokerServer.parseRequireLocalReplica(" false"))
+  }
+
+  @Test
+  def nnbspPrefixedFalseKeepsGateEngaged(): Unit = {
+    // U+202F NARROW NO-BREAK SPACE — not stripped by String.trim().
+    assertTrue(BrokerServer.parseRequireLocalReplica(" false"))
+  }
+
+  @Test
+  def zwspPrefixedFalseKeepsGateEngaged(): Unit = {
+    // U+200B ZERO-WIDTH SPACE — invisible, not stripped by String.trim().
+    assertTrue(BrokerServer.parseRequireLocalReplica("​false"))
+  }
+
+  @Test
+  def ideographicSpacePrefixedFalseKeepsGateEngaged(): Unit = {
+    // U+3000 IDEOGRAPHIC SPACE — not stripped by String.trim().
+    assertTrue(BrokerServer.parseRequireLocalReplica("　false"))
+  }
 }

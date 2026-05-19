@@ -231,10 +231,14 @@ object BrokerServer {
   /**
    * Parser for the {@code governance.bootstrap.require.local.replica} broker
    * property. Fail-CLOSED by design: the only values that disable the
-   * require-local-replica safety gate are exact, lowercase, trimmed matches of
-   * {@code "false"}, {@code "no"}, or {@code "0"}. Any other value — including
-   * {@code null} (absent), typos (e.g. {@code "fals"}), unknown booleans
-   * (e.g. {@code "off"}, {@code "yes"}, {@code "1"}), and garbage — yields
+   * require-local-replica safety gate are exact, lowercase, ASCII-trimmed
+   * matches of {@code "false"}, {@code "no"}, or {@code "0"}. Any other
+   * value — including {@code null} (absent), typos (e.g. {@code "fals"}),
+   * unknown booleans (e.g. {@code "off"}, {@code "yes"}, {@code "1"}),
+   * NBSP-prefixed or other hostile-Unicode-whitespace inputs (Java
+   * {@link String#trim()} only strips codepoints &lt;= U+0020, so NBSP /
+   * U+00A0, NNBSP / U+202F, ZWSP / U+200B etc. survive trimming and fail the
+   * exact match — which is the safe outcome), and garbage — yields
    * {@code true} and leaves the gate engaged.
    *
    * <p>This knob is read directly from {@link KafkaConfig#originals()} rather
@@ -244,14 +248,20 @@ object BrokerServer {
    * is roughly equivalent: case-insensitive trimmed match of "true"/"false")
    * but for the dynamic-config admit path:
    * <ul>
-   *   <li>If this key were typed, {@link DynamicBrokerConfig#AllDynamicConfigs}
-   *       would either include it (admitting runtime AlterConfigs writes) or
-   *       have to explicitly exclude it. Either way, the admit-time gate
-   *       would consult typed validation, and a future maintainer adding a
-   *       {@code BrokerReconfigurable} listener for symmetry with other
-   *       broker configs would split-brain runtime state (consumed by the
-   *       listener) versus next-restart state (consumed here) — with no
-   *       rolling-restart story for moving the gate.</li>
+   *   <li>{@link DynamicBrokerConfig#AllDynamicConfigs} is a positive union of
+   *       per-component {@code ReconfigurableConfigs} sets — there is no
+   *       "explicit exclusion" mechanism, a key is admitted to the dynamic
+   *       surface only by some component opting it in. The hazard is therefore
+   *       compound: a future maintainer who added a {@code BrokerReconfigurable}
+   *       listener for symmetry with other broker configs AND opted the key
+   *       into a dynamic {@code ReconfigurableConfigs} set would split-brain
+   *       runtime state (consumed by the listener) versus next-restart state
+   *       (consumed here) — with no rolling-restart story for moving the gate.
+   *       (Note: {@link DynamicBrokerConfig#verifyReconfigurableConfigs}
+   *       enforces {@code configNames ∩ nonDynamicProps == ∅} and would
+   *       fail-fast at construction time if the key were placed in
+   *       {@code nonDynamicProps} while a listener wired it, but that catches
+   *       only one of the two ways the maintainer might wire it wrong.)</li>
    *   <li>An admit-time ConfigException on a malformed value (which
    *       ConfigDef.BOOLEAN would raise for, say, {@code "off"}) would
    *       reject the ENTIRE incremental alteration batch, including
@@ -276,7 +286,8 @@ object BrokerServer {
    *                 (may be {@code null} when the key is absent; otherwise
    *                 typically a {@code String} but may be any {@code Object}
    *                 that has a meaningful {@code toString})
-   * @return {@code false} only on exact lowercase-trimmed match of
+   * @return {@code false} only on exact lowercase ASCII-trimmed (Java
+   *         {@link String#trim()}, codepoints &lt;= U+0020) match of
    *         {@code "false"}, {@code "no"}, or {@code "0"}; {@code true} for
    *         every other input including {@code null}
    */
