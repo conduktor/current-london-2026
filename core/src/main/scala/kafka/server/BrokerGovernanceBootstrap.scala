@@ -630,7 +630,26 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
 
   /**
    * Schedule [[drainOnce]] on `scheduler` every `intervalMs` milliseconds.
-   * Returns a handle that the broker calls on shutdown to stop the task.
+   *
+   * <p>Returns {@code Unit}: shutdown is handled exclusively by the
+   * scheduler itself. {@link BrokerServer} calls
+   * {@code kafkaScheduler.shutdown()} (BrokerServer.scala L1219) before
+   * {@code replicaManager.shutdown()} (L1238); that ordering is documented
+   * at BrokerServer.scala L1211-1216 as deliberate (to avoid LogManager /
+   * scheduler interleaving during log close). {@code KafkaScheduler#shutdown}
+   * calls the underlying {@code ScheduledThreadPoolExecutor#shutdown},
+   * which cancels pending periodic iterations by JDK default
+   * ({@code continueExistingPeriodicTasksAfterShutdownPolicy=false}) and
+   * then {@code awaitTermination(1, DAY)} blocks until the in-flight tick
+   * (if any) returns. Net effect: a drain tick that begins concurrently
+   * with shutdown completes synchronously before the scheduler shutdown
+   * returns, and no subsequent tick can fire after {@code replicaManager}
+   * is closed. Capturing the {@link java.util.concurrent.ScheduledFuture}
+   * handle here would be redundant defense-in-depth; the R25-C #1 BLOCKER
+   * claim ("drain may run after replicaManager shutdown because the
+   * handle is leaked") is therefore not actionable as written. If a tick
+   * hangs inside {@code log.read()} the relevant defense is a per-tick
+   * watchdog (tracked separately as Task #218), not handle capture.
    *
    * <p>If [[drainOnce]] throws on every tick (the canonical example is a
    * broker that has been reassigned away from {@code __governance-0} mid-
