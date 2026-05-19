@@ -114,6 +114,22 @@ public final class KafkaHttpServlet extends HttpServlet {
             return;
         }
 
+        // Strict Content-Type before the body is read. The bridge accepts application/json only; everything else
+        // (text/plain, application/x-www-form-urlencoded, multipart/form-data, absent header) is rejected here with
+        // 415 Unsupported Media Type. The check defends against the cross-origin form-POST CSRF primitive: a browser
+        // form with enctype="text/plain" submits cross-origin WITHOUT a CORS preflight (RFC 9110 §15.3 "simple
+        // request"); without this guard an attacker page can craft a form body whose serialised text starts with a
+        // valid JSON object that the bridge would accept (Jackson silently ignores trailing data after the first
+        // JSON value — see WsSubscribeMessageParser axis-RR notes), producing records anonymously. Strict
+        // Content-Type closes that primitive independently of the fronting reverse proxy's per-origin defences.
+        // Bonus: 415 is the right answer for callers that genuinely got their headers wrong, so the failure mode
+        // is diagnosable rather than masked as a generic 400 "body is not valid JSON".
+        if (!isJsonContentType(req.getContentType())) {
+            writeUnsupportedMediaType(resp);
+            metrics.recordRequest(HttpBridgeMetrics.Operation.PRODUCE, elapsedMs(startNanos), HttpStatusMapper.UNSUPPORTED_MEDIA_TYPE);
+            return;
+        }
+
         JsonNode body;
         // Wrap the request InputStream in a hard byte cap BEFORE handing it to Jackson — readTree() will consume the
         // entire stream into memory, and Jetty's default HttpConfiguration has no body-size limit of its own. Without
@@ -507,6 +523,31 @@ public final class KafkaHttpServlet extends HttpServlet {
         resp.setHeader(HEADER_RETRY_AFTER, "5");
         writeEnvelope(resp, HttpStatusMapper.TOO_MANY_REQUESTS,
             "too many concurrent SSE streams; try again later");
+    }
+
+    private void writeUnsupportedMediaType(HttpServletResponse resp) throws IOException {
+        // The check fires BEFORE the body is read so the request stream is still at byte 0 — no Connection: close is
+        // needed (no body bytes in flight to drain). Keep-alive stays intact; the next pipelined request on this
+        // connection is parsed as normal.
+        writeEnvelope(resp, HttpStatusMapper.UNSUPPORTED_MEDIA_TYPE,
+            "content type must be application/json");
+    }
+
+    /**
+     * Returns true if the {@code Content-Type} header advertises {@code application/json}, with or without trailing
+     * parameters such as {@code charset=utf-8}. The check is intentionally lax on parameters: RFC 8259 says JSON is
+     * UTF-8 (so the charset parameter is a no-op the bridge does not need to police) and a strict charset check would
+     * reject the {@code application/json; charset=utf-8} value that browsers and several SDKs send by default. The
+     * type/subtype pair is the discriminator. {@code null} (header absent) is rejected — RFC 9110 §8.3 permits a
+     * server that does not infer a default media type to return 415, which is exactly the posture we want here.
+     */
+    static boolean isJsonContentType(String contentType) {
+        if (contentType == null) {
+            return false;
+        }
+        int semicolon = contentType.indexOf(';');
+        String mediaType = (semicolon >= 0 ? contentType.substring(0, semicolon) : contentType).trim();
+        return ContentTypeNegotiator.APPLICATION_JSON.equalsIgnoreCase(mediaType);
     }
 
     private static boolean rootCauseIsBodyTooLarge(Throwable t) {

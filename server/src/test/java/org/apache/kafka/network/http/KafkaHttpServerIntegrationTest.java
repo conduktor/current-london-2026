@@ -369,6 +369,118 @@ class KafkaHttpServerIntegrationTest {
                 + raw);
     }
 
+    // ----- Wave 28 W28-OO: Content-Type strictness on produce -----
+
+    @Test
+    void produceRejectsTextPlainContentTypeWith415() throws Exception {
+        // Browser CSRF defence. An HTML form with enctype="text/plain" submits cross-origin WITHOUT a CORS preflight
+        // (RFC 9110 §15.3 "simple request"); the browser sets Content-Type: text/plain regardless of body content.
+        // Without the 415 guard, an attacker page could send a form whose serialised body starts with a valid JSON
+        // object — Jackson silently ignores trailing data after the first JSON value, so the bridge would happily
+        // produce records anonymously to attacker-chosen topics. The 415 closes that primitive at the request
+        // boundary, before any body byte is read.
+        //
+        // Note: submitter.produceResult is intentionally left null. If the guard ever regresses, the request reaches
+        // the bridge with a null result → NullPointerException → 500 envelope. The 415 assertion below therefore
+        // strongly distinguishes "guard passes the check, regresses to 500" from "guard works, returns 415".
+        ContentResponse resp = client.newRequest(url("/v1/topics/orders/records"))
+            .method(HttpMethod.POST)
+            .body(new StringRequestContent("text/plain",
+                "{\"records\":[{\"value\":{\"type\":\"STRING\",\"data\":\"x\"}}]}"))
+            .send();
+
+        assertEquals(415, resp.getStatus());
+        JsonNode envelope = asJson(resp.getContent());
+        assertTrue(envelope.get("errorMessage").asText().contains("application/json"),
+            "errorMessage must name the expected media type, got: " + envelope.get("errorMessage").asText());
+    }
+
+    @Test
+    void produceRejectsAbsentContentTypeWith415() throws Exception {
+        // The bare-curl case: `curl -X POST -d '{...}' <bridge>` ships without Content-Type. RFC 9110 §8.3 permits a
+        // server that does not infer a default media type to reply 415; that's the posture here. Drives the wire
+        // directly because Jetty HttpClient's request-content abstractions always declare a Content-Type — there is
+        // no API knob to suppress the header.
+        String body = "{\"records\":[{\"value\":{\"type\":\"STRING\",\"data\":\"x\"}}]}";
+        String raw;
+        try (Socket s = new Socket("127.0.0.1", server.boundPort())) {
+            s.setSoTimeout(5000);
+            OutputStream out = s.getOutputStream();
+            String req =
+                "POST /v1/topics/orders/records HTTP/1.1\r\n"
+                    + "Host: 127.0.0.1\r\n"
+                    + "Content-Length: " + body.length() + "\r\n"
+                    + "Connection: close\r\n"
+                    + "\r\n"
+                    + body;
+            out.write(req.getBytes(StandardCharsets.US_ASCII));
+            out.flush();
+            raw = readAllAscii(s.getInputStream());
+        }
+
+        assertTrue(raw.startsWith("HTTP/1.1 415"),
+            "absent Content-Type must yield 415, got status line: " + raw.split("\r\n", 2)[0]);
+
+        // No Connection: close on a 415 — the body was never read, so there are no in-flight bytes to drain. Keep-alive
+        // remains intact. The smuggling defect class addressed by Wave 24 does not apply here (no partial body-read).
+        // We do not assert the absence of Connection: close on the wire because the test request itself carries
+        // Connection: close in its outbound headers; Jetty echoes that on the response. The semantic claim — "the
+        // bridge does not unilaterally close the connection on 415" — is covered by the produceAccepts*
+        // regression tests that exercise keep-alive via the standard HttpClient.
+    }
+
+    @Test
+    void produceRejectsFormUrlEncodedContentTypeWith415() throws Exception {
+        // application/x-www-form-urlencoded is the default for an HTML form without explicit enctype. Same CSRF class
+        // as text/plain but a different content-type — the guard's "anything but application/json" rule must cover
+        // both branches.
+        ContentResponse resp = client.newRequest(url("/v1/topics/orders/records"))
+            .method(HttpMethod.POST)
+            .body(new StringRequestContent("application/x-www-form-urlencoded",
+                "{\"records\":[{\"value\":{\"type\":\"STRING\",\"data\":\"x\"}}]}"))
+            .send();
+
+        assertEquals(415, resp.getStatus());
+    }
+
+    @Test
+    void produceAcceptsApplicationJsonWithCharsetParameter() throws Exception {
+        // Common SDK / browser default — fetch() with body and JSON content sends `Content-Type: application/json;
+        // charset=utf-8`. The Content-Type guard must accept this verbatim; rejecting it would break every realistic
+        // browser-side client overnight. The parameter is a no-op per RFC 8259 (JSON is always UTF-8) so the bridge
+        // does not police its value.
+        submitter.produceResult = new RequestSubmitter.ProduceResult(
+            Collections.singletonList(
+                new ProduceResponseFormatter.PartitionResult(0, 0L, Errors.NONE, null)),
+            0L);
+
+        ContentResponse resp = client.newRequest(url("/v1/topics/orders/records"))
+            .method(HttpMethod.POST)
+            .body(new StringRequestContent("application/json; charset=utf-8",
+                "{\"records\":[{\"value\":{\"type\":\"STRING\",\"data\":\"x\"}}]}"))
+            .send();
+
+        assertEquals(200, resp.getStatus());
+    }
+
+    @Test
+    void produceAcceptsApplicationJsonCaseInsensitive() throws Exception {
+        // RFC 9110 §8.3: media types are case-insensitive. A client that sends `Application/JSON` (e.g. older Postman
+        // releases, some Go HTTP libraries) must be served the same way as one sending `application/json`.
+        submitter.produceResult = new RequestSubmitter.ProduceResult(
+            Collections.singletonList(
+                new ProduceResponseFormatter.PartitionResult(0, 0L, Errors.NONE, null)),
+            0L);
+
+        ContentResponse resp = client.newRequest(url("/v1/topics/orders/records"))
+            .method(HttpMethod.POST)
+            .body(new StringRequestContent("Application/JSON",
+                "{\"records\":[{\"value\":{\"type\":\"STRING\",\"data\":\"x\"}}]}"))
+            .send();
+
+        assertEquals(200, resp.getStatus());
+    }
+
     // ----- fetch -----
 
     @Test

@@ -645,6 +645,14 @@ class BrokerServer(
       // rate limiting and per-IP connection counting are the fronting proxy's responsibility — the same proxy that
       // performs authentication in step (2) above. Do not expose the bridge port without one.
       //
+      // Browser-origin CSRF defence is also deferred to the fronting proxy. The WebSocket upgrade handler does not
+      // inspect the Origin request header (RFC 6455 §10.2); a browser tab on the open internet can speculatively
+      // open ws://bridge/v1/topics/{topic}/subscribe from any HTTPS page if it can reach the bridge directly. The
+      // HTTP produce endpoint rejects non-application/json request bodies with 415 Unsupported Media Type (closing
+      // the cross-origin form-POST CSRF primitive at the bridge boundary — see KafkaHttpServlet.doPost), but the
+      // WS upgrade path is browser-reachable without that defence. Origin-allowlist enforcement and CSRF-token
+      // schemes belong on the same proxy that performs authentication in step (2) above.
+      //
       // Per-request authentication is a follow-up item, not a v1 deliverable.
       if (config.httpBridgeEnabled) {
         val submitter = new KafkaApiRequestSubmitter(

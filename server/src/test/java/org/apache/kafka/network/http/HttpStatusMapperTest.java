@@ -195,6 +195,14 @@ class HttpStatusMapperTest {
         assertFalse(HttpStatusMapper.statusCarriesRetryAfter(403));
         assertFalse(HttpStatusMapper.statusCarriesRetryAfter(404));
         assertFalse(HttpStatusMapper.statusCarriesRetryAfter(413));
+        assertFalse(HttpStatusMapper.statusCarriesRetryAfter(415));
+    }
+
+    @Test
+    void unsupportedMediaTypeConstantIs415() {
+        // The 415 constant is consumed by KafkaHttpServlet's Content-Type guard on the produce path; pin its value so
+        // a refactor of the mapper's constants cannot accidentally re-route 415 to a different status.
+        assertEquals(415, HttpStatusMapper.UNSUPPORTED_MEDIA_TYPE);
     }
 
     @Test
