@@ -977,10 +977,24 @@ public class RuleJsonCodecTest {
         // shorts but every assigned Errors enum value is positive. Negatives
         // are likely operator typos and would, after narrowing, map to
         // Errors.UNKNOWN_SERVER_ERROR or worse — reject up front.
+        //
+        // R29 #263 — pin both the field name and the offending value, mirroring
+        // errorCodeAboveShortMaxRejected. Asserting only on the exception class
+        // passes for the wrong reason: a refactor that throws RuleEnvelopeException
+        // for an unrelated reason (apiKeys malformed, when missing, …) would
+        // silently regress this branch. Note -1 is special-cased in production:
+        // Errors.UNKNOWN_SERVER_ERROR.code() is -1, so the known-Errors equality
+        // check at the tail of parseErrorCode would NOT catch -1 on its own. The
+        // range check (code < 1) is the only gate that rejects it, and this test
+        // is what pins that gate.
         String json = "{\"apiKeys\":[\"METADATA\"],\"action\":\"DENY\","
             + "\"when\":\"true\",\"errorCode\":-1}";
-        assertThrows(RuleEnvelopeException.class,
+        RuleEnvelopeException ex = assertThrows(RuleEnvelopeException.class,
             () -> RuleJsonCodec.decode("k", json.getBytes(StandardCharsets.UTF_8)));
+        assertTrue(ex.getMessage().contains("errorCode"),
+            "error must name the offending field: " + ex.getMessage());
+        assertTrue(ex.getMessage().contains("-1"),
+            "error must name the offending value: " + ex.getMessage());
     }
 
     @Test
