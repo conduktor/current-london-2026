@@ -570,6 +570,45 @@ public final class RuleEngine {
                     + "principal; reject at startup rather than "
                     + "under-granting the bypass silently.");
             }
+            // R30 #280 [HIGH]: detect non-ASCII whitespace codepoints inside
+            // the component. The leading/trailing whitespace check above
+            // covers edges; the invisible-codepoint check covers C0/C1
+            // controls and the zero-width/bidi block. Neither catches
+            // visible-but-non-ASCII space variants (NBSP U+00A0, NARROW
+            // NBSP U+202F, FIGURE SPACE U+2007, IDEOGRAPHIC SPACE U+3000,
+            // ...) which render identically to ASCII space in most fonts
+            // but are not collapsed at runtime by String.equals. Operator
+            // paste-from-word-processor footgun: a DN like
+            // `CN=Broker One,...` looks correct on screen, parses
+            // successfully here, then NEVER matches the runtime
+            // `CN=Broker One,...` peer principal — same soft-brick class
+            // as R29 #270/#272/#278.
+            String typeNonAsciiWs = firstNonAsciiWhitespaceCodePointLabel(type);
+            if (typeNonAsciiWs != null) {
+                throw new IllegalArgumentException(
+                    "governance.bypass.principals entry has "
+                    + typeNonAsciiWs + " in the principal type: '"
+                    + LogSafe.sanitize(trimmed) + "'. This codepoint looks "
+                    + "like an ASCII space but is not — the entry's "
+                    + "canonical form will never match a runtime peer "
+                    + "principal (whose DN spaces are ASCII U+0020). "
+                    + "Common cause: a paste from a word-processor or web "
+                    + "page that auto-replaced ASCII space with a "
+                    + "non-breaking variant.");
+            }
+            String nameNonAsciiWs = firstNonAsciiWhitespaceCodePointLabel(name);
+            if (nameNonAsciiWs != null) {
+                throw new IllegalArgumentException(
+                    "governance.bypass.principals entry has "
+                    + nameNonAsciiWs + " in the principal name: '"
+                    + LogSafe.sanitize(trimmed) + "'. This codepoint looks "
+                    + "like an ASCII space but is not — the entry's "
+                    + "canonical form will never match a runtime peer "
+                    + "principal (whose DN spaces are ASCII U+0020). "
+                    + "Common cause: a paste from a word-processor or web "
+                    + "page that auto-replaced ASCII space with a "
+                    + "non-breaking variant.");
+            }
             // R29 #278 [HIGH]: detect non-ASCII comma/semicolon
             // confusables BEFORE the ASCII-only comma-typo regex below.
             // The invisible-codepoint check above covers smuggled
@@ -830,6 +869,54 @@ public final class RuleEngine {
     }
 
     /**
+     * R30 #280 [HIGH]: detect any non-ASCII whitespace codepoint inside
+     * a parsed component. The parser intentionally allows internal ASCII
+     * space (U+0020) so legitimate SSL DN values like
+     * {@code CN=Broker One,OU=Kafka Brokers,O=Example Corp,C=US} parse
+     * correctly. But Unicode has many other space-class codepoints
+     * (NBSP U+00A0, NARROW NO-BREAK SPACE U+202F, FIGURE SPACE U+2007,
+     * EN SPACE U+2002, EM SPACE U+2003, IDEOGRAPHIC SPACE U+3000, ...)
+     * that render visually identical to ASCII space in most fonts but
+     * are NOT collapsed by the JDK String comparator at runtime.
+     *
+     * <p>Hazard: an operator pastes
+     * {@code User:CN=Broker One,OU=...} from a word-processor or
+     * web page that auto-replaced ASCII space with NBSP. The parser
+     * stores the entry intact — NBSP is not in
+     * {@link #firstInvisibleCodePointLabel} (which covers only invisible
+     * smuggling: C0/C1/zero-width/bidi) and not in
+     * {@link #firstConfusableSeparatorLabel} (which covers only comma
+     * and semicolon confusables). At runtime the broker's canonical
+     * peer principal is built from {@code X500Principal.getName()}
+     * which yields ASCII U+0020 — verbatim mismatch — silent
+     * soft-brick of the bypass, identical user-impact to
+     * R29 #270/#272/#278.
+     *
+     * <p>The leading/trailing whitespace rejection above already covers
+     * edge cases via {@link #isAnyWhitespaceCodePoint}; this helper
+     * covers the interior. C0 controls (TAB/LF/CR/...) are caught
+     * earlier by {@link #firstInvisibleCodePointLabel}; this helper
+     * fires only for non-control whitespace that slipped through.
+     *
+     * <p>Returns a label of the form
+     * {@code "non-ASCII whitespace U+00A0"} on first hit; null
+     * otherwise. ASCII space U+0020 is deliberately excluded — SSL DN
+     * values contain it legitimately.
+     */
+    private static String firstNonAsciiWhitespaceCodePointLabel(String s) {
+        int len = s.length();
+        for (int i = 0; i < len; ) {
+            int cp = s.codePointAt(i);
+            if (cp != 0x0020
+                    && (Character.isWhitespace(cp) || Character.isSpaceChar(cp))) {
+                return String.format("non-ASCII whitespace U+%04X", cp);
+            }
+            i += Character.charCount(cp);
+        }
+        return null;
+    }
+
+    /**
      * R29 #278 [HIGH]: detect non-ASCII codepoints that are VISUALLY
      * identical or near-identical to ASCII {@code ,} (the comma-typo
      * shape rejected by {@link #COMMA_SEPARATOR_TYPO}) or ASCII
@@ -865,7 +952,10 @@ public final class RuleEngine {
             //   U+2E32  TURNED COMMA
             //   U+2E34  RAISED COMMA
             //   U+2E41  REVERSED COMMA
+            //   U+2E4C  MEDIEVAL COMMA            ← R30 #279, same block as U+2E32/34/41
             //   U+3001  IDEOGRAPHIC COMMA
+            //   U+A60D  VAI COMMA                 ← R30 #279, Vai script (named "COMMA")
+            //   U+A6F5  BAMUM COMMA               ← R30 #279, Bamum script (named "COMMA")
             //   U+FE10  PRESENTATION FORM COMMA
             //   U+FE11  PRESENTATION FORM IDEOGRAPHIC COMMA
             //   U+FE50  SMALL COMMA
@@ -875,7 +965,9 @@ public final class RuleEngine {
             if (cp == 0x055D || cp == 0x060C || cp == 0x1363
                     || cp == 0x1802 || cp == 0x1808
                     || cp == 0x2E32 || cp == 0x2E34 || cp == 0x2E41
+                    || cp == 0x2E4C
                     || cp == 0x3001
+                    || cp == 0xA60D || cp == 0xA6F5
                     || cp == 0xFE10 || cp == 0xFE11
                     || cp == 0xFE50 || cp == 0xFE51
                     || cp == 0xFF0C || cp == 0xFF64) {

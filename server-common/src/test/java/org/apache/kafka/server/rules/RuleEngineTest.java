@@ -1932,6 +1932,192 @@ public class RuleEngineTest {
     }
 
     @Test
+    public void parseBypassPrincipalsRejectsAdditionalCommaConfusables() {
+        // R30 #279 [HIGH]: an adversarial follow-on audit of R29 #278 found
+        // three more codepoints visually confusable with ASCII `,` that were
+        // missing from firstConfusableSeparatorLabel's enumeration. All
+        // three are Po category, NFKC=self, and named literally "COMMA":
+        //
+        //   U+2E4C  MEDIEVAL COMMA           ← Supplemental Punctuation,
+        //                                       same block as U+2E32/34/41
+        //   U+A60D  VAI COMMA                ← Vai script
+        //   U+A6F5  BAMUM COMMA              ← Bamum script
+        //
+        // Bypass shape identical to R29 #278: an entry like
+        // `User:admin⹌User:broker` (U+2E4C between the two principals)
+        // parses as ONE principal of name `admin⹌User:broker` whose
+        // canonical form never matches the runtime peer principal. Same
+        // silent soft-brick class as R29 #270/#272/#278.
+        //
+        // Recorded for posterity: this enumeration-based defense is a
+        // structural moving target — Unicode has ~250 Po codepoints and
+        // growing. Each new audit round may find another miss. The
+        // long-term fix is property-based rejection over the Unicode
+        // confusables-data class for `,` and `;`, but that requires
+        // shipping ICU4J data which is too heavy for Kafka's
+        // dependency footprint. Pragmatic posture: extend the
+        // enumeration as audits surface new shapes.
+
+        String[] additionalCommaConfusables = new String[] {
+            // U+2E4C MEDIEVAL COMMA
+            "User:admin⹌User:broker",
+            // U+A60D VAI COMMA
+            "User:admin꘍User:broker",
+            // U+A6F5 BAMUM COMMA
+            "User:admin꛵User:broker",
+        };
+        for (String input : additionalCommaConfusables) {
+            IllegalArgumentException ex = org.junit.jupiter.api.Assertions
+                .assertThrows(IllegalArgumentException.class,
+                    () -> RuleEngine.parseBypassPrincipals(input),
+                    "additional comma-confusable bypass must be rejected: '"
+                        + input + "'");
+            String msg = ex.getMessage().toLowerCase();
+            assertTrue(msg.contains("confusable") || msg.contains("look")
+                    || msg.contains("comma"),
+                "diagnostic must name the comma-confusable hazard; got: "
+                    + ex.getMessage());
+            // Codepoint name must appear in the diagnostic so the operator
+            // can locate the offending character in their config.
+            assertTrue(ex.getMessage().toUpperCase().contains("U+2E4C")
+                    || ex.getMessage().toUpperCase().contains("U+A60D")
+                    || ex.getMessage().toUpperCase().contains("U+A6F5"),
+                "diagnostic must name the codepoint; got: "
+                    + ex.getMessage());
+        }
+    }
+
+    @Test
+    public void parseBypassPrincipalsRejectsInternalNonAsciiWhitespace() {
+        // R30 #280 [HIGH]: the parser intentionally allows internal ASCII
+        // space (U+0020) so legitimate SSL DN values like
+        // `CN=Broker One,OU=Kafka Brokers,O=Example Corp,C=US` parse.
+        // But Unicode has many other space-class codepoints rendering
+        // visually identical to ASCII space:
+        //
+        //   U+00A0  NO-BREAK SPACE           ← common word-processor auto-replace
+        //   U+202F  NARROW NO-BREAK SPACE
+        //   U+2007  FIGURE SPACE
+        //   U+2002  EN SPACE
+        //   U+2003  EM SPACE
+        //   U+3000  IDEOGRAPHIC SPACE        ← CJK keyboard default
+        //
+        // None of these are caught by firstInvisibleCodePointLabel
+        // (which covers only C0/C1/zero-width/bidi smuggling), and none
+        // are in firstConfusableSeparatorLabel (which covers only
+        // comma/semicolon confusables). At runtime the broker's canonical
+        // peer principal has ASCII U+0020 inside the DN; verbatim
+        // String.equals returns false — silent soft-brick, same class as
+        // R29 #270/#272/#278.
+        //
+        // Operator scenario: paste `User:CN=Broker One,OU=...` from a
+        // word-processor or web page that auto-replaced ASCII space with
+        // NBSP. Looks identical on screen; never matches at runtime.
+
+        // ---- NBSP U+00A0 internal in name ----
+        IllegalArgumentException nbspName = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals(
+                    "User:CN=Broker One,OU=Kafka"));
+        assertTrue(nbspName.getMessage().contains("U+00A0")
+            && nbspName.getMessage().toLowerCase().contains("whitespace")
+            && nbspName.getMessage().contains("principal name"),
+            "internal NBSP in name must abort with codepoint-named "
+                + "whitespace diagnostic; got: " + nbspName.getMessage());
+
+        // ---- NNBSP U+202F internal in name ----
+        IllegalArgumentException nnbsp = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals(
+                    "User:bro ker"));
+        assertTrue(nnbsp.getMessage().contains("U+202F"),
+            "internal NNBSP must abort with codepoint-named diagnostic; "
+                + "got: " + nnbsp.getMessage());
+
+        // ---- FIGURE SPACE U+2007 internal in name ----
+        IllegalArgumentException figure = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals(
+                    "User:bro ker"));
+        assertTrue(figure.getMessage().contains("U+2007"),
+            "internal FIGURE SPACE must abort with codepoint-named "
+                + "diagnostic; got: " + figure.getMessage());
+
+        // ---- IDEOGRAPHIC SPACE U+3000 internal in name ----
+        IllegalArgumentException ideo = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals(
+                    "User:bro　ker"));
+        assertTrue(ideo.getMessage().contains("U+3000"),
+            "internal IDEOGRAPHIC SPACE must abort with codepoint-named "
+                + "diagnostic; got: " + ideo.getMessage());
+
+        // ---- EN SPACE U+2002, EM SPACE U+2003 internal in name ----
+        // Both render identical to ASCII space in proportional fonts.
+        IllegalArgumentException enSp = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals(
+                    "User:bro ker"));
+        assertTrue(enSp.getMessage().contains("U+2002"),
+            "internal EN SPACE must abort with codepoint-named "
+                + "diagnostic; got: " + enSp.getMessage());
+        IllegalArgumentException emSp = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals(
+                    "User:bro ker"));
+        assertTrue(emSp.getMessage().contains("U+2003"),
+            "internal EM SPACE must abort with codepoint-named "
+                + "diagnostic; got: " + emSp.getMessage());
+
+        // ---- NBSP internal in TYPE (symmetric defense) ----
+        IllegalArgumentException nbspType = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals(
+                    "Service Account:bot"));
+        assertTrue(nbspType.getMessage().contains("U+00A0")
+            && nbspType.getMessage().contains("principal type"),
+            "internal NBSP in TYPE must abort with codepoint-named "
+                + "diagnostic naming the type slot; got: "
+                + nbspType.getMessage());
+
+        // ---- LogSafe regression: diagnostic must not embed raw CR or
+        //      other unsanitised codepoints that could forge a fatal
+        //      startup log line.
+        IllegalArgumentException exLog = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals(
+                    "User:bro ker\rX"));
+        assertFalse(exLog.getMessage().contains("\r"),
+            "non-ASCII-whitespace diagnostic must sanitise CR; got: "
+                + exLog.getMessage());
+
+        // ---- Regression guard: legitimate SSL DN with ASCII spaces
+        //      internally is STILL accepted. This is the carve-out
+        //      that the parser deliberately preserves (Codex round-5 P1).
+        String sslDn = "User:CN=Broker One,OU=Kafka Brokers,"
+            + "O=Example Corp,C=US";
+        java.util.Set<String> ok = RuleEngine.parseBypassPrincipals(sslDn);
+        assertEquals(1, ok.size(),
+            "legitimate SSL DN with internal ASCII U+0020 must remain "
+                + "accepted; got: " + ok);
+        assertTrue(ok.contains(sslDn));
+
+        // ---- Order-of-checks: an entry that has BOTH a C0 control
+        //      (whitespace-class TAB) and an NBSP fires the more specific
+        //      C0-control diagnostic first because the invisible-codepoint
+        //      check runs before the non-ASCII-whitespace check.
+        IllegalArgumentException exBoth = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals(
+                    "User:bro\tker X"));
+        assertTrue(exBoth.getMessage().toLowerCase().contains("c0 control")
+                || exBoth.getMessage().contains("U+0009"),
+            "when both C0 control AND non-ASCII whitespace present, the "
+                + "C0-control diagnostic should fire first; got: "
+                + exBoth.getMessage());
+    }
+
+    @Test
     public void parseBypassPrincipalsThrowsOnUnicodeBlankComponent() {
         // Codex round-4 F2: String.trim() only strips ASCII whitespace (chars
         // <= 0x20), so a non-breaking space (U+00A0) inside a component
