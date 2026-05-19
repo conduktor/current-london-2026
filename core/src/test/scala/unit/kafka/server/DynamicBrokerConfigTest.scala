@@ -294,6 +294,62 @@ class DynamicBrokerConfigTest {
   }
 
   @Test
+  def governanceBootstrapRequireLocalReplicaIsUntypedAndNonDynamic(): Unit = {
+    // R39-E-3 pin: `governance.bootstrap.require.local.replica` is the
+    // operator opt-out for the broker-safety gate that prevents a
+    // non-replica broker from publishing an empty RuleSet on startup. It is
+    // deliberately read via `config.originals().get(...)` rather than wired
+    // through `ServerConfigs.CONFIG_DEF` (see BrokerServer.parseRequireLocalReplica
+    // javadoc for the rationale: typed-config surface area invites permissive
+    // boolean coercion that would re-introduce the fail-open hole this knob
+    // is meant to gate).
+    //
+    // The hazard this test guards against is structurally identical to #296
+    // (governance.bypass.principals split-brain): if someone "cleans up" the
+    // originals()-bypass by adding this key to CONFIG_DEF and the dynamic
+    // configs set without ALSO wiring a BrokerReconfigurable listener,
+    // different brokers in the cluster end up respecting different values
+    // for the safety gate with no operator-visible signal. The forcing
+    // function: this test fails on either of two changes —
+    //   (a) registration in ServerConfigs.CONFIG_DEF (the typed-surface
+    //       cleanup), or
+    //   (b) registration in DynamicBrokerConfig.AllDynamicConfigs (the
+    //       follow-on dynamic promotion).
+    // — and forces the author to confront the listener-absence hazard
+    // before either change lands. The test is a forcing function, not a
+    // security control.
+    val key = "governance.bootstrap.require.local.replica"
+
+    // (a) The config has no typed surface. CONFIG_DEF entries imply config
+    // doc generation and validator surface area; this knob is intentionally
+    // outside that surface so that only the exact-match parser sees the
+    // value. If a future change adds it to CONFIG_DEF, this assertion fails
+    // and the author has to read the parser javadoc.
+    assertFalse(
+      ServerConfigs.CONFIG_DEF.names().contains(key),
+      s"$key must remain outside ServerConfigs.CONFIG_DEF — promoting to a typed " +
+        s"config invites permissive boolean coercion that would re-introduce the " +
+        s"fail-open hole this knob is meant to gate; see BrokerServer.parseRequireLocalReplica"
+    )
+
+    // (b) The config cannot be dynamically updated. Even though (a) currently
+    // also guarantees this transitively (a config not in CONFIG_DEF cannot
+    // be in AllDynamicConfigs), pinning the dynamic-set membership directly
+    // catches the secondary hazard: a future change that registers the key
+    // in CONFIG_DEF and also adds it to AllDynamicConfigs in the same patch
+    // would otherwise need the test author to remember to add the dynamic
+    // assertion. Pinning it explicitly here means the dynamic-promotion
+    // path fails the test immediately, regardless of CONFIG_DEF state.
+    assertFalse(
+      DynamicBrokerConfig.AllDynamicConfigs.contains(key),
+      s"$key must remain non-dynamic — if it becomes dynamic without a " +
+        s"BrokerReconfigurable listener wired, different brokers in the cluster " +
+        s"will respect different values for the safety gate with no operator-visible " +
+        s"signal (R39-E-3, parallel to #296 for governance.bypass.principals)"
+    )
+  }
+
+  @Test
   def testConfigUpdateWithSomeInvalidConfigs(): Unit = {
     val origProps = TestUtils.createBrokerConfig(0, port = 8181)
     origProps.put(SslConfigs.SSL_KEYSTORE_TYPE_CONFIG, "JKS")
