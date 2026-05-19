@@ -76,20 +76,30 @@ final class Evaluator {
         switch (u.op) {
             case NOT:
                 if (v instanceof Boolean) return !((Boolean) v);
-                return null; // non-boolean → unknown
+                // Non-boolean operand → SKIP. Returning null here would feed
+                // equalsValuesOrNull's "null vs non-null → FALSE" branch, which NEQ negates into a
+                // confident TRUE. A predicate like `!body.tenant != true` with body.tenant a
+                // string would then admit the record. SKIP propagates through evalBinary's SKIP
+                // guard and through evalLogical's OR/AND rescue.
+                return SKIP;
             case NEG:
                 if (v instanceof Long) {
                     long lv = (Long) v;
                     // -Long.MIN_VALUE silently wraps to Long.MIN_VALUE in Java 2's-complement.
-                    // arithLong already converts equivalent overflows on +/-/* to null via
-                    // Math.*Exact; NEG must do the same so predicates like `-body.priority < -100`
-                    // don't admit a Long.MIN_VALUE payload through the wrap. Predicates are an
-                    // access-control boundary; "unknown" (null) is the safe result.
-                    if (lv == Long.MIN_VALUE) return null;
+                    // arithLong already converts equivalent overflows on +/-/* to SKIP via
+                    // Math.*Exact; NEG must do the same so predicates like
+                    // `-body.priority != -Long.MIN_VALUE` don't admit a Long.MIN_VALUE payload
+                    // through the wrap-then-NEQ-via-null bypass. SKIP (not null) is required:
+                    // null would reach equalsValuesOrNull's null-vs-non-null FALSE branch and
+                    // NEQ would negate it into a confident TRUE.
+                    if (lv == Long.MIN_VALUE) return SKIP;
                     return -lv;
                 }
                 if (v instanceof Double) return -((Double) v);
-                return null;
+                // Non-numeric operand (string, boolean, null) → SKIP for the same reason as the
+                // NOT branch above. E.g. `-body.amount != 0` with body.amount="blocked" must
+                // drop the record, not admit it.
+                return SKIP;
             default:
                 return SKIP;
         }
@@ -275,7 +285,12 @@ final class Evaluator {
             int cmp = Integer.signum(((String) l).compareTo((String) r));
             return matches(cmp, target, inclusive);
         }
-        return null;
+        // Type mismatch (both operands present but incompatible — e.g. string vs number, boolean
+        // vs number). SKIP, not null: the value of `body.name < 5` with body.name="blocked" must
+        // not be flippable via `(body.name < 5) != true` into a confident TRUE. The null/absent
+        // case (one operand null) above keeps returning null so absent-field semantics matched
+        // by `absentFieldEvaluatesAsNullForNegatedPredicate` remain pinned.
+        return SKIP;
     }
 
     private static Integer compareNumeric(Number l, Number r) {
@@ -372,10 +387,17 @@ final class Evaluator {
             if (dr >= IEEE_SAFE_INTEGER || dr <= -IEEE_SAFE_INTEGER) {
                 BigDecimal exact = exactArith((Number) l, (Number) r, op);
                 if (exact == null) {
-                    // Non-terminating division: BigDecimal cannot represent the exact result
-                    // either, but the double value is already approximate. Trust the double
-                    // here — the comparator can still produce a meaningful boolean.
-                    return result;
+                    // Non-terminating BigDecimal division (e.g. 1/3, or any irrational ratio):
+                    // we cannot validate the rounded double against an exact reference. Inside
+                    // the precision-loss zone (|dr| >= 2^53) two different exact mathematical
+                    // results can round to the same double, so a follow-up equality against
+                    // another precision-loss-zone double can match even though the underlying
+                    // values are not equal. Example: with body.id = 2^53,
+                    //   (body.id / 0.9999999999999999) == (body.id + 2.0)
+                    // would match because both sides round to 9007199254740994.0 although
+                    // their exact values differ. SKIP, not return: trusting the double here
+                    // is unsafe.
+                    return SKIP;
                 }
                 if (new BigDecimal(dr).compareTo(exact) != 0) {
                     return SKIP;
@@ -506,13 +528,17 @@ final class Evaluator {
     private Object resolvePath(Ast.Path path, RecordContext ctx) {
         switch (path.root) {
             case "offset":
-                if (!path.accessors.isEmpty()) return null;
+                // Scalar root with an accessor (e.g. `offset.foo`) is a semantic error: there is
+                // no sub-field to address. SKIP, not null: null would feed the NEQ-via-null
+                // bypass (e.g. `offset.foo != 0` would admit every record). The parser does not
+                // enforce scalar-root no-accessor invariants, so this guard is load-bearing.
+                if (!path.accessors.isEmpty()) return SKIP;
                 return ctx.offset();
             case "partition":
-                if (!path.accessors.isEmpty()) return null;
+                if (!path.accessors.isEmpty()) return SKIP;
                 return (long) ctx.partition(); // promote to long for uniform numeric handling
             case "timestamp":
-                if (!path.accessors.isEmpty()) return null;
+                if (!path.accessors.isEmpty()) return SKIP;
                 return ctx.timestamp();
             case "key":
                 return resolveKey(path, ctx);
@@ -529,8 +555,9 @@ final class Evaluator {
                 return v;
             }
             default:
-                // Should never reach here — parser rejects unknown roots.
-                return null;
+                // Should never reach here — parser rejects unknown roots. SKIP as defense in
+                // depth so a parser regression cannot become an admit-anything bypass.
+                return SKIP;
         }
     }
 
@@ -543,7 +570,9 @@ final class Evaluator {
      * {@code key != 'blocked'} would falsely retain the record).
      */
     private Object resolveKey(Ast.Path path, RecordContext ctx) {
-        if (!path.accessors.isEmpty()) return null;
+        // `key` is a scalar; an accessor (e.g. `key.foo`) is a semantic error. SKIP, not null,
+        // to avoid the NEQ-via-null bypass.
+        if (!path.accessors.isEmpty()) return SKIP;
         Optional<String> decoded = ctx.keyAsString();
         if (decoded.isPresent()) return decoded.get();
         return ctx.rawKey() == null ? null : SKIP;
@@ -551,7 +580,9 @@ final class Evaluator {
 
     /** Same absent-vs-undecodable distinction as {@link #resolveKey} for header accessors. */
     private Object resolveHeader(Ast.Path path, RecordContext ctx) {
-        if (path.accessors.size() != 1) return null;
+        // Header lookup requires exactly one accessor (`headers['name']`). Zero or multiple
+        // accessors is a semantic error → SKIP, for the same NEQ-via-null reason.
+        if (path.accessors.size() != 1) return SKIP;
         String name = path.accessors.get(0);
         Optional<String> decoded = ctx.header(name);
         if (decoded.isPresent()) return decoded.get();

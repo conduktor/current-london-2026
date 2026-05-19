@@ -973,4 +973,96 @@ class CompiledPredicateTest {
         assertTrue(ltResult.isPresent() && !ltResult.get(),
                 () -> "expected -0.0 < 0.0 to be FALSE, got " + ltResult);
     }
+
+    // ---------- R34: NEQ-via-null bypass closures beyond R33b (Codex Finding 2026-05-19) ----------
+
+    @Test
+    void unaryNegOnNonNumericBodyDoesNotPassNegatedPredicate() {
+        // R34 BLOCKER A: evalUnary's NEG branch on a non-numeric operand previously returned
+        // null. NEQ would then negate equalsValuesOrNull(null, 0) == FALSE into a confident TRUE,
+        // admitting a record whose unary negation could not be evaluated. After R34 the branch
+        // returns SKIP and the record is correctly dropped.
+        CompiledPredicate p = compiler.compile("-body.amount != 0");
+        Optional<Boolean> r = p.evaluate(jsonRecord("{\"amount\":\"blocked\"}"));
+        assertTrue(r.isEmpty(),
+                () -> "unary NEG on non-numeric must yield SKIP, got " + r);
+    }
+
+    @Test
+    void unaryNotOnNonBooleanBodyDoesNotPassNegatedPredicate() {
+        // R34 BLOCKER A variant: evalUnary's NOT branch on a non-boolean operand previously
+        // returned null. Same NEQ-via-null bypass as the NEG branch. After R34: SKIP.
+        CompiledPredicate p = compiler.compile("!body.flag != true");
+        Optional<Boolean> r = p.evaluate(jsonRecord("{\"flag\":\"yes\"}"));
+        assertTrue(r.isEmpty(),
+                () -> "unary NOT on non-boolean must yield SKIP, got " + r);
+    }
+
+    @Test
+    void negationOfLongMinValueDoesNotPassNegatedPredicate() {
+        // R34 BLOCKER A variant: evalUnary's NEG of Long.MIN_VALUE previously returned null to
+        // prevent the two's-complement wrap, but null fed equalsValuesOrNull's FALSE branch and
+        // NEQ negated it into a confident TRUE. The probe uses a body Long.MIN_VALUE and any
+        // arbitrary RHS — pre-R34 the NEG-then-NEQ chain admits, post-R34 it returns SKIP.
+        // (We cannot write -9223372036854775808 as a literal: Lexer correctly rejects
+        // 9223372036854775808 as outside long range. An arbitrary RHS is sufficient since the
+        // bypass triggers on the null LHS regardless of the RHS literal.)
+        CompiledPredicate p = compiler.compile("-body.priority != 100");
+        // {"priority":-9223372036854775808} = Long.MIN_VALUE, the wrap-vulnerable value.
+        Optional<Boolean> r = p.evaluate(jsonRecord("{\"priority\":-9223372036854775808}"));
+        assertTrue(r.isEmpty(),
+                () -> "NEG of Long.MIN_VALUE must yield SKIP through NEQ, got " + r);
+    }
+
+    @Test
+    void compareTypeMismatchDoesNotPassNegatedPredicate() {
+        // R34 follow-on: compare(String, Number) previously returned null. `(body.name < 5) !=
+        // true` would then become equalsValuesOrNull(null, true) == FALSE, NEQ-negated into a
+        // confident TRUE, admitting a record whose ordered comparison was a type error. After
+        // R34: SKIP. (The null/absent operand case in compare is unchanged — it still preserves
+        // the pinned absent-field-through-NEQ-admits semantics.)
+        CompiledPredicate p = compiler.compile("(body.name < 5) != true");
+        Optional<Boolean> r = p.evaluate(jsonRecord("{\"name\":\"blocked\"}"));
+        assertTrue(r.isEmpty(),
+                () -> "compare type mismatch through NEQ must yield SKIP, got " + r);
+    }
+
+    @Test
+    void nonTerminatingDivisionInPrecisionLossZoneDoesNotAdmitCollisionEquality() {
+        // R34 BLOCKER B: arith's BigDecimal post-validation skipped non-terminating-divide results
+        // by returning the rounded double. Inside the precision-loss zone (|dr| >= 2^53), two
+        // different exact values can round to the same double — letting a follow-up equality
+        // match across the collision. The probe:
+        //   body.id = 2^53 = 9007199254740992
+        //   LHS: body.id / 0.9999999999999999 — exact result is non-terminating; rounded double
+        //        is 9007199254740994.0
+        //   RHS: body.id + 2.0 — exact is 9007199254740994 and the double representation matches
+        // Pre-R34 the predicate evaluated TRUE and admitted the record; post-R34 LHS returns
+        // SKIP and the record is dropped.
+        CompiledPredicate p = compiler.compile(
+                "(body.id / 0.9999999999999999) == (body.id + 2.0)");
+        Optional<Boolean> r = p.evaluate(jsonRecord("{\"id\":9007199254740992}"));
+        assertTrue(r.isEmpty(),
+                () -> "non-terminating div in precision-loss zone must yield SKIP, got " + r);
+    }
+
+    @Test
+    void illegalAccessorOnScalarRootsDoesNotPassNegatedPredicate() {
+        // R34 BLOCKER C: resolvePath returned null when a scalar root carried an accessor
+        // (`offset.foo`, `partition.foo`, `timestamp.foo`, `key.foo`, `headers` with !=1
+        // accessor). The Parser does NOT semantically validate accessors against scalar roots,
+        // so these paths reach the evaluator unchanged. Null then flowed through NEQ-via-null
+        // to admit every record. After R34: each returns SKIP. The probes:
+        for (String pred : new String[]{
+                "offset.foo != 0",
+                "partition.foo != 0",
+                "timestamp.foo != 0",
+                "key.foo != 'x'"
+        }) {
+            CompiledPredicate p = compiler.compile(pred);
+            Optional<Boolean> r = p.evaluate(jsonRecord("{}"));
+            assertTrue(r.isEmpty(),
+                    () -> "illegal scalar-root accessor '" + pred + "' must yield SKIP, got " + r);
+        }
+    }
 }
