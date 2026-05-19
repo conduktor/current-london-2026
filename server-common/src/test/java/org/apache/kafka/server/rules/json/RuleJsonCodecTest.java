@@ -112,6 +112,49 @@ public class RuleJsonCodecTest {
     }
 
     @Test
+    public void unknownApiKeyNameWithControlBytesIsSanitisedInMessage() {
+        // R23 #237: rule-id parse errors sanitise the wire-derived value at
+        // the throw site so RuleEnvelopeException.getMessage() is uniformly
+        // safe to log raw. Mirror that contract for apiKey: an attacker who
+        // publishes an envelope with JSON-escaped CR/LF or other control
+        // bytes inside the apiKey string must not be able to leak forged log
+        // lines via any future call site that logs e.getMessage() directly.
+        //
+        // The JSON source uses \\r\\n which Jackson decodes to actual CR/LF
+        // bytes — the envelope is structurally well-formed (so the parse
+        // reaches parseApiKeys, not the upstream malformed-JSON catch) and
+        // the decoded apiKey name therefore embeds control bytes by the
+        // time it reaches the throw at the unknown-name guard.
+        String json = "{\"apiKeys\":[\"BAD\\r\\nINJECTED 2026 ERROR forged\"],"
+            + "\"action\":\"DENY\",\"when\":\"true\",\"errorCode\":1}";
+        RuleEnvelopeException e = assertThrows(RuleEnvelopeException.class,
+            () -> RuleJsonCodec.decode("k", json.getBytes(StandardCharsets.UTF_8)));
+        String msg = e.getMessage();
+        assertTrue(!msg.contains("\r") && !msg.contains("\n"),
+            "RuleEnvelopeException message must not carry raw CR/LF from wire input: " + msg);
+        assertTrue(msg.contains("unknown api key name"),
+            "diagnostic should still describe the unknown-api-key cause: " + msg);
+    }
+
+    @Test
+    public void unknownActionWithControlBytesIsSanitisedInMessage() {
+        // R23 #237: same defense-in-depth as the apiKey path above. The
+        // content of the action JSON string is wire-derived and must not
+        // survive into an exception message verbatim, even if it is the
+        // semantically-malformed value that drives the throw.
+        String json = "{\"apiKeys\":[\"METADATA\"],"
+            + "\"action\":\"PURGE\\r\\nINJECTED 2026 ERROR forged\","
+            + "\"when\":\"true\",\"errorCode\":1}";
+        RuleEnvelopeException e = assertThrows(RuleEnvelopeException.class,
+            () -> RuleJsonCodec.decode("k", json.getBytes(StandardCharsets.UTF_8)));
+        String msg = e.getMessage();
+        assertTrue(!msg.contains("\r") && !msg.contains("\n"),
+            "RuleEnvelopeException message must not carry raw CR/LF from wire input: " + msg);
+        assertTrue(msg.contains("unsupported action"),
+            "diagnostic should still describe the unsupported-action cause: " + msg);
+    }
+
+    @Test
     public void invalidCelExpressionRejected() {
         String json = "{\"apiKeys\":[\"METADATA\"],\"action\":\"DENY\","
             + "\"when\":\"foo &&\",\"errorCode\":1}";

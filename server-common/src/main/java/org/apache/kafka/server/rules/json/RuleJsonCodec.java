@@ -634,7 +634,16 @@ public final class RuleJsonCodec {
             try {
                 parsed = ApiKeys.valueOf(name);
             } catch (IllegalArgumentException e) {
-                throw new RuleEnvelopeException("unknown api key name: '" + name + "'");
+                // R23 #237: rule-id parse errors sanitise the wire-derived
+                // value at the throw site (see L269/L294 above); mirror that
+                // here so RuleEnvelopeException.getMessage() is safe to log
+                // even from a future call site that forgets to wrap with
+                // LogSafe. Current log path already sanitises at the log
+                // site via sanitizePoisonMessage(), so this is
+                // defense-in-depth against a regression where someone logs
+                // e.getMessage() directly.
+                throw new RuleEnvelopeException(
+                    "unknown api key name: '" + LogSafe.sanitize(name) + "'");
             }
             // Pre-auth and broker→controller forwarding api-keys are
             // unrulable: a DENY would brick handshake / control plane (see
@@ -642,8 +651,13 @@ public final class RuleJsonCodec {
             // lands in the live RuleSet — the operator sees a clear error
             // pointing at the offending key rather than a soft cluster brick.
             if (FORBIDDEN_API_KEYS.contains(parsed)) {
+                // R23 #237: defense-in-depth — `name` here is `parsed.name()`
+                // (enum constant, charset-safe) since FORBIDDEN_API_KEYS is
+                // built from ApiKeys instances, but go through LogSafe so the
+                // throw-site contract is uniform: every RuleEnvelopeException
+                // message is safe to log raw.
                 throw new RuleEnvelopeException(
-                    "api key '" + name + "' is on the engine's forbidden list "
+                    "api key '" + LogSafe.sanitize(name) + "' is on the engine's forbidden list "
                         + "and cannot be the target of a DENY rule. A rule on this "
                         + "api-key would prevent clients from completing the "
                         + "pre-authentication handshake (API_VERSIONS / SASL_*) "
@@ -664,8 +678,11 @@ public final class RuleJsonCodec {
         try {
             return RuleAction.valueOf(s);
         } catch (IllegalArgumentException e) {
+            // R23 #237: sanitise at the throw site so
+            // RuleEnvelopeException.getMessage() is uniformly safe to log
+            // raw, mirroring the rule-id parse path (L269/L294).
             throw new RuleEnvelopeException(
-                "unsupported action '" + s + "' (only DENY is supported in v1)");
+                "unsupported action '" + LogSafe.sanitize(s) + "' (only DENY is supported in v1)");
         }
     }
 
