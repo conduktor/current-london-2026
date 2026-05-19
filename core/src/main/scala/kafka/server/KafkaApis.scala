@@ -5155,7 +5155,46 @@ class KafkaApis(val requestChannel: RequestChannel,
       requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
         describeUserScramCredentialsRequest.getErrorResponse(requestThrottleMs, Errors.CLUSTER_AUTHORIZATION_FAILED.exception))
     } else {
-      val result = metadataCache.asInstanceOf[KRaftMetadataCache].describeScramCredentials(describeUserScramCredentialsRequest.data())
+      // Tenant SCRAM credentials live in the shared SCRAM image but their user
+      // name carries the `__tenant_<id>.<user>` form. A cluster-wide caller
+      // describing all users would otherwise enumerate every tenant's SCRAM
+      // roster (count + per-user mechanism + iteration count). Explicit
+      // lookup of a guessed `__tenant_*` name would either return the same
+      // metadata or, for an unconfigured user, RESOURCE_NOT_FOUND with the
+      // physical name in the message — an existence oracle either way.
+      //
+      // Refuse tenant-prefixed user names per-entry on input (return
+      // RESOURCE_NOT_FOUND with no message), and strip tenant-prefixed
+      // results from the "list all users" response so a non-tenant caller
+      // sees a cluster-only view.
+      val data = describeUserScramCredentialsRequest.data()
+      val requested = data.users()
+      val deferredResults = new util.ArrayList[DescribeUserScramCredentialsResponseData.DescribeUserScramCredentialsResult]()
+      if (requested != null && !requested.isEmpty) {
+        val filtered = new util.ArrayList[DescribeUserScramCredentialsRequestData.UserName](requested.size())
+        requested.forEach { u =>
+          if (u != null && isReservedTenantPrincipalNamespace(u.name())) {
+            // RESOURCE_NOT_FOUND with no message — same shape as the
+            // SCRAM image's response for a never-existed user.
+            deferredResults.add(new DescribeUserScramCredentialsResponseData.DescribeUserScramCredentialsResult()
+              .setUser(u.name())
+              .setErrorCode(Errors.RESOURCE_NOT_FOUND.code()))
+          } else {
+            filtered.add(u)
+          }
+        }
+        data.setUsers(filtered)
+      }
+      val result = metadataCache.asInstanceOf[KRaftMetadataCache].describeScramCredentials(data)
+      // Strip tenant-prefixed entries from the response. Covers both the
+      // "list all" path (where the input filter doesn't apply) and any
+      // defence-in-depth case where a tenant entry slipped through.
+      val kept = new util.ArrayList[DescribeUserScramCredentialsResponseData.DescribeUserScramCredentialsResult]()
+      result.results().forEach { r =>
+        if (!isReservedTenantPrincipalNamespace(r.user())) kept.add(r)
+      }
+      deferredResults.forEach(r => kept.add(r))
+      result.setResults(kept)
       requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
         new DescribeUserScramCredentialsResponse(result.setThrottleTimeMs(requestThrottleMs)))
     }

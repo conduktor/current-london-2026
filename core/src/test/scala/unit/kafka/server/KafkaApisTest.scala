@@ -17888,4 +17888,143 @@ class KafkaApisTest extends Logging {
       any[Option[AbstractResponse] => Unit]())
   }
 
+  @Test
+  def testDescribeUserScramCredentialsClusterWideCallerFiltersTenantPrefixedFromListAll(): Unit = {
+    // The "list all users" form (null/empty Users) makes the SCRAM image
+    // dump every credentialled user — including any `__tenant_*` entries —
+    // back to the caller. From a cluster-wide listener this leaks the tenant
+    // roster (and per-user mechanism + iteration count). The handler must
+    // strip those entries before returning.
+    val cacheMock = mock(classOf[KRaftMetadataCache])
+    metadataCache = cacheMock
+    val allResults = new DescribeUserScramCredentialsResponseData()
+      .setResults(util.Arrays.asList(
+        new DescribeUserScramCredentialsResponseData.DescribeUserScramCredentialsResult()
+          .setUser("admin")
+          .setCredentialInfos(util.Arrays.asList(
+            new DescribeUserScramCredentialsResponseData.CredentialInfo()
+              .setMechanism(1.toByte).setIterations(8192))),
+        new DescribeUserScramCredentialsResponseData.DescribeUserScramCredentialsResult()
+          .setUser("__tenant_acme.alice")
+          .setCredentialInfos(util.Arrays.asList(
+            new DescribeUserScramCredentialsResponseData.CredentialInfo()
+              .setMechanism(1.toByte).setIterations(8192))),
+        new DescribeUserScramCredentialsResponseData.DescribeUserScramCredentialsResult()
+          .setUser("__tenant_beta.bob")
+          .setCredentialInfos(util.Arrays.asList(
+            new DescribeUserScramCredentialsResponseData.CredentialInfo()
+              .setMechanism(2.toByte).setIterations(4096)))))
+    when(cacheMock.describeScramCredentials(any[DescribeUserScramCredentialsRequestData]))
+      .thenReturn(allResults)
+
+    val describeRequest = new DescribeUserScramCredentialsRequest.Builder(
+      new DescribeUserScramCredentialsRequestData().setUsers(null)).build()
+    val request = buildRequest(
+      describeRequest,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleDescribeUserScramCredentialsRequest(request)
+
+    val response = verifyNoThrottling[DescribeUserScramCredentialsResponse](request)
+    val users = response.data().results().asScala.map(_.user).toSet
+    assertEquals(Set("admin"), users,
+      "tenant SCRAM users must be filtered out of the cluster-wide 'list all' response")
+  }
+
+  @Test
+  def testDescribeUserScramCredentialsClusterWideCallerRefusesExplicitTenantUser(): Unit = {
+    // Explicit-list form: the adversary names `__tenant_acme.alice` to probe
+    // existence. The image would return the SCRAM metadata if the user
+    // exists, or RESOURCE_NOT_FOUND with the physical name in the message if
+    // it doesn't — either branch confirms or denies existence. Refuse the
+    // tenant-prefixed name pre-image with RESOURCE_NOT_FOUND and an empty
+    // error message so the response is indistinguishable from "user never
+    // existed".
+    val cacheMock = mock(classOf[KRaftMetadataCache])
+    metadataCache = cacheMock
+    // If the handler had let the tenant-prefixed name reach the image, this
+    // mock would have returned metadata. The test asserts the image is
+    // called with an empty Users list (so it returns the empty placeholder).
+    when(cacheMock.describeScramCredentials(any[DescribeUserScramCredentialsRequestData]))
+      .thenReturn(new DescribeUserScramCredentialsResponseData())
+
+    val users = new util.ArrayList[DescribeUserScramCredentialsRequestData.UserName]()
+    users.add(new DescribeUserScramCredentialsRequestData.UserName().setName("__tenant_acme.alice"))
+    val describeRequest = new DescribeUserScramCredentialsRequest.Builder(
+      new DescribeUserScramCredentialsRequestData().setUsers(users)).build()
+    val request = buildRequest(
+      describeRequest,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleDescribeUserScramCredentialsRequest(request)
+
+    val response = verifyNoThrottling[DescribeUserScramCredentialsResponse](request)
+    val results = response.data().results().asScala
+    assertEquals(1, results.size, "exactly one result for one named user")
+    val r = results.head
+    assertEquals("__tenant_acme.alice", r.user)
+    assertEquals(Errors.RESOURCE_NOT_FOUND.code, r.errorCode,
+      "tenant-prefixed SCRAM user lookup must be indistinguishable from never-existed")
+    assertTrue(r.errorMessage == null || r.errorMessage.isEmpty,
+      "error message must be empty so it does not leak existence vs absence")
+    assertTrue(r.credentialInfos() == null || r.credentialInfos().isEmpty,
+      "no SCRAM metadata may be returned for a tenant-prefixed user from a cluster-wide caller")
+  }
+
+  @Test
+  def testDescribeUserScramCredentialsMixedBatchSplitsTenantAndClusterEntries(): Unit = {
+    // Mixed batch where the caller names a legitimate cluster user AND a
+    // tenant-prefixed user. The cluster user must round-trip; the tenant
+    // user must come back with RESOURCE_NOT_FOUND and no oracle leak. The
+    // ordering of results is not specified by the protocol — assert by
+    // user name lookup.
+    val cacheMock = mock(classOf[KRaftMetadataCache])
+    metadataCache = cacheMock
+    when(cacheMock.describeScramCredentials(any[DescribeUserScramCredentialsRequestData]))
+      .thenAnswer(invocation => {
+        val req = invocation.getArgument[DescribeUserScramCredentialsRequestData](0)
+        // The handler must have stripped the tenant-prefixed user from the
+        // request BEFORE calling the image. Mirror the image's behaviour:
+        // produce one entry per requested user.
+        val data = new DescribeUserScramCredentialsResponseData()
+        req.users().forEach { u =>
+          data.results().add(new DescribeUserScramCredentialsResponseData.DescribeUserScramCredentialsResult()
+            .setUser(u.name())
+            .setCredentialInfos(util.Arrays.asList(
+              new DescribeUserScramCredentialsResponseData.CredentialInfo()
+                .setMechanism(1.toByte).setIterations(8192))))
+        }
+        data
+      })
+
+    val users = new util.ArrayList[DescribeUserScramCredentialsRequestData.UserName]()
+    users.add(new DescribeUserScramCredentialsRequestData.UserName().setName("ops-admin"))
+    users.add(new DescribeUserScramCredentialsRequestData.UserName().setName("__tenant_acme.alice"))
+    val describeRequest = new DescribeUserScramCredentialsRequest.Builder(
+      new DescribeUserScramCredentialsRequestData().setUsers(users)).build()
+    val request = buildRequest(
+      describeRequest,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleDescribeUserScramCredentialsRequest(request)
+
+    val response = verifyNoThrottling[DescribeUserScramCredentialsResponse](request)
+    val byUser = response.data().results().asScala.map(r => r.user -> r).toMap
+    assertEquals(Set("ops-admin", "__tenant_acme.alice"), byUser.keySet,
+      "both named users must appear in the response, but with different shapes")
+    val cluster = byUser("ops-admin")
+    assertEquals(Errors.NONE.code, cluster.errorCode,
+      "cluster user must round-trip with full SCRAM metadata")
+    assertEquals(1, cluster.credentialInfos().size)
+    val tenant = byUser("__tenant_acme.alice")
+    assertEquals(Errors.RESOURCE_NOT_FOUND.code, tenant.errorCode,
+      "tenant user must be returned as RESOURCE_NOT_FOUND, regardless of actual existence")
+    assertTrue(tenant.errorMessage == null || tenant.errorMessage.isEmpty,
+      "error message must be empty so it does not leak existence vs absence")
+    assertTrue(tenant.credentialInfos() == null || tenant.credentialInfos().isEmpty)
+  }
+
 }
