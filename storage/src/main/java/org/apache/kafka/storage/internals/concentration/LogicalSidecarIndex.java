@@ -16,6 +16,7 @@
  */
 package org.apache.kafka.storage.internals.concentration;
 
+import org.apache.kafka.common.utils.Crc32C;
 import org.apache.kafka.storage.internals.log.CorruptIndexException;
 
 import java.io.Closeable;
@@ -36,12 +37,35 @@ import java.util.Objects;
  * model: the broker's per-partition produce serialisation already ensures only one thread
  * appends; reads from the fetch path are safe concurrently.
  *
+ * <p>On-disk entry layout (Codex r19 ADV-STORAGE BLOCKER #132 — data-loss without per-entry CRC):
+ * <pre>
+ *   offset 0..7   : 8-byte big-endian backing offset
+ *   offset 8..11  : 4-byte big-endian CRC32C of bytes 0..7
+ * </pre>
+ * A torn write (partial tail entry) is caught at open time by the {@code length % ENTRY_SIZE != 0}
+ * check; a bit-flip inside an aligned 12-byte entry — undetectable from length alone — is caught
+ * by the CRC mismatch on the next read. Without the CRC a corrupted backing offset survives the
+ * length sanity check and silently delivers the wrong record (cross-tenant on a shared backing,
+ * out-of-bounds on a single-tenant one). CRC32C is the same algorithm Kafka's record format uses
+ * for its own data CRC, hardware-accelerated on x86 SSE 4.2 / ARMv8 CRC32 — adding it here is
+ * 32 bits per entry on disk and a few cycles per append/lookup.
+ *
  * <p>On crash mid-append the file may be inconsistent. v1 recovery rebuilds the sidecar from
  * the backing log when sanity checks fail; see {@link BackingScanRecoverer}.
  */
 public final class LogicalSidecarIndex implements Closeable {
 
-    private static final int ENTRY_SIZE = Long.BYTES;
+    /**
+     * 8-byte backing offset + 4-byte CRC32C of those 8 bytes. The two fields together make every
+     * entry self-verifying: a torn write that produces a half-written entry is caught by the
+     * length-not-multiple-of-ENTRY_SIZE check at open time, and a bit-flip inside a full entry is
+     * caught by the CRC mismatch at read time. Both surface as
+     * {@link CorruptIndexException} so the {@link BackingScanRecoverer} backing-log scan fallback
+     * can rebuild the sidecar from {@link ConcentrationHeaders}-stamped records.
+     */
+    static final int OFFSET_BYTES = Long.BYTES;
+    static final int CRC_BYTES = Integer.BYTES;
+    static final int ENTRY_SIZE = OFFSET_BYTES + CRC_BYTES;
 
     private final File file;
     private final String logicalTopic;
@@ -113,7 +137,14 @@ public final class LogicalSidecarIndex implements Closeable {
                     + lastBackingOffset);
         }
         ByteBuffer buf = ByteBuffer.allocate(ENTRY_SIZE);
-        buf.putLong(backingOffset).flip();
+        buf.putLong(backingOffset);
+        // CRC32C over the 8 backing-offset bytes only. The CRC sits in the entry's tail so a
+        // half-written entry surfaces as a length-not-multiple-of-ENTRY_SIZE failure at open time
+        // (caught before any read happens); a bit-flip in either field surfaces as a CRC mismatch
+        // at read time. The two cases together cover every silent-corruption mode that produces a
+        // wrong logical→backing mapping on the fetch path.
+        long crc = Crc32C.compute(buf.array(), 0, OFFSET_BYTES);
+        buf.putInt((int) crc).flip();
         long position = entries * ENTRY_SIZE;
         while (buf.hasRemaining()) {
             int written = channel.write(buf, position + (ENTRY_SIZE - buf.remaining()));
@@ -167,7 +198,25 @@ public final class LogicalSidecarIndex implements Closeable {
             }
         }
         buf.flip();
-        return buf.getLong();
+        long backingOffset = buf.getLong();
+        int storedCrc = buf.getInt();
+        // Recompute the CRC over the just-read 8 backing-offset bytes and compare. A mismatch
+        // means either the stored backing-offset bytes or the stored CRC itself were corrupted
+        // since the entry was written (bit-rot, partial-page write the OS reported as complete,
+        // misdirected write from a buggy storage stack). Either way the on-disk mapping cannot
+        // be trusted — silently returning {@code backingOffset} would route a fetch to the wrong
+        // physical record, which on a shared backing means delivering another logical topic's
+        // bytes to the consumer of this one. CorruptIndexException is the local idiom shared with
+        // OffsetIndex / TimeIndex; surfacing it tells {@link BackingScanRecoverer} the sidecar
+        // must be rebuilt from the backing log.
+        long expectedCrc = Crc32C.compute(buf.array(), 0, OFFSET_BYTES);
+        if ((int) expectedCrc != storedCrc) {
+            throw new CorruptIndexException("sidecar " + file + " entry " + index + " failed CRC "
+                + "check (stored=" + Integer.toUnsignedString(storedCrc) + ", computed="
+                + Integer.toUnsignedString((int) expectedCrc) + "); backing-offset bytes or CRC "
+                + "field corrupted on disk — sidecar must be rebuilt from backing log");
+        }
+        return backingOffset;
     }
 
     private void ensureOpen() {

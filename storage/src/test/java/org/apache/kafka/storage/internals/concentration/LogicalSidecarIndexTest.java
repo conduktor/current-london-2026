@@ -33,6 +33,8 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
+import static org.apache.kafka.storage.internals.concentration.LogicalSidecarIndex.ENTRY_SIZE;
+import static org.apache.kafka.storage.internals.concentration.LogicalSidecarIndex.OFFSET_BYTES;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -40,13 +42,14 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * Behavioural contract of {@link LogicalSidecarIndex}.
  *
- * <p>One file per (logicalTopic, logicalPartition). Each 8-byte entry stores the backing offset
- * for the next logical offset (positionally encoded — entry i is for logical offset
- * baseLogicalOffset + i). Lookup is O(1) — no binary search needed. PROMPT lesson: "Kafka's
- * existing .index and .timeindex files exist for very good reasons. The custom index should
- * follow their shape, not invent a new one." This implementation mirrors that shape (mmap'd,
- * fixed-size entries, no fsync per append) while exploiting the fact that logical offsets are
- * contiguous to skip the relative-offset / binary-search machinery.
+ * <p>One file per (logicalTopic, logicalPartition). Each 12-byte entry stores the backing offset
+ * (8 bytes) plus a CRC32C of those bytes (4 bytes), positionally encoded — entry i is for logical
+ * offset baseLogicalOffset + i. Lookup is O(1). PROMPT lesson: "Kafka's existing .index and
+ * .timeindex files exist for very good reasons. The custom index should follow their shape, not
+ * invent a new one." This implementation mirrors that shape (fixed-size entries, no fsync per
+ * append) while exploiting the fact that logical offsets are contiguous to skip the
+ * relative-offset / binary-search machinery. The per-entry CRC32C closes a bit-rot DATA-LOSS hole
+ * that a length-only sanity check cannot catch.
  */
 public class LogicalSidecarIndexTest {
 
@@ -242,7 +245,7 @@ public class LogicalSidecarIndexTest {
         // through the JVM's FD limit (1024 by default on Linux) and surface as either a
         // FileSystemException("Too many open files") or an IOException from the open itself.
         File file = new File(tempDir, "leak-probe-0.sidecar");
-        Files.write(file.toPath(), new byte[]{1, 2, 3}); // 3 bytes — not a multiple of 8
+        Files.write(file.toPath(), new byte[]{1, 2, 3}); // 3 bytes — not a multiple of ENTRY_SIZE
         // 2000 iterations is well above any reasonable default soft FD limit; if even 1% leaked
         // we would exhaust FDs before completing.
         for (int i = 0; i < 2000; i++) {
@@ -276,13 +279,107 @@ public class LogicalSidecarIndexTest {
         RuntimeException thrown = assertThrows(RuntimeException.class,
             () -> new LogicalSidecarIndex(file, "torn", 0).close());
         // Pin both the local idiom (CorruptIndexException — same family as OffsetIndex /
-        // TimeIndex) and that the message identifies the offending file and length.
+        // TimeIndex) and that the message identifies the offending file and length. With the CRC
+        // format change, 2 entries = 24 bytes + 3 partial = 27 — and 27 % 12 != 0 still trips the
+        // length sanity check before the CRC pass ever runs.
         assertEquals("org.apache.kafka.storage.internals.log.CorruptIndexException",
             thrown.getClass().getName(),
             "must throw CorruptIndexException (the local Kafka idiom), got " + thrown.getClass());
+        long tornLength = existing.length + 3L;
         assertTrue(thrown.getMessage().contains(file.getName())
-                && thrown.getMessage().contains("19")
+                && thrown.getMessage().contains(Long.toString(tornLength))
                 && thrown.getMessage().contains("not a multiple"),
             "message must identify file and torn length: " + thrown.getMessage());
+    }
+
+    @Test
+    public void bitFlipInsideAlignedEntryIsCaughtByCrc() throws IOException {
+        // PROMPT r19 ADV-STORAGE BLOCKER #132 — DATA-LOSS. Length-only sanity checks miss bit-flips
+        // inside a complete 12-byte entry. Without per-entry CRC, a corrupted backing-offset byte
+        // returns a wrong logical→backing mapping and the fetch path silently delivers the wrong
+        // record (cross-tenant on a shared backing). The CRC field at offset 8..11 of every entry
+        // must make this a loud CorruptIndexException, not a silent misroute.
+        File file = new File(tempDir, "bitflip-0.sidecar");
+        try (LogicalSidecarIndex idx = new LogicalSidecarIndex(file, "bitflip", 0)) {
+            idx.append(100L);
+            idx.append(200L);
+            idx.append(300L);
+        }
+
+        // Flip a single bit in the backing-offset payload of entry 1 (bytes 12..19, since entry
+        // 0 occupies bytes 0..11). Choose byte 19 (the LSB of the 8-byte offset) so the value
+        // visibly diverges from 200L without overflowing any sanity guard.
+        byte[] contents = Files.readAllBytes(file.toPath());
+        int bytePos = ENTRY_SIZE + (OFFSET_BYTES - 1); // last byte of entry 1's offset payload
+        contents[bytePos] = (byte) (contents[bytePos] ^ 0x01);
+        Files.write(file.toPath(), contents);
+
+        try (LogicalSidecarIndex reopened = new LogicalSidecarIndex(file, "bitflip", 0)) {
+            // Entry 0 is intact — lookup must still resolve correctly.
+            assertEquals(100L, reopened.lookup(0L));
+            // Entry 1 has the bit-flip and the stored CRC32C no longer matches. The read must
+            // throw CorruptIndexException, NOT silently return the flipped value.
+            RuntimeException thrown = assertThrows(RuntimeException.class,
+                () -> reopened.lookup(1L));
+            assertEquals("org.apache.kafka.storage.internals.log.CorruptIndexException",
+                thrown.getClass().getName(),
+                "bit-flipped entry must surface as CorruptIndexException: got " + thrown);
+            assertTrue(thrown.getMessage().contains("CRC"),
+                "message must say which check failed: " + thrown.getMessage());
+        }
+    }
+
+    @Test
+    public void bitFlipInCrcFieldAlsoSurfacesAsCorruption() throws IOException {
+        // Mirror case of bitFlipInsideAlignedEntryIsCaughtByCrc. The CRC field itself is on disk
+        // and just as vulnerable to bit-rot as the payload. A corrupted CRC byte that no longer
+        // matches the (still-intact) offset bytes must also raise CorruptIndexException —
+        // silently trusting the offset because "the CRC was probably wrong" would defeat the
+        // detection (we cannot distinguish "CRC corrupt + offset intact" from "offset corrupt +
+        // CRC intact" — both are equally untrustworthy).
+        File file = new File(tempDir, "crc-bitflip-0.sidecar");
+        try (LogicalSidecarIndex idx = new LogicalSidecarIndex(file, "crc-bitflip", 0)) {
+            idx.append(42L);
+        }
+        byte[] contents = Files.readAllBytes(file.toPath());
+        // Flip a byte inside the CRC field (bytes 8..11). Pick byte 8 — first CRC byte.
+        int crcBytePos = OFFSET_BYTES;
+        contents[crcBytePos] = (byte) (contents[crcBytePos] ^ 0x01);
+        Files.write(file.toPath(), contents);
+
+        try (LogicalSidecarIndex reopened = new LogicalSidecarIndex(file, "crc-bitflip", 0)) {
+            RuntimeException thrown = assertThrows(RuntimeException.class,
+                () -> reopened.lookup(0L));
+            assertEquals("org.apache.kafka.storage.internals.log.CorruptIndexException",
+                thrown.getClass().getName(),
+                "CRC-bitflipped entry must surface as CorruptIndexException: got " + thrown);
+        }
+    }
+
+    @Test
+    public void crcOnLastEntryIsVerifiedAtConstructionTime() throws IOException {
+        // Construction reads the last entry to seed lastBackingOffset (so append() can enforce
+        // strict monotonicity across a process restart). That read MUST go through the CRC
+        // verification — otherwise a corrupted last entry would be silently trusted as the
+        // monotonicity baseline, and a subsequent append could either succeed when it shouldn't
+        // (next produce overlaps a corrupted offset) or fail spuriously (monotonicity check
+        // against garbage). The right answer is to fail-fast at open time so the recovery path
+        // rebuilds from the backing log.
+        File file = new File(tempDir, "ctor-crc-0.sidecar");
+        try (LogicalSidecarIndex idx = new LogicalSidecarIndex(file, "ctor-crc", 0)) {
+            idx.append(10L);
+            idx.append(20L);
+        }
+        byte[] contents = Files.readAllBytes(file.toPath());
+        // Flip a byte in the LAST entry's offset payload (bytes 12..19 of the 24-byte file).
+        int bytePos = ENTRY_SIZE + (OFFSET_BYTES - 1);
+        contents[bytePos] = (byte) (contents[bytePos] ^ 0x02);
+        Files.write(file.toPath(), contents);
+
+        RuntimeException thrown = assertThrows(RuntimeException.class,
+            () -> new LogicalSidecarIndex(file, "ctor-crc", 0).close());
+        assertEquals("org.apache.kafka.storage.internals.log.CorruptIndexException",
+            thrown.getClass().getName(),
+            "corrupted last entry must abort construction with CorruptIndexException: got " + thrown);
     }
 }

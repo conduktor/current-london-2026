@@ -1294,18 +1294,20 @@ public class ConcentrationKernelTest {
         // Reproduces the silent-corruption bug B.7 fixes: a cached LogicalSidecarIndex holds an
         // in-memory `entries` count that, after a recovery truncate+rebuild via a FRESH handle,
         // points past the actual end-of-file. Without B.7's eviction the next produce on the
-        // stale handle writes at the old position (entries*8) — overwriting nothing, but creating
-        // a sparse region that resolveBackingOffset reads as 0L instead of the just-written value.
+        // stale handle writes at the old position (entries*ENTRY_SIZE) — overwriting nothing, but
+        // creating a sparse region that resolveBackingOffset reads as 0L instead of the just-
+        // written value. (ENTRY_SIZE is 12 bytes after r19 BLOCKER #132 added per-entry CRC32C.)
         kernel.declare(descriptor("orders", 1, "shared", 1));
         TopicPartition backing = new TopicPartition("shared", 0);
 
-        // Phase 1: produce 5 records — cached handle reaches entries=5, file grows to 40 bytes.
+        // Phase 1: produce 5 records — cached handle reaches entries=5, file grows to 60 bytes
+        // (5 × 12-byte entries: 8-byte offset + 4-byte CRC32C).
         long[] originalBackingOffsets = {100L, 200L, 300L, 400L, 500L};
         for (long backingOffset : originalBackingOffsets) {
             kernel.commitProduce(kernel.reserveProduce("orders", 0), backingOffset);
         }
         File sidecarFile = new File(new File(sidecarDir, "orders"), "0.sidecar");
-        assertEquals(40L, sidecarFile.length(), "pre-condition: 5 entries × 8 bytes");
+        assertEquals(60L, sidecarFile.length(), "pre-condition: 5 entries × 12 bytes");
 
         // Phase 2: leader-loss simulation. markBackingUnready must evict the cached handle so the
         // recovery path that follows is free to rebuild the file via a fresh handle without
@@ -1326,13 +1328,13 @@ public class ConcentrationKernelTest {
 
         // Phase 4: post-recovery produce. With B.7 the next sidecarFor("orders", 0) lazy-opens
         // a fresh handle that reads file size 0 → entries=0 → write lands at byte 0.
-        // Without B.7 the stale cached handle's entries=5 drives a write at byte 40, leaving
-        // a sparse [0..39] region of zeros that resolveBackingOffset misreads as 0L.
+        // Without B.7 the stale cached handle's entries=5 drives a write at byte 60, leaving
+        // a sparse [0..59] region of zeros that resolveBackingOffset misreads as 0L.
         kernel.commitProduce(kernel.reserveProduce("orders", 0), 999L);
 
-        assertEquals(8L, sidecarFile.length(),
-            "fresh handle must write at byte 0, producing exactly 8 bytes — not 48 (the "
-                + "stale-handle wrong-offset signature)");
+        assertEquals(12L, sidecarFile.length(),
+            "fresh handle must write at byte 0, producing exactly 12 bytes — not 72 (the "
+                + "stale-handle wrong-offset signature: 5 stale entries × 12 + 1 new × 12)");
         assertEquals(999L, kernel.resolveBackingOffset("orders", 0, 0L),
             "logical offset 0 must resolve to the just-produced backing offset, not 0L from "
                 + "the zero-pad");
@@ -1370,17 +1372,18 @@ public class ConcentrationKernelTest {
 
         File sidecarA = new File(new File(sidecarDir, "orders"), "0.sidecar");
         File sidecarB = new File(new File(sidecarDir, "invoices"), "0.sidecar");
-        assertEquals(8L, sidecarA.length());
-        assertEquals(8L, sidecarB.length());
+        // 12 bytes per entry: 8-byte offset + 4-byte CRC32C (r19 BLOCKER #132).
+        assertEquals(12L, sidecarA.length());
+        assertEquals(12L, sidecarB.length());
 
         // Evict only sharedA.
         kernel.markBackingUnready(backingA);
 
         // sharedB's cached handle was NOT evicted: a follow-up produce must still resolve cleanly
-        // against the original file contents and append at byte 8 — the canonical "untouched"
+        // against the original file contents and append at byte 12 — the canonical "untouched"
         // signature.
         kernel.commitProduce(kernel.reserveProduce("invoices", 0), 21L);
-        assertEquals(16L, sidecarB.length(),
+        assertEquals(24L, sidecarB.length(),
             "sharedB sidecar must continue appending — eviction of sharedA must not have touched it");
         assertEquals(20L, kernel.resolveBackingOffset("invoices", 0, 0L));
         assertEquals(21L, kernel.resolveBackingOffset("invoices", 0, 1L));
