@@ -1094,6 +1094,67 @@ class IoUringTransportLayerTest {
     }
 
     @Test
+    void postCloseAsyncWriteListenerDoesNotRepolluteAsyncWriteFailure() throws Exception {
+        // CONC-F1: Netty completes writeAndFlush futures asynchronously on the event-loop
+        // thread, so a listener registered just before close() runs on the Processor can
+        // fire AFTER close() has reset asyncWriteFailure (DIAG-3) and pendingWriteBytes
+        // (DIAG-4). Without a closed-state short-circuit at the top of the listener,
+        // recordAsyncWriteFailure's CAS would succeed (slot is null again after close)
+        // and re-pollute asyncWriteFailure — silently breaking the closed-resource
+        // invariant that DIAG-3 closed for the Processor-thread side.
+        //
+        // Determinism: we use the onAsyncWriteCompleteForTesting seam to drive the
+        // listener body directly. EmbeddedChannel completes promises synchronously on
+        // the caller, so a real-channel test cannot observe the post-close interleaving
+        // without flaky timing primitives. The seam delegates to the production method
+        // (not a duplicated body), so a regression in the lambda → onAsyncWriteComplete
+        // refactor would surface here.
+        EmbeddedChannel netty = new EmbeddedChannel();
+        IoUringTransportLayer l = new IoUringTransportLayer(netty, REMOTE, LOCAL);
+
+        l.close();
+        assertFalse(l.hasPendingWrites(),
+            "precondition: close() must leave the channel drained");
+
+        // Fire the listener as if Netty completed a failed writeAndFlush AFTER close().
+        IOException stale = new IOException("post-close async write failure");
+        l.onAsyncWriteCompleteForTesting(false, stale, 256);
+
+        assertFalse(l.hasPendingWrites(),
+            "CONC-F1: post-close listener must not re-pollute asyncWriteFailure via " +
+            "recordAsyncWriteFailure's CAS. A non-null stashed failure after close would " +
+            "make hasPendingWrites() report true on a torn-down channel, violating the " +
+            "closed-resource invariant DIAG-3 established on the Processor-thread side.");
+        assertEquals(0, l.pendingWriteBytesSnapshot(),
+            "CONC-F1: post-close listener must not decrement pendingWriteBytes. close() " +
+            "set the counter to 0; addAndGet(-256) without the guard would drive it to -256, " +
+            "leaking a negative value to the snapshot seam and any future observability hook.");
+    }
+
+    @Test
+    void preCloseAsyncWriteListenerStillMutatesState() throws Exception {
+        // Anti-tautology check for CONC-F1. The closed-state guard must not be so eager
+        // that it suppresses normal (pre-close) listener firings. If a regression flipped
+        // the guard sense or fired it too early, this test catches it before the
+        // post-close test could mask a broken happy path.
+        EmbeddedChannel netty = new EmbeddedChannel();
+        IoUringTransportLayer l = new IoUringTransportLayer(netty, REMOTE, LOCAL);
+
+        l.addPendingWriteBytesForTesting(256);
+        assertEquals(256, l.pendingWriteBytesSnapshot(),
+            "precondition: planted bytes must show up in the snapshot");
+
+        IOException cause = new IOException("pre-close failure");
+        l.onAsyncWriteCompleteForTesting(false, cause, 256);
+
+        assertEquals(0, l.pendingWriteBytesSnapshot(),
+            "pre-close listener must still decrement pendingWriteBytes by the chunk size");
+        assertTrue(l.hasPendingWrites(),
+            "pre-close failure must still pollute asyncWriteFailure so the next write() " +
+            "call surfaces the IOException to the Processor's FAILED_SEND path");
+    }
+
+    @Test
     void recordAsyncWriteFailureNeverDropsACauseUnderConcurrentConsumerRetryRace() throws Exception {
         // DIAG-5: the retry-CAS path in recordAsyncWriteFailure has a window where a third
         // listener can win the slot between our primary.get() (which returned null because
