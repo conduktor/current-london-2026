@@ -224,12 +224,52 @@ public class CelProgramTest {
 
     @Test
     public void shortCircuitDoesNotEvaluateRhs() {
+        // R16 MED / Task #178: pin that && and || skip the RHS at AST level
+        // when the LHS already determines the result, not "test passes
+        // because the RHS happens to evaluate to a falsy value".
+        //
+        // The previous fixture used `missing.foo == 1` as the RHS, but CEL
+        // null-propagates undefined identifiers (Field.eval at CelNode.java
+        // line 86 returns null when the receiver is null; Identifier.eval
+        // returns whatever the activation map returns for a missing key —
+        // null). So `missing.foo == 1` → `null == 1` → false WITHOUT
+        // throwing, and the assertions held whether short-circuit kicked
+        // in or not. The test passed for the wrong reason.
+        //
+        // size(null) throws CelEvaluationException (see SizeCall.eval at
+        // CelNode.java line 368-370), so it is a real discriminator: only
+        // a genuinely-skipped RHS keeps the assertion from converting to
+        // an exception.
         Map<String, Object> env = new HashMap<>();
         env.put("a", false);
-        // `missing` is not in env; a false short-circuits and prevents the failing lookup.
-        assertFalse(evalBool("a && missing.foo == 1", env));
         env.put("b", true);
-        assertTrue(evalBool("b || missing.foo == 1", env));
+
+        // Setup invariant: the RHS in isolation throws — confirms the
+        // expression is a real discriminator and the fixture is wired
+        // correctly. If anyone weakens size(null) to return 0 in a future
+        // refactor, this assertion catches it and the rest of the test
+        // would become tautological — so they must update both together.
+        assertThrows(CelEvaluationException.class,
+            () -> evalBool("size(null) > 0", env),
+            "size(null) must throw — RHS is a real short-circuit discriminator");
+
+        // && with false LHS must skip the RHS at AST level, no throw.
+        assertFalse(evalBool("a && size(null) > 0", env));
+        // || with true LHS must skip the RHS at AST level, no throw.
+        assertTrue(evalBool("b || size(null) > 0", env));
+
+        // Conjugate coverage: && with true LHS DOES evaluate the RHS, and
+        // || with false LHS DOES evaluate the RHS. The throw must
+        // propagate — confirms the AST node is not silently swallowing
+        // CelEvaluationException, and that the falsy-LHS assertions above
+        // are not passing by accident of the RHS being unreachable for
+        // some other reason (e.g. dead code elimination).
+        assertThrows(CelEvaluationException.class,
+            () -> evalBool("b && size(null) > 0", env),
+            "true && X must evaluate X — throw must propagate");
+        assertThrows(CelEvaluationException.class,
+            () -> evalBool("a || size(null) > 0", env),
+            "false || X must evaluate X — throw must propagate");
     }
 
     @Test
