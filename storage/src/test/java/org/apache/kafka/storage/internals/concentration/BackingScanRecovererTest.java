@@ -440,12 +440,40 @@ public class BackingScanRecovererTest {
         }
         Path expectedSidecarDir = sidecarDir.toPath().toAbsolutePath().normalize();
         Path expectedTopicDir = new File(sidecarDir, "freshTopic").toPath().toAbsolutePath().normalize();
-        assertEquals(2, rec.flushedPaths.size(),
-            "fresh-topic openSidecar must fsync sidecarDir AND topic-dir; saw " + rec.flushedPaths);
-        assertTrue(rec.flushedPaths.contains(expectedSidecarDir),
-            "must fsync sidecarDir; saw " + rec.flushedPaths);
-        assertTrue(rec.flushedPaths.contains(expectedTopicDir),
-            "must fsync topic-dir; saw " + rec.flushedPaths);
+        // ORDER matters per POSIX: the topic-dir's dirent lives in sidecarDir; fsync'ing the
+        // .sidecar dirent (inside topic-dir) before sidecarDir means a crash between the two
+        // fsyncs would leave a durable .sidecar inode pointing through a NON-durable topic-dir
+        // dirent — recovery would not see either file. Asserting on ordered List equality (not
+        // set membership) pins the chain {sidecarDir -> topic-dir -> .sidecar} the audit
+        // requires for r24 #248.
+        assertEquals(List.of(expectedSidecarDir, expectedTopicDir), rec.flushedPaths,
+            "fsync order must be sidecarDir-first then topic-dir; saw " + rec.flushedPaths);
+    }
+
+    @Test
+    public void ensureTopicDirRollsBackTopicDirWhenSidecarDirFsyncFails() throws IOException {
+        // r25 audit follow-up to BLOCKER #248: when mkdirs succeeds but the parent-dir fsync
+        // fails, the just-created topic-dir must be removed so a retry re-runs the full
+        // mkdirs + fsync chain. Without rollback, the next ensureTopicDir call observes
+        // topicDir.isDirectory()==true, fast-paths past the missing fsync, and the broker
+        // never re-flushes the dirent the OS reported as un-durable.
+        CountingRecoverer rec = new CountingRecoverer(sidecarDir);
+        rec.failOnFlushDir = new IOException("simulated metadata-fsync failure");
+        File topicDir = new File(sidecarDir, "freshTopic");
+        assertThrows(IOException.class, () -> rec.openSidecar("freshTopic", 0));
+        assertTrue(!topicDir.exists(),
+            "topic-dir must be rolled back so the retry re-fsyncs sidecarDir");
+
+        // Retry succeeds and observably re-fsyncs sidecarDir AND topic-dir in order.
+        rec.failOnFlushDir = null;
+        rec.flushedPaths.clear();
+        try (LogicalSidecarIndex sidecar = rec.openSidecar("freshTopic", 0)) {
+            sidecar.append(0L);
+        }
+        Path expectedSidecarDir = sidecarDir.toPath().toAbsolutePath().normalize();
+        Path expectedTopicDir = topicDir.toPath().toAbsolutePath().normalize();
+        assertEquals(List.of(expectedSidecarDir, expectedTopicDir), rec.flushedPaths,
+            "retry after rollback must observably fsync sidecarDir AND topic-dir");
     }
 
     @Test

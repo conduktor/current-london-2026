@@ -143,10 +143,27 @@ public class BackingScanRecoverer {
         }
         synchronized (this) {
             if (topicDir.isDirectory()) return topicDir;
-            if (!topicDir.mkdirs() && !topicDir.isDirectory()) {
+            boolean created = topicDir.mkdirs();
+            if (!created && !topicDir.isDirectory()) {
                 throw new IOException("could not create topic dir " + topicDir);
             }
-            flushDirSeam(sidecarDir.toPath().toAbsolutePath().normalize());
+            try {
+                flushDirSeam(sidecarDir.toPath().toAbsolutePath().normalize());
+            } catch (IOException e) {
+                // r25 audit follow-up to BLOCKER #248: if mkdirs succeeded but the parent-dir
+                // fsync failed, the topicDir is on disk while its dirent is NOT yet durable.
+                // Leaving it would cause the next ensureTopicDir call to fast-path on
+                // {@code topicDir.isDirectory()==true} and silently SKIP the missing parent-dir
+                // fsync forever — exactly the data-loss vector #248 was filed to close.
+                // Rolling back the just-created directory forces the next attempt to retry the
+                // full mkdirs + flushDirSeam chain. Only delete if WE created it: if mkdirs
+                // returned false because a concurrent caller (or external process) had already
+                // materialised the dir, that owner is responsible for its own fsync.
+                if (created) {
+                    topicDir.delete();
+                }
+                throw e;
+            }
         }
         return topicDir;
     }
