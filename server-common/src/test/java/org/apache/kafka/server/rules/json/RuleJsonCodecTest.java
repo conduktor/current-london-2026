@@ -155,6 +155,62 @@ public class RuleJsonCodecTest {
     }
 
     @Test
+    public void uncompilableCelWithControlBytesIsSanitisedInMessage() {
+        // R25-B F1: closes the R23 #237 overclaim. The original commit
+        // sanitised three explicit throw sites (unknown api / forbidden api /
+        // unsupported action) but documented the contract as "uniform across
+        // the decoder", which it was not — the uncompilable-CEL throw site
+        // embedded e.getMessage() from CelCompilationException verbatim, and
+        // CelCompiler.truncateForLog only bounds *length*, not control bytes.
+        // The `when` source is fully operator-controlled and reaches this
+        // path whenever the CEL parser rejects it. An attacker who publishes
+        // an envelope whose `when` contains JSON-escaped CR/LF plus an
+        // ambiguous-but-clearly-bad CEL fragment can force the parse to fail
+        // late enough that the source is echoed into the throw site.
+        //
+        // The trailing `&&` guarantees a CEL parse error so the throw site
+        // is reached; the JSON-escaped `\\r\\n` decodes to actual CR/LF
+        // bytes inside the `when` source field that CelCompiler then echoes.
+        String json = "{\"apiKeys\":[\"METADATA\"],\"action\":\"DENY\","
+            + "\"when\":\"BAD\\r\\nINJECTED 2026 ERROR forged &&\",\"errorCode\":1}";
+        RuleEnvelopeException e = assertThrows(RuleEnvelopeException.class,
+            () -> RuleJsonCodec.decode("k", json.getBytes(StandardCharsets.UTF_8)));
+        String msg = e.getMessage();
+        assertTrue(!msg.contains("\r") && !msg.contains("\n"),
+            "RuleEnvelopeException message must not carry raw CR/LF from CEL source: " + msg);
+        assertTrue(msg.contains("uncompilable CEL"),
+            "diagnostic should still describe the uncompilable-CEL cause: " + msg);
+        assertTrue(msg.contains("'k'"),
+            "diagnostic should still identify the offending rule id: " + msg);
+    }
+
+    @Test
+    public void malformedJsonEnvelopeWithControlBytesIsSanitisedInMessage() {
+        // R25-B F1 (continued): the malformed-JSON parse error path embeds
+        // Jackson's e.getMessage(), which can echo wire-derived source
+        // fragments. Even if Jackson today happens to label control bytes
+        // numerically rather than emit them raw, the contract this commit
+        // pins is: regardless of what Jackson's diagnostic carries, the
+        // RuleEnvelopeException message visible to a caller's log line is
+        // CR/LF-free. Future Jackson upgrades or alternative failure
+        // shapes must not be able to silently re-open this hole.
+        //
+        // The payload is deliberately *byte-malformed* (raw CR/LF outside
+        // a string + garbage tokens) so Jackson reaches the parseJson catch
+        // before any of the structural envelope guards have a chance to
+        // run, exercising the L608 throw site specifically.
+        byte[] payload = ("garbage\r\nINJECTED 2026 ERROR forged\r\n}")
+            .getBytes(StandardCharsets.UTF_8);
+        RuleEnvelopeException e = assertThrows(RuleEnvelopeException.class,
+            () -> RuleJsonCodec.decode("k", payload));
+        String msg = e.getMessage();
+        assertTrue(!msg.contains("\r") && !msg.contains("\n"),
+            "RuleEnvelopeException message must not carry raw CR/LF from Jackson diagnostic: " + msg);
+        assertTrue(msg.contains("malformed JSON envelope"),
+            "diagnostic should still describe the malformed-envelope cause: " + msg);
+    }
+
+    @Test
     public void invalidCelExpressionRejected() {
         String json = "{\"apiKeys\":[\"METADATA\"],\"action\":\"DENY\","
             + "\"when\":\"foo &&\",\"errorCode\":1}";

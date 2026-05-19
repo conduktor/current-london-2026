@@ -319,8 +319,16 @@ public final class RuleJsonCodec {
         try {
             return new Rule(id, apiKeys, action, when, errorCode, CelCompiler.compile(when));
         } catch (CelCompilationException e) {
+            // R25-B F1: CelCompilationException.getMessage() embeds the
+            // operator-controlled `when` source via CelCompiler.truncateForLog,
+            // which bounds length but NOT control bytes. Wrap with
+            // LogSafe.sanitize so the wire-derived fragment cannot inject CR/LF
+            // into the SLF4J line a caller writes from this exception. This
+            // closes the R23 #237 overclaim: the throw-site contract was
+            // documented as "uniform" but two siblings (here and parseJson)
+            // were unsanitised.
             throw new RuleEnvelopeException(
-                "rule '" + id + "' has uncompilable CEL: " + e.getMessage(), e);
+                "rule '" + id + "' has uncompilable CEL: " + LogSafe.sanitize(e.getMessage()), e);
         }
     }
 
@@ -605,7 +613,15 @@ public final class RuleJsonCodec {
         try {
             return MAPPER.readTree(value);
         } catch (Exception e) {
-            throw new RuleEnvelopeException("malformed JSON envelope: " + e.getMessage(), e);
+            // R25-B F1: Jackson's exception message echoes the offending
+            // source fragment verbatim (e.g. "Unexpected character ('X' …)
+            // at [Source: …; line: 1, column: 5]"), which can carry
+            // attacker-controlled bytes from the wire envelope. Sanitise the
+            // embedded message so a downstream `log.error(e.getMessage())`
+            // cannot be coerced into log-line injection. This closes the
+            // R23 #237 overclaim alongside the L322 uncompilable-CEL site.
+            throw new RuleEnvelopeException(
+                "malformed JSON envelope: " + LogSafe.sanitize(e.getMessage()), e);
         }
     }
 
