@@ -226,6 +226,14 @@ public final class SelectorThroughputBenchmark {
                     copy.put(payload);
                     copy.flip();
                     selector.send(new NetworkSend(id, ByteBufferSend.sizePrefixed(copy)));
+                    // KafkaChannel.setSend() implicitly mutes the channel (state machine:
+                    // NOT_MUTED -> MUTED_AND_RESPONSE_PENDING). The real Processor mirrors
+                    // this with unmute() in handleCompletedSends() once the response is
+                    // flushed, otherwise IoUringSelector's read step at runActiveChannelRead
+                    // skips the channel via the `!channel.isMuted()` gate and the bench
+                    // wedges after the first round-trip on every connection. Without this
+                    // unmute the harness silently stalls at ~100 connections.
+                    selector.unmute(id);
                     thisPollRecv++;
                 }
                 totalRecv += thisPollRecv;
@@ -373,17 +381,29 @@ public final class SelectorThroughputBenchmark {
 
     private static Result runClients(Config cfg, int port) throws Exception {
         Socket[] sockets = new Socket[cfg.connections];
-        for (int i = 0; i < cfg.connections; i++) {
-            Socket s = new Socket();
-            s.connect(new InetSocketAddress(BIND_HOST, port), 10_000);
-            s.setTcpNoDelay(true);
-            s.setKeepAlive(true);
-            sockets[i] = s;
-        }
+        int populated = 0;
         try {
+            for (int i = 0; i < cfg.connections; i++) {
+                Socket s = new Socket();
+                // connect() is the throw-prone step (peer RST under load, ephemeral port
+                // exhaustion at high connection counts). The array population MUST stay
+                // inside this try so the catch below can close the [0..populated-1] slice;
+                // a previous version of this loop sat outside the try and leaked one FD
+                // per already-connected socket every time the harness aborted mid-warmup.
+                s.connect(new InetSocketAddress(BIND_HOST, port), 10_000);
+                s.setTcpNoDelay(true);
+                s.setKeepAlive(true);
+                sockets[i] = s;
+                populated = i + 1;
+            }
             return drive(cfg, sockets);
         } finally {
-            for (Socket s : sockets) {
+            // On both happy-path completion AND mid-loop connect failure, close every
+            // socket that actually got created. populated bounds the live range — slots
+            // past it are guaranteed-null because we set them last in the populate step.
+            for (int i = 0; i < populated; i++) {
+                Socket s = sockets[i];
+                if (s == null) continue;
                 try {
                     s.close();
                 } catch (IOException ignored) {
@@ -479,6 +499,17 @@ public final class SelectorThroughputBenchmark {
         long endBytes = bytes.sum();
         long endMsg = messages.sum();
         stop.set(true);
+        // Workers are inside DataInputStream.readInt() at this point — unblock them by
+        // closing the sockets so the next read throws and the catch(Throwable) drops
+        // the thread out of its loop. Without this, a worker mid-read would block the
+        // join() forever because the client sockets have no SO_TIMEOUT.
+        for (java.io.Closeable s : sockets) {
+            try {
+                s.close();
+            } catch (IOException ignored) {
+                // best-effort wakeup
+            }
+        }
         for (Thread w : workers) w.join();
 
         long elapsedNs = endNs - startNs;

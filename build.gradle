@@ -1040,6 +1040,31 @@ project(':server') {
   javadoc {
     enabled = false
   }
+
+  // PROMPT.md "minimum viable outcome #4": 10k-connection PLAINTEXT comparison
+  // of io_uring vs the NIO baseline. The benchmark lives under src/test/java so it
+  // can reuse the test runtime classpath (junit, the netty native classifiers, etc.)
+  // without being pulled into the production server-jar. This task is the runner —
+  // -Pbench.backend / -Pbench.connections / etc. forward to main(String[]) as
+  // --backend / --connections / ... so the same code path drives both gradle and
+  // bare `java -cp` invocations.
+  task runIoUringBench(type: JavaExec, dependsOn: testClasses) {
+    description = "Runs SelectorThroughputBenchmark; see BENCHMARK.md for usage."
+    group = "verification"
+    mainClass = "org.apache.kafka.network.iouring.bench.SelectorThroughputBenchmark"
+    classpath = sourceSets.test.runtimeClasspath
+    // Forward bench JVM stdout/stderr live to gradle's console — otherwise progress
+    // logs only appear after the JVM exits, which makes a stuck bench impossible to
+    // diagnose without jstack-ing the forked PID.
+    standardOutput = System.out
+    errorOutput = System.err
+    // Pass-through bench knobs. Any property left unset falls back to the
+    // SelectorThroughputBenchmark.Config defaults (10k connections, 16 threads,
+    // 256-byte payload, 5s warmup, 20s measurement).
+    def benchProps = ["backend", "connections", "threads", "payload", "warmupMs", "durationMs"]
+    args = benchProps.findAll { project.hasProperty("bench.$it") }
+                     .collect { "--$it=${project.property("bench.$it")}" }
+  }
 }
 
 project(':core') {
