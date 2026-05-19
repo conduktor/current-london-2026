@@ -6176,6 +6176,11 @@ class KafkaApisTest extends Logging {
     // co-tenant group sharing that backing partition. The rejection MUST run AFTER auth so
     // an UNauthorized probe still receives TOPIC_AUTHORIZATION_FAILED and cannot enumerate
     // the declared-backing set (auth-first / shadow-second precedence, same as #159/#146).
+    //
+    // r23 BLOCKER #245 — error code is UNKNOWN_TOPIC_OR_PARTITION (matching the genuinely-
+    // unknown branch) to close the existence-oracle that an INVALID_TOPIC_EXCEPTION
+    // asymmetry would otherwise leak. See testOffsetDeleteBackingReturnsSameErrorAsUnknownTopic
+    // for the explicit oracle-closure discriminator.
     val group = "groupId"
     val backingTopic = "backing-topic-r22-205"
     val plainTopic = "tenant-topic-r22-205"
@@ -6227,8 +6232,9 @@ class KafkaApisTest extends Logging {
     val backingResp = response.data.topics.find(backingTopic)
     assertNotNull(backingResp, "backing topic must still appear in response with rejection error")
     backingResp.partitions.forEach { p =>
-      assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, p.errorCode,
-        s"Backing topic partition ${p.partitionIndex} must be rejected with INVALID_TOPIC_EXCEPTION")
+      assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION.code, p.errorCode,
+        s"Backing topic partition ${p.partitionIndex} must be rejected with UNKNOWN_TOPIC_OR_PARTITION " +
+          "(same code as a genuinely-unknown topic — closes the existence oracle from #245)")
     }
     val plainResp = response.data.topics.find(plainTopic)
     assertNotNull(plainResp, "non-backing topic must be forwarded to coordinator and present in response")
@@ -6245,6 +6251,71 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testOffsetDeleteBackingReturnsSameErrorAsUnknownTopic(): Unit = {
+    // r23 BLOCKER #245 — explicit oracle-closure discriminator for the OffsetDelete sibling
+    // of the OffsetCommit fix. Same threat model: a wildcard-authorized principal probing
+    // arbitrary names must not learn whether a name is a backing topic by observing the
+    // returned error code. See testOffsetCommitBackingReturnsSameErrorAsUnknownTopic.
+    val group = "groupId"
+    val backingTopic = "backing-r23-245-oracle-delete"
+    val unknownTopic = "definitely-does-not-exist-r23-245-delete"
+    addTopicToMetadataCache(backingTopic, numPartitions = 4)
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+    when(concentrationKernel.isBackingTopic(unknownTopic)).thenReturn(false)
+
+    val topics = new OffsetDeleteRequestTopicCollection()
+    topics.add(new OffsetDeleteRequestTopic()
+      .setName(backingTopic)
+      .setPartitions(Seq(new OffsetDeleteRequestPartition().setPartitionIndex(0)).asJava))
+    topics.add(new OffsetDeleteRequestTopic()
+      .setName(unknownTopic)
+      .setPartitions(Seq(new OffsetDeleteRequestPartition().setPartitionIndex(0)).asJava))
+
+    val offsetDeleteRequest = new OffsetDeleteRequest.Builder(
+      new OffsetDeleteRequestData().setGroupId(group).setTopics(topics)
+    ).build()
+    val request = buildRequest(offsetDeleteRequest)
+
+    val requestLocal = RequestLocal.withThreadConfinedCaching
+    // Both topics rejected at handler level → authorizedTopicPartitions is empty, but the
+    // current handler always calls groupCoordinator.deleteOffsets (even with empty topics).
+    // Stub a completed empty future so the response merges cleanly.
+    val future = new CompletableFuture[OffsetDeleteResponseData]()
+    when(groupCoordinator.deleteOffsets(
+      ArgumentMatchers.eq(request.context),
+      any[OffsetDeleteRequestData],
+      ArgumentMatchers.eq(requestLocal.bufferSupplier)
+    )).thenReturn(future)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleOffsetDeleteRequest(request, requestLocal)
+    future.complete(new OffsetDeleteResponseData())
+
+    val response = verifyNoThrottling[OffsetDeleteResponse](request)
+    val backingResp = response.data.topics.find(backingTopic)
+    assertNotNull(backingResp, "backing topic must appear in response")
+    val unknownResp = response.data.topics.find(unknownTopic)
+    assertNotNull(unknownResp, "unknown topic must appear in response")
+
+    val backingCode = backingResp.partitions.find(0).errorCode
+    val unknownCode = unknownResp.partitions.find(0).errorCode
+
+    assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION.code, unknownCode,
+      "Unknown-topic branch must continue to return UNKNOWN_TOPIC_OR_PARTITION (sanity)")
+    assertEquals(unknownCode, backingCode,
+      "Existence-oracle closure (#245) on OffsetDelete: backing-name and unknown-name probes " +
+        "MUST return the same error code. If this fails, the oracle has reopened.")
+
+    // Neither topic must be forwarded to the coordinator — both were rejected pre-forward.
+    val captor = ArgumentCaptor.forClass(classOf[OffsetDeleteRequestData])
+    verify(groupCoordinator).deleteOffsets(any(), captor.capture(), any())
+    val forwarded = captor.getValue
+    assertNull(forwarded.topics.find(backingTopic),
+      "Backing topic MUST NOT be forwarded to group coordinator")
+    assertNull(forwarded.topics.find(unknownTopic),
+      "Unknown topic MUST NOT be forwarded to group coordinator")
+  }
+
+  @Test
   def testOffsetCommitRejectsBackingTopic(): Unit = {
     // r22 BLOCKER #205 — backing topics for concentrated logical topics are real Kafka
     // topics, so metadataCache.contains returns true and handleOffsetCommitRequest would
@@ -6253,6 +6324,12 @@ class KafkaApisTest extends Logging {
     // co-tenant consumer group sharing that backing partition. Rejection runs AFTER auth so
     // an UNauthorized probe still receives TOPIC_AUTHORIZATION_FAILED and cannot enumerate
     // the declared-backing set (auth-first / shadow-second precedence).
+    //
+    // r23 BLOCKER #245 — error code is UNKNOWN_TOPIC_OR_PARTITION, the SAME code returned by
+    // the genuinely-unknown branch. A wildcard-authorized principal must not be able to
+    // distinguish "this name is a backing" from "this name is unknown" by error-code
+    // asymmetry — that would be a one-probe existence oracle for the declared backing set.
+    // See testOffsetCommitBackingReturnsSameErrorAsUnknownTopic for the explicit closure.
     val backingTopic = "backing-topic-r22-205-commit"
     val plainTopic = "tenant-topic-r22-205-commit"
     addTopicToMetadataCache(backingTopic, numPartitions = 8)
@@ -6306,8 +6383,9 @@ class KafkaApisTest extends Logging {
     val backingResp = responseTopics.find(_.name == backingTopic).getOrElse(
       fail("backing topic must appear in response with rejection error").asInstanceOf[Nothing])
     backingResp.partitions.asScala.foreach { p =>
-      assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, p.errorCode,
-        s"Backing topic partition ${p.partitionIndex} must be rejected with INVALID_TOPIC_EXCEPTION")
+      assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION.code, p.errorCode,
+        s"Backing topic partition ${p.partitionIndex} must be rejected with UNKNOWN_TOPIC_OR_PARTITION " +
+          "(same code as a genuinely-unknown topic — closes the existence oracle from #245)")
     }
     val plainResp = responseTopics.find(_.name == plainTopic).getOrElse(
       fail("non-backing topic must be forwarded and appear in response").asInstanceOf[Nothing])
@@ -6322,6 +6400,76 @@ class KafkaApisTest extends Logging {
       "Backing topic MUST NOT be forwarded to group coordinator — offset state must never key on backing")
     assertTrue(forwarded.topics.asScala.exists(_.name == plainTopic),
       "Non-backing topic MUST be forwarded to group coordinator")
+  }
+
+  @Test
+  def testOffsetCommitBackingReturnsSameErrorAsUnknownTopic(): Unit = {
+    // r23 BLOCKER #245 — explicit oracle-closure discriminator. A principal authorized on a
+    // wildcard ACL (e.g. Topic:* for OFFSET_COMMIT) can issue probes against arbitrary topic
+    // names. Before the #245 fix, two such probes — one against a declared backing-topic
+    // name, one against a random unknown name — returned different error codes
+    // (INVALID_TOPIC_EXCEPTION vs UNKNOWN_TOPIC_OR_PARTITION), letting the attacker enumerate
+    // the declared backing-topic set one probe at a time. The fix collapses both branches to
+    // UNKNOWN_TOPIC_OR_PARTITION. This test pins that — without the fix the two error codes
+    // diverge and assertEquals fails.
+    //
+    // This is the canonical oracle-closure discriminator: two probes from the SAME authorized
+    // principal, one targeting a backing name and one targeting a genuinely-unknown name,
+    // MUST receive the same error code.
+    val backingTopic = "backing-r23-245-oracle"
+    val unknownTopic = "definitely-does-not-exist-r23-245"
+    // Backing topic IS in the metadata cache (it's a real Kafka topic, just declared as
+    // a backing for some logical topic). The unknown topic is NOT in the cache.
+    addTopicToMetadataCache(backingTopic, numPartitions = 8)
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+    when(concentrationKernel.isBackingTopic(unknownTopic)).thenReturn(false)
+    when(concentrationKernel.isLogicalTopic(unknownTopic)).thenReturn(false)
+
+    val offsetCommitRequest = new OffsetCommitRequestData()
+      .setGroupId("group")
+      .setMemberId("member")
+      .setTopics(List(
+        new OffsetCommitRequestData.OffsetCommitRequestTopic()
+          .setName(backingTopic)
+          .setPartitions(List(
+            new OffsetCommitRequestData.OffsetCommitRequestPartition()
+              .setPartitionIndex(0)
+              .setCommittedOffset(666)).asJava),
+        new OffsetCommitRequestData.OffsetCommitRequestTopic()
+          .setName(unknownTopic)
+          .setPartitions(List(
+            new OffsetCommitRequestData.OffsetCommitRequestPartition()
+              .setPartitionIndex(0)
+              .setCommittedOffset(777)).asJava)).asJava)
+
+    val requestChannelRequest = buildRequest(new OffsetCommitRequest.Builder(offsetCommitRequest).build())
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handle(requestChannelRequest, RequestLocal.noCaching)
+
+    val response = verifyNoThrottling[OffsetCommitResponse](requestChannelRequest)
+    val responseTopics = response.data.topics.asScala
+    val backingResp = responseTopics.find(_.name == backingTopic).getOrElse(
+      fail("backing topic must appear in response").asInstanceOf[Nothing])
+    val unknownResp = responseTopics.find(_.name == unknownTopic).getOrElse(
+      fail("unknown topic must appear in response").asInstanceOf[Nothing])
+
+    val backingCode = backingResp.partitions.asScala.head.errorCode
+    val unknownCode = unknownResp.partitions.asScala.head.errorCode
+
+    assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION.code, unknownCode,
+      "Unknown-topic branch must continue to return UNKNOWN_TOPIC_OR_PARTITION (sanity)")
+    assertEquals(unknownCode, backingCode,
+      "Existence-oracle closure (#245): a backing-name probe and an unknown-name probe MUST " +
+        "return the same error code so a wildcard-authorized attacker cannot enumerate the " +
+        "declared backing-topic set by observing error-code asymmetry. If this assertion " +
+        "fails, the oracle has reopened.")
+
+    // Neither topic must be forwarded to the group coordinator — both are rejected at the
+    // KafkaApis handler level, so authorizedTopicsRequest is empty and commitOffsets is never
+    // invoked (KafkaApis.scala:466 short-circuit). Verifying the absence of any coordinator
+    // call is a tighter assertion than capturing forwarded payloads.
+    verify(groupCoordinator, never()).commitOffsets(any(), any[OffsetCommitRequestData], any())
   }
 
   @Test

@@ -419,8 +419,16 @@ class KafkaApis(val requestChannel: RequestChannel,
           // runs AFTER auth so an UNauthorized probe still receives TOPIC_AUTHORIZATION_FAILED
           // and cannot enumerate the declared-backing set (same auth-first precedence as
           // DescribeConfigs #159 / Alter* #146).
+          //
+          // r23 BLOCKER #245 — return UNKNOWN_TOPIC_OR_PARTITION (same code as the genuinely-
+          // unknown branch below) rather than a distinguishing INVALID_TOPIC_EXCEPTION. A
+          // principal holding a wildcard ACL (e.g. Topic:*) passes the auth gate above for any
+          // name they probe, so an INVALID_TOPIC vs UNKNOWN_TOPIC_OR_PARTITION asymmetry would
+          // let them enumerate the declared backing-topic set one probe at a time — exactly the
+          // existence oracle r22 #159/#146 closed elsewhere. Collapsing both branches to the
+          // same error code preserves the original #205 rejection and removes the leak channel.
           responseBuilder.addPartitions[OffsetCommitRequestData.OffsetCommitRequestPartition](
-            topic.name, topic.partitions, _.partitionIndex, Errors.INVALID_TOPIC_EXCEPTION)
+            topic.name, topic.partitions, _.partitionIndex, Errors.UNKNOWN_TOPIC_OR_PARTITION)
         } else if (!metadataCache.contains(topic.name) && !concentrationKernel.isLogicalTopic(topic.name)) {
           // If the topic is unknown (neither in the KRaft cache nor declared as a logical
           // topic) we add the topic and all its partitions to the response with
@@ -3618,8 +3626,14 @@ class KafkaApis(val requestChannel: RequestChannel,
           // re-processing across every co-tenant group. Rejection runs AFTER auth so an
           // UNauthorized probe still receives TOPIC_AUTHORIZATION_FAILED and cannot enumerate
           // the declared-backing set (same auth-first precedence as #159/#146).
+          //
+          // r23 BLOCKER #245 — return UNKNOWN_TOPIC_OR_PARTITION (same code as the genuinely-
+          // unknown branch below) so a wildcard-authorized principal cannot distinguish
+          // "backing exists" from "unknown" by error-code asymmetry. The original #205
+          // rejection is preserved; only the leak channel is closed. See OffsetCommit at
+          // line 423 for the sibling fix and rationale.
           responseBuilder.addPartitions[OffsetDeleteRequestData.OffsetDeleteRequestPartition](
-            topic.name, topic.partitions, _.partitionIndex, Errors.INVALID_TOPIC_EXCEPTION)
+            topic.name, topic.partitions, _.partitionIndex, Errors.UNKNOWN_TOPIC_OR_PARTITION)
         } else if (!metadataCache.contains(topic.name)) {
           // If the topic is unknown, we add the topic and all its partitions
           // to the response with UNKNOWN_TOPIC_OR_PARTITION.
