@@ -318,6 +318,112 @@ class BrokerGovernanceBootstrapTest {
     assertEquals(0L, second, "cursor must have advanced past the poison")
   }
 
+  // ── Round-21 HIGH (Agent 3 F-21-1): poison-WARN throttle by exception class ──
+
+  @Test
+  def poisonRecordWarnsAreThrottledByExceptionClass(): Unit = {
+    // Threat: a principal holding __governance write ACL publishes a burst
+    // of malformed records. With the unthrottled WARN, every poisoned
+    // record in a single drainOnce() emitted a synchronous SLF4J line on
+    // the drain thread — N log lines for N records — burning CPU on the
+    // drain hot path and amplifying attacker payload into the operator's
+    // log pipeline. The throttle keys on `t.getClass.getName` (stable,
+    // bounded cardinality across Kafka codec/walker error surfaces) and
+    // collapses repeats within FailureWarnIntervalNanos to a single WARN
+    // with a suppressed-count rollup.
+    //
+    // This test feeds five records that all throw the *same* exception
+    // class (`RuntimeException`) inside a single drain. Pre-fix:
+    // warnEmissions would advance by 5. Post-fix: by exactly 1.
+    val rm = mock(classOf[ReplicaManager])
+    val log = mock(classOf[UnifiedLog])
+    val engine = new RuleEngine()
+    val spyLoader = mock(classOf[GovernanceLoader])
+    doAnswer(_ => null).when(spyLoader).apply(anyString(), any())
+    doAnswer(_ => null).when(spyLoader).commit()
+    // Five records, all poisoned with distinct *messages* but the SAME
+    // exception class. Pre-fix this is exactly the log-flood vector —
+    // attacker can vary the message per record but cannot synthesise
+    // new exception classes from outside the JVM codec surface.
+    doThrow(new RuntimeException("poison-1"))
+      .when(spyLoader).apply(org.mockito.ArgumentMatchers.eq("r1"), any())
+    doThrow(new RuntimeException("poison-2"))
+      .when(spyLoader).apply(org.mockito.ArgumentMatchers.eq("r2"), any())
+    doThrow(new RuntimeException("poison-3"))
+      .when(spyLoader).apply(org.mockito.ArgumentMatchers.eq("r3"), any())
+    doThrow(new RuntimeException("poison-4"))
+      .when(spyLoader).apply(org.mockito.ArgumentMatchers.eq("r4"), any())
+    doThrow(new RuntimeException("poison-5"))
+      .when(spyLoader).apply(org.mockito.ArgumentMatchers.eq("r5"), any())
+
+    when(rm.getLog(tp)).thenReturn(Some(log))
+    when(log.logStartOffset).thenReturn(0L)
+    when(log.highWatermark).thenReturn(5L)
+    when(log.read(0L, 1024 * 1024, FetchIsolation.HIGH_WATERMARK, true)).thenReturn(
+      recordsAt(0L,
+        new SimpleRecord("r1".getBytes(StandardCharsets.UTF_8), envelope("true", ApiKeys.METADATA, 7)),
+        new SimpleRecord("r2".getBytes(StandardCharsets.UTF_8), envelope("true", ApiKeys.METADATA, 7)),
+        new SimpleRecord("r3".getBytes(StandardCharsets.UTF_8), envelope("true", ApiKeys.METADATA, 7)),
+        new SimpleRecord("r4".getBytes(StandardCharsets.UTF_8), envelope("true", ApiKeys.METADATA, 7)),
+        new SimpleRecord("r5".getBytes(StandardCharsets.UTF_8), envelope("true", ApiKeys.METADATA, 7))))
+
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp, spyLoader)
+    // Pin the failure-warn clock so the test is not racing the throttle window.
+    val clock = new AtomicLong(0L)
+    boot.failureWarnNowNanos = () => clock.get()
+
+    val n = boot.drainOnce()
+    assertEquals(5L, n, "all five poisoned records must be visited; drain does not stall")
+    assertEquals(1L, boot.warnEmissions.get(),
+      "five same-class poison records inside one window must collapse to exactly ONE WARN — " +
+        "the log-flood vector against the operator's log pipeline must be neutralised")
+  }
+
+  @Test
+  def poisonRecordWarnsRollUpAfterIntervalAndFireOnNewClass(): Unit = {
+    // Two further invariants of the throttle:
+    //   (a) once the window crosses, the same exception class emits a
+    //       rollup WARN that names the suppressed count;
+    //   (b) a brand-new exception class fires immediately, regardless of
+    //       window state — operators must see the transition to a new
+    //       failure mode without waiting.
+    val rm = mock(classOf[ReplicaManager])
+    val engine = new RuleEngine()
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp)
+    val clock = new AtomicLong(0L)
+    boot.failureWarnNowNanos = () => clock.get()
+
+    // First poison fires.
+    boot.maybeWarnPoisonedRecord(100L, new RuntimeException("first"))
+    assertEquals(1L, boot.warnEmissions.get(),
+      "first poison of a fresh exception class must WARN")
+
+    // Same class, inside the window — suppressed.
+    clock.set(10_000L * 1_000_000L)
+    boot.maybeWarnPoisonedRecord(101L, new RuntimeException("inside-window-1"))
+    clock.set(30_000L * 1_000_000L)
+    boot.maybeWarnPoisonedRecord(102L, new RuntimeException("inside-window-2"))
+    clock.set(59_999L * 1_000_000L)
+    boot.maybeWarnPoisonedRecord(103L, new RuntimeException("inside-window-3"))
+    assertEquals(1L, boot.warnEmissions.get(),
+      "same-class poison inside the window must be silently suppressed")
+
+    // Crossing the window — rollup fires.
+    clock.set(60_001L * 1_000_000L)
+    boot.maybeWarnPoisonedRecord(104L, new RuntimeException("rollup"))
+    assertEquals(2L, boot.warnEmissions.get(),
+      "crossing the window with the same class must roll up the suppressed count " +
+        "into exactly ONE WARN, not one per suppressed occurrence")
+
+    // A brand-new class fires immediately.
+    clock.set(60_500L * 1_000_000L)
+    boot.maybeWarnPoisonedRecord(105L,
+      new IllegalArgumentException("new-class"))
+    assertEquals(3L, boot.warnEmissions.get(),
+      "a transition to a new exception class must WARN immediately — operators must see " +
+        "the failure mode change without waiting for the suppression window")
+  }
+
   @Test
   def drainOncePropagatesHardLogReadFailureSoBrokerCanFailClosed(): Unit = {
     // The bootstrap drain runs before SocketServer.enableRequestProcessing and

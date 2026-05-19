@@ -889,8 +889,69 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
   private val partitionCountDriftThrottle =
     new WarnThrottle("governance partitioning drift detected")
 
+  /**
+   * Round-21 HIGH (Agent 3 F-21-1): the per-record poison WARN at the
+   * record-loop catch fired UNTHROTTLED. A principal with __governance
+   * write ACL publishing N malformed records produced N synchronous
+   * SLF4J WARN lines per drain tick — log-flood vector against an
+   * operator's SIEM/log pipeline plus drain-thread CPU steal.
+   *
+   * Cannot reuse [[WarnThrottle]] verbatim: that throttle dedupes by
+   * full message equality, and the poison WARN message embeds the
+   * offset (always unique) and the exception's sanitised getMessage()
+   * (typically unique per malformed payload). So even with the existing
+   * pattern, each poison record would still emit. The fix is a throttle
+   * keyed on a STABLE dimension — exception class name — with bounded
+   * cardinality (Kafka's codec error classes are a small enumerated set).
+   *
+   * Operators see one WARN per (class × window). The displayed message
+   * still carries the full diagnostic for the *triggering* record
+   * (offset, sanitised getMessage()), so a single representative sample
+   * is preserved per window. The suppressed-count rollup tells the
+   * operator the magnitude of the flood without emitting per-record.
+   */
+  private class PoisonRecordThrottle {
+    private val lastClassName = new AtomicReference[String](null)
+    private val lastWarnAtNanos = new AtomicLong(0L)
+    private val suppressedSinceLastWarn = new AtomicLong(0L)
+
+    def emit(offset: Long, t: Throwable): Unit = {
+      val className = t.getClass.getName
+      val now = failureWarnNowNanos()
+      val previous = lastClassName.get()
+      val sample = sanitizePoisonMessage(t)
+      if (previous == null || previous != className) {
+        val suppressed = suppressedSinceLastWarn.getAndSet(0L)
+        lastClassName.set(className)
+        lastWarnAtNanos.set(now)
+        if (suppressed > 0L && previous != null) {
+          warn(s"skipping poisoned __governance record at offset $offset: $sample " +
+            s"(previous class '$previous' repeated and was suppressed $suppressed " +
+            s"time(s) before this new class)")
+        } else {
+          warn(s"skipping poisoned __governance record at offset $offset: $sample")
+        }
+        warnEmissions.incrementAndGet()
+      } else if (now - lastWarnAtNanos.get() >= FailureWarnIntervalNanos) {
+        val rolled = suppressedSinceLastWarn.getAndSet(0L)
+        lastWarnAtNanos.set(now)
+        warn(s"skipping poisoned __governance record at offset $offset: $sample " +
+          s"(same exception class repeated $rolled time(s) in the last " +
+          s"${FailureWarnIntervalNanos / 1_000_000L}ms)")
+        warnEmissions.incrementAndGet()
+      } else {
+        suppressedSinceLastWarn.incrementAndGet()
+      }
+    }
+  }
+
+  private val poisonRecordThrottle = new PoisonRecordThrottle
+
   private[server] def maybeWarnSuppressed(message: String): Unit =
     drainFailureThrottle.emit(message)
+
+  private[server] def maybeWarnPoisonedRecord(offset: Long, t: Throwable): Unit =
+    poisonRecordThrottle.emit(offset, t)
 
   /**
    * Result of a single [[replay]] pass. Carries three numbers:
@@ -978,8 +1039,7 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
               didApply = loader.apply(keyStr, value)
             } catch {
               case t: Throwable =>
-                warn(s"skipping poisoned __governance record at offset " +
-                  s"${rec.offset()}: ${sanitizePoisonMessage(t)}")
+                maybeWarnPoisonedRecord(rec.offset(), t)
             }
             if (didApply) {
               applied += 1
