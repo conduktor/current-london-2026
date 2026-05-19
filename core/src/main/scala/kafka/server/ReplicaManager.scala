@@ -2789,6 +2789,58 @@ class ReplicaManager(val config: KafkaConfig,
     }
   }
 
+  /**
+   * Concentration: close the per-backing readiness gate BEFORE {@code partition.makeLeader(...)}
+   * is invoked, so that a logical produce racing this thread cannot enter the produce hot path
+   * during the window where the partition is locally-leader but the recoverer has not yet
+   * closed the gate.
+   *
+   * <p>Why this exists (r22 BLOCKER #218): {@link ConcentrationKernel#isBackingReady} returns
+   * {@code true} by default for any backing the kernel has never observed (the {@code s == null}
+   * branch). On the FIRST leader-acquisition of a backing topic-partition by a broker —
+   * cold-start or first-time leadership — the kernel has no {@code BackingGateState} entry yet,
+   * so {@code isBackingReady} returns {@code true}. The original wiring closed the gate via
+   * {@link #maybeStartConcentrationRecovery} only AFTER {@code makeLeader} returned, leaving a
+   * small but real window where:
+   *
+   * <pre>
+   *   T0: applyLocalLeadersDelta enters for backing tp
+   *   T1: partition.makeLeader(...) returns — partition is locally-leader
+   *   T2: another thread (KafkaApis produce handler) routes a logical request,
+   *       finds onlinePartition(tp).isDefined,
+   *       finds isBackingReady(tp) == true (default for never-seen backing),
+   *       proceeds to commit against a stale or absent tracker
+   *   T3: maybeStartConcentrationRecovery → markBackingUnready (too late)
+   * </pre>
+   *
+   * <p>Closing the gate BEFORE {@code makeLeader} guarantees that any produce that races the
+   * leadership transition sees {@code isBackingReady == false} and is rejected with
+   * {@code NOT_LEADER_OR_FOLLOWER}, which stock idempotent producers retry against the next
+   * metadata refresh. The recoverer's later {@code markBackingUnready} bumps the generation
+   * again and the async scan fences against that LATER generation — same contract as before.
+   *
+   * <p>Idempotent: {@link ConcentrationKernel#markBackingUnready} tolerates back-to-back calls;
+   * each bumps generation and evicts cached sidecars, both of which are no-ops when the cache
+   * is already empty (cold-start case). The double-close is intentional — the recoverer's
+   * captured-generation token must come from the close it OWNS, not from a prior close that
+   * could race with another leadership event.
+   *
+   * <p>Note: this method is also called on stay-leader epoch bumps (where the partition was
+   * already leader on this broker). That's fine: the gate is briefly closed, makeLeader runs,
+   * the recoverer closes again and re-runs the scan. Logical produce in flight during the
+   * bump sees the closed gate and retries — which is correct behaviour anyway given a fresh
+   * leader epoch.
+   *
+   * <p>Visible for testing.
+   */
+  private[server] def maybeCloseConcentrationGateBeforeMakeLeader(tp: TopicPartition): Unit = {
+    concentrationKernel.foreach { kernel =>
+      if (kernel.isBackingTopic(tp.topic)) {
+        kernel.markBackingUnready(tp)
+      }
+    }
+  }
+
   private def applyLocalLeadersDelta(
     changedPartitions: mutable.Set[Partition],
     delta: TopicsDelta,
@@ -2802,6 +2854,14 @@ class ReplicaManager(val config: KafkaConfig,
     localLeaders.foreachEntry { (tp, info) =>
       getOrCreatePartition(tp, delta, info.topicId).foreach { case (partition, isNew) =>
         try {
+          // Concentration: close the per-backing readiness gate BEFORE makeLeader returns
+          // (r22 BLOCKER #218). The kernel's isBackingReady defaults to TRUE for any backing
+          // it has never observed; without this pre-close, a logical produce racing makeLeader
+          // could find onlinePartition(tp).isDefined AND isBackingReady(tp) == true, and commit
+          // against a stale-or-absent tracker before the recoverer's markBackingUnready runs.
+          // See maybeCloseConcentrationGateBeforeMakeLeader for the full rationale.
+          maybeCloseConcentrationGateBeforeMakeLeader(tp)
+
           val state = info.partition.toLeaderAndIsrPartitionState(tp, isNew)
           val partitionAssignedDirectoryId = directoryIds.find(_._1.topicPartition() == tp).map(_._2)
           partition.makeLeader(state, offsetCheckpoints, Some(info.topicId), partitionAssignedDirectoryId)
@@ -2815,10 +2875,12 @@ class ReplicaManager(val config: KafkaConfig,
           // Concentration: leader-acquisition is the moment the per-backing tracker and
           // sidecars may be stale (rebuilt against a prior leader) or absent (broker never
           // led this partition since startup). The recoverer closes the readiness gate
-          // synchronously, then asynchronously rebuilds sidecar state from the backing log
-          // and re-opens the gate under a generation CAS — see Codex GAP 2, leg three.
-          // Listener is attached first because a delete/failure event that races with the
-          // recovery scan must already be wired to bump the generation token.
+          // synchronously (bumping the generation AGAIN — double-close is intentional, the
+          // recoverer's captured-generation token must come from the close it OWNS), then
+          // asynchronously rebuilds sidecar state from the backing log and re-opens the gate
+          // under a generation CAS — see Codex GAP 2, leg three. Listener is attached first
+          // because a delete/failure event that races with the recovery scan must already be
+          // wired to bump the generation token.
           maybeStartConcentrationRecovery(tp, partition)
 
           changedPartitions.add(partition)

@@ -65,6 +65,7 @@ import org.apache.kafka.server.storage.log.{FetchIsolation, FetchParams, FetchPa
 import org.apache.kafka.server.util.timer.MockTimer
 import org.apache.kafka.server.util.{MockScheduler, MockTime, Scheduler}
 import org.apache.kafka.storage.internals.checkpoint.LazyOffsetCheckpoints
+import org.apache.kafka.storage.internals.concentration.ConcentrationKernel
 import org.apache.kafka.storage.internals.epoch.LeaderEpochFileCache
 import org.apache.kafka.storage.internals.log.{AppendOrigin, FetchDataInfo, LocalLog, LogConfig, LogDirFailureChannel, LogLoader, LogOffsetMetadata, LogOffsetSnapshot, LogSegments, ProducerStateManager, ProducerStateManagerConfig, RemoteStorageFetchInfo, VerificationGuard}
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats
@@ -3230,7 +3231,8 @@ class ReplicaManagerTest {
     setupLogDirMetaProperties: Boolean = false,
     directoryEventHandler: DirectoryEventHandler = DirectoryEventHandler.NOOP,
     buildRemoteLogAuxState: Boolean = false,
-    remoteFetchQuotaExceeded: Option[Boolean] = None
+    remoteFetchQuotaExceeded: Option[Boolean] = None,
+    concentrationKernel: Option[ConcentrationKernel] = None
   ): ReplicaManager = {
     val props = TestUtils.createBrokerConfig(brokerId)
     val path1 = TestUtils.tempRelativeDir("data").getAbsolutePath
@@ -3324,7 +3326,8 @@ class ReplicaManagerTest {
           remoteLogManager
         else
           Some(mockRemoteLogManager)
-      } else None) {
+      } else None,
+      concentrationKernel = concentrationKernel) {
 
       override protected def createReplicaFetcherManager(
         metrics: Metrics,
@@ -5716,6 +5719,85 @@ class ReplicaManagerTest {
     val fetchState = manager.getFetcher(tp).flatMap(_.fetchState(tp))
     assertTrue(fetchState.isDefined)
     assertEquals(expectedTopicId, fetchState.get.topicId)
+  }
+
+  // ----- r22 BLOCKER #218: gate-close-before-makeLeader regression coverage -----
+  //
+  // The kernel's isBackingReady defaults to TRUE for any backing it has never observed
+  // (ConcentrationKernel#isBackingReady: `return s == null || s.ready`). On the FIRST
+  // leader-acquisition of a backing topic-partition by a broker, the recoverer's
+  // markBackingUnready was wired to run AFTER partition.makeLeader returned, leaving a
+  // race window where a logical produce could find:
+  //   - onlinePartition(tp).isDefined (makeLeader already returned)
+  //   - isBackingReady(tp) == true (default, since kernel never saw this backing)
+  // and proceed to commit against a stale-or-absent tracker.
+  //
+  // The fix introduces maybeCloseConcentrationGateBeforeMakeLeader, called BEFORE
+  // partition.makeLeader inside applyLocalLeadersDelta. These tests pin the helper's
+  // semantics: it must close the gate on backing topics and NEVER touch the kernel for
+  // non-backing topics (so leader-acquisition for the broker's everyday partitions stays
+  // free of kernel calls).
+
+  @Test
+  def testMaybeCloseConcentrationGateBeforeMakeLeaderClosesGateForBackingTopic(): Unit = {
+    val kernel = mock(classOf[ConcentrationKernel])
+    val backingTp = new TopicPartition("orders-backing", 7)
+    when(kernel.isBackingTopic(backingTp.topic)).thenReturn(true)
+    val replicaManager = setupReplicaManagerWithMockedPurgatories(
+      new MockTimer(time),
+      concentrationKernel = Some(kernel)
+    )
+    try {
+      replicaManager.maybeCloseConcentrationGateBeforeMakeLeader(backingTp)
+
+      verify(kernel).isBackingTopic(backingTp.topic)
+      verify(kernel).markBackingUnready(backingTp)
+      verifyNoMoreInteractions(kernel)
+    } finally {
+      replicaManager.shutdown(checkpointHW = false)
+    }
+  }
+
+  @Test
+  def testMaybeCloseConcentrationGateBeforeMakeLeaderIsNoopForNonBackingTopic(): Unit = {
+    val kernel = mock(classOf[ConcentrationKernel])
+    val nonBackingTp = new TopicPartition("ordinary-topic", 0)
+    when(kernel.isBackingTopic(nonBackingTp.topic)).thenReturn(false)
+    val replicaManager = setupReplicaManagerWithMockedPurgatories(
+      new MockTimer(time),
+      concentrationKernel = Some(kernel)
+    )
+    try {
+      replicaManager.maybeCloseConcentrationGateBeforeMakeLeader(nonBackingTp)
+
+      verify(kernel).isBackingTopic(nonBackingTp.topic)
+      // Critically: markBackingUnready MUST NOT be called for non-backing topics.
+      // Otherwise every leader-acquisition on an ordinary topic would pollute
+      // backingGateState with a (false, 1) entry the kernel never opens, and every
+      // produce on that topic would consult an extra map lookup forever after.
+      verify(kernel, never()).markBackingUnready(any[TopicPartition])
+      verifyNoMoreInteractions(kernel)
+    } finally {
+      replicaManager.shutdown(checkpointHW = false)
+    }
+  }
+
+  @Test
+  def testMaybeCloseConcentrationGateBeforeMakeLeaderIsNoopWhenKernelAbsent(): Unit = {
+    // Broker started without concentration enabled: no kernel, no work to do. The
+    // helper must short-circuit before any kernel call would NPE — applyLocalLeadersDelta
+    // runs on every broker, not just those participating in concentration.
+    val replicaManager = setupReplicaManagerWithMockedPurgatories(
+      new MockTimer(time),
+      concentrationKernel = None
+    )
+    try {
+      // No exception thrown — pure no-op.
+      replicaManager.maybeCloseConcentrationGateBeforeMakeLeader(
+        new TopicPartition("anything", 0))
+    } finally {
+      replicaManager.shutdown(checkpointHW = false)
+    }
   }
 
   @Test
