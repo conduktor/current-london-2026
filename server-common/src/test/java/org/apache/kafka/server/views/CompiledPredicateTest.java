@@ -1086,4 +1086,71 @@ class CompiledPredicateTest {
                     () -> "illegal scalar-root accessor '" + pred + "' must yield SKIP, got " + r);
         }
     }
+
+    @Test
+    void nestedUnsafeEqualityDoesNotPassThroughOuterNeq() {
+        // R36 BLOCKER #1 (Codex): the round-5 tri-state contract for
+        // numericEqLongDoubleOrNull's "unsafe Long/Double" UNKNOWN is safe ONLY for direct
+        // boolean use of `==` / `!=`. When the EQ result is itself an operand of an OUTER
+        // binary operator (e.g. `(body.x == LITERAL) != true`), applyBinaryOp returns bare
+        // `null` from the inner EQ; the outer NEQ then runs equalsValuesOrNull(null, true)
+        // which falls into the "null vs non-null → Boolean.FALSE" branch (line 231) and NEQ
+        // negates FALSE to a confident TRUE — admitting a record whose equality was
+        // undecidable. Same NEQ-via-null shape as R3-R7/R33b/R34/R35 applied to a fresh
+        // nesting depth. After R36: applyBinaryOp EQ/NEQ converts the bare null to SKIP at
+        // the operator boundary so it cannot be wrapped.
+        CompiledPredicate p = compiler.compile("(body.x == 9007199254740992.0) != true");
+        Optional<Boolean> r = p.evaluate(jsonRecord("{\"x\":9007199254740993}"));
+        assertTrue(r.isEmpty(),
+                () -> "nested unsafe-Long EQ wrapped in NEQ must yield SKIP, got " + r);
+        // Symmetric: NEQ wrapped in NEQ — same shape via the NEQ branch.
+        CompiledPredicate q = compiler.compile("(body.x != 9007199254740992.0) != false");
+        Optional<Boolean> rq = q.evaluate(jsonRecord("{\"x\":9007199254740993}"));
+        assertTrue(rq.isEmpty(),
+                () -> "nested unsafe-Long NEQ wrapped in NEQ must yield SKIP, got " + rq);
+    }
+
+    @Test
+    void wrongShapeIntermediateBodyDoesNotPassNegatedPredicate() {
+        // R36 BLOCKER #2a (Codex): RecordContexts.navigate returned bare `null` when a path
+        // descent encountered a non-object intermediate value (e.g. body.user.region against
+        // body `{"user":"anything"}`). That null is NOT legitimate absence — it is an
+        // adversary-controlled wrong-type. Through NEQ it admitted (`null != 'blocked'` →
+        // Boolean.TRUE via equalsValuesOrNull's null-vs-non-null FALSE flip). After R36:
+        // navigate returns BODY_UNUSABLE for present-but-wrong-shape intermediates, which
+        // resolvePath maps to SKIP.
+        CompiledPredicate p = compiler.compile("body.user.region != 'blocked'");
+        Optional<Boolean> r = p.evaluate(jsonRecord("{\"user\":\"anything\"}"));
+        assertTrue(r.isEmpty(),
+                () -> "scalar at intermediate path must yield SKIP, not admit through NEQ, got " + r);
+        // Absent-field (`user` simply missing) must STILL evaluate as null per
+        // absentHeaderEvaluatesAsNullForNegatedPredicate's documented contract: missing field
+        // is the legitimately-absent case and NEQ on it admits.
+        Optional<Boolean> rAbsent = p.evaluate(jsonRecord("{\"other\":1}"));
+        assertTrue(rAbsent.isPresent() && rAbsent.get(),
+                () -> "absent intermediate field must remain null, admitted by NEQ, got " + rAbsent);
+    }
+
+    @Test
+    void compoundAtLeafPositionDoesNotPassNegatedPredicate() {
+        // R36 BLOCKER #2b (Codex): a compound (object or array) at the LEAF path position was
+        // captured as `null` by extractLeaf's default branch, then propagated through NEQ as
+        // an admit. (`body.region != 'blocked'` against body `{"region":{"value":"blocked"}}`
+        // admitted because null != 'blocked' flips to TRUE.) The leaf is present and not JSON
+        // null — it is wrong type. After R36: extractLeaf returns BODY_UNUSABLE for
+        // START_OBJECT/START_ARRAY; VALUE_NULL still returns null (legitimate JSON-null
+        // leaf).
+        CompiledPredicate p = compiler.compile("body.region != 'blocked'");
+        Optional<Boolean> rObj = p.evaluate(jsonRecord("{\"region\":{\"value\":\"blocked\"}}"));
+        assertTrue(rObj.isEmpty(),
+                () -> "object at leaf must yield SKIP, not admit through NEQ, got " + rObj);
+        Optional<Boolean> rArr = p.evaluate(jsonRecord("{\"region\":[\"a\",\"b\"]}"));
+        assertTrue(rArr.isEmpty(),
+                () -> "array at leaf must yield SKIP, not admit through NEQ, got " + rArr);
+        // JSON-null leaf is legitimate absence and must continue to admit via NEQ — same
+        // contract as absentHeaderEvaluatesAsNullForNegatedPredicate.
+        Optional<Boolean> rNull = p.evaluate(jsonRecord("{\"region\":null}"));
+        assertTrue(rNull.isPresent() && rNull.get(),
+                () -> "JSON-null leaf must remain null, admitted by NEQ, got " + rNull);
+    }
 }

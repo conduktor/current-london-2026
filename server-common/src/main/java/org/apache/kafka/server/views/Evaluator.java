@@ -166,16 +166,19 @@ final class Evaluator {
         switch (op) {
             case EQ: {
                 // Tri-state: null means "unknown" (e.g. unsafe Long/Double precision-loss).
-                // null propagates as falsy in boolean context so the record is skipped — the
-                // safe outcome at an access-control boundary. Returning Boolean.FALSE here
-                // instead would let NEQ negate it to TRUE and admit a record whose equality
-                // we couldn't actually decide.
+                // We convert null → SKIP at the operator boundary so it cannot be wrapped in
+                // an OUTER binary operator and bypass the guard. R36 (Codex BLOCKER #1):
+                // returning bare null here let `(body.x == LIT) != true` admit a record whose
+                // inner equality was undecidable, because the outer NEQ ran
+                // equalsValuesOrNull(null, true) and the line-231 null-vs-non-null FALSE branch
+                // got NEQ-flipped to a confident TRUE. SKIP propagates through evalBinary
+                // (lines 114-122) so wrapping cannot launder it.
                 Boolean eq = equalsValuesOrNull(lv, rv);
-                return eq;
+                return eq == null ? SKIP : eq;
             }
             case NEQ: {
                 Boolean eq = equalsValuesOrNull(lv, rv);
-                return eq == null ? null : Boolean.valueOf(!eq.booleanValue());
+                return eq == null ? SKIP : Boolean.valueOf(!eq.booleanValue());
             }
             case LT:
                 return compare(lv, rv, -1, false);

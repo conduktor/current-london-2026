@@ -323,7 +323,12 @@ public final class RecordContexts {
         Object capturedLeaf = null;
         for (int pi = 0; pi < path.size(); pi++) {
             if (t != JsonToken.START_OBJECT) {
-                return null;
+                // Path descent demands an object at this level but the present value is a
+                // scalar / array — adversary-controlled wrong type, NOT legitimate absence.
+                // BODY_UNUSABLE (→ SKIP in Evaluator.resolvePath line 566), not null:
+                // returning null here let `body.user.region != 'blocked'` against
+                // `{"user":"anything"}` admit through NEQ-via-null (R36 BLOCKER #2a, Codex).
+                return RecordContext.BODY_UNUSABLE;
             }
             if (pi + 1 > maxDepth) {
                 return RecordContext.BODY_UNUSABLE;
@@ -408,8 +413,9 @@ public final class RecordContexts {
                     // Leaf level: capture the scalar value before the parser moves on.
                     capturedScalar = extractLeaf(p, valueToken, maxScalarStringChars);
                     if (valueToken == JsonToken.START_OBJECT || valueToken == JsonToken.START_ARRAY) {
-                        // Compound at leaf position; captured value is null (extractLeaf semantics).
-                        // We still must skip children so the duplicate-scan stays at the correct level.
+                        // Compound at leaf position; captured value is BODY_UNUSABLE (extractLeaf
+                        // semantics — R36). We still must skip children so the duplicate-scan
+                        // stays at the correct level.
                         p.skipChildren();
                     }
                 } else {
@@ -477,10 +483,19 @@ public final class RecordContexts {
                 return Boolean.TRUE;
             case VALUE_FALSE:
                 return Boolean.FALSE;
-            case VALUE_NULL:
             case START_OBJECT:
             case START_ARRAY:
+                // Compound (object or array) at the leaf position: present but wrong type
+                // for any scalar comparison. BODY_UNUSABLE (→ SKIP in Evaluator.resolvePath
+                // line 566), not null: returning null here let `body.region != 'blocked'`
+                // against `{"region":{...}}` admit through NEQ-via-null (R36 BLOCKER #2b,
+                // Codex).
+                return RecordContext.BODY_UNUSABLE;
+            case VALUE_NULL:
             default:
+                // VALUE_NULL is a legitimate JSON-null leaf: `key == null` should be true,
+                // and `key != "x"` should admit per the absent-vs-present contract pinned by
+                // absentHeaderEvaluatesAsNullForNegatedPredicate.
                 return null;
         }
     }
