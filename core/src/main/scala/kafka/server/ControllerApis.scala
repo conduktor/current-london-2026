@@ -968,16 +968,30 @@ class ControllerApis(
   // the only way a caller's identity can carry a tenant is through the
   // KafkaPrincipal name itself (`__tenant_<id>.<user>`), already validated
   // by TenantPrincipalBuilder on the originating broker/edge listener.
+  //
+  // The `__tenant_` prefix is RESERVED: ANY name shaped `__tenant_<id>.<x>`
+  // with non-empty `<id>` is a reserved-namespace name, regardless of whether
+  // `<id>` is currently bound to a broker listener. A structural check is
+  // required here for two reasons:
+  //
+  //  - Pre-binding pollution: an admin on a cluster-wide listener could plant
+  //    delegation tokens, SCRAM creds, or ACLs under `__tenant_X.*` BEFORE
+  //    tenant X is bound. The newly-bound tenant would inherit the planted
+  //    state on first use.
+  //  - Split-mode KRaft: a process running with `process.roles=controller`
+  //    only has no broker listeners and therefore an empty TenantConfig.
+  //    Without a structural check, every controller-side guard collapses,
+  //    re-opening the identity-laundering hole this method exists to close.
+  //
+  // The narrow lookup lives in `callerTenantFromPrincipal`: only callers whose
+  // tenant id is currently bound on this node are recognised, so legitimate
+  // tenant clients remain exempt via `belongsToCallerTenant`.
   private def isReservedTenantPrincipalNamespace(name: String): Boolean = {
     if (name == null) return false
     if (!name.startsWith(TenantNamespace.PRINCIPAL_PREFIX)) return false
-    val knownTenants = tenantConfig.allTenants
-    if (knownTenants.isEmpty) return false
-    val it = knownTenants.iterator
-    while (it.hasNext) {
-      if (name.startsWith(TenantNamespace.PRINCIPAL_PREFIX + it.next + ".")) return true
-    }
-    false
+    val afterPrefix = name.substring(TenantNamespace.PRINCIPAL_PREFIX.length)
+    val dot = afterPrefix.indexOf('.')
+    dot > 0
   }
 
   // Derive the caller's tenant from their principal name when the principal

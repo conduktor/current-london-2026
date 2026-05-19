@@ -1360,6 +1360,66 @@ class ControllerApisTest {
   }
 
   @Test
+  def testControllerCreateDelegationTokenRefusesTenantPrefixedOwnerOnSplitModeController(): Unit = {
+    // Split-mode KRaft / pre-binding case: the controller node is configured
+    // with `process.roles=controller` only, so it has no broker listeners and
+    // its TenantConfig is empty. Without a structural guard, every controller-
+    // side tenant check would collapse on `allTenants.isEmpty` and a cluster
+    // admin could mint delegation tokens for ANY tenant principal — including
+    // ones already bound on the broker nodes. Asserts the structural widening
+    // of isReservedTenantPrincipalNamespace closes this regression on the
+    // controller side.
+    val createRequest = new CreateDelegationTokenRequest.Builder(
+      new CreateDelegationTokenRequestData()
+        .setOwnerPrincipalType(KafkaPrincipal.USER_TYPE)
+        .setOwnerPrincipalName("__tenant_acme.alice")).build()
+    val request = buildTokenRequest(createRequest, new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = new MockController.Builder().build(),
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.empty())
+    controllerApis.handleCreateDelegationTokenRequest(request).get()
+
+    val response = captureSentResponse(request).asInstanceOf[CreateDelegationTokenResponse]
+    assertEquals(Errors.DELEGATION_TOKEN_AUTHORIZATION_FAILED.code, response.data.errorCode,
+      "the `__tenant_` prefix is reserved even on a controller with no listener bindings — closes split-mode KRaft gap")
+  }
+
+  @Test
+  def testControllerAlterUserScramCredentialsRefusesTenantPrefixedUpsertionOnSplitModeController(): Unit = {
+    // Companion to the delegation-token split-mode test: a SCRAM upsertion
+    // for `__tenant_acme.alice` on a controller with empty TenantConfig must
+    // still be refused. Without the structural guard, a cluster admin could
+    // mint SCRAM credentials for the tenant on the controller (where the
+    // record is persisted) and the broker would happily authenticate the
+    // tenant identity on its tenant listener at the next SASL handshake.
+    val upsertions = new util.ArrayList[AlterUserScramCredentialsRequestData.ScramCredentialUpsertion]()
+    upsertions.add(new AlterUserScramCredentialsRequestData.ScramCredentialUpsertion()
+      .setName("__tenant_acme.alice")
+      .setMechanism(1.toByte)
+      .setIterations(8192)
+      .setSalt(Array.emptyByteArray)
+      .setSaltedPassword(Array.emptyByteArray))
+    val alterRequest = new AlterUserScramCredentialsRequest.Builder(
+      new AlterUserScramCredentialsRequestData().setUpsertions(upsertions)).build()
+    val request = buildTokenRequest(alterRequest, new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = new MockController.Builder().build(),
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.empty())
+    controllerApis.handle(request, RequestLocal.noCaching())
+
+    val response = captureSentResponse(request).asInstanceOf[AlterUserScramCredentialsResponse]
+    assertEquals(1, response.data.results.size)
+    val result = response.data.results.get(0)
+    assertEquals("__tenant_acme.alice", result.user)
+    assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED.code, result.errorCode,
+      "controller must refuse SCRAM planting under `__tenant_*` even when its TenantConfig is empty (split-mode KRaft)")
+  }
+
+  @Test
   def testControllerCreateDelegationTokenRefusesTenantPrefixedOwnerFromClusterCaller(): Unit = {
     // Non-tenant caller asking the CONTROLLER to mint a token whose owner is
     // `__tenant_acme.alice`. The broker-side guard does not apply on this

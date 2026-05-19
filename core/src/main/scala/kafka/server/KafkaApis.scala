@@ -181,23 +181,33 @@ class KafkaApis(val requestChannel: RequestChannel,
   }
 
   // Outside-in guard for coordinator-keyed namespaces (consumer-group ids and
-  // transactional ids). The physical wire form is `__tenant_<id>.<logical>`; a
-  // privileged caller on a non-tenant listener naming `__tenant_acme.foo`
-  // directly addresses acme's slot in `__consumer_offsets` /
-  // `__transaction_state` and could fence the tenant or read their commits.
-  // Mirrors isReservedTenantNamespace: refuse only when the prefix encodes a
-  // KNOWN tenant id (an unknown `__tenant_*` is opaque to the broker and the
-  // coordinator's own validation will land the rejection).
+  // transactional ids). The `__tenant_` prefix is RESERVED by the multi-tenancy
+  // fork: ANY name shaped `__tenant_<id>.<x>` with non-empty `<id>` is a
+  // reserved-namespace name, regardless of whether `<id>` is currently bound to
+  // a listener on this node. Two reasons to keep the check structural rather
+  // than tenant-id-aware:
+  //
+  //  - Pre-binding pollution: an attacker on a cluster-wide listener can plant
+  //    offsets / txn state / ACLs / SCRAM creds / delegation tokens under
+  //    `__tenant_X.*` BEFORE tenant X is bound. The newly-bound tenant then
+  //    inherits the pollution (their first OffsetFetch sees the planted
+  //    commits, their CreateTopics conflicts with planted ACLs, etc).
+  //  - Split-mode KRaft: a controller node runs with no broker listeners and
+  //    therefore an empty TenantConfig. Every controller-side check against
+  //    `allTenants` collapses, re-opening the cross-tenant guards on every
+  //    forwarded RPC. A structural check fires on the controller too.
+  //
+  // The narrow lookup lives in `callerTenantFromPrincipal`: only callers whose
+  // tenant id is currently bound are recognised as tenant clients and get
+  // exempted from this guard via `belongsToCallerTenant`. Unknown-tenant
+  // principals are refused; legitimate tenant clients on their own listener
+  // are not.
   private def isReservedTenantPrincipalNamespace(name: String): Boolean = {
     if (name == null) return false
     if (!name.startsWith(org.apache.kafka.server.tenant.TenantNamespace.PRINCIPAL_PREFIX)) return false
-    val knownTenants = tenantConfig.allTenants
-    if (knownTenants.isEmpty) return false
-    val it = knownTenants.iterator
-    while (it.hasNext) {
-      if (name.startsWith(org.apache.kafka.server.tenant.TenantNamespace.PRINCIPAL_PREFIX + it.next + ".")) return true
-    }
-    false
+    val afterPrefix = name.substring(org.apache.kafka.server.tenant.TenantNamespace.PRINCIPAL_PREFIX.length)
+    val dot = afterPrefix.indexOf('.')
+    dot > 0
   }
 
   // Return the PHYSICAL TopicIdPartition the tenant is allowed to fetch, or
@@ -3890,10 +3900,12 @@ class KafkaApis(val requestChannel: RequestChannel,
   // handleDeleteAclsRequest:
   //
   //  L1 (filter validation): refuse with CLUSTER_AUTHORIZATION_FAILED if the
-  //     filter EXPLICITLY NAMES a known tenant namespace via the patternFilter
-  //     (TOPIC + reserved-topic name; GROUP/TXN/USER + reserved-principal
-  //     name) or via the entryFilter principal (`User:__tenant_<known>.*`).
-  //     This closes the existence-oracle and prefix-enumeration vectors.
+  //     filter EXPLICITLY NAMES a tenant namespace via the patternFilter
+  //     (TOPIC + reserved-topic name with a KNOWN tenant id; GROUP/TXN/USER +
+  //     any `__tenant_*` shape) or via the entryFilter principal
+  //     (`User:__tenant_<id>.*` for any id, bound or not). This closes the
+  //     existence-oracle, prefix-enumeration, and pre-binding pollution
+  //     discovery vectors.
   //  L2 (response scrub): for wildcard / ResourceType.ANY queries (which we
   //     intentionally let through — they are the inherent reach of cluster
   //     admin), pass a scrub predicate down to AclApis that drops every
@@ -3906,8 +3918,11 @@ class KafkaApis(val requestChannel: RequestChannel,
   // no cross-tenant leak is possible from a tenant principal.
   //
   // When no tenants are configured (tenantConfig.allTenants is empty) the
-  // guards are no-ops (isReservedTenantNamespace / isReservedTenantPrincipalNamespace
-  // both short-circuit on empty knownTenants) and behaviour matches stock Kafka.
+  // topic-namespace guard is a no-op (isReservedTenantNamespace short-circuits
+  // on empty knownTenants). The principal-prefix guards stay structural and
+  // continue to refuse `__tenant_*` names — this is desired: even on a node
+  // with no listener bindings (e.g. a split-mode KRaft controller, or a broker
+  // before any tenant is bound) the `__tenant_` prefix is reserved.
   def handleDescribeAcls(request: RequestChannel.Request): Unit = {
     val tenantCtx = tenantContextFor(request)
     if (tenantCtx.effectiveTenant.isPresent) {
@@ -4518,12 +4533,12 @@ class KafkaApis(val requestChannel: RequestChannel,
   }
 
   // True iff `principalStr` is in the legacy `User:<name>` form AND the
-  // <name> portion is a tenant-prefixed principal naming a KNOWN tenant.
-  // ACL bindings serialize the principal as `User:foo`; the tenant-encoded
-  // form is `User:__tenant_<id>.<user>`. Unknown tenant ids are opaque and
-  // not refused here — the cluster admin can still ACL their own users
-  // even if `__tenant_x.y` happens to look tenant-shaped, as long as `x`
-  // isn't a configured tenant on this broker.
+  // <name> portion is any tenant-prefixed principal (`__tenant_<id>.<x>` with
+  // non-empty `<id>`). ACL bindings serialize the principal as `User:foo`; the
+  // tenant-encoded form is `User:__tenant_<id>.<user>`. The `__tenant_` prefix
+  // is RESERVED — even an unknown `<id>` is treated as foreign because pre-
+  // binding pollution would otherwise let an admin plant ACLs that the tenant
+  // inherits on binding. The narrow ownership check is callerTenantFromPrincipal.
   private def isReservedUserPrincipalLiteral(principalStr: String): Boolean = {
     if (principalStr == null) return false
     val userPrefix = "User:"

@@ -13585,12 +13585,15 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
-  def testDescribeAclsClusterWideListenerUnknownTenantPrincipalOpaque(): Unit = {
-    // `__tenant_unknown.bob` doesn't match any KNOWN tenant id, so the
-    // reserved-namespace helpers short-circuit to false. The filter is treated
-    // as a regular principal probe — passes L1, response unscrubbed. Mirrors
-    // CreateAcls behaviour for unknown tenant ids and keeps cluster admin
-    // tooling working when a stale tenant id is queried.
+  def testDescribeAclsClusterWideListenerUnknownTenantPrincipalRefused(): Unit = {
+    // The `__tenant_` prefix is RESERVED — any `__tenant_<id>.<x>` is reserved
+    // namespace shape regardless of whether `<id>` is currently bound on this
+    // node. A cluster-wide admin asking for ACLs whose principal filter is
+    // `User:__tenant_unknown.bob` is probing a not-yet-bound tenant's slot;
+    // refusing the lookup at L1 closes the pre-binding pollution leak (admin
+    // plants ACLs under `__tenant_<future>.X`, future tenant inherits them on
+    // bind) and the enumeration oracle that would otherwise let a privileged
+    // caller learn which tenant ids any operator has ever attached ACLs to.
     val req = describeAclsRequest(ResourceType.ANY, null, PatternType.ANY,
       "User:__tenant_unknown.bob")
     val request = buildRequest(req)
@@ -13607,9 +13610,11 @@ class KafkaApisTest extends Logging {
     kafkaApis.handleDescribeAcls(request)
 
     val response = verifyNoThrottling[DescribeAclsResponse](request)
-    assertEquals(Errors.NONE.code, response.data.errorCode)
-    assertEquals(1, response.data.resources.size,
-      "unknown-tenant principal must be opaque (not scrubbed, not refused)")
+    assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED.code, response.data.errorCode,
+      "any `__tenant_*` prefix is reserved — refuse at L1 to close pre-binding pollution oracle")
+    assertEquals(0, response.data.resources.size,
+      "refusal must not leak any bindings")
+    verify(auth, never()).acls(any[AclBindingFilter]())
   }
 
   @Test
@@ -16114,12 +16119,46 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
-  def testInitProducerIdOutsideInPassesThroughForUnknownTenant(): Unit = {
-    // Mirror of isReservedTenantNamespace semantics: only KNOWN tenant prefixes
-    // are reserved at the broker boundary. An unknown `__tenant_*` prefix is
-    // opaque — the coordinator's own validation lands the rejection. This is
-    // what keeps the guard from blocking unrelated id schemes that happen to
-    // share the prefix shape in installations not running this fork.
+  def testInitProducerIdOutsideInRefusesTenantPrincipalPrefixOnNodeWithEmptyTenantConfig(): Unit = {
+    // Models the split-mode KRaft / pre-binding-on-this-broker case: the node
+    // has NO listener-tenant bindings (TenantConfig.empty), but a cluster-wide
+    // admin tries to plant a producer epoch under `__tenant_acme.tx`. The
+    // structural guard must still fire here — otherwise the planted epoch
+    // becomes a back-door fence once acme is bound on this or any other node.
+    // The old narrow check would return false because `allTenants.isEmpty`,
+    // letting the planted record through.
+    val initRequest = new InitProducerIdRequest.Builder(new InitProducerIdRequestData()
+      .setTransactionalId("__tenant_acme.tx")
+      .setTransactionTimeoutMs(TimeUnit.MINUTES.toMillis(1).toInt)
+      .setProducerId(RecordBatch.NO_PRODUCER_ID)
+      .setProducerEpoch(RecordBatch.NO_PRODUCER_EPOCH))
+      .build()
+    val request = buildRequest(initRequest) // cluster-wide listener, no tenant binding
+
+    kafkaApis = createKafkaApis(
+      authorizer = None,
+      tenantConfig = TenantConfig.empty())
+    kafkaApis.handleInitProducerIdRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[InitProducerIdResponse](request)
+    assertEquals(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.code, response.data.errorCode,
+      "the `__tenant_` prefix is reserved even on nodes with no listener bindings — closes split-mode KRaft + pre-binding gap")
+    verify(txnCoordinator, never()).handleInitProducerId(
+      any[String](), anyInt(), any[Option[ProducerIdAndEpoch]](),
+      any[InitProducerIdResult => Unit](), any[RequestLocal]())
+  }
+
+  @Test
+  def testInitProducerIdOutsideInRefusesUnknownTenantPrincipalPrefix(): Unit = {
+    // The `__tenant_` prefix is RESERVED — any `__tenant_<id>.<x>` names the
+    // coordinator slot that tenant `<id>` will inherit once `<id>` is bound on
+    // any broker. A cluster-wide caller naming `__tenant_unknown.tx` here would
+    // otherwise mint a producer-id-and-epoch on that slot before the tenant
+    // arrives; the tenant's first InitProducerId on bind would then receive a
+    // fenced epoch from another caller. Refuse structurally regardless of
+    // whether `unknown` is currently bound (closes pre-binding pollution AND
+    // the split-mode KRaft case where the broker has tenants but the
+    // controller's TenantConfig is empty).
     val initRequest = new InitProducerIdRequest.Builder(new InitProducerIdRequestData()
       .setTransactionalId("__tenant_unknown.tx")
       .setTransactionTimeoutMs(TimeUnit.MINUTES.toMillis(1).toInt)
@@ -16128,25 +16167,17 @@ class KafkaApisTest extends Logging {
       .build()
     val request = buildRequest(initRequest)
 
-    val responseCallback: ArgumentCaptor[InitProducerIdResult => Unit] =
-      ArgumentCaptor.forClass(classOf[InitProducerIdResult => Unit])
-    val requestLocal = RequestLocal.withThreadConfinedCaching
-    when(txnCoordinator.handleInitProducerId(
-      ArgumentMatchers.eq("__tenant_unknown.tx"),
-      anyInt(),
-      ArgumentMatchers.eq(Option.empty),
-      responseCallback.capture(),
-      ArgumentMatchers.eq(requestLocal)
-    )).thenAnswer(_ => responseCallback.getValue.apply(InitProducerIdResult(7L, 0.toShort, Errors.NONE)))
-
     kafkaApis = createKafkaApis(
       authorizer = None,
       tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
-    kafkaApis.handleInitProducerIdRequest(request, requestLocal)
+    kafkaApis.handleInitProducerIdRequest(request, RequestLocal.withThreadConfinedCaching)
 
     val response = verifyNoThrottling[InitProducerIdResponse](request)
-    assertEquals(Errors.NONE.code, response.data.errorCode,
-      "an unknown `__tenant_*` prefix is not reserved — the coordinator owns its own validation")
+    assertEquals(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.code, response.data.errorCode,
+      "the `__tenant_` prefix is reserved on every coordinator-keyed RPC — refuse pre-binding pollution attempt")
+    verify(txnCoordinator, never()).handleInitProducerId(
+      any[String](), anyInt(), any[Option[ProducerIdAndEpoch]](),
+      any[InitProducerIdResult => Unit](), any[RequestLocal]())
   }
 
   @Test
@@ -17530,15 +17561,15 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
-  def testDescribeDelegationTokenUnknownTenantPrefixOwnerForwarded(): Unit = {
-    // Per the mint-guard convention, an unknown-tenant prefix
-    // (`__tenant_xyz.*` when xyz is not a registered tenant) is opaque to the
-    // broker: it does not represent any actual tenant principal namespace, so
-    // the broker neither refuses the lookup nor scrubs the response. The
-    // request flows through to tokenManager.getTokens, which will simply
-    // return nothing matching that opaque owner.
+  def testDescribeDelegationTokenUnknownTenantPrefixOwnerRefused(): Unit = {
+    // The `__tenant_` prefix is RESERVED — a cluster-wide admin asking to
+    // describe tokens whose owner is `__tenant_xyz.dave` is probing a not-yet-
+    // bound tenant's token slot. Without this refusal, an admin could enumerate
+    // any tenant id any operator has ever minted a token for (pre-binding
+    // pollution discovery), or — combined with CreateDelegationToken minting on
+    // the same slot — gain a credential the tenant inherits on bind. Refuse
+    // structurally regardless of whether `xyz` is currently bound.
     val tokenManagerMock = mock(classOf[DelegationTokenManager])
-    when(tokenManagerMock.getTokens(any())).thenReturn(List.empty[DelegationToken])
 
     val owners = util.List.of(new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_xyz.dave"))
     val describeRequest = new DescribeDelegationTokenRequest.Builder(owners).build()
@@ -17553,10 +17584,10 @@ class KafkaApisTest extends Logging {
     kafkaApis.handleDescribeTokensRequest(request)
 
     val response = verifyNoThrottling[DescribeDelegationTokenResponse](request)
-    assertEquals(Errors.NONE.code, response.error.code,
-      "unknown-tenant prefix is opaque and not refused on the request side")
-    assertTrue(response.tokens.isEmpty)
-    verify(tokenManagerMock).getTokens(any())
+    assertEquals(Errors.DELEGATION_TOKEN_AUTHORIZATION_FAILED.code, response.error.code,
+      "the `__tenant_` prefix is reserved — refuse enumeration even for unbound tenant ids")
+    assertTrue(response.tokens.isEmpty, "refusal must not leak any tokens")
+    verify(tokenManagerMock, never()).getTokens(any())
   }
 
   // ---------------------------------------------------------------------------
@@ -17716,11 +17747,15 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
-  def testAlterUserScramCredentialsUnknownTenantPrefixedUserForwarded(): Unit = {
-    // An unknown `__tenant_xyz.*` prefix is opaque to the broker (xyz is not a
-    // registered tenant). Per the mint-guard convention, the broker does not
-    // refuse here — the request is forwarded and the controller's own
-    // validation lands the rejection if the user is itself malformed.
+  def testAlterUserScramCredentialsUnknownTenantPrefixedUserRefused(): Unit = {
+    // The `__tenant_` prefix is RESERVED — minting (or deleting) a SCRAM
+    // credential for `__tenant_xyz.dave` is the planting form of pre-binding
+    // pollution: once tenant `xyz` is bound on some broker, that broker's
+    // TenantPrincipalBuilder will mint the `__tenant_xyz.dave` principal on
+    // SASL/SCRAM auth and the planted credential becomes a back-door tenant
+    // identity. Refuse structurally regardless of binding state — closes the
+    // pollution path on the broker side and the split-mode KRaft case where
+    // the controller has no listener bindings.
     val upsertions = new util.ArrayList[AlterUserScramCredentialsRequestData.ScramCredentialUpsertion]()
     upsertions.add(new AlterUserScramCredentialsRequestData.ScramCredentialUpsertion()
       .setName("__tenant_xyz.dave")
@@ -17737,8 +17772,13 @@ class KafkaApisTest extends Logging {
     kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
     kafkaApis.handleAlterUserScramCredentialsRequest(request)
 
-    verify(forwardingManager).forwardRequest(
-      ArgumentMatchers.eq(request),
+    val response = verifyNoThrottling[AlterUserScramCredentialsResponse](request)
+    assertEquals(1, response.data.results.size)
+    val result = response.data.results.get(0)
+    assertEquals("__tenant_xyz.dave", result.user)
+    assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED.code, result.errorCode,
+      "the `__tenant_` prefix is reserved — refuse credential planting for unbound tenant ids")
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
       any[Option[AbstractResponse] => Unit]())
   }
 
