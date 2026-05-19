@@ -48,6 +48,7 @@ import io.netty.channel.embedded.EmbeddedChannel;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -1731,6 +1732,109 @@ class IoUringSelectorTest {
         } finally {
             s.close();
         }
+    }
+
+    @Test
+    void lowMemoryShufflesChannelIterationOrder() throws Exception {
+        // MEMPOOL-1 regression. Under sustained low-memory pressure, NIO's
+        // Selector.determineHandlingOrder (clients/.../Selector.java:665-674) shuffles
+        // the channel-handling order so the same handful of channels (the earliest-
+        // accepted, in LinkedHashMap insertion order) don't repeatedly win the race
+        // to memoryPool.tryAllocate while later-accepted channels starve. The io_uring
+        // selector must match.
+        //
+        // Test double: a MemoryPool whose tryAllocate ALWAYS succeeds (so the read
+        // completes and we can observe iteration order via completedReceives) but
+        // whose availableMemory reports BELOW the 0.1 * size() threshold. The two
+        // are coupled in real pools — decoupling in the fake lets us isolate the
+        // shuffle gate from the self-mute path.
+        MemoryPool fakeLowMem = new MemoryPool() {
+            @Override
+            public ByteBuffer tryAllocate(int sizeBytes) {
+                return ByteBuffer.allocate(sizeBytes);
+            }
+
+            @Override
+            public void release(ByteBuffer previouslyAllocated) {
+            }
+
+            @Override
+            public long size() {
+                return 100L;          // → threshold = 10
+            }
+
+            @Override
+            public long availableMemory() {
+                return 5L;            // < threshold → shuffle gate trips
+            }
+
+            @Override
+            public boolean isOutOfMemory() {
+                return false;
+            }
+        };
+        selector = new IoUringSelector(LISTENER, MAX_RECEIVE, fakeLowMem, IDLE_NANOS_NEVER, time);
+
+        // Accept N channels in known insertion order. N=10 keeps the false-positive
+        // odds (random shuffle happens to match insertion) at 1/10! ≈ 2.8e-7.
+        final int n = 10;
+        List<EmbeddedChannel> netties = new ArrayList<>();
+        for (int i = 0; i < n; i++) {
+            netties.add(acceptNew(selector, new InetSocketAddress("198.51.100." + (i + 1), 12000 + i)));
+        }
+        selector.poll(0);  // surface accepts (justAccepted defers reads to next poll)
+        List<String> insertionOrder = new ArrayList<>(selector.connected());
+        assertEquals(n, insertionOrder.size(), "sanity: all channels accepted");
+
+        // Feed one distinct framed payload per channel.
+        for (int i = 0; i < n; i++) {
+            selector.onRead(netties.get(i), framed("p" + i));
+        }
+        selector.poll(0);
+
+        // completedReceives ordering reflects channel iteration order in step 2.
+        List<String> receiveOrder = new ArrayList<>();
+        for (NetworkReceive recv : selector.completedReceives()) {
+            receiveOrder.add(recv.source());
+        }
+        assertEquals(n, receiveOrder.size(),
+            "every channel must have surfaced its frame — none should have been skipped");
+        assertNotEquals(insertionOrder, receiveOrder,
+            "under low memory, channel iteration must NOT be in insertion order — " +
+            "without the shuffle, the earliest-accepted channels would always win " +
+            "first-to-allocate and starve the later ones. P(false positive) ≈ 1/10!");
+    }
+
+    @Test
+    void normalMemoryPreservesInsertionOrder() throws Exception {
+        // MEMPOOL-1 fast-path sanity. With MemoryPool.NONE (or any pool reporting
+        // availableMemory >= 0.1 * size()), the shuffle gate must stay closed and
+        // iteration must follow LinkedHashMap insertion order — no allocation cost,
+        // no per-poll shuffle overhead. Mirrors the else-branch of NIO's
+        // determineHandlingOrder (clients/.../Selector.java:672-673).
+        selector = newSelector(IDLE_NANOS_NEVER);
+
+        final int n = 10;
+        List<EmbeddedChannel> netties = new ArrayList<>();
+        for (int i = 0; i < n; i++) {
+            netties.add(acceptNew(selector, new InetSocketAddress("198.51.100." + (i + 1), 13000 + i)));
+        }
+        selector.poll(0);
+        List<String> insertionOrder = new ArrayList<>(selector.connected());
+
+        for (int i = 0; i < n; i++) {
+            selector.onRead(netties.get(i), framed("p" + i));
+        }
+        selector.poll(0);
+
+        List<String> receiveOrder = new ArrayList<>();
+        for (NetworkReceive recv : selector.completedReceives()) {
+            receiveOrder.add(recv.source());
+        }
+        assertEquals(insertionOrder, receiveOrder,
+            "with adequate memory (MemoryPool.NONE), iteration must follow insertion " +
+            "order — the shuffle gate (memoryPool.availableMemory() < lowMemThreshold) " +
+            "must stay closed");
     }
 
     /**

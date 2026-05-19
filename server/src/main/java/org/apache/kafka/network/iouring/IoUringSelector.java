@@ -36,6 +36,7 @@ import java.net.InetSocketAddress;
 import java.nio.channels.SocketChannel;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -191,6 +192,19 @@ public final class IoUringSelector implements BrokerSelector {
      * lines 457-466 own this exact recovery path, and the io_uring selector must preserve it.
      */
     private boolean outOfMemory;
+    /**
+     * Threshold for the iteration-order shuffle in step 2 of {@link #poll(long)} — when
+     * {@code memoryPool.availableMemory()} drops below this number, the channel iteration
+     * order is shuffled so the same handful of channels (the earliest-accepted, by
+     * LinkedHashMap insertion order) don't repeatedly win first-to-allocate and starve
+     * everyone else. Mirrors NIO {@code Selector.lowMemThreshold} (clients/.../Selector.java:126,
+     * 183) and {@code determineHandlingOrder} (clients/.../Selector.java:665-674).
+     *
+     * <p>{@code MemoryPool.NONE} reports {@code size() == Long.MAX_VALUE} and
+     * {@code availableMemory() == Long.MAX_VALUE}; the gate ({@code availableMemory <
+     * lowMemThreshold}) stays false forever, so unbounded pools incur no shuffle cost.
+     */
+    private final long lowMemThreshold;
 
     // Cross-thread queues (event loop pushes, Processor pulls).
     private final Queue<KafkaChannel> pendingAccepts = new ConcurrentLinkedQueue<>();
@@ -314,6 +328,7 @@ public final class IoUringSelector implements BrokerSelector {
         this.processorId = processorId;
         this.configs = Objects.requireNonNull(configs, "configs");
         this.maxPendingAccepts = DEFAULT_MAX_PENDING_ACCEPTS;
+        this.lowMemThreshold = (long) (0.1 * memoryPool.size());
     }
 
     // -------------------------------------------------------------------------
@@ -536,83 +551,9 @@ public final class IoUringSelector implements BrokerSelector {
         }
 
         // 2. For each active channel, do at most one read and one write step.
-        //    Channels in justAccepted (added this same poll's step 1) are deferred until
-        //    the next poll — SocketServer must run applyConnectionQuotasForNewlyAcceptedChannels
-        //    against the freshly-connected channel before we surface any receive from it.
-        for (Iterator<Map.Entry<String, KafkaChannel>> it = channels.entrySet().iterator(); it.hasNext(); ) {
-            Map.Entry<String, KafkaChannel> entry = it.next();
-            KafkaChannel channel = entry.getValue();
-            if (!channel.ready()) continue;
-            if (justAccepted.contains(channel.id())) continue;
-
-            // Read step. KafkaChannel.isMuted() is the source of truth: mute(id) above calls
-            // through to KafkaChannel.mute() via KafkaChannelMuteBridge, which sets muteState
-            // and removes OP_READ; the transport layer translates the OP_READ removal into
-            // Netty autoRead=false. So a muted channel here has both kernel-level backpressure
-            // (no more inbound from Netty) and a state-machine gate (so we never produce a
-            // completedReceive while the Processor expects MUTED or MUTED_AND_RESPONSE_PENDING).
-            if (!channel.isMuted()) {
-                try {
-                    long read = channel.read();
-                    if (read > 0) {
-                        lastActiveNanos.put(channel.id(), nowNanos);
-                        madeProgress = true;
-                    }
-                    NetworkReceive completed = channel.maybeCompleteReceive();
-                    if (completed != null) {
-                        completedReceives.add(completed);
-                        receivesThisPoll.add(channel.id());
-                        madeProgress = true;
-                    }
-                    // Self-mute detection: KafkaChannel.read() flips muteState to MUTED when
-                    // memoryPool.tryAllocate returns null. If now muted and NOT operator-muted,
-                    // the read self-muted us. Flag outOfMemory so the next poll's
-                    // recoverFromMemoryPressure() walks channels. Mirrors NIO Selector:691-692.
-                    if (channel.isMuted() && !explicitlyMutedChannels.contains(channel)) {
-                        outOfMemory = true;
-                    }
-                } catch (Exception e) {
-                    // Catch Exception, not just IOException: KafkaChannel.read() declares
-                    // throws IOException, but NetworkReceive throws InvalidReceiveException
-                    // (a KafkaException -> RuntimeException) when the wire reports a negative
-                    // size or a size > socket.request.max.bytes. Catching only IOException
-                    // lets that escape poll() so Processor.poll() never sees the failure,
-                    // the channel is never closed, the connection quota is never decremented,
-                    // and the unread Netty ByteBufs accumulate until idle expiry or direct-
-                    // memory failure. Matches NIO Selector.pollSelectionKeys's catch (Exception).
-                    log.debug("Read failed on channel {}", channel.id(), e);
-                    enqueueClose(channel.id(), ChannelState.LOCAL_CLOSE);
-                    it.remove();
-                    lastActiveNanos.remove(channel.id());
-                    continue;
-                }
-            }
-
-            // Write step. C-18-F1: pending send counts as activity even if write()==0
-            // (Netty high-water). See idleExpiryDoesNotReapMutedChannelWithBackpressuredSend.
-            if (channel.hasSend()) {
-                lastActiveNanos.put(channel.id(), nowNanos);
-                try {
-                    long written = channel.write();
-                    if (written > 0) {
-                        madeProgress = true;
-                    }
-                    NetworkSend send = channel.maybeCompleteSend();
-                    if (send != null) {
-                        completedSends.add(send);
-                        madeProgress = true;
-                    }
-                } catch (Exception e) {
-                    // Same rationale as the read path: catch Exception, not just IOException,
-                    // so a RuntimeException from inside the send chain (e.g. an outbound
-                    // ByteBufferSend tripping over a malformed message) routes through
-                    // FAILED_SEND instead of escaping poll() and stranding the channel.
-                    log.debug("Write failed on channel {}", channel.id(), e);
-                    enqueueClose(channel.id(), ChannelState.FAILED_SEND);
-                    it.remove();
-                    lastActiveNanos.remove(channel.id());
-                }
-            }
+        //    Helper extracted to keep poll() under checkstyle's MethodLength limit.
+        if (runActiveChannelReadWriteStep(nowNanos)) {
+            madeProgress = true;
         }
 
         // 3. Drain disconnects — but give buffered bytes one last delivery pass first,
@@ -663,6 +604,119 @@ public final class IoUringSelector implements BrokerSelector {
             }
             outOfMemory = false;
         }
+    }
+
+    /**
+     * Step 2 of {@link #poll(long)}: for each active channel, do at most one read and one
+     * write step. Extracted so {@link #poll(long)} stays under the checkstyle MethodLength
+     * cap. Returns {@code true} iff any progress was observed (bytes read, receive surfaced,
+     * bytes written, or send completed).
+     *
+     * <p>MEMPOOL-1: iterate a snapshot (not the live LinkedHashMap.values() view) and
+     * shuffle that snapshot when {@code memoryPool.availableMemory()} drops below
+     * {@link #lowMemThreshold}. Without the shuffle, the LinkedHashMap insertion-order
+     * iteration means the earliest-accepted channels repeatedly win the race to
+     * {@code memoryPool.tryAllocate} and the later-accepted ones starve under sustained
+     * low-memory pressure. Mirrors NIO {@code Selector.determineHandlingOrder}
+     * (clients/src/main/java/org/apache/kafka/common/network/Selector.java:665-674).
+     *
+     * <p>The snapshot also lets us defer the {@code channels.remove()} call until after the
+     * loop — a for-each over {@code LinkedHashMap.values()} throws CME on in-loop removal,
+     * and the prior {@code Iterator/it.remove()} pattern cannot accommodate shuffling.
+     *
+     * <p>Channels in {@link #justAccepted} (added this same poll's step 1) are deferred
+     * until the next poll — SocketServer must run
+     * {@code applyConnectionQuotasForNewlyAcceptedChannels} against the freshly-connected
+     * channel before we surface any receive from it.
+     */
+    private boolean runActiveChannelReadWriteStep(long nowNanos) {
+        boolean madeProgress = false;
+        List<KafkaChannel> handlingOrder = new ArrayList<>(channels.values());
+        if (!outOfMemory && memoryPool.availableMemory() < lowMemThreshold) {
+            Collections.shuffle(handlingOrder);
+        }
+        List<String> closedThisStep = null;
+        for (KafkaChannel channel : handlingOrder) {
+            if (!channel.ready()) continue;
+            if (justAccepted.contains(channel.id())) continue;
+
+            // Read step. KafkaChannel.isMuted() is the source of truth: mute(id) calls
+            // through to KafkaChannel.mute() via KafkaChannelMuteBridge, which sets muteState
+            // and removes OP_READ; the transport layer translates the OP_READ removal into
+            // Netty autoRead=false. So a muted channel here has both kernel-level backpressure
+            // (no more inbound from Netty) and a state-machine gate (so we never produce a
+            // completedReceive while the Processor expects MUTED or MUTED_AND_RESPONSE_PENDING).
+            if (!channel.isMuted()) {
+                try {
+                    long read = channel.read();
+                    if (read > 0) {
+                        lastActiveNanos.put(channel.id(), nowNanos);
+                        madeProgress = true;
+                    }
+                    NetworkReceive completed = channel.maybeCompleteReceive();
+                    if (completed != null) {
+                        completedReceives.add(completed);
+                        receivesThisPoll.add(channel.id());
+                        madeProgress = true;
+                    }
+                    // Self-mute detection: KafkaChannel.read() flips muteState to MUTED when
+                    // memoryPool.tryAllocate returns null. If now muted and NOT operator-muted,
+                    // the read self-muted us. Flag outOfMemory so the next poll's
+                    // recoverFromMemoryPressure() walks channels. Mirrors NIO Selector:691-692.
+                    if (channel.isMuted() && !explicitlyMutedChannels.contains(channel)) {
+                        outOfMemory = true;
+                    }
+                } catch (Exception e) {
+                    // Catch Exception, not just IOException: KafkaChannel.read() declares
+                    // throws IOException, but NetworkReceive throws InvalidReceiveException
+                    // (a KafkaException -> RuntimeException) when the wire reports a negative
+                    // size or a size > socket.request.max.bytes. Catching only IOException
+                    // lets that escape poll() so Processor.poll() never sees the failure,
+                    // the channel is never closed, the connection quota is never decremented,
+                    // and the unread Netty ByteBufs accumulate until idle expiry or direct-
+                    // memory failure. Matches NIO Selector.pollSelectionKeys's catch (Exception).
+                    log.debug("Read failed on channel {}", channel.id(), e);
+                    enqueueClose(channel.id(), ChannelState.LOCAL_CLOSE);
+                    if (closedThisStep == null) closedThisStep = new ArrayList<>(2);
+                    closedThisStep.add(channel.id());
+                    lastActiveNanos.remove(channel.id());
+                    continue;
+                }
+            }
+
+            // Write step. C-18-F1: pending send counts as activity even if write()==0
+            // (Netty high-water). See idleExpiryDoesNotReapMutedChannelWithBackpressuredSend.
+            if (channel.hasSend()) {
+                lastActiveNanos.put(channel.id(), nowNanos);
+                try {
+                    long written = channel.write();
+                    if (written > 0) {
+                        madeProgress = true;
+                    }
+                    NetworkSend send = channel.maybeCompleteSend();
+                    if (send != null) {
+                        completedSends.add(send);
+                        madeProgress = true;
+                    }
+                } catch (Exception e) {
+                    // Same rationale as the read path: catch Exception, not just IOException,
+                    // so a RuntimeException from inside the send chain (e.g. an outbound
+                    // ByteBufferSend tripping over a malformed message) routes through
+                    // FAILED_SEND instead of escaping poll() and stranding the channel.
+                    log.debug("Write failed on channel {}", channel.id(), e);
+                    enqueueClose(channel.id(), ChannelState.FAILED_SEND);
+                    if (closedThisStep == null) closedThisStep = new ArrayList<>(2);
+                    closedThisStep.add(channel.id());
+                    lastActiveNanos.remove(channel.id());
+                }
+            }
+        }
+        if (closedThisStep != null) {
+            for (String id : closedThisStep) {
+                channels.remove(id);
+            }
+        }
+        return madeProgress;
     }
 
     /**
