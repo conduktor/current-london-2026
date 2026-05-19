@@ -104,12 +104,57 @@ socket.selector.implementation = auto    # default; picks io_uring on Linux, els
                                 = io_uring  # force io_uring (PLAINTEXT only; non-PLAINTEXT listeners still use NIO)
 ```
 
+The setting is broker-wide. A per-listener override is honoured via
+`listener.name.<name>.socket.selector.implementation` — the per-listener value,
+if set, takes precedence over the broker-wide value for that listener only.
+
 Misuse modes and the broker's response:
 
-- Value not in `{nio, io_uring, auto}` → `ConfigException` at startup with the
-  invalid token surfaced.
-- `io_uring` on a non-Linux host or a host without the Netty native library →
-  for `auto`, transparently falls back to NIO; for explicit `io_uring`, fails
-  fast with a message that names the missing capability.
-- `io_uring` on an SSL / SASL_PLAINTEXT / SASL_SSL listener → that listener
-  transparently uses NIO. (Lifted in a follow-up version.)
+| Operator request                                  | Listener security protocol           | Platform / native-lib state       | Broker behaviour                                                                                                                                                                  |
+|---------------------------------------------------|--------------------------------------|-----------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| value not in `{nio, io_uring, auto}`              | any                                  | any                               | `ConfigException` at startup, the invalid token surfaced.                                                                                                                         |
+| `nio`                                             | any                                  | any                               | NIO. Always wins; explicit `nio` is never escalated.                                                                                                                              |
+| `auto` (default)                                  | PLAINTEXT                            | Linux + io_uring native lib found | io_uring.                                                                                                                                                                         |
+| `auto`                                            | PLAINTEXT                            | any other (non-Linux, no kernel)  | Silent NIO fallback. **No warn spam**, one `INFO` log per listener at start (`F-INT-LOG`) names the resolved backend.                                                             |
+| `auto`                                            | SSL / SASL_PLAINTEXT / SASL_SSL      | any                               | Silent NIO fallback. v1 PLAINTEXT-only contract.                                                                                                                                  |
+| `io_uring` (explicit)                             | PLAINTEXT                            | Linux + native lib found          | io_uring.                                                                                                                                                                         |
+| `io_uring` (explicit)                             | PLAINTEXT                            | Linux but native lib missing      | **Hard fail at broker start** — `IllegalStateException` from `BrokerSelectorFactory.resolve`, message names `io_uring` and the `IoUringSupport.unavailabilityReason()`.            |
+| `io_uring` (explicit)                             | PLAINTEXT                            | non-Linux                         | **Hard fail at broker start** — same as above; the operator asked for io_uring explicitly, silently downgrading would hide configuration drift.                                   |
+| `io_uring` (explicit)                             | SSL / SASL_PLAINTEXT / SASL_SSL      | any                               | Silent NIO fallback for that listener. Other PLAINTEXT listeners on the same broker still use io_uring per the rules above.                                                       |
+
+Operator-observable log line on every listener start (since `F-INT-LOG`):
+
+```
+INFO  [SocketServer brokerId=…] Listener PLAINTEXT://0.0.0.0:9092 resolved to io_uring backend
+INFO  [SocketServer brokerId=…] Listener SSL://0.0.0.0:9093 resolved to nio backend (PLAINTEXT-only contract for io_uring v1)
+```
+
+## Native library dependencies
+
+io_uring is reached through Netty 4.2.x's `IoUringServerSocketChannel` /
+`IoUringSocketChannel`. Three Maven artifacts are involved:
+
+| Artifact                                                                                                                | Classpath role  | Required to compile? | Required to run io_uring? |
+|-------------------------------------------------------------------------------------------------------------------------|-----------------|----------------------|---------------------------|
+| `io.netty:netty-transport-classes-io_uring`                                                                             | `implementation` (compile + runtime) | yes              | yes                       |
+| `io.netty:netty-transport-native-io_uring` (classifier `linux-x86_64`)                                                  | `runtimeOnly`                        | no               | yes (on x86_64 Linux)     |
+| `io.netty:netty-transport-native-io_uring` (classifier `linux-aarch_64`)                                                | `runtimeOnly`                        | no               | yes (on aarch_64 Linux)   |
+
+The classes artifact is on the compile classpath; the native artifacts are
+`runtimeOnly` because (a) they are classifier-bound and would break compilation
+on macOS / Windows / FreeBSD CI machines, and (b) every reference to the native
+classes is gated behind `IoUringSupport.isAvailable()`, which performs a
+reflective probe on first use. Both Linux native classifiers ship together so a
+single Kafka tarball boots on both Intel/AMD x86_64 and ARM64 (Graviton,
+Ampere, Apple-Silicon-Linux) brokers; Netty's `NativeLibraryLoader` picks the
+matching `.so` from `os.arch` at startup. `LICENSE-binary` enumerates the seven
+Netty artifacts the broker now bundles (Apache 2.0).
+
+If either the classes artifact or the native artifact for the current
+architecture is missing at runtime, `IoUringSupport.computeProbe()` catches the
+resulting `LinkageError` / `ClassNotFoundException` / `UnsatisfiedLinkError`,
+caches `isAvailable = false`, and surfaces a one-line reason via
+`unavailabilityReason()`. The resolution table above then applies — `auto`
+silently uses NIO, explicit `io_uring` aborts startup with the reason in the
+error message. This is the only place a stripped-down deployment image (e.g.,
+a custom Docker base that excludes one classifier) is observed by the operator.
