@@ -357,6 +357,8 @@
     <!-- benchmarks -->
     <suppress checks="(ClassDataAbstractionCoupling|ClassFanOutComplexity)"
               files="(ReplicaFetcherThreadBenchmark).java"/>
+    <suppress checks="(NPathComplexity|CyclomaticComplexity|JavaNCSS|MethodLength|ClassFanOutComplexity|ClassDataAbstractionCoupling)"
+              files="(SelectorThroughputBenchmark).java"/>
 
      <!-- Add the new suppression rule for JaasTestUtils.java -->
     <suppress checks="ImportControl" files="(JaasTestUtils).java" />
