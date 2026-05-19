@@ -12726,6 +12726,82 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testCreateTopicsClusterWideListenerRejectsHeterogeneousBrokerForeignTenantName(): Unit = {
+    // F7: structural shape check. Broker is bound to tenant `acme` LOCALLY but
+    // a different broker (in a heterogeneous multi-broker deployment) may be
+    // bound to `gamma`. A cluster-wide caller naming `gamma.foo` on THIS broker
+    // must still be rejected — the previous iteration over
+    // `tenantConfig.allTenants` missed this because `gamma` is not in the
+    // local snapshot. With the structural check, `gamma` satisfies
+    // TenantNamespace.validateTenantId → reserved → INVALID_TOPIC_EXCEPTION.
+    val createRequest = new CreateTopicsRequest.Builder(new CreateTopicsRequestData()
+      .setTopics(new CreateTopicsRequestData.CreatableTopicCollection(
+        Collections.singleton(new CreateTopicsRequestData.CreatableTopic()
+          .setName("gamma.foo").setNumPartitions(1).setReplicationFactor(1.toShort)).iterator)))
+      .build()
+    val request = buildRequest(createRequest)
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleCreateTopicsRequest(request)
+
+    val response = verifyNoThrottling[CreateTopicsResponse](request)
+    val byName = response.data.topics.asScala.map(t => t.name -> t.errorCode).toMap
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, byName("gamma.foo"),
+      "structurally tenant-shaped name (foreign to local broker config) must be rejected")
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[AbstractRequest](), any[Option[AbstractResponse] => Unit]())
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
+  def testAlterConfigsClusterWideListenerRejectsHeterogeneousBrokerForeignTenantName(): Unit = {
+    // F7 sibling: same heterogeneous-broker bug for AlterConfigs. The local
+    // broker has `acme` bound; a cluster-wide caller alters configs on
+    // `gamma.foo` (gamma bound on a different broker). Structural check
+    // rejects without forwarding.
+    val resource = new ConfigResource(ConfigResource.Type.TOPIC, "gamma.foo")
+    val configEntries = new util.ArrayList[AlterConfigsRequest.ConfigEntry]()
+    configEntries.add(new AlterConfigsRequest.ConfigEntry("retention.ms", "60000"))
+    val configs = Map(resource -> new AlterConfigsRequest.Config(configEntries)).asJava
+    val alterRequest = new AlterConfigsRequest.Builder(configs, false).build()
+    val request = buildRequest(alterRequest)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleAlterConfigsRequest(request)
+
+    val response = verifyNoThrottling[AlterConfigsResponse](request)
+    val byName = response.data.responses.asScala.map(r => r.resourceName -> r).toMap
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, byName("gamma.foo").errorCode,
+      "heterogeneous-broker foreign-tenant name must be refused at structural shape level")
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[AbstractRequest](), any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
+  def testCreateTopicsClusterWideListenerForwardsSingleUnderscoreNameWhenTenantsConfigured(): Unit = {
+    // F7 negative case: `_confluent-metrics` and similar single-`_` prefix
+    // names are an operator convention (Confluent platform topics, Connect
+    // connector configs) and must NOT be classified as a tenant namespace
+    // even when tenants are bound. The structural check exits on
+    // `name.startsWith("_")` before reaching the dot-shape rule.
+    val createRequest = new CreateTopicsRequest.Builder(new CreateTopicsRequestData()
+      .setTopics(new CreateTopicsRequestData.CreatableTopicCollection(
+        Collections.singleton(new CreateTopicsRequestData.CreatableTopic()
+          .setName("_confluent-metrics").setNumPartitions(1).setReplicationFactor(1.toShort)).iterator)))
+      .build()
+    val request = buildRequest(createRequest)
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleCreateTopicsRequest(request)
+
+    verify(forwardingManager).forwardRequest(
+      ArgumentMatchers.eq(request),
+      any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
   def testCreateTopicsClusterWideListenerPassesInternalTopicsThrough(): Unit = {
     // Internal topics are never tenant-namespaced. Even with tenants
     // configured, `__consumer_offsets` (etc.) must not be misclassified as

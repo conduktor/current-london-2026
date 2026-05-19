@@ -140,20 +140,44 @@ class KafkaApis(val requestChannel: RequestChannel,
   // Outside-in pollution guard, applied by non-tenant handlers (Produce / Fetch
   // / DeleteTopics) before they would otherwise hit replicaManager or forward
   // to the controller. A privileged caller on a non-tenant listener naming
-  // `<knownTenantId>.X` directly addresses tenant storage — without this guard
-  // they could overwrite, read, or delete tenant data despite the CreateTopics
-  // pollution guard refusing to create the same name in the first place.
-  // Internal Kafka topics are exempt: they are never tenant-prefixed and the
-  // cluster relies on them being addressable by name from broker code paths.
+  // `<id>.X` where `<id>` is tenant-shaped directly addresses tenant storage —
+  // without this guard they could overwrite, read, or delete tenant data
+  // despite the CreateTopics pollution guard refusing to create the same name
+  // in the first place. Internal Kafka topics are exempt.
+  //
+  // STRUCTURAL ITERATION (F7) — when the broker is tenant-aware, classify by
+  // tenant-id SHAPE rather than by membership in this broker's locally-bound
+  // tenant set. The previous form iterated `tenantConfig.allTenants` and
+  // therefore missed the heterogeneous-broker case: broker A configured with
+  // `tenant.ids=acme,beta` would accept `gamma.foo` as a plain topic even
+  // when `gamma` is bound on broker B and the cluster therefore owns that
+  // namespace. The new rule mirrors `065b0d247e` / task #114 on the
+  // controller side: `<id>.<rest>` is reserved iff `<id>` is syntactically a
+  // valid tenant id per `TenantNamespace.validateTenantId`.
+  //
+  // The `allTenants.isEmpty` early-out is preserved: a stock-Kafka cluster
+  // with zero tenants anywhere on this broker keeps the historical "tenant-
+  // looking names are just topic names" behaviour, so a `foo.bar` topic
+  // continues to work on plain deployments. The fix changes behaviour only
+  // on brokers that already have at least one tenant bound locally — which
+  // is precisely where the cross-broker blindspot opens up.
+  //
+  // Single-`_` prefix and dot-free names are not in any tenant namespace
+  // (`_confluent-*`, Connect configs, plain `orders`). Reserved internal
+  // topics short-circuit via `Topic.isInternal`.
   private def isReservedTenantNamespace(name: String): Boolean = {
     if (name == null || Topic.isInternal(name)) return false
-    val knownTenants = tenantConfig.allTenants
-    if (knownTenants.isEmpty) return false
-    val it = knownTenants.iterator
-    while (it.hasNext) {
-      if (name.startsWith(it.next + ".")) return true
+    if (tenantConfig.allTenants.isEmpty) return false
+    if (name.startsWith("_")) return false
+    val dot = name.indexOf('.')
+    if (dot <= 0) return false
+    val prefix = name.substring(0, dot)
+    try {
+      TenantNamespace.validateTenantId(prefix)
+    } catch {
+      case _: IllegalArgumentException => return false
     }
-    false
+    true
   }
 
   // Whether this Fetch is a *trusted* inter-broker follower fetch.
@@ -324,23 +348,21 @@ class KafkaApis(val requestChannel: RequestChannel,
       // Outside-in pollution guard. A privileged caller on an unbound listener
       // could otherwise CreateTopics("acme.foo") literally; tenant acme on its
       // own listener would then see `foo` in ListTopics because the broker
-      // cannot tell intent apart from prefix. Reject any topic name beginning
-      // with `<knownTenantId>.` (for any configured tenant) at the broker so
-      // the controller never sees the tenant-prefixed name. Internal topics
-      // are exempt — they are never tenant-namespaced.
-      val knownTenants = tenantConfig.allTenants
-      if (knownTenants.isEmpty) {
-        forwardToController(request)
-        return
-      }
+      // cannot tell intent apart from prefix. Refuse any structurally
+      // tenant-shaped name (F7: see `isReservedTenantNamespace` — uses
+      // TenantNamespace.validateTenantId on the prefix rather than this
+      // broker's local `allTenants` snapshot, so a heterogeneous-broker
+      // deployment where `gamma` is bound only on broker B still refuses
+      // `gamma.foo` on broker A). Internal topics are exempt — they are
+      // never tenant-namespaced. The helper short-circuits when
+      // `tenantConfig.allTenants` is empty, so a stock Kafka deployment is
+      // unaffected.
       val createReq = request.body[CreateTopicsRequest]
       val pollutionRejected = new util.ArrayList[CreateTopicsResponseData.CreatableTopicResult]()
       val forwardable = new CreateTopicsRequestData.CreatableTopicCollection(createReq.data.topics.size)
       createReq.data.topics.forEach { t =>
         val name = t.name
-        val pollutes = name != null && !Topic.isInternal(name) &&
-          knownTenants.asScala.exists(id => name.startsWith(id + "."))
-        if (pollutes) {
+        if (isReservedTenantNamespace(name)) {
           pollutionRejected.add(new CreateTopicsResponseData.CreatableTopicResult()
             .setName(name)
             .setErrorCode(Errors.INVALID_TOPIC_EXCEPTION.code)
@@ -2007,10 +2029,15 @@ class KafkaApis(val requestChannel: RequestChannel,
       val nonExistingTopics = authorizedTopics.filterNot(metadataCache.contains)
       if (metadataRequest.allowAutoTopicCreation && config.autoCreateTopicsEnable && nonExistingTopics.nonEmpty) {
         if (!tenantScoped && tenantConfig.allTenants.asScala.nonEmpty) {
-          val knownPrefixes: Set[String] =
-            tenantConfig.allTenants.asScala.toSet.map((id: String) => id + ".")
-          pollutionRejectedTopics = nonExistingTopics.filter(name =>
-            !isInternal(name) && knownPrefixes.exists(name.startsWith))
+          // STRUCTURAL CHECK (F7) — mirrors `isReservedTenantNamespace` above
+          // rather than the locally-bound `allTenants` snapshot. A heterogeneous
+          // broker without `gamma` in its config must still refuse to
+          // auto-create `gamma.foo` if `gamma` is a syntactically valid tenant
+          // id, because `gamma` may be bound on another broker. The outer gate
+          // (`tenantConfig.allTenants.asScala.nonEmpty`) preserves the
+          // stock-Kafka case where no tenants are configured anywhere on this
+          // broker — see the helper docstring for the full rationale.
+          pollutionRejectedTopics = nonExistingTopics.filter(isReservedTenantNamespace)
           if (pollutionRejectedTopics.nonEmpty) {
             authorizedTopics = authorizedTopics.diff(pollutionRejectedTopics)
           }
