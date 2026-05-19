@@ -259,7 +259,23 @@ public final class KafkaHttpServer {
         // dispatch, emit the bridge's 405 envelope, and force-close the connection.
         Handler.Wrapper connectGuard = new ConnectMethodGuard(mapper, context);
         jetty.setHandler(connectGuard);
-        jetty.start();
+        // Wrap jetty.start() so a partial-start failure (e.g. port already bound, IOException from the
+        // acceptor selector, or any Lifecycle component throwing in its doStart) does not leak the Jetty
+        // QueuedThreadPool, acceptor threads, or selector channels that were already spun up before the
+        // failure. Without this, the local `jetty` reference is dropped on throw — but Jetty's started
+        // beans keep running until they observe a stop signal, so the process retains threads tied to a
+        // server the caller no longer holds. The cleanup is best-effort: a failing stop() during recovery
+        // is logged and suppressed, but the original start() failure is what we propagate to the caller.
+        try {
+            jetty.start();
+        } catch (Exception startFailure) {
+            try {
+                jetty.stop();
+            } catch (Exception stopFailure) {
+                LOG.warn("Jetty stop() during start() unwind failed: {}", stopFailure.toString());
+            }
+            throw startFailure;
+        }
 
         this.server = jetty;
         this.boundPort = connector.getLocalPort();
@@ -400,6 +416,13 @@ public final class KafkaHttpServer {
         // matches the broker stop sequence shape: by the time the client retries the listener has
         // either fully gone or is back on a different broker via the bootstrap address.
         if (shuttingDown) {
+            // Force-close the underlying TCP connection. Without this, a client that pipelined an upgrade
+            // request behind earlier requests (or that holds a keep-alive socket from a previous response)
+            // could send a follow-up request on the same connection during the remaining grace window —
+            // landing on a socket that is about to be closed by Server.stop(). Connection: close emits
+            // the standard signal so the client treats this socket as terminal and the next attempt opens
+            // a fresh one (which the closed connector will refuse cleanly, not via mid-response reset).
+            resp.setHeader("Connection", "close");
             resp.setHeader("Retry-After", "1");
             resp.sendError(HttpStatusMapper.SERVICE_UNAVAILABLE,
                 "broker is shutting down; try again shortly");
@@ -425,6 +448,10 @@ public final class KafkaHttpServer {
         // activeWsSessions after stop()'s snapshot and observe 1006. Release the slot we just took.
         if (shuttingDown) {
             token.close();
+            // Same Connection: close rationale as the pre-tryAcquire branch above — keep the socket
+            // contract symmetric across both shutdown rejection points so a client can't pipeline a
+            // second request on a connection the server is about to close.
+            resp.setHeader("Connection", "close");
             resp.setHeader("Retry-After", "1");
             resp.sendError(HttpStatusMapper.SERVICE_UNAVAILABLE,
                 "broker is shutting down; try again shortly");

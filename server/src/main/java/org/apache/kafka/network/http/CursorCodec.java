@@ -16,6 +16,8 @@
  */
 package org.apache.kafka.network.http;
 
+import org.apache.kafka.common.internals.Topic;
+
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.Objects;
@@ -67,6 +69,18 @@ public final class CursorCodec {
         }
 
         String topic = raw.substring(0, firstSep);
+        // Defence-in-depth: validate the decoded topic against the same rules every other ingress applies
+        // (KafkaHttpServlet.extractTopic, KafkaHttpServer.extractSubscribeTopic). Downstream the parser
+        // checks cross-topic equality against the path topic, which already rejects mismatches — but a
+        // forged cursor carrying an LF/CR or other ASCII control byte that happens to match the request
+        // path topic would skip that gate. Topic.isValid here forbids any topic name the rest of the
+        // bridge would not accept on first ingress, so a cursor can never smuggle a name through the
+        // bridge that a plain query parameter could not. Reject at decode rather than at the equality
+        // check so the failure is reported uniformly across the cursor's two consumers (fetch parser,
+        // future link-builders) without each having to repeat the validation.
+        if (!Topic.isValid(topic)) {
+            throw new IllegalArgumentException("Cursor topic is not a valid Kafka topic name");
+        }
         try {
             int partition = Integer.parseInt(raw.substring(firstSep + 1, lastSep));
             long offset = Long.parseLong(raw.substring(lastSep + 1));

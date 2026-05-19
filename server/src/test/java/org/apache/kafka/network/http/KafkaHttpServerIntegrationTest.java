@@ -2321,6 +2321,17 @@ class KafkaHttpServerIntegrationTest {
                     assertTrue(raw.toLowerCase(java.util.Locale.ROOT).contains("retry-after: 1"),
                         "503 must carry Retry-After: 1 so clients back off briefly during the restart, got: "
                             + raw);
+                    // Wave 31 axis DDD-5: the 503 must also force-close the TCP connection. Without this,
+                    // a client that had pipelined a second request behind the upgrade (or that holds the
+                    // keep-alive socket from a previous response) would send a follow-up on the same
+                    // connection during the remaining grace window, only to land on a socket Server.stop()
+                    // is about to close. Connection: close emits the standard signal so the next attempt
+                    // opens a fresh socket, which the closed connector then refuses cleanly rather than
+                    // delivering a mid-response reset.
+                    assertTrue(raw.toLowerCase(java.util.Locale.ROOT).contains("connection: close"),
+                        "503 shutdown response must carry Connection: close so the socket is treated as "
+                            + "terminal — preventing pipelined follow-up requests on a socket the server "
+                            + "is about to close, got: " + raw);
                     int headerEnd = raw.indexOf("\r\n\r\n");
                     assertTrue(headerEnd > 0, "503 response must terminate its headers, got: " + raw);
                     String body = stripChunkPrefix(raw.substring(headerEnd + 4));

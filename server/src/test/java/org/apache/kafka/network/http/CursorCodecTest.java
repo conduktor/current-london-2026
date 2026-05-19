@@ -119,6 +119,45 @@ class CursorCodecTest {
     }
 
     @Test
+    void decodeRejectsForgedTopicWithControlBytes() {
+        // Wave 31 axis AAA defence-in-depth: a tampered cursor must not be allowed to smuggle a topic
+        // name through that the rest of the bridge would reject on first ingress. Downstream the parser
+        // checks cross-topic equality against the path topic — but a forged cursor whose decoded topic
+        // happens to match the request path (e.g. an LF-bearing string that the server also receives in
+        // the path) would skip that gate. Topic.isValid here forbids any character outside [a-zA-Z0-9._-]
+        // so the same control-byte rejection that protects extractTopic on plain GETs is enforced on
+        // cursor-bearing GETs too. Pin the contract with an LF in the middle of an otherwise valid name.
+        String forged = java.util.Base64.getUrlEncoder().withoutPadding()
+            .encodeToString("topic\nlf|0|0".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+            () -> CursorCodec.decode(forged));
+        assertTrue(e.getMessage().toLowerCase(java.util.Locale.ROOT).contains("topic"),
+            "rejection must name the topic so the failure is attributable, got: " + e.getMessage());
+    }
+
+    @Test
+    void decodeRejectsForgedTopicWithSlashSeparator() {
+        // Defence-in-depth (Wave 31 AAA, continued): "/" is a path separator the bridge's URL routing
+        // depends on for /v1/topics/{topic}/records. A cursor whose decoded topic carries a slash would
+        // bypass the path-shape checks the servlet enforces on first ingress (KafkaHttpServlet.extractTopic
+        // rejects topic.indexOf('/') >= 0). Topic.isValid rejects "/" as outside LEGAL_CHARS, which keeps
+        // the cursor surface symmetric with the plain-GET surface.
+        String forged = java.util.Base64.getUrlEncoder().withoutPadding()
+            .encodeToString("orders/payments|0|0".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        assertThrows(IllegalArgumentException.class, () -> CursorCodec.decode(forged));
+    }
+
+    @Test
+    void decodeRejectsForgedEmptyTopic() {
+        // A cursor whose decoded form starts with the separator yields an empty topic. The current parser
+        // already rejects this via firstSep <= 0 — but pin it explicitly so a future refactor that allows
+        // a zero-length topic must also confront Topic.isValid (which rejects "" as a degenerate case).
+        String forged = java.util.Base64.getUrlEncoder().withoutPadding()
+            .encodeToString("|0|0".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        assertThrows(IllegalArgumentException.class, () -> CursorCodec.decode(forged));
+    }
+
+    @Test
     void decodeAcceptsCursorAtMaxLength() {
         // A 512-char base64url string is acceptable in shape (the base64 decode may fail for arbitrary
         // bytes, but that's a separate validation path). Build a real round-trippable cursor that
