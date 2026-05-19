@@ -102,25 +102,31 @@ public final class LogicalRecoveryExtractor {
 
     private static ParsedHeaders parseHeaders(Header[] headers) {
         ParsedHeaders out = new ParsedHeaders();
+        // Last-wins by design: see the matching comment in
+        // {@link LogicalFetchTranslator#readMarkers}. Recovery reads records that have been
+        // durably written, so the layer-1 stamper guard prevents this from mattering for records
+        // produced after the guard ships — but during a rolling upgrade some backing pages may
+        // contain records produced by a broker that lacked the guard. Last-wins ensures the
+        // broker-stamped identity always overrides any client-supplied forgery, including
+        // for the sidecar rebuild that recovery feeds.
         for (Header h : headers) {
             if (h == null || h.key() == null) continue;
             applyHeader(h, out);
-            if (out.complete()) break;
         }
         return out;
     }
 
     private static void applyHeader(Header h, ParsedHeaders out) {
         if (ConcentrationHeaders.LOGICAL_TOPIC_HEADER.equals(h.key())) {
-            if (out.logicalTopic == null && h.value() != null) {
+            if (h.value() != null) {
                 out.logicalTopic = new String(h.value(), StandardCharsets.UTF_8);
             }
         } else if (ConcentrationHeaders.LOGICAL_PARTITION_HEADER.equals(h.key())) {
-            if (out.logicalPartition == null && h.value() != null && h.value().length == Integer.BYTES) {
+            if (h.value() != null && h.value().length == Integer.BYTES) {
                 out.logicalPartition = ByteBuffer.wrap(h.value()).getInt();
             }
         } else if (ConcentrationHeaders.LOGICAL_OFFSET_HEADER.equals(h.key())) {
-            if (out.logicalOffset == null && h.value() != null && h.value().length == Long.BYTES) {
+            if (h.value() != null && h.value().length == Long.BYTES) {
                 out.logicalOffset = ByteBuffer.wrap(h.value()).getLong();
             }
         }
@@ -130,9 +136,5 @@ public final class LogicalRecoveryExtractor {
         String logicalTopic;
         Integer logicalPartition;
         Long logicalOffset;
-
-        boolean complete() {
-            return logicalTopic != null && logicalPartition != null && logicalOffset != null;
-        }
     }
 }

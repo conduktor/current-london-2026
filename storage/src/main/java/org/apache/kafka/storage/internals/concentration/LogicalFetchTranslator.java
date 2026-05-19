@@ -128,24 +128,30 @@ public final class LogicalFetchTranslator {
         String logicalTopic = null;
         Integer logicalPartition = null;
         Long logicalOffset = null;
+        // Last-wins by design: {@link LogicalProduceStamper#stamp} appends the broker's three
+        // concentration headers at the tail of each record's header array. If a malformed record
+        // (e.g., one persisted by a pre-guard broker during a rolling upgrade) carries duplicate
+        // entries, the broker-stamped values are always physically last and must override any
+        // client-supplied values earlier in the array. Using first-wins here would let a client
+        // forge the logical topic / partition / offset and route its record under another
+        // tenant's identity. We also cannot {@code break} on first match for the same reason.
         for (Header h : headers) {
-            if (logicalTopic == null
-                && ConcentrationHeaders.LOGICAL_TOPIC_HEADER.equals(h.key())) {
-                logicalTopic = new String(h.value(), StandardCharsets.UTF_8);
-            } else if (logicalPartition == null
-                && ConcentrationHeaders.LOGICAL_PARTITION_HEADER.equals(h.key())) {
+            if (h == null || h.key() == null) continue;
+            if (ConcentrationHeaders.LOGICAL_TOPIC_HEADER.equals(h.key())) {
+                if (h.value() != null) {
+                    logicalTopic = new String(h.value(), StandardCharsets.UTF_8);
+                }
+            } else if (ConcentrationHeaders.LOGICAL_PARTITION_HEADER.equals(h.key())) {
                 byte[] v = h.value();
                 if (v != null && v.length == Integer.BYTES) {
                     logicalPartition = ByteBuffer.wrap(v).getInt();
                 }
-            } else if (logicalOffset == null
-                && ConcentrationHeaders.LOGICAL_OFFSET_HEADER.equals(h.key())) {
+            } else if (ConcentrationHeaders.LOGICAL_OFFSET_HEADER.equals(h.key())) {
                 byte[] v = h.value();
                 if (v != null && v.length == Long.BYTES) {
                     logicalOffset = ByteBuffer.wrap(v).getLong();
                 }
             }
-            if (logicalTopic != null && logicalPartition != null && logicalOffset != null) break;
         }
         return new ConcentrationMarkers(logicalTopic, logicalPartition, logicalOffset);
     }

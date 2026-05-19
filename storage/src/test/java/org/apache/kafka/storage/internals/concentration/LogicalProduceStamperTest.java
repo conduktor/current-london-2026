@@ -260,6 +260,70 @@ public class LogicalProduceStamperTest {
     }
 
     @Test
+    public void stampRejectsClientSuppliedLogicalTopicHeader() {
+        // r21 D1 BLOCKER: a client cannot pre-stamp a record with the broker's reserved topic
+        // header. Allowing it lets a malicious tenant rewrite the logical-topic identity at fetch
+        // time (the reader used to be first-wins, which would have picked the client value over
+        // the broker's appended one), routing the record under another tenant's name. Defence in
+        // depth — even with the reader now last-wins, the produce path must reject loudly.
+        Header forged = new RecordHeader(
+            ConcentrationHeaders.LOGICAL_TOPIC_HEADER,
+            "victim-tenant".getBytes(StandardCharsets.UTF_8));
+        MemoryRecords source = MemoryRecords.withRecords(Compression.NONE,
+            new SimpleRecord(System.currentTimeMillis(), "k".getBytes(), "v".getBytes(),
+                new Header[] {forged}));
+
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+            () -> LogicalProduceStamper.stamp(source, "attacker-tenant", 0, new long[] {0L}));
+        assertTrue(ex.getMessage().contains(ConcentrationHeaders.LOGICAL_TOPIC_HEADER),
+            "rejection must name the offending reserved key for operator diagnostics");
+    }
+
+    @Test
+    public void stampRejectsClientSuppliedLogicalPartitionHeader() {
+        Header forged = new RecordHeader(
+            ConcentrationHeaders.LOGICAL_PARTITION_HEADER,
+            ByteBuffer.allocate(Integer.BYTES).putInt(99).array());
+        MemoryRecords source = MemoryRecords.withRecords(Compression.NONE,
+            new SimpleRecord(System.currentTimeMillis(), "k".getBytes(), "v".getBytes(),
+                new Header[] {forged}));
+
+        assertThrows(IllegalArgumentException.class,
+            () -> LogicalProduceStamper.stamp(source, "orders", 0, new long[] {0L}));
+    }
+
+    @Test
+    public void stampRejectsClientSuppliedLogicalOffsetHeader() {
+        Header forged = new RecordHeader(
+            ConcentrationHeaders.LOGICAL_OFFSET_HEADER,
+            ByteBuffer.allocate(Long.BYTES).putLong(1234L).array());
+        MemoryRecords source = MemoryRecords.withRecords(Compression.NONE,
+            new SimpleRecord(System.currentTimeMillis(), "k".getBytes(), "v".getBytes(),
+                new Header[] {forged}));
+
+        assertThrows(IllegalArgumentException.class,
+            () -> LogicalProduceStamper.stamp(source, "orders", 0, new long[] {0L}));
+    }
+
+    @Test
+    public void stampRejectsForgedHeaderEvenIfNotFirstRecord() {
+        // Inject the forged reserved key on the THIRD record only. The validation pre-pass must
+        // examine every record, not short-circuit after the first clean one — otherwise a producer
+        // can hide the attack behind a few innocuous records and the guard would be a paper one.
+        Header forged = new RecordHeader(
+            ConcentrationHeaders.LOGICAL_TOPIC_HEADER,
+            "spoofed".getBytes(StandardCharsets.UTF_8));
+        MemoryRecords source = MemoryRecords.withRecords(Compression.NONE,
+            new SimpleRecord("a".getBytes()),
+            new SimpleRecord("b".getBytes()),
+            new SimpleRecord(System.currentTimeMillis(), "c".getBytes(), "v".getBytes(),
+                new Header[] {forged}));
+
+        assertThrows(IllegalArgumentException.class,
+            () -> LogicalProduceStamper.stamp(source, "orders", 0, new long[] {0L, 1L, 2L}));
+    }
+
+    @Test
     public void stampOnNullKeyRecordIsHandled() {
         // Stock producers commonly write keyless records (round-robin partitioner). The rebuild
         // must not crash on a null key.

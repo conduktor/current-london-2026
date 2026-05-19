@@ -329,6 +329,58 @@ public class LogicalFetchTranslatorTest {
     }
 
     @Test
+    public void translateUsesLastWinsOnDuplicateConcentrationHeaders() {
+        // r21 D1 BLOCKER (layer-2 defence): the stamper now rejects produce records carrying any
+        // reserved concentration header, but during a rolling upgrade some backing-log pages may
+        // contain records persisted by an older broker that lacked the guard. For those records
+        // the reader must pick the LAST occurrence of each concentration header (the broker
+        // stamp is always physically appended after the client headers), never the first — first-
+        // wins would let a client-forged header override the broker stamp and route the record
+        // under a different tenant's identity.
+        //
+        // We hand-build a backing record with the attacker's forged headers prepended and the
+        // broker's "real" headers appended, bypassing the stamper guard (the test simulates the
+        // upgrade-window record that lacked the guard).
+        Header forgedTopic = new RecordHeader(
+            ConcentrationHeaders.LOGICAL_TOPIC_HEADER,
+            "victim-tenant".getBytes(StandardCharsets.UTF_8));
+        Header forgedPartition = new RecordHeader(
+            ConcentrationHeaders.LOGICAL_PARTITION_HEADER,
+            ByteBuffer.allocate(Integer.BYTES).putInt(99).array());
+        Header forgedOffset = new RecordHeader(
+            ConcentrationHeaders.LOGICAL_OFFSET_HEADER,
+            ByteBuffer.allocate(Long.BYTES).putLong(999L).array());
+        Header brokerTopic = new RecordHeader(
+            ConcentrationHeaders.LOGICAL_TOPIC_HEADER,
+            "attacker-tenant".getBytes(StandardCharsets.UTF_8));
+        Header brokerPartition = new RecordHeader(
+            ConcentrationHeaders.LOGICAL_PARTITION_HEADER,
+            ByteBuffer.allocate(Integer.BYTES).putInt(0).array());
+        Header brokerOffset = new RecordHeader(
+            ConcentrationHeaders.LOGICAL_OFFSET_HEADER,
+            ByteBuffer.allocate(Long.BYTES).putLong(7L).array());
+
+        MemoryRecords malformed = MemoryRecords.withRecords(Compression.NONE,
+            new SimpleRecord(RecordBatch.NO_TIMESTAMP, "k".getBytes(), "payload".getBytes(),
+                new Header[] {forgedTopic, forgedPartition, forgedOffset,
+                              brokerTopic, brokerPartition, brokerOffset}));
+
+        // Reader should see the BROKER values, not the forged ones. So:
+        //   - A consumer of "victim-tenant" (the forged identity) sees NOTHING.
+        //   - A consumer of "attacker-tenant" partition 0 sees the record at logical offset 7.
+        MemoryRecords victimView = LogicalFetchTranslator.translate(malformed, "victim-tenant", 99);
+        assertEquals(0, collectRecords(victimView).size(),
+            "forged client header must NOT route a record under the victim tenant's identity");
+
+        MemoryRecords attackerView = LogicalFetchTranslator.translate(malformed, "attacker-tenant", 0);
+        List<Record> records = collectRecords(attackerView);
+        assertEquals(1, records.size(),
+            "broker-stamped identity (last in header array) must win");
+        assertEquals(7L, records.get(0).offset(),
+            "logical offset must come from the broker-stamped offset header (7), not the forged one (999)");
+    }
+
+    @Test
     public void translateSkipsRecordsWithMissingLogicalPartitionHeader() {
         // Defensive: a record carrying the topic header but no partition header cannot be proven
         // to belong to the caller's logical partition. Drop it rather than guessing — leaking a

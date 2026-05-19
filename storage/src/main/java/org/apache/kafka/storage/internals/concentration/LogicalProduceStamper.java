@@ -93,16 +93,7 @@ public final class LogicalProduceStamper {
                 "LogicalProduceStamper.stamp currently supports single-batch MemoryRecords only");
         }
 
-        int recordCount = 0;
-        for (Record r : batch) {
-            recordCount++;
-            if (r == null) {
-                // defensive — iterators on corrupt records can yield null; the broker upstream
-                // would have rejected this batch, but we'd rather fail explicitly here than NPE
-                // mid-rebuild
-                throw new IllegalArgumentException("null record encountered in batch");
-            }
-        }
+        int recordCount = validateAndCountRecords(batch);
         if (recordCount != logicalOffsets.length) {
             throw new IllegalArgumentException(
                 "logicalOffsets length (" + logicalOffsets.length
@@ -168,6 +159,36 @@ public final class LogicalProduceStamper {
         }
 
         return builder.build();
+    }
+
+    /**
+     * Pre-flight pass over the input batch. Validates that every record is non-null and that none
+     * of them carries a reserved concentration header key (layer-1 defence against the
+     * cross-tenant identity-rewrite vector described on {@link #stamp}), and returns the record
+     * count for downstream length checks. Extracted from {@link #stamp} both for readability and
+     * to keep {@code stamp}'s NPath complexity within the project's checkstyle ceiling.
+     */
+    private static int validateAndCountRecords(RecordBatch batch) {
+        int recordCount = 0;
+        for (Record r : batch) {
+            recordCount++;
+            if (r == null) {
+                // defensive — iterators on corrupt records can yield null; the broker upstream
+                // would have rejected this batch, but we'd rather fail explicitly here than NPE
+                // mid-rebuild
+                throw new IllegalArgumentException("null record encountered in batch");
+            }
+            for (Header h : r.headers()) {
+                if (h == null) continue;
+                if (ConcentrationHeaders.isReserved(h.key())) {
+                    throw new IllegalArgumentException(
+                        "client record carries reserved concentration header key '" + h.key()
+                            + "' — these keys are broker-stamped and must not appear on the "
+                            + "produce path");
+                }
+            }
+        }
+        return recordCount;
     }
 
     /**

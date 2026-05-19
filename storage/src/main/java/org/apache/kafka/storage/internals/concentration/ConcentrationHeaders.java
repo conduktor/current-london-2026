@@ -52,4 +52,18 @@ public final class ConcentrationHeaders {
      * data on every concentrated topic.
      */
     public static final String LOGICAL_PARTITION_HEADER = "__concentration_logical_partition";
+
+    /**
+     * True if {@code key} is one of the three broker-stamped concentration header keys. These
+     * keys are reserved: a client-supplied record that carries any of them on the produce path
+     * is rejected by {@link LogicalProduceStamper#stamp}, because allowing the client value to
+     * survive next to the broker's would let a malicious tenant overwrite the logical-topic /
+     * partition / offset identity of its own record and route it under another tenant's name —
+     * a cross-tenant identity-rewrite vector.
+     */
+    public static boolean isReserved(String key) {
+        return LOGICAL_TOPIC_HEADER.equals(key)
+            || LOGICAL_PARTITION_HEADER.equals(key)
+            || LOGICAL_OFFSET_HEADER.equals(key);
+    }
 }
