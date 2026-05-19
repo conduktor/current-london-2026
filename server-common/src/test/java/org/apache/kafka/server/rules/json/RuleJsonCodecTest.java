@@ -310,6 +310,139 @@ public class RuleJsonCodecTest {
     }
 
     @Test
+    public void supplementaryPlaneVariationSelectorsInIdRejected() {
+        // R23 #223: the per-char loop in earlier rounds saw supplementary-
+        // plane codepoints — variation selectors VS17-256 at U+E0100-U+E01EF
+        // and the Unicode language tag block at U+E0020-U+E007F — as two
+        // separate unpaired-surrogate chars in the 0xD800-0xDFFF range that
+        // didn't match any explicit `case`. An attacker could append, say,
+        // VARIATION SELECTOR 17 (U+E0100) to a legitimate-looking id; the
+        // codec would accept it, but downstream consumers that normalise
+        // (NFC, ICU foldings) would render the id identically to a
+        // different stored rule, defeating unambiguous attribution.
+        //
+        // After #223 the loop iterates by codepoint (codePointAt +
+        // charCount) and isForbiddenIdCodepoint rejects every codepoint
+        // whose Character.getType is FORMAT — which covers VS17-256 and
+        // every Unicode language tag without naming them individually.
+        String[] supplementary = {
+            "rule-vs17"           + new String(Character.toChars(0xE0100)),
+            "rule-vs256"          + new String(Character.toChars(0xE01EF)),
+            "rule-langtag-start"  + new String(Character.toChars(0xE0001)),
+            "rule-langtag-ascii"  + new String(Character.toChars(0xE0041)),  // tag-A
+            "rule-langtag-end"    + new String(Character.toChars(0xE007F)),  // CANCEL TAG
+        };
+        for (String id : supplementary) {
+            RuleEnvelopeException ex = assertThrows(RuleEnvelopeException.class,
+                () -> RuleJsonCodec.decode(id, SAMPLE.getBytes(StandardCharsets.UTF_8)),
+                "id should be rejected: '" + id + "'");
+            assertTrue(ex.getMessage().contains("forbidden codepoint"),
+                "rejection must name the forbidden codepoint: " + ex.getMessage());
+            // Defence-in-depth: the index reported must be a valid Java
+            // String index (i.e. inside the high surrogate of the pair),
+            // not garbage past the end. With charCount-driven iteration
+            // the supplementary codepoint is reported at the position of
+            // its high surrogate.
+            assertTrue(ex.getMessage().contains("at index "),
+                "diagnostic must include 'at index N' position: " + ex.getMessage());
+        }
+    }
+
+    @Test
+    public void bmpVariationSelectorsAndInvisibleFamiliesInIdRejected() {
+        // R23 #223: BMP-range variation selectors (VS1-16, U+FE00-U+FE0F),
+        // COMBINING GRAPHEME JOINER (U+034F, Mn category but invisible),
+        // SOFT HYPHEN (U+00AD), Hangul fillers (render as space-like
+        // glyph), invisible math operators (U+2061-U+2064), Mongolian FVS
+        // (U+180B-U+180F). Each renders blank or near-blank in modern
+        // terminals / Kibana / X11 trees, so an id like "rule­X"
+        // displays identically to "rule X" and to "ruleX" depending on the
+        // viewer — same hazard class as the LRM/RLM strong-mark family.
+        String[] invisibleBmp = {
+            "rule"  + new String(Character.toChars(0xFE00)) + "X",  // VS1
+            "rule"  + new String(Character.toChars(0xFE0F)) + "X",  // VS16
+            "rule"  + new String(Character.toChars(0x034F)) + "X",  // CGJ
+            "rule"  + new String(Character.toChars(0x00AD)) + "X",  // SOFT HYPHEN
+            "rule"  + new String(Character.toChars(0x115F)) + "X",  // HANGUL CHOSEONG FILLER
+            "rule"  + new String(Character.toChars(0x1160)) + "X",  // HANGUL JUNGSEONG FILLER
+            "rule"  + new String(Character.toChars(0x3164)) + "X",  // HANGUL FILLER
+            "rule"  + new String(Character.toChars(0xFFA0)) + "X",  // HALFWIDTH HANGUL FILLER
+            "rule"  + new String(Character.toChars(0x2061)) + "X",  // FUNCTION APPLICATION
+            "rule"  + new String(Character.toChars(0x2062)) + "X",  // INVISIBLE TIMES
+            "rule"  + new String(Character.toChars(0x2063)) + "X",  // INVISIBLE SEPARATOR
+            "rule"  + new String(Character.toChars(0x2064)) + "X",  // INVISIBLE PLUS
+            "rule"  + new String(Character.toChars(0x180B)) + "X",  // MONGOLIAN FVS1
+            "rule"  + new String(Character.toChars(0x180C)) + "X",  // MONGOLIAN FVS2
+            "rule"  + new String(Character.toChars(0x180D)) + "X",  // MONGOLIAN FVS3
+            "rule"  + new String(Character.toChars(0x180F)) + "X",  // MONGOLIAN FVS4 (Unicode 14.0+)
+        };
+        for (String id : invisibleBmp) {
+            RuleEnvelopeException ex = assertThrows(RuleEnvelopeException.class,
+                () -> RuleJsonCodec.decode(id, SAMPLE.getBytes(StandardCharsets.UTF_8)),
+                "id should be rejected: '" + id + "'");
+            assertTrue(ex.getMessage().contains("forbidden codepoint"),
+                "rejection must name the forbidden codepoint: " + ex.getMessage());
+        }
+    }
+
+    @Test
+    public void unpairedSurrogatesInIdRejected() {
+        // R23 #223: well-formed Java Strings built from valid UTF-8 / UTF-16
+        // never carry unpaired surrogates, but a poisoned ByteBuffer-decoded
+        // record, a hand-rolled (char) literal, or a String built via
+        // String(char[]) with raw surrogate halves can sneak one in. They
+        // are not valid Unicode and many downstream consumers (regex /u,
+        // Elasticsearch analyzers, protobuf string fields) reject or
+        // silently drop them — exactly the normaliser-vs-storage divergence
+        // the rest of the forbidden-codepoint list defends against.
+        //
+        // We build pathological ids with a high surrogate (no following
+        // low) and with a lone low surrogate (no preceding high) and
+        // assert both are rejected at intake.
+        String highOnly = "rule-" + ((char) 0xD83D) + "X";    // lone high
+        String lowOnly  = "rule-" + ((char) 0xDE00) + "X";    // lone low
+        String highAtEnd = "rule" + ((char) 0xD83D);          // dangling high at end-of-string
+        for (String id : new String[] {highOnly, lowOnly, highAtEnd}) {
+            RuleEnvelopeException ex = assertThrows(RuleEnvelopeException.class,
+                () -> RuleJsonCodec.decode(id, SAMPLE.getBytes(StandardCharsets.UTF_8)),
+                "id should be rejected: '" + id + "'");
+            assertTrue(ex.getMessage().contains("forbidden codepoint"),
+                "rejection must name the forbidden codepoint: " + ex.getMessage());
+        }
+    }
+
+    @Test
+    public void validateRuleIdMatchesDecodeOnNewCodepointFamilies() {
+        // R23 #223: the public validateRuleId() pre-decode helper must stay
+        // in lockstep with decode() — every codepoint that decode() rejects
+        // must also be rejected by validateRuleId(), otherwise a caller
+        // that pre-validates and then decodes would see the id pass the
+        // pre-check and fail on decode (defeating the "fail fast" contract
+        // of the public helper). This test pins a representative from each
+        // family the R23 #223 commit adds.
+        int[] reps = {
+            0xE0100,  // supplementary VS17
+            0xE0041,  // Tag letter A
+            0xFE00,   // BMP VS1
+            0x034F,   // CGJ
+            0x00AD,   // SOFT HYPHEN
+            0x115F,   // HANGUL CHOSEONG FILLER
+            0x2061,   // FUNCTION APPLICATION
+            0x180B,   // MONGOLIAN FVS1
+        };
+        for (int cp : reps) {
+            String id = "rule-" + new String(Character.toChars(cp)) + "X";
+            RuleEnvelopeException ex = assertThrows(RuleEnvelopeException.class,
+                () -> RuleJsonCodec.validateRuleId(id),
+                "validateRuleId must reject id with codepoint U+"
+                    + String.format("%04X", cp));
+            assertTrue(ex.getMessage().contains("forbidden codepoint"),
+                "rejection must name the forbidden codepoint for U+"
+                    + String.format("%04X", cp) + ": " + ex.getMessage());
+        }
+    }
+
+    @Test
     public void controlCharactersInIdRejected() {
         // Round-11 audit (audit-forgery sub-agent, CRITICAL): rule ids are
         // logged verbatim by every DENY emission in KafkaApis.handle and by

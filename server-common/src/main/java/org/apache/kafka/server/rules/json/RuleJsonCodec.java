@@ -249,9 +249,18 @@ public final class RuleJsonCodec {
         //       isSpaceChar/isWhitespace do not flag.
         // Operator ids have no legitimate need for ANY of these — they are
         // log keys, not display strings.
-        for (int i = 0; i < id.length(); i++) {
-            char c = id.charAt(i);
-            if (isForbiddenIdCodepoint(c)) {
+        // R23 #223: iterate by codepoint, not by char. A char-indexed walk
+        // sees supplementary-plane codepoints (e.g. U+E0100-U+E01EF
+        // variation selectors, U+E0020-U+E007F language tags) as two
+        // separate UTF-16 code units, each of which is an unpaired
+        // surrogate in 0xD800-0xDFFF that does not match any of the
+        // historic explicit cases. Codepoint iteration sees the
+        // supplementary codepoint as one value and the
+        // Character.getType==FORMAT branch in isForbiddenIdCodepoint
+        // catches it.
+        for (int i = 0; i < id.length(); ) {
+            int cp = id.codePointAt(i);
+            if (isForbiddenIdCodepoint(cp)) {
                 // Round-13 BLOCKER-1: the id is wire-derived and may itself
                 // contain the very codepoint we're rejecting. Sanitise it
                 // before embedding in the exception message so the WARN
@@ -259,7 +268,7 @@ public final class RuleJsonCodec {
                 // not re-introduce control characters into the broker log.
                 throw new RuleEnvelopeException(
                     "rule id '" + LogSafe.sanitize(id) + "' contains forbidden codepoint U+"
-                        + String.format("%04X", (int) c) + " at index " + i
+                        + String.format("%04X", cp) + " at index " + i
                         + "; rule ids may not contain whitespace, zero-width, or BOM "
                         + "characters (operator-authored identifiers have no legitimate "
                         + "use for these, and a Unicode-padded id could be rendered "
@@ -268,6 +277,7 @@ public final class RuleJsonCodec {
                         + "Elasticsearch's default analyzer, and regex \\s under UNICODE "
                         + "flag all collapse these)");
             }
+            i += Character.charCount(cp);
         }
         // Reserve the "__name__" id shape for engine-internal sentinels.
         // RuleEngine.ACTIVATION_BUDGET_RULE_ID is the only one today (used as
@@ -412,19 +422,24 @@ public final class RuleJsonCodec {
                     + "strings — every DENY emission logs the id verbatim, so "
                     + "an unbounded id is a log-amplification primitive");
         }
-        for (int i = 0; i < id.length(); i++) {
-            char c = id.charAt(i);
-            if (isForbiddenIdCodepoint(c)) {
+        // R23 #223: see decode() for the rationale of codepoint iteration —
+        // both surfaces must use the same walk so a supplementary-plane
+        // variation selector or language tag cannot slip past one of them.
+        for (int i = 0; i < id.length(); ) {
+            int cp = id.codePointAt(i);
+            if (isForbiddenIdCodepoint(cp)) {
                 throw new RuleEnvelopeException(
                     "rule id '" + LogSafe.sanitize(id) + "' contains forbidden codepoint U+"
-                        + String.format("%04X", (int) c) + " at index " + i
+                        + String.format("%04X", cp) + " at index " + i
                         + "; rule ids may not contain whitespace, zero-width, BOM, "
-                        + "bidi-format controls, or C0/C1 control codepoints "
+                        + "bidi-format controls, variation selectors, language tags, "
+                        + "lone surrogates, or C0/C1 control codepoints "
                         + "(operator-authored identifiers have no legitimate use for "
                         + "these, and a Unicode-padded id could be rendered identically "
                         + "to an engine-internal sentinel in audit consumers that "
                         + "normalise on display)");
             }
+            i += Character.charCount(cp);
         }
         if (isReservedNameShape(id)) {
             throw new RuleEnvelopeException(
@@ -459,19 +474,91 @@ public final class RuleJsonCodec {
      * audit-log emitter in sync. Adding a codepoint here is a strictly
      * additive constraint — operator ids never contain these.
      */
-    private static boolean isForbiddenIdCodepoint(char c) {
+    private static boolean isForbiddenIdCodepoint(int cp) {
         // C0 controls (0x00-0x1F), DEL (0x7F), C1 controls (0x80-0x9F).
         // Note that several ASCII whitespace codepoints (TAB, LF, VT, FF, CR)
         // are inside this range and would also be flagged by isWhitespace
         // below — but a dedicated range check is cheaper than a per-char
         // method call and pins the log-injection rationale next to the check.
-        if (c <= 0x1F || c == 0x7F || (c >= 0x80 && c <= 0x9F)) {
+        if (cp <= 0x1F || cp == 0x7F || (cp >= 0x80 && cp <= 0x9F)) {
             return true;
         }
-        if (Character.isWhitespace(c) || Character.isSpaceChar(c)) {
+        if (Character.isWhitespace(cp) || Character.isSpaceChar(cp)) {
             return true;
         }
-        switch (c) {
+        // R23 #223: lone / unpaired surrogates. A well-formed Java String
+        // built from valid UTF-8 / UTF-16 never contains an unpaired
+        // surrogate, but a String constructed from a raw byte[] cast, a
+        // hand-rolled (char) literal, or a poisoned ByteBuffer-decoded
+        // record can carry them. They are not valid Unicode and many
+        // downstream consumers (regex /u, Elasticsearch analyzers,
+        // protobuf string fields) reject or silently drop them — exactly
+        // the normaliser-vs-storage divergence the rest of this list
+        // defends against. Reject the entire U+D800-U+DFFF range; valid
+        // codepoint iteration would never produce a value here because
+        // String.codePointAt always pairs surrogates into supplementary
+        // codepoints when the next char is a valid low surrogate, but a
+        // dangling high surrogate at end-of-string OR a lone low surrogate
+        // would surface here.
+        if (cp >= 0xD800 && cp <= 0xDFFF) {
+            return true;
+        }
+        // R23 #223: Character.getType == FORMAT is Unicode's umbrella for
+        // codepoints that influence formatting without contributing a
+        // visible glyph. This catches a wide swath in one stroke — bidi
+        // controls (U+202A-U+202E, U+2066-U+2069), strong bidi marks
+        // (U+200E, U+200F, U+061C), zero-width joiners (U+200C, U+200D),
+        // WORD JOINER (U+2060), invisible operators (U+2061-U+2064),
+        // Mongolian FVS (U+180B-U+180F including U+180E), language tags
+        // (U+E0001, U+E0020-U+E007F), SOFT HYPHEN (U+00AD), and others.
+        // Future FORMAT additions are automatically covered without a
+        // code change. The explicit switch arms below remain for hazard-
+        // class documentation (so a reader sees WHY each codepoint is
+        // unsafe) and as defence-in-depth in case a JVM ships a stale
+        // Unicode data file.
+        if (Character.getType(cp) == Character.FORMAT) {
+            return true;
+        }
+        // R23 #223: variation selectors. VS1-16 (U+FE00-U+FE0F) and
+        // VS17-256 (U+E0100-U+E01EF) are Unicode-category Mn (Mark,
+        // Non-spacing), NOT Cf (FORMAT) — so the umbrella check above
+        // does not catch them. They are invisible by definition: a VS
+        // appended to any base character requests a font-specific glyph
+        // variation but the codepoint itself contributes zero visible
+        // width. An id like "rule︀X" displays identically to "ruleX"
+        // in any viewer without a variation-selector-aware font, defeating
+        // the unambiguous-attribution promise the rest of this list rests
+        // on. Reject the entire VS range — operator-authored ids never
+        // legitimately use them.
+        if ((cp >= 0xFE00 && cp <= 0xFE0F) || (cp >= 0xE0100 && cp <= 0xE01EF)) {
+            return true;
+        }
+        // Mongolian Free Variation Selectors (FVS1-FVS4): U+180B, U+180C,
+        // U+180D, U+180F. Same invisible-glyph hazard class as the standard
+        // VS ranges above but categorised as Mn (Mark, Non-spacing), so the
+        // FORMAT umbrella misses them. Note: U+180E (MONGOLIAN VOWEL
+        // SEPARATOR) IS Cf and is already caught by the FORMAT umbrella;
+        // it's listed here for completeness of the FVS hazard family.
+        if (cp == 0x180B || cp == 0x180C || cp == 0x180D || cp == 0x180F) {
+            return true;
+        }
+        // R23 #223: invisible / confusable codepoints that are NOT in the
+        // FORMAT category but still render as nothing or as a space-like
+        // glyph in common viewers — same hazard class as the FORMAT
+        // controls above.
+        switch (cp) {
+            case 0x034F: // COMBINING GRAPHEME JOINER (Mn category, invisible)
+            case 0x115F: // HANGUL CHOSEONG FILLER (Lo, renders as space)
+            case 0x1160: // HANGUL JUNGSEONG FILLER (Lo, renders as space)
+            case 0x3164: // HANGUL FILLER (Lo, renders as space)
+            case 0xFFA0: // HALFWIDTH HANGUL FILLER (Lo, renders as space)
+                return true;
+            default:
+                // Fall through to the legacy switch below — historic explicit
+                // arms for FORMAT codepoints, kept for hazard-class documentation.
+                break;
+        }
+        switch (cp) {
             case '​': // ZERO-WIDTH SPACE
             case '‌': // ZERO-WIDTH NON-JOINER
             case '‍': // ZERO-WIDTH JOINER
