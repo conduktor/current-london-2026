@@ -136,6 +136,15 @@ class ControllerConfigurationValidator(kafkaConfig: KafkaConfig) extends Configu
         // runtime. Mirror the startup check here so the controller refuses
         // to write the record in the first place.
         TenantConfig.validateSuperUsersAreNotTenantPrefixed(newConfigs)
+        // Refuse any AlterConfigs that would change tenant.id bindings.
+        // The listener→tenant mapping is established once at broker startup
+        // from server.properties; persisting a different value into the
+        // metadata log silently re-routes the listener on the next broker
+        // restart. DynamicConfig.Broker.validate allows unknown listener-
+        // prefixed keys (customPropsAllowed=true), so without this guard
+        // `listener.name.X.tenant.id=evil` would slip past the broker-side
+        // preprocess and reach the metadata log.
+        TenantConfig.validateTenantIdNotInAlterConfig(newConfigs, oldConfigs)
       case CLIENT_METRICS =>
         val properties = new Properties()
         newConfigs.forEach((key, value) => properties.setProperty(key, value))

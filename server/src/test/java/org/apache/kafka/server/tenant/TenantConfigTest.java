@@ -310,4 +310,141 @@ class TenantConfigTest {
         assertTrue(ex.getMessage().contains("__tenant_acme.alice"),
             "error should quote the offender even when the User: prefix is missing");
     }
+
+    @Test
+    void validateTenantIdNotInAlterConfigPassesWhenBothMapsEmpty() {
+        // Typical case: neither map carries a tenant.id binding because the
+        // binding lives only in broker-static config and is never persisted
+        // to the metadata log. AlterConfigs must not be impeded.
+        TenantConfig.validateTenantIdNotInAlterConfig(Map.of(), Map.of());
+    }
+
+    @Test
+    void validateTenantIdNotInAlterConfigPassesWhenBothMapsNull() {
+        // Defensive: callers pass null when the resource is newly created.
+        TenantConfig.validateTenantIdNotInAlterConfig(null, null);
+    }
+
+    @Test
+    void validateTenantIdNotInAlterConfigPassesForUnrelatedConfigs() {
+        // log.retention.ms and other broker configs unrelated to tenant routing
+        // must flow through the validator untouched.
+        Map<String, Object> newConfigs = new HashMap<>();
+        newConfigs.put("log.retention.ms", "604800000");
+        newConfigs.put("min.insync.replicas", "2");
+        Map<String, Object> oldConfigs = new HashMap<>();
+        TenantConfig.validateTenantIdNotInAlterConfig(newConfigs, oldConfigs);
+    }
+
+    @Test
+    void validateTenantIdNotInAlterConfigRejectsAddingListenerPrefixed() {
+        // The headline threat: kafka-configs --alter --add-config
+        // listener.name.X.tenant.id=evil persists a new binding into the
+        // metadata log and the next broker restart silently re-routes the
+        // listener. Reject at write time.
+        Map<String, Object> newConfigs = new HashMap<>();
+        newConfigs.put("listener.name.tenant_acme.tenant.id", "evilTenant");
+        Map<String, Object> oldConfigs = new HashMap<>();
+
+        ConfigException ex = assertThrows(ConfigException.class,
+            () -> TenantConfig.validateTenantIdNotInAlterConfig(newConfigs, oldConfigs));
+        assertTrue(ex.getMessage().contains("listener.name.tenant_acme.tenant.id"),
+            "error should name the offending key; was: " + ex.getMessage());
+        assertTrue(ex.getMessage().contains("AlterConfigs"),
+            "error should explain the operation is forbidden; was: " + ex.getMessage());
+    }
+
+    @Test
+    void validateTenantIdNotInAlterConfigRejectsAddingBareTenantId() {
+        // TenantPrincipalBuilder.configure also reads bare `tenant.id` (no
+        // listener prefix); the validator must guard both forms.
+        Map<String, Object> newConfigs = new HashMap<>();
+        newConfigs.put("tenant.id", "acme");
+        Map<String, Object> oldConfigs = new HashMap<>();
+
+        ConfigException ex = assertThrows(ConfigException.class,
+            () -> TenantConfig.validateTenantIdNotInAlterConfig(newConfigs, oldConfigs));
+        assertTrue(ex.getMessage().contains("tenant.id"),
+            "error should name the offending key; was: " + ex.getMessage());
+    }
+
+    @Test
+    void validateTenantIdNotInAlterConfigRejectsModifying() {
+        // Both maps have the key but with different values — operator is
+        // trying to flip an existing binding. Refuse.
+        Map<String, Object> newConfigs = new HashMap<>();
+        newConfigs.put("listener.name.tenant_acme.tenant.id", "beta");
+        Map<String, Object> oldConfigs = new HashMap<>();
+        oldConfigs.put("listener.name.tenant_acme.tenant.id", "acme");
+
+        ConfigException ex = assertThrows(ConfigException.class,
+            () -> TenantConfig.validateTenantIdNotInAlterConfig(newConfigs, oldConfigs));
+        assertTrue(ex.getMessage().contains("listener.name.tenant_acme.tenant.id"),
+            "error should name the offending key; was: " + ex.getMessage());
+    }
+
+    @Test
+    void validateTenantIdNotInAlterConfigRejectsDeleting() {
+        // oldConfigs has the key, newConfigs does not — operator is removing
+        // an existing binding via AlterConfigs. Refuse: removal is also a
+        // state change that takes effect on next restart.
+        Map<String, Object> newConfigs = new HashMap<>();
+        Map<String, Object> oldConfigs = new HashMap<>();
+        oldConfigs.put("listener.name.tenant_acme.tenant.id", "acme");
+
+        ConfigException ex = assertThrows(ConfigException.class,
+            () -> TenantConfig.validateTenantIdNotInAlterConfig(newConfigs, oldConfigs));
+        assertTrue(ex.getMessage().contains("listener.name.tenant_acme.tenant.id"),
+            "error should name the offending key; was: " + ex.getMessage());
+    }
+
+    @Test
+    void validateTenantIdNotInAlterConfigPassesWhenValueUnchanged() {
+        // No-op AlterConfigs where the same tenant.id appears in both maps
+        // with the same value is benign (e.g. a touch-and-resubmit). Accept.
+        Map<String, Object> newConfigs = new HashMap<>();
+        newConfigs.put("listener.name.tenant_acme.tenant.id", "acme");
+        Map<String, Object> oldConfigs = new HashMap<>();
+        oldConfigs.put("listener.name.tenant_acme.tenant.id", "acme");
+        TenantConfig.validateTenantIdNotInAlterConfig(newConfigs, oldConfigs);
+    }
+
+    @Test
+    void validateTenantIdNotInAlterConfigAggregatesMultipleOffenders() {
+        // Several tenant.id keys touched at once: list every one so the
+        // operator can repair the request in a single round-trip.
+        Map<String, Object> newConfigs = new HashMap<>();
+        newConfigs.put("listener.name.tenant_acme.tenant.id", "evil");
+        newConfigs.put("listener.name.tenant_beta.tenant.id", "evil2");
+        newConfigs.put("tenant.id", "evil3");
+        Map<String, Object> oldConfigs = new HashMap<>();
+
+        ConfigException ex = assertThrows(ConfigException.class,
+            () -> TenantConfig.validateTenantIdNotInAlterConfig(newConfigs, oldConfigs));
+        assertTrue(ex.getMessage().contains("listener.name.tenant_acme.tenant.id"),
+            "error should name first offender; was: " + ex.getMessage());
+        assertTrue(ex.getMessage().contains("listener.name.tenant_beta.tenant.id"),
+            "error should name second offender; was: " + ex.getMessage());
+        assertTrue(ex.getMessage().contains("tenant.id"),
+            "error should name bare-key offender; was: " + ex.getMessage());
+    }
+
+    @Test
+    void validateTenantIdNotInAlterConfigIgnoresSimilarButDistinctKeys() {
+        // Keys that happen to contain the substring "tenant.id" but are not
+        // the bare key or `listener.name.<lname>.tenant.id` shape (e.g. a
+        // listener.name.X.tenant.id.something deeper sub-key, or a config
+        // unrelated to listener.name.) must NOT trigger the guard. Otherwise
+        // the validator would block unrelated AlterConfigs traffic.
+        Map<String, Object> newConfigs = new HashMap<>();
+        // No `.` after LISTENER_PREFIX (defensive shape) — not a listener-
+        // prefixed key.
+        newConfigs.put("listener.nametenant.id", "something");
+        // A deeper key under a listener.name.X prefix that is NOT tenant.id.
+        newConfigs.put("listener.name.tenant_acme.connections.max.idle.ms", "60000");
+        // A key whose name contains "tenant.id" only as a substring.
+        newConfigs.put("my.custom.tenant.id.config", "anything");
+        Map<String, Object> oldConfigs = new HashMap<>();
+        TenantConfig.validateTenantIdNotInAlterConfig(newConfigs, oldConfigs);
+    }
 }

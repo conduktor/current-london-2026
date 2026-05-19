@@ -21,11 +21,14 @@ import org.apache.kafka.common.network.ListenerName;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeSet;
 
 /**
  * Broker-wide view of which listeners are bound to which tenant id. Built once
@@ -277,6 +280,94 @@ public final class TenantConfig {
                 + "'. A super-user bypasses every ACL check, so granting it to a "
                 + "tenant principal defeats tenant isolation. Configure super.users "
                 + "with operator principals only; never with tenant principals.");
+    }
+
+    /**
+     * Refuse any AlterConfigs that would set, change, or delete a
+     * {@code tenant.id} key (either bare or {@code listener.name.<lname>.tenant.id})
+     * in the broker config metadata. The tenant-to-listener binding is
+     * established once at broker startup from {@code server.properties} and is
+     * the load-bearing fact for the entire isolation model: principal builder
+     * stamping, the privileged-on-tenant-listener refusal, topic-prefix
+     * rewriting, ACL prefix scoping. Persisting a different value to the
+     * cluster metadata log silently re-routes the listener on the next broker
+     * restart — every existing tenant resource is now reachable from a
+     * different tenant id, and the operator has no audit trail beyond the
+     * AlterConfigs record itself.
+     *
+     * <p>The keys are not part of {@link KafkaConfig#configNames}, so
+     * {@code DynamicConfig.Broker.validate} (which allows unknown listener-
+     * prefixed properties via {@code customPropsAllowed=true}) does not catch
+     * them. The controller validator is the only choke point that sees both
+     * old and new state and can recognise a change.
+     *
+     * <p>Comparison is by string value across the union of keys in both maps,
+     * so the check rejects ADD ({@code newConfigs} has it, {@code oldConfigs}
+     * does not), MODIFY (both have it with different values), and DELETE
+     * ({@code oldConfigs} has it, {@code newConfigs} does not). The typical
+     * case — neither map carrying the key because the binding lives only in
+     * broker-static config — is a no-op.
+     *
+     * @param newConfigs the post-merge effective config state proposed by the
+     *                   AlterConfigs request (must not be {@code null}, may be empty)
+     * @param oldConfigs the pre-existing metadata config state (must not be
+     *                   {@code null}, may be empty)
+     * @throws ConfigException listing every tenant-id key whose value would change
+     */
+    public static void validateTenantIdNotInAlterConfig(Map<String, ?> newConfigs,
+                                                       Map<String, ?> oldConfigs) {
+        Map<String, ?> safeNew = newConfigs == null ? Map.of() : newConfigs;
+        Map<String, ?> safeOld = oldConfigs == null ? Map.of() : oldConfigs;
+        Set<String> allKeys = new HashSet<>(safeNew.keySet());
+        allKeys.addAll(safeOld.keySet());
+        Set<String> offenders = new TreeSet<>();
+        for (String key : allKeys) {
+            if (!isTenantIdKey(key)) {
+                continue;
+            }
+            String newVal = valueAsString(safeNew.get(key));
+            String oldVal = valueAsString(safeOld.get(key));
+            if (!Objects.equals(newVal, oldVal)) {
+                offenders.add(key);
+            }
+        }
+        if (offenders.isEmpty()) {
+            return;
+        }
+        // Report the first offending key as the ConfigException's `name` to
+        // surface in `kafka-configs.sh` output, but list all offenders in the
+        // message so an operator fixes the request in one round-trip.
+        String firstKey = offenders.iterator().next();
+        Object firstValue = safeNew.get(firstKey);
+        throw new ConfigException(firstKey, firstValue,
+            "tenant.id binding(s) " + String.join(", ", offenders)
+                + " cannot be set, modified, or deleted via AlterConfigs. "
+                + "The tenant-to-listener binding is fixed at broker startup "
+                + "(server.properties); changing it via the metadata log "
+                + "would silently re-route the listener on the next broker "
+                + "restart. Update server.properties and restart the broker "
+                + "instead.");
+    }
+
+    private static boolean isTenantIdKey(String key) {
+        if (key == null) {
+            return false;
+        }
+        if (key.equals(TENANT_ID_KEY)) {
+            return true;
+        }
+        if (!key.startsWith(LISTENER_PREFIX)) {
+            return false;
+        }
+        int suffixStart = key.indexOf('.', LISTENER_PREFIX.length());
+        if (suffixStart < 0) {
+            return false;
+        }
+        return key.substring(suffixStart + 1).equals(TENANT_ID_KEY);
+    }
+
+    private static String valueAsString(Object v) {
+        return v == null ? null : v.toString();
     }
 
     private static BuilderRef resolveBuilderRef(Object listenerOverride, Class<?> defaultBuilderClass) {

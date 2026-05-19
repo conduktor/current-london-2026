@@ -224,6 +224,68 @@ class ControllerConfigurationValidatorTest {
   }
 
   @Test
+  def testBrokerConfigRejectsAddingListenerTenantIdOnController(): Unit = {
+    // Controller-side defence: the listener→tenant binding is established
+    // once at broker startup from server.properties. Persisting a different
+    // value into the metadata log via AlterConfigs would silently re-route
+    // the listener on the next broker restart — the corrupted record reaches
+    // every tenant resource (topics, ACLs, group ids, principals) at once.
+    // DynamicConfig.Broker.validate accepts unknown listener-prefixed keys
+    // (customPropsAllowed=true), so without this guard the request would
+    // sail through to the controller.
+    val config = new util.TreeMap[String, String]()
+    config.put("listener.name.tenant_acme.tenant.id", "evilTenant")
+    val ex = assertThrows(classOf[ConfigException], () => validator.validate(
+      new ConfigResource(BROKER, "1"), config, emptyMap()))
+    val msg = ex.getMessage
+    assertTrue(msg.contains("listener.name.tenant_acme.tenant.id"),
+      s"expected offending key listed in: $msg")
+    assertTrue(msg.contains("AlterConfigs"),
+      s"expected explanation that AlterConfigs is forbidden in: $msg")
+  }
+
+  @Test
+  def testBrokerConfigRejectsModifyingListenerTenantIdOnController(): Unit = {
+    // The bound listener already routes to tenant=acme; AlterConfigs tries
+    // to flip it to tenant=beta. Refuse — the broker would silently re-route
+    // every connection on the listener at the next restart.
+    val config = new util.TreeMap[String, String]()
+    config.put("listener.name.tenant_acme.tenant.id", "beta")
+    val old = new util.TreeMap[String, String]()
+    old.put("listener.name.tenant_acme.tenant.id", "acme")
+    val ex = assertThrows(classOf[ConfigException], () => validator.validate(
+      new ConfigResource(BROKER, "1"), config, old))
+    assertTrue(ex.getMessage.contains("listener.name.tenant_acme.tenant.id"),
+      s"expected offending key listed in: ${ex.getMessage}")
+  }
+
+  @Test
+  def testBrokerConfigRejectsDeletingListenerTenantIdOnController(): Unit = {
+    // The metadata log carries a tenant.id binding; AlterConfigs proposes
+    // to delete it (key absent from newConfigs, present in oldConfigs).
+    // Refuse — the listener would lose its binding on the next restart and
+    // silently become an open cluster-wide listener.
+    val config = new util.TreeMap[String, String]()
+    val old = new util.TreeMap[String, String]()
+    old.put("listener.name.tenant_acme.tenant.id", "acme")
+    val ex = assertThrows(classOf[ConfigException], () => validator.validate(
+      new ConfigResource(BROKER, "1"), config, old))
+    assertTrue(ex.getMessage.contains("listener.name.tenant_acme.tenant.id"),
+      s"expected offending key listed in: ${ex.getMessage}")
+  }
+
+  @Test
+  def testBrokerConfigAcceptsTenantIdUnchangedOnController(): Unit = {
+    // A no-op AlterConfigs that re-asserts the existing binding (same key,
+    // same value in both maps) is benign and must be accepted.
+    val config = new util.TreeMap[String, String]()
+    config.put("listener.name.tenant_acme.tenant.id", "acme")
+    val old = new util.TreeMap[String, String]()
+    old.put("listener.name.tenant_acme.tenant.id", "acme")
+    validator.validate(new ConfigResource(BROKER, "1"), config, old)
+  }
+
+  @Test
   def testValidGroupConfig(): Unit = {
     val config = new util.TreeMap[String, String]()
     config.put(GroupConfig.CONSUMER_SESSION_TIMEOUT_MS_CONFIG, "50000")
