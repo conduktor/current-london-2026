@@ -28,9 +28,12 @@ import subprocess
 # Constant: Regex to extract dependency tokens from the LICENSE file.
 # Matches lines that start with a dash and then a dependency token of the form:
 #   DependencyName-x.y, DependencyName-x.y.z, or DependencyName-x.y.z.w
-# Optionally, a trailing suffix (e.g., "-alpha") is captured.
+# A trailing version qualifier (e.g. "-alpha", ".Final") and optional Maven
+# classifier segments (e.g. "-linux-x86_64", "-linux-aarch_64") are also
+# captured. The classifier suffix permits underscores because Netty's native
+# jars use "aarch_64"/"x86_64" tokens.
 LICENSE_DEP_PATTERN = re.compile(
-    r'^\s*-\s*([A-Za-z0-9_.+-]+-[0-9]+\.[0-9]+(?:\.[0-9]+){0,2}(?:[-.][A-Za-z0-9]+)?)',
+    r'^\s*-\s*([A-Za-z0-9_.+-]+-[0-9]+\.[0-9]+(?:\.[0-9]+){0,2}(?:[-.][A-Za-z0-9_]+)*)',
     re.MULTILINE
 )
 
