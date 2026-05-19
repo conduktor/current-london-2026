@@ -16998,6 +16998,132 @@ class KafkaApisTest extends Logging {
     assertEquals(99L, part.activeProducers.get(0).producerId)
   }
 
+  // ---------------------------------------------------------------------------
+  // OffsetForLeaderEpoch outside-in scrub (#131)
+  //
+  // The handler grants CLUSTER_ACTION to a cluster-wide caller and then hands
+  // each topic to `replicaManager.lastOffsetForLeaderEpoch`. Without the
+  // outside-in guard, a non-tenant caller naming `acme.orders` (the PHYSICAL
+  // form of acme's logical `orders`) would receive real `leaderEpoch` and
+  // `endOffset` for the tenant's storage — an existence oracle plus an
+  // end-offset leak plus a truncation oracle when paired with a spoofed
+  // current epoch. The guard refuses per-entry with TOPIC_AUTHORIZATION_FAILED,
+  // matching the exact wire shape of the existing DESCRIBE-deny branch.
+  // ---------------------------------------------------------------------------
+  @Test
+  def testOffsetForLeaderEpochOutsideInRefusesTenantPhysicalTopic(): Unit = {
+    val reservedTopic = "acme.orders"
+    val regularTopic = "regular-topic"
+    val partition = 0
+
+    val topics = new OffsetForLeaderEpochRequestData.OffsetForLeaderTopicCollection()
+    topics.add(new OffsetForLeaderEpochRequestData.OffsetForLeaderTopic()
+      .setTopic(reservedTopic)
+      .setPartitions(List(new OffsetForLeaderEpochRequestData.OffsetForLeaderPartition()
+        .setPartition(partition).setLeaderEpoch(0).setCurrentLeaderEpoch(-1)).asJava))
+    topics.add(new OffsetForLeaderEpochRequestData.OffsetForLeaderTopic()
+      .setTopic(regularTopic)
+      .setPartitions(List(new OffsetForLeaderEpochRequestData.OffsetForLeaderPartition()
+        .setPartition(partition).setLeaderEpoch(0).setCurrentLeaderEpoch(-1)).asJava))
+
+    val request = buildRequest(OffsetsForLeaderEpochRequest.Builder.forConsumer(topics).build())
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    // Mock the regular topic returning a populated `EpochEndOffset`. Without
+    // the outside-in guard, replicaManager would also receive the reserved
+    // topic and a similar shape would leak the tenant's end offset.
+    when(replicaManager.lastOffsetForLeaderEpoch(any[Seq[OffsetForLeaderEpochRequestData.OffsetForLeaderTopic]]))
+      .thenAnswer { invocation =>
+        val passed = invocation.getArgument[Seq[OffsetForLeaderEpochRequestData.OffsetForLeaderTopic]](0)
+        passed.map { t =>
+          new OffsetForLeaderEpochResponseData.OffsetForLeaderTopicResult()
+            .setTopic(t.topic)
+            .setPartitions(t.partitions.asScala.map { p =>
+              new OffsetForLeaderEpochResponseData.EpochEndOffset()
+                .setPartition(p.partition)
+                .setErrorCode(Errors.NONE.code)
+                .setLeaderEpoch(7)
+                .setEndOffset(123L)
+            }.toList.asJava)
+        }
+      }
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleOffsetForLeaderEpochRequest(request)
+
+    val response = verifyNoThrottling[OffsetsForLeaderEpochResponse](request)
+    val byTopic = response.data.topics.asScala.map(t => t.topic -> t).toMap
+
+    val acmePart = byTopic(reservedTopic).partitions.asScala.find(_.partition == partition).get
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED.code, acmePart.errorCode,
+      "reserved-physical-form topic must be refused with TOPIC_AUTHORIZATION_FAILED")
+    assertEquals(-1, acmePart.leaderEpoch,
+      "refused topic must not leak leaderEpoch — wire shape must match a DESCRIBE-deny")
+    assertEquals(-1L, acmePart.endOffset,
+      "refused topic must not leak endOffset — wire shape must match a DESCRIBE-deny")
+
+    val regularPart = byTopic(regularTopic).partitions.asScala.find(_.partition == partition).get
+    assertEquals(Errors.NONE.code, regularPart.errorCode,
+      "non-reserved topic in the same batch must still be processed")
+    assertEquals(7, regularPart.leaderEpoch)
+    assertEquals(123L, regularPart.endOffset)
+
+    // Per-entry refusal: the reserved topic must never reach replicaManager,
+    // otherwise a probe could time the call and still derive existence.
+    val captor: ArgumentCaptor[Seq[OffsetForLeaderEpochRequestData.OffsetForLeaderTopic]] =
+      ArgumentCaptor.forClass(classOf[Seq[OffsetForLeaderEpochRequestData.OffsetForLeaderTopic]])
+    verify(replicaManager).lastOffsetForLeaderEpoch(captor.capture())
+    val invokedTopics = captor.getValue.map(_.topic).toSet
+    assertEquals(Set(regularTopic), invokedTopics,
+      "replicaManager.lastOffsetForLeaderEpoch must only see the non-reserved entry")
+  }
+
+  @Test
+  def testOffsetForLeaderEpochClusterWideListenerForwardsTenantLookingNamesWhenNoTenantsConfigured(): Unit = {
+    // Without any configured tenants, `acme.orders` is just a dotted topic
+    // name; the outside-in guard must not fire — stock Kafka behaviour must
+    // be preserved on non-tenant clusters.
+    val topicName = "acme.orders"
+    val partition = 0
+
+    val topics = new OffsetForLeaderEpochRequestData.OffsetForLeaderTopicCollection()
+    topics.add(new OffsetForLeaderEpochRequestData.OffsetForLeaderTopic()
+      .setTopic(topicName)
+      .setPartitions(List(new OffsetForLeaderEpochRequestData.OffsetForLeaderPartition()
+        .setPartition(partition).setLeaderEpoch(0).setCurrentLeaderEpoch(-1)).asJava))
+
+    val request = buildRequest(OffsetsForLeaderEpochRequest.Builder.forConsumer(topics).build())
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    when(replicaManager.lastOffsetForLeaderEpoch(any[Seq[OffsetForLeaderEpochRequestData.OffsetForLeaderTopic]]))
+      .thenAnswer { invocation =>
+        val passed = invocation.getArgument[Seq[OffsetForLeaderEpochRequestData.OffsetForLeaderTopic]](0)
+        passed.map { t =>
+          new OffsetForLeaderEpochResponseData.OffsetForLeaderTopicResult()
+            .setTopic(t.topic)
+            .setPartitions(t.partitions.asScala.map { p =>
+              new OffsetForLeaderEpochResponseData.EpochEndOffset()
+                .setPartition(p.partition)
+                .setErrorCode(Errors.NONE.code)
+                .setLeaderEpoch(2)
+                .setEndOffset(42L)
+            }.toList.asJava)
+        }
+      }
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleOffsetForLeaderEpochRequest(request)
+
+    val response = verifyNoThrottling[OffsetsForLeaderEpochResponse](request)
+    val part = response.data.topics.asScala.head.partitions.asScala.head
+    assertEquals(Errors.NONE.code, part.errorCode,
+      "with no tenants configured the dotted topic name is not reserved")
+    assertEquals(2, part.leaderEpoch)
+    assertEquals(42L, part.endOffset)
+  }
+
   @Test
   def testDescribeTopicPartitionsAllTopicsSilentlyDropsTenantPhysicalTopics(): Unit = {
     // fetchAllTopics path: the handler iterates metadataCache.getAllTopics()

@@ -4026,8 +4026,29 @@ class KafkaApis(val requestChannel: RequestChannel,
         (topics, Seq.empty[OffsetForLeaderTopic])
       else authHelper.partitionSeqByAuthorized(request.context, DESCRIBE, TOPIC, topics)(_.topic)
 
-    val endOffsetsForAuthorizedPartitions = replicaManager.lastOffsetForLeaderEpoch(authorizedTopics)
-    val endOffsetsForUnauthorizedPartitions = unauthorizedTopics.map { offsetForLeaderTopic =>
+    // Outside-in existence/end-offset oracle: a cluster-wide caller naming a
+    // tenant's physical topic (`acme.orders`) would otherwise pass the
+    // CLUSTER_ACTION check above and receive real `leaderEpoch` + `endOffset`
+    // from `replicaManager.lastOffsetForLeaderEpoch`. That leaks both topic
+    // existence and the tenant's current end offsets, and — combined with a
+    // spoofed follower epoch — feeds a truncation oracle. Refuse per-entry
+    // with the exact wire shape `unauthorizedTopics` already produces above
+    // (each partition gets TOPIC_AUTHORIZATION_FAILED, no leaderEpoch, no
+    // endOffset), so the refusal is indistinguishable from a legitimate
+    // DESCRIBE deny. OFFSET_FOR_LEADER_EPOCH is outside TENANT_ALLOWED_APIS,
+    // so tenant principals never reach here — this only fires for non-tenant
+    // callers. Per-entry (not whole-batch) so a cluster admin can still ask
+    // about legitimate non-tenant topics in the same request.
+    val (cleanAuthorizedTopics, pollutionRejectedTopics) =
+      if (tenantContextFor(request).effectiveTenant.isPresent) {
+        (authorizedTopics, Seq.empty[OffsetForLeaderTopic])
+      } else {
+        authorizedTopics.partition(t => !isReservedTenantNamespace(t.topic))
+      }
+
+    val endOffsetsForAuthorizedPartitions = replicaManager.lastOffsetForLeaderEpoch(cleanAuthorizedTopics)
+    val refusedTopics = unauthorizedTopics ++ pollutionRejectedTopics
+    val endOffsetsForUnauthorizedPartitions = refusedTopics.map { offsetForLeaderTopic =>
       val partitions = offsetForLeaderTopic.partitions.asScala.map { offsetForLeaderPartition =>
         new EpochEndOffset()
           .setPartition(offsetForLeaderPartition.partition)
