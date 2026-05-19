@@ -340,12 +340,21 @@ class DynamicBrokerConfigTest {
     // would otherwise need the test author to remember to add the dynamic
     // assertion. Pinning it explicitly here means the dynamic-promotion
     // path fails the test immediately, regardless of CONFIG_DEF state.
+    // This assertion pins membership in AllDynamicConfigs; it does NOT itself
+    // pin the absence of a BrokerReconfigurable listener (the broader hazard
+    // described in the test-method comment block above). The two facts are
+    // structurally linked but not co-pinned by this one assertion: if a
+    // future maintainer wires a listener BEFORE adding the key to
+    // AllDynamicConfigs, this assertion would still hold; if they wire the
+    // listener AFTER (in the same PR as the dynamic promotion), this
+    // assertion fails first and the listener wiring becomes moot. Either
+    // failure path lands the author on the test-method comment, which is
+    // where the split-brain hazard is documented.
     assertFalse(
       DynamicBrokerConfig.AllDynamicConfigs.contains(key),
-      s"$key must remain non-dynamic — if it becomes dynamic without a " +
-        s"BrokerReconfigurable listener wired, different brokers in the cluster " +
-        s"will respect different values for the safety gate with no operator-visible " +
-        s"signal (R39-E-3, parallel to #296 for governance.bypass.principals)"
+      s"$key must remain outside DynamicBrokerConfig.AllDynamicConfigs — " +
+        s"see test-method comment for the split-brain hazard rationale " +
+        s"(R39-E-3, parallel to #296 for governance.bypass.principals)"
     )
   }
 
