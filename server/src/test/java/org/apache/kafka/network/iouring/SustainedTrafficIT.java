@@ -106,16 +106,26 @@ class SustainedTrafficIT {
     }
 
     private static void echoLoop(IoUringSelector selector) {
+        // Mirror the production Processor mute/unmute pair: a request mutes its channel
+        // until the response is flushed, then completedSends unmutes it. Without this the
+        // bench drives selector.send() back-to-back while the channel state machine still
+        // thinks it's READY-for-receive — KafkaChannel.setSend throws "prior send still
+        // in progress" and tears the connection down, manifesting as EOFException on the
+        // client. Identical pattern to MultiClientSustainedTrafficIT.echoLoop.
         try {
             while (!Thread.currentThread().isInterrupted()) {
                 selector.poll(50);
                 for (NetworkReceive recv : selector.completedReceives()) {
                     String id = recv.source();
+                    selector.mute(id);
                     ByteBuffer payload = recv.payload();
                     ByteBuffer copy = ByteBuffer.allocate(payload.remaining());
                     copy.put(payload);
                     copy.flip();
                     selector.send(new NetworkSend(id, ByteBufferSend.sizePrefixed(copy)));
+                }
+                for (org.apache.kafka.common.network.NetworkSend sent : selector.completedSends()) {
+                    selector.unmute(sent.destinationId());
                 }
                 selector.clearCompletedReceives();
                 selector.clearCompletedSends();

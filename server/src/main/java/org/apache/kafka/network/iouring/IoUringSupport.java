@@ -87,6 +87,22 @@ public final class IoUringSupport {
             LOG.debug("Failed to probe Netty io_uring availability via reflection", e);
             return new Probe(false, "Reflective probe of " + IO_URING_PROBE_CLASS
                 + " failed: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+        } catch (LinkageError e) {
+            // Catching LinkageError (a sub-class of Error, NOT Exception) covers
+            // UnsatisfiedLinkError (native lib missing or ABI-incompatible),
+            // NoClassDefFoundError (a transitive dependency of IoUring failed to link),
+            // and ExceptionInInitializerError (the IoUring static initializer threw,
+            // typically when Native.tryLoadFirstAvailable fails). Without this branch,
+            // such errors escape computeProbe and re-fire on every access as
+            // "Could not initialize class IoUringSupport" — the NIO fallback path that
+            // PROMPT.md mandates fails open, and broker startup crashes hard with a
+            // confusing error instead of logging "io_uring not available: <reason>"
+            // and continuing on NIO. Encountered on Linux hosts where the
+            // netty-io_uring jar is present but the bundled .so doesn't match the
+            // kernel ABI (older glibc, musl, missing libnuma).
+            LOG.debug("Failed to link Netty io_uring native transport", e);
+            return new Probe(false, "Netty io_uring native transport failed to load ("
+                + e.getClass().getSimpleName() + ": " + e.getMessage() + ")");
         }
     }
 

@@ -190,18 +190,46 @@ public final class IoUringServerListener implements AutoCloseable {
 
             ChannelFuture future = bootstrap.bind(bindAddress).sync();
             this.serverChannel = future.channel();
+            // Port extraction is the last step that can fail post-bind. If localAddress() ever
+            // returns null (channel torn down between bind() and getPort()) or the cast trips a
+            // ClassCastException on a non-Inet address, the catch (RuntimeException) below must
+            // tear down the bound LISTEN socket — otherwise the port stays in LISTEN until the
+            // event loop is GC'd and external readiness probes see a phantom "ready" broker.
             this.boundPort = ((InetSocketAddress) serverChannel.localAddress()).getPort();
+            // started=true must be the last line of the happy path. If anything above this throws,
+            // we run the partial-failure cleanup in the catch blocks instead of leaving the
+            // listener half-initialized.
             this.started = true;
             log.info("io_uring listener bound to {} (port {}, sendBufferSize={}, receiveBufferSize={})",
                 bindAddress, boundPort, sendBufferSize, receiveBufferSize);
         } catch (InterruptedException ie) {
-            eventLoopGroup.shutdownGracefully();
+            cleanupAfterFailedStart();
             Thread.currentThread().interrupt();
             throw new IllegalStateException("Interrupted while binding io_uring listener", ie);
         } catch (RuntimeException e) {
-            eventLoopGroup.shutdownGracefully();
+            cleanupAfterFailedStart();
             throw e;
         }
+    }
+
+    /**
+     * Releases all resources held by a failed {@link #start()} attempt: the bound LISTEN socket
+     * (if {@code bind()} succeeded but a later step threw), and the io_uring event-loop group.
+     * Sets {@code closed=true} so a subsequent {@link #close()} is a no-op and a re-{@code start()}
+     * fails with "was closed before start()" instead of silently re-using a torn-down event loop.
+     */
+    private void cleanupAfterFailedStart() {
+        if (serverChannel != null) {
+            try {
+                // Use awaitUninterruptibly with a tight bound — we're already on an error path
+                // and must not block start() indefinitely if the event loop is wedged.
+                serverChannel.close().awaitUninterruptibly(SHUTDOWN_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            } catch (Exception suppress) {
+                log.debug("error closing io_uring server channel during failed-start cleanup", suppress);
+            }
+        }
+        eventLoopGroup.shutdownGracefully(SHUTDOWN_QUIET_MS, SHUTDOWN_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        closed = true;
     }
 
     /**
@@ -229,9 +257,17 @@ public final class IoUringServerListener implements AutoCloseable {
         // file descriptors are released.
         if (serverChannel != null) {
             try {
-                serverChannel.close().sync();
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
+                // Bound the close() with awaitUninterruptibly(timeout). sync() blocks forever
+                // if the event loop is wedged (deadlocked native code, runaway handler) and
+                // that turns into an unkillable broker shutdown — operators must SIGKILL.
+                // shutdownGracefully below already enforces its own bound, so the listener
+                // shutdown path now has a definite upper time bound regardless of loop health.
+                boolean closedInTime = serverChannel.close()
+                    .awaitUninterruptibly(SHUTDOWN_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+                if (!closedInTime) {
+                    log.warn("io_uring server channel did not close within {}ms; forcing event-loop shutdown",
+                        SHUTDOWN_TIMEOUT_MS);
+                }
             } catch (Exception e) {
                 log.debug("error closing io_uring server channel", e);
             }

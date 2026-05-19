@@ -211,6 +211,14 @@ final class IoUringTransportLayer implements TransportLayer {
         int size = buf.readableBytes();
         offerInboundCalls.incrementAndGet();
         totalInboundBytes.addAndGet(size);
+        // Increment-before-offer ordering. If we offered first and then incremented, a
+        // concurrent reader could peek the buf, drain it, and run inboundBytes.addAndGet(-total)
+        // BEFORE our addAndGet(+size) lands — making inboundBytes transiently negative and
+        // tripping the LOW watermark check on the read path. Incrementing first guarantees the
+        // counter is at least as large as the queued bytes at every observable moment; the
+        // counter can briefly OVER-estimate (we added size, but haven't queued yet) which is
+        // safe — the watermark gate erring conservative protects against direct-memory OOM.
+        long after = inboundBytes.addAndGet(size);
         inbound.offer(buf);
         if (closed) {
             // Race with Processor's close(): drain anything we just queued so we don't leak.
@@ -221,7 +229,6 @@ final class IoUringTransportLayer implements TransportLayer {
             inboundBytes.set(0);
             return;
         }
-        long after = inboundBytes.addAndGet(size);
         // Inbound watermark gate. When the queue crosses the high water mark, flip Netty
         // autoRead off so the kernel stops pushing more bytes to us — TCP's own flow
         // control will throttle the peer. Without this gate, a fast/abusive PLAINTEXT
