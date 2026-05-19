@@ -293,6 +293,32 @@ public class MirrorSourceConnectorTest {
     }
 
     @Test
+    public void testViewConfigsAreNotReplicatedByDefault() {
+        // Topic Views: view.backing.topic / view.cel.predicate / view.offset.mode are security-sensitive.
+        // Replicating them onto a target cluster would either silently materialize the source view there
+        // (granting target-side READ on view to whatever data a target-side topic of the same name happens
+        // to hold) or pre-stage a privilege-escalation channel that target-side R23/R24 gates then have to
+        // reject. Either way they should not flow through MM2 by default.
+        MirrorSourceConnector connector = new MirrorSourceConnector(new SourceAndTarget("source", "target"),
+            new DefaultReplicationPolicy(), x -> true, new DefaultConfigPropertyFilter());
+        ArrayList<ConfigEntry> entries = new ArrayList<>();
+        entries.add(new ConfigEntry("retention.ms", "60000"));
+        entries.add(new ConfigEntry("view.backing.topic", "__consumer_offsets"));
+        entries.add(new ConfigEntry("view.cel.predicate", "true"));
+        entries.add(new ConfigEntry("view.offset.mode", "source_sparse"));
+        Config config = new Config(entries);
+        Config targetConfig = connector.targetConfig(config, true);
+        assertTrue(targetConfig.entries().stream()
+            .anyMatch(x -> x.name().equals("retention.ms")), "should still replicate ordinary topic configs");
+        assertFalse(targetConfig.entries().stream()
+            .anyMatch(x -> x.name().equals("view.backing.topic")), "should not replicate view.backing.topic");
+        assertFalse(targetConfig.entries().stream()
+            .anyMatch(x -> x.name().equals("view.cel.predicate")), "should not replicate view.cel.predicate");
+        assertFalse(targetConfig.entries().stream()
+            .anyMatch(x -> x.name().equals("view.offset.mode")), "should not replicate view.offset.mode");
+    }
+
+    @Test
     @Deprecated
     public void testConfigPropertyFilteringWithAlterConfigs() {
         MirrorSourceConnector connector = new MirrorSourceConnector(new SourceAndTarget("source", "target"),
