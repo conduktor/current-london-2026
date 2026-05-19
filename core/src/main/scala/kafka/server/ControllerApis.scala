@@ -374,11 +374,20 @@ class ControllerApis(
     // surfaces as INVALID_TOPIC_EXCEPTION (the same shape the broker emits at
     // KafkaApis line 347) so a privileged caller sees one refusal per
     // offender instead of a silently-truncated request.
+    //
+    // Principal-aware: a legitimate forwarded tenant request reaches the
+    // controller as `acme.foo` from principal `__tenant_acme.alice`. The
+    // broker has already rewritten the name and validated the listener/
+    // principal binding (#86, #110), so we use `isForeignTenantNamespace`
+    // here — refuse `acme.foo` from `User:admin` (cluster-wide pollution)
+    // or from `__tenant_evil.alice` (cross-tenant pollution) but pass
+    // through when the caller's own tenant owns the prefix.
+    val callerTenant = callerTenantFromPrincipal(request.context.principal.getName)
     val pollutionRejected = new util.ArrayList[CreatableTopicResult]()
     val topicsIter = createTopicsRequest.data.topics().iterator()
     while (topicsIter.hasNext) {
       val t = topicsIter.next()
-      if (isReservedTenantNamespace(t.name())) {
+      if (isForeignTenantNamespace(t.name(), callerTenant)) {
         pollutionRejected.add(new CreatableTopicResult()
           .setName(t.name())
           .setErrorCode(INVALID_TOPIC_EXCEPTION.code)
@@ -1024,22 +1033,37 @@ class ControllerApis(
     dot > 0
   }
 
-  // Outside-in pollution guard for TOPIC-namespace requests. A cluster-wide
-  // admin reaching the CONTROLLER listener directly via
-  // `AdminClient.bootstrap.controllers` (KIP-590) skips every broker-side
+  // Outside-in pollution guard for TOPIC-namespace requests on the controller
+  // listener. A cluster-wide admin reaching the CONTROLLER listener directly
+  // via `AdminClient.bootstrap.controllers` (KIP-590) skips every broker-side
   // outside-in scrub in KafkaApis, and would otherwise mutate tenant topic
   // state (create/delete/alter configs/reassign/elect/...) by naming
-  // `<tenantId>.X` literally. Mirrors KafkaApis.isReservedTenantNamespace —
-  // skip Kafka-internal topics (never tenant-prefixed) and short-circuit
-  // when no tenants are configured (split-mode KRaft is task #114; in
-  // combined mode tenantConfig is populated from server.properties).
-  private def isReservedTenantNamespace(name: String): Boolean = {
+  // `<tenantId>.X` literally.
+  //
+  // Principal-aware by construction: returns true when the topic name
+  // lies in a tenant namespace that does NOT belong to the caller. So the
+  // legitimate forwarded tenant flow — broker rewrites `foo` → `acme.foo`,
+  // envelopes to controller with forwarded principal `__tenant_acme.alice`
+  // — passes through untouched while a cluster-wide admin or a cross-tenant
+  // principal `__tenant_evil.X` attempting `acme.foo` is refused.
+  //
+  // Cross-tenant case: `callerTenant = Some("evil")`, name `acme.foo`. The
+  // name's prefix matches known tenant `acme` but not the caller's tenant,
+  // so the scrub fires. This is the same semantics as
+  // `belongsToCallerTenant` in the delegation-token guards (line 1083) but
+  // expressed in topic-namespace form rather than principal form.
+  private def isForeignTenantNamespace(name: String, callerTenant: Option[String]): Boolean = {
     if (name == null || Topic.isInternal(name)) return false
     val knownTenants = tenantConfig.allTenants
     if (knownTenants.isEmpty) return false
     val it = knownTenants.iterator
     while (it.hasNext) {
-      if (name.startsWith(it.next + ".")) return true
+      val t = it.next()
+      if (name.startsWith(t + ".")) {
+        // Topic IS in tenant `t`'s namespace. Refuse unless the caller's
+        // effective tenant is exactly `t`.
+        return !callerTenant.contains(t)
+      }
     }
     false
   }

@@ -2014,6 +2014,89 @@ class ControllerApisTest {
     verify(controller, never()).createTopics(any(), any(), any())
   }
 
+  @Test
+  def testControllerCreateTopicsAllowsLegitimateForwardedTenantPrincipal(): Unit = {
+    // Must-not-regress: the legitimate forwarded tenant flow places a
+    // *physical* tenant-prefixed name in the metadata-log mutation. A tenant
+    // client sends `CreateTopics("foo")` to its broker listener; KafkaApis
+    // rewrites the name to `acme.foo` and envelopes the request to the
+    // controller with `forwardedPrincipal=__tenant_acme.alice`. The
+    // outside-in scrub must NOT refuse `acme.foo` here — the broker has
+    // already validated the listener/principal binding (#86, #110), so
+    // tenant identity is canonical from the forwarded principal. Refusing
+    // would silently break every tenant CreateTopics.
+    val topics = new CreatableTopicCollection()
+    topics.add(new CreatableTopic().setName("acme.foo").setNumPartitions(1).setReplicationFactor(1.toShort))
+    val createTopicsRequest = new CreateTopicsRequest.Builder(
+      new CreateTopicsRequestData().setTopics(topics)).build()
+    val tenantPrincipal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_acme.alice")
+    val envelopeRequest = kafka.utils.TestUtils.buildEnvelopeRequest(
+      createTopicsRequest, envelopePrincipalSerde, requestChannelMetrics, time.nanoseconds(),
+      forwardedPrincipal = tenantPrincipal,
+      outerPrincipal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    val controller = mock(classOf[Controller])
+    when(controller.createTopics(
+      any(classOf[ControllerRequestContext]),
+      any(classOf[CreateTopicsRequestData]),
+      any(classOf[java.util.Set[String]])))
+      .thenReturn(CompletableFuture.completedFuture(new CreateTopicsResponseData()))
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = tenantConfigBinding("acme", "CONTROLLER"))
+    controllerApis.handle(envelopeRequest, RequestLocal.noCaching())
+
+    // The scrub did NOT refuse: the controller received the create call
+    // with the physical name. Without principal awareness, this assertion
+    // would fire `times(0)` and the legitimate flow would be silently
+    // refused at the controller.
+    val createCaptor: ArgumentCaptor[CreateTopicsRequestData] =
+      ArgumentCaptor.forClass(classOf[CreateTopicsRequestData])
+    verify(controller).createTopics(
+      any(classOf[ControllerRequestContext]),
+      createCaptor.capture(),
+      any(classOf[java.util.Set[String]]))
+    val forwarded = createCaptor.getValue.topics().asScala.map(_.name).toList
+    assertEquals(List("acme.foo"), forwarded,
+      "legitimate tenant CreateTopics must reach controller with its physical name intact")
+  }
+
+  @Test
+  def testControllerCreateTopicsRefusesCrossTenantPrincipalForeignNamespace(): Unit = {
+    // Cross-tenant pollution: a known tenant `evil` (or any `__tenant_*`
+    // principal) tries to create `acme.foo`. Even though the caller is
+    // tenant-namespaced, their tenant id does not match the topic's
+    // namespace prefix — so the scrub must refuse and the controller must
+    // never see the create. Pins the principal-AWARE shape: refusal keys
+    // on (topic-prefix ∈ knownTenants) AND (callerTenant ≠ topic-prefix),
+    // not on "any tenant-prefixed name".
+    val topics = new CreatableTopicCollection()
+    topics.add(new CreatableTopic().setName("acme.foo").setNumPartitions(1).setReplicationFactor(1.toShort))
+    val createTopicsRequest = new CreateTopicsRequest.Builder(
+      new CreateTopicsRequestData().setTopics(topics)).build()
+    val crossTenantPrincipal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_evil.alice")
+    val envelopeRequest = kafka.utils.TestUtils.buildEnvelopeRequest(
+      createTopicsRequest, envelopePrincipalSerde, requestChannelMetrics, time.nanoseconds(),
+      forwardedPrincipal = crossTenantPrincipal,
+      outerPrincipal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    val controller = mock(classOf[Controller])
+    // Configure BOTH tenants so the cross-tenant principal would otherwise
+    // be recognised as a (foreign-to-acme) legitimate tenant. The scrub
+    // must still refuse because the topic prefix names a different tenant.
+    val originals = new java.util.HashMap[String, AnyRef]()
+    originals.put("listener.name.tenant_acme.tenant.id", "acme")
+    originals.put("listener.name.tenant_evil.tenant.id", "evil")
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.from(originals))
+    controllerApis.handle(envelopeRequest, RequestLocal.noCaching())
+
+    verify(controller, never()).createTopics(any(), any(), any())
+  }
+
   @AfterEach
   def tearDown(): Unit = {
     quotasNeverThrottleControllerMutations.shutdown()
