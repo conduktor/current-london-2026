@@ -1015,6 +1015,18 @@ public class ReplicationControlManager {
         if (topic == null) {
             throw new UnknownTopicIdException(UNKNOWN_TOPIC_ID.message());
         }
+        // R39 (Codex Finding #1): refuse to delete a topic that is the active backing for any
+        // view topic. ViewSpec stores the backing by NAME only — letting the delete through
+        // would allow a follow-up CreateTopics with the same name to silently re-bind the
+        // original view to a new topic that the view-creator never authorized, bypassing the
+        // round-23 view-create READ-on-backing gate. The check runs inside the controller
+        // event loop so it is atomic against concurrent IncrementalAlterConfigs that could
+        // re-point views.
+        Set<String> dependentViews = configurationControl.topicsReferencingBackingTopic(topic.name);
+        if (!dependentViews.isEmpty()) {
+            throw new InvalidRequestException("Topic '" + topic.name + "' is the backing for view topic(s) " +
+                dependentViews + ". Delete or re-point those views before deleting the backing topic.");
+        }
         int numPartitions = topic.parts.size();
         log.trace("Deleting topic {} with ID {} and {} partitions", topic.name, id, numPartitions);
         try {

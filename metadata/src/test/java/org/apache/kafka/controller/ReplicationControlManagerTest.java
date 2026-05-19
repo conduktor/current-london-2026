@@ -139,6 +139,7 @@ import static org.apache.kafka.common.protocol.Errors.INELIGIBLE_REPLICA;
 import static org.apache.kafka.common.protocol.Errors.INVALID_PARTITIONS;
 import static org.apache.kafka.common.protocol.Errors.INVALID_REPLICATION_FACTOR;
 import static org.apache.kafka.common.protocol.Errors.INVALID_REPLICA_ASSIGNMENT;
+import static org.apache.kafka.common.protocol.Errors.INVALID_REQUEST;
 import static org.apache.kafka.common.protocol.Errors.INVALID_TOPIC_EXCEPTION;
 import static org.apache.kafka.common.protocol.Errors.NEW_LEADER_ELECTED;
 import static org.apache.kafka.common.protocol.Errors.NONE;
@@ -1548,6 +1549,167 @@ public class ReplicationControlManagerTest {
         assertEquals(singletonMap(topicId, new ApiError(THROTTLING_QUOTA_EXCEEDED, QUOTA_EXCEEDED_IN_TEST_MSG)),
             deleteResult.response());
         assertEquals(0, deleteResult.records().size());
+    }
+
+    /**
+     * R39 (Codex Finding #1): the controller must refuse to delete a topic that is the
+     * active backing for any view topic. ViewSpec stores the backing by NAME only — without
+     * this check, an attacker with DELETE on the backing could delete it, then a separate
+     * principal with CREATE on TOPIC could create a different sensitive topic that happens
+     * to reuse the same name, and the original view's fetch path would silently re-bind to
+     * the new topic. That bypass route never executes a view-create, so it sidesteps the
+     * round-23 view-create READ-on-backing gate entirely.
+     *
+     * The check lives in ReplicationControlManager.deleteTopic (controller event loop) so
+     * it is atomic against concurrent IncrementalAlterConfigs that could re-point views.
+     * Failure mode: INVALID_REQUEST with an operator-readable message naming the dependent
+     * views. The backing topic must remain in metadata (no records produced).
+     */
+    @Test
+    public void testDeleteTopicRejectedWhenTopicIsBackingForActiveView() {
+        ReplicationControlTestContext ctx = new ReplicationControlTestContext.Builder().build();
+        ReplicationControlManager replicationControl = ctx.replicationControl;
+        ctx.registerBrokers(0, 1);
+        ctx.unfenceBrokers(0, 1);
+
+        // Create the backing topic "orders_private" and the view topic "alice_view".
+        CreateTopicsRequestData request = new CreateTopicsRequestData();
+        request.topics().add(new CreatableTopic().setName("orders_private").
+            setNumPartitions(3).setReplicationFactor((short) 2));
+        request.topics().add(new CreatableTopic().setName("alice_view").
+            setNumPartitions(3).setReplicationFactor((short) 2));
+        ControllerRequestContext createCtx = anonymousContextFor(ApiKeys.CREATE_TOPICS);
+        ControllerResult<CreateTopicsResponseData> createResult = replicationControl.createTopics(
+            createCtx, request, new HashSet<>(Arrays.asList("orders_private", "alice_view")));
+        ctx.replay(createResult.records());
+
+        // Mark "alice_view" as a view backed by "orders_private" through configs.
+        ctx.alterTopicConfig("alice_view",
+            ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, "orders_private");
+        ctx.alterTopicConfig("alice_view",
+            ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.region == 'US'");
+
+        // Now attempt to delete the backing topic. The controller must refuse.
+        Uuid backingId = replicationControl.getTopicId("orders_private");
+        ControllerRequestContext deleteCtx = anonymousContextFor(ApiKeys.DELETE_TOPICS);
+        ControllerResult<Map<Uuid, ApiError>> deleteResult = replicationControl.deleteTopics(
+            deleteCtx, Collections.singletonList(backingId));
+
+        ApiError error = deleteResult.response().get(backingId);
+        assertEquals(INVALID_REQUEST, error.error(),
+            "delete of a topic referenced as view.backing.topic must return INVALID_REQUEST");
+        assertNotNull(error.message(), "the rejection should carry an operator-readable reason");
+        assertTrue(error.message().contains("alice_view"),
+            "the error message should name the dependent view (got: " + error.message() + ")");
+        assertTrue(error.message().contains("orders_private"),
+            "the error message should name the backing topic (got: " + error.message() + ")");
+        assertEquals(0, deleteResult.records().size(),
+            "no RemoveTopicRecord should be produced for the rejected delete — the backing must " +
+                "remain in metadata, otherwise replay would still drop it");
+
+        // Sanity check: the backing topic is still present after the rejected delete.
+        ctx.replay(deleteResult.records());
+        assertNotNull(replicationControl.getPartition(backingId, 0),
+            "the backing topic must still exist after the rejected delete");
+    }
+
+    /**
+     * R39 (Codex Finding #1) negative case: a topic that is NOT a backing for any view must
+     * still be deletable. Without this case, a regression that blanket-rejects on any view-
+     * topic-config presence could pass the positive test above.
+     */
+    @Test
+    public void testDeleteTopicSucceedsWhenTopicIsNotABackingForAnyView() {
+        ReplicationControlTestContext ctx = new ReplicationControlTestContext.Builder().build();
+        ReplicationControlManager replicationControl = ctx.replicationControl;
+        ctx.registerBrokers(0, 1);
+        ctx.unfenceBrokers(0, 1);
+
+        CreateTopicsRequestData request = new CreateTopicsRequestData();
+        request.topics().add(new CreatableTopic().setName("orders_private").
+            setNumPartitions(3).setReplicationFactor((short) 2));
+        request.topics().add(new CreatableTopic().setName("alice_view").
+            setNumPartitions(3).setReplicationFactor((short) 2));
+        request.topics().add(new CreatableTopic().setName("unrelated").
+            setNumPartitions(2).setReplicationFactor((short) 2));
+        ControllerRequestContext createCtx = anonymousContextFor(ApiKeys.CREATE_TOPICS);
+        ControllerResult<CreateTopicsResponseData> createResult = replicationControl.createTopics(
+            createCtx, request, new HashSet<>(Arrays.asList("orders_private", "alice_view", "unrelated")));
+        ctx.replay(createResult.records());
+
+        // alice_view → orders_private. unrelated is not a backing for anything.
+        ctx.alterTopicConfig("alice_view",
+            ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, "orders_private");
+        ctx.alterTopicConfig("alice_view",
+            ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.region == 'US'");
+
+        // Delete "unrelated" — must succeed.
+        Uuid unrelatedId = replicationControl.getTopicId("unrelated");
+        ControllerRequestContext deleteCtx = anonymousContextFor(ApiKeys.DELETE_TOPICS);
+        ControllerResult<Map<Uuid, ApiError>> deleteResult = replicationControl.deleteTopics(
+            deleteCtx, Collections.singletonList(unrelatedId));
+        assertEquals(NONE, deleteResult.response().get(unrelatedId).error(),
+            "delete of a topic not referenced as anyone's backing must succeed");
+        assertEquals(1, deleteResult.records().size(),
+            "a successful delete must emit exactly one RemoveTopicRecord");
+
+        // Also: deleting the VIEW topic itself (alice_view) must succeed — it isn't a backing
+        // for anything, only its own view-config points outward. The R39 check only blocks
+        // deletion of topics that appear as the right-hand side of some other view's
+        // view.backing.topic.
+        ctx.replay(deleteResult.records());
+        Uuid viewId = replicationControl.getTopicId("alice_view");
+        ControllerResult<Map<Uuid, ApiError>> deleteViewResult = replicationControl.deleteTopics(
+            deleteCtx, Collections.singletonList(viewId));
+        assertEquals(NONE, deleteViewResult.response().get(viewId).error(),
+            "deleting the view topic itself must be allowed — only deletion of a backing-of-" +
+                "live-view is gated");
+        assertEquals(1, deleteViewResult.records().size());
+    }
+
+    /**
+     * R39 (Codex Finding #1) bypass-attempt: after the view that referenced the backing has
+     * been deleted (and its config tombstoned), the backing must once again be deletable.
+     * This pins that the gate keys off live config state, not stale records — otherwise an
+     * operator who legitimately decommissions a view would be unable to clean up its
+     * backing afterwards.
+     */
+    @Test
+    public void testDeleteBackingSucceedsAfterDependentViewIsDeleted() {
+        ReplicationControlTestContext ctx = new ReplicationControlTestContext.Builder().build();
+        ReplicationControlManager replicationControl = ctx.replicationControl;
+        ctx.registerBrokers(0, 1);
+        ctx.unfenceBrokers(0, 1);
+
+        CreateTopicsRequestData request = new CreateTopicsRequestData();
+        request.topics().add(new CreatableTopic().setName("orders_private").
+            setNumPartitions(3).setReplicationFactor((short) 2));
+        request.topics().add(new CreatableTopic().setName("alice_view").
+            setNumPartitions(3).setReplicationFactor((short) 2));
+        ControllerRequestContext createCtx = anonymousContextFor(ApiKeys.CREATE_TOPICS);
+        ControllerResult<CreateTopicsResponseData> createResult = replicationControl.createTopics(
+            createCtx, request, new HashSet<>(Arrays.asList("orders_private", "alice_view")));
+        ctx.replay(createResult.records());
+
+        ctx.alterTopicConfig("alice_view",
+            ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, "orders_private");
+
+        // Delete the view first — view-config tombstone is part of the delete records via
+        // configurationControl.deleteTopicConfigs() in replay().
+        Uuid viewId = replicationControl.getTopicId("alice_view");
+        ControllerRequestContext deleteCtx = anonymousContextFor(ApiKeys.DELETE_TOPICS);
+        ControllerResult<Map<Uuid, ApiError>> deleteViewResult = replicationControl.deleteTopics(
+            deleteCtx, Collections.singletonList(viewId));
+        assertEquals(NONE, deleteViewResult.response().get(viewId).error());
+        ctx.replay(deleteViewResult.records());
+
+        // Now the backing can be deleted — no live view references it any more.
+        Uuid backingId = replicationControl.getTopicId("orders_private");
+        ControllerResult<Map<Uuid, ApiError>> deleteBackingResult = replicationControl.deleteTopics(
+            deleteCtx, Collections.singletonList(backingId));
+        assertEquals(NONE, deleteBackingResult.response().get(backingId).error(),
+            "once the dependent view is gone, the backing must be deletable");
+        assertEquals(1, deleteBackingResult.records().size());
     }
 
     @Test

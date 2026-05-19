@@ -36,6 +36,7 @@ import org.apache.kafka.server.common.EligibleLeaderReplicasVersion;
 import org.apache.kafka.server.mutable.BoundedList;
 import org.apache.kafka.server.policy.AlterConfigPolicy;
 import org.apache.kafka.server.policy.AlterConfigPolicy.RequestMetadata;
+import org.apache.kafka.server.views.ViewTopicConfig;
 import org.apache.kafka.timeline.SnapshotRegistry;
 import org.apache.kafka.timeline.TimelineHashMap;
 import org.apache.kafka.timeline.TimelineHashSet;
@@ -46,12 +47,14 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.Consumer;
 
 import static org.apache.kafka.clients.admin.AlterConfigOp.OpType.APPEND;
@@ -714,6 +717,34 @@ public class ConfigurationControlManager {
     Map<String, String> currentTopicConfig(String topicName) {
         Map<String, String> result = configData.get(new ConfigResource(Type.TOPIC, topicName));
         return (result == null) ? Collections.emptyMap() : result;
+    }
+
+    /**
+     * Return the names of topics whose `view.backing.topic` config currently points to
+     * {@code backingTopicName}. The lookup runs inside the controller event loop against
+     * the live, atomic {@link #configData} state.
+     *
+     * <p>R39 (Codex Finding #1): {@link ReplicationControlManager#deleteTopic} uses this
+     * to refuse deletion of a topic that is the active backing of any view. {@code ViewSpec}
+     * stores the backing by NAME only — without this check, a principal with DELETE on the
+     * backing could delete it, then a separate principal with CREATE on TOPIC could create
+     * a different sensitive topic that happens to reuse the same name, and the original
+     * view's fetch path would silently re-bind to the new topic. That bypasses the
+     * round-23 view-create READ-on-backing gate, since the bypass route never executes a
+     * view-create at all.
+     */
+    Set<String> topicsReferencingBackingTopic(String backingTopicName) {
+        if (backingTopicName == null) return Collections.emptySet();
+        Set<String> result = new HashSet<>();
+        for (Entry<ConfigResource, TimelineHashMap<String, String>> entry : configData.entrySet()) {
+            ConfigResource resource = entry.getKey();
+            if (resource.type() != Type.TOPIC) continue;
+            String configured = entry.getValue().get(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG);
+            if (configured != null && backingTopicName.equals(configured.trim())) {
+                result.add(resource.name());
+            }
+        }
+        return result;
     }
 
     // Visible to test
