@@ -26,9 +26,14 @@ import java.util.Objects;
  * reads sneak through.
  *
  * <p>Why this exists: Jetty's default {@link jakarta.servlet.http.HttpServletRequest#getInputStream()} has no built-in
- * cap, and Jackson's {@code readTree} consumes the entire stream into memory before it parses. Without this wrapper a
- * single 1 GiB POST can OOM the broker process before any Kafka admission control runs. The bridge runs inside the
- * broker; a misbehaving HTTP client must not be able to take the binary protocol down with it.
+ * cap, and Jackson's {@code readTree} builds a {@link com.fasterxml.jackson.databind.JsonNode} tree that grows linearly
+ * with the input size — each token in the wire bytes allocates one or more node objects in the tree. Jackson itself
+ * does NOT pre-buffer the input ({@code UTF8StreamJsonParser._loadMore} reads through an ~8 KiB recycled byte buffer)
+ * and {@link BridgeJsonMappers#MAX_DOCUMENT_LENGTH} would catch the byte count in production, but the cap here is the
+ * upstream defence: a 1 GiB POST against any future code path that used a non-hardened mapper would grow the parsed
+ * tree until OOM, and the cap fails such a request with an identifiable {@link BodyTooLargeException} (mapped to 413)
+ * rather than an unstructured {@code OutOfMemoryError}. The bridge runs inside the broker; a misbehaving HTTP client
+ * must not be able to take the binary protocol down with it.
  *
  * <p>The cap is INCLUSIVE — exactly {@code limit} bytes read are fine; byte {@code limit + 1} fails. We pre-validate
  * a negative limit at construction so callers can't pass {@code -1} and then be surprised by a runtime exception

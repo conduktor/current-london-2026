@@ -322,13 +322,18 @@ public final class WsStreamer {
                 return true;
             }
             if (!credits.compareAndSet(c, c - 1)) {
-                // Another thread (a concurrent grant or another drain run) raced us on credits. Re-read.
+                // A concurrent grantCredits CAS raced us on the credit counter. The draining mutex
+                // (drainAndMaybeFetch's CAS on `draining`) keeps any other drain body out, so the
+                // racing thread is necessarily a grant, not another drain. Re-read and retry.
                 continue;
             }
             FetchResponseFormatter.FetchedRecord r = buffer.poll();
             if (r == null) {
-                // Race: between our isEmpty check and poll, another drain took the record. Refund the
-                // credit we reserved and exit — there is nothing left to deliver right now.
+                // close()/closeOnFailure() called buffer.clear() between our isEmpty check and the
+                // poll — those are the only producers of buffer-emptiness besides our own polling,
+                // because the draining mutex serialises all drain bodies. Refund the credit we
+                // reserved and exit; the next drain iteration (gated on closed.get()) will observe
+                // the close and bail.
                 credits.incrementAndGet();
                 return true;
             }
