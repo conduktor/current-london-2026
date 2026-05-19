@@ -70,6 +70,34 @@ final class CelLimits {
      * defensible legitimate use; rules approaching this cap are almost
      * certainly trying to bypass the engine's other bounds via a giant
      * string/regex literal and should be rewritten as a coarser filter.
+     *
+     * <p><b>R34-C-2 audit (pushback, verified not-a-finding):</b> the cap is
+     * deliberately measured in {@code char} units, not UTF-8 bytes. Asymmetric
+     * with {@code RuleJsonCodec.MAX_RULE_ID_BYTES=256} (which IS byte-based)
+     * — and that asymmetry is the right answer because the two caps defend
+     * different threat axes:
+     * <ul>
+     *   <li>{@code MAX_RULE_ID_BYTES} defends <b>log-amplification</b> on the
+     *       DENY hot path (every denied request writes the id verbatim to the
+     *       broker log; log bytes are UTF-8 bytes; hence byte cap). See R23
+     *       adversarial #235.</li>
+     *   <li>{@code MAX_EXPR_LEN} defends <b>lexer Token allocation</b>: the
+     *       lexer iterates the source by {@code char} and produces ~1 Token
+     *       per character span. The transient allocation cost is
+     *       proportional to {@code source.length()}, not UTF-8 bytes —
+     *       a 8192-char CJK source allocates the same ~8192 Tokens as an
+     *       8192-char ASCII source. The byte width of each char never enters
+     *       the lexer's working-set estimate.</li>
+     * </ul>
+     * <p>The byte axis is independently bounded by
+     * {@code RuleJsonCodec.MAX_ENVELOPE_BYTES=65 KB} at the codec intake — a
+     * pathological 8192-char CJK source (3 UTF-8 bytes/char ≈ 24 KB plus
+     * JSON envelope overhead ≈ 25 KB total) sits comfortably under that cap.
+     * A multi-byte source that exceeds 65 KB on the wire is rejected by the
+     * envelope cap before it can reach the CEL compiler at all, so the
+     * "multibyte source exceeds byte budget" framing does not describe a
+     * reachable attack: the envelope intake gate trips first. Pinned by
+     * {@code RuleJsonCodecTest.multibyteCelSourceAdmittedByCharCapStaysUnderEnvelopeByteCap}.
      */
     static final int MAX_EXPR_LEN = 8192;
 

@@ -1285,4 +1285,98 @@ public class RuleJsonCodecTest {
         Rule r = RuleJsonCodec.decode("fwd", json.getBytes(StandardCharsets.UTF_8));
         assertEquals(RuleAction.DENY, r.action());
     }
+
+    @Test
+    public void multibyteCelSourceAdmittedByCharCapStaysUnderEnvelopeByteCap() {
+        // R34-C-2 pushback pin: the audit framing was "MAX_EXPR_LEN measured
+        // in UTF-16 chars not bytes — multibyte CEL source exceeds byte
+        // budget". The pushback verdict is: there is no byte budget on the
+        // compiler side (the cap defends lexer Token allocation, which is
+        // char-proportional). The independent byte cap lives at the codec:
+        // MAX_ENVELOPE_BYTES=65 KB rejects any wire envelope larger than
+        // that — including envelopes whose `when` field is multibyte-amplified.
+        //
+        // This test pins the contract: a pathological CEL source filled with
+        // BMP CJK codepoints (each costing 3 UTF-8 bytes — the worst case for
+        // BMP) sized just under MAX_EXPR_LEN admits cleanly through both
+        // gates, and the resulting envelope is well under MAX_ENVELOPE_BYTES.
+        // If a future change tightened the envelope cap toward the
+        // 3× MAX_EXPR_LEN frontier, this test would catch the regression by
+        // failing the assertion on envelope byte size.
+        //
+        // Frame: 'request.topic == "<payload>"' uses 19 ASCII chars; the
+        // payload occupies the rest. 8100 leaves slack under MAX_EXPR_LEN
+        // (8192) so the chars budget is comfortably satisfied; 8100 CJK
+        // codepoints in UTF-8 = 24300 bytes. With JSON envelope overhead
+        // (~70 bytes for the surrounding {"apiKeys":["FETCH"],"action":
+        // "DENY","when":"...","errorCode":42}) the wire image is ~24.4 KB.
+        // That sits at ~37% of MAX_ENVELOPE_BYTES (65536), confirming the
+        // two caps do not need to share a byte axis — the envelope cap has
+        // ~3× headroom over the worst-case CJK-multiplied source.
+        //
+        // CEL String literals admit non-ASCII codepoints (R28 #247 only
+        // restricted identifiers/numerics to ASCII), so building a valid
+        // CEL source with 8100 CJK chars inside a string literal exercises
+        // both the lexer's multibyte tolerance and the codec's byte intake.
+        char cjk = '我'; // 我 — BMP CJK Unified Ideograph, 3 UTF-8 bytes
+        StringBuilder payload = new StringBuilder(8100);
+        for (int i = 0; i < 8100; i++) {
+            payload.append(cjk);
+        }
+        String when = "request.topic == \"" + payload + "\"";
+        // Sanity-check the char-axis frame BEFORE handing to Jackson — if
+        // anyone tightens MAX_EXPR_LEN below this, the test premise is
+        // gone and the assertion below would pass for the wrong reason.
+        assertTrue(when.length() < 8192,
+            "test premise: source must stay under MAX_EXPR_LEN to exercise the "
+                + "admit-at-compiler / cap-at-envelope contract; len=" + when.length());
+
+        // The string literal in CEL source is itself JSON-quoted in the
+        // envelope, so escape the embedded quote pair via Jackson's
+        // ObjectNode writer rather than hand-assembling. (Hand-assembly
+        // would also work for ASCII-only payloads but is fragile here.)
+        com.fasterxml.jackson.databind.ObjectMapper m =
+            new com.fasterxml.jackson.databind.ObjectMapper();
+        com.fasterxml.jackson.databind.node.ObjectNode root = m.createObjectNode();
+        com.fasterxml.jackson.databind.node.ArrayNode keys = root.putArray("apiKeys");
+        keys.add("FETCH");
+        root.put("action", "DENY");
+        root.put("when", when);
+        root.put("errorCode", 42);
+        byte[] wire;
+        try {
+            wire = m.writeValueAsBytes(root);
+        } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+            throw new AssertionError("test setup: failed to build envelope", e);
+        }
+
+        // The byte-axis premise — wire image must be under MAX_ENVELOPE_BYTES
+        // by a clear margin so the contract documented on CelLimits.MAX_EXPR_LEN
+        // is structurally pinned. If this assertion ever fires, either
+        // MAX_ENVELOPE_BYTES has been tightened toward the 3×-CJK frontier
+        // (in which case the CelLimits.MAX_EXPR_LEN javadoc pushback needs to
+        // be revisited) or the test source has grown beyond the safety margin.
+        assertTrue(wire.length < RuleJsonCodec.MAX_ENVELOPE_BYTES,
+            "8100-char CJK envelope must sit comfortably under MAX_ENVELOPE_BYTES — "
+                + "wire.length=" + wire.length + " MAX_ENVELOPE_BYTES="
+                + RuleJsonCodec.MAX_ENVELOPE_BYTES);
+        // Positive headroom check: expect at least 30% of the envelope cap
+        // free, so the cap is structurally not at risk from the worst-case
+        // 3-bytes-per-char amplification on a near-full-CEL source.
+        assertTrue(wire.length < (RuleJsonCodec.MAX_ENVELOPE_BYTES * 7) / 10,
+            "wire bytes must leave >=30% headroom under envelope cap to keep the "
+                + "MAX_EXPR_LEN(char-axis) / MAX_ENVELOPE_BYTES(byte-axis) "
+                + "separation structurally robust: wire.length=" + wire.length);
+
+        // Codec must accept the envelope and round-trip it: the CEL source's
+        // multibyte content must survive intake and the resulting Rule's
+        // whenSource must equal the input verbatim. The CEL compiler accepts
+        // because the CJK chars live inside a string literal (R28 #247 only
+        // restricted identifiers).
+        Rule r = RuleJsonCodec.decode("multibyte-cjk", wire);
+        assertEquals(when, r.whenSource(),
+            "whenSource() must round-trip the multibyte source verbatim — "
+                + "any silent transcoding here would invalidate the audit "
+                + "premise that bytes-on-wire match chars-in-source-modulo-encoding");
+    }
 }
