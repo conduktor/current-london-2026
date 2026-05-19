@@ -27,6 +27,8 @@ import org.apache.kafka.network.iouring.IoUringSelector;
 import org.apache.kafka.network.iouring.IoUringServerListener;
 import org.apache.kafka.network.iouring.IoUringSupport;
 
+import org.junit.jupiter.api.Test;
+
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
@@ -122,6 +124,34 @@ public final class SelectorThroughputBenchmark {
     /** Per-thread latency sample buffer size — rotates as a ring. */
     private static final int LATENCY_RING_SIZE = 4096;
 
+    /**
+     * Gradle-invocable entry point. The harness must NOT run in normal
+     * {@code :server:test} executions (a 10k-connection benchmark would be a
+     * 25-second test that consumes the test JVM); the {@code bench.run} system
+     * property gates it. Per-knob {@code bench.*} properties become CLI args of
+     * the form {@link #main(String[])} expects, so the same code path drives
+     * both gradle and a bare {@code java} invocation.
+     */
+    @Test
+    void runIfRequested() throws Exception {
+        if (!Boolean.getBoolean("bench.run")) {
+            return;
+        }
+        java.util.List<String> args = new java.util.ArrayList<>();
+        addPropertyArg(args, "bench.backend", "--backend=");
+        addPropertyArg(args, "bench.connections", "--connections=");
+        addPropertyArg(args, "bench.threads", "--threads=");
+        addPropertyArg(args, "bench.payload", "--payload=");
+        addPropertyArg(args, "bench.warmupMs", "--warmupMs=");
+        addPropertyArg(args, "bench.durationMs", "--durationMs=");
+        main(args.toArray(new String[0]));
+    }
+
+    private static void addPropertyArg(java.util.List<String> args, String prop, String prefix) {
+        String v = System.getProperty(prop);
+        if (v != null && !v.isEmpty()) args.add(prefix + v);
+    }
+
     public static void main(String[] args) throws Exception {
         Config cfg = Config.parse(args);
         System.out.printf("benchmark config: backend=%s, connections=%d, threads=%d, " +
@@ -181,8 +211,14 @@ public final class SelectorThroughputBenchmark {
     /** Echo loop for the io_uring backend: every completedReceive triggers a send of the same bytes. */
     private static void ioUringEchoLoop(IoUringSelector selector, AtomicBoolean stop) {
         try {
+            long iter = 0;
+            long lastLog = System.nanoTime();
+            long totalRecv = 0;
+            long totalAccepts = 0;
             while (!stop.get()) {
                 selector.poll(50);
+                totalAccepts += selector.connected().size();
+                int thisPollRecv = 0;
                 for (NetworkReceive recv : selector.completedReceives()) {
                     String id = recv.source();
                     ByteBuffer payload = recv.payload();
@@ -190,6 +226,14 @@ public final class SelectorThroughputBenchmark {
                     copy.put(payload);
                     copy.flip();
                     selector.send(new NetworkSend(id, ByteBufferSend.sizePrefixed(copy)));
+                    thisPollRecv++;
+                }
+                totalRecv += thisPollRecv;
+                iter++;
+                if (System.nanoTime() - lastLog > 1_000_000_000L) {
+                    System.err.printf("[iouring-echo] iter=%d totalAccepts=%d totalRecv=%d disconnected=%d%n",
+                        iter, totalAccepts, totalRecv, selector.disconnected().size());
+                    lastLog = System.nanoTime();
                 }
                 selector.clearCompletedReceives();
                 selector.clearCompletedSends();
