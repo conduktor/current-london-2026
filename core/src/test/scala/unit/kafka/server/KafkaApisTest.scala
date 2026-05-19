@@ -2463,6 +2463,140 @@ class KafkaApisTest extends Logging {
     assertEquals(expectedErrors, markersResponse.errorsByProducerId.get(1L))
   }
 
+  @Test
+  def testWriteTxnMarkersClusterWideListenerRefusesReservedNamespacePartitions(): Unit = {
+    // #152 — WriteTxnMarkers is a coordinator→leader RPC that bypasses every
+    // request-side rewrite: the caller chooses the producerId, the
+    // coordinatorEpoch, AND the target TopicPartition list. The handler then
+    // calls `replicaManager.appendRecords(internalTopicsAllowed=true)` with
+    // those partitions as-is. Without the per-partition reserved-namespace
+    // refusal, a cluster admin holding ALTER:CLUSTER or CLUSTER_ACTION on the
+    // regular client listener could plant ABORT markers in `acme.orders-0`
+    // and erase tenant-committed records (read-committed consumers skip
+    // aborted records), or plant COMMIT markers to expose pending state.
+    //
+    // The fix refuses tenant-namespace partitions per-element with
+    // TOPIC_AUTHORIZATION_FAILED on every non-inter-broker listener; this
+    // test pins that behaviour and asserts the good partition still proceeds
+    // (the bad one must NOT short-circuit the rest of the batch).
+    val tenantPartition = new TopicPartition("acme.orders", 0)
+    val normalPartition = new TopicPartition("t", 0)
+    val (_, request) = createWriteTxnMarkersRequest(asList(tenantPartition, normalPartition))
+    val expectedErrors = Map(
+      tenantPartition -> Errors.TOPIC_AUTHORIZATION_FAILED,
+      normalPartition -> Errors.NONE).asJava
+
+    val capturedResponse: ArgumentCaptor[WriteTxnMarkersResponse] =
+      ArgumentCaptor.forClass(classOf[WriteTxnMarkersResponse])
+    val responseCallback: ArgumentCaptor[Map[TopicPartition, PartitionResponse] => Unit] =
+      ArgumentCaptor.forClass(classOf[Map[TopicPartition, PartitionResponse] => Unit])
+    val entriesCaptor: ArgumentCaptor[Map[TopicPartition, MemoryRecords]] =
+      ArgumentCaptor.forClass(classOf[Map[TopicPartition, MemoryRecords]])
+
+    // The tenant partition must NEVER reach onlinePartition; only the normal
+    // one does. If the namespace guard accidentally swallowed both, the
+    // verify(onlinePartition).times(1) below would catch the regression.
+    when(replicaManager.onlinePartition(normalPartition))
+      .thenReturn(Some(mock(classOf[Partition])))
+
+    val requestLocal = RequestLocal.withThreadConfinedCaching
+    when(replicaManager.appendRecords(anyLong,
+      anyShort,
+      ArgumentMatchers.eq(true),
+      ArgumentMatchers.eq(AppendOrigin.COORDINATOR),
+      entriesCaptor.capture(),
+      responseCallback.capture(),
+      any(),
+      any(),
+      ArgumentMatchers.eq(requestLocal),
+      any(),
+      any()
+    )).thenAnswer(_ => responseCallback.getValue.apply(Map(normalPartition -> new PartitionResponse(Errors.NONE))))
+
+    // Tenant must be bound for the structural namespace check to fire
+    // (`isReservedTenantNamespace` short-circuits to false when
+    // `tenantConfig.allTenants.isEmpty`). Default test listener is PLAINTEXT
+    // == config.interBrokerListenerName, so we route the request through
+    // EXTERNAL_SASL to model "cluster admin on a non-inter-broker listener".
+    val attackerListener = new ListenerName("EXTERNAL_SASL")
+    val attackerRequest = buildRequest(
+      request.body[WriteTxnMarkersRequest],
+      listenerName = attackerListener,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "cluster-admin"))
+
+    kafkaApis = createKafkaApis(
+      authorizer = None,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleWriteTxnMarkersRequest(attackerRequest, requestLocal)
+
+    verify(requestChannel).sendResponse(
+      ArgumentMatchers.eq(attackerRequest),
+      capturedResponse.capture(),
+      ArgumentMatchers.eq(None)
+    )
+    val markersResponse = capturedResponse.getValue
+    assertEquals(expectedErrors, markersResponse.errorsByProducerId.get(1L))
+
+    // Defence-in-depth: `appendRecords` must be invoked, and its entries map
+    // must contain ONLY the normal partition. If the tenant partition leaked
+    // through, this would catch it.
+    val capturedEntries = entriesCaptor.getValue
+    assertEquals(Set(normalPartition), capturedEntries.keySet,
+      s"appendRecords must not see the tenant-namespace partition; saw ${capturedEntries.keySet}")
+
+    // And: onlinePartition must never be called for the tenant partition.
+    verify(replicaManager, never()).onlinePartition(tenantPartition)
+  }
+
+  @Test
+  def testWriteTxnMarkersInterBrokerListenerProceedsOnTenantPartitions(): Unit = {
+    // #152 complement — the legitimate transaction coordinator path. The
+    // coordinator issues WriteTxnMarkers over `config.interBrokerListenerName`
+    // (PLAINTEXT in the test broker) to materialise commit/abort markers in
+    // the tenant's own partitions on behalf of the tenant's EndTxn. That
+    // path MUST be preserved or transactional writes by tenants would never
+    // complete. Same request shape as the attacker test; only the listener
+    // differs.
+    val tenantPartition = new TopicPartition("acme.orders", 0)
+    val (_, request) = createWriteTxnMarkersRequest(asList(tenantPartition))
+    val expectedErrors = Map(tenantPartition -> Errors.NONE).asJava
+
+    val capturedResponse: ArgumentCaptor[WriteTxnMarkersResponse] =
+      ArgumentCaptor.forClass(classOf[WriteTxnMarkersResponse])
+    val responseCallback: ArgumentCaptor[Map[TopicPartition, PartitionResponse] => Unit] =
+      ArgumentCaptor.forClass(classOf[Map[TopicPartition, PartitionResponse] => Unit])
+
+    when(replicaManager.onlinePartition(tenantPartition))
+      .thenReturn(Some(mock(classOf[Partition])))
+
+    val requestLocal = RequestLocal.withThreadConfinedCaching
+    when(replicaManager.appendRecords(anyLong,
+      anyShort,
+      ArgumentMatchers.eq(true),
+      ArgumentMatchers.eq(AppendOrigin.COORDINATOR),
+      any(),
+      responseCallback.capture(),
+      any(),
+      any(),
+      ArgumentMatchers.eq(requestLocal),
+      any(),
+      any()
+    )).thenAnswer(_ => responseCallback.getValue.apply(Map(tenantPartition -> new PartitionResponse(Errors.NONE))))
+
+    kafkaApis = createKafkaApis(
+      authorizer = None,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleWriteTxnMarkersRequest(request, requestLocal)
+
+    verify(requestChannel).sendResponse(
+      ArgumentMatchers.eq(request),
+      capturedResponse.capture(),
+      ArgumentMatchers.eq(None)
+    )
+    val markersResponse = capturedResponse.getValue
+    assertEquals(expectedErrors, markersResponse.errorsByProducerId.get(1L))
+  }
+
   @ParameterizedTest
   @ValueSource(strings = Array("ALTER", "CLUSTER_ACTION"))
   def shouldAppendToLogOnWriteTxnMarkersWhenCorrectMagicVersion(allowedAclOperation: String): Unit = {

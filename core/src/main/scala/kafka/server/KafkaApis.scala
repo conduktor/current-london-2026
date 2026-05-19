@@ -3436,6 +3436,28 @@ class KafkaApis(val requestChannel: RequestChannel,
     // be nice to have only one append to the log. This requires pushing the building of the control records
     // into Log so that we only append those having a valid producer epoch, and exposing a new appendControlRecord
     // API in ReplicaManager. For now, we've done the simpler approach
+
+    // #152: WriteTxnMarkers is a coordinator→leader RPC that bypasses every
+    // request-side rewrite: the caller chooses producerId, coordinatorEpoch
+    // AND the target TopicPartition list, and the handler `appendRecords` with
+    // `internalTopicsAllowed=true`. On the legitimate path the transaction
+    // coordinator issues the request over the inter-broker listener with the
+    // inter-broker principal; that path MUST be preserved because the
+    // coordinator legitimately writes commit/abort markers into tenant
+    // partitions on behalf of the tenant's own EndTxn. Outside the
+    // inter-broker listener, any caller — a cluster admin holding ALTER:CLUSTER
+    // or CLUSTER_ACTION, a service account on the regular client listener —
+    // could otherwise plant ABORT markers into `acme.orders-0` and erase
+    // tenant-committed records (consumers in read-committed isolation would
+    // skip them), or plant COMMIT markers and expose uncommitted state. Refuse
+    // reserved-namespace partitions per-element with TOPIC_AUTHORIZATION_FAILED,
+    // same shape as a regular ACL deny. The structural namespace check covers
+    // every tenant prefix, including unbound ones (defends against pre-binding
+    // pollution).
+    val writeTxnMarkersInterBroker = {
+      val ibl = config.interBrokerListenerName
+      ibl != null && ibl == request.context.listenerName
+    }
     var skippedMarkers = 0
     for (marker <- markers.asScala) {
       val producerId = marker.producerId
@@ -3443,11 +3465,15 @@ class KafkaApis(val requestChannel: RequestChannel,
 
       val currentErrors = new ConcurrentHashMap[TopicPartition, Errors]()
       marker.partitions.forEach { partition =>
-        replicaManager.onlinePartition(partition) match {
-          case Some(_)  =>
-            partitionsWithCompatibleMessageFormat += partition
-          case None =>
-            currentErrors.put(partition, Errors.UNKNOWN_TOPIC_OR_PARTITION)
+        if (!writeTxnMarkersInterBroker && isReservedTenantNamespace(partition.topic)) {
+          currentErrors.put(partition, Errors.TOPIC_AUTHORIZATION_FAILED)
+        } else {
+          replicaManager.onlinePartition(partition) match {
+            case Some(_)  =>
+              partitionsWithCompatibleMessageFormat += partition
+            case None =>
+              currentErrors.put(partition, Errors.UNKNOWN_TOPIC_OR_PARTITION)
+          }
         }
       }
 
