@@ -2995,10 +2995,27 @@ class KafkaApis(val requestChannel: RequestChannel,
             // eventual WriteTxnMarkers writes a COMMIT/ABORT control record onto the
             // backing partition — and per PROMPT.md a marker on the backing commits ACROSS
             // every logical topic sharing that partition, corrupting every other tenant's
-            // transactional view. Pin this as INVALID_TOPIC_EXCEPTION so the producer sees
-            // a clear, non-retriable error at the topic level, mirroring the produce-side
-            // backing rejection.
-            nonExistingTopicErrors += topicPartition -> Errors.INVALID_TOPIC_EXCEPTION
+            // transactional view. Reject so the txn coordinator never sees the backing
+            // partition, mirroring the produce-side backing rejection.
+            //
+            // r25 BLOCKER #253 — return UNKNOWN_TOPIC_OR_PARTITION (same code as the
+            // genuinely-unknown branch below) rather than a distinguishing
+            // INVALID_TOPIC_EXCEPTION. A principal holding a wildcard ACL (e.g. Topic:*)
+            // passes the auth gate above for any name they probe, so an
+            // INVALID_TOPIC_EXCEPTION (backing) vs UNKNOWN_TOPIC_OR_PARTITION (unknown)
+            // vs INVALID_TXN_STATE (logical) asymmetry let them enumerate the declared
+            // backing-topic set one probe at a time — the same existence oracle r23 #245
+            // closed at OffsetCommit. We collapse ONLY the backing branch with the unknown
+            // branch: backing names are broker-internal secrets that MUST NEVER surface
+            // to clients (filtered out of METADATA at KafkaApis.scala:1798). Logical names
+            // are NOT secret — METADATA(isAllTopics) explicitly includes them via
+            // {@code allLogicalTopicNames}, so the logical branch keeps INVALID_TXN_STATE
+            // (see below) to give a misconfigured transactional producer a clear,
+            // fatal-non-retriable signal that v1 logical topics are non-transactional;
+            // collapsing logical→UNKNOWN would mislead the producer into infinite
+            // metadata-refresh retries on a name that DOES exist and which they can see
+            // in their own Metadata view.
+            nonExistingTopicErrors += topicPartition -> Errors.UNKNOWN_TOPIC_OR_PARTITION
           else if (concentrationKernel.isLogicalTopic(topicPartition.topic))
             // r19 ADV-A BLOCKER #140 (logical side): logical topics are non-transactional
             // in v1 — the produce path already rejects transactional batches at
@@ -3160,13 +3177,30 @@ class KafkaApis(val requestChannel: RequestChannel,
           // logical tenants. Allowing a transactional offset commit against the backing
           // partition smuggles the backing partition into __consumer_offsets via the
           // tx-staged offsets path — and v1 has no logical-aware end-txn / abort logic to
-          // clear it. Pin this as INVALID_TOPIC_EXCEPTION (non-retriable) so the producer
-          // sees a clear, topic-level failure, mirroring the produce-side backing
-          // rejection at :553 and the AddPartitionsToTxn rejection landed in #140.
-          // Check runs AFTER authz so unauthorized callers still see
-          // TOPIC_AUTHORIZATION_FAILED first (no-enumeration-oracle posture).
+          // clear it. Reject so the group coordinator never sees the backing partition,
+          // mirroring the produce-side backing rejection at :553 and the
+          // AddPartitionsToTxn rejection landed in #140. Check runs AFTER authz so
+          // unauthorized callers still see TOPIC_AUTHORIZATION_FAILED first
+          // (no-enumeration-oracle posture).
+          //
+          // r25 BLOCKER #254 — return UNKNOWN_TOPIC_OR_PARTITION (same code as the
+          // genuinely-unknown branch below) rather than a distinguishing
+          // INVALID_TOPIC_EXCEPTION. A principal holding a wildcard ACL (e.g. Topic:*)
+          // passes the auth gate above for any name they probe, so an
+          // INVALID_TOPIC_EXCEPTION (backing) vs UNKNOWN_TOPIC_OR_PARTITION (unknown)
+          // vs INVALID_TXN_STATE (logical) asymmetry let them enumerate the declared
+          // backing-topic set one probe at a time — the same existence oracle r23 #245
+          // closed at OffsetCommit. We collapse ONLY the backing branch with the unknown
+          // branch: backing names are broker-internal secrets that MUST NEVER surface
+          // to clients (filtered out of METADATA at KafkaApis.scala:1798). Logical names
+          // are NOT secret — METADATA(isAllTopics) explicitly includes them via
+          // {@code allLogicalTopicNames}, so the logical branch keeps INVALID_TXN_STATE
+          // (see below) to give a misconfigured transactional consumer a clear,
+          // fatal-non-retriable signal that v1 logical topics are non-transactional;
+          // collapsing logical→UNKNOWN would mislead the client into infinite
+          // metadata-refresh retries on a name that DOES exist in their own Metadata view.
           responseBuilder.addPartitions[TxnOffsetCommitRequestData.TxnOffsetCommitRequestPartition](
-            topic.name, topic.partitions, _.partitionIndex, Errors.INVALID_TOPIC_EXCEPTION)
+            topic.name, topic.partitions, _.partitionIndex, Errors.UNKNOWN_TOPIC_OR_PARTITION)
         } else if (concentrationKernel.isLogicalTopic(topic.name)) {
           // r19 ADV-A BLOCKER #142 (logical side): logical topics are non-transactional in
           // v1 — the produce path rejects transactional batches at :621 with

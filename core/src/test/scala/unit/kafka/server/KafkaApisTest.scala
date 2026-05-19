@@ -2370,14 +2370,19 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
-  def testAddPartitionsToTxnRejectsBackingTopicWithInvalidTopicException(): Unit = {
+  def testAddPartitionsToTxnRejectsBackingTopicAsUnknown(): Unit = {
     // r19 ADV-A BLOCKER #140: backing topics carry interleaved records for multiple logical
     // tenants. Enrolling a backing partition in a transaction means the eventual
     // WriteTxnMarkers writes a COMMIT/ABORT control record onto the backing partition — per
     // PROMPT.md a marker on the backing commits ACROSS every logical topic sharing that
     // partition, corrupting every other tenant's transactional view. The handler must reject
-    // at the topic level with INVALID_TOPIC_EXCEPTION (non-retriable), mirroring the
-    // produce-side backing rejection at KafkaApis.scala:553.
+    // before forwarding to the txn coordinator.
+    //
+    // r25 BLOCKER #253: the error code MUST be UNKNOWN_TOPIC_OR_PARTITION — same code as the
+    // genuinely-unknown branch — so a wildcard-ACL principal probing arbitrary names cannot
+    // distinguish a declared backing name from an unknown name. The pre-#253 code returned
+    // INVALID_TOPIC_EXCEPTION here, which opened the existence-oracle channel r23 #245
+    // closed at OffsetCommit.
     val backingTopic = "backing-topic"
     addTopicToMetadataCache(backingTopic, numPartitions = 1)
     when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
@@ -2401,9 +2406,114 @@ class KafkaApisTest extends Logging {
 
     val response = verifyNoThrottling[AddPartitionsToTxnResponse](request)
     val error = response.errors().get(AddPartitionsToTxnResponse.V3_AND_BELOW_TXN_ID).get(tp)
-    assertEquals(Errors.INVALID_TOPIC_EXCEPTION, error,
-      "AddPartitionsToTxn on a backing topic must be rejected with INVALID_TOPIC_EXCEPTION")
+    assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION, error,
+      "AddPartitionsToTxn on a backing topic must be rejected with UNKNOWN_TOPIC_OR_PARTITION " +
+        "(r25 BLOCKER #253: collapsed with unknown branch to close the existence oracle)")
     // Transaction coordinator must NEVER see the backing partition.
+    verify(txnCoordinator, never()).handleAddPartitionsToTransaction(any(), any(), any(), any(), any(), any(), any())
+    verify(txnCoordinator, never()).handleVerifyPartitionsInTransaction(any(), any(), any(), any(), any())
+  }
+
+  @Test
+  def testAddPartitionsToTxnBackingReturnsSameErrorAsUnknownTopic(): Unit = {
+    // r25 BLOCKER #253 — explicit oracle-closure discriminator, modelled on the r23 #245
+    // companion test at testOffsetCommitBackingReturnsSameErrorAsUnknownTopic. Two probes
+    // from the SAME authorized principal, one targeting a declared backing-topic name and
+    // one targeting a genuinely-unknown name, MUST receive the same error code so the
+    // attacker cannot enumerate the declared backing-topic set by observing error-code
+    // asymmetry. Without the #253 fix the two codes diverged (INVALID_TOPIC_EXCEPTION vs
+    // UNKNOWN_TOPIC_OR_PARTITION) and this assertion would fail.
+    //
+    // NOTE: the logical-topic branch intentionally KEEPS Errors.INVALID_TXN_STATE — see
+    // testAddPartitionsToTxnLogicalDifferentFromBackingByDesign for the rationale and the
+    // asymmetry's regression guard.
+    val backingTopic = "backing-r25-253-oracle"
+    val unknownTopic = "definitely-does-not-exist-r25-253"
+    // Backing IS in the metadata cache (it's a real Kafka topic, declared as a backing for
+    // some logical topic). The unknown topic is NOT in the cache.
+    addTopicToMetadataCache(backingTopic, numPartitions = 8)
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+    when(concentrationKernel.isBackingTopic(unknownTopic)).thenReturn(false)
+    when(concentrationKernel.isLogicalTopic(unknownTopic)).thenReturn(false)
+
+    val transactionalId = "txnId-253"
+    val producerId = 15L
+    val epoch = 0.toShort
+    val backingTp = new TopicPartition(backingTopic, 0)
+    val unknownTp = new TopicPartition(unknownTopic, 0)
+    val addPartitionsToTxnRequest = AddPartitionsToTxnRequest.Builder.forClient(
+      transactionalId,
+      producerId,
+      epoch,
+      java.util.Arrays.asList(backingTp, unknownTp)).build(3.toShort)
+    val request = buildRequest(addPartitionsToTxnRequest)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleAddPartitionsToTxnRequest(request, RequestLocal.noCaching)
+
+    val response = verifyNoThrottling[AddPartitionsToTxnResponse](request)
+    val errorsByTp = response.errors().get(AddPartitionsToTxnResponse.V3_AND_BELOW_TXN_ID)
+    val backingCode = errorsByTp.get(backingTp)
+    val unknownCode = errorsByTp.get(unknownTp)
+
+    assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION, unknownCode,
+      "Unknown-topic branch must continue to return UNKNOWN_TOPIC_OR_PARTITION (sanity)")
+    assertEquals(unknownCode, backingCode,
+      "Existence-oracle closure (#253): a backing-name probe and an unknown-name probe MUST " +
+        "return the same error code so a wildcard-authorized attacker cannot enumerate the " +
+        "declared backing-topic set by observing error-code asymmetry. If this assertion " +
+        "fails, the oracle has reopened.")
+
+    // Transaction coordinator must NEVER see either partition — both are rejected at the
+    // handler level before the authorized-partitions list is forwarded.
+    verify(txnCoordinator, never()).handleAddPartitionsToTransaction(any(), any(), any(), any(), any(), any(), any())
+    verify(txnCoordinator, never()).handleVerifyPartitionsInTransaction(any(), any(), any(), any(), any())
+  }
+
+  @Test
+  def testAddPartitionsToTxnLogicalDifferentFromBackingByDesign(): Unit = {
+    // r25 BLOCKER #253 (asymmetric-fix regression guard) — pin the design decision that the
+    // logical branch returns a DIFFERENT error code (INVALID_TXN_STATE) than the backing
+    // branch (UNKNOWN_TOPIC_OR_PARTITION). The asymmetry is intentional and not an oracle
+    // leak: logical topic names are PUBLIC via METADATA(isAllTopics) at KafkaApis.scala:1798
+    // (allLogicalTopicNames is unconditionally included), so a wildcard-authorized attacker
+    // who can probe AddPartitionsToTxn can ALREADY enumerate logical names cheaper via a
+    // single MetadataRequest — distinguishing logical from unknown leaks nothing they don't
+    // already have. Meanwhile, returning INVALID_TXN_STATE (fatal-non-retriable) is the
+    // correct UX for a misconfigured transactional producer pointed at a v1 logical topic;
+    // collapsing to UNKNOWN would push them into a metadata-refresh retry loop on a name
+    // that DOES exist in their own Metadata view.
+    //
+    // If a future maintainer collapses logical→UNKNOWN_TOPIC_OR_PARTITION "for symmetry",
+    // this test will fail and force a re-read of the rationale above.
+    val backingTopic = "backing-asym-253"
+    val logicalTopic = "logical-asym-253"
+    addTopicToMetadataCache(backingTopic, numPartitions = 4)
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+    when(concentrationKernel.isBackingTopic(logicalTopic)).thenReturn(false)
+    when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
+
+    val transactionalId = "txnId-asym"
+    val producerId = 15L
+    val epoch = 0.toShort
+    val backingTp = new TopicPartition(backingTopic, 0)
+    val logicalTp = new TopicPartition(logicalTopic, 0)
+    val addPartitionsToTxnRequest = AddPartitionsToTxnRequest.Builder.forClient(
+      transactionalId,
+      producerId,
+      epoch,
+      java.util.Arrays.asList(backingTp, logicalTp)).build(3.toShort)
+    val request = buildRequest(addPartitionsToTxnRequest)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleAddPartitionsToTxnRequest(request, RequestLocal.noCaching)
+
+    val response = verifyNoThrottling[AddPartitionsToTxnResponse](request)
+    val errorsByTp = response.errors().get(AddPartitionsToTxnResponse.V3_AND_BELOW_TXN_ID)
+    assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION, errorsByTp.get(backingTp),
+      "Backing branch MUST return UNKNOWN_TOPIC_OR_PARTITION (#253 oracle closure)")
+    assertEquals(Errors.INVALID_TXN_STATE, errorsByTp.get(logicalTp),
+      "Logical branch MUST return INVALID_TXN_STATE (#140) — logical names are NOT secret " +
+        "(METADATA includes them) and a misconfigured txn producer needs a fatal-non-retriable " +
+        "signal that v1 logical topics are non-transactional, not an infinite retry loop")
     verify(txnCoordinator, never()).handleAddPartitionsToTransaction(any(), any(), any(), any(), any(), any(), any())
     verify(txnCoordinator, never()).handleVerifyPartitionsInTransaction(any(), any(), any(), any(), any())
   }
@@ -2445,16 +2555,20 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
-  def testTxnOffsetCommitRejectsBackingTopicWithInvalidTopicException(): Unit = {
+  def testTxnOffsetCommitRejectsBackingTopicAsUnknown(): Unit = {
     // r19 ADV-A BLOCKER #142: backing topics carry interleaved records for multiple logical
     // tenants. Committing TRANSACTIONAL offsets against the backing partition smuggles the
     // backing partition into __consumer_offsets via the txn-staged offsets path — and there
     // is no logical-aware end-txn / abort logic in v1 to clear it. The handler must reject
-    // at the topic level with INVALID_TOPIC_EXCEPTION (non-retriable), mirroring the
-    // produce-side backing rejection at KafkaApis.scala:553 and the AddPartitionsToTxn
-    // rejection landed in #140. The check must run AFTER authz (so unauthorized callers
-    // see TOPIC_AUTHORIZATION_FAILED first, preserving the no-enumeration-oracle posture)
-    // and BEFORE the offsets are forwarded to groupCoordinator.commitTransactionalOffsets.
+    // before forwarding to groupCoordinator.commitTransactionalOffsets. The check must run
+    // AFTER authz (so unauthorized callers see TOPIC_AUTHORIZATION_FAILED first, preserving
+    // the no-enumeration-oracle posture).
+    //
+    // r25 BLOCKER #254: the error code MUST be UNKNOWN_TOPIC_OR_PARTITION — same code as the
+    // genuinely-unknown branch — so a wildcard-ACL principal probing arbitrary names cannot
+    // distinguish a declared backing name from an unknown name. The pre-#254 code returned
+    // INVALID_TOPIC_EXCEPTION here, which opened the existence-oracle channel r23 #245
+    // closed at OffsetCommit.
     val backingTopic = "backing-topic"
     addTopicToMetadataCache(backingTopic, numPartitions = 1)
     when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
@@ -2480,9 +2594,108 @@ class KafkaApisTest extends Logging {
     kafkaApis.handleTxnOffsetCommitRequest(request, RequestLocal.withThreadConfinedCaching)
 
     val response = verifyNoThrottling[TxnOffsetCommitResponse](request)
-    assertEquals(Errors.INVALID_TOPIC_EXCEPTION, response.errors().get(backingTp),
-      "TxnOffsetCommit on a backing topic must be rejected with INVALID_TOPIC_EXCEPTION")
+    assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION, response.errors().get(backingTp),
+      "TxnOffsetCommit on a backing topic must be rejected with UNKNOWN_TOPIC_OR_PARTITION " +
+        "(r25 BLOCKER #254: collapsed with unknown branch to close the existence oracle)")
     // Group coordinator must NEVER see the backing partition.
+    verify(groupCoordinator, never()).commitTransactionalOffsets(any(), any(), any())
+  }
+
+  @Test
+  def testTxnOffsetCommitBackingReturnsSameErrorAsUnknownTopic(): Unit = {
+    // r25 BLOCKER #254 — explicit oracle-closure discriminator, modelled on the r23 #245
+    // companion test at testOffsetCommitBackingReturnsSameErrorAsUnknownTopic. Two probes
+    // from the SAME authorized principal, one targeting a declared backing-topic name and
+    // one targeting a genuinely-unknown name, MUST receive the same error code so the
+    // attacker cannot enumerate the declared backing-topic set by observing error-code
+    // asymmetry. Without the #254 fix the two codes diverged (INVALID_TOPIC_EXCEPTION vs
+    // UNKNOWN_TOPIC_OR_PARTITION) and this assertion would fail.
+    //
+    // NOTE: the logical-topic branch intentionally KEEPS Errors.INVALID_TXN_STATE — see
+    // testTxnOffsetCommitLogicalDifferentFromBackingByDesign for the rationale and the
+    // asymmetry's regression guard.
+    val backingTopic = "backing-r25-254-oracle"
+    val unknownTopic = "definitely-does-not-exist-r25-254"
+    addTopicToMetadataCache(backingTopic, numPartitions = 8)
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+    when(concentrationKernel.isBackingTopic(unknownTopic)).thenReturn(false)
+    when(concentrationKernel.isLogicalTopic(unknownTopic)).thenReturn(false)
+
+    val backingTp = new TopicPartition(backingTopic, 0)
+    val unknownTp = new TopicPartition(unknownTopic, 0)
+    val partitionOffsetCommitData = new TxnOffsetCommitRequest.CommittedOffset(15L, "", Optional.empty())
+    val txnOffsetCommitRequest = new TxnOffsetCommitRequest.Builder(
+      "txnId",
+      "groupId",
+      15L,
+      0.toShort,
+      Map(backingTp -> partitionOffsetCommitData, unknownTp -> partitionOffsetCommitData).asJava,
+      true
+    ).build()
+    val request = buildRequest(txnOffsetCommitRequest)
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleTxnOffsetCommitRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[TxnOffsetCommitResponse](request)
+    val backingCode = response.errors().get(backingTp)
+    val unknownCode = response.errors().get(unknownTp)
+
+    assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION, unknownCode,
+      "Unknown-topic branch must continue to return UNKNOWN_TOPIC_OR_PARTITION (sanity)")
+    assertEquals(unknownCode, backingCode,
+      "Existence-oracle closure (#254): a backing-name probe and an unknown-name probe MUST " +
+        "return the same error code so a wildcard-authorized attacker cannot enumerate the " +
+        "declared backing-topic set by observing error-code asymmetry. If this assertion " +
+        "fails, the oracle has reopened.")
+    verify(groupCoordinator, never()).commitTransactionalOffsets(any(), any(), any())
+  }
+
+  @Test
+  def testTxnOffsetCommitLogicalDifferentFromBackingByDesign(): Unit = {
+    // r25 BLOCKER #254 (asymmetric-fix regression guard) — pin the design decision that the
+    // logical branch returns a DIFFERENT error code (INVALID_TXN_STATE) than the backing
+    // branch (UNKNOWN_TOPIC_OR_PARTITION). The asymmetry is intentional and not an oracle
+    // leak: logical topic names are PUBLIC via METADATA(isAllTopics) at KafkaApis.scala:1798
+    // (allLogicalTopicNames is unconditionally included), so a wildcard-authorized attacker
+    // who can probe TxnOffsetCommit can ALREADY enumerate logical names cheaper via a
+    // single MetadataRequest — distinguishing logical from unknown leaks nothing they don't
+    // already have. Meanwhile, returning INVALID_TXN_STATE (fatal-non-retriable) is the
+    // correct UX for a misconfigured transactional consumer pointed at a v1 logical topic;
+    // collapsing to UNKNOWN would push them into a metadata-refresh retry loop on a name
+    // that DOES exist in their own Metadata view.
+    val backingTopic = "backing-asym-254"
+    val logicalTopic = "logical-asym-254"
+    addTopicToMetadataCache(backingTopic, numPartitions = 4)
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+    when(concentrationKernel.isBackingTopic(logicalTopic)).thenReturn(false)
+    when(concentrationKernel.isLogicalTopic(logicalTopic)).thenReturn(true)
+
+    val backingTp = new TopicPartition(backingTopic, 0)
+    val logicalTp = new TopicPartition(logicalTopic, 0)
+    val partitionOffsetCommitData = new TxnOffsetCommitRequest.CommittedOffset(15L, "", Optional.empty())
+    val txnOffsetCommitRequest = new TxnOffsetCommitRequest.Builder(
+      "txnId",
+      "groupId",
+      15L,
+      0.toShort,
+      Map(backingTp -> partitionOffsetCommitData, logicalTp -> partitionOffsetCommitData).asJava,
+      true
+    ).build()
+    val request = buildRequest(txnOffsetCommitRequest)
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleTxnOffsetCommitRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[TxnOffsetCommitResponse](request)
+    assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION, response.errors().get(backingTp),
+      "Backing branch MUST return UNKNOWN_TOPIC_OR_PARTITION (#254 oracle closure)")
+    assertEquals(Errors.INVALID_TXN_STATE, response.errors().get(logicalTp),
+      "Logical branch MUST return INVALID_TXN_STATE (#142) — logical names are NOT secret " +
+        "(METADATA includes them) and a misconfigured txn consumer needs a fatal-non-retriable " +
+        "signal that v1 logical topics are non-transactional, not an infinite retry loop")
     verify(groupCoordinator, never()).commitTransactionalOffsets(any(), any(), any())
   }
 
