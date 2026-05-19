@@ -72,8 +72,17 @@ public class TenantPrincipalBuilder
         // KerberosShortNamer / SslPrincipalMapper are not propagated through
         // configure(Map); custom builders that need them must rebuild from
         // configs. v1 is SASL_PLAIN / SCRAM only and does not need either.
+        //
+        // SslPrincipalMapper.fromRules(null) resolves to the DEFAULT identity
+        // mapping rule (see SslPrincipalMapper.DEFAULT_SSL_PRINCIPAL_MAPPING_RULES).
+        // Passing a null mapper would NPE at DefaultKafkaPrincipalBuilder
+        // .applySslPrincipalMapper as soon as a peer presents an X500Principal —
+        // the standard mTLS case. Even though v1 does not advertise mTLS, this
+        // guards against accidental SSL-listener wiring producing an NPE on
+        // every handshake instead of an authentication failure with a usable
+        // identity.
         this(new DefaultKafkaPrincipalBuilder(
-            (KerberosShortNamer) null, (SslPrincipalMapper) null));
+            (KerberosShortNamer) null, SslPrincipalMapper.fromRules(null)));
     }
 
     // Visible for delegate injection from tests; not part of the public API.

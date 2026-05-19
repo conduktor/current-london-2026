@@ -21,9 +21,13 @@ import org.apache.kafka.common.security.auth.KafkaPrincipal;
 import org.apache.kafka.common.security.auth.PlaintextAuthenticationContext;
 import org.apache.kafka.common.security.auth.SaslAuthenticationContext;
 import org.apache.kafka.common.security.auth.SecurityProtocol;
+import org.apache.kafka.common.security.auth.SslAuthenticationContext;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 
+import javax.net.ssl.SSLPeerUnverifiedException;
+import javax.net.ssl.SSLSession;
+import javax.security.auth.x500.X500Principal;
 import javax.security.sasl.SaslServer;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
@@ -268,6 +272,45 @@ class TenantPrincipalBuilderTest {
         KafkaPrincipal p = builder.build(saslContextOn("__tenant_acme.alice", "PLAINTEXT"));
 
         assertEquals(KafkaPrincipal.ANONYMOUS, p);
+    }
+
+    @Test
+    void buildsTenantPrefixedPrincipalFromMutualTlsOnBoundListener() throws Exception {
+        // #173 regression: the no-arg constructor used to hand the DefaultKafkaPrincipalBuilder
+        // a null SslPrincipalMapper. As soon as a peer presented an X500Principal — the
+        // standard mTLS case — applySslPrincipalMapper would dereference null and NPE on
+        // every handshake instead of producing a usable identity. The fix wires the DEFAULT
+        // (identity) mapping rule so the handshake completes and the tenant prefix is applied
+        // exactly as it would be on a SASL listener.
+        TenantPrincipalBuilder builder = new TenantPrincipalBuilder();
+        builder.configure(configMap("acme"));
+
+        SSLSession session = Mockito.mock(SSLSession.class);
+        X500Principal peer = new X500Principal("CN=alice,OU=test,O=acme");
+        Mockito.when(session.getPeerPrincipal()).thenReturn(peer);
+        SslAuthenticationContext ctx = new SslAuthenticationContext(
+            session, InetAddress.getByName("127.0.0.1"), LISTENER_NAME);
+
+        KafkaPrincipal p = builder.build(ctx);
+
+        assertEquals(KafkaPrincipal.USER_TYPE, p.getPrincipalType());
+        // DEFAULT identity rule returns the DN unchanged; the tenant prefix is then stamped.
+        assertEquals("__tenant_acme.CN=alice,OU=test,O=acme", p.getName());
+    }
+
+    @Test
+    void unverifiedSslPeerProducesAnonymousNotNpe() throws Exception {
+        // SSLPeerUnverifiedException must surface as ANONYMOUS — never NPE on a missing
+        // SslPrincipalMapper. ANONYMOUS is then refused tenant-prefixing by build().
+        TenantPrincipalBuilder builder = new TenantPrincipalBuilder();
+        builder.configure(configMap("acme"));
+
+        SSLSession session = Mockito.mock(SSLSession.class);
+        Mockito.when(session.getPeerPrincipal()).thenThrow(new SSLPeerUnverifiedException("peer not verified"));
+        SslAuthenticationContext ctx = new SslAuthenticationContext(
+            session, InetAddress.getByName("127.0.0.1"), LISTENER_NAME);
+
+        assertEquals(KafkaPrincipal.ANONYMOUS, builder.build(ctx));
     }
 
     private static SaslAuthenticationContext saslContextOn(String authId, String listener) throws UnknownHostException {
