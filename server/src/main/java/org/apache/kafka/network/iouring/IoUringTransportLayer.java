@@ -651,7 +651,8 @@ final class IoUringTransportLayer implements TransportLayer {
                 // future, handedOff stays false and the finally below releases buf;
                 // if addListener threw after writeAndFlush returned, Netty owns the buf
                 // and will release it on flush completion (no decrementer installed, but
-                // the inc on line 516 didn't run either — counter stays consistent).
+                // the inc statement after addListener didn't run either — counter stays
+                // consistent).
                 throw new IOException("write submission failed", e);
             }
         } finally {
