@@ -42,7 +42,8 @@ import org.apache.kafka.security.CredentialProvider
 import org.apache.kafka.server.authorizer.Authorizer
 import org.apache.kafka.server.config.ServerLogConfigs.{ALTER_CONFIG_POLICY_CLASS_NAME_CONFIG, CREATE_TOPIC_POLICY_CLASS_NAME_CONFIG}
 import org.apache.kafka.server.common.{ApiMessageAndVersion, KRaftVersion, NodeToControllerChannelManager}
-import org.apache.kafka.server.config.ConfigType
+import org.apache.kafka.server.config.{ConfigType, ServerConfigs}
+import org.apache.kafka.storage.internals.concentration.LogicalTopicConfigParser
 import org.apache.kafka.server.metrics.{KafkaMetricsGroup, KafkaYammerMetrics, LinuxIoMetricsCollector}
 import org.apache.kafka.server.network.{EndpointReadyFutures, KafkaAuthorizerServerInfo}
 import org.apache.kafka.server.policy.{AlterConfigPolicy, CreateTopicPolicy}
@@ -123,6 +124,18 @@ class ControllerServer(
     try {
       this.logIdent = logContext.logPrefix()
       info("Starting controller")
+      // r19 ADV-CONFIG HIGH #126: cross-stack drift detection. The controller parses
+      // concentration.logical.topics independently in ControllerApis to enforce shadow guards
+      // on CreateTopics / DeleteTopics / AlterConfigs; the broker parses the same config to
+      // declare the kernel. There is no v1 metadata channel to reconcile the two — so each
+      // node logs a deterministic fingerprint of its parsed declarations at startup and an
+      // operator (or automation) can grep "concentration declarations fingerprint" across the
+      // cluster and confirm a single value. A mismatch means broker/controller declarations
+      // have drifted and shadow-guard semantics will diverge from kernel semantics until the
+      // config is reconciled and the affected nodes restart. See
+      // LogicalTopicConfigParser#declarationFingerprint for the canonicalisation contract.
+      info(s"concentration declarations fingerprint=" +
+        s"${LogicalTopicConfigParser.declarationFingerprint(config.getString(ServerConfigs.CONCENTRATION_LOGICAL_TOPICS_CONFIG))}")
       config.dynamicConfig.initialize(clientMetricsReceiverPluginOpt = None)
 
       maybeChangeStatus(STARTING, STARTED)

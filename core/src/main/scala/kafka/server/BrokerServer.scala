@@ -359,9 +359,25 @@ class BrokerServer(
       // server.properties under concentration.logical.topics, e.g. "orders:100:shared:4". A
       // malformed entry surfaces here as a ConfigException that fails broker startup — the
       // right semantic, because we cannot serve a logical topic we cannot construct.
-      LogicalTopicConfigParser.parse(
+      //
+      // r19 ADV-CONFIG HIGH #109: route every declare through parseAndDeclare so that any
+      // IllegalStateException from the kernel (cross-descriptor invariants — shared backing
+      // with mismatched M, name reuse across logical/backing namespaces) is rewrapped as a
+      // ConfigException. The previous `parse(...).forEach(declare)` leaked the wrong exception
+      // class past the startup machinery and left the kernel half-populated with whatever
+      // descriptors had succeeded before the failing one.
+      val rawConcentrationDeclarations =
         config.getString(ServerConfigs.CONCENTRATION_LOGICAL_TOPICS_CONFIG)
-      ).forEach(concentrationKernel.declare(_))
+      LogicalTopicConfigParser.parseAndDeclare(rawConcentrationDeclarations, concentrationKernel)
+      // r19 ADV-CONFIG HIGH #126: cross-stack drift detection. Broker and controller each parse
+      // the same config independently — there is no v1 metadata-record channel to publish the
+      // declared set between them. Logging an ordering- and whitespace-insensitive fingerprint
+      // at startup lets an operator (or automation) grep across every node's log and confirm a
+      // single value cluster-wide. A mismatch surfaces declaration asymmetry immediately
+      // instead of waiting for the first client request to fail confusingly. See
+      // LogicalTopicConfigParser#declarationFingerprint for the canonicalisation contract.
+      info(s"concentration declarations fingerprint=" +
+        s"${LogicalTopicConfigParser.declarationFingerprint(rawConcentrationDeclarations)}")
 
       // Hook #5 (cheap path): PROMPT acceptance criterion — "Broker restart with intact durable
       // index → sub-second offset-tracker rebuild from the sidecar file." Sidecars on disk are
