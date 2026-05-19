@@ -17,6 +17,7 @@
 package org.apache.kafka.network;
 
 import org.apache.kafka.common.Endpoint;
+import org.apache.kafka.common.config.ConfigException;
 import org.apache.kafka.common.network.ListenerName;
 import org.apache.kafka.common.security.auth.SecurityProtocol;
 
@@ -27,6 +28,7 @@ import java.util.HashMap;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 public class SocketServerConfigsTest {
     @Test
@@ -103,5 +105,27 @@ public class SocketServerConfigsTest {
             new Endpoint("CONTROLLER", SecurityProtocol.PLAINTEXT, "example.com", 9093)),
                 SocketServerConfigs.listenerListToEndPoints("CONTROLLER://example.com:9093",
                     map));
+    }
+
+    @Test
+    public void socketSelectorImplementationAcceptsValidEnumValues() {
+        for (String value : new String[]{"nio", "io_uring", "auto",
+                                         "NIO", "IO_URING", "AUTO",
+                                         "Io_Uring", "Auto"}) {
+            Map<String, Object> parsed = SocketServerConfigs.CONFIG_DEF.parse(Map.of(
+                SocketServerConfigs.SOCKET_SELECTOR_IMPLEMENTATION_CONFIG, value));
+            assertEquals(value, parsed.get(SocketServerConfigs.SOCKET_SELECTOR_IMPLEMENTATION_CONFIG),
+                "ConfigDef must accept '" + value + "' for " + SocketServerConfigs.SOCKET_SELECTOR_IMPLEMENTATION_CONFIG);
+        }
+    }
+
+    @Test
+    public void socketSelectorImplementationRejectsTyposAtParseTime() {
+        for (String typo : new String[]{"iouring", "io-uring", "uring", "epoll", "kqueue", "junk", ""}) {
+            assertThrows(ConfigException.class,
+                () -> SocketServerConfigs.CONFIG_DEF.parse(Map.of(
+                    SocketServerConfigs.SOCKET_SELECTOR_IMPLEMENTATION_CONFIG, typo)),
+                "ConfigDef must reject '" + typo + "' for " + SocketServerConfigs.SOCKET_SELECTOR_IMPLEMENTATION_CONFIG);
+        }
     }
 }

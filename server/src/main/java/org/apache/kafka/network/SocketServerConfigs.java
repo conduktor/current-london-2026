@@ -21,6 +21,7 @@ import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.config.ConfigDef;
 import org.apache.kafka.common.network.ListenerName;
 import org.apache.kafka.common.security.auth.SecurityProtocol;
+import org.apache.kafka.network.iouring.SelectorImplementation;
 import org.apache.kafka.server.util.Csv;
 
 import java.util.ArrayList;
@@ -179,7 +180,15 @@ public class SocketServerConfigs {
             .define(QUEUED_MAX_REQUESTS_CONFIG, INT, QUEUED_MAX_REQUESTS_DEFAULT, atLeast(1), HIGH, QUEUED_MAX_REQUESTS_DOC)
             .define(QUEUED_MAX_BYTES_CONFIG, LONG, QUEUED_MAX_REQUEST_BYTES_DEFAULT, MEDIUM, QUEUED_MAX_REQUEST_BYTES_DOC)
             .define(NUM_NETWORK_THREADS_CONFIG, INT, NUM_NETWORK_THREADS_DEFAULT, atLeast(1), HIGH, NUM_NETWORK_THREADS_DOC)
-            .define(SOCKET_SELECTOR_IMPLEMENTATION_CONFIG, STRING, SOCKET_SELECTOR_IMPLEMENTATION_DEFAULT, MEDIUM, SOCKET_SELECTOR_IMPLEMENTATION_DOC);
+            // CaseInsensitiveValidString matches SelectorImplementation.fromConfig (which lowercases input). Without
+            // a parse-time validator, a typo like "iouring" or "io-uring" silently falls through to the default
+            // NIO selector — operator sees no error at startup, just unexpected behavior in production.
+            .define(SOCKET_SELECTOR_IMPLEMENTATION_CONFIG, STRING, SOCKET_SELECTOR_IMPLEMENTATION_DEFAULT,
+                ConfigDef.CaseInsensitiveValidString.in(
+                    SelectorImplementation.NIO.configValue(),
+                    SelectorImplementation.IO_URING.configValue(),
+                    SelectorImplementation.AUTO.configValue()),
+                MEDIUM, SOCKET_SELECTOR_IMPLEMENTATION_DOC);
 
     private static final Pattern URI_PARSE_REGEXP = Pattern.compile(
         "^(.*)://\\[?([0-9a-zA-Z\\-%._:]*)\\]?:(-?[0-9]+)");
