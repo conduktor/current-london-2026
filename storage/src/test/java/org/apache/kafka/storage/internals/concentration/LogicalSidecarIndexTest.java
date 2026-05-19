@@ -337,17 +337,26 @@ public class LogicalSidecarIndexTest {
         // silently trusting the offset because "the CRC was probably wrong" would defeat the
         // detection (we cannot distinguish "CRC corrupt + offset intact" from "offset corrupt +
         // CRC intact" — both are equally untrustworthy).
+        //
+        // We use two entries and corrupt the CRC of the FIRST one so that constructor-time
+        // readEntryAt(entries-1) verifies the intact last entry (entry 1) and the test reaches
+        // the explicit lookup(0L) — keeping this case focused on the lookup-path CRC check.
+        // The "corrupt last entry rejected at construction" case is covered separately by
+        // crcOnLastEntryIsVerifiedAtConstructionTime.
         File file = new File(tempDir, "crc-bitflip-0.sidecar");
         try (LogicalSidecarIndex idx = new LogicalSidecarIndex(file, "crc-bitflip", 0)) {
             idx.append(42L);
+            idx.append(99L);
         }
         byte[] contents = Files.readAllBytes(file.toPath());
-        // Flip a byte inside the CRC field (bytes 8..11). Pick byte 8 — first CRC byte.
+        // Flip a byte inside entry 0's CRC field (bytes 8..11). Pick byte 8 — first CRC byte.
         int crcBytePos = OFFSET_BYTES;
         contents[crcBytePos] = (byte) (contents[crcBytePos] ^ 0x01);
         Files.write(file.toPath(), contents);
 
         try (LogicalSidecarIndex reopened = new LogicalSidecarIndex(file, "crc-bitflip", 0)) {
+            // Entry 1 (the last, intact) is read at construction to seed lastBackingOffset, so the
+            // constructor succeeds. The explicit lookup(0L) below is the path under test.
             RuntimeException thrown = assertThrows(RuntimeException.class,
                 () -> reopened.lookup(0L));
             assertEquals("org.apache.kafka.storage.internals.log.CorruptIndexException",
