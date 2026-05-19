@@ -579,14 +579,34 @@ class ControllerApis(
     // Same view-backing READ gate as handleIncrementalAlterConfigs and handleCreateTopics
     // (see the rationale on createTopics). The legacy AlterConfigs API is full-replace, so any
     // non-blank `view.backing.topic` in the submitted config map is treated as the new backing.
+    //
+    // R38 (Codex): also gate on READ of the CURRENT backing whenever the topic is currently a
+    // view AND any view.* config key appears in the submitted (replacement) config map. Without
+    // this, a principal with ALTER_CONFIGS on a current view could submit a legacy AlterConfigs
+    // that preserves view.backing.topic at its current value (so the new-backing gate doesn't
+    // fire — the new value equals the current value, and the requester already has the implicit
+    // "READ on current" from the original view-author's check at R23) while relaxing
+    // view.cel.predicate to `true` or changing view.offset.mode. The same exploit shape as the
+    // incremental gap. The "topic currently a view → READ on current backing required for any
+    // view.* mutation" rule is what closes it; do not weaken to "only when the new value differs"
+    // because the configRepository snapshot used to determine currency can race with the alter,
+    // and the strict rule is what the test pins.
     val configChangesIterator = configChanges.entrySet().iterator()
     while (configChangesIterator.hasNext) {
       val entry = configChangesIterator.next()
       val resource = entry.getKey
       if (resource.`type`() == ConfigResource.Type.TOPIC) {
         val backing = entry.getValue.get(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG)
-        if (backing != null && !backing.trim.isEmpty &&
-            !authHelper.authorize(request.context, READ, TOPIC, backing)) {
+        val newBackingDenied = backing != null && !backing.trim.isEmpty &&
+            !authHelper.authorize(request.context, READ, TOPIC, backing)
+        val currentBackingDenied = if (!newBackingDenied && legacyTouchesAnyViewConfig(entry.getValue)) {
+          currentViewBacking(resource.name()) match {
+            case Some(currentBacking) =>
+              !authHelper.authorize(request.context, READ, TOPIC, currentBacking)
+            case None => false
+          }
+        } else false
+        if (newBackingDenied || currentBackingDenied) {
           response.responses().add(new OldAlterConfigsResourceResponse().
             setErrorCode(TOPIC_AUTHORIZATION_FAILED.code()).
             setErrorMessage("Authorization failed.").
@@ -841,23 +861,39 @@ class ControllerApis(
     // backing topic. The fetch path intentionally does not re-check ACLs on the backing
     // (see the rationale on createTopics above). Require READ on the proposed backing here, so
     // that ALTER_CONFIGS on the view name alone cannot escalate into reading an arbitrary topic.
+    //
+    // R38 (Codex): the round-23 gate above only fires when view.backing.topic is being SET in the
+    // request. For an EXISTING view, a principal with ALTER_CONFIGS on the view (and no READ on
+    // the current backing) could relax view.cel.predicate to `true` (or remove it via DELETE) and
+    // then fetch the view to read the full backing stream — the predicate IS the security
+    // boundary at fetch time per the comment in KafkaApis.handleFetchRequest. Require READ on
+    // the CURRENT effective backing whenever any view.* config is being mutated on a topic that
+    // is currently a view, regardless of which view.* key is touched and which op type is used.
     val configChangesIterator = configChanges.entrySet().iterator()
     while (configChangesIterator.hasNext) {
       val entry = configChangesIterator.next()
       val resource = entry.getKey
       if (resource.`type`() == ConfigResource.Type.TOPIC) {
         val backingEntry = entry.getValue.get(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG)
-        if (backingEntry != null && backingEntry.getKey == AlterConfigOp.OpType.SET) {
+        val newBackingDenied = if (backingEntry != null && backingEntry.getKey == AlterConfigOp.OpType.SET) {
           val backing = backingEntry.getValue
-          if (backing != null && !backing.trim.isEmpty &&
-              !authHelper.authorize(request.context, READ, TOPIC, backing)) {
-            response.responses().add(new AlterConfigsResourceResponse().
-              setErrorCode(TOPIC_AUTHORIZATION_FAILED.code()).
-              setErrorMessage("Authorization failed.").
-              setResourceName(resource.name()).
-              setResourceType(resource.`type`().id()))
-            configChangesIterator.remove()
+          backing != null && !backing.trim.isEmpty &&
+            !authHelper.authorize(request.context, READ, TOPIC, backing)
+        } else false
+        val currentBackingDenied = if (!newBackingDenied && touchesAnyViewConfig(entry.getValue)) {
+          currentViewBacking(resource.name()) match {
+            case Some(currentBacking) =>
+              !authHelper.authorize(request.context, READ, TOPIC, currentBacking)
+            case None => false
           }
+        } else false
+        if (newBackingDenied || currentBackingDenied) {
+          response.responses().add(new AlterConfigsResourceResponse().
+            setErrorCode(TOPIC_AUTHORIZATION_FAILED.code()).
+            setErrorMessage("Authorization failed.").
+            setResourceName(resource.name()).
+            setResourceType(resource.`type`().id()))
+          configChangesIterator.remove()
         }
       }
     }
@@ -877,6 +913,48 @@ class ControllerApis(
             new IncrementalAlterConfigsResponse(response.setThrottleTimeMs(throttleMs)))
         }
       }
+  }
+
+  // R38 helpers for the "current view backing" READ-gate (see handleIncrementalAlterConfigs).
+  // Set of all view.* topic config keys whose mutation must be gated on READ-on-current-backing
+  // when the topic is currently a view.
+  private val viewTopicConfigKeys: Set[String] = Set(
+    ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG,
+    ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG,
+    ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG)
+
+  private def touchesAnyViewConfig(
+    altersByName: util.Map[String, Entry[AlterConfigOp.OpType, String]]
+  ): Boolean = {
+    val it = altersByName.keySet().iterator()
+    while (it.hasNext) {
+      if (viewTopicConfigKeys.contains(it.next())) return true
+    }
+    false
+  }
+
+  // Legacy AlterConfigs uses the full-replacement (String, String) map shape.
+  private def legacyTouchesAnyViewConfig(configs: util.Map[String, String]): Boolean = {
+    val it = configs.keySet().iterator()
+    while (it.hasNext) {
+      if (viewTopicConfigKeys.contains(it.next())) return true
+    }
+    false
+  }
+
+  // Returns the current effective backing topic for a topic resource, if the topic is currently
+  // configured as a view (view.backing.topic set and non-blank). Returns None for non-view topics
+  // and for any lookup failure (e.g. metadata not yet propagated) — failing closed here would
+  // break alter requests for topics that don't exist yet (pre-create or post-delete races); the
+  // newBackingDenied branch above still protects the create/rebind path.
+  private def currentViewBacking(topicName: String): Option[String] = {
+    try {
+      val props = metadataCache.topicConfig(topicName)
+      Option(props.getProperty(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG))
+        .map(_.trim).filter(_.nonEmpty)
+    } catch {
+      case _: Exception => None
+    }
   }
 
   private def handleCreatePartitions(request: RequestChannel.Request): CompletableFuture[Unit] = {

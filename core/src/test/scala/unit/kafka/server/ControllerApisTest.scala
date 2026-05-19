@@ -154,7 +154,8 @@ class ControllerApisTest {
   private def createControllerApis(authorizer: Option[Authorizer],
                                    controller: Controller,
                                    props: Properties = new Properties(),
-                                   throttle: Boolean = false): ControllerApis = {
+                                   throttle: Boolean = false,
+                                   metadataCacheOverride: Option[KRaftMetadataCache] = None): ControllerApis = {
     props.put(KRaftConfigs.NODE_ID_CONFIG, nodeId: java.lang.Integer)
     props.put(KRaftConfigs.PROCESS_ROLES_CONFIG, "controller")
     props.put(KRaftConfigs.CONTROLLER_LISTENER_NAMES_CONFIG, "CONTROLLER")
@@ -174,7 +175,7 @@ class ControllerApisTest {
         ListenerType.CONTROLLER,
         true,
         () => FinalizedFeatures.fromKRaftVersion(MetadataVersion.latestTesting())),
-      metadataCache
+      metadataCacheOverride.getOrElse(metadataCache)
     )
   }
 
@@ -907,6 +908,245 @@ class ControllerApisTest {
     val response = capturedResponse.getValue.asInstanceOf[AlterConfigsResponse]
     val viewResponse = response.data().responses().asScala.find(_.resourceName() == viewTopicName).get
     assertEquals(TOPIC_AUTHORIZATION_FAILED.code(), viewResponse.errorCode())
+    assertEquals("Authorization failed.", viewResponse.errorMessage())
+  }
+
+  /**
+   * R38 (Codex): the round-23 IncrementalAlterConfigs gate only fired when `view.backing.topic`
+   * was being SET. A principal with ALTER_CONFIGS on an existing view (and no READ on the
+   * current backing) could send `SET view.cel.predicate = "true"` to relax the predicate to
+   * admit everything, then fetch the view and read the full backing stream — the predicate IS
+   * the security boundary at fetch time per the rationale in KafkaApis.handleFetchRequest. This
+   * test pins that any view.* mutation on a current view requires READ on the current backing.
+   * Covered keys: predicate (the exploit vector Codex demonstrated), offset.mode (defense in
+   * depth; even if there is no current observable predicate-relaxation via offset.mode, gating
+   * here keeps the rule uniform and survives future offset-mode semantics changes).
+   */
+  @Test
+  def testIncrementalAlterConfigsOfViewPredicateOnExistingViewRequiresReadOnCurrentBacking(): Unit = {
+    for (viewKey <- Seq(ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG,
+                        ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG)) {
+      val viewTopicName = "alice_view"
+      val currentBacking = "orders_private"
+      // Seed metadataCache with the current view binding.
+      val metadataCacheMock = mock(classOf[KRaftMetadataCache])
+      val currentProps = new Properties()
+      currentProps.put(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, currentBacking)
+      currentProps.put(ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.region == 'EU'")
+      when(metadataCacheMock.topicConfig(viewTopicName)).thenReturn(currentProps)
+
+      val newValue = if (viewKey == ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG) "true"
+                     else ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE
+      val requestData = new IncrementalAlterConfigsRequestData().setResources(
+        new AlterConfigsResourceCollection(util.Arrays.asList(
+          new AlterConfigsResource().
+            setResourceName(viewTopicName).
+            setResourceType(ConfigResource.Type.TOPIC.id()).
+            setConfigs(new AlterableConfigCollection(util.Arrays.asList(new AlterableConfig().
+              setName(viewKey).
+              setValue(newValue).
+              setConfigOperation(AlterConfigOp.OpType.SET.id())).iterator()))
+          ).iterator()))
+      val request = buildRequest(new IncrementalAlterConfigsRequest.Builder(requestData).build(0))
+
+      val authorizer = mock(classOf[Authorizer])
+      when(authorizer.authorize(
+        any[AuthorizableRequestContext],
+        any[util.List[Action]]
+      )).thenAnswer { invocation =>
+        val actions = invocation.getArgument[util.List[Action]](1).asScala
+        val results = actions.map { action =>
+          val op = action.operation()
+          val resourceName = action.resourcePattern().name()
+          if (op == AclOperation.ALTER_CONFIGS && resourceName == viewTopicName) AuthorizationResult.ALLOWED
+          else AuthorizationResult.DENIED
+        }
+        new util.ArrayList[AuthorizationResult](results.asJava)
+      }
+      controllerApis = createControllerApis(Some(authorizer), new MockController.Builder().build(),
+        metadataCacheOverride = Some(metadataCacheMock))
+      controllerApis.handleIncrementalAlterConfigs(request)
+      val capturedResponse: ArgumentCaptor[AbstractResponse] =
+        ArgumentCaptor.forClass(classOf[AbstractResponse])
+      verify(requestChannel, atLeastOnce()).sendResponse(
+        ArgumentMatchers.eq(request),
+        capturedResponse.capture(),
+        ArgumentMatchers.eq(None))
+      val response = capturedResponse.getValue.asInstanceOf[IncrementalAlterConfigsResponse]
+      val viewResponse = response.data().responses().asScala.find(_.resourceName() == viewTopicName).get
+      assertEquals(TOPIC_AUTHORIZATION_FAILED.code(), viewResponse.errorCode(),
+        s"alter on view.* config $viewKey on existing view without READ on current backing must be rejected")
+      assertEquals("Authorization failed.", viewResponse.errorMessage())
+      reset(requestChannel)
+    }
+  }
+
+  /**
+   * R38 positive: same scenario, but the principal HAS READ on the current backing → the alter
+   * succeeds. Pins that the new gate is not a blanket block.
+   */
+  @Test
+  def testIncrementalAlterConfigsOfViewPredicateWithReadOnCurrentBackingSucceeds(): Unit = {
+    val viewTopicName = "alice_view"
+    val currentBacking = "orders_private"
+    val metadataCacheMock = mock(classOf[KRaftMetadataCache])
+    val currentProps = new Properties()
+    currentProps.put(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, currentBacking)
+    when(metadataCacheMock.topicConfig(viewTopicName)).thenReturn(currentProps)
+
+    val requestData = new IncrementalAlterConfigsRequestData().setResources(
+      new AlterConfigsResourceCollection(util.Arrays.asList(
+        new AlterConfigsResource().
+          setResourceName(viewTopicName).
+          setResourceType(ConfigResource.Type.TOPIC.id()).
+          setConfigs(new AlterableConfigCollection(util.Arrays.asList(new AlterableConfig().
+            setName(ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG).
+            setValue("body.region == 'US'").
+            setConfigOperation(AlterConfigOp.OpType.SET.id())).iterator()))
+        ).iterator()))
+    val request = buildRequest(new IncrementalAlterConfigsRequest.Builder(requestData).build(0))
+
+    val authorizer = mock(classOf[Authorizer])
+    when(authorizer.authorize(
+      any[AuthorizableRequestContext],
+      any[util.List[Action]]
+    )).thenAnswer { invocation =>
+      val actions = invocation.getArgument[util.List[Action]](1).asScala
+      val results = actions.map { action =>
+        val op = action.operation()
+        val resourceName = action.resourcePattern().name()
+        if (op == AclOperation.ALTER_CONFIGS && resourceName == viewTopicName) AuthorizationResult.ALLOWED
+        else if (op == AclOperation.READ && resourceName == currentBacking) AuthorizationResult.ALLOWED
+        else AuthorizationResult.DENIED
+      }
+      new util.ArrayList[AuthorizationResult](results.asJava)
+    }
+    controllerApis = createControllerApis(Some(authorizer), new MockController.Builder().build(),
+      metadataCacheOverride = Some(metadataCacheMock))
+    controllerApis.handleIncrementalAlterConfigs(request)
+    val capturedResponse: ArgumentCaptor[AbstractResponse] =
+      ArgumentCaptor.forClass(classOf[AbstractResponse])
+    verify(requestChannel).sendResponse(
+      ArgumentMatchers.eq(request),
+      capturedResponse.capture(),
+      ArgumentMatchers.eq(None))
+    val response = capturedResponse.getValue.asInstanceOf[IncrementalAlterConfigsResponse]
+    val viewResponse = response.data().responses().asScala.find(_.resourceName() == viewTopicName).get
+    assertEquals(NONE.code(), viewResponse.errorCode(),
+      "alter on view.cel.predicate WITH READ on current backing must succeed")
+  }
+
+  /**
+   * R38: an ALTER_CONFIGS on a NON-VIEW topic that happens to set a non-view config (e.g.
+   * cleanup.policy) must NOT be gated on any backing READ — the topic isn't a view, there is
+   * no backing to gate on. Without this case a regression that blanket-rejects could pass the
+   * negative test above.
+   */
+  @Test
+  def testIncrementalAlterConfigsOnNonViewTopicIsNotGatedByViewBackingCheck(): Unit = {
+    val regularTopicName = "regular_topic"
+    val metadataCacheMock = mock(classOf[KRaftMetadataCache])
+    when(metadataCacheMock.topicConfig(regularTopicName)).thenReturn(new Properties())
+
+    val requestData = new IncrementalAlterConfigsRequestData().setResources(
+      new AlterConfigsResourceCollection(util.Arrays.asList(
+        new AlterConfigsResource().
+          setResourceName(regularTopicName).
+          setResourceType(ConfigResource.Type.TOPIC.id()).
+          setConfigs(new AlterableConfigCollection(util.Arrays.asList(new AlterableConfig().
+            setName(TopicConfig.CLEANUP_POLICY_CONFIG).
+            setValue("delete").
+            setConfigOperation(AlterConfigOp.OpType.SET.id())).iterator()))
+        ).iterator()))
+    val request = buildRequest(new IncrementalAlterConfigsRequest.Builder(requestData).build(0))
+
+    val authorizer = mock(classOf[Authorizer])
+    when(authorizer.authorize(
+      any[AuthorizableRequestContext],
+      any[util.List[Action]]
+    )).thenAnswer { invocation =>
+      val actions = invocation.getArgument[util.List[Action]](1).asScala
+      val results = actions.map { action =>
+        val op = action.operation()
+        val resourceName = action.resourcePattern().name()
+        // Only ALTER_CONFIGS on the regular topic is allowed.
+        if (op == AclOperation.ALTER_CONFIGS && resourceName == regularTopicName) AuthorizationResult.ALLOWED
+        else AuthorizationResult.DENIED
+      }
+      new util.ArrayList[AuthorizationResult](results.asJava)
+    }
+    controllerApis = createControllerApis(Some(authorizer), new MockController.Builder().build(),
+      metadataCacheOverride = Some(metadataCacheMock))
+    controllerApis.handleIncrementalAlterConfigs(request)
+    val capturedResponse: ArgumentCaptor[AbstractResponse] =
+      ArgumentCaptor.forClass(classOf[AbstractResponse])
+    verify(requestChannel).sendResponse(
+      ArgumentMatchers.eq(request),
+      capturedResponse.capture(),
+      ArgumentMatchers.eq(None))
+    val response = capturedResponse.getValue.asInstanceOf[IncrementalAlterConfigsResponse]
+    val viewResponse = response.data().responses().asScala.find(_.resourceName() == regularTopicName).get
+    // Either the alter succeeds (NONE) or fails for an unrelated reason (e.g. MockController
+    // semantics), but NOT TOPIC_AUTHORIZATION_FAILED — that would mean the view gate fired
+    // incorrectly on a non-view topic.
+    assertNotEquals(TOPIC_AUTHORIZATION_FAILED.code(), viewResponse.errorCode(),
+      "alter on non-view topic must not be gated by the view-backing READ check")
+  }
+
+  /**
+   * R38: the same predicate-only bypass exists in legacy AlterConfigs (full-replace). A principal
+   * with ALTER_CONFIGS could submit a legacy AlterConfigs that includes view.cel.predicate=`true`
+   * without including view.backing.topic — the round-24 gate at line 587 only fires when
+   * view.backing.topic appears in the new (replacement) map. Pin that an existing-view legacy
+   * AlterConfigs touching any view.* key also requires READ on the current backing.
+   */
+  @Test
+  def testLegacyAlterConfigsOfViewPredicateOnExistingViewRequiresReadOnCurrentBacking(): Unit = {
+    val viewTopicName = "alice_view"
+    val currentBacking = "orders_private"
+    val metadataCacheMock = mock(classOf[KRaftMetadataCache])
+    val currentProps = new Properties()
+    currentProps.put(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, currentBacking)
+    when(metadataCacheMock.topicConfig(viewTopicName)).thenReturn(currentProps)
+
+    val requestData = new AlterConfigsRequestData().setResources(
+      new OldAlterConfigsResourceCollection(util.Arrays.asList(
+        new OldAlterConfigsResource().
+          setResourceName(viewTopicName).
+          setResourceType(ConfigResource.Type.TOPIC.id()).
+          setConfigs(new OldAlterableConfigCollection(util.Arrays.asList(new OldAlterableConfig().
+            setName(ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG).
+            setValue("true")).iterator()))
+        ).iterator()))
+    val request = buildRequest(new AlterConfigsRequest(requestData, 0))
+
+    val authorizer = mock(classOf[Authorizer])
+    when(authorizer.authorize(
+      any[AuthorizableRequestContext],
+      any[util.List[Action]]
+    )).thenAnswer { invocation =>
+      val actions = invocation.getArgument[util.List[Action]](1).asScala
+      val results = actions.map { action =>
+        val op = action.operation()
+        val resourceName = action.resourcePattern().name()
+        if (op == AclOperation.ALTER_CONFIGS && resourceName == viewTopicName) AuthorizationResult.ALLOWED
+        else AuthorizationResult.DENIED
+      }
+      new util.ArrayList[AuthorizationResult](results.asJava)
+    }
+    controllerApis = createControllerApis(Some(authorizer), new MockController.Builder().build(),
+      metadataCacheOverride = Some(metadataCacheMock))
+    controllerApis.handleLegacyAlterConfigs(request)
+    val capturedResponse: ArgumentCaptor[AbstractResponse] =
+      ArgumentCaptor.forClass(classOf[AbstractResponse])
+    verify(requestChannel).sendResponse(
+      ArgumentMatchers.eq(request),
+      capturedResponse.capture(),
+      ArgumentMatchers.eq(None))
+    val response = capturedResponse.getValue.asInstanceOf[AlterConfigsResponse]
+    val viewResponse = response.data().responses().asScala.find(_.resourceName() == viewTopicName).get
+    assertEquals(TOPIC_AUTHORIZATION_FAILED.code(), viewResponse.errorCode(),
+      "legacy AlterConfigs touching view.* on existing view without READ on current backing must be rejected")
     assertEquals("Authorization failed.", viewResponse.errorMessage())
   }
 

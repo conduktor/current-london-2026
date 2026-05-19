@@ -99,12 +99,23 @@ class ConfigHelper(metadataCache: MetadataCache, config: KafkaConfig, configRepo
     request: RequestChannel.Request,
     authHelper: AuthHelper
   ): DescribeConfigsResponseData.DescribeConfigsResult = {
-    // Read the backing topic from the (already-built) response entry rather than re-loading from
-    // configRepository: the entry was built from the same snapshot and the value is what would be
-    // disclosed if we did nothing.
-    val backingEntryOpt = result.configs.asScala.find(_.name == ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG)
-    val backingName = backingEntryOpt.flatMap(e => Option(e.value)).filter(_.nonEmpty)
-    backingName match {
+    // R38 (Codex): resolve the backing topic from the AUTHORITATIVE topic config in
+    // configRepository, NOT from the response entry. The response entry has already been filtered
+    // by `resource.configurationKeys` upstream (see describeConfigs line 130), so if the requester
+    // asks only for `view.cel.predicate` (or any subset that omits `view.backing.topic`), the old
+    // code's `find` returned None, no backing was derived, redaction was skipped — and the
+    // predicate (which IS the security boundary per ViewTopicConfig.java:44) leaked unredacted to
+    // a requester without READ on the backing. Reading the full topic config here closes that
+    // bypass; the actual *redaction* still only touches entries that ARE in the (filtered)
+    // response, so a request that didn't ask for view.cel.predicate doesn't gain a phantom entry.
+    val topicName = result.resourceName
+    val currentBacking = try {
+      val props = configRepository.topicConfig(topicName)
+      Option(props.getProperty(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG)).map(_.trim).filter(_.nonEmpty)
+    } catch {
+      case _: Exception => None
+    }
+    currentBacking match {
       case Some(backing) if !authHelper.authorize(request.context, READ, TOPIC, backing) =>
         result.configs.asScala.foreach { entry =>
           val name = entry.name

@@ -425,6 +425,78 @@ class KafkaApisTest extends Logging {
       "predicate must be visible when requester holds READ on the backing")
   }
 
+  /**
+   * Round 38 (Codex HIGH #2): the `redactViewBackingForUnauthorizedRequester` pass used to derive
+   * the backing topic from `result.configs`, which is filtered upstream by
+   * `resource.configurationKeys` (ConfigHelper.scala:141). A requester who asks ONLY for
+   * `view.cel.predicate` (or any subset that omits `view.backing.topic`) could bypass the redaction
+   * — the predicate value (which IS the security boundary at fetch time, see
+   * ViewTopicConfig.java:44) would be returned in cleartext to a principal lacking READ on the
+   * backing. The fix reads the backing from `configRepository.topicConfig` (the authoritative
+   * source), so the redaction fires regardless of which keys the requester selected.
+   */
+  @Test
+  def testDescribeConfigsOnViewRedactsPredicateEvenWhenConfigurationKeysOmitBacking(): Unit = {
+    val viewTopic = "alice_view"
+    val backingTopic = "tenant_a_raw"
+    val predicate = "body.color == 'red'"
+    val authorizer: Authorizer = mock(classOf[Authorizer])
+    when(authorizer.authorize(any[RequestContext], any[util.List[Action]]))
+      .thenAnswer { invocation =>
+        val actions = invocation.getArgument[util.List[Action]](1).asScala
+        val results = actions.map { action =>
+          val op = action.operation()
+          val resourceName = action.resourcePattern().name()
+          if (op == AclOperation.DESCRIBE_CONFIGS && resourceName == viewTopic) AuthorizationResult.ALLOWED
+          else AuthorizationResult.DENIED
+        }
+        new util.ArrayList[AuthorizationResult](results.asJava)
+      }
+
+    val configRepository: ConfigRepository = mock(classOf[ConfigRepository])
+    val topicConfigs = new Properties()
+    topicConfigs.put(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, backingTopic)
+    topicConfigs.put(ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, predicate)
+    topicConfigs.put(ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+    when(configRepository.topicConfig(viewTopic)).thenReturn(topicConfigs)
+
+    metadataCache = mock(classOf[KRaftMetadataCache])
+    when(metadataCache.contains(viewTopic)).thenReturn(true)
+
+    val requestHeader = new RequestHeader(ApiKeys.DESCRIBE_CONFIGS, ApiKeys.DESCRIBE_CONFIGS.latestVersion,
+      clientId, 0)
+    val describeConfigsRequest = new DescribeConfigsRequest.Builder(new DescribeConfigsRequestData()
+      .setIncludeSynonyms(true)
+      .setResources(List(new DescribeConfigsRequestData.DescribeConfigsResource()
+        .setResourceName(viewTopic)
+        .setResourceType(ConfigResource.Type.TOPIC.id)
+        .setConfigurationKeys(List(ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG).asJava)).asJava))
+      .build(requestHeader.apiVersion)
+    val request = buildRequest(describeConfigsRequest, requestHeader = Option(requestHeader))
+
+    kafkaApis = createKafkaApis(authorizer = Some(authorizer), configRepository = configRepository)
+    kafkaApis.handleDescribeConfigsRequest(request)
+
+    val response = verifyNoThrottling[DescribeConfigsResponse](request)
+    val result = response.data.results.get(0)
+    assertEquals(Errors.NONE.code, result.errorCode)
+    val configs = result.configs.asScala.map(c => (c.name, c)).toMap
+
+    val predicateEntry = configs(ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG)
+    assertNull(predicateEntry.value,
+      "view.cel.predicate must be redacted even when the requester selected ONLY this key " +
+        "(omitting view.backing.topic) — the backing must be resolved from the authoritative " +
+        "topic config, not from the filtered response.")
+    assertTrue(predicateEntry.isSensitive,
+      "view.cel.predicate must be marked sensitive after redaction")
+    predicateEntry.synonyms.forEach(syn => assertNull(syn.value,
+      s"synonym ${syn.name} of view.cel.predicate must be redacted"))
+
+    assertFalse(configs.contains(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG),
+      "view.backing.topic must NOT appear in the response — the requester did not select it; the " +
+        "redaction must not add phantom entries that weren't asked for.")
+  }
+
   @Test
   def testElectLeadersForwarding(): Unit = {
     val requestBuilder = new ElectLeadersRequest.Builder(ElectionType.PREFERRED, null, 30000)
