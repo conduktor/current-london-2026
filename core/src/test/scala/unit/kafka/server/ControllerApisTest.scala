@@ -33,7 +33,7 @@ import org.apache.kafka.common.message.AlterConfigsResponseData.{AlterConfigsRes
 import org.apache.kafka.common.message.ApiMessageType.ListenerType
 import org.apache.kafka.common.message.CreatePartitionsRequestData.CreatePartitionsTopic
 import org.apache.kafka.common.message.CreatePartitionsResponseData.CreatePartitionsTopicResult
-import org.apache.kafka.common.message.CreateTopicsRequestData.{CreatableTopic, CreatableTopicCollection}
+import org.apache.kafka.common.message.CreateTopicsRequestData.{CreatableTopic, CreatableTopicCollection, CreatableTopicConfig, CreatableTopicConfigCollection}
 import org.apache.kafka.common.message.CreateTopicsResponseData.CreatableTopicResult
 import org.apache.kafka.common.message.DeleteTopicsRequestData.DeleteTopicState
 import org.apache.kafka.common.message.DeleteTopicsResponseData.DeletableTopicResult
@@ -59,6 +59,7 @@ import org.apache.kafka.server.authorizer.{Action, AuthorizableRequestContext, A
 import org.apache.kafka.server.common.{ApiMessageAndVersion, FinalizedFeatures, KRaftVersion, MetadataVersion, ProducerIdsBlock, RequestLocal}
 import org.apache.kafka.server.config.{KRaftConfigs, ServerConfigs}
 import org.apache.kafka.server.util.FutureUtils
+import org.apache.kafka.server.views.ViewTopicConfig
 import org.apache.kafka.storage.internals.log.CleanerConfig
 import org.junit.jupiter.api.Assertions._
 import org.junit.jupiter.api.{AfterEach, Test}
@@ -740,7 +741,122 @@ class ControllerApisTest {
     assertEquals(expectedResponse, controllerApis.createTopics(ANONYMOUS_CONTEXT, request,
       hasClusterAuth = false,
       _ => Set("baz", "indescribable"),
-      _ => Set("baz")).get().topics().asScala.toSet)
+      _ => Set("baz"),
+      _ => Set.empty[String]).get().topics().asScala.toSet)
+  }
+
+  private def viewConfigs(backing: String, predicate: String = "true"): CreatableTopicConfigCollection = {
+    val configs = new CreatableTopicConfigCollection()
+    configs.add(new CreatableTopicConfig().
+      setName(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG).
+      setValue(backing))
+    configs.add(new CreatableTopicConfig().
+      setName(ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG).
+      setValue(predicate))
+    configs
+  }
+
+  /**
+   * Round 23: CreateTopics must refuse to bind a view to a backing topic the requester cannot
+   * READ. The fetch path treats a view as a transparent window onto its backing and intentionally
+   * skips the per-fetch backing ACL check (the predicate is the access control). Without a
+   * READ-on-backing gate at create time, any principal with CREATE on a namespace can publish a
+   * view over an arbitrary topic (e.g. __consumer_offsets) and read it back — privilege
+   * escalation. This test pins the closed-on-deny posture: even though "spy_view" itself is
+   * CREATE-authorized, the request must fail because READ on the backing is not authorized.
+   */
+  @Test
+  def testCreateTopicsWithUnauthorizedViewBackingFailsClosedToProtectAgainstPrivEscalation(): Unit = {
+    val controller = new MockController.Builder().build()
+    controllerApis = createControllerApis(None, controller)
+    val request = new CreateTopicsRequestData().setTopics(new CreatableTopicCollection(
+      util.Arrays.asList(
+        new CreatableTopic().setName("spy_view").setNumPartitions(1).setReplicationFactor(1).
+          setConfigs(viewConfigs("__consumer_offsets"))
+      ).iterator()))
+    val response = controllerApis.createTopics(ANONYMOUS_CONTEXT, request,
+      hasClusterAuth = true,
+      _ => Set("spy_view"),
+      _ => Set("spy_view"),
+      _ => Set.empty[String]).get()
+    val result = response.topics().asScala.find(_.name() == "spy_view").get
+    assertEquals(TOPIC_AUTHORIZATION_FAILED.code(), result.errorCode())
+    assertEquals("Authorization failed.", result.errorMessage())
+  }
+
+  /**
+   * Round 23: positive case. When the requester DOES have READ on the backing, view creation
+   * proceeds. Pins that the new gate is not a blanket-block — only an unauthorized backing is
+   * rejected. Without this case, a regression that always-denies view creation would still pass
+   * the negative test above.
+   */
+  @Test
+  def testCreateTopicsWithAuthorizedViewBackingSucceeds(): Unit = {
+    val controller = new MockController.Builder().build()
+    controllerApis = createControllerApis(None, controller)
+    val request = new CreateTopicsRequestData().setTopics(new CreatableTopicCollection(
+      util.Arrays.asList(
+        new CreatableTopic().setName("alice_view").setNumPartitions(1).setReplicationFactor(1).
+          setConfigs(viewConfigs("alice_backing"))
+      ).iterator()))
+    val response = controllerApis.createTopics(ANONYMOUS_CONTEXT, request,
+      hasClusterAuth = true,
+      _ => Set("alice_view"),
+      _ => Set("alice_view"),
+      _ => Set("alice_backing")).get()
+    val result = response.topics().asScala.find(_.name() == "alice_view").get
+    assertEquals(NONE.code(), result.errorCode())
+  }
+
+  /**
+   * Round 23: IncrementalAlterConfigs must enforce the same READ-on-backing gate when the
+   * `view.backing.topic` config is being SET on an existing topic. Without this check, a principal
+   * with only ALTER_CONFIGS on a topic could rebind its backing to any topic in the cluster and
+   * read it via fetch.
+   */
+  @Test
+  def testIncrementalAlterConfigsToSetViewBackingRequiresReadOnBacking(): Unit = {
+    val viewTopicName = "alice_view"
+    val unauthorizedBacking = "__consumer_offsets"
+    val requestData = new IncrementalAlterConfigsRequestData().setResources(
+      new AlterConfigsResourceCollection(util.Arrays.asList(
+        new AlterConfigsResource().
+          setResourceName(viewTopicName).
+          setResourceType(ConfigResource.Type.TOPIC.id()).
+          setConfigs(new AlterableConfigCollection(util.Arrays.asList(new AlterableConfig().
+            setName(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG).
+            setValue(unauthorizedBacking).
+            setConfigOperation(AlterConfigOp.OpType.SET.id())).iterator()))
+        ).iterator()))
+    val request = buildRequest(new IncrementalAlterConfigsRequest.Builder(requestData).build(0))
+
+    val authorizer = mock(classOf[Authorizer])
+    when(authorizer.authorize(
+      any[AuthorizableRequestContext],
+      any[util.List[Action]]
+    )).thenAnswer { invocation =>
+      val actions = invocation.getArgument[util.List[Action]](1).asScala
+      val results = actions.map { action =>
+        val op = action.operation()
+        val resourceName = action.resourcePattern().name()
+        // ALTER_CONFIGS on the view name is fine; READ on the backing is what we are gating.
+        if (op == AclOperation.ALTER_CONFIGS && resourceName == viewTopicName) AuthorizationResult.ALLOWED
+        else AuthorizationResult.DENIED
+      }
+      new util.ArrayList[AuthorizationResult](results.asJava)
+    }
+    controllerApis = createControllerApis(Some(authorizer), new MockController.Builder().build())
+    controllerApis.handleIncrementalAlterConfigs(request)
+    val capturedResponse: ArgumentCaptor[AbstractResponse] =
+      ArgumentCaptor.forClass(classOf[AbstractResponse])
+    verify(requestChannel).sendResponse(
+      ArgumentMatchers.eq(request),
+      capturedResponse.capture(),
+      ArgumentMatchers.eq(None))
+    val response = capturedResponse.getValue.asInstanceOf[IncrementalAlterConfigsResponse]
+    val viewResponse = response.data().responses().asScala.find(_.resourceName() == viewTopicName).get
+    assertEquals(TOPIC_AUTHORIZATION_FAILED.code(), viewResponse.errorCode())
+    assertEquals("Authorization failed.", viewResponse.errorMessage())
   }
 
   @ParameterizedTest(name = "testCreateTopicsMutationQuota with throttle: {0}")

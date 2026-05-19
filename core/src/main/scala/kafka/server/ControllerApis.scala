@@ -31,7 +31,7 @@ import kafka.server.metadata.KRaftMetadataCache
 import kafka.utils.Logging
 import org.apache.kafka.clients.admin.{AlterConfigOp, EndpointType}
 import org.apache.kafka.common.Uuid.ZERO_UUID
-import org.apache.kafka.common.acl.AclOperation.{ALTER, ALTER_CONFIGS, CLUSTER_ACTION, CREATE, CREATE_TOKENS, DELETE, DESCRIBE, DESCRIBE_CONFIGS}
+import org.apache.kafka.common.acl.AclOperation.{ALTER, ALTER_CONFIGS, CLUSTER_ACTION, CREATE, CREATE_TOKENS, DELETE, DESCRIBE, DESCRIBE_CONFIGS, READ}
 import org.apache.kafka.common.config.ConfigResource
 import org.apache.kafka.common.errors.{ApiException, ClusterAuthorizationException, InvalidRequestException, TopicDeletionDisabledException, UnsupportedVersionException}
 import org.apache.kafka.common.internals.FatalExitError
@@ -58,6 +58,7 @@ import org.apache.kafka.common.security.auth.KafkaPrincipal
 import org.apache.kafka.common.security.auth.SecurityProtocol
 import org.apache.kafka.server.authorizer.Authorizer
 import org.apache.kafka.server.common.{ApiMessageAndVersion, RequestLocal}
+import org.apache.kafka.server.views.ViewTopicConfig
 
 import scala.jdk.CollectionConverters._
 
@@ -369,6 +370,8 @@ class ControllerApis(
         authHelper.authorize(request.context, CREATE, CLUSTER, CLUSTER_NAME, logIfDenied = false),
         names => authHelper.filterByAuthorized(request.context, CREATE, TOPIC, names)(identity),
         names => authHelper.filterByAuthorized(request.context, DESCRIBE_CONFIGS, TOPIC,
+            names, logIfDenied = false)(identity),
+        names => authHelper.filterByAuthorized(request.context, READ, TOPIC,
             names, logIfDenied = false)(identity))
     future.handle[Unit] { (result, exception) =>
       val response = if (exception != null) {
@@ -391,7 +394,8 @@ class ControllerApis(
     request: CreateTopicsRequestData,
     hasClusterAuth: Boolean,
     getCreatableTopics: Iterable[String] => Set[String],
-    getDescribableTopics: Iterable[String] => Set[String]
+    getDescribableTopics: Iterable[String] => Set[String],
+    getReadableTopics: Iterable[String] => Set[String]
   ): CompletableFuture[CreateTopicsResponseData] = {
     val topicNames = new util.HashSet[String]()
     val duplicateTopicNames = new util.HashSet[String]()
@@ -421,6 +425,45 @@ class ControllerApis(
         iterator.remove()
       }
     }
+    // A view topic created with view.backing.topic=B is, at fetch time, a read window into B
+    // (filtered through the predicate). The fetch path intentionally does NOT re-check ACLs on
+    // B — the predicate IS the access control. That model is only safe when the requester
+    // creating the view already has READ on B; otherwise CREATE-on-namespace becomes a
+    // privilege-escalation channel into any topic in the cluster (e.g. __consumer_offsets).
+    // Apply the READ-on-backing gate here, after the topic-name CREATE filter, so the response
+    // surfaces TOPIC_AUTHORIZATION_FAILED for the view name (not the backing — that would
+    // disclose internal-topic targeting back to the requester).
+    val viewBackings = new util.HashMap[String, String]()
+    effectiveRequest.topics().forEach { topic =>
+      val configs = topic.configs()
+      if (configs != null) {
+        configs.forEach { entry =>
+          if (ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG == entry.name()) {
+            val value = entry.value()
+            if (value != null && !value.trim.isEmpty) {
+              viewBackings.put(topic.name(), value)
+            }
+          }
+        }
+      }
+    }
+    val backingAuthFailed = new util.HashSet[String]()
+    if (!viewBackings.isEmpty) {
+      val readableBackings = getReadableTopics.apply(viewBackings.values().asScala)
+      viewBackings.forEach { (topicName, backing) =>
+        if (!readableBackings.contains(backing)) {
+          backingAuthFailed.add(topicName)
+        }
+      }
+      if (!backingAuthFailed.isEmpty) {
+        val backingIterator = effectiveRequest.topics().iterator()
+        while (backingIterator.hasNext) {
+          if (backingAuthFailed.contains(backingIterator.next().name())) {
+            backingIterator.remove()
+          }
+        }
+      }
+    }
     controller.createTopics(context, effectiveRequest, describableTopicNames).thenApply { response =>
       duplicateTopicNames.forEach { name =>
         response.topics().add(new CreatableTopicResult().
@@ -434,7 +477,7 @@ class ControllerApis(
             setName(name).
             setErrorCode(INVALID_REQUEST.code).
             setErrorMessage(s"Creation of internal topic ${Topic.CLUSTER_METADATA_TOPIC_NAME} is prohibited."))
-        } else if (!authorizedTopicNames.contains(name)) {
+        } else if (!authorizedTopicNames.contains(name) || backingAuthFailed.contains(name)) {
           response.topics().add(new CreatableTopicResult().
             setName(name).
             setErrorCode(TOPIC_AUTHORIZATION_FAILED.code).
@@ -772,6 +815,30 @@ class ControllerApis(
           setResourceName(resource.name()).
           setResourceType(resource.`type`().id()))
         iterator.remove()
+      }
+    }
+    // Setting view.backing.topic on a topic config turns that topic into a view-window onto the
+    // backing topic. The fetch path intentionally does not re-check ACLs on the backing
+    // (see the rationale on createTopics above). Require READ on the proposed backing here, so
+    // that ALTER_CONFIGS on the view name alone cannot escalate into reading an arbitrary topic.
+    val configChangesIterator = configChanges.entrySet().iterator()
+    while (configChangesIterator.hasNext) {
+      val entry = configChangesIterator.next()
+      val resource = entry.getKey
+      if (resource.`type`() == ConfigResource.Type.TOPIC) {
+        val backingEntry = entry.getValue.get(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG)
+        if (backingEntry != null && backingEntry.getKey == AlterConfigOp.OpType.SET) {
+          val backing = backingEntry.getValue
+          if (backing != null && !backing.trim.isEmpty &&
+              !authHelper.authorize(request.context, READ, TOPIC, backing)) {
+            response.responses().add(new AlterConfigsResourceResponse().
+              setErrorCode(TOPIC_AUTHORIZATION_FAILED.code()).
+              setErrorMessage("Authorization failed.").
+              setResourceName(resource.name()).
+              setResourceType(resource.`type`().id()))
+            configChangesIterator.remove()
+          }
+        }
       }
     }
     controller.incrementalAlterConfigs(context, configChanges, alterConfigsRequest.data.validateOnly)
