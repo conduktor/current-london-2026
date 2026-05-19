@@ -29,7 +29,9 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -91,6 +93,16 @@ public final class KafkaWebSocketEndpoint implements Session.Listener.AutoDemand
      * no data flowing. Relaxing to {@link #IDLE_TIMEOUT} only once a positive credit grant exists
      * keeps the "subscribe-zero-then-flow-later" idiom available to a well-behaved client (it has
      * 30s to grant credit) while denying the slot-pinning escape hatch.
+     *
+     * <p><strong>Why a paired explicit deadline (Wave 41 axis AAA).</strong> The Jetty idle timeout
+     * is a <em>byte-level</em> watchdog: {@code AbstractEndPoint.fill()} calls {@code notIdle()} on
+     * every inbound read, so a client that sends a 2-byte WebSocket Ping (opcode 0x9) every 25s keeps
+     * the watchdog alive indefinitely while never sending a subscribe frame. Pings are auto-handled by
+     * Jetty (the bridge never sees them) and they cost the attacker nothing — a single attacker can
+     * pin every {@link WsStreamLimiter} slot until {@link #IDLE_TIMEOUT}. The fix is to <em>also</em>
+     * arm an explicit one-shot deadline at {@link #onWebSocketOpen} that fires regardless of inbound
+     * byte activity: see {@link #scheduleSubscribeDeadline()} / {@link #onSubscribeDeadlineFired()}.
+     * The Jetty idle timeout remains as defence-in-depth for the bytes-not-arriving case.
      */
     private static final Duration PRE_SUBSCRIBE_IDLE_TIMEOUT = Duration.ofSeconds(30);
 
@@ -182,6 +194,77 @@ public final class KafkaWebSocketEndpoint implements Session.Listener.AutoDemand
         // is what stops a slow-reader-with-large-credit-grant from accumulating an unbounded outbound
         // queue inside Jetty.
         session.setMaxOutgoingFrames(MAX_OUTGOING_FRAMES);
+        // Wave 41 axis AAA: arm an explicit subscribe deadline that is independent of the Jetty
+        // byte-level idle timeout. A hostile client that sends only WebSocket Pings keeps Jetty's
+        // notIdle() ticking forever; without this scheduler-driven deadline the PRE_SUBSCRIBE
+        // watchdog never fires and the limiter slot is pinned for the full IDLE_TIMEOUT. See the
+        // javadoc on PRE_SUBSCRIBE_IDLE_TIMEOUT for the full attack model.
+        scheduleSubscribeDeadline();
+    }
+
+    /**
+     * Wave 41 axis AAA: schedule the explicit subscribe deadline. Dispatches a one-shot runnable via
+     * the {@code httpExecutor} after {@link #PRE_SUBSCRIBE_IDLE_TIMEOUT}; the runnable invokes
+     * {@link #onSubscribeDeadlineFired()}, which is a no-op if positive credits have already been
+     * granted or the endpoint has already torn down.
+     *
+     * <p>The pattern matches {@link WsStreamer#scheduleDrainAfter(long)}: the same JDK static delayer
+     * fires the timer, then dispatches to the Jetty thread pool. A {@code RejectedExecutionException}
+     * at dispatch time (broker shutting down) completes the dependent future exceptionally and is
+     * logged at DEBUG — without the terminal exception handler the failure would be silently dropped
+     * and the deadline would simply never enforce.
+     */
+    private void scheduleSubscribeDeadline() {
+        try {
+            CompletableFuture.runAsync(this::onSubscribeDeadlineFired,
+                CompletableFuture.delayedExecutor(
+                    PRE_SUBSCRIBE_IDLE_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS, httpExecutor))
+                .exceptionally(t -> {
+                    LOG.debug("WS subscribe-deadline dispatch failed on {}: {}", topic,
+                        t == null ? "null" : t.toString());
+                    return null;
+                });
+        } catch (RuntimeException e) {
+            // The synchronous dispatch leg (queueing into the static delayer) is virtually never
+            // reachable, but if it ever throws we lose the deadline. Log so a regression is
+            // diagnosable; the Jetty idle timeout remains as defence-in-depth.
+            LOG.warn("WS subscribe-deadline schedule failed on {}", topic, e);
+        }
+    }
+
+    /**
+     * Wave 41 axis AAA: deadline-fire handler. Closes the session with {@link StatusCode#POLICY_VIOLATION
+     * 1008} when the explicit subscribe deadline elapses without a positive credit grant having arrived.
+     * Package-private so unit tests can simulate the deadline firing without waiting for real time —
+     * production callers go through {@link #scheduleSubscribeDeadline()}.
+     *
+     * <p>No-op if either of:
+     * <ul>
+     *   <li>{@code idleTimeoutRelaxed} is set — the steady-state path is already in force and the
+     *       Jetty idle timeout (5 min) is now the controlling watchdog;</li>
+     *   <li>{@code closed} is set — teardown already completed for some other reason.</li>
+     * </ul>
+     * Both checks are race-tolerant: a concurrent positive credit grant that flips
+     * {@code idleTimeoutRelaxed} between the check and the close is also harmless because
+     * {@code tearDown()} is idempotent and the broker has nothing in flight on a session that has
+     * yet to issue its first fetch.
+     */
+    void onSubscribeDeadlineFired() {
+        if (closed || idleTimeoutRelaxed.get()) {
+            return;
+        }
+        LOG.debug("WS subscribe deadline elapsed on {} — closing 1008", topic);
+        Session s = this.session;
+        if (s != null) {
+            sendErrorEnvelope("SUBSCRIBE_DEADLINE",
+                "no positive credits granted within subscribe deadline");
+            try {
+                s.close(StatusCode.POLICY_VIOLATION, "subscribe deadline elapsed", Callback.NOOP);
+            } catch (RuntimeException e) {
+                LOG.debug("close(1008) failed on {}: {}", topic, e.toString());
+            }
+        }
+        tearDown();
     }
 
     @Override

@@ -23,6 +23,7 @@ import org.apache.kafka.common.protocol.Errors;
 
 import org.eclipse.jetty.websocket.api.Callback;
 import org.eclipse.jetty.websocket.api.Session;
+import org.eclipse.jetty.websocket.api.StatusCode;
 import org.eclipse.jetty.websocket.api.UpgradeRequest;
 import org.eclipse.jetty.websocket.api.UpgradeResponse;
 import org.junit.jupiter.api.AfterEach;
@@ -279,6 +280,86 @@ class KafkaWebSocketEndpointTest {
         endpoint.onWebSocketText("{\"type\":\"flow\",\"credits\":3}");
         assertEquals(Duration.ofMinutes(99), session.idleTimeout,
             "subsequent positive flow grants must not re-set the timeout (CAS is one-shot)");
+    }
+
+    @Test
+    void subscribeDeadlineClosesSessionWith1008WhenNoPositiveCreditsArrive() {
+        // Wave 41 axis AAA: a hostile client opens the WS connection and never sends a subscribe frame —
+        // only periodic WebSocket Pings (opcode 0x9) handled internally by Jetty. Pings invoke
+        // notIdle() on every inbound read, so the byte-level PRE_SUBSCRIBE_IDLE_TIMEOUT watchdog never
+        // fires; the limiter slot is pinned for the full IDLE_TIMEOUT (5 min). The explicit subscribe
+        // deadline armed by onWebSocketOpen() is the load-bearing fix: it closes the session with 1008
+        // POLICY_VIOLATION regardless of inbound byte activity. In tests we cannot wait the real 30s,
+        // so simulate the deadline fire by invoking the package-private callback directly — production
+        // schedules this via CompletableFuture.delayedExecutor on the httpExecutor.
+        WsStreamLimiter.Token token = limiter.tryAcquire();
+        KafkaWebSocketEndpoint endpoint = newEndpoint(token, "orders");
+        endpoint.onWebSocketOpen(session);
+        assertEquals(1, limiter.inUse(), "open consumed a limiter slot");
+
+        // No subscribe frame ever arrives — simulates the ping-only attacker. Fire the deadline.
+        endpoint.onSubscribeDeadlineFired();
+
+        assertTrue(session.closed.get(), "subscribe deadline must close the session");
+        assertEquals(StatusCode.POLICY_VIOLATION, session.closeStatus.get(),
+            "close must use 1008 POLICY_VIOLATION (subscribe deadline distinct from BAD_MESSAGE)");
+        assertEquals("subscribe deadline elapsed", session.closeReason.get(),
+            "close reason must name the deadline so operators can diagnose without log access");
+        assertEquals(1, session.errorCount(),
+            "client must receive the JSON error envelope before the close frame so it can self-diagnose");
+        JsonNode err = session.errorAt(0);
+        assertEquals("SUBSCRIBE_DEADLINE", err.get("errorCode").asText(),
+            "error envelope code must distinguish this from BAD_MESSAGE / INTERNAL");
+        assertEquals(0, limiter.inUse(),
+            "deadline-driven close must release the slot — that's the entire point of the watchdog");
+    }
+
+    @Test
+    void subscribeDeadlineIsNoOpAfterPositiveCreditsRelaxedTheTimeout() {
+        // Wave 41 axis AAA contract: once positive credits have been granted (idleTimeoutRelaxed=true),
+        // a late deadline fire MUST be a no-op. Without this guard, a slow CI host that takes >30s from
+        // upgrade to first fetch could see the steady-state subscription torn down by the deadline that
+        // raced the relax. The CAS-based idleTimeoutRelaxed flag is the gate.
+        WsStreamLimiter.Token token = limiter.tryAcquire();
+        submitter.queueFetch(records(0, 1));
+        KafkaWebSocketEndpoint endpoint = newEndpoint(token, "orders");
+        endpoint.onWebSocketOpen(session);
+        endpoint.onWebSocketText(
+            "{\"type\":\"subscribe\",\"partition\":0,\"offset\":0,\"initialCredits\":1}");
+        assertEquals(Duration.ofMinutes(5), session.idleTimeout,
+            "positive initial credits relaxed the watchdog to steady-state");
+        boolean wasClosed = session.closed.get();
+
+        // Now fire the deadline late.
+        endpoint.onSubscribeDeadlineFired();
+
+        assertEquals(wasClosed, session.closed.get(),
+            "deadline fire after positive credits must not change session-closed state");
+        assertEquals(0, session.errorCount(),
+            "deadline fire after positive credits must not emit a spurious error envelope");
+    }
+
+    @Test
+    void subscribeDeadlineIsNoOpAfterTeardown() {
+        // Wave 41 axis AAA contract: after teardown (client disconnect, error, shutdown), the deadline
+        // must be a no-op even if positive credits never arrived. Without the closed guard, the deadline
+        // would call sendErrorEnvelope on an already-closed session — FakeSession's sendText throws if
+        // the session is closed in production, so this would generate noisy DEBUG logs and a redundant
+        // close attempt every time a client disconnects before granting credits.
+        WsStreamLimiter.Token token = limiter.tryAcquire();
+        KafkaWebSocketEndpoint endpoint = newEndpoint(token, "orders");
+        endpoint.onWebSocketOpen(session);
+        endpoint.onWebSocketClose(1000, "client disconnect before subscribe");
+        assertEquals(0, limiter.inUse(), "client disconnect released the slot");
+        int errorsBeforeDeadline = session.errorCount();
+
+        endpoint.onSubscribeDeadlineFired();
+
+        assertEquals(errorsBeforeDeadline, session.errorCount(),
+            "deadline fire after teardown must not emit any envelope (closed flag short-circuits)");
+        assertEquals(0, limiter.inUse(),
+            "deadline fire after teardown must not double-release (token CAS already covers this, "
+                + "but the no-op short-circuit avoids the wasted work)");
     }
 
     @Test

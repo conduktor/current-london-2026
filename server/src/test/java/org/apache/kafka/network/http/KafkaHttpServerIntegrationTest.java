@@ -1861,16 +1861,46 @@ class KafkaHttpServerIntegrationTest {
     }
 
     @Test
-    void putMethodReturns405() throws Exception {
-        // PUT/DELETE/PATCH have no override on HttpServlet, so the default already returns 405 + a stock HTML
-        // body. Pin the contract: the bridge must answer with the {errorCode, errorMessage} envelope so clients
-        // see a consistent error shape across every refused method.
+    void putMethodReturns405WithAllowHeader() throws Exception {
+        // Wave 41 DDD: HttpServlet.doPut defaults to sendError(405) without setting Allow. JsonErrorHandler
+        // renders the envelope on the sendError path, but the missing Allow header silently violates RFC 9110
+        // §15.5.6 ("a 405 response MUST generate an Allow header listing the methods that are allowed").
+        // Override doPut to route through writeMethodNotAllowed so every refused verb advertises the same
+        // curated Allow set as the TRACE / CONNECT / OPTIONS surfaces.
         ContentResponse resp = client.newRequest(url("/v1/topics/orders/records"))
             .method(HttpMethod.PUT)
             .body(new StringRequestContent("application/json", "{}"))
             .send();
 
         assertEquals(405, resp.getStatus());
+        String allow = resp.getHeaders().get("Allow");
+        assertNotNull(allow, "PUT 405 response must include Allow header per RFC 9110 §15.5.6");
+        assertEquals("GET, HEAD, OPTIONS, POST", allow,
+            "PUT 405 must advertise the curated Allow set (must match doOptions / doTrace / ConnectMethodGuard), got: "
+                + allow);
+        JsonNode envelope = asJson(resp.getContent());
+        assertEquals(405, envelope.get("errorCode").asInt(),
+            "PUT 405 envelope errorCode must be 405");
+        assertEquals("method not allowed", envelope.get("errorMessage").asText(),
+            "PUT 405 envelope errorMessage must match the canonical phrase used by TRACE / CONNECT 405s");
+    }
+
+    @Test
+    void deleteMethodReturns405WithAllowHeader() throws Exception {
+        // Wave 41 DDD: same RFC 9110 §15.5.6 contract as PUT. Asserted on a separate verb so a regression that
+        // re-introduces the default sendError(405) path for one method but not the other is caught.
+        ContentResponse resp = client.newRequest(url("/v1/topics/orders/records"))
+            .method(HttpMethod.DELETE)
+            .send();
+
+        assertEquals(405, resp.getStatus());
+        String allow = resp.getHeaders().get("Allow");
+        assertNotNull(allow, "DELETE 405 response must include Allow header per RFC 9110 §15.5.6");
+        assertEquals("GET, HEAD, OPTIONS, POST", allow,
+            "DELETE 405 must advertise the curated Allow set, got: " + allow);
+        JsonNode envelope = asJson(resp.getContent());
+        assertEquals(405, envelope.get("errorCode").asInt());
+        assertEquals("method not allowed", envelope.get("errorMessage").asText());
     }
 
     // ----- async correctness -----

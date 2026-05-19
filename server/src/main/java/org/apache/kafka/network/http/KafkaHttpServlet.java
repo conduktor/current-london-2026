@@ -93,6 +93,24 @@ public final class KafkaHttpServlet extends HttpServlet {
     }
 
     @Override
+    protected void doDelete(HttpServletRequest req, HttpServletResponse resp) throws IOException {
+        // Wave 41 axis DDD: HttpServlet.doDelete defaults to sendError(405, ...) but does NOT set the
+        // Allow header that RFC 9110 §15.5.6 mandates ("a 405 response MUST generate an Allow header
+        // listing the methods that are allowed"). JsonErrorHandler renders the JSON envelope on the
+        // sendError path, but neither it nor the default servlet method sets Allow — so DELETE 405s
+        // silently drift from the curated set advertised by doOptions / doTrace / ConnectMethodGuard.
+        // Route through writeMethodNotAllowed to pin the contract symmetrically across every refused verb.
+        writeMethodNotAllowed(resp);
+    }
+
+    @Override
+    protected void doPut(HttpServletRequest req, HttpServletResponse resp) throws IOException {
+        // Same rationale as doDelete: HttpServlet.doPut defaults to sendError(405, ...) with no Allow
+        // header. Override so PUT 405s carry the curated Allow set required by RFC 9110 §15.5.6.
+        writeMethodNotAllowed(resp);
+    }
+
+    @Override
     protected void doOptions(HttpServletRequest req, HttpServletResponse resp) throws IOException {
         // The default doOptions reflects every doXxx defined on the class hierarchy into an Allow header — that
         // still listed TRACE before we overrode it, and would re-introduce the leak the moment HttpServlet adds
