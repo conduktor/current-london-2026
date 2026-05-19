@@ -9371,6 +9371,77 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testAlterReplicaLogDirsClusterWideListenerRefusesTenantPartition(): Unit = {
+    // A cluster-wide ALTER caller naming `acme.orders-0` would otherwise force
+    // tenant log dirs onto a different (slow / pending-removal) disk without
+    // any tenant signal in the audit log. The broker must partition the input
+    // into eligible vs reserved-tenant before calling replicaManager — only
+    // the eligible map reaches ReplicaManager; the reserved-tenant entries
+    // surface as per-partition INVALID_TOPIC_EXCEPTION in the response.
+    val data = new AlterReplicaLogDirsRequestData()
+    val dir = new AlterReplicaLogDirsRequestData.AlterReplicaLogDir().setPath("/foo")
+    dir.topics().add(new AlterReplicaLogDirsRequestData.AlterReplicaLogDirTopic()
+      .setName("acme.orders").setPartitions(asList(0)))
+    dir.topics().add(new AlterReplicaLogDirsRequestData.AlterReplicaLogDirTopic()
+      .setName("plain").setPartitions(asList(0)))
+    data.dirs().add(dir)
+    val req = new AlterReplicaLogDirsRequest.Builder(data).build()
+    val request = buildRequest(req)
+
+    reset(replicaManager, clientRequestQuotaManager, requestChannel)
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+    val plainTp = new TopicPartition("plain", 0)
+    when(replicaManager.alterReplicaLogDirs(ArgumentMatchers.eq(Map(plainTp -> "/foo"))))
+      .thenReturn(Map(plainTp -> Errors.NONE))
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleAlterReplicaLogDirsRequest(request)
+
+    val response = verifyNoThrottling[AlterReplicaLogDirsResponse](request)
+    val byTopic = response.data.results.asScala.map(r => r.topicName -> r).toMap
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code,
+      byTopic("acme.orders").partitions.asScala.head.errorCode,
+      "tenant-prefixed partition must be refused on cluster-wide listener")
+    assertEquals(Errors.NONE.code,
+      byTopic("plain").partitions.asScala.head.errorCode,
+      "non-polluting partition must still reach ReplicaManager")
+    // ReplicaManager must NOT have seen the polluting partition.
+    verify(replicaManager).alterReplicaLogDirs(ArgumentMatchers.eq(Map(plainTp -> "/foo")))
+  }
+
+  @Test
+  def testAlterReplicaLogDirsClusterWideListenerAllPollutingShortCircuits(): Unit = {
+    // When every requested partition lives in a tenant namespace, the eligible
+    // map is empty — ReplicaManager.alterReplicaLogDirs must NOT be called at
+    // all (asking it to act on an empty map is wasteful and noisy). The caller
+    // still receives one INVALID_TOPIC_EXCEPTION per requested partition.
+    val data = new AlterReplicaLogDirsRequestData()
+    val dir = new AlterReplicaLogDirsRequestData.AlterReplicaLogDir().setPath("/foo")
+    dir.topics().add(new AlterReplicaLogDirsRequestData.AlterReplicaLogDirTopic()
+      .setName("acme.orders").setPartitions(asList(0, 1)))
+    data.dirs().add(dir)
+    val req = new AlterReplicaLogDirsRequest.Builder(data).build()
+    val request = buildRequest(req)
+
+    reset(replicaManager, clientRequestQuotaManager, requestChannel)
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleAlterReplicaLogDirsRequest(request)
+
+    val response = verifyNoThrottling[AlterReplicaLogDirsResponse](request)
+    val parts = response.data.results.asScala.head.partitions.asScala
+      .map(p => p.partitionIndex.toInt -> p.errorCode).toMap
+    assertEquals(Set(Errors.INVALID_TOPIC_EXCEPTION.code), parts.values.toSet)
+    assertEquals(Set(0, 1), parts.keySet)
+    verify(replicaManager, never()).alterReplicaLogDirs(any[Map[TopicPartition, String]]())
+  }
+
+  @Test
   def testSizeOfThrottledPartitions(): Unit = {
     val topicNames = new util.HashMap[Uuid, String]
     val topicIds = new util.HashMap[String, Uuid]()

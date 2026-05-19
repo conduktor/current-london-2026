@@ -4716,13 +4716,36 @@ class KafkaApis(val requestChannel: RequestChannel,
       .setConfigs(Collections.emptyList[DescribeConfigsResponseData.DescribeConfigsResourceResult])
   }
 
+  // ALTER_REPLICA_LOG_DIRS — outside-in storage-rebalance guard. The handler
+  // gates only on CLUSTER:ALTER and then asks ReplicaManager to move each
+  // (topic-partition → dir) mapping. A cluster-wide caller naming
+  // `acme.orders` would otherwise force tenant log dirs onto a slow disk, a
+  // pending-removal dir, or a dir under a different filesystem — all without
+  // any tenant signal in the audit log. ALTER_REPLICA_LOG_DIRS is not in
+  // TENANT_ALLOWED_APIS, so every caller reaching this branch is non-tenant
+  // by construction; partition the input into (reservedPolluting, eligible)
+  // by topic-name namespace, execute on the eligible set only, and synthesize
+  // per-partition INVALID_TOPIC_EXCEPTION results for the reserved set so the
+  // caller sees the refusal per-partition rather than the whole request being
+  // silently truncated. Matches #82's pattern on AlterPartitionReassignments.
   def handleAlterReplicaLogDirsRequest(request: RequestChannel.Request): Unit = {
     val alterReplicaDirsRequest = request.body[AlterReplicaLogDirsRequest]
     if (authHelper.authorize(request.context, ALTER, CLUSTER, CLUSTER_NAME)) {
-      val result = replicaManager.alterReplicaLogDirs(alterReplicaDirsRequest.partitionDirs.asScala)
+      val partitionDirs = alterReplicaDirsRequest.partitionDirs.asScala
+      val (rejected, eligible) =
+        if (tenantContextFor(request).effectiveTenant.isPresent) {
+          (Map.empty[TopicPartition, String], partitionDirs)
+        } else {
+          partitionDirs.partition { case (tp, _) => isReservedTenantNamespace(tp.topic) }
+        }
+      val realResult = if (eligible.isEmpty) Map.empty[TopicPartition, Errors]
+                       else replicaManager.alterReplicaLogDirs(eligible)
+      val rejectedSynth: Map[TopicPartition, Errors] =
+        rejected.iterator.map { case (tp, _) => (tp, Errors.INVALID_TOPIC_EXCEPTION) }.toMap
+      val combined = realResult ++ rejectedSynth
       requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
         new AlterReplicaLogDirsResponse(new AlterReplicaLogDirsResponseData()
-          .setResults(result.groupBy(_._1.topic).map {
+          .setResults(combined.groupBy(_._1.topic).map {
             case (topic, errors) => new AlterReplicaLogDirsResponseData.AlterReplicaLogDirTopicResult()
               .setTopicName(topic)
               .setPartitions(errors.map {
