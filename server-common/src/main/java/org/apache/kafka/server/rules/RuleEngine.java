@@ -140,6 +140,26 @@ public final class RuleEngine {
     private static final ThreadLocal<Boolean> IN_EVALUATE =
         ThreadLocal.withInitial(() -> Boolean.FALSE);
 
+    /**
+     * Marker subclass of {@link IllegalStateException} thrown by the re-entry
+     * guard. Distinguishes the engine's own engine-state signal from operator-
+     * authored rule failures that legitimately throw {@code IllegalStateException}
+     * (e.g. a buggy CEL host function or a misauthored accessor). The per-rule
+     * fail-OPEN catch in {@link #evaluate} swallows generic
+     * {@code IllegalStateException} (so a buggy rule cannot deny every
+     * request) but selectively re-throws this subclass so a re-entrant engine
+     * call surfaces as a 5xx in {@code KafkaApis} instead of silently advancing
+     * to ALLOW. Public callers can still catch {@code IllegalStateException}
+     * — the marker IS-A IllegalStateException; only the dispatch inside
+     * {@link #evaluate} treats it specifically. See R23 #224.
+     */
+    static final class EvaluateReentryException extends IllegalStateException {
+        private static final long serialVersionUID = 1L;
+        EvaluateReentryException(String msg) {
+            super(msg);
+        }
+    }
+
     private final AtomicReference<RuleSet> active = new AtomicReference<>(RuleSet.EMPTY);
 
     /**
@@ -728,7 +748,7 @@ public final class RuleEngine {
         // re-entrant call would actually reach the budget-reset or the rule
         // loop (i.e. when there is real state to corrupt).
         if (Boolean.TRUE.equals(IN_EVALUATE.get())) {
-            throw new IllegalStateException(
+            throw new EvaluateReentryException(
                 "RuleEngine.evaluate must not be called recursively on the same "
                     + "thread. The per-request CEL step budget guarantee depends "
                     + "on a single evaluate() entry per request thread; a "
@@ -870,6 +890,35 @@ public final class RuleEngine {
                     boolean matched;
                     try {
                         matched = rule.compiled().evalBoolean(activation::get);
+                    } catch (EvaluateReentryException reentry) {
+                        // R23 #224: the re-entry guard at the top of
+                        // evaluate() throws EvaluateReentryException (an
+                        // IllegalStateException subclass — see field
+                        // declaration). It is the engine's own signal that a
+                        // supplier or compiled CEL program recursively called
+                        // evaluate() on the same thread. The per-rule
+                        // fail-OPEN catch below intentionally swallows
+                        // generic IllegalStateException — a buggy operator-
+                        // authored rule throwing ISE must NOT be able to
+                        // deny every request — but the engine-state re-entry
+                        // signal is a different category: silently treating
+                        // it as ALLOW lets the buggy/hostile reentrant call
+                        // evade the very DENY rule whose evaluation
+                        // triggered it, with no operator visibility.
+                        // Re-throwing the marker subclass propagates up to
+                        // KafkaApis's outer Throwable catch (5xx), mirroring
+                        // the round-15 H2 reasoning for Error subclasses:
+                        // programming-error / engine-state signals belong
+                        // above the rule-level catch.
+                        //
+                        // Today the supplier-level re-entrant case is
+                        // covered by the activation-supplier catch at line
+                        // ~1158 (which IS intentionally fail-OPEN — see
+                        // reentrantEvaluateFromActivationSupplierIsCaughtAndFailsOpen).
+                        // This narrowed re-throw covers the path where a
+                        // future CEL host function or custom accessor
+                        // re-enters evaluate() from inside evalBoolean.
+                        throw reentry;
                     } catch (Exception e) {
                         evalErrorObserved = true;
                         // Round-15 Walker HIGH H2: narrowed from {@code Throwable}

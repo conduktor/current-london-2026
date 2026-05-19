@@ -304,6 +304,63 @@ public class RuleEngineTest {
     }
 
     @Test
+    public void perRuleCatchMustNotSwallowReentryFromInsideEvalBoolean() {
+        // R23 #224: the engine's re-entry guard at the top of evaluate()
+        // throws EvaluateReentryException — a private IllegalStateException
+        // subclass that distinguishes the engine's own engine-state signal
+        // from operator-rule failures that legitimately throw plain
+        // IllegalStateException (see
+        // buggyPredicateThrowingExceptionStillFailsOpenAndAdvancesToNextRule
+        // for the operator-rule contract that this design preserves).
+        //
+        // Today the supplier-level re-entrant case is covered by the
+        // activation-supplier catch at the supplier-failure site, which IS
+        // intentionally fail-OPEN (pinned by
+        // reentrantEvaluateFromActivationSupplierIsCaughtAndFailsOpen).
+        // That posture is correct: the supplier "failed" from the engine's
+        // perspective, so the activation-supplier WARN+fail-OPEN is the
+        // right outcome.
+        //
+        // This test pins the DIFFERENT path: a future CEL host function or
+        // a custom accessor that re-enters evaluate() from INSIDE the
+        // per-rule evalBoolean() call. Without the marker-subclass re-throw,
+        // the per-rule fail-OPEN catch below the rule-eval call would
+        // swallow the re-entry signal and mark the offending rule ALLOW —
+        // a hostile rule or a buggy supplier could thereby evade the very
+        // DENY rule whose evaluation triggered it, silently and without
+        // operator visibility. The fix surfaces the re-entry signal up to
+        // KafkaApis (5xx).
+        //
+        // The test forces the path with a custom activation Map whose
+        // get("r") recursively calls engine.evaluate(); the rule "r.x == 1"
+        // looks up "r" from inside evalBoolean(), so the inner evaluate
+        // sees IN_EVALUATE=TRUE → throws EvaluateReentryException → the
+        // per-rule catch must NOT absorb it.
+        RuleEngine engine = new RuleEngine();
+        engine.install(new RuleSetBuilder()
+            .put(denyRule("deny-on-x", ApiKeys.METADATA, "r.x == 1", 99))
+            .build());
+        Map<String, Object> reentrantActivation = new java.util.HashMap<String, Object>() {
+            @Override
+            public Object get(Object key) {
+                if ("r".equals(key)) {
+                    engine.evaluate(ApiKeys.METADATA, "c", null, false, Collections::emptyMap);
+                }
+                return super.get(key);
+            }
+        };
+        IllegalStateException ise = assertThrows(IllegalStateException.class,
+            () -> engine.evaluate(
+                ApiKeys.METADATA, "c", null, false, () -> reentrantActivation));
+        assertTrue(ise.getMessage().contains("must not be called recursively"),
+            "expected re-entry guard message; got: " + ise.getMessage());
+        assertTrue(ise instanceof RuleEngine.EvaluateReentryException,
+            "expected EvaluateReentryException marker subclass so the per-rule catch "
+                + "can distinguish engine-state re-entry from operator-rule ISE; got: "
+                + ise.getClass().getName());
+    }
+
+    @Test
     public void budgetOverflowWarnIsThrottledUnderRapidFire() {
         // DoS-P1: the fail-closed posture in
         // activationBudgetExceededFailsClosedWithPolicyViolation correctly
