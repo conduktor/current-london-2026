@@ -637,6 +637,16 @@ public final class RuleEngine {
             if (cp >= 0x2066 && cp <= 0x2069) {
                 return String.format("bidi isolate U+%04X", cp);
             }
+            // Round-22 (R22-#212): strong directional marks were missed in
+            // earlier rounds. Same hazard class as the bidi override/isolate
+            // sets above — they reorder display without changing codepoint
+            // content. A bypass entry like "User:broker‎" displays as
+            // "User:broker" in every bidi-aware admin viewer but its canonical
+            // form never matches a runtime peer principal, silently
+            // under-granting the bypass.
+            if (cp == 0x200E || cp == 0x200F || cp == 0x061C) {
+                return String.format("bidi mark U+%04X", cp);
+            }
             i += Character.charCount(cp);
         }
         return null;

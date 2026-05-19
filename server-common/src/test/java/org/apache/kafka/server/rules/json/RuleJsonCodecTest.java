@@ -283,6 +283,21 @@ public class RuleJsonCodecTest {
             "᠎__activation-budget-exceeded__",  // MONGOLIAN VOWEL SEPARATOR
             "‪__activation-budget-exceeded__",  // LRE (bidi format)
             "‮__activation-budget-exceeded__",  // RLO (bidi format)
+            // Round-22 (R22-#212): strong directional marks. U+200E LRM /
+            // U+200F RLM / U+061C ALM are NOT classified as whitespace and
+            // have ZERO visible width — an id like "rule-X\u200E" displays
+            // identically to "rule-X" in any bidi-aware viewer; admin
+            // searches for the operator-visible form never find the stored
+            // rule, defeating the unambiguous-attribution promise.
+            "‎__activation-budget-exceeded__",  // LRM (left-to-right mark)
+            "‏__activation-budget-exceeded__",  // RLM (right-to-left mark)
+            "؜__activation-budget-exceeded__",  // ALM (arabic letter mark)
+            // Round-22 / R15 #163: Unicode bidi isolates were missing from
+            // earlier rounds — same hazard class as the strong marks above.
+            "⁦__activation-budget-exceeded__",  // LRI (left-to-right isolate)
+            "⁧__activation-budget-exceeded__",  // RLI (right-to-left isolate)
+            "⁨__activation-budget-exceeded__",  // FSI (first strong isolate)
+            "⁩__activation-budget-exceeded__",  // PDI (pop directional isolate)
             "rule with nbsp",              // embedded NBSP, plain operator id
         };
         for (String id : invisible) {

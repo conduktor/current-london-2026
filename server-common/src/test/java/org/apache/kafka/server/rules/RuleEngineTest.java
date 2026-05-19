@@ -1430,6 +1430,61 @@ public class RuleEngineTest {
             "internal LRI (U+2066) must abort startup with a bidi-isolate "
                 + "diagnostic naming the codepoint; got: " + lri.getMessage());
 
+        // Round-22 (R22-#163): close the bidi-isolate set — RLI/FSI/PDI
+        // (U+2067/U+2068/U+2069) reorder display the same way as LRI and
+        // were missing from the rejection set. Same hazard as LRI: an entry
+        // like "User:broker⁧" displays as "User:broker" but its
+        // canonical form never matches a runtime peer principal.
+        IllegalArgumentException rli = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals("User:bro⁧ker"));
+        assertTrue(rli.getMessage().contains("bidi isolate")
+            && rli.getMessage().contains("U+2067"),
+            "internal RLI (U+2067) must abort startup with a bidi-isolate "
+                + "diagnostic naming the codepoint; got: " + rli.getMessage());
+        IllegalArgumentException fsi = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals("User:bro⁨ker"));
+        assertTrue(fsi.getMessage().contains("bidi isolate")
+            && fsi.getMessage().contains("U+2068"),
+            "internal FSI (U+2068) must abort startup with a bidi-isolate "
+                + "diagnostic naming the codepoint; got: " + fsi.getMessage());
+        IllegalArgumentException pdi = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals("User:bro⁩ker"));
+        assertTrue(pdi.getMessage().contains("bidi isolate")
+            && pdi.getMessage().contains("U+2069"),
+            "internal PDI (U+2069) must abort startup with a bidi-isolate "
+                + "diagnostic naming the codepoint; got: " + pdi.getMessage());
+
+        // Round-22 (R22-#212): strong directional marks — LRM/RLM/ALM
+        // (U+200E/U+200F/U+061C) reorder display in bidi-aware admin viewers
+        // without changing codepoint content. An entry like
+        // "User:broker‎" renders as "User:broker" but its canonical
+        // form never matches a runtime peer principal, silently
+        // under-granting the bypass. Reject with a "bidi mark" diagnostic.
+        IllegalArgumentException lrm = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals("User:broker‎"));
+        assertTrue(lrm.getMessage().contains("bidi mark")
+            && lrm.getMessage().contains("U+200E"),
+            "trailing LRM (U+200E) must abort startup with a bidi-mark "
+                + "diagnostic naming the codepoint; got: " + lrm.getMessage());
+        IllegalArgumentException rlm = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals("User:broker‏"));
+        assertTrue(rlm.getMessage().contains("bidi mark")
+            && rlm.getMessage().contains("U+200F"),
+            "trailing RLM (U+200F) must abort startup with a bidi-mark "
+                + "diagnostic naming the codepoint; got: " + rlm.getMessage());
+        IllegalArgumentException alm = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals("User؜:broker"));
+        assertTrue(alm.getMessage().contains("bidi mark")
+            && alm.getMessage().contains("U+061C"),
+            "ALM (U+061C) in type must abort startup with a bidi-mark "
+                + "diagnostic naming the codepoint; got: " + alm.getMessage());
+
         // ---- ZWJ / ZWNJ also rejected (U+200C, U+200D) ----
         org.junit.jupiter.api.Assertions.assertThrows(
             IllegalArgumentException.class,

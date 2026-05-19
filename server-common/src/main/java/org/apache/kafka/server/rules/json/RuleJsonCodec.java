@@ -410,6 +410,29 @@ public final class RuleJsonCodec {
             case '‬': // POP DIRECTIONAL FORMATTING
             case '‭': // LEFT-TO-RIGHT OVERRIDE
             case '‮': // RIGHT-TO-LEFT OVERRIDE
+            // Round-22 (Agent 3 R22-#212): strong directional marks. U+200E
+            // LRM / U+200F RLM / U+061C ALM are NOT classified as whitespace
+            // by either Character.isWhitespace or Character.isSpaceChar and
+            // have ZERO visible width. An id like \"rule-X\u200E\" renders
+            // identically to \"rule-X\" in any bidi-aware viewer (Kibana,
+            // modern terminals, X11 trees); an operator searching the admin
+            // tool for \"rule-X\" would never find the stored rule, defeating
+            // the unambiguous-attribution property the rest of this list rests
+            // on. Same hazard class as the U+202A-U+202E embeddings/overrides.
+            case '‎': // LEFT-TO-RIGHT MARK
+            case '‏': // RIGHT-TO-LEFT MARK
+            case '؜': // ARABIC LETTER MARK
+            // Round-22 / R15 #163: Unicode bidi isolates were missing from the
+            // earlier round. Same hazard class as the strong marks above and
+            // the U+202A-U+202E embeddings/overrides: they reorder display
+            // without changing codepoint content. A trailing PDI may legitimately
+            // appear alone in non-id text, but operator-authored rule ids have
+            // no legitimate use for any directional formatting control, so we
+            // reject every isolate codepoint.
+            case '⁦': // LEFT-TO-RIGHT ISOLATE
+            case '⁧': // RIGHT-TO-LEFT ISOLATE
+            case '⁨': // FIRST STRONG ISOLATE
+            case '⁩': // POP DIRECTIONAL ISOLATE
             case '⁠': // WORD JOINER
             case '﻿': // ZERO-WIDTH NO-BREAK SPACE / BOM
             case '᠎': // MONGOLIAN VOWEL SEPARATOR
