@@ -156,23 +156,41 @@ public class RuleJsonCodecTest {
 
     @Test
     public void uncompilableCelWithControlBytesIsSanitisedInMessage() {
-        // R25-B F1: closes the R23 #237 overclaim. The original commit
-        // sanitised three explicit throw sites (unknown api / forbidden api /
-        // unsupported action) but documented the contract as "uniform across
-        // the decoder", which it was not — the uncompilable-CEL throw site
-        // embedded e.getMessage() from CelCompilationException verbatim, and
+        // R25-B F1 / R26-D F1: closes the R23 #237 overclaim. The original
+        // commit sanitised three explicit throw sites (unknown api / forbidden
+        // api / unsupported action) but documented the contract as "uniform
+        // across the decoder", which it was not — the uncompilable-CEL throw
+        // site embedded CelCompilationException#getMessage() verbatim, and
         // CelCompiler.truncateForLog only bounds *length*, not control bytes.
-        // The `when` source is fully operator-controlled and reaches this
-        // path whenever the CEL parser rejects it. An attacker who publishes
-        // an envelope whose `when` contains JSON-escaped CR/LF plus an
-        // ambiguous-but-clearly-bad CEL fragment can force the parse to fail
-        // late enough that the source is echoed into the throw site.
         //
-        // The trailing `&&` guarantees a CEL parse error so the throw site
-        // is reached; the JSON-escaped `\\r\\n` decodes to actual CR/LF
-        // bytes inside the `when` source field that CelCompiler then echoes.
+        // R26-D F1 pushed back on an earlier version of this test that used
+        // `when="BAD\r\nINJECTED..."`. That input is hashed through the
+        // CelCompiler lexer which treats CR/LF as Character.isWhitespace and
+        // silently consumes them at L148; tokenisation yields IDENT IDENT
+        // sequences and the parser throws a CelCompilationException carrying
+        // the message "unexpected token after expression: IDENT(INJECTED)" —
+        // no CR/LF reaches the throw at RuleJsonCodec.java:331, so the
+        // LogSafe.sanitize wrap is a no-op and the test passes whether
+        // sanitisation is present or not. To actually exercise the
+        // source-echoing arm we must reach the `catch (RuntimeException e)`
+        // branch in CelCompiler.compile (L61), which only triggers for
+        // JDK-level RuntimeException — and the only such path the lexer
+        // takes is Lexer#number → Long.parseLong → NumberFormatException
+        // when the digit run exceeds Long.MAX_VALUE (19 digits).
+        //
+        // The payload below starts with a 20-digit run (overflow) followed
+        // by JSON-escaped `\\r\\n` (decoded by Jackson into real CR/LF
+        // bytes inside the `when` string). The lexer consumes the 20 digits
+        // in number() and then Long.parseLong throws NumberFormatException;
+        // CelCompiler's RuntimeException catch rebuilds the message as
+        // "failed to parse: " + truncateForLog(source) + " (...)" where
+        // truncateForLog is the ONLY place the raw `when` bytes survive.
+        // Without LogSafe.sanitize on the outer throw at RuleJsonCodec:331
+        // the operator's log line would carry forged CR/LF. With it, the
+        // surfaced message is CR/LF-free.
         String json = "{\"apiKeys\":[\"METADATA\"],\"action\":\"DENY\","
-            + "\"when\":\"BAD\\r\\nINJECTED 2026 ERROR forged &&\",\"errorCode\":1}";
+            + "\"when\":\"99999999999999999999\\r\\nINJECTED 2026 ERROR forged\","
+            + "\"errorCode\":1}";
         RuleEnvelopeException e = assertThrows(RuleEnvelopeException.class,
             () -> RuleJsonCodec.decode("k", json.getBytes(StandardCharsets.UTF_8)));
         String msg = e.getMessage();
@@ -182,23 +200,46 @@ public class RuleJsonCodecTest {
             "diagnostic should still describe the uncompilable-CEL cause: " + msg);
         assertTrue(msg.contains("'k'"),
             "diagnostic should still identify the offending rule id: " + msg);
+        // Anchor the attacker-controllable token: the `INJECTED` literal
+        // sits AFTER the CR/LF in the original `when` source. Without the
+        // lexer reaching the overflow arm of CelCompiler the message
+        // wouldn't contain it at all — pinning its presence confirms the
+        // truncateForLog(source) arm is exercised (and therefore that
+        // LogSafe.sanitize is doing real work, not coincidental work).
+        assertTrue(msg.contains("INJECTED"),
+            "test must reach the truncateForLog(source) arm so the wire-derived "
+                + "fragment is actually present-then-sanitised, not just absent by lexer luck: " + msg);
     }
 
     @Test
     public void malformedJsonEnvelopeWithControlBytesIsSanitisedInMessage() {
-        // R25-B F1 (continued): the malformed-JSON parse error path embeds
-        // Jackson's e.getMessage(), which can echo wire-derived source
-        // fragments. Even if Jackson today happens to label control bytes
-        // numerically rather than emit them raw, the contract this commit
-        // pins is: regardless of what Jackson's diagnostic carries, the
-        // RuleEnvelopeException message visible to a caller's log line is
-        // CR/LF-free. Future Jackson upgrades or alternative failure
-        // shapes must not be able to silently re-open this hole.
+        // R25-B F1 / R26-D F2 (continued): the malformed-JSON parse error
+        // path embeds Jackson's e.getMessage(), and the LogSafe.sanitize
+        // wrap at RuleJsonCodec:624 sanitises that embedded message.
         //
-        // The payload is deliberately *byte-malformed* (raw CR/LF outside
-        // a string + garbage tokens) so Jackson reaches the parseJson catch
-        // before any of the structural envelope guards have a chance to
-        // run, exercising the L608 throw site specifically.
+        // R26-D F2 pushed back that on Jackson 2.x's default configuration
+        // (INCLUDE_SOURCE_IN_LOCATION disabled) wire-derived source bytes
+        // do NOT actually appear in Jackson's diagnostic for the payload
+        // chosen here: Jackson emits "Unrecognized token 'garbage': was
+        // expecting ... at [Source: REDACTED ...; line: 1, column: 9]"
+        // which contains Jackson's own structural newlines but not the
+        // wire's `\\r\\nINJECTED` fragment. So today this test would pass
+        // whether or not LogSafe.sanitize is applied at L624.
+        //
+        // The contract this test still earns is forward-compatibility:
+        //  * a future Jackson upgrade may re-enable source inclusion or
+        //    change quoting in ways that DO surface wire bytes;
+        //  * an alternative malformed-JSON failure shape (unterminated
+        //    string, illegal escape inside a string value) takes a
+        //    different code path inside Jackson where wire bytes can leak.
+        // Either way, the outer LogSafe.sanitize wrap + this regression
+        // pin together guarantee the operator's log line is CR/LF-free.
+        //
+        // This test is documented honestly as defense-in-depth, not as
+        // proof that the unsanitised version was exploitable for this
+        // exact payload. A stronger adversarial coverage variant is left
+        // as a TODO to switch to a payload (e.g. unterminated quoted
+        // string carrying raw CR/LF) where Jackson DOES echo wire bytes.
         byte[] payload = ("garbage\r\nINJECTED 2026 ERROR forged\r\n}")
             .getBytes(StandardCharsets.UTF_8);
         RuleEnvelopeException e = assertThrows(RuleEnvelopeException.class,
