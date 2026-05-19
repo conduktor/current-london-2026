@@ -18,6 +18,7 @@ package org.apache.kafka.server.rules.cel;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -527,23 +528,15 @@ abstract class CelNode {
             if (l instanceof String && r instanceof String) {
                 int len = Math.min(((String) l).length(), ((String) r).length());
                 CelLimits.bumpSteps(Math.max(1, len));
-            } else if (l instanceof List && r instanceof List) {
-                // Round-10 audit: List equality walks every element via
-                // AbstractList.equals → recursive Objects.equals. A rule like
-                // request.giantList == request.otherGiantList in an
-                // attacker-iterated comprehension could amortise N element
-                // compares per CEL step. Charge proportionally; size mismatch
-                // short-circuits inside Objects.equals so this overcharges
-                // only in the (cheap) early-bail case.
-                CelLimits.bumpSteps(Math.min(((List<?>) l).size(), ((List<?>) r).size()));
-            } else if (l instanceof Map && r instanceof Map) {
-                // Same motivation for Map equality: AbstractMap.equals walks
-                // every entry; for ApiMessageActivation-shaped data both sides
-                // can be deep nested maps. Charge proportional to the smaller
-                // side (size-mismatch short-circuit) so the step budget kills
-                // the runaway at the iteration limit, not after the walk.
-                CelLimits.bumpSteps(Math.min(((Map<?, ?>) l).size(), ((Map<?, ?>) r).size()));
             }
+            // R28 Axis Walker F8 (Task #244): List/Map equality is now
+            // accounted for inside {@link #valueEquals} via the deep helpers
+            // {@link #listEqualsDeep} / {@link #mapEqualsDeep}, which charge
+            // bumpSteps(size) at EVERY recursion layer. The previous outer
+            // pre-charges here (Round-10 audit) covered only the outermost
+            // size — a nested == nested could amortise inner work at the
+            // outer cost. The deep helpers also short-circuit on size
+            // mismatch with no charge (matches the cheap exit posture).
             if (op == Op.EQ) {
                 return valueEquals(l, r);
             }
@@ -597,20 +590,15 @@ abstract class CelNode {
                     if (len > 1) {
                         CelLimits.bumpSteps(len - 1);
                     }
-                } else if (v instanceof List && item instanceof List) {
-                    // R27-B (Task #182): mirror Compare.eval's list-vs-list
-                    // charge. Without this, `bigList in [bigListCopy1, ...]`
-                    // amortises N element compares per inner valueEquals at
-                    // only one step apiece — symmetric DoS hole with the one
-                    // Compare's bump already closes.
-                    CelLimits.bumpSteps(Math.min(((List<?>) v).size(), ((List<?>) item).size()));
-                } else if (v instanceof Map && item instanceof Map) {
-                    // R27-B (Task #182): mirror Compare.eval's map-vs-map
-                    // charge — AbstractMap.equals walks every entry; for
-                    // ApiMessageActivation-shaped data both sides can be
-                    // deep nested maps.
-                    CelLimits.bumpSteps(Math.min(((Map<?, ?>) v).size(), ((Map<?, ?>) item).size()));
                 }
+                // R28 Axis Walker F8 (Task #244): List/Map equality is now
+                // accounted for inside {@link #valueEquals} via the deep
+                // helpers, which charge at EVERY recursion layer. The
+                // previous outer pre-charges here (R27-B, Task #182) covered
+                // only the outermost size — a nested list/map inside `in`
+                // could amortise inner work at the outer cost. The deep
+                // helpers also short-circuit on size mismatch with no
+                // charge, so the cheap exit path stays cheap.
                 if (valueEquals(v, item)) {
                     return true;
                 }
@@ -794,14 +782,80 @@ abstract class CelNode {
     }
 
     /**
-     * Equality with numeric promotion: Integer(5) equals Long(5). Anything else
-     * defers to {@link Objects#equals}. CEL treats all integers as the same value
-     * type; Java's autoboxing produces distinct wrappers we must reconcile.
+     * Equality with numeric promotion: Integer(5) equals Long(5). For Lists and
+     * Maps we recurse through {@link #listEqualsDeep} / {@link #mapEqualsDeep}
+     * which charge the per-element cost against the per-request CEL step
+     * budget at every layer. Anything else defers to {@link Objects#equals}.
+     * CEL treats all integers as the same value type; Java's autoboxing
+     * produces distinct wrappers we must reconcile.
+     *
+     * <p><b>R28 Axis Walker F8 (Task #244):</b> the previous implementation
+     * delegated to {@code Objects.equals} unconditionally, which for nested
+     * Lists/Maps walked {@code AbstractList.equals} / {@code AbstractMap.equals}
+     * recursively without any step charge. A walker-produced shape like
+     * {@code CreateTopics} with 100 topic descriptors × 100 configs each was
+     * 10,000 leaf compares charged as the single outer pre-charge in
+     * {@link Compare}/{@link InList}. With deep helpers here, every recursion
+     * layer charges its size before walking, so nested == nested converges to
+     * O(total-leaves) charges instead of O(outermost-size).
      */
     private static boolean valueEquals(Object l, Object r) {
         if (l instanceof Number && r instanceof Number) {
             return ((Number) l).longValue() == ((Number) r).longValue();
         }
+        if (l instanceof List && r instanceof List) {
+            return listEqualsDeep((List<?>) l, (List<?>) r);
+        }
+        if (l instanceof Map && r instanceof Map) {
+            return mapEqualsDeep((Map<?, ?>) l, (Map<?, ?>) r);
+        }
         return Objects.equals(l, r);
+    }
+
+    /**
+     * Deep list equality that charges {@code l.size()} steps before walking,
+     * then recurses into each element pair via {@link #valueEquals}. Size
+     * mismatch short-circuits with no charge — the cheap exit path stays
+     * cheap. Iterator-based traversal so non-RandomAccess List implementations
+     * (e.g. LinkedList) walk in O(N) total, not O(N²). See valueEquals javadoc
+     * (R28 Axis Walker F8) for the amplification this closes.
+     */
+    private static boolean listEqualsDeep(List<?> l, List<?> r) {
+        if (l.size() != r.size()) {
+            return false;
+        }
+        CelLimits.bumpSteps(l.size());
+        Iterator<?> li = l.iterator();
+        Iterator<?> ri = r.iterator();
+        while (li.hasNext()) {
+            if (!valueEquals(li.next(), ri.next())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Deep map equality that charges {@code l.size()} steps before walking,
+     * then looks up each key in {@code r} and recurses into the value pair
+     * via {@link #valueEquals}. Size mismatch short-circuits with no charge.
+     * Missing-key (key in l but not in r) returns false. See valueEquals
+     * javadoc (R28 Axis Walker F8) for the amplification this closes.
+     */
+    private static boolean mapEqualsDeep(Map<?, ?> l, Map<?, ?> r) {
+        if (l.size() != r.size()) {
+            return false;
+        }
+        CelLimits.bumpSteps(l.size());
+        for (Map.Entry<?, ?> e : l.entrySet()) {
+            Object rv = r.get(e.getKey());
+            if (rv == null && !r.containsKey(e.getKey())) {
+                return false;
+            }
+            if (!valueEquals(e.getValue(), rv)) {
+                return false;
+            }
+        }
+        return true;
     }
 }

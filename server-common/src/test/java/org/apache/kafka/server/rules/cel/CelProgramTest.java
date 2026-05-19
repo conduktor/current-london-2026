@@ -936,6 +936,94 @@ public class CelProgramTest {
     }
 
     @Test
+    public void nestedListEqualityRecursivelyChargesAgainstBudget() {
+        // R28 Axis Walker F8 (Task #244): valueEquals used to delegate to
+        // Objects.equals for Lists/Maps, which walks AbstractList/AbstractMap
+        // .equals recursively WITHOUT charging the per-element cost at each
+        // layer. The outer Compare/InList pre-charges only accounted for the
+        // outermost size — a walker-produced shape like CreateTopics with N
+        // topic descriptors × M configs each charged ~N steps but did N*M
+        // leaf compares.
+        //
+        // With listEqualsDeep/mapEqualsDeep in valueEquals, every recursion
+        // layer charges bumpSteps(size) before walking. For an outer list
+        // of 100 inner lists of 100 strings each, == itself charges
+        // 100 outer + 100*100 inner = 10_100 steps per Compare. 10 iters of
+        // such a Compare inside all() = 101_000 > MAX_EVAL_STEPS(=100_000).
+        //
+        // Negative control: without inner-layer accounting (the pre-fix
+        // shape), per-iter would charge ~101 (1 baseline + outer pre-charge);
+        // 10 iters = ~1_010 steps, well under 100k — the rule would
+        // evaluate to true and the test would FAIL on the missing throw.
+        // The diff makes the failure mode observable: budget trips at
+        // ~10k recursion-charged steps in the first iter pair.
+        java.util.List<Object> needle = new java.util.ArrayList<>();
+        for (int i = 0; i < 100; i++) {
+            java.util.List<Object> inner = new java.util.ArrayList<>();
+            for (int j = 0; j < 100; j++) {
+                inner.add("v-" + i + "-" + j);
+            }
+            needle.add(inner);
+        }
+        java.util.List<Object> iters = new java.util.ArrayList<>();
+        for (int k = 0; k < 10; k++) {
+            // Deep copy so == walks every element in every iteration (no
+            // reference-equality short-circuit inside AbstractList.equals
+            // would have saved the pre-fix shape either, since every
+            // element is a freshly-allocated string with the same content
+            // but a different identity — Objects.equals goes to .equals).
+            java.util.List<Object> copy = new java.util.ArrayList<>();
+            for (Object inner : needle) {
+                copy.add(new java.util.ArrayList<>((java.util.List<?>) inner));
+            }
+            iters.add(copy);
+        }
+        Map<String, Object> env = new HashMap<>();
+        env.put("xs", iters);
+        env.put("needle", needle);
+        assertThrows(CelEvaluationException.class,
+            () -> evalBool("xs.all(x, x == needle)", env));
+    }
+
+    @Test
+    public void nestedMapEqualityRecursivelyChargesAgainstBudget() {
+        // R28 Axis Walker F8 (Task #244): mirror for nested Map-of-Map. Same
+        // amplification shape — pre-fix outer pre-charge accounted only for
+        // entry count of the top map; AbstractMap.equals walked every nested
+        // value uncharged. With mapEqualsDeep in valueEquals, every recursion
+        // layer charges bumpSteps(size).
+        //
+        // For 50 outer × 50 inner entries: == itself charges 50 + 50*50 =
+        // 2_550 steps. 41 iters inside all() = 104_550 > 100k. Without inner
+        // accounting (negative control): 51 per iter × 41 = ~2_091 — far
+        // under budget.
+        java.util.Map<String, Object> needle = new java.util.LinkedHashMap<>();
+        for (int i = 0; i < 50; i++) {
+            java.util.Map<String, Object> inner = new java.util.LinkedHashMap<>();
+            for (int j = 0; j < 50; j++) {
+                inner.put("k-" + j, "v-" + i + "-" + j);
+            }
+            needle.put("k-" + i, inner);
+        }
+        java.util.List<Object> iters = new java.util.ArrayList<>();
+        for (int k = 0; k < 41; k++) {
+            java.util.Map<String, Object> copy = new java.util.LinkedHashMap<>();
+            for (Map.Entry<String, Object> e : needle.entrySet()) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> innerCopy =
+                    new java.util.LinkedHashMap<>((Map<String, Object>) e.getValue());
+                copy.put(e.getKey(), innerCopy);
+            }
+            iters.add(copy);
+        }
+        Map<String, Object> env = new HashMap<>();
+        env.put("xs", iters);
+        env.put("needle", needle);
+        assertThrows(CelEvaluationException.class,
+            () -> evalBool("xs.all(x, x == needle)", env));
+    }
+
+    @Test
     public void listLiteralConstructionChargesPerElementAgainstBudget() {
         // Round-10 audit: ListLiteral.eval charged zero per element. A
         // literal allocated inside a comprehension paid for its
