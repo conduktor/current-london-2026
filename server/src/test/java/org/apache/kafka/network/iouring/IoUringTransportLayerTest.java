@@ -20,6 +20,7 @@ import org.apache.kafka.common.network.TransportLayer;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
 
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
@@ -63,6 +64,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * deterministic. The thread-safety of that queue is guaranteed by
  * {@link java.util.concurrent.ConcurrentLinkedQueue} regardless of which thread feeds it.
  */
+@ExtendWith(IoUringLeakDetectorExtension.class)
 class IoUringTransportLayerTest {
 
     private static final InetSocketAddress REMOTE = new InetSocketAddress("198.51.100.7", 51234);

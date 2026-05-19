@@ -32,6 +32,7 @@ import org.apache.kafka.common.utils.MockTime;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
 
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
@@ -64,6 +65,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *
  * <p>Time is controlled with {@link MockTime} so idle-expiry assertions don't race.
  */
+@ExtendWith(IoUringLeakDetectorExtension.class)
 class IoUringSelectorTest {
 
     private static final ListenerName LISTENER = ListenerName.normalised("PLAINTEXT");
