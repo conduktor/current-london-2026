@@ -162,7 +162,15 @@ public final class GovernanceTopicReader implements AutoCloseable {
                 // Non-fatal: log and continue. The loader's working state is
                 // unaffected. A persistent failure (e.g. authorisation revoked)
                 // will manifest as a flood of warns — the right place to alert.
-                LOG.warn("governance reader poll failed: {}", e.toString());
+                //
+                // R23 #222: e.toString() can embed wire-derived attacker bytes
+                // — e.g. an UnknownTopicOrPartitionException naming an
+                // attacker-controlled topic, an AuthorizationException naming
+                // an attacker-controlled principal, or a SerializationException
+                // wrapping a hostile payload. Sanitise through LogSafe so a
+                // poisoned message cannot inject CR/LF/control bytes into the
+                // operator's SLF4J line.
+                LOG.warn("governance reader poll failed: {}", LogSafe.sanitize(e.toString()));
             }
         }
     }

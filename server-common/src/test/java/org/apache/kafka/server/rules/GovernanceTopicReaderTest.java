@@ -187,4 +187,56 @@ public class GovernanceTopicReaderTest {
         reader.close();
         t.join(2_000);
     }
+
+    @Test
+    public void pollExceptionWithControlBytesDoesNotHaltRunLoopAndIsSanitised() throws InterruptedException {
+        // R23 #222 regression test: a RuntimeException raised inside
+        // pollOnce() (e.g. a broker-side AuthorizationException whose
+        // message embeds a wire-derived principal or topic name) must NOT
+        // halt the reader and must NOT leak attacker-controllable
+        // CR/LF/control bytes into the operator's SLF4J line. The catch
+        // logs LogSafe.sanitize(e.toString()) and keeps draining — this
+        // test proves the loop continues past the exception and ultimately
+        // applies a subsequent good record so the engine reaches DENY.
+        //
+        // We can't easily intercept SLF4J output without a custom appender
+        // here, but the sanitisation itself is exercised by LogSafeTest;
+        // what THIS test pins is the behavioural contract: poll-time
+        // RuntimeExceptions are caught and the loop recovers. Without the
+        // catch (or if a future refactor narrows it to e.g. only
+        // KafkaException), this test would deadlock-then-time-out.
+        MockConsumer<String, byte[]> consumer = newConsumer();
+        RuleEngine engine = new RuleEngine();
+        GovernanceLoader loader = new GovernanceLoader(engine);
+        GovernanceTopicReader reader = new GovernanceTopicReader(consumer, loader, Duration.ofMillis(5));
+
+        // Arm a one-shot poll exception with a wire-derivable message that
+        // includes CR/LF control bytes — the very class of payload that
+        // motivates the LogSafe.sanitize wrapping.
+        consumer.setPollException(
+            new org.apache.kafka.common.KafkaException(
+                "simulated broker error\r\nINJECTED 2026-01-01 ERROR forged log line"));
+
+        consumer.addRecord(new ConsumerRecord<>(GovernanceTopic.NAME, 0, 0L, "good",
+            envelope("true", ApiKeys.METADATA, 99)));
+
+        Thread t = new Thread(reader::runLoop, "test-governance-reader");
+        t.start();
+        long deadline = System.nanoTime() + Duration.ofSeconds(3).toNanos();
+        boolean reached = false;
+        while (System.nanoTime() < deadline) {
+            RuleDecision d = engine.evaluate(ApiKeys.METADATA, "c", false, Collections::emptyMap);
+            if (d.denied() && "good".equals(d.denyingRuleId())) {
+                reached = true;
+                break;
+            }
+            Thread.sleep(5);
+        }
+        reader.close();
+        t.join(2_000);
+        assertTrue(reached,
+            "runLoop must recover from a RuntimeException raised by poll() and apply the subsequent good record");
+        assertSame(false, t.isAlive(),
+            "runLoop must exit cleanly on close() even after a poll-time exception");
+    }
 }
