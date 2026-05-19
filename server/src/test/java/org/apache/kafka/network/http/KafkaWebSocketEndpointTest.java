@@ -205,6 +205,29 @@ class KafkaWebSocketEndpointTest {
     // ----- lifecycle and error path -----
 
     @Test
+    void openInstallsEveryDefensiveCapSoNoJettyDefaultRaisesThePerSessionHeapCeiling() {
+        // Regression guard: every cap the endpoint installs at open time must remain set. Leaving any
+        // of {maxText, maxBinary, maxFrame, maxOutgoing, idle} at Jetty's defaults (64 KiB for the
+        // size caps, -1 for outgoing, 30 s for idle) raises the per-session heap ceiling against
+        // hostile inbound frames or lets the outbound queue grow without bound. The text-message cap
+        // alone is insufficient — a single 64 KiB text frame still buffers up to Jetty's frame default
+        // before the message cap fires, and binary frames (which the bridge silently drops) buffer up
+        // to the binary default ceiling before discard.
+        WsStreamLimiter.Token token = limiter.tryAcquire();
+        KafkaWebSocketEndpoint endpoint = newEndpoint(token, "orders");
+
+        endpoint.onWebSocketOpen(session);
+
+        assertEquals(Duration.ofMinutes(5), session.idleTimeout, "idle timeout must be 5 minutes");
+        assertEquals(8 * 1024L, session.maxTextMessageSize, "text message cap must be 8 KiB");
+        assertEquals(8 * 1024L, session.maxBinaryMessageSize,
+            "binary message cap must match text — bridge has no binary sink");
+        assertEquals(8 * 1024L, session.maxFrameSize,
+            "frame cap must be 8 KiB so per-frame bound matches per-message");
+        assertEquals(1024, session.maxOutgoingFrames, "outgoing-frame queue cap must be MAX_OUTGOING_FRAMES");
+    }
+
+    @Test
     void closeReleasesLimiterEvenWithoutSubscribe() {
         // Client opens the WS connection then disconnects before sending any frame. The endpoint
         // must still release the slot it was holding on the limiter — otherwise idle clients
@@ -342,6 +365,15 @@ class KafkaWebSocketEndpointTest {
         private final ConcurrentLinkedQueue<JsonNode> records = new ConcurrentLinkedQueue<>();
         private final ConcurrentLinkedQueue<JsonNode> errors = new ConcurrentLinkedQueue<>();
 
+        // Cap values the endpoint installs on open. Captured so the test can prove every defensive
+        // bound is applied — leaving any of these at Jetty's defaults raises the per-session heap
+        // ceiling for hostile inbound frames.
+        volatile Duration idleTimeout;
+        volatile long maxTextMessageSize;
+        volatile long maxBinaryMessageSize;
+        volatile long maxFrameSize;
+        volatile int maxOutgoingFrames;
+
         @Override
         public void sendText(String text, Callback callback) {
             try {
@@ -445,15 +477,16 @@ class KafkaWebSocketEndpointTest {
             return false;
         }
 
-        // Configurable surface — Jetty's Session extends Configurable. None of these are used by the
-        // endpoint; if a future change adds usage, the test will fail loudly.
+        // Configurable surface — Jetty's Session extends Configurable. Setters that the endpoint
+        // invokes on open capture into volatile fields above so a regression test can assert every
+        // defensive cap is applied; unused getters return zero (no test reads them).
 
         @Override public Duration getIdleTimeout() {
             return Duration.ZERO;
         }
 
         @Override public void setIdleTimeout(Duration duration) {
-            // Endpoint may set an idle timeout on open; absorb silently rather than failing the test.
+            this.idleTimeout = duration;
         }
 
         @Override public int getInputBufferSize() {
@@ -472,19 +505,25 @@ class KafkaWebSocketEndpointTest {
             return 0;
         }
 
-        @Override public void setMaxBinaryMessageSize(long size) { }
+        @Override public void setMaxBinaryMessageSize(long size) {
+            this.maxBinaryMessageSize = size;
+        }
 
         @Override public long getMaxTextMessageSize() {
             return 0;
         }
 
-        @Override public void setMaxTextMessageSize(long size) { }
+        @Override public void setMaxTextMessageSize(long size) {
+            this.maxTextMessageSize = size;
+        }
 
         @Override public long getMaxFrameSize() {
             return 0;
         }
 
-        @Override public void setMaxFrameSize(long size) { }
+        @Override public void setMaxFrameSize(long size) {
+            this.maxFrameSize = size;
+        }
 
         @Override public boolean isAutoFragment() {
             return false;
@@ -496,6 +535,8 @@ class KafkaWebSocketEndpointTest {
             return 0;
         }
 
-        @Override public void setMaxOutgoingFrames(int maxOutgoingFrames) { }
+        @Override public void setMaxOutgoingFrames(int maxOutgoingFrames) {
+            this.maxOutgoingFrames = maxOutgoingFrames;
+        }
     }
 }

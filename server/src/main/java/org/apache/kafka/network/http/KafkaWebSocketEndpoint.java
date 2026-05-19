@@ -121,6 +121,15 @@ public final class KafkaWebSocketEndpoint implements Session.Listener.AutoDemand
         // Cap the inbound text size so a hostile client cannot stream a multi-megabyte subscribe
         // frame into our heap. Subscribe/flow JSONs are tens of bytes; 8 KiB is loose but cheap.
         session.setMaxTextMessageSize(8 * 1024);
+        // The bridge has no binary message sink — Jetty drops binary frames silently — but its default
+        // 64 KiB reassembly cap still lets a hostile client park up to that ceiling of transient heap
+        // per session before the data is discarded. Align the binary cap with the text cap so the
+        // inbound heap ceiling does not differ by frame type.
+        session.setMaxBinaryMessageSize(8 * 1024);
+        // Per-frame cap that complements the per-message caps above. Without this, a single 64 KiB
+        // text frame is parsed up to Jetty's default 64 KiB before the 8 KiB message cap fires; with
+        // this set, oversized frames are rejected at the parser instead of after full reassembly.
+        session.setMaxFrameSize(8 * 1024);
         // Defence-in-depth backstop for the credit protocol. See MAX_OUTGOING_FRAMES javadoc — this
         // is what stops a slow-reader-with-large-credit-grant from accumulating an unbounded outbound
         // queue inside Jetty.
