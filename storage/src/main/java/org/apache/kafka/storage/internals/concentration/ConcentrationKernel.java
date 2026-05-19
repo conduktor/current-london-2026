@@ -813,37 +813,44 @@ public final class ConcentrationKernel implements AutoCloseable {
         // cycle must produce two distinct generations or the second unready event will be
         // confused with the first by a recoverer that captured the first generation.
         //
-        // BLOCKER #207 / HIGH #180: evict cached sidecars INSIDE the compute() lambda so the
-        // (generation bump, cache eviction) pair is atomic under the per-key compute lock. The
-        // previous ordering — bump first, evict afterwards — left a window where a concurrent
-        // commitProduce / commitProduceBatch could pass its first gen check, observe the
-        // pre-eviction cache state in sidecarFor(), and then race recovery's truncate. With the
-        // eviction moved inside the lambda, any commitProduce that observes the old generation
-        // ALSO observes the cache as still-populated (or about-to-be-evicted under the same
-        // lock), and the matching second gen check in commitProduce/commitProduceBatch catches
-        // the bump before any sidecar write happens.
+        // BLOCKER #222 — eviction-inside-compute regression of #207. The earlier "atomize gen-bump
+        // and cache-evict under the compute lambda" fix was wrong on CHM semantics:
+        // evictCachedSidecarsForBacking mutates the {@code sidecars} CHM, which has no
+        // synchronization relationship with the per-key bin lock held on the {@code
+        // backingGateState} CHM. {@code sidecars.remove(...)} publishes via the sidecars CHM the
+        // moment it returns, but the new {@link BackingGateState} only becomes visible to
+        // external {@code backingGateState.get(...)} callers when the compute lambda returns.
+        // That leaves an externally observable window:
+        //   1. A concurrent commitProduce passes check 1 reading gen=N (lambda not yet returned).
+        //   2. The lambda runs evictCachedSidecarsForBacking → sidecars.remove publishes.
+        //   3. commitProduce calls sidecarFor → cache MISS → opens a FRESH handle on the file.
+        //   4. commitProduce passes check 2 STILL reading gen=N (lambda still not returned).
+        //   5. commitProduce appends to the fresh handle and ACKs the producer.
+        //   6. Lambda returns; recovery later truncates the file, losing an ACKed write.
+        // The fix is to evict AFTER compute returns: any commit reaching check 2 then reads the
+        // bumped generation, mismatches its stamp, and rolls back BEFORE writing. The window the
+        // original #207 fix worried about — "pass check 1, observe pre-eviction cache, race
+        // recovery's truncate" — is closed by the double-check pattern alone, not by the
+        // lambda-internal eviction.
         //
-        // B.7: the eviction itself drops every cached LogicalSidecarIndex handle for logical
-        // partitions mapped onto this backing. Recovery (KafkaConcentrationLeaderRecoverer.runScan)
-        // opens its OWN fresh sidecar handles via BackingScanRecoverer.openSidecar, calls
-        // truncateTo(0), then re-appends from the backing log. The cached handles still in this
-        // map carry pre-recovery in-memory state (entries count, lastBackingOffset) — which
-        // becomes a SILENT DATA CORRUPTION trap once the gate reopens: the next produce routes
-        // through the cached handle, whose stale `entries` count drives a write at the WRONG
-        // byte offset in the freshly-rebuilt file, overwriting recovered data and shadowing the
-        // rest as "out of bounds" on lookup.
-        //
-        // The compute lambda runs under the ConcurrentHashMap per-key lock, so the eviction is
-        // serialised with publishIfGenerationMatches and markBackingReady on the same backing.
-        // Eviction does I/O (close() on each cached handle); that lengthens the lock-hold
-        // proportional to the number of logical partitions on this backing, but those closes are
-        // O(1) syscalls and the alternative — split atomicity — is what the BLOCKER documents as
-        // unacceptable.
+        // B.7 invariant preserved: the eviction itself drops every cached LogicalSidecarIndex
+        // handle for logical partitions mapped onto this backing. Recovery
+        // ({@link KafkaConcentrationLeaderRecoverer#runScan}) opens its OWN fresh sidecar handles
+        // via {@link BackingScanRecoverer#openSidecar}, calls truncateTo(0), then re-appends from
+        // the backing log. Cached handles carry pre-recovery in-memory state ({@code entries}
+        // count, {@code lastBackingOffset}) which would write at the WRONG byte offset post-
+        // rebuild — eviction must complete before any subsequent produce can resolve a sidecar
+        // for these partitions. The recoverer-side {@code markBackingReady} runs AFTER the
+        // recoverer's own scan completes, by which point eviction has long since returned.
         backingGateState.compute(backing, (k, prev) -> {
             long nextGen = (prev == null ? 0L : prev.generation) + 1L;
-            evictCachedSidecarsForBacking(backing);
             return new BackingGateState(false, nextGen);
         });
+        // Eviction runs AFTER the (false, gen+1) state is published on the backingGateState CHM.
+        // The double-check pattern in commitProduce/commitProduceBatch guarantees any in-flight
+        // commit that passed check 1 against the old generation will see the new generation at
+        // check 2 and roll back — before opening a fresh sidecar or appending to a cached one.
+        evictCachedSidecarsForBacking(backing);
     }
 
     /**

@@ -30,8 +30,11 @@ import java.io.IOException;
 import java.util.List;
 import java.util.NoSuchElementException;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -1759,5 +1762,136 @@ public class ConcentrationKernelTest {
 
         assertTrue(kernel.logicalTopicByTopicId(logicalId).isEmpty(),
             "shadowed names must not be reachable via the by-topic-id overlay");
+    }
+
+    @Test
+    public void concurrentMarkUnreadyAndCommitProduceKeepsTrackerAndFileInLockStep() throws Exception {
+        // r22 BLOCKER #222 — regression catcher for the prior fix (#207) that moved cache
+        // eviction inside backingGateState.compute(). That ordering left a window where
+        // {@code sidecars.remove(...)} published on the sidecars CHM BEFORE the new
+        // {@link BackingGateState} published on the backingGateState CHM, so a concurrent
+        // commitProduce could observe (cache empty → fresh handle) AND (generation still N)
+        // at both gen checks, append, and ACK — only for the lambda to return and recovery
+        // to truncate the file later, losing the ACKed write.
+        //
+        // The fix evicts AFTER the compute returns. The double-check pattern in commitProduce
+        // then catches the bump at check 2 whenever the race window opens.
+        //
+        // This is a stress test, not a deterministic discriminator: it cannot directly probe
+        // the in-flight (cache state, gate state) tuple from outside the kernel. What it CAN
+        // assert is the invariant every iteration: after both threads complete, the sidecar
+        // file size on disk and {@code nextLogicalOffset} on the tracker must agree — either
+        // both grew by 12 bytes / 1 offset (commit won) or both stayed at the warmup state
+        // (commit fenced). A bug that lets commit succeed via a fresh handle while concurrently
+        // the gate moved past stampedGen still produces a consistent (file=24, tracker=2)
+        // tuple — same as the legitimate "commit ran first" outcome — so this test is a
+        // regression marker that exercises the path, not a witness to the precise bug. The
+        // primary protection is the source-side comment that pins the ordering invariant.
+        final int iterations = 100;
+        for (int iter = 0; iter < iterations; iter++) {
+            runMarkUnreadyVsCommitProduceRace(iter);
+        }
+    }
+
+    private void runMarkUnreadyVsCommitProduceRace(int iter) throws Exception {
+        File dir = TestUtils.tempDirectory();
+        try (ConcentrationKernel localKernel = new ConcentrationKernel(dir)) {
+            localKernel.declare(descriptor("orders", 1, "shared", 1));
+            TopicPartition backing = new TopicPartition("shared", 0);
+
+            // Warm the cache so eviction has actual work to do; this widens the window in
+            // which the bug would exploit a partially-mutated (sidecars, backingGateState) pair.
+            localKernel.commitProduce(localKernel.reserveProduce("orders", 0), 1L);
+            final long bytesPerEntry = 12L; // 8-byte backing offset + 4-byte CRC32C
+
+            long startingGen = localKernel.currentGeneration(backing);
+
+            CountDownLatch start = new CountDownLatch(1);
+            AtomicReference<Throwable> err = new AtomicReference<>();
+            AtomicBoolean committed = new AtomicBoolean();
+            AtomicBoolean fenced = new AtomicBoolean();
+            AtomicBoolean lostReserve = new AtomicBoolean();
+
+            Thread tUnready = new Thread(() -> awaitThen(start, () -> localKernel.markBackingUnready(backing)),
+                "unready-" + iter);
+            Thread tCommit = new Thread(
+                () -> awaitThen(start, () -> commitWithRaceOutcome(localKernel, iter, committed, fenced, lostReserve, err)),
+                "commit-" + iter);
+            tUnready.start();
+            tCommit.start();
+            start.countDown();
+            tUnready.join();
+            tCommit.join();
+
+            if (err.get() != null) {
+                throw new AssertionError("iteration " + iter + ": unexpected exception on commit thread", err.get());
+            }
+            // Exactly one of the three outcomes must fire — commit succeeded, commit was fenced
+            // mid-flight, or reserveProduce lost the race up-front.
+            int outcomes = (committed.get() ? 1 : 0) + (fenced.get() ? 1 : 0) + (lostReserve.get() ? 1 : 0);
+            assertEquals(1, outcomes,
+                "iteration " + iter + ": exactly one of {committed, fenced, lostReserve} must fire");
+
+            assertFalse(localKernel.isBackingReady(backing),
+                "iteration " + iter + ": markBackingUnready must close the gate");
+            assertEquals(startingGen + 1, localKernel.currentGeneration(backing),
+                "iteration " + iter + ": generation must bump exactly once");
+
+            File sidecarFile = new File(new File(dir, "orders"), "0.sidecar");
+            long expectedEntries = committed.get() ? 2L : 1L;
+            assertEquals(expectedEntries, localKernel.nextLogicalOffset("orders", 0),
+                "iteration " + iter + ": tracker offset must match outcome (committed=2, fenced/lost=1)");
+            assertEquals(expectedEntries * bytesPerEntry, sidecarFile.length(),
+                "iteration " + iter + ": sidecar file size must match tracker (lock-step invariant)");
+        }
+    }
+
+    private static void awaitThen(CountDownLatch gate, IORunnable body) {
+        try {
+            gate.await();
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            return;
+        }
+        try {
+            body.run();
+        } catch (Throwable ignored) {
+            // commitWithRaceOutcome captures its own errors via the AtomicReference;
+            // markBackingUnready never throws checked exceptions in this code path.
+        }
+    }
+
+    @FunctionalInterface
+    private interface IORunnable {
+        void run() throws Exception;
+    }
+
+    private static void commitWithRaceOutcome(ConcentrationKernel kernel, int iter,
+            AtomicBoolean committed, AtomicBoolean fenced, AtomicBoolean lostReserve,
+            AtomicReference<Throwable> err) {
+        // Reserve + commit on the SAME thread per the kernel's per-partition serialization
+        // contract (LogicalOffsetTracker holds the partition lock across reserve→commit/
+        // rollback). The race we are stressing is between this thread's reserve→commit
+        // window and the concurrent markBackingUnready.
+        Reservation r;
+        try {
+            r = kernel.reserveProduce("orders", 0);
+        } catch (NotLeaderOrFollowerException nlf) {
+            // markBackingUnready won the race AGAINST reserveProduce —
+            // captureGenerationIfReady saw ready=false and rejected up-front.
+            lostReserve.set(true);
+            return;
+        } catch (Throwable e) {
+            err.set(e);
+            return;
+        }
+        try {
+            kernel.commitProduce(r, 100L + iter);
+            committed.set(true);
+        } catch (BackingGenerationChangedException e) {
+            fenced.set(true);
+        } catch (Throwable e) {
+            err.set(e);
+        }
     }
 }
