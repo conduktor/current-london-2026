@@ -176,6 +176,19 @@ final class BypassPrincipalsValidatorTest {
         // Confirm the admin reading the error knows which config to fix.
         assertTrue(ex.getMessage().contains(CONFIG_NAME),
             "Admin diagnostic must name the config: " + ex.getMessage());
+        // R43-D-2: the `<name>` slot is filled by ConfigException's
+        // constructor mechanically — asserting on its presence proves only
+        // that the framework's format string holds. A regression that
+        // stripped ALL validator-contributed reason (`throw new
+        // ConfigException(name, value, "")`) would still pass the prior
+        // assertion. Pin the validator's OWN helper text "`type:name`"
+        // (from RuleEngine.java:487) so the assertion fails if the
+        // validator drops its diagnostic and falls back to the framework's
+        // default reason. The input value "garbage" deliberately exercises
+        // the missing-colon throw path (parseBypassPrincipals L484-489).
+        assertTrue(ex.getMessage().contains("`type:name`"),
+            "Admin diagnostic must include the validator's helper text "
+            + "describing the expected format: " + ex.getMessage());
     }
 
     @Test

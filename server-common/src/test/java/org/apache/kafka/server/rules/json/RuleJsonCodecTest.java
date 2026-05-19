@@ -87,8 +87,18 @@ public class RuleJsonCodecTest {
             + "\"when\":\"true\",\"errorCode\":1}";
         RuleEnvelopeException e = assertThrows(RuleEnvelopeException.class,
             () -> RuleJsonCodec.decode("k", json.getBytes(StandardCharsets.UTF_8)));
+        // R43-D-1: pin BOTH halves of the diagnostic contract (twin of
+        // unknownActionRejected at L114): (a) the input echo so operators
+        // can correlate the offending name against the source publisher,
+        // and (b) the helper label "unknown api key" so a regression that
+        // drops the helper text (e.g. `throw new RuleEnvelopeException(
+        // "'" + name + "'")`) is caught — relying on the echo alone makes
+        // the assertion permanently true via the input value regardless
+        // of whether the helper text actually names the problem.
         assertTrue(e.getMessage().contains("NOT_A_REAL_API"),
             "error must name the offending api key: " + e.getMessage());
+        assertTrue(e.getMessage().toLowerCase().contains("unknown api key"),
+            "error must include the helper label 'unknown api key': " + e.getMessage());
     }
 
     @Test

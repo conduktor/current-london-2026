@@ -262,16 +262,28 @@ class BrokerServerRequireLocalReplicaTest {
         s, s.trim,
         f"U+$cp%04X must survive String.trim — parser fail-closed contract depends on this"
       )
-      // R42-D follow-up: ALSO call the parser directly so a refactor that
-      // swaps `.trim` for `.strip()` (which DOES strip U+00A0, U+202F,
-      // U+2007, U+1680, U+180E etc. under JDK 11+ `Character.isWhitespace`)
-      // breaks this test on the codepoints the dedicated single-codepoint
-      // tests above do NOT cover. Without this assertion the invariant test
-      // is a JDK tautology: it would pass even if the parser was changed to
-      // a hostile permissive form, because the loop body never invoked the
-      // parser. Pinning both contracts in the same iteration closes that
-      // gap and makes the relationship between "trim is the strict primitive"
-      // and "parser inherits the strict primitive's behaviour" assertable.
+      // R42-D / R43-C follow-up: ALSO call the parser directly so the
+      // invariant test is not a JDK tautology — the loop body MUST exercise
+      // the parser, otherwise a refactor that swapped the parser's
+      // strict-primitive could pass while String.trim still says trim-stable.
+      //
+      // Specifically: of the 12 hostile codepoints in this list, `String.strip()`
+      // — which uses `Character.isWhitespace` rather than the `<= U+0020` rule
+      // — strips exactly 4: U+3000 IDEOGRAPHIC SPACE, U+2028 LINE SEP,
+      // U+2029 PARAGRAPH SEP, and U+1680 OGHAM SPACE MARK. The other 8
+      // (U+00A0, U+202F, U+200B, U+00AD, U+FEFF, U+2007, U+2060, U+180E)
+      // are NOT stripped by `.strip()` either, because `Character.isWhitespace`
+      // deliberately excludes NBSP-family codepoints and zero-width / format
+      // controls. So a refactor that swaps `.trim` for `.strip` would silently
+      // change behaviour for ONLY those 4 codepoints, and the parser-call
+      // assertion below catches the regression for those 4 specifically.
+      // (For the 8 codepoints `.strip` doesn't touch either, both the
+      // trim-invariant assertion above and the parser-call assertion below
+      // remain green under the `.trim → .strip` refactor — defence is from
+      // the dedicated single-codepoint tests above, not this loop.)
+      // Pinning both contracts in the same iteration makes the relationship
+      // between "trim is the strict primitive" and "parser inherits the
+      // strict primitive's behaviour" directly assertable.
       assertTrue(
         BrokerServer.parseRequireLocalReplica(s),
         f"U+$cp%04X-prefixed 'false' must NOT disable the gate — parser fail-closed contract"
