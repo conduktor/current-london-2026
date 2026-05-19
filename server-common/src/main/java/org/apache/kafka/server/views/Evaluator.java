@@ -16,6 +16,7 @@
  */
 package org.apache.kafka.server.views;
 
+import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -332,27 +333,91 @@ final class Evaluator {
 
     private Object arith(Object l, Object r, Op op) {
         if (!(l instanceof Number) || !(r instanceof Number)) {
-            return null;
+            // Type-mismatched arithmetic (string + number, absent operand + number, nested
+            // arith-error sentinel + number, ...) returns SKIP rather than null. A null here
+            // would feed equalsValuesOrNull's "null operand → FALSE" branch on the way to NEQ,
+            // and NEQ would negate FALSE into a confident TRUE — admitting a record whose
+            // arithmetic could not be evaluated. SKIP propagates through evalBinary's SKIP guard
+            // and through evalLogical with the OR/AND rescue semantics, so a complex predicate
+            // can still be saved by a determinate sibling clause without being silently flipped.
+            // E.g. `headers['tenant'] + 1 != 'blocked1'` with header tenant='blocked' must drop
+            // the record, not admit it.
+            return SKIP;
         }
         boolean wantDouble = l instanceof Double || r instanceof Double;
         if (wantDouble) {
-            // Same IEEE-safe-integer guard applied in equalsValues / compare must apply here.
-            // Without it, mixed Long/Double arithmetic silently rounds an unsafe Long to its
-            // nearest double, and a follow-up Double-vs-Double equality lets the rounded value
-            // match a literal. E.g. predicate `body.id / 1.0 == 9007199254740992.0` would
-            // match a record with body.id = 9007199254740993 (Long), because
-            // (double) 9007199254740993L rounds to 9007199254740992.0. Refuse the operation
-            // when an operand cannot survive the round trip to double; the predicate evaluates
-            // to null and the record is skipped (consistent with cost-cap / malformed JSON).
+            // Operand-level IEEE-safe-integer guard: a Long beyond 2^53 cannot survive promotion
+            // to double, so the rounded value would let a follow-up Double-vs-Double equality
+            // match a literal. E.g. `body.id / 1.0 == 9007199254740992.0` would match
+            // body.id = 9007199254740993L (Long) because (double) 9007199254740993L rounds to
+            // 9007199254740992.0. Refuse early when an operand cannot survive that round-trip.
             if (l instanceof Long && unsafeForDouble(((Long) l).longValue())) {
-                return null;
+                return SKIP;
             }
             if (r instanceof Long && unsafeForDouble(((Long) r).longValue())) {
-                return null;
+                return SKIP;
             }
-            return arithDouble(((Number) l).doubleValue(), ((Number) r).doubleValue(), op);
+            Object result = arithDouble(((Number) l).doubleValue(), ((Number) r).doubleValue(), op);
+            if (!(result instanceof Double)) {
+                return result; // already SKIP / non-finite
+            }
+            // Result-level precision validation. Even with both operands inside [-2^53, 2^53],
+            // ADD/SUB/MUL/DIV can produce a double whose integer neighbours are not all
+            // representable: e.g. (2^53) + 1.0 rounds to 2^53.0, and (2^53 - 1) + 2.0 also
+            // rounds to 2^53.0. A predicate like `body.x + N <= 2^53.0` would then admit either
+            // Long value, bypassing the intended boundary. Validate the double result against
+            // an exact arithmetic expansion (BigDecimal) when the result reaches the unsafe
+            // integer range; refuse if precision was lost.
+            double dr = (Double) result;
+            if (dr >= IEEE_SAFE_INTEGER || dr <= -IEEE_SAFE_INTEGER) {
+                BigDecimal exact = exactArith((Number) l, (Number) r, op);
+                if (exact == null) {
+                    // Non-terminating division: BigDecimal cannot represent the exact result
+                    // either, but the double value is already approximate. Trust the double
+                    // here — the comparator can still produce a meaningful boolean.
+                    return result;
+                }
+                if (new BigDecimal(dr).compareTo(exact) != 0) {
+                    return SKIP;
+                }
+            }
+            return result;
         }
         return arithLong(((Number) l).longValue(), ((Number) r).longValue(), op);
+    }
+
+    /**
+     * Compute the exact mathematical result of a mixed Long/Double (or Double/Double) operation
+     * for the result-level precision check above. Returns {@code null} when the exact result
+     * cannot be expressed (non-terminating division, divide/mod by zero) — the caller treats
+     * that as "cannot validate, accept the double".
+     */
+    private static BigDecimal exactArith(Number l, Number r, Op op) {
+        BigDecimal bdL = toBigDecimal(l);
+        BigDecimal bdR = toBigDecimal(r);
+        try {
+            switch (op) {
+                case ADD: return bdL.add(bdR);
+                case SUB: return bdL.subtract(bdR);
+                case MUL: return bdL.multiply(bdR);
+                case DIV:
+                    if (bdR.signum() == 0) return null;
+                    return bdL.divide(bdR); // exact-only; throws ArithmeticException if non-terminating
+                case MOD:
+                    if (bdR.signum() == 0) return null;
+                    return bdL.remainder(bdR);
+                default:
+                    return null;
+            }
+        } catch (ArithmeticException ae) {
+            return null;
+        }
+    }
+
+    private static BigDecimal toBigDecimal(Number n) {
+        if (n instanceof Long) return BigDecimal.valueOf(((Long) n).longValue());
+        // BigDecimal(double) captures the exact bit-level value of the double.
+        return new BigDecimal(((Double) n).doubleValue());
     }
 
     private static boolean unsafeForDouble(long v) {
@@ -373,21 +438,21 @@ final class Evaluator {
                 break;
             case DIV:
                 if (b == 0.0) {
-                    return null;
+                    return SKIP;
                 }
                 v = a / b;
                 break;
             case MOD:
                 if (b == 0.0) {
-                    return null;
+                    return SKIP;
                 }
                 v = a % b;
                 break;
             default:
-                return null;
+                return SKIP;
         }
         if (Double.isNaN(v) || Double.isInfinite(v)) {
-            return null;
+            return SKIP;
         }
         return v;
     }
@@ -403,7 +468,7 @@ final class Evaluator {
                     return Math.multiplyExact(a, b);
                 case DIV:
                     if (b == 0) {
-                        return null;
+                        return SKIP;
                     }
                     // JLS 15.17.2: Long.MIN_VALUE / -1 overflows silently to Long.MIN_VALUE
                     // (Math.multiplyExact for Long.MAX_VALUE+1 would throw, but `/` does not).
@@ -412,22 +477,29 @@ final class Evaluator {
                     // `body.priority / -1 < -100` admits a record with body.priority = Long.MIN_VALUE:
                     // the division wraps to Long.MIN_VALUE, which compares <= -100 as true.
                     if (a == Long.MIN_VALUE && b == -1L) {
-                        return null;
+                        return SKIP;
                     }
                     return a / b;
                 case MOD:
                     if (b == 0) {
-                        return null;
+                        // Returning SKIP (not null) is critical: a null operand reaches
+                        // equalsValuesOrNull's "null vs non-null → FALSE" branch, and NEQ then
+                        // negates FALSE to a confident TRUE. A predicate like
+                        // `body.x % body.y != 0` with body.y == 0 would then admit the record.
+                        // SKIP propagates through evalBinary's SKIP guard and the OR/AND rescue.
+                        return SKIP;
                     }
                     // Long.MIN_VALUE % -1 is defined by JLS 15.17.3 to return 0 (not overflow),
                     // so no special-case is needed for MOD.
                     return a % b;
                 default:
-                    return null;
+                    return SKIP;
             }
         } catch (ArithmeticException overflow) {
-            // long overflow on +/-/* → propagate as "unknown" rather than crashing the broker.
-            return null;
+            // long overflow on +/-/* → propagate as SKIP rather than null. null would feed the
+            // null-operand → FALSE → NEQ-TRUE bypass described in arith() above; SKIP propagates
+            // upward and lets evalLogical rescue when a sibling clause is determinate.
+            return SKIP;
         }
     }
 

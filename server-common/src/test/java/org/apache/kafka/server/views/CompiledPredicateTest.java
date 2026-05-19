@@ -319,9 +319,12 @@ class CompiledPredicateTest {
         // Sanity: ordinary division still works.
         CompiledPredicate q = compiler.compile("body.x / 2 == 5");
         assertTrue(q.evaluate(jsonRecord("{\"x\":10}")).orElse(false));
-        // Sanity: division by zero still returns null (no crash).
+        // Sanity: division by zero is SKIP (no crash), so the predicate is empty. Prior to the
+        // arith-SKIP refactor, DIV/0 returned null which equality coerced to a confident FALSE;
+        // the companion NEQ form is what the refactor primarily defends — see
+        // modByZeroDoesNotPassNegatedPredicate.
         CompiledPredicate z = compiler.compile("body.x / 0 == 0");
-        assertFalse(z.evaluate(jsonRecord("{\"x\":5}")).orElse(true));
+        assertTrue(z.evaluate(jsonRecord("{\"x\":5}")).isEmpty());
     }
 
     @Test
@@ -381,6 +384,98 @@ class CompiledPredicateTest {
         CompiledPredicate ok = compiler.compile("body.x != 42.0");
         assertTrue(ok.evaluate(jsonRecord("{\"x\":7}")).orElse(false));
         assertFalse(ok.evaluate(jsonRecord("{\"x\":42}")).orElse(true));
+    }
+
+    @Test
+    void modByZeroDoesNotPassNegatedPredicate() {
+        // R33b BLOCKER #3 (Codex): `body.x % body.y` returned null when body.y == 0. Then
+        // equalsValuesOrNull(null, 0) yielded a confident FALSE on the EQ path, and NEQ
+        // negated FALSE to a confident TRUE — admitting any record whose `% != 0` clause
+        // tripped a modulo-by-zero. A predicate written as `body.x % body.y != 0` (intent:
+        // admit only records that are not exact multiples of body.y) would then admit
+        // every record where body.y was zero, regardless of body.x. The fix is to return SKIP
+        // from arithLong on divide/mod-by-zero so both EQ and NEQ refuse to commit.
+        CompiledPredicate p = compiler.compile("body.x % body.y != 0");
+        Optional<Boolean> r = p.evaluate(jsonRecord("{\"x\":5,\"y\":0}"));
+        assertTrue(r.isEmpty() || !r.get(),
+                () -> "mod by zero must yield SKIP/false on != , not silently admit, got " + r);
+        // Companion EQ form must also drop.
+        CompiledPredicate q = compiler.compile("body.x % body.y == 0");
+        Optional<Boolean> rq = q.evaluate(jsonRecord("{\"x\":5,\"y\":0}"));
+        assertTrue(rq.isEmpty() || !rq.get(),
+                () -> "mod by zero == 0 must yield SKIP/false, got " + rq);
+        // Sanity: with a non-zero divisor, NEQ still works.
+        assertTrue(p.evaluate(jsonRecord("{\"x\":5,\"y\":3}")).orElse(false),
+                "5 % 3 != 0 must remain TRUE");
+        assertFalse(p.evaluate(jsonRecord("{\"x\":6,\"y\":3}")).orElse(true),
+                "6 % 3 != 0 must remain FALSE");
+        // DIV by zero through NEQ has the same shape — same defense applies.
+        CompiledPredicate d = compiler.compile("body.x / body.y != 0");
+        Optional<Boolean> rd = d.evaluate(jsonRecord("{\"x\":5,\"y\":0}"));
+        assertTrue(rd.isEmpty() || !rd.get(),
+                () -> "div by zero must yield SKIP/false on !=, got " + rd);
+    }
+
+    @Test
+    void arithTypeMismatchDoesNotPassNegatedPredicate() {
+        // R33b BLOCKER #5 (Codex): `string + number` returned null from arith, which then
+        // propagated through equalsValuesOrNull as FALSE and through NEQ as a confident TRUE.
+        // A predicate `headers['tenant'] + 1 != 'blocked1'` with header tenant='blocked' would
+        // admit the record — the broken arithmetic short-circuited the access control. The fix
+        // is to return SKIP from arith on type mismatch.
+        CompiledPredicate p = compiler.compile("headers['tenant'] + 1 != 'blocked1'");
+        Optional<Boolean> r = p.evaluate(RecordContexts.builder()
+                .body("{}".getBytes())
+                .header("tenant", "blocked".getBytes())
+                .build());
+        assertTrue(r.isEmpty() || !r.get(),
+                () -> "string + number != literal must yield SKIP/false, not admit, got " + r);
+        // EQ form must also drop.
+        CompiledPredicate q = compiler.compile("headers['tenant'] + 1 == 'blocked1'");
+        Optional<Boolean> rq = q.evaluate(RecordContexts.builder()
+                .body("{}".getBytes())
+                .header("tenant", "blocked".getBytes())
+                .build());
+        assertTrue(rq.isEmpty() || !rq.get(),
+                () -> "string + number == literal must yield SKIP/false, got " + rq);
+        // Body-scalar variant: boolean + number → SKIP, NEQ does not flip it.
+        CompiledPredicate b = compiler.compile("body.flag + 1 != 0");
+        Optional<Boolean> rb = b.evaluate(jsonRecord("{\"flag\":true}"));
+        assertTrue(rb.isEmpty() || !rb.get(),
+                () -> "boolean + number != literal must yield SKIP/false, got " + rb);
+    }
+
+    @Test
+    void mixedLongDoubleArithRefusesPrecisionLossResult() {
+        // R33b BLOCKER #2 (Codex): the operand-level IEEE_SAFE_INTEGER guard uses strict `>`,
+        // so a Long of exactly 2^53 is treated as safe. But double arithmetic at the boundary
+        // silently rounds: (2^53).double + 1.0 evaluates to 2^53.0, not 2^53+1.0. A predicate
+        // `body.id + 1.0 <= 9007199254740992.0` with body.id = 9007199254740992L (=2^53) would
+        // therefore admit the record — the rounded result equals the literal, even though the
+        // exact mathematical answer is one greater. The fix validates the double result against
+        // exact (BigDecimal) arithmetic when the result reaches the unsafe integer range.
+        CompiledPredicate p = compiler.compile("body.id + 1.0 <= 9007199254740992.0");
+        Optional<Boolean> r = p.evaluate(jsonRecord("{\"id\":9007199254740992}"));
+        assertTrue(r.isEmpty() || !r.get(),
+                () -> "body.id+1.0 at 2^53 must not silently round under the literal, got " + r);
+        // Same exploit shape just under the boundary: (2^53-1) + 2.0 rounds to 2^53.0.
+        CompiledPredicate q = compiler.compile("body.id + 2.0 <= 9007199254740992.0");
+        Optional<Boolean> rq = q.evaluate(jsonRecord("{\"id\":9007199254740991}"));
+        assertTrue(rq.isEmpty() || !rq.get(),
+                () -> "(2^53-1)+2.0 must not silently round into the literal, got " + rq);
+        // EQ variant: precision-lost arithmetic must not admit a false equality.
+        CompiledPredicate eq = compiler.compile("body.id + 1.0 == 9007199254740992.0");
+        Optional<Boolean> req = eq.evaluate(jsonRecord("{\"id\":9007199254740992}"));
+        assertTrue(req.isEmpty() || !req.get(),
+                () -> "body.id+1.0 == 2^53.0 must not match body.id=2^53 (exact sum is 2^53+1), got " + req);
+        // Sanity: identity arithmetic at the boundary remains accepted (no precision loss).
+        CompiledPredicate ok = compiler.compile("body.id + 0.0 == 9007199254740992.0");
+        assertTrue(ok.evaluate(jsonRecord("{\"id\":9007199254740992}")).orElse(false),
+                "body.id+0.0 == 2^53.0 with body.id=2^53 must remain TRUE (arithmetic is exact)");
+        // Sanity: arithmetic well below the boundary remains accepted.
+        CompiledPredicate small = compiler.compile("body.id + 1.0 <= 100.0");
+        assertTrue(small.evaluate(jsonRecord("{\"id\":50}")).orElse(false));
+        assertFalse(small.evaluate(jsonRecord("{\"id\":200}")).orElse(true));
     }
 
     @Test
