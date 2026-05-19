@@ -655,7 +655,14 @@ public final class IoUringSelector implements BrokerSelector {
             }
             if (!keepClosing) {
                 explicitlyMutedChannels.remove(channel);
-                disconnected.put(id, ChannelState.LOCAL_CLOSE);
+                // Surface the channel's actual state, not a hardcoded LOCAL_CLOSE. NIO's
+                // {@code Selector.java:973} does the same: a peer-FIN'd channel stays READY,
+                // a write failure was already set to FAILED_SEND by the failedSends path,
+                // idle expiry uses the idle-sweep path (already EXPIRED). Hardcoding
+                // LOCAL_CLOSE here misclassified every remote disconnect — every metric,
+                // log, and downstream gauge that distinguishes peer-initiated vs broker-
+                // initiated disconnects was reading the wrong cause for io_uring listeners.
+                disconnected.put(id, channel.state());
                 Utils.closeQuietly(channel, "closing channel evicted");
                 it.remove();
             }
@@ -926,6 +933,17 @@ public final class IoUringSelector implements BrokerSelector {
      */
     Channel nettyChannelFor(String id) {
         return nettyChannels.get(id);
+    }
+
+    /**
+     * Package-private diagnostic accessor for tests to inspect transport-layer counters
+     * (inbound queue depth, pending outbound bytes) during stall reproduction. Reaches the
+     * {@link IoUringTransportLayer} attached to the channel's Netty attribute store. Not on
+     * the {@link BrokerSelector} interface — purely a test hook.
+     */
+    IoUringTransportLayer transportFor(String id) {
+        Channel nettyChannel = nettyChannels.get(id);
+        return nettyChannel == null ? null : nettyChannel.attr(TRANSPORT_ATTR).get();
     }
 
     @Override

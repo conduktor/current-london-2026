@@ -127,6 +127,10 @@ final class IoUringTransportLayer implements TransportLayer {
      * channel be re-used (it is not, in v1, but the invariant is cheap to maintain).
      */
     private final AtomicLong inboundBytes = new AtomicLong(0);
+    /** Cumulative bytes ever pushed into {@link #inbound} by Netty event loop. Test-only diagnostic. */
+    private final AtomicLong totalInboundBytes = new AtomicLong(0);
+    /** Number of offerInbound calls. Test-only diagnostic. */
+    private final AtomicLong offerInboundCalls = new AtomicLong(0);
     private volatile boolean eofSeen;
     private volatile boolean closed;
     /**
@@ -205,6 +209,8 @@ final class IoUringTransportLayer implements TransportLayer {
             return;
         }
         int size = buf.readableBytes();
+        offerInboundCalls.incrementAndGet();
+        totalInboundBytes.addAndGet(size);
         inbound.offer(buf);
         if (closed) {
             // Race with Processor's close(): drain anything we just queued so we don't leak.
@@ -472,16 +478,20 @@ final class IoUringTransportLayer implements TransportLayer {
             io.netty.channel.ChannelFuture future = nettyChannel.writeAndFlush(buf);
             handedOff = true;
             future.addListener(f -> {
-                pendingWriteBytes.addAndGet(-safeChunk);
                 if (!f.isSuccess()) {
                     // Record the cause so the next Processor write step can throw it
                     // synchronously and route the channel through FAILED_SEND. Without
                     // this, a peer RST mid-response leaves the broker thinking the send
                     // completed normally — completedSends fires, RESPONSE_SENT mute event
                     // succeeds, and the request handling pipeline silently advances on a
-                    // request the client never saw.
+                    // request the client never saw. Set BEFORE decrementing pendingWriteBytes:
+                    // a reader observing the listener mid-flight must not see
+                    // (pendingWriteBytes == 0 && asyncWriteFailure == null) — that window is
+                    // the exact false-success window where ByteBufferSend.completed() returns
+                    // true and KafkaChannel.maybeCompleteSend() emits a Send the kernel rejected.
                     asyncWriteFailure = f.cause();
                 }
+                pendingWriteBytes.addAndGet(-safeChunk);
                 // Wake the Processor's poll(). The listener runs on Netty's event loop
                 // thread (a separate thread from the Processor in production), so without
                 // this callback the Processor stays asleep on its wakeup Semaphore until
@@ -580,6 +590,31 @@ final class IoUringTransportLayer implements TransportLayer {
     @Override
     public boolean isOpen() {
         return !closed;
+    }
+
+    /** Package-private diagnostic — bytes queued in {@link #inbound} (test/debug only). */
+    long inboundBytesSnapshot() {
+        return inboundBytes.get();
+    }
+
+    /** Package-private diagnostic — bytes still riding inside Netty's outbound queue (test/debug only). */
+    long pendingWriteBytesSnapshot() {
+        return pendingWriteBytes.get();
+    }
+
+    /** Package-private diagnostic — number of {@link ByteBuf} buffers queued for read (test/debug only). */
+    int inboundQueueDepth() {
+        return inbound.size();
+    }
+
+    /** Package-private diagnostic — cumulative bytes ever offered by Netty (test/debug only). */
+    long totalInboundBytesSnapshot() {
+        return totalInboundBytes.get();
+    }
+
+    /** Package-private diagnostic — cumulative {@link #offerInbound} calls (test/debug only). */
+    long offerInboundCallsSnapshot() {
+        return offerInboundCalls.get();
     }
 
     @Override

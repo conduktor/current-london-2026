@@ -359,15 +359,16 @@ class IoUringSelectorTest {
     }
 
     @Test
-    void disconnectFromEventLoopSurfacesAsLocalCloseAfterDrainingFinalBytes() throws Exception {
+    void disconnectFromEventLoopSurfacesChannelStateAfterDrainingFinalBytes() throws Exception {
         // A peer-closed connection with bytes still in the queue must deliver those bytes
         // BEFORE we declare the channel disconnected. Mirrors NIO Selector.clear() at
         // clients/.../Selector.java:842-865 — the channel stays in closingChannels while
         // there's pending work; only when nothing more is forthcoming does doClose
-        // (notifyDisconnect=true) emit the LOCAL_CLOSE into `disconnected`. Deferring
-        // the disconnect notification to the eviction poll closes the double-dec window
-        // where the Processor would otherwise see `disconnected` for an id in the same
-        // poll that closeExcessConnections could also call selector.close(id) on.
+        // (notifyDisconnect=true) emit the channel's current state into `disconnected`
+        // (NIO Selector.java:973 writes channel.state(), not a hardcoded LOCAL_CLOSE).
+        // Deferring the disconnect notification to the eviction poll closes the double-dec
+        // window where the Processor would otherwise see `disconnected` for an id in the
+        // same poll that closeExcessConnections could also call selector.close(id) on.
         IoUringSelector s = newSelector(IDLE_NANOS_NEVER);
         EmbeddedChannel netty = acceptNew(s, REMOTE_A);
         s.poll(0);
@@ -397,12 +398,17 @@ class IoUringSelectorTest {
             "closingChannel must surface the disconnected channel so the Processor can resolve the final receive");
 
         // Poll 2: eviction poll. Nothing more is forthcoming (read returned nothing,
-        // !muted, !sendFailed) so drainClosingChannels evicts and emits LOCAL_CLOSE.
+        // !muted, !sendFailed) so drainClosingChannels evicts and emits the disconnect
+        // with the channel's actual state — READY for a peer-FIN'd channel that never had
+        // its state mutated. Matches NIO Selector.java:973 (doClose writes channel.state()).
         s.poll(0);
         assertTrue(s.disconnected().containsKey(id),
-            "eviction poll must emit LOCAL_CLOSE — this is the SINGLE disconnect notification for the channel");
-        assertEquals(ChannelState.LOCAL_CLOSE, s.disconnected().get(id),
-            "evicted closing channel surfaces as LOCAL_CLOSE per NIO doClose(channel, true)");
+            "eviction poll must emit the disconnect — this is the SINGLE notification for the channel");
+        assertEquals(ChannelState.READY, s.disconnected().get(id),
+            "evicted peer-FIN'd channel surfaces with its actual state (READY), matching NIO "
+                + "doClose at clients/.../Selector.java:973 which writes channel.state(). "
+                + "LOCAL_CLOSE is reserved for local close(id) which routes through enqueueClose "
+                + "and never traverses drainClosingChannels.");
         assertNull(s.closingChannel(id),
             "closingChannel must be evicted on the next poll; only one extra poll of grace");
         assertTrue(s.completedReceives().isEmpty(),
@@ -577,18 +583,19 @@ class IoUringSelectorTest {
 
         // Poll 2 is the eviction poll: failedSends.remove(id) inside drainClosingChannels
         // makes sendFailed=true, the read attempt is skipped, the channel is evicted, and
-        // exactly one entry lands in disconnected — LOCAL_CLOSE, matching NIO's
-        // doClose(channel, notifyDisconnect=true) at clients/.../Selector.java:856-857
-        // which writes channel.state() (the original close cause). The subsequent
-        // `for (String id : failedSends)` loop sees nothing for this id because the
-        // closingChannels drain already consumed it — that suppression is what prevents
-        // the duplicate FAILED_SEND that would double-notify processDisconnected.
+        // exactly one entry lands in disconnected. NIO's doClose at clients/.../Selector.java:973
+        // writes channel.state(), which is READY for a peer-FIN'd channel that hadn't had its
+        // state mutated. The subsequent `for (String id : failedSends)` loop sees nothing
+        // for this id because the closingChannels drain already consumed it — that
+        // suppression is what prevents the duplicate FAILED_SEND that would double-notify
+        // processDisconnected.
         s.poll(0);
         assertTrue(s.disconnected().containsKey(id),
             "eviction poll must emit exactly one disconnect for the channel");
-        assertEquals(ChannelState.LOCAL_CLOSE, s.disconnected().get(id),
-            "evicted closing channel surfaces as LOCAL_CLOSE (the original close cause); " +
-            "the duplicate FAILED_SEND notification must be suppressed by failedSends.remove");
+        assertEquals(ChannelState.READY, s.disconnected().get(id),
+            "evicted peer-FIN'd channel surfaces with channel.state() (READY); the duplicate "
+                + "FAILED_SEND notification must be suppressed by failedSends.remove inside "
+                + "drainClosingChannels");
         assertNull(s.closingChannel(id),
             "the channel must be fully evicted on the eviction poll");
 
@@ -735,11 +742,13 @@ class IoUringSelectorTest {
         assertEquals(1, s.completedReceives().size(), "drain poll 2: R3 surfaces");
         assertContains(s.completedReceives(), "r3");
 
-        // Poll 4: eviction — read produces no more bytes, channel is evicted with LOCAL_CLOSE.
+        // Poll 4: eviction — read produces no more bytes, channel is evicted with its actual state (READY for peer FIN).
         s.poll(0);
         assertTrue(s.disconnected().containsKey(id),
-            "eviction poll: all pipelined work drained, channel evicted with LOCAL_CLOSE");
-        assertEquals(ChannelState.LOCAL_CLOSE, s.disconnected().get(id));
+            "eviction poll: all pipelined work drained, channel evicted with channel.state()");
+        // Peer-FIN'd channel was never explicitly state-mutated, so it stays READY.
+        // NIO Selector.java:973 emits channel.state() the same way.
+        assertEquals(ChannelState.READY, s.disconnected().get(id));
         assertNull(s.closingChannel(id), "fully evicted");
     }
 
@@ -1021,15 +1030,17 @@ class IoUringSelectorTest {
         // channel would never be evicted. With the FIX, explicitlyMutedChannels.contains
         // returns false → channel.read() runs → tryAllocate still returns null (we have
         // NOT released memory) → no completedReceive → keepClosing stays false → the
-        // channel is evicted with LOCAL_CLOSE, recovering the connection-quota slot and
-        // releasing the queued ByteBufs.
+        // channel is evicted with channel.state() (READY for a peer-FIN'd channel),
+        // recovering the connection-quota slot and releasing the queued ByteBufs.
         selector.poll(0);
 
         assertNull(selector.closingChannel(id),
             "self-muted closing channel must be evicted by drainClosingChannels even when " +
             "memory pressure persists — otherwise the connection-quota slot leaks forever");
-        assertEquals(ChannelState.LOCAL_CLOSE, selector.disconnected().get(id),
-            "evicted self-muted closing channel must surface as LOCAL_CLOSE (NIO contract)");
+        // NIO Selector.java:973 emits channel.state() on eviction. A peer-FIN'd channel was
+        // never explicitly state-mutated, so it remains READY — not LOCAL_CLOSE.
+        assertEquals(ChannelState.READY, selector.disconnected().get(id),
+            "evicted self-muted closing channel must surface its actual state (READY for peer FIN) per NIO contract");
         pool.release(drain);
     }
 
