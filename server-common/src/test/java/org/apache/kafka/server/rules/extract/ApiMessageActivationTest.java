@@ -1205,6 +1205,84 @@ public class ApiMessageActivationTest {
         }
     }
 
+    @Test
+    public void mapValuedFieldsSurfaceAsNullNotDescendedThrough() {
+        // Round-18 MED E-1 (defense-in-depth): no Kafka ApiMessage shape today
+        // carries a java.util.Map field — but if a future KIP adds one, the
+        // pre-fix walker would have fallen through to accessorsFor(HashMap.class)
+        // and descended into JDK collection internals via keySet()/values()/
+        // entrySet()/clone(). The carve-out at convert() surfaces any Map as
+        // null — same posture as Double/Float — so the leak vector cannot
+        // appear from a schema change alone; the walker must be explicitly
+        // amended to add a convertMap helper if Map-field access is desired.
+        Map<String, Object> activation = ApiMessageActivation.from(new MapFieldNode());
+        // The key is present (the field accessor was discovered) but the
+        // value is null (the Map carve-out replaced it).
+        assertTrue(activation.containsKey("labels"),
+            "Map-typed field accessor must still appear in the activation; got " + activation);
+        assertNull(activation.get("labels"),
+            "Map-typed field VALUE must surface as null, not a walked sub-tree of " +
+                "HashMap internals (keySet/values/entrySet/clone)");
+        // Defence-in-depth: confirm the walker did NOT silently strip the key
+        // entirely. A future regression that returns Collections.emptyMap()
+        // for a Map field would lose the field's presence signal — operators
+        // would see no key at all, and rules referencing the field would
+        // behave the same as if the field didn't exist on the message shape.
+        // We want the key visible (so missing-field vs. opaque-value is
+        // distinguishable in audit) and the value null.
+        assertEquals(1L, activation.get("idx"),
+            "scalar siblings of a Map field must still surface normally");
+    }
+
+    /**
+     * Fixture for Round-18 MED E-1: an ApiMessage whose accessor returns a
+     * {@link java.util.Map} field. No real Kafka schema has this shape today,
+     * but the walker's behaviour must be pinned regardless so a future
+     * schema addition cannot regress to descending into JDK collection
+     * internals.
+     */
+    @SuppressWarnings("unused")
+    public static final class MapFieldNode implements org.apache.kafka.common.protocol.ApiMessage {
+        public java.util.Map<String, String> labels() {
+            java.util.Map<String, String> m = new java.util.LinkedHashMap<>();
+            m.put("alpha", "one");
+            m.put("beta", "two");
+            return m;
+        }
+        public long idx() {
+            return 1L;
+        }
+        @Override public short apiKey() {
+            return -1;
+        }
+        @Override public short lowestSupportedVersion() {
+            return 0;
+        }
+        @Override public short highestSupportedVersion() {
+            return 0;
+        }
+        @Override public org.apache.kafka.common.protocol.Message duplicate() {
+            return new MapFieldNode();
+        }
+        @Override public java.util.List<org.apache.kafka.common.protocol.types.RawTaggedField> unknownTaggedFields() {
+            return java.util.Collections.emptyList();
+        }
+        @Override public void read(org.apache.kafka.common.protocol.Readable readable, short version) {
+        }
+        @Override public void write(org.apache.kafka.common.protocol.Writable writable,
+                                    org.apache.kafka.common.protocol.ObjectSerializationCache cache,
+                                    short version) {
+        }
+        @Override public int size(org.apache.kafka.common.protocol.ObjectSerializationCache cache,
+                                  short version) {
+            return 0;
+        }
+        @Override public void addSize(org.apache.kafka.common.protocol.MessageSizeAccumulator size,
+                                      org.apache.kafka.common.protocol.ObjectSerializationCache cache,
+                                      short version) {
+        }
+    }
+
     private static java.io.File locatePackageDir(String pkg) {
         String rel = pkg.replace('.', '/');
         for (String root : new String[]{

@@ -472,6 +472,32 @@ public final class ApiMessageActivation {
         if (v instanceof Iterable) {
             return convertIterable((Iterable<?>) v, depth, invocations);
         }
+        // Round-18 MED E-1 (defense-in-depth): no Kafka {@link ApiMessage}
+        // shape today carries a {@link java.util.Map} field — the message
+        // generator emits {@code ArrayList<...Element>} for repeated entries
+        // and there is no map-typed field in any current schema. But if a
+        // future KIP adds one, the fall-through below would descend into the
+        // concrete Map type's public no-arg accessors:
+        // {@code keySet}, {@code values}, {@code entrySet}, {@code clone}, ...
+        // — surfacing the operator with a junk-shaped sub-tree of JDK
+        // collection internals, with the entry-set itself walked as an
+        // Iterable of {@code Map.Entry} (an interface with {@code getKey}
+        // and {@code getValue} accessors that would be discovered). The
+        // result would be a confusing partial leak whose shape depends on
+        // the exact Map implementation chosen by the schema author.
+        //
+        // Surface as null — same posture as Double/Float above — so a future
+        // schema addition forces an explicit decision in this file rather
+        // than discovering the leak in production. Operators who reference
+        // {@code request.<mapField>} will see null instead of a half-walked
+        // tree, and a CEL predicate against it will resolve consistently.
+        // When a KIP genuinely needs map-field access, this branch is the
+        // explicit place to add a {@code convertMap(Map<?,?>, ...)} helper
+        // with the same step-charging and depth-cap rigor as
+        // {@link #convertIterable}.
+        if (v instanceof Map) {
+            return null;
+        }
         // Anything else with accessors: walk recursively. We do NOT restrict to
         // ApiMessage — nested records inside generated classes implement just
         // Message, and inner-collection element types implement
