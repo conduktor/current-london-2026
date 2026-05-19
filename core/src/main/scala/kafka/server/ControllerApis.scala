@@ -591,6 +591,10 @@ class ControllerApis(
     // view.* mutation" rule is what closes it; do not weaken to "only when the new value differs"
     // because the configRepository snapshot used to determine currency can race with the alter,
     // and the strict rule is what the test pins.
+    // R40b: capture the current backing seen at preflight time so we can pass it as a controller
+    // precondition. ConfigurationControlManager re-checks this against the authoritative configData
+    // atomically inside the event loop, closing the broker-snapshot-vs-controller-commit TOCTOU.
+    val expectedConfigValues = new util.HashMap[ConfigResource, util.Map[String, String]]()
     val configChangesIterator = configChanges.entrySet().iterator()
     while (configChangesIterator.hasNext) {
       val entry = configChangesIterator.next()
@@ -599,8 +603,9 @@ class ControllerApis(
         val backing = entry.getValue.get(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG)
         val newBackingDenied = backing != null && !backing.trim.isEmpty &&
             !authHelper.authorize(request.context, READ, TOPIC, backing)
-        val currentBackingDenied = if (!newBackingDenied && legacyTouchesAnyViewConfig(entry.getValue)) {
-          currentViewBacking(resource.name()) match {
+        val currentBackingOpt = if (legacyTouchesAnyViewConfig(entry.getValue)) currentViewBacking(resource.name()) else None
+        val currentBackingDenied = if (!newBackingDenied) {
+          currentBackingOpt match {
             case Some(currentBacking) =>
               !authHelper.authorize(request.context, READ, TOPIC, currentBacking)
             case None => false
@@ -613,10 +618,15 @@ class ControllerApis(
             setResourceName(resource.name()).
             setResourceType(resource.`type`().id()))
           configChangesIterator.remove()
+        } else {
+          currentBackingOpt.foreach { currentBacking =>
+            expectedConfigValues.put(resource,
+              util.Collections.singletonMap(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, currentBacking))
+          }
         }
       }
     }
-    controller.legacyAlterConfigs(context, configChanges, alterConfigsRequest.data.validateOnly)
+    controller.legacyAlterConfigs(context, configChanges, expectedConfigValues, alterConfigsRequest.data.validateOnly)
       .handle[Unit] { (controllerResults, exception) =>
         if (exception != null) {
           requestHelper.handleError(request, exception)
@@ -869,6 +879,9 @@ class ControllerApis(
     // boundary at fetch time per the comment in KafkaApis.handleFetchRequest. Require READ on
     // the CURRENT effective backing whenever any view.* config is being mutated on a topic that
     // is currently a view, regardless of which view.* key is touched and which op type is used.
+    // R40b: capture the current backing seen at preflight so the controller can re-validate it
+    // atomically inside the event loop. See the corresponding comment in handleLegacyAlterConfigs.
+    val expectedConfigValues = new util.HashMap[ConfigResource, util.Map[String, String]]()
     val configChangesIterator = configChanges.entrySet().iterator()
     while (configChangesIterator.hasNext) {
       val entry = configChangesIterator.next()
@@ -880,8 +893,9 @@ class ControllerApis(
           backing != null && !backing.trim.isEmpty &&
             !authHelper.authorize(request.context, READ, TOPIC, backing)
         } else false
-        val currentBackingDenied = if (!newBackingDenied && touchesAnyViewConfig(entry.getValue)) {
-          currentViewBacking(resource.name()) match {
+        val currentBackingOpt = if (touchesAnyViewConfig(entry.getValue)) currentViewBacking(resource.name()) else None
+        val currentBackingDenied = if (!newBackingDenied) {
+          currentBackingOpt match {
             case Some(currentBacking) =>
               !authHelper.authorize(request.context, READ, TOPIC, currentBacking)
             case None => false
@@ -894,10 +908,15 @@ class ControllerApis(
             setResourceName(resource.name()).
             setResourceType(resource.`type`().id()))
           configChangesIterator.remove()
+        } else {
+          currentBackingOpt.foreach { currentBacking =>
+            expectedConfigValues.put(resource,
+              util.Collections.singletonMap(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, currentBacking))
+          }
         }
       }
     }
-    controller.incrementalAlterConfigs(context, configChanges, alterConfigsRequest.data.validateOnly)
+    controller.incrementalAlterConfigs(context, configChanges, expectedConfigValues, alterConfigsRequest.data.validateOnly)
       .handle[Unit] { (controllerResults, exception) =>
         if (exception != null) {
           requestHelper.handleError(request, exception)

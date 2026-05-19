@@ -108,6 +108,7 @@ public class MockController implements Controller {
 
     public static class Builder {
         private final Map<String, MockTopic> initialTopics = new HashMap<>();
+        private final Map<ConfigResource, Map<String, String>> initialConfigs = new HashMap<>();
 
         public Builder newInitialTopic(String name, Uuid id) {
             initialTopics.put(name, new MockTopic(name, id));
@@ -119,17 +120,26 @@ public class MockController implements Controller {
             return this;
         }
 
+        public Builder newInitialConfig(ConfigResource resource, String key, String value) {
+            initialConfigs.computeIfAbsent(resource, __ -> new HashMap<>()).put(key, value);
+            return this;
+        }
+
         public MockController build() {
-            return new MockController(initialTopics.values());
+            return new MockController(initialTopics.values(), initialConfigs);
         }
     }
 
     private volatile boolean active = true;
 
-    private MockController(Collection<MockTopic> initialTopics) {
+    private MockController(Collection<MockTopic> initialTopics,
+                           Map<ConfigResource, Map<String, String>> initialConfigs) {
         for (MockTopic topic : initialTopics) {
             topics.put(topic.id, topic);
             topicNameToId.put(topic.name, topic.id);
+        }
+        for (Entry<ConfigResource, Map<String, String>> entry : initialConfigs.entrySet()) {
+            configs.computeIfAbsent(entry.getKey(), __ -> new HashMap<>()).putAll(entry.getValue());
         }
     }
 
@@ -356,17 +366,36 @@ public class MockController implements Controller {
     public CompletableFuture<Map<ConfigResource, ApiError>> incrementalAlterConfigs(
         ControllerRequestContext context,
         Map<ConfigResource, Map<String, Entry<AlterConfigOp.OpType, String>>> configChanges,
+        Map<ConfigResource, Map<String, String>> expectedConfigValues,
         boolean validateOnly
     ) {
         Map<ConfigResource, ApiError> results = new HashMap<>();
         for (Entry<ConfigResource, Map<String, Entry<AlterConfigOp.OpType, String>>> entry :
                 configChanges.entrySet()) {
             ConfigResource resource = entry.getKey();
+            Map<String, String> expected = expectedConfigValues.getOrDefault(resource, Map.of());
+            Map<String, String> current = configs.getOrDefault(resource, Map.of());
+            ApiError preconditionError = checkPreconditions(expected, current);
+            if (preconditionError.isFailure()) {
+                results.put(resource, preconditionError);
+                continue;
+            }
             results.put(resource, incrementalAlterResource(resource, entry.getValue(), validateOnly));
         }
         CompletableFuture<Map<ConfigResource, ApiError>> future = new CompletableFuture<>();
         future.complete(results);
         return future;
+    }
+
+    private static ApiError checkPreconditions(Map<String, String> expected, Map<String, String> current) {
+        for (Entry<String, String> e : expected.entrySet()) {
+            String got = current.get(e.getKey());
+            if (!java.util.Objects.equals(got, e.getValue())) {
+                return new ApiError(INVALID_REQUEST,
+                    "Expected " + e.getKey() + "=" + e.getValue() + " but found " + got + ".");
+            }
+        }
+        return ApiError.NONE;
     }
 
     private ApiError incrementalAlterResource(ConfigResource resource,
@@ -418,12 +447,20 @@ public class MockController implements Controller {
     public CompletableFuture<Map<ConfigResource, ApiError>> legacyAlterConfigs(
         ControllerRequestContext context,
         Map<ConfigResource, Map<String, String>> newConfigs,
+        Map<ConfigResource, Map<String, String>> expectedConfigValues,
         boolean validateOnly
     ) {
         Map<ConfigResource, ApiError> results = new HashMap<>();
-        if (!validateOnly) {
-            for (Entry<ConfigResource, Map<String, String>> entry : newConfigs.entrySet()) {
-                ConfigResource resource = entry.getKey();
+        for (Entry<ConfigResource, Map<String, String>> entry : newConfigs.entrySet()) {
+            ConfigResource resource = entry.getKey();
+            Map<String, String> expected = expectedConfigValues.getOrDefault(resource, Map.of());
+            Map<String, String> current = configs.getOrDefault(resource, Map.of());
+            ApiError preconditionError = checkPreconditions(expected, current);
+            if (preconditionError.isFailure()) {
+                results.put(resource, preconditionError);
+                continue;
+            }
+            if (!validateOnly) {
                 Map<String, String> map = configs.computeIfAbsent(resource, __ -> new HashMap<>());
                 map.clear();
                 map.putAll(entry.getValue());

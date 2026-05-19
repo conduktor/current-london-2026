@@ -534,4 +534,114 @@ public class ConfigurationControlManagerTest {
             assertEquals(Errors.INVALID_UPDATE_VERSION, result.response().error());
         }
     }
+
+    /**
+     * R40b: the precondition map on {@code incrementalAlterConfigs} closes the R38 TOCTOU residual.
+     * Scenario simulated here:
+     *   1. Broker preflight sees view backing = "B_old" and authorizes READ on it.
+     *   2. Between preflight and controller commit, the backing is rebound to "B_new" via a
+     *      separate alter (the in-test {@code replay} of a ConfigRecord stands in for that
+     *      concurrent commit landing first in the event loop).
+     *   3. The original alter — a predicate-only mutation — must now be rejected because the
+     *      controller's current backing no longer matches what the broker authorized against.
+     */
+    @Test
+    public void testR40bPredicateOnlyAlterRejectedWhenBackingRaced() {
+        ConfigurationControlManager manager = new ConfigurationControlManager.Builder().
+            setKafkaConfigSchema(SCHEMA).
+            build();
+
+        manager.replay(new ConfigRecord().setResourceType(TOPIC.id()).setResourceName("mytopic").
+            setName("view.backing.topic").setValue("B_new"));
+
+        Map<ConfigResource, Map<String, String>> preconditions =
+            toMap(entry(MYTOPIC, toMap(entry("view.backing.topic", "B_old"))));
+        ControllerResult<Map<ConfigResource, ApiError>> result = manager.incrementalAlterConfigs(
+            toMap(entry(MYTOPIC, toMap(entry("view.cel.predicate", entry(SET, "true"))))),
+            preconditions,
+            false);
+
+        assertEquals(Collections.emptyList(), result.records(),
+            "no records should be emitted when the precondition fails");
+        ApiError err = result.response().get(MYTOPIC);
+        assertEquals(Errors.INVALID_REQUEST, err.error());
+        assertTrue(err.message().contains("view.backing.topic"),
+            "error message must name the failing key, got: " + err.message());
+    }
+
+    @Test
+    public void testR40bPredicateOnlyAlterAdmittedWhenBackingMatches() {
+        ConfigurationControlManager manager = new ConfigurationControlManager.Builder().
+            setKafkaConfigSchema(SCHEMA).
+            build();
+        manager.replay(new ConfigRecord().setResourceType(TOPIC.id()).setResourceName("mytopic").
+            setName("view.backing.topic").setValue("B_old"));
+
+        Map<ConfigResource, Map<String, String>> preconditions =
+            toMap(entry(MYTOPIC, toMap(entry("view.backing.topic", "B_old"))));
+        ControllerResult<Map<ConfigResource, ApiError>> result = manager.incrementalAlterConfigs(
+            toMap(entry(MYTOPIC, toMap(entry("view.cel.predicate", entry(SET, "true"))))),
+            preconditions,
+            false);
+
+        assertEquals(ApiError.NONE, result.response().get(MYTOPIC));
+        assertEquals(1, result.records().size());
+        ConfigRecord emitted = (ConfigRecord) result.records().get(0).message();
+        assertEquals("view.cel.predicate", emitted.name());
+        assertEquals("true", emitted.value());
+    }
+
+    @Test
+    public void testR40bLegacyAlterRejectedWhenBackingRaced() {
+        ConfigurationControlManager manager = new ConfigurationControlManager.Builder().
+            setKafkaConfigSchema(SCHEMA).
+            build();
+        manager.replay(new ConfigRecord().setResourceType(TOPIC.id()).setResourceName("mytopic").
+            setName("view.backing.topic").setValue("B_new"));
+
+        Map<ConfigResource, Map<String, String>> preconditions =
+            toMap(entry(MYTOPIC, toMap(entry("view.backing.topic", "B_old"))));
+        ControllerResult<Map<ConfigResource, ApiError>> result = manager.legacyAlterConfigs(
+            toMap(entry(MYTOPIC, toMap(
+                entry("view.backing.topic", "B_new"),
+                entry("view.cel.predicate", "true")))),
+            preconditions,
+            false);
+
+        assertEquals(Collections.emptyList(), result.records());
+        assertEquals(Errors.INVALID_REQUEST, result.response().get(MYTOPIC).error());
+    }
+
+    /**
+     * Precondition pinned at the absent-key value (null) — exercises the {@code null}-vs-string
+     * matching branch of {@link ConfigurationControlManager#checkPreconditions} so a future change
+     * that conflates "no precondition" with "expect null" gets caught here.
+     */
+    @Test
+    public void testR40bAbsentBackingPrecondition() {
+        ConfigurationControlManager manager = new ConfigurationControlManager.Builder().
+            setKafkaConfigSchema(SCHEMA).
+            build();
+
+        Map<String, String> expected = new HashMap<>();
+        expected.put("view.backing.topic", null);
+        Map<ConfigResource, Map<String, String>> preconditions = toMap(entry(MYTOPIC, expected));
+
+        ControllerResult<Map<ConfigResource, ApiError>> ok = manager.incrementalAlterConfigs(
+            toMap(entry(MYTOPIC, toMap(entry("def", entry(SET, "x"))))),
+            preconditions,
+            false);
+        assertEquals(ApiError.NONE, ok.response().get(MYTOPIC),
+            "absent-backing precondition should pass when no backing is set");
+
+        manager.replay(new ConfigRecord().setResourceType(TOPIC.id()).setResourceName("mytopic").
+            setName("view.backing.topic").setValue("B_set"));
+
+        ControllerResult<Map<ConfigResource, ApiError>> nok = manager.incrementalAlterConfigs(
+            toMap(entry(MYTOPIC, toMap(entry("def", entry(SET, "y"))))),
+            preconditions,
+            false);
+        assertEquals(Errors.INVALID_REQUEST, nok.response().get(MYTOPIC).error(),
+            "absent-backing precondition should fail once a backing is set");
+    }
 }

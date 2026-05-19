@@ -1883,6 +1883,7 @@ public final class QuorumController implements Controller {
     public CompletableFuture<Map<ConfigResource, ApiError>> incrementalAlterConfigs(
         ControllerRequestContext context,
         Map<ConfigResource, Map<String, Entry<OpType, String>>> configChanges,
+        Map<ConfigResource, Map<String, String>> expectedConfigValues,
         boolean validateOnly
     ) {
         if (configChanges.isEmpty()) {
@@ -1890,7 +1891,7 @@ public final class QuorumController implements Controller {
         }
         return appendWriteEvent("incrementalAlterConfigs", context.deadlineNs(), () -> {
             ControllerResult<Map<ConfigResource, ApiError>> result =
-                configurationControl.incrementalAlterConfigs(configChanges, false);
+                configurationControl.incrementalAlterConfigs(configChanges, expectedConfigValues, false);
             if (validateOnly) {
                 return result.withoutRecords();
             } else {
@@ -1928,14 +1929,16 @@ public final class QuorumController implements Controller {
     @Override
     public CompletableFuture<Map<ConfigResource, ApiError>> legacyAlterConfigs(
         ControllerRequestContext context,
-        Map<ConfigResource, Map<String, String>> newConfigs, boolean validateOnly
+        Map<ConfigResource, Map<String, String>> newConfigs,
+        Map<ConfigResource, Map<String, String>> expectedConfigValues,
+        boolean validateOnly
     ) {
         if (newConfigs.isEmpty()) {
             return CompletableFuture.completedFuture(Collections.emptyMap());
         }
         return appendWriteEvent("legacyAlterConfigs", context.deadlineNs(), () -> {
             ControllerResult<Map<ConfigResource, ApiError>> result =
-                configurationControl.legacyAlterConfigs(newConfigs, false);
+                configurationControl.legacyAlterConfigs(newConfigs, expectedConfigValues, false);
             if (validateOnly) {
                 return result.withoutRecords();
             } else {

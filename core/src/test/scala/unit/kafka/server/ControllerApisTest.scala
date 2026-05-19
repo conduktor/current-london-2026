@@ -1021,7 +1021,13 @@ class ControllerApisTest {
       }
       new util.ArrayList[AuthorizationResult](results.asJava)
     }
-    controllerApis = createControllerApis(Some(authorizer), new MockController.Builder().build(),
+    // R40b: MockController must be seeded with the same backing the broker preflight sees, so the
+    // precondition map passed by ControllerApis matches the controller-side state.
+    val mockController = new MockController.Builder().
+      newInitialConfig(new ConfigResource(ConfigResource.Type.TOPIC, viewTopicName),
+        ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, currentBacking).
+      build()
+    controllerApis = createControllerApis(Some(authorizer), mockController,
       metadataCacheOverride = Some(metadataCacheMock))
     controllerApis.handleIncrementalAlterConfigs(request)
     val capturedResponse: ArgumentCaptor[AbstractResponse] =
@@ -1148,6 +1154,75 @@ class ControllerApisTest {
     assertEquals(TOPIC_AUTHORIZATION_FAILED.code(), viewResponse.errorCode(),
       "legacy AlterConfigs touching view.* on existing view without READ on current backing must be rejected")
     assertEquals("Authorization failed.", viewResponse.errorMessage())
+  }
+
+  /**
+   * R40b: even with READ on the CURRENT backing at preflight time, a predicate-only alter must
+   * be rejected if the controller's authoritative current-backing value differs at apply time —
+   * i.e. a concurrent rebind committed inside the controller event loop in the broker→controller
+   * gap. The R38 broker-side gate uses {@code metadataCache.topicConfig}, which is a broker
+   * snapshot; the controller is the source of truth. ControllerApis now passes the preflight-seen
+   * backing as a precondition; the controller (here MockController seeded with the post-rebind
+   * value) rejects with INVALID_REQUEST when the precondition does not match.
+   */
+  @Test
+  def testIncrementalAlterConfigsOfViewPredicateRejectedWhenBackingRacedAtController(): Unit = {
+    val viewTopicName = "alice_view"
+    val backingAtBroker = "orders_v1"
+    val backingAtController = "orders_v2" // race-committed by a different principal before our alter applied
+    val metadataCacheMock = mock(classOf[KRaftMetadataCache])
+    val currentProps = new Properties()
+    currentProps.put(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, backingAtBroker)
+    when(metadataCacheMock.topicConfig(viewTopicName)).thenReturn(currentProps)
+
+    val requestData = new IncrementalAlterConfigsRequestData().setResources(
+      new AlterConfigsResourceCollection(util.Arrays.asList(
+        new AlterConfigsResource().
+          setResourceName(viewTopicName).
+          setResourceType(ConfigResource.Type.TOPIC.id()).
+          setConfigs(new AlterableConfigCollection(util.Arrays.asList(new AlterableConfig().
+            setName(ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG).
+            setValue("true").
+            setConfigOperation(AlterConfigOp.OpType.SET.id())).iterator()))
+        ).iterator()))
+    val request = buildRequest(new IncrementalAlterConfigsRequest.Builder(requestData).build(0))
+
+    val authorizer = mock(classOf[Authorizer])
+    when(authorizer.authorize(
+      any[AuthorizableRequestContext],
+      any[util.List[Action]]
+    )).thenAnswer { invocation =>
+      val actions = invocation.getArgument[util.List[Action]](1).asScala
+      val results = actions.map { action =>
+        val op = action.operation()
+        val resourceName = action.resourcePattern().name()
+        if (op == AclOperation.ALTER_CONFIGS && resourceName == viewTopicName) AuthorizationResult.ALLOWED
+        // Principal has READ on the OLD backing (what the broker preflight sees), but the
+        // controller has already moved to backingAtController, which is the test point.
+        else if (op == AclOperation.READ && resourceName == backingAtBroker) AuthorizationResult.ALLOWED
+        else AuthorizationResult.DENIED
+      }
+      new util.ArrayList[AuthorizationResult](results.asJava)
+    }
+
+    val mockController = new MockController.Builder().
+      newInitialConfig(new ConfigResource(ConfigResource.Type.TOPIC, viewTopicName),
+        ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, backingAtController).
+      build()
+    controllerApis = createControllerApis(Some(authorizer), mockController,
+      metadataCacheOverride = Some(metadataCacheMock))
+    controllerApis.handleIncrementalAlterConfigs(request)
+
+    val capturedResponse: ArgumentCaptor[AbstractResponse] =
+      ArgumentCaptor.forClass(classOf[AbstractResponse])
+    verify(requestChannel).sendResponse(
+      ArgumentMatchers.eq(request),
+      capturedResponse.capture(),
+      ArgumentMatchers.eq(None))
+    val response = capturedResponse.getValue.asInstanceOf[IncrementalAlterConfigsResponse]
+    val viewResponse = response.data().responses().asScala.find(_.resourceName() == viewTopicName).get
+    assertEquals(INVALID_REQUEST.code(), viewResponse.errorCode(),
+      "TOCTOU rebind between broker preflight and controller apply must be caught by the precondition")
   }
 
   @ParameterizedTest(name = "testCreateTopicsMutationQuota with throttle: {0}")

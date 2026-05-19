@@ -255,9 +255,35 @@ public interface Controller extends AclMutator, AutoCloseable {
      *
      * @return              A future yielding a map from config resources to error results.
      */
+    default CompletableFuture<Map<ConfigResource, ApiError>> incrementalAlterConfigs(
+        ControllerRequestContext context,
+        Map<ConfigResource, Map<String, Map.Entry<AlterConfigOp.OpType, String>>> configChanges,
+        boolean validateOnly
+    ) {
+        return incrementalAlterConfigs(context, configChanges, Map.of(), validateOnly);
+    }
+
+    /**
+     * Perform some incremental configuration changes, with per-resource preconditions checked
+     * atomically inside the controller event loop.
+     *
+     * @param context             The controller request context.
+     * @param configChanges       The changes.
+     * @param expectedConfigValues For each resource, a map of {@code config key -> expected current
+     *                             value} that must match {@code configData} at apply time. Use this
+     *                             to close TOCTOU windows where the broker-side preflight read
+     *                             must be re-validated against the authoritative controller state
+     *                             before the mutation lands. A resource whose precondition fails
+     *                             gets {@code INVALID_REQUEST} and its mutations are skipped.
+     *                             Pass {@link Map#of()} when no precondition is required.
+     * @param validateOnly        True if we should validate the changes but not apply them.
+     *
+     * @return                    A future yielding a map from config resources to error results.
+     */
     CompletableFuture<Map<ConfigResource, ApiError>> incrementalAlterConfigs(
         ControllerRequestContext context,
         Map<ConfigResource, Map<String, Map.Entry<AlterConfigOp.OpType, String>>> configChanges,
+        Map<ConfigResource, Map<String, String>> expectedConfigValues,
         boolean validateOnly
     );
 
@@ -296,9 +322,24 @@ public interface Controller extends AclMutator, AutoCloseable {
      *
      * @return              A future yielding a map from config resources to error results.
      */
+    default CompletableFuture<Map<ConfigResource, ApiError>> legacyAlterConfigs(
+        ControllerRequestContext context,
+        Map<ConfigResource, Map<String, String>> newConfigs,
+        boolean validateOnly
+    ) {
+        return legacyAlterConfigs(context, newConfigs, Map.of(), validateOnly);
+    }
+
+    /**
+     * Perform some configuration changes using the legacy API, with per-resource preconditions
+     * checked atomically inside the controller event loop. See
+     * {@link #incrementalAlterConfigs(ControllerRequestContext, Map, Map, boolean)} for the
+     * precondition semantics.
+     */
     CompletableFuture<Map<ConfigResource, ApiError>> legacyAlterConfigs(
         ControllerRequestContext context,
         Map<ConfigResource, Map<String, String>> newConfigs,
+        Map<ConfigResource, Map<String, String>> expectedConfigValues,
         boolean validateOnly
     );
 

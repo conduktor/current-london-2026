@@ -63,6 +63,7 @@ import static org.apache.kafka.common.config.TopicConfig.MIN_IN_SYNC_REPLICAS_CO
 import static org.apache.kafka.common.config.TopicConfig.UNCLEAN_LEADER_ELECTION_ENABLE_CONFIG;
 import static org.apache.kafka.common.metadata.MetadataRecordType.CONFIG_RECORD;
 import static org.apache.kafka.common.protocol.Errors.INVALID_CONFIG;
+import static org.apache.kafka.common.protocol.Errors.INVALID_REQUEST;
 import static org.apache.kafka.controller.QuorumController.MAX_RECORDS_PER_USER_OP;
 
 
@@ -203,19 +204,64 @@ public class ConfigurationControlManager {
         Map<ConfigResource, Map<String, Entry<OpType, String>>> configChanges,
         boolean newlyCreatedResource
     ) {
+        return incrementalAlterConfigs(configChanges, Collections.emptyMap(), newlyCreatedResource);
+    }
+
+    /**
+     * R40b: variant accepting per-resource preconditions. For each entry in
+     * {@code expectedConfigValues}, the current value of that config key in {@link #configData}
+     * (read inside the controller event loop, atomically) must equal the expected value, otherwise
+     * the resource's mutations are rejected with {@code INVALID_REQUEST}. The check is per-key:
+     * an expected value of {@code null} matches an absent key; any non-null expected value must
+     * match the stored string exactly. Pass {@link Collections#emptyMap()} when no precondition is
+     * required.
+     *
+     * <p>This closes the R38 TOCTOU residual: the broker-side preflight reads the current view
+     * backing through {@code metadataCache}, which can race a concurrent rebind committed by a
+     * different principal between the preflight authz check and the controller apply. By
+     * threading the expected backing through as a precondition, the controller event-loop
+     * commit-time view of {@code configData} is what is actually authorized against — there is
+     * no window where the alter lands on a backing the broker never saw.
+     */
+    ControllerResult<Map<ConfigResource, ApiError>> incrementalAlterConfigs(
+        Map<ConfigResource, Map<String, Entry<OpType, String>>> configChanges,
+        Map<ConfigResource, Map<String, String>> expectedConfigValues,
+        boolean newlyCreatedResource
+    ) {
         List<ApiMessageAndVersion> outputRecords =
                 BoundedList.newArrayBacked(MAX_RECORDS_PER_USER_OP);
         Map<ConfigResource, ApiError> outputResults = new HashMap<>();
         for (Entry<ConfigResource, Map<String, Entry<OpType, String>>> resourceEntry :
                 configChanges.entrySet()) {
-            ApiError apiError = incrementalAlterConfigResource(resourceEntry.getKey(),
+            ConfigResource resource = resourceEntry.getKey();
+            ApiError preconditionError = checkPreconditions(resource,
+                expectedConfigValues.getOrDefault(resource, Collections.emptyMap()));
+            if (preconditionError.isFailure()) {
+                outputResults.put(resource, preconditionError);
+                continue;
+            }
+            ApiError apiError = incrementalAlterConfigResource(resource,
                 resourceEntry.getValue(),
                 newlyCreatedResource,
                 outputRecords);
-            outputResults.put(resourceEntry.getKey(), apiError);
+            outputResults.put(resource, apiError);
         }
         outputRecords.addAll(createClearElrRecordsAsNeeded(outputRecords));
         return ControllerResult.atomicOf(outputRecords, outputResults);
+    }
+
+    private ApiError checkPreconditions(ConfigResource resource, Map<String, String> expected) {
+        if (expected.isEmpty()) return ApiError.NONE;
+        TimelineHashMap<String, String> current = configData.get(resource);
+        for (Entry<String, String> e : expected.entrySet()) {
+            String got = current == null ? null : current.get(e.getKey());
+            if (!Objects.equals(got, e.getValue())) {
+                return new ApiError(INVALID_REQUEST,
+                    "Precondition failed for " + resource + ": expected " + e.getKey() +
+                    "=" + e.getValue() + " but current value is " + got + ".");
+            }
+        }
+        return ApiError.NONE;
     }
 
     List<ApiMessageAndVersion> createClearElrRecordsAsNeeded(List<ApiMessageAndVersion> input) {
@@ -424,12 +470,34 @@ public class ConfigurationControlManager {
         Map<ConfigResource, Map<String, String>> newConfigs,
         boolean newlyCreatedResource
     ) {
+        return legacyAlterConfigs(newConfigs, Collections.emptyMap(), newlyCreatedResource);
+    }
+
+    /**
+     * R40b: legacy variant of
+     * {@link #incrementalAlterConfigs(Map, Map, boolean)} with per-resource preconditions.
+     * Same semantics: each entry in {@code expectedConfigValues} is compared against
+     * {@link #configData} atomically; a resource whose precondition fails gets
+     * {@code INVALID_REQUEST} and its mutations are skipped.
+     */
+    ControllerResult<Map<ConfigResource, ApiError>> legacyAlterConfigs(
+        Map<ConfigResource, Map<String, String>> newConfigs,
+        Map<ConfigResource, Map<String, String>> expectedConfigValues,
+        boolean newlyCreatedResource
+    ) {
         List<ApiMessageAndVersion> outputRecords =
                 BoundedList.newArrayBacked(MAX_RECORDS_PER_USER_OP);
         Map<ConfigResource, ApiError> outputResults = new HashMap<>();
         for (Entry<ConfigResource, Map<String, String>> resourceEntry :
             newConfigs.entrySet()) {
-            legacyAlterConfigResource(resourceEntry.getKey(),
+            ConfigResource resource = resourceEntry.getKey();
+            ApiError preconditionError = checkPreconditions(resource,
+                expectedConfigValues.getOrDefault(resource, Collections.emptyMap()));
+            if (preconditionError.isFailure()) {
+                outputResults.put(resource, preconditionError);
+                continue;
+            }
+            legacyAlterConfigResource(resource,
                 resourceEntry.getValue(),
                 newlyCreatedResource,
                 outputRecords,
