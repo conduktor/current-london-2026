@@ -3886,9 +3886,44 @@ class KafkaApis(val requestChannel: RequestChannel,
         if (exception != null) {
           requestHelper.sendMaybeThrottle(request, consumerGroupHeartbeatRequest.getErrorResponse(exception))
         } else {
+          // r22 BLOCKER #227 (Agent 3 Finding #3): defense-in-depth on the ASSIGNMENT response.
+          // The #210 fix above rejects explicit backing-name SUBSCRIPTIONS at the request boundary,
+          // but the coordinator can still derive a backing topicId for an assignment via two
+          // paths still flagged as pending in r22:
+          //   (a) regex subscriptions resolved server-side against the raw metadata image (pending
+          //       #209/#169/#143 — the resolver does not exclude backing topics today), and
+          //   (b) pre-existing __consumer_offsets / coordinator state carrying a backing
+          //       topicId from before #210 was deployed.
+          // If a backing topicId reaches the consumer in its assignment, the consumer's next
+          // Fetch resolves that UUID to the backing topic and reads cross-tenant bytes. The
+          // strict filter here drops any assignment entry whose topicId resolves on this broker
+          // to a backing name; entries that fail to resolve are ALSO dropped (fail-closed,
+          // matching the share-state #171 precedent — a transient stale-cache window cannot be
+          // used to forward a backing UUID under a None resolution). A legit assignment dropped
+          // on a stale-cache window will be re-issued on the next heartbeat cycle, which is the
+          // standard KIP-848 reconciliation contract.
+          filterBackingTopicPartitionsFromHeartbeatAssignment(response.assignment)
           requestHelper.sendMaybeThrottle(request, new ConsumerGroupHeartbeatResponse(response))
         }
       }
+    }
+  }
+
+  private def filterBackingTopicPartitionsFromHeartbeatAssignment(
+      assignment: ConsumerGroupHeartbeatResponseData.Assignment): Unit = {
+    if (assignment == null || assignment.topicPartitions == null) return
+    val original = assignment.topicPartitions
+    val filtered = original.stream()
+      .filter { tp =>
+        metadataCache.getTopicName(tp.topicId) match {
+          case Some(name) => !concentrationKernel.isBackingTopic(name)
+          // Fail-closed on unresolved UUID. See callsite comment for rationale.
+          case None => false
+        }
+      }
+      .collect(Collectors.toList[ConsumerGroupHeartbeatResponseData.TopicPartitions])
+    if (filtered.size != original.size) {
+      assignment.setTopicPartitions(filtered)
     }
   }
 

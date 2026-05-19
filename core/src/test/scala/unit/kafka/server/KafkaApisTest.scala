@@ -13733,6 +13733,108 @@ class KafkaApisTest extends Logging {
     verify(groupCoordinator, never()).consumerGroupHeartbeat(any[RequestContext], any[ConsumerGroupHeartbeatRequestData])
   }
 
+  // r22 BLOCKER #227 (Agent 3 Finding #3): defense-in-depth on the ASSIGNMENT response of
+  // ConsumerGroupHeartbeat. Even though #210 rejects explicit backing-name subscriptions at the
+  // request boundary, the coordinator can still derive a backing topicId via (a) regex resolution
+  // (pending #209/#169/#143) or (b) coordinator state predating the #210 deployment. Without the
+  // assignment-response filter, the consumer receives the backing UUID, resolves it on its next
+  // Fetch, and reads cross-tenant bytes.
+  @Test
+  def testConsumerGroupHeartbeatFiltersBackingTopicFromAssignment(): Unit = {
+    metadataCache = mock(classOf[KRaftMetadataCache])
+    val groupId = "group"
+    val backingTopic = "backing-r22-227"
+    val plainTopic = "plain-r22-227"
+    val backingUuid = Uuid.randomUuid()
+    val plainUuid = Uuid.randomUuid()
+
+    when(metadataCache.getTopicName(backingUuid)).thenReturn(Some(backingTopic))
+    when(metadataCache.getTopicName(plainUuid)).thenReturn(Some(plainTopic))
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+    when(concentrationKernel.isBackingTopic(plainTopic)).thenReturn(false)
+
+    val consumerGroupHeartbeatRequest = new ConsumerGroupHeartbeatRequestData().setGroupId(groupId)
+    val requestChannelRequest = buildRequest(new ConsumerGroupHeartbeatRequest.Builder(consumerGroupHeartbeatRequest).build())
+
+    val future = new CompletableFuture[ConsumerGroupHeartbeatResponseData]()
+    when(groupCoordinator.consumerGroupHeartbeat(
+      requestChannelRequest.context,
+      consumerGroupHeartbeatRequest
+    )).thenReturn(future)
+    kafkaApis = createKafkaApis(featureVersions = Seq(GroupVersion.GV_1))
+    kafkaApis.handle(requestChannelRequest, RequestLocal.noCaching)
+
+    // Coordinator returns an assignment containing BOTH a backing topicId and a plain one.
+    // The bug we're guarding is the broker forwarding the backing topicId unchanged.
+    val coordinatorResponse = new ConsumerGroupHeartbeatResponseData()
+      .setMemberId("member-227")
+      .setAssignment(new ConsumerGroupHeartbeatResponseData.Assignment()
+        .setTopicPartitions(List(
+          new ConsumerGroupHeartbeatResponseData.TopicPartitions()
+            .setTopicId(backingUuid)
+            .setPartitions(List(Integer.valueOf(0), Integer.valueOf(1)).asJava),
+          new ConsumerGroupHeartbeatResponseData.TopicPartitions()
+            .setTopicId(plainUuid)
+            .setPartitions(List(Integer.valueOf(0)).asJava)
+        ).asJava))
+    future.complete(coordinatorResponse)
+
+    val response = verifyNoThrottling[ConsumerGroupHeartbeatResponse](requestChannelRequest)
+    val returnedTopicIds = response.data.assignment.topicPartitions.asScala.map(_.topicId).toSet
+    assertFalse(returnedTopicIds.contains(backingUuid),
+      s"ConsumerGroupHeartbeat leaked backing topicId '$backingUuid' (resolves to backing topic '$backingTopic') to the consumer; returned=$returnedTopicIds")
+    assertTrue(returnedTopicIds.contains(plainUuid),
+      s"ConsumerGroupHeartbeat over-filtered: dropped legitimate topicId '$plainUuid'; returned=$returnedTopicIds")
+  }
+
+  // r22 BLOCKER #227 — fail-closed on a UUID that doesn't resolve in this broker's metadata
+  // cache. A stale-cache window cannot be used to forward a backing UUID under a None
+  // resolution, matching the share-state #171 precedent. A legit assignment dropped this way is
+  // re-issued on the next heartbeat cycle, which is the standard KIP-848 reconciliation contract.
+  @Test
+  def testConsumerGroupHeartbeatDropsUnresolvableTopicIdFromAssignment(): Unit = {
+    metadataCache = mock(classOf[KRaftMetadataCache])
+    val groupId = "group"
+    val unresolvableUuid = Uuid.randomUuid()
+    val resolvableUuid = Uuid.randomUuid()
+    val resolvableTopic = "resolvable-r22-227"
+
+    when(metadataCache.getTopicName(unresolvableUuid)).thenReturn(None)
+    when(metadataCache.getTopicName(resolvableUuid)).thenReturn(Some(resolvableTopic))
+    when(concentrationKernel.isBackingTopic(resolvableTopic)).thenReturn(false)
+
+    val consumerGroupHeartbeatRequest = new ConsumerGroupHeartbeatRequestData().setGroupId(groupId)
+    val requestChannelRequest = buildRequest(new ConsumerGroupHeartbeatRequest.Builder(consumerGroupHeartbeatRequest).build())
+
+    val future = new CompletableFuture[ConsumerGroupHeartbeatResponseData]()
+    when(groupCoordinator.consumerGroupHeartbeat(
+      requestChannelRequest.context,
+      consumerGroupHeartbeatRequest
+    )).thenReturn(future)
+    kafkaApis = createKafkaApis(featureVersions = Seq(GroupVersion.GV_1))
+    kafkaApis.handle(requestChannelRequest, RequestLocal.noCaching)
+
+    val coordinatorResponse = new ConsumerGroupHeartbeatResponseData()
+      .setMemberId("member-227b")
+      .setAssignment(new ConsumerGroupHeartbeatResponseData.Assignment()
+        .setTopicPartitions(List(
+          new ConsumerGroupHeartbeatResponseData.TopicPartitions()
+            .setTopicId(unresolvableUuid)
+            .setPartitions(List(Integer.valueOf(0)).asJava),
+          new ConsumerGroupHeartbeatResponseData.TopicPartitions()
+            .setTopicId(resolvableUuid)
+            .setPartitions(List(Integer.valueOf(0)).asJava)
+        ).asJava))
+    future.complete(coordinatorResponse)
+
+    val response = verifyNoThrottling[ConsumerGroupHeartbeatResponse](requestChannelRequest)
+    val returnedTopicIds = response.data.assignment.topicPartitions.asScala.map(_.topicId).toSet
+    assertFalse(returnedTopicIds.contains(unresolvableUuid),
+      s"ConsumerGroupHeartbeat failed open on unresolvable topicId '$unresolvableUuid' — could be used to forward a backing UUID through a stale-cache window; returned=$returnedTopicIds")
+    assertTrue(returnedTopicIds.contains(resolvableUuid),
+      s"ConsumerGroupHeartbeat over-filtered: dropped resolvable plain topicId '$resolvableUuid'; returned=$returnedTopicIds")
+  }
+
   @ParameterizedTest
   @ValueSource(booleans = Array(true, false))
   def testConsumerGroupDescribe(includeAuthorizedOperations: Boolean): Unit = {
