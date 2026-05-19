@@ -1488,7 +1488,22 @@ private[kafka] class Processor(
       // are not confused"). If start() is never called (broker shutdown between construction and
       // enableRequestProcessing), the listener's close() handles the unbind-less cleanup path.
       ioBundle.listener.foreach(_.start())
-      thread.start()
+      try {
+        thread.start()
+      } catch {
+        case t: Throwable =>
+          // thread.start() can throw OutOfMemoryError under nproc/ulimit-thread
+          // exhaustion or SecurityException under a SecurityManager. The Processor's
+          // run() never executes, so its `finally { closeAll() }` (line ~1095) cannot
+          // reclaim the LISTEN socket just bound by ioBundle.listener.start(), nor the
+          // ioBundle.selector + event-loop group constructed in the Processor ctor.
+          // The close() path's `if (!started.get) closeAll()` guard also skips cleanup
+          // because `started` was flipped to true above. Without this explicit cleanup,
+          // the LISTEN port stays bound for the JVM's lifetime on every nproc-exhausted
+          // broker start.
+          CoreUtils.swallow(closeAll(), this, Level.ERROR)
+          throw t
+      }
     }
   }
 
