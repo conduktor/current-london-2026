@@ -684,7 +684,7 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
    */
   def scheduleOngoing(scheduler: KafkaScheduler,
                       intervalMs: Long): Unit = {
-    val task: Runnable = () => {
+    val task: Runnable = () => withDrainThreadName {
       try {
         // Round-14 HIGH H-1 (compaction sub-agent): peek at the local log's
         // resolved LogConfig and emit a throttled audit WARN if cleanup.policy
@@ -737,6 +737,33 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
       }
     }
     scheduler.schedule("governance-rules-drain", task, intervalMs, intervalMs)
+  }
+
+  /**
+   * R28 #249: name the executing thread for the duration of {@code body} so that
+   * an operator capturing a JVM thread dump can distinguish a wedged drain
+   * from any other background task in the shared {@code KafkaScheduler} pool
+   * (default prefix {@code kafka-scheduler-N}).
+   *
+   * <p>The drain task is the only known path that calls {@code UnifiedLog.read},
+   * which has no timeout — if the underlying I/O wedges (NFS log dir, frozen
+   * disk, kernel page-fault stall), the task never returns. The watchdog
+   * landing in #218/#243 will surface that condition as a metric, but the
+   * operator still has to identify WHICH scheduler thread to dump. Setting a
+   * recognisable name during execution lets them grep {@code governance-drain}
+   * straight out of {@code jstack}/{@code kill -3}. The original name is
+   * restored in {@code finally} so the scheduler thread returns to its pool
+   * identity for the next task.
+   *
+   * <p>Prefix-not-replace preserves the pool index in the name, e.g.
+   * {@code governance-drain-kafka-scheduler-7}, so the operator can still
+   * correlate against scheduler metrics keyed by the pool prefix.
+   */
+  private[server] def withDrainThreadName[A](body: => A): A = {
+    val thread = Thread.currentThread()
+    val previousName = thread.getName
+    thread.setName(s"governance-drain-$previousName")
+    try body finally thread.setName(previousName)
   }
 
   /**

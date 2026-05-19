@@ -2176,4 +2176,47 @@ class BrokerGovernanceBootstrapTest {
     assertEquals(0, engine.active().size(),
       "no rule must be installed when drainStartup throws on a partial drain")
   }
+
+  // R28 #249 — drain thread is named "governance-drain-<prev>" during execution
+  // and restored on return, so operators can pick the wedged-drain thread out
+  // of a JVM thread dump rather than guess among shared KafkaScheduler workers.
+  @Test
+  def withDrainThreadNamePrefixesThreadDuringBody(): Unit = {
+    val rm = mock(classOf[ReplicaManager])
+    val boot = new BrokerGovernanceBootstrap(rm, new RuleEngine(), tp)
+
+    val captured = boot.withDrainThreadName(Thread.currentThread().getName)
+
+    assertTrue(captured.startsWith("governance-drain-"),
+      s"thread name during drain body must be prefixed with 'governance-drain-', " +
+        s"got: $captured")
+  }
+
+  @Test
+  def withDrainThreadNameRestoresOriginalNameOnReturn(): Unit = {
+    val rm = mock(classOf[ReplicaManager])
+    val boot = new BrokerGovernanceBootstrap(rm, new RuleEngine(), tp)
+
+    val before = Thread.currentThread().getName
+    boot.withDrainThreadName(())
+    val after = Thread.currentThread().getName
+
+    assertEquals(before, after,
+      "thread name must be restored to its original value after drain body returns")
+  }
+
+  @Test
+  def withDrainThreadNameRestoresOriginalNameOnException(): Unit = {
+    val rm = mock(classOf[ReplicaManager])
+    val boot = new BrokerGovernanceBootstrap(rm, new RuleEngine(), tp)
+
+    val before = Thread.currentThread().getName
+    assertThrows(classOf[RuntimeException],
+      () => boot.withDrainThreadName[Unit](throw new RuntimeException("simulated drain failure")))
+    val after = Thread.currentThread().getName
+
+    assertEquals(before, after,
+      "thread name must be restored even when drain body throws — the finally " +
+        "clause is what guarantees the scheduler thread returns to its pool identity")
+  }
 }
