@@ -3917,7 +3917,7 @@ class KafkaApis(val requestChannel: RequestChannel,
           // used to forward a backing UUID under a None resolution). A legit assignment dropped
           // on a stale-cache window will be re-issued on the next heartbeat cycle, which is the
           // standard KIP-848 reconciliation contract.
-          filterBackingTopicPartitionsFromHeartbeatAssignment(response.assignment)
+          filterBackingTopicPartitionsFromHeartbeatAssignment(response)
           requestHelper.sendMaybeThrottle(request, new ConsumerGroupHeartbeatResponse(response))
         }
       }
@@ -3925,7 +3925,8 @@ class KafkaApis(val requestChannel: RequestChannel,
   }
 
   private def filterBackingTopicPartitionsFromHeartbeatAssignment(
-      assignment: ConsumerGroupHeartbeatResponseData.Assignment): Unit = {
+      response: ConsumerGroupHeartbeatResponseData): Unit = {
+    val assignment = response.assignment
     if (assignment == null || assignment.topicPartitions == null) return
     val original = assignment.topicPartitions
     val filtered = original.stream()
@@ -3938,7 +3939,27 @@ class KafkaApis(val requestChannel: RequestChannel,
       }
       .collect(Collectors.toList[ConsumerGroupHeartbeatResponseData.TopicPartitions])
     if (filtered.size != original.size) {
-      assignment.setTopicPartitions(filtered)
+      if (filtered.isEmpty) {
+        // r23 HIGH #233: assignment-shape oracle. The schema field is
+        //   { name: "Assignment", nullableVersions: "0+", default: "null",
+        //     about: "null if not provided; the assignment otherwise." }
+        // so a null Assignment is the wire shape the coordinator emits whenever it has no new
+        // assignment to communicate. Leaving the Assignment in place with topicPartitions=[]
+        // would be wire-distinguishable from that natural shape and would tell the adversary
+        // "you were assigned at least one topic that was filtered out" — i.e., it confirms the
+        // existence of a backing tenant the member tried to subscribe to. Collapsing to null
+        // when the filter removed every entry erases that signal: the response is now
+        // indistinguishable from the coordinator's normal "no new assignment" frame.
+        //
+        // Correctness: the member never observed the pre-filter assignment, so it had nothing
+        // to revoke. Receiving a null Assignment is the standard KIP-848 "keep your current
+        // (empty-for-this-member) assignment" instruction, which is exactly the desired end
+        // state. A subsequent heartbeat will either deliver a legitimate assignment or repeat
+        // null, with no behavioural difference for an honest member.
+        response.setAssignment(null)
+      } else {
+        assignment.setTopicPartitions(filtered)
+      }
     }
   }
 
@@ -4160,7 +4181,7 @@ class KafkaApis(val requestChannel: RequestChannel,
           // matching the share-state #171 precedent — a transient stale-cache window cannot be
           // used to forward a backing UUID under a None resolution). A legit assignment dropped
           // on a stale-cache window will be re-issued on the next heartbeat cycle.
-          filterBackingTopicPartitionsFromShareGroupHeartbeatAssignment(response.assignment)
+          filterBackingTopicPartitionsFromShareGroupHeartbeatAssignment(response)
           requestHelper.sendMaybeThrottle(request, new ShareGroupHeartbeatResponse(response))
         }
       }
@@ -4168,7 +4189,8 @@ class KafkaApis(val requestChannel: RequestChannel,
   }
 
   private def filterBackingTopicPartitionsFromShareGroupHeartbeatAssignment(
-      assignment: ShareGroupHeartbeatResponseData.Assignment): Unit = {
+      response: ShareGroupHeartbeatResponseData): Unit = {
+    val assignment = response.assignment
     if (assignment == null || assignment.topicPartitions == null) return
     val original = assignment.topicPartitions
     val filtered = original.stream()
@@ -4181,7 +4203,24 @@ class KafkaApis(val requestChannel: RequestChannel,
       }
       .collect(Collectors.toList[ShareGroupHeartbeatResponseData.TopicPartitions])
     if (filtered.size != original.size) {
-      assignment.setTopicPartitions(filtered)
+      if (filtered.isEmpty) {
+        // r23 HIGH #233 (sibling of consumer-group): assignment-shape oracle. The ShareGroup
+        // schema field is { name: "Assignment", nullableVersions: "0+", default: "null",
+        // about: "null if not provided; the assignment otherwise." } — identical to the
+        // consumer-group case — so a null Assignment is the wire shape the coordinator emits
+        // when it has no new assignment to communicate. Leaving Assignment present with
+        // topicPartitions=[] after a total filter would be wire-distinguishable from that
+        // natural shape and would confirm "you tried to subscribe to at least one topic the
+        // broker is hiding from you." Collapsing to null erases that signal.
+        //
+        // Correctness mirrors the consumer-group reasoning: the share-group member never saw
+        // the pre-filter assignment, so it has nothing to release; receiving a null Assignment
+        // is the share-group reconciliation contract's "keep your current (empty-for-this-
+        // member) assignment" instruction, exactly the desired end state.
+        response.setAssignment(null)
+      } else {
+        assignment.setTopicPartitions(filtered)
+      }
     }
   }
 

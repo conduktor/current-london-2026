@@ -13887,6 +13887,53 @@ class KafkaApisTest extends Logging {
       s"ConsumerGroupHeartbeat over-filtered: dropped resolvable plain topicId '$resolvableUuid'; returned=$returnedTopicIds")
   }
 
+  // r23 HIGH #233 — assignment-shape oracle. When EVERY entry in the coordinator's assignment
+  // would be filtered out as backing-or-unresolvable, the schema-natural wire shape is a null
+  // Assignment (the schema field is nullable, default "null", "null if not provided; the
+  // assignment otherwise"). Leaving Assignment present with topicPartitions=[] is wire-
+  // distinguishable from the natural "no new assignment" shape and confirms to the adversary
+  // that they were assigned at least one topic the broker is hiding. The fix collapses the
+  // total-filter case to setAssignment(null).
+  @Test
+  def testConsumerGroupHeartbeatCollapsesAllBackingAssignmentToNull(): Unit = {
+    metadataCache = mock(classOf[KRaftMetadataCache])
+    val groupId = "group"
+    val backingTopic = "backing-r23-233"
+    val backingUuid = Uuid.randomUuid()
+
+    when(metadataCache.getTopicName(backingUuid)).thenReturn(Some(backingTopic))
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+
+    val consumerGroupHeartbeatRequest = new ConsumerGroupHeartbeatRequestData().setGroupId(groupId)
+    val requestChannelRequest = buildRequest(new ConsumerGroupHeartbeatRequest.Builder(consumerGroupHeartbeatRequest).build())
+
+    val future = new CompletableFuture[ConsumerGroupHeartbeatResponseData]()
+    when(groupCoordinator.consumerGroupHeartbeat(
+      requestChannelRequest.context,
+      consumerGroupHeartbeatRequest
+    )).thenReturn(future)
+    kafkaApis = createKafkaApis(featureVersions = Seq(GroupVersion.GV_1))
+    kafkaApis.handle(requestChannelRequest, RequestLocal.noCaching)
+
+    // Coordinator's assignment is EXCLUSIVELY backings — every entry will be filtered.
+    val coordinatorResponse = new ConsumerGroupHeartbeatResponseData()
+      .setMemberId("member-233")
+      .setAssignment(new ConsumerGroupHeartbeatResponseData.Assignment()
+        .setTopicPartitions(List(
+          new ConsumerGroupHeartbeatResponseData.TopicPartitions()
+            .setTopicId(backingUuid)
+            .setPartitions(List(Integer.valueOf(0), Integer.valueOf(1)).asJava)
+        ).asJava))
+    future.complete(coordinatorResponse)
+
+    val response = verifyNoThrottling[ConsumerGroupHeartbeatResponse](requestChannelRequest)
+    assertNull(response.data.assignment,
+      "ConsumerGroupHeartbeat must null the Assignment field when every entry was filtered as backing; "
+        + "leaving Assignment present with topicPartitions=[] is wire-distinguishable from the schema-natural "
+        + "'no new assignment' (null) shape and confirms to a colluding adversary that the member tried to "
+        + "subscribe to a backing tenant. Got: " + response.data.assignment)
+  }
+
   @ParameterizedTest
   @ValueSource(booleans = Array(true, false))
   def testConsumerGroupDescribe(includeAuthorizedOperations: Boolean): Unit = {
@@ -14695,6 +14742,51 @@ class KafkaApisTest extends Logging {
       s"ShareGroupHeartbeat failed open on unresolvable topicId '$unresolvableUuid' — could be used to forward a backing UUID through a stale-cache window; returned=$returnedTopicIds")
     assertTrue(returnedTopicIds.contains(resolvableUuid),
       s"ShareGroupHeartbeat over-filtered: dropped resolvable plain topicId '$resolvableUuid'; returned=$returnedTopicIds")
+  }
+
+  // r23 HIGH #233 sibling — share-group assignment-shape oracle. Same schema shape as the
+  // consumer-group case (Assignment is nullable, default null). Total-filter must collapse to
+  // setAssignment(null) so the wire shape is indistinguishable from the coordinator's natural
+  // "no new assignment" frame.
+  @Test
+  def testShareGroupHeartbeatCollapsesAllBackingAssignmentToNull(): Unit = {
+    metadataCache = mock(classOf[KRaftMetadataCache])
+    val groupId = "share-group"
+    val backingTopic = "backing-r23-233-share"
+    val backingUuid = Uuid.randomUuid()
+
+    when(metadataCache.getTopicName(backingUuid)).thenReturn(Some(backingTopic))
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+
+    val shareGroupHeartbeatRequest = new ShareGroupHeartbeatRequestData().setGroupId(groupId)
+    val requestChannelRequest = buildRequest(new ShareGroupHeartbeatRequest.Builder(shareGroupHeartbeatRequest, true).build())
+
+    val future = new CompletableFuture[ShareGroupHeartbeatResponseData]()
+    when(groupCoordinator.shareGroupHeartbeat(
+      requestChannelRequest.context,
+      shareGroupHeartbeatRequest
+    )).thenReturn(future)
+    kafkaApis = createKafkaApis(
+      overrideProperties = Map(ShareGroupConfig.SHARE_GROUP_ENABLE_CONFIG -> "true"),
+    )
+    kafkaApis.handle(requestChannelRequest, RequestLocal.noCaching)
+
+    val coordinatorResponse = new ShareGroupHeartbeatResponseData()
+      .setMemberId("member-233-share")
+      .setAssignment(new ShareGroupHeartbeatResponseData.Assignment()
+        .setTopicPartitions(List(
+          new ShareGroupHeartbeatResponseData.TopicPartitions()
+            .setTopicId(backingUuid)
+            .setPartitions(List(Integer.valueOf(0), Integer.valueOf(1)).asJava)
+        ).asJava))
+    future.complete(coordinatorResponse)
+
+    val response = verifyNoThrottling[ShareGroupHeartbeatResponse](requestChannelRequest)
+    assertNull(response.data.assignment,
+      "ShareGroupHeartbeat must null the Assignment field when every entry was filtered as backing; "
+        + "leaving Assignment present with topicPartitions=[] is wire-distinguishable from the schema-natural "
+        + "'no new assignment' (null) shape and confirms to a colluding adversary that the member tried to "
+        + "subscribe to a backing tenant. Got: " + response.data.assignment)
   }
 
   @Test
