@@ -798,6 +798,21 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
    * outage; a loud audit signal is the right cost-benefit trade.
    */
   private[server] def maybeWarnIfCleanupPolicyDrifted(): Unit = {
+    // R38-B-1 [MED, deferred refactor]: the detector reads via the local log
+    // (`replicaManager.getLog(...).foreach`) and silently no-ops on a broker
+    // that does not host a replica of `__governance`. This is asymmetric with
+    // `maybeWarnIfPartitionCountDrifted` which uses a metadata-image-backed
+    // probe and runs on every broker. The asymmetry is intentional today:
+    // a NonReplica broker is already loudly handled by drainOnce
+    // (`requireLocalReplica=true` aborts startup; the opt-out branch at
+    // L226-L238 logs ERROR every drain tick), and cleanup.policy drift on a
+    // replicated `__governance` (RF >= 2) is always WARN'd by every replica
+    // broker — the operator never sees a silent drift unless RF=1 AND the
+    // sole replica is down, a misconfiguration on a security-critical topic.
+    // Closing the asymmetry by switching to a `cleanupPolicyProbe` would
+    // require updating 6+ tests including the #258 getLog-call-capture test,
+    // disproportionate to the marginal coverage gain. Pinned by
+    // `maybeWarnIfCleanupPolicyDriftedIsNoOpWhenLogIsAbsent`.
     replicaManager.getLog(topicPartition).foreach { log =>
       val cfg = log.config
       // Exact-match {compact}: compaction enabled AND delete disabled. The
