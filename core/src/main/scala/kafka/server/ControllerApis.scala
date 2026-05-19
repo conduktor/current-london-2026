@@ -573,15 +573,31 @@ class ControllerApis(
     val context = new ControllerRequestContext(request.context.header.data, request.context.principal, OptionalLong.empty())
     val duplicateResources = new util.HashSet[ConfigResource]
     val configChanges = new util.HashMap[ConfigResource, util.Map[String, String]]()
+    // Outside-in defence: refuse foreign-tenant TOPIC and GROUP resource names
+    // BEFORE they enter `configChanges` and reach the controller. A direct
+    // `bootstrap.controllers` admin (KIP-590) reaches this handler without
+    // traversing KafkaApis, so the broker-side TOPIC scrub does not run; the
+    // GROUP type is unscrubbed even on the broker, so the controller is the
+    // sole chokepoint. Same pattern as #117 / #123-#125.
+    val callerTenant = callerTenantFromPrincipal(request.context.principal.getName)
     alterConfigsRequest.data.resources.forEach { resource =>
       val configResource = new ConfigResource(
         ConfigResource.Type.forId(resource.resourceType), resource.resourceName())
+      val foreignTenantRefusal = foreignTenantConfigRefusal(configResource, callerTenant)
       if (configResource.`type`().equals(ConfigResource.Type.UNKNOWN)) {
         response.responses().add(new OldAlterConfigsResourceResponse().
           setErrorCode(UNSUPPORTED_VERSION.code()).
           setErrorMessage("Unknown resource type " + resource.resourceType() + ".").
           setResourceName(resource.resourceName()).
           setResourceType(resource.resourceType()))
+      } else if (foreignTenantRefusal.isDefined) {
+        val (errorCode, errorMessage) = foreignTenantRefusal.get
+        response.responses().add(new OldAlterConfigsResourceResponse().
+          setErrorCode(errorCode).
+          setErrorMessage(errorMessage).
+          setResourceName(resource.resourceName()).
+          setResourceType(resource.resourceType()))
+        duplicateResources.add(configResource)
       } else if (!duplicateResources.contains(configResource)) {
         val configs = new util.HashMap[String, String]()
         resource.configs().forEach(config => configs.put(config.name(), config.value()))
@@ -609,21 +625,31 @@ class ControllerApis(
         iterator.remove()
       }
     }
-    controller.legacyAlterConfigs(context, configChanges, alterConfigsRequest.data.validateOnly)
-      .handle[Unit] { (controllerResults, exception) =>
-        if (exception != null) {
-          requestHelper.handleError(request, exception)
-        } else {
-          controllerResults.forEach((key, value) => response.responses().add(
-            new OldAlterConfigsResourceResponse().
-              setErrorCode(value.error().code()).
-              setErrorMessage(value.message()).
-              setResourceName(key.name()).
-              setResourceType(key.`type`().id())))
-          requestHelper.sendResponseMaybeThrottle(request, throttleMs =>
-            new AlterConfigsResponse(response.setThrottleTimeMs(throttleMs)))
-        }
+    val legacyControllerFuture =
+      if (configChanges.isEmpty) {
+        // Every resource was refused upstream (UNKNOWN, duplicate, foreign
+        // tenant, authz). Skip the controller round-trip entirely so no
+        // metadata write is attempted — preserves the per-resource response
+        // envelope built above.
+        CompletableFuture.completedFuture(
+          java.util.Collections.emptyMap[ConfigResource, ApiError]())
+      } else {
+        controller.legacyAlterConfigs(context, configChanges, alterConfigsRequest.data.validateOnly)
       }
+    legacyControllerFuture.handle[Unit] { (controllerResults, exception) =>
+      if (exception != null) {
+        requestHelper.handleError(request, exception)
+      } else {
+        controllerResults.forEach((key, value) => response.responses().add(
+          new OldAlterConfigsResourceResponse().
+            setErrorCode(value.error().code()).
+            setErrorMessage(value.message()).
+            setResourceName(key.name()).
+            setResourceType(key.`type`().id())))
+        requestHelper.sendResponseMaybeThrottle(request, throttleMs =>
+          new AlterConfigsResponse(response.setThrottleTimeMs(throttleMs)))
+      }
+    }
   }
 
   def handleVote(request: RequestChannel.Request): CompletableFuture[Unit] = {
@@ -846,9 +872,14 @@ class ControllerApis(
     val configChanges = new util.HashMap[ConfigResource,
       util.Map[String, Entry[AlterConfigOp.OpType, String]]]()
     val brokerLoggerResponses = new util.ArrayList[AlterConfigsResourceResponse](1)
+    // Outside-in defence: refuse foreign-tenant TOPIC and GROUP resource names
+    // BEFORE they enter `configChanges` and reach the controller. See the
+    // legacy handler above for the full rationale.
+    val callerTenant = callerTenantFromPrincipal(request.context.principal.getName)
     alterConfigsRequest.data.resources.forEach { resource =>
       val configResource = new ConfigResource(
         ConfigResource.Type.forId(resource.resourceType), resource.resourceName())
+      val foreignTenantRefusal = foreignTenantConfigRefusal(configResource, callerTenant)
       if (configResource.`type`().equals(ConfigResource.Type.BROKER_LOGGER)) {
         val apiError = try {
           runtimeLoggerManager.applyChangesForResource(
@@ -870,6 +901,14 @@ class ControllerApis(
           setErrorMessage("Unknown resource type " + resource.resourceType() + ".").
           setResourceName(resource.resourceName()).
           setResourceType(resource.resourceType()))
+      } else if (foreignTenantRefusal.isDefined) {
+        val (errorCode, errorMessage) = foreignTenantRefusal.get
+        response.responses().add(new AlterConfigsResourceResponse().
+          setErrorCode(errorCode).
+          setErrorMessage(errorMessage).
+          setResourceName(resource.resourceName()).
+          setResourceType(resource.resourceType()))
+        duplicateResources.add(configResource)
       } else if (!duplicateResources.contains(configResource)) {
         val altersByName = new util.HashMap[String, Entry[AlterConfigOp.OpType, String]]()
         resource.configs.forEach { config =>
@@ -900,22 +939,32 @@ class ControllerApis(
         iterator.remove()
       }
     }
-    controller.incrementalAlterConfigs(context, configChanges, alterConfigsRequest.data.validateOnly)
-      .handle[Unit] { (controllerResults, exception) =>
-        if (exception != null) {
-          requestHelper.handleError(request, exception)
-        } else {
-          controllerResults.forEach((key, value) => response.responses().add(
-            new AlterConfigsResourceResponse().
-              setErrorCode(value.error().code()).
-              setErrorMessage(value.message()).
-              setResourceName(key.name()).
-              setResourceType(key.`type`().id())))
-          brokerLoggerResponses.forEach(r => response.responses().add(r))
-          requestHelper.sendResponseMaybeThrottle(request, throttleMs =>
-            new IncrementalAlterConfigsResponse(response.setThrottleTimeMs(throttleMs)))
-        }
+    val incrementalControllerFuture =
+      if (configChanges.isEmpty) {
+        // Every resource was refused upstream (BROKER_LOGGER handled inline,
+        // UNKNOWN, duplicate, foreign tenant, authz). Skip the controller
+        // round-trip so no metadata write is attempted; brokerLoggerResponses
+        // are still appended below.
+        CompletableFuture.completedFuture(
+          java.util.Collections.emptyMap[ConfigResource, ApiError]())
+      } else {
+        controller.incrementalAlterConfigs(context, configChanges, alterConfigsRequest.data.validateOnly)
       }
+    incrementalControllerFuture.handle[Unit] { (controllerResults, exception) =>
+      if (exception != null) {
+        requestHelper.handleError(request, exception)
+      } else {
+        controllerResults.forEach((key, value) => response.responses().add(
+          new AlterConfigsResourceResponse().
+            setErrorCode(value.error().code()).
+            setErrorMessage(value.message()).
+            setResourceName(key.name()).
+            setResourceType(key.`type`().id())))
+        brokerLoggerResponses.forEach(r => response.responses().add(r))
+        requestHelper.sendResponseMaybeThrottle(request, throttleMs =>
+          new IncrementalAlterConfigsResponse(response.setThrottleTimeMs(throttleMs)))
+      }
+    }
   }
 
   private def handleCreatePartitions(request: RequestChannel.Request): CompletableFuture[Unit] = {
@@ -1219,6 +1268,42 @@ class ControllerApis(
     // to treat any tenant-namespaced topic as foreign — closing #103.
     if (dot == afterPrefix.length - 1) return None
     Some(afterPrefix.substring(0, dot))
+  }
+
+  // For AlterConfigs / IncrementalAlterConfigs on the controller listener.
+  // Returns `Some((errorCode, errorMessage))` when the resource lies in a
+  // foreign tenant's namespace, or `None` when the resource is acceptable for
+  // this caller.
+  //
+  // TOPIC names are <id>.<rest>; GROUP ids are __tenant_<id>.<rest>
+  // (TenantNamespace.groupToPhysical uses the principal-prefix form so groups
+  // and topics cannot collide in __consumer_offsets). The two checks are
+  // therefore SEPARATE: `isForeignTenantNamespace` for TOPIC,
+  // `isReservedTenantPrincipalNamespace` (+ caller-tenant carve-out) for
+  // GROUP.
+  //
+  // Error semantics:
+  //  - TOPIC → INVALID_TOPIC_EXCEPTION with the echoed name (the topic name
+  //    is public via Metadata; nothing to hide).
+  //  - GROUP → GROUP_AUTHORIZATION_FAILED with NULL errorMessage. The
+  //    physical group id `__tenant_<id>.<rest>` would otherwise serve as a
+  //    presence oracle for that tenant's consumer groups.
+  //  - BROKER, BROKER_LOGGER, CLIENT_METRICS → no tenant scrub needed (they
+  //    are not in any tenant namespace).
+  private def foreignTenantConfigRefusal(
+      resource: ConfigResource,
+      callerTenant: Option[String]): Option[(Short, String)] = {
+    resource.`type`() match {
+      case ConfigResource.Type.TOPIC if isForeignTenantNamespace(resource.name(), callerTenant) =>
+        Some((INVALID_TOPIC_EXCEPTION.code,
+          s"Topic name '${resource.name()}' is reserved (tenant namespace prefix)"))
+      case ConfigResource.Type.GROUP if isReservedTenantPrincipalNamespace(resource.name()) =>
+        val callerOwned = callerTenant.exists(t =>
+          resource.name().startsWith(TenantNamespace.PRINCIPAL_PREFIX + t + "."))
+        if (callerOwned) None
+        else Some((GROUP_AUTHORIZATION_FAILED.code, null))
+      case _ => None
+    }
   }
 
   private[server] def handleCreateDelegationTokenRequest(request: RequestChannel.Request): CompletableFuture[Unit] = {

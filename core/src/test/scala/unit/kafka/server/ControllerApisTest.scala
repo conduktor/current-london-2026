@@ -2886,6 +2886,201 @@ class ControllerApisTest {
       "tenant user must come back with CLUSTER_AUTHORIZATION_FAILED")
   }
 
+  // ---------------------------------------------------------------------------
+  // #126 / F1 — handleIncrementalAlterConfigs + handleLegacyAlterConfigs on
+  // ControllerApis pre-scrub TOPIC and GROUP resource names. A privileged
+  // caller hitting the controller listener via `bootstrap.controllers`
+  // (KIP-590) skips every broker-side scrub (KafkaApis.scala:4039 / 4094),
+  // and the GROUP type is unscrubbed even on the broker, so the controller is
+  // the sole chokepoint. The scrub:
+  //   - TOPIC: refuse `<tenantId>.<rest>` shape unless caller is in tenant
+  //     `<tenantId>`. Error code INVALID_TOPIC_EXCEPTION, echoed name (the
+  //     name is public via Metadata anyway).
+  //   - GROUP: refuse `__tenant_<tenantId>.<rest>` shape unless caller is in
+  //     tenant `<tenantId>`. Error code GROUP_AUTHORIZATION_FAILED with NULL
+  //     errorMessage — leaking the physical group id back would be a presence
+  //     oracle for that tenant's consumer groups.
+  // ---------------------------------------------------------------------------
+
+  private def incrementalResource(resourceType: ConfigResource.Type, name: String): AlterConfigsResource = {
+    new AlterConfigsResource()
+      .setResourceName(name)
+      .setResourceType(resourceType.id())
+      .setConfigs(new AlterableConfigCollection(util.Arrays.asList(
+        new AlterableConfig().setName("retention.ms").setValue("60000")
+          .setConfigOperation(AlterConfigOp.OpType.SET.id())).iterator()))
+  }
+
+  private def legacyResource(resourceType: ConfigResource.Type, name: String): OldAlterConfigsResource = {
+    new OldAlterConfigsResource()
+      .setResourceName(name)
+      .setResourceType(resourceType.id())
+      .setConfigs(new OldAlterableConfigCollection(util.Arrays.asList(
+        new OldAlterableConfig().setName("retention.ms").setValue("60000")).iterator()))
+  }
+
+  @Test
+  def testControllerIncrementalAlterConfigsRefusesForeignTenantTopicFromClusterWideCaller(): Unit = {
+    val controller = mock(classOf[Controller])
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.empty())
+
+    val requestData = new IncrementalAlterConfigsRequestData().setResources(
+      new AlterConfigsResourceCollection(util.Arrays.asList(
+        incrementalResource(ConfigResource.Type.TOPIC, "acme.orders")).iterator()))
+    val req = buildTokenRequest(
+      new IncrementalAlterConfigsRequest.Builder(requestData).build(0),
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    controllerApis.handleIncrementalAlterConfigs(req)
+
+    // Controller must NEVER see the foreign-tenant TOPIC. If it did, the
+    // metadata write layer would persist the topic-config record verbatim.
+    verify(controller, never()).incrementalAlterConfigs(
+      any(classOf[ControllerRequestContext]), any(), anyBoolean())
+
+    val response = captureSentResponse(req).asInstanceOf[IncrementalAlterConfigsResponse]
+    val r = response.data().responses().asScala.head
+    assertEquals(INVALID_TOPIC_EXCEPTION.code(), r.errorCode(),
+      "cluster-wide caller must be refused for a tenant-prefixed TOPIC resource")
+    assertEquals("acme.orders", r.resourceName())
+  }
+
+  @Test
+  def testControllerIncrementalAlterConfigsRefusesForeignTenantGroupFromClusterWideCaller(): Unit = {
+    val controller = mock(classOf[Controller])
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.empty())
+
+    val requestData = new IncrementalAlterConfigsRequestData().setResources(
+      new AlterConfigsResourceCollection(util.Arrays.asList(
+        incrementalResource(ConfigResource.Type.GROUP, "__tenant_acme.alice-group")).iterator()))
+    val req = buildTokenRequest(
+      new IncrementalAlterConfigsRequest.Builder(requestData).build(0),
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    controllerApis.handleIncrementalAlterConfigs(req)
+
+    verify(controller, never()).incrementalAlterConfigs(
+      any(classOf[ControllerRequestContext]), any(), anyBoolean())
+
+    val response = captureSentResponse(req).asInstanceOf[IncrementalAlterConfigsResponse]
+    val r = response.data().responses().asScala.head
+    assertEquals(GROUP_AUTHORIZATION_FAILED.code(), r.errorCode(),
+      "cluster-wide caller must be refused for a tenant-prefixed GROUP resource")
+    assertTrue(r.errorMessage() == null || r.errorMessage().isEmpty,
+      "error message must not echo the physical tenant group id back to the caller (presence oracle)")
+  }
+
+  @Test
+  def testControllerIncrementalAlterConfigsAllowsSameTenantGroupFromTenantCaller(): Unit = {
+    val controller = mock(classOf[Controller])
+    // Stub controller to acknowledge the legitimately-tenant-owned entry.
+    when(controller.incrementalAlterConfigs(
+      any(classOf[ControllerRequestContext]), any(), anyBoolean()))
+      .thenReturn(CompletableFuture.completedFuture(
+        java.util.Collections.singletonMap(
+          new ConfigResource(ConfigResource.Type.GROUP, "__tenant_acme.bob-group"),
+          ApiError.NONE)))
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.empty())
+
+    val requestData = new IncrementalAlterConfigsRequestData().setResources(
+      new AlterConfigsResourceCollection(util.Arrays.asList(
+        incrementalResource(ConfigResource.Type.GROUP, "__tenant_acme.bob-group")).iterator()))
+    val req = buildTokenRequest(
+      new IncrementalAlterConfigsRequest.Builder(requestData).build(0),
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_acme.alice"))
+
+    controllerApis.handleIncrementalAlterConfigs(req)
+
+    verify(controller).incrementalAlterConfigs(
+      any(classOf[ControllerRequestContext]), any(), anyBoolean())
+    val response = captureSentResponse(req).asInstanceOf[IncrementalAlterConfigsResponse]
+    val r = response.data().responses().asScala.head
+    assertEquals(NONE.code(), r.errorCode(),
+      "a forwarded tenant principal may tune configs for groups in its own namespace")
+  }
+
+  @Test
+  def testControllerIncrementalAlterConfigsMixedBatchSplitsRefusedAndAccepted(): Unit = {
+    val controller = mock(classOf[Controller])
+    val clusterResource = new ConfigResource(ConfigResource.Type.GROUP, "regular-cluster-group")
+    // Controller will only see the cluster-namespaced entry; the tenant
+    // entries (TOPIC + GROUP) are refused upstream and never forwarded.
+    when(controller.incrementalAlterConfigs(
+      any(classOf[ControllerRequestContext]), any(), anyBoolean()))
+      .thenReturn(CompletableFuture.completedFuture(
+        java.util.Collections.singletonMap(clusterResource, ApiError.NONE)))
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.empty())
+
+    val requestData = new IncrementalAlterConfigsRequestData().setResources(
+      new AlterConfigsResourceCollection(util.Arrays.asList(
+        incrementalResource(ConfigResource.Type.GROUP, "regular-cluster-group"),
+        incrementalResource(ConfigResource.Type.TOPIC, "acme.orders"),
+        incrementalResource(ConfigResource.Type.GROUP, "__tenant_acme.alice-group")
+      ).iterator()))
+    val req = buildTokenRequest(
+      new IncrementalAlterConfigsRequest.Builder(requestData).build(0),
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    controllerApis.handleIncrementalAlterConfigs(req)
+
+    // Verify only the cluster-namespaced GROUP reached the controller.
+    val forwarded: ArgumentCaptor[util.Map[ConfigResource, util.Map[String, java.util.Map.Entry[AlterConfigOp.OpType, String]]]] =
+      ArgumentCaptor.forClass(classOf[util.Map[ConfigResource, util.Map[String, java.util.Map.Entry[AlterConfigOp.OpType, String]]]])
+    verify(controller).incrementalAlterConfigs(
+      any(classOf[ControllerRequestContext]), forwarded.capture(), anyBoolean())
+    assertEquals(Set(clusterResource), forwarded.getValue.keySet().asScala.toSet,
+      "only the cluster-namespaced GROUP must reach the controller")
+
+    val response = captureSentResponse(req).asInstanceOf[IncrementalAlterConfigsResponse]
+    val byName: Map[String, Short] = response.data().responses().asScala
+      .map(r => r.resourceName() -> r.errorCode()).toMap
+    assertEquals(NONE.code(), byName("regular-cluster-group"),
+      "cluster group must round-trip with NONE")
+    assertEquals(INVALID_TOPIC_EXCEPTION.code(), byName("acme.orders"),
+      "tenant TOPIC must come back with INVALID_TOPIC_EXCEPTION")
+    assertEquals(GROUP_AUTHORIZATION_FAILED.code(), byName("__tenant_acme.alice-group"),
+      "tenant GROUP must come back with GROUP_AUTHORIZATION_FAILED")
+  }
+
+  @Test
+  def testControllerLegacyAlterConfigsRefusesForeignTenantTopicFromClusterWideCaller(): Unit = {
+    val controller = mock(classOf[Controller])
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.empty())
+
+    val requestData = new AlterConfigsRequestData().setResources(
+      new OldAlterConfigsResourceCollection(util.Arrays.asList(
+        legacyResource(ConfigResource.Type.TOPIC, "acme.orders")).iterator()))
+    val req = buildTokenRequest(
+      new AlterConfigsRequest(requestData, 0),
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    controllerApis.handleLegacyAlterConfigs(req)
+
+    verify(controller, never()).legacyAlterConfigs(
+      any(classOf[ControllerRequestContext]), any(), anyBoolean())
+
+    val response = captureSentResponse(req).asInstanceOf[AlterConfigsResponse]
+    val r = response.data().responses().asScala.head
+    assertEquals(INVALID_TOPIC_EXCEPTION.code(), r.errorCode(),
+      "legacy handler must also refuse a tenant-prefixed TOPIC from a cluster-wide caller")
+    assertEquals("acme.orders", r.resourceName())
+  }
+
   @AfterEach
   def tearDown(): Unit = {
     quotasNeverThrottleControllerMutations.shutdown()
