@@ -172,7 +172,19 @@ class KafkaApiRequestSubmitter(
       .setTimeoutMs(produceTimeoutMs)
       .setTopicData(topicCollection)
 
-    ProduceRequest.builder(data).build()
+    // Pin the request version to the latest STABLE version. ProduceRequest.builder(data) delegates to
+    // ApiKeys.PRODUCE.latestVersion() (the no-arg form), which calls highestSupportedVersion(true) and so
+    // enables any in-development version flagged latestVersionUnstable in ProduceRequest.json. Binary
+    // clients never see those versions in ApiVersionsResponse (which is gated on the stable ceiling), so
+    // letting HTTP-originated requests exercise them creates a canary risk: the bridge would silently
+    // run the broker at protocol versions no shipped client speaks, masking divergence and amplifying
+    // the blast radius of any in-development breakage. No-op at the current schema (Produce 3-12, no
+    // unstable marker) but defensive against the next schema bump that adds one.
+    new ProduceRequest.Builder(
+      ApiKeys.PRODUCE.oldestVersion(),
+      ApiKeys.PRODUCE.latestVersion(false),
+      data
+    ).build()
   }
 
   private def toSimpleRecord(entry: ProduceRequestParser.RecordEntry): SimpleRecord = {
@@ -200,8 +212,14 @@ class KafkaApiRequestSubmitter(
     val toFetch = new util.LinkedHashMap[TopicPartition, FetchRequest.PartitionData]()
     toFetch.put(new TopicPartition(command.topic(), command.partition()), partitionData)
 
+    // Pin to the latest STABLE Fetch version. The no-arg ApiKeys.FETCH.latestVersion() returns
+    // highestSupportedVersion(true), which includes any in-development version flagged
+    // latestVersionUnstable in FetchRequest.json. Binary consumers never negotiate such a version
+    // through ApiVersionsResponse (stable-gated), so allowing HTTP-originated fetches to use one
+    // would let the bridge exercise broker behaviour no shipped client speaks. Same canary-risk
+    // mitigation as the Produce branch above; no-op today (Fetch 4-17 has no unstable marker).
     FetchRequest.Builder
-      .forConsumer(ApiKeys.FETCH.latestVersion(), fetchMaxWaitMs, fetchMinBytes, toFetch)
+      .forConsumer(ApiKeys.FETCH.latestVersion(false), fetchMaxWaitMs, fetchMinBytes, toFetch)
       .setMaxBytes(fetchResponseMaxBytes)
       .build()
   }
@@ -324,6 +342,16 @@ class KafkaApiRequestSubmitter(
     val context = new RequestContext(
       parsedHeader,
       KafkaApiRequestSubmitter.ConnectionId,
+      // clientAddress is deliberately the loopback address, NOT the HTTP caller's real peer IP. The bridge's
+      // v1 security model (BrokerServer.scala "WARNING — security posture") attributes every HTTP-originated
+      // request to a single synthetic identity — ANONYMOUS principal at the bridge's local boundary —
+      // because there is no per-request authentication. The trust boundary is "host can reach
+      // http.bridge.port", not "the real peer IP at the broker authorizer". Surfacing the real remote IP
+      // here would create the illusion of per-request distinguishability (e.g. let host-based ACLs
+      // discriminate between bridge callers) that the v1 operator guidance explicitly tells operators not
+      // to rely on; the documented ACL posture is topic-scoped, not host-scoped. The synthetic loopback
+      // address is also what the broker logs as the request peer — that's accurate to the v1 design:
+      // the bridge IS the peer, every caller is the same logical principal at the same physical interface.
       InetAddress.getLoopbackAddress,
       Optional.empty(),
       principal,

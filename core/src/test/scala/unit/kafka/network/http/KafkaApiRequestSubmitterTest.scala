@@ -27,7 +27,7 @@ import org.apache.kafka.common.message.FetchResponseData.{FetchableTopicResponse
 import org.apache.kafka.common.header.Header
 import org.apache.kafka.common.network.ListenerName
 import org.apache.kafka.common.message.ApiMessageType
-import org.apache.kafka.common.protocol.Errors
+import org.apache.kafka.common.protocol.{ApiKeys, Errors}
 import org.apache.kafka.common.record.{MemoryRecords, SimpleRecord}
 import org.apache.kafka.common.requests.{AbstractRequest, AbstractResponse, FetchResponse, ProduceRequest, ProduceResponse}
 import org.apache.kafka.common.security.auth.{KafkaPrincipal, SecurityProtocol}
@@ -179,6 +179,35 @@ class KafkaApiRequestSubmitterTest {
     assertEquals(42L, partitionData.fetchOffset)
     assertEquals(2048, partitionData.maxBytes)
     assertEquals(topicId, partitionData.topicId, "resolved topic id must be threaded into the request")
+  }
+
+  @Test
+  def builtRequestsPinToTheStableApiVersionSoTheBridgeNeverExercisesUnstableProtocols(): Unit = {
+    // Binary consumers/producers negotiate API versions through ApiVersionsResponse, which is gated on the
+    // STABLE ceiling (highestSupportedVersion(false)) — no shipped client speaks a latestVersionUnstable
+    // version. The HTTP/WS/SSE bridge synthesises produce and fetch requests directly through
+    // KafkaApiRequestSubmitter and therefore would, if it used the no-arg latestVersion() (which delegates
+    // to highestSupportedVersion(true) and includes unstable), let HTTP-originated traffic run the broker
+    // at protocol versions no binary client speaks. That widens the blast radius of any in-development
+    // protocol change and breaks the parity-with-binary-clients posture the bridge documents. Pin both
+    // built requests to ApiKeys.{PRODUCE,FETCH}.latestVersion(false).
+    //
+    // No-op at the current schema (Produce 3-12 and Fetch 4-17 carry no latestVersionUnstable marker, so
+    // latestVersion() == latestVersion(false) today). The test exists to fail loudly the next time a
+    // schema bump flags an unstable version and someone reverts the pin without thinking through this.
+    val submitter = newSubmitter()
+
+    val produceCmd = new ProduceRequestParser.ProduceCommand(topic, util.List.of(
+      newRecord(0, "k", "v")
+    ))
+    val produceRequest = submitter.buildProduceRequest(produceCmd)
+    assertEquals(ApiKeys.PRODUCE.latestVersion(false), produceRequest.version(),
+      "ProduceRequest version must be the latest STABLE version — never an unstable in-development version")
+
+    val fetchCmd = new FetchRequestParser.FetchCommand(topic, 0, 0L, OptionalInt.empty())
+    val fetchRequest = submitter.buildFetchRequest(fetchCmd)
+    assertEquals(ApiKeys.FETCH.latestVersion(false), fetchRequest.version(),
+      "FetchRequest version must be the latest STABLE version — never an unstable in-development version")
   }
 
   @Test
