@@ -2256,6 +2256,8 @@ public class RuleEngineTest {
 
         int[] invisibleFormat = new int[] {
             0x00AD,         // SOFT HYPHEN
+            0x2060,         // WORD JOINER (R33 #290 — was the
+                            //              off-by-one gap below)
             0x2061,         // FUNCTION APPLICATION
             0x2062,         // INVISIBLE TIMES
             0x2063,         // INVISIBLE SEPARATOR
@@ -2305,6 +2307,97 @@ public class RuleEngineTest {
                 && braille.getMessage().contains("principal name"),
             "braille-blank diagnostic must name codepoint, helper label, "
                 + "and slot; got: " + braille.getMessage());
+    }
+
+    @Test
+    public void parseBypassPrincipalsRejectsWordJoinerAtEverySlot() {
+        // R33 #290 [HIGH] — regression-named arm for the 13th bypass shape.
+        // U+2060 WORD JOINER (Cf, Default_Ignorable_Code_Point) is the
+        // off-by-one neighbour of the (U+2061..U+2064) invisible-math
+        // family. Auto-inserted by Markdown renderers around technical
+        // strings (chat clients, wikis, docs sites) to prevent unwanted
+        // line breaks. The codec already catches U+2060 via the
+        // Character.FORMAT umbrella AND an explicit `case '⁠'` arm in
+        // RuleJsonCodec.isForbiddenIdCodepoint; this parser was the
+        // last remaining path with the gap.
+        //
+        // This test exercises every slot a paste-from-renderer hazard
+        // would land in: leading, internal, trailing, AND mid-type. The
+        // standalone helper-label assertion guards against a regex-typo
+        // refactor that silently shrinks the (U+2060..U+2064) range back
+        // to (U+2061..U+2064).
+        String wj = new String(Character.toChars(0x2060));
+
+        // Slot 1: trailing of name (most-likely paste shape — renderer
+        // inserts WJ around the end of the technical token).
+        IllegalArgumentException trailing = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals("User:broker" + wj),
+                "trailing U+2060 in name must abort startup");
+        assertTrue(trailing.getMessage().contains("U+2060")
+                && trailing.getMessage().toLowerCase().contains("invisible format")
+                && trailing.getMessage().contains("principal name"),
+            "trailing-WJ diagnostic must name codepoint, helper label, "
+                + "and slot; got: " + trailing.getMessage());
+
+        // Slot 2: leading of name.
+        IllegalArgumentException leading = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals("User:" + wj + "broker"),
+                "leading U+2060 in name must abort startup");
+        assertTrue(leading.getMessage().contains("U+2060")
+                && leading.getMessage().toLowerCase().contains("invisible format")
+                && leading.getMessage().contains("principal name"),
+            "leading-WJ diagnostic must name codepoint, helper label, "
+                + "and slot; got: " + leading.getMessage());
+
+        // Slot 3: internal of name.
+        IllegalArgumentException internal = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals("User:bro" + wj + "ker"),
+                "internal U+2060 in name must abort startup");
+        assertTrue(internal.getMessage().contains("U+2060")
+                && internal.getMessage().toLowerCase().contains("invisible format")
+                && internal.getMessage().contains("principal name"),
+            "internal-WJ diagnostic must name codepoint, helper label, "
+                + "and slot; got: " + internal.getMessage());
+
+        // Slot 4: mid-type — same hazard class as R32 #287's
+        // case-mismatch coverage but via codepoint smuggling. The
+        // diagnostic-slot label is "principal type" here.
+        IllegalArgumentException midType = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals("Us" + wj + "er:broker"),
+                "mid-type U+2060 must abort startup");
+        assertTrue(midType.getMessage().contains("U+2060")
+                && midType.getMessage().toLowerCase().contains("invisible format")
+                && midType.getMessage().contains("principal type"),
+            "mid-type-WJ diagnostic must name codepoint, helper label, "
+                + "and slot; got: " + midType.getMessage());
+
+        // Coverage-floor sweep: the entire contiguous invisible-math
+        // family (U+2060..U+2064) must reject with the SAME helper
+        // label. Without this, a future refactor that shrinks the
+        // range back (e.g. `(cp >= 0x2061 && cp <= 0x2064)`) goes
+        // unnoticed because each codepoint also has scattered prose
+        // coverage elsewhere. Pin contiguity here.
+        for (int cp = 0x2060; cp <= 0x2064; cp++) {
+            String s = new String(Character.toChars(cp));
+            int cpf = cp;
+            IllegalArgumentException ex = org.junit.jupiter.api.Assertions
+                .assertThrows(IllegalArgumentException.class,
+                    () -> RuleEngine.parseBypassPrincipals(
+                        "User:bro" + s + "ker"),
+                    "U+" + String.format("%04X", cpf)
+                        + " must reject (invisible-math family floor)");
+            assertTrue(ex.getMessage().contains(String.format("U+%04X", cpf))
+                    && ex.getMessage().toLowerCase()
+                            .contains("invisible format"),
+                "invisible-math family-floor diagnostic for U+"
+                    + String.format("%04X", cpf)
+                    + " must name codepoint and helper label; got: "
+                    + ex.getMessage());
+        }
     }
 
     @Test

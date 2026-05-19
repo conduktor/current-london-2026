@@ -1026,9 +1026,13 @@ public final class RuleEngine {
                     || (cp >= 0x180B && cp <= 0x180E)) {
                 return String.format("invisible mark U+%04X", cp);
             }
-            // R31 #281 [HIGH] / closes R23 #223: format characters that the
-            // Unicode standard requires renderers to suppress.
+            // R31 #281 [HIGH] / R33 #290 [HIGH] / closes R23 #223: format
+            // characters that the Unicode standard requires renderers to
+            // suppress.
             //   U+00AD  SOFT HYPHEN
+            //   U+2060  WORD JOINER                  (R33 #290 — was the
+            //                                        off-by-one neighbour
+            //                                        of the family below)
             //   U+2061  FUNCTION APPLICATION
             //   U+2062  INVISIBLE TIMES
             //   U+2063  INVISIBLE SEPARATOR
@@ -1037,8 +1041,22 @@ public final class RuleEngine {
             //   U+FFFA  INTERLINEAR ANNOTATION SEPARATOR
             //   U+FFFB  INTERLINEAR ANNOTATION TERMINATOR
             //   U+FFFC  OBJECT REPLACEMENT CHARACTER
+            //
+            // R33 #290 [HIGH]: U+2060 WORD JOINER (Cf, Default_Ignorable)
+            // sits immediately below U+2061 in the same Unicode "invisible
+            // math/format" family. Auto-inserted by many Markdown
+            // renderers (chat clients, wikis, docs sites) around technical
+            // strings to prevent unwanted line breaks. An operator pasting
+            // `User:broker⁠` would store the verbatim form while the
+            // runtime peer's principal is `User:broker` — silent
+            // fail-CLOSED soft-brick, identical impact class to
+            // R29-R32 #270/#272/#278/#280/#281/#284/#287/#282. The codec
+            // (RuleJsonCodec.isForbiddenIdCodepoint) already catches it
+            // both via the `Character.FORMAT` umbrella AND an explicit
+            // `case '⁠'` arm — this parser was the only remaining
+            // path with the gap.
             if (cp == 0x00AD
-                    || (cp >= 0x2061 && cp <= 0x2064)
+                    || (cp >= 0x2060 && cp <= 0x2064)
                     || (cp >= 0xFFF9 && cp <= 0xFFFC)) {
                 return String.format("invisible format U+%04X", cp);
             }
