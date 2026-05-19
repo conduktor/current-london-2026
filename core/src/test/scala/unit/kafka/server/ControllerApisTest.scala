@@ -3082,6 +3082,146 @@ class ControllerApisTest {
   }
 
   // ---------------------------------------------------------------------------
+  // #70: DescribeConfigs on the controller listener is the SOLE chokepoint
+  // against the `bootstrap.controllers` (KIP-590) bypass: a cluster-wide Admin
+  // talking directly to the controller skips the broker-side KafkaApis scrub
+  // and could ask for `acme.orders` (TOPIC) or `__tenant_acme.alice-group`
+  // (GROUP). Without a controller-side scrub the response carries:
+  //   - for a tenant topic that exists, the full topic config (retention.ms,
+  //     segment.bytes, cleanup.policy, ...) — full disclosure;
+  //   - for a tenant topic that does not exist, UNKNOWN_TOPIC_OR_PARTITION
+  //     (whereas a refused entry would carry TOPIC_AUTHORIZATION_FAILED) —
+  //     existence oracle.
+  // Same-tenant carve-out: a forwarded `__tenant_acme.alice` principal must
+  // still be able to read configs of resources in its own namespace.
+  // ---------------------------------------------------------------------------
+
+  private def describeConfigsResource(rt: ConfigResource.Type, name: String): DescribeConfigsRequestData.DescribeConfigsResource = {
+    new DescribeConfigsRequestData.DescribeConfigsResource()
+      .setResourceType(rt.id())
+      .setResourceName(name)
+  }
+
+  @Test
+  def testControllerDescribeConfigsRefusesForeignTenantTopicFromBootstrapControllersAdmin(): Unit = {
+    val controller = mock(classOf[Controller])
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.empty())
+
+    val requestData = new DescribeConfigsRequestData().setResources(
+      util.Arrays.asList(describeConfigsResource(ConfigResource.Type.TOPIC, "acme.orders")))
+    val req = buildTokenRequest(
+      new DescribeConfigsRequest.Builder(requestData).build(1),
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    controllerApis.handleDescribeConfigsRequest(req)
+
+    val response = captureSentResponse(req).asInstanceOf[DescribeConfigsResponse]
+    val r = response.data().results().asScala.head
+    assertEquals(TOPIC_AUTHORIZATION_FAILED.code(), r.errorCode(),
+      "bootstrap.controllers admin must be refused for a tenant-prefixed TOPIC; otherwise the response would leak the topic's full config (#70)")
+    assertEquals("acme.orders", r.resourceName(),
+      "echoed name must be the structurally-refused logical form")
+    assertTrue(r.configs() == null || r.configs().isEmpty,
+      "no config entries may be returned for a refused tenant TOPIC")
+    assertTrue(r.errorMessage() == null || r.errorMessage().isEmpty,
+      "errorMessage must not echo physical names back to the cluster-wide caller (existence oracle)")
+  }
+
+  @Test
+  def testControllerDescribeConfigsRefusesForeignTenantGroupFromBootstrapControllersAdmin(): Unit = {
+    val controller = mock(classOf[Controller])
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.empty())
+
+    val requestData = new DescribeConfigsRequestData().setResources(
+      util.Arrays.asList(describeConfigsResource(ConfigResource.Type.GROUP, "__tenant_acme.alice-group")))
+    val req = buildTokenRequest(
+      new DescribeConfigsRequest.Builder(requestData).build(1),
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    controllerApis.handleDescribeConfigsRequest(req)
+
+    val response = captureSentResponse(req).asInstanceOf[DescribeConfigsResponse]
+    val r = response.data().results().asScala.head
+    assertEquals(GROUP_AUTHORIZATION_FAILED.code(), r.errorCode(),
+      "bootstrap.controllers admin must be refused for a tenant-prefixed GROUP")
+    assertEquals("__tenant_acme.alice-group", r.resourceName())
+    assertTrue(r.configs() == null || r.configs().isEmpty,
+      "no config entries for a refused tenant GROUP")
+    assertTrue(r.errorMessage() == null || r.errorMessage().isEmpty,
+      "errorMessage must not echo physical group id back to the cluster-wide caller")
+  }
+
+  @Test
+  def testControllerDescribeConfigsAllowsSameTenantGroupFromForwardedTenantPrincipal(): Unit = {
+    val controller = mock(classOf[Controller])
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.empty())
+
+    val requestData = new DescribeConfigsRequestData().setResources(
+      util.Arrays.asList(describeConfigsResource(ConfigResource.Type.GROUP, "__tenant_acme.bob-group")))
+    val req = buildTokenRequest(
+      new DescribeConfigsRequest.Builder(requestData).build(1),
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_acme.alice"))
+
+    controllerApis.handleDescribeConfigsRequest(req)
+
+    val response = captureSentResponse(req).asInstanceOf[DescribeConfigsResponse]
+    val r = response.data().results().asScala.head
+    // The carve-out lets the resource flow into ConfigHelper, which then
+    // resolves the GROUP via the (empty) metadata cache: default group config
+    // is returned with NONE. The point of the assertion is the *negative*:
+    // the entry was NOT short-circuited with GROUP_AUTHORIZATION_FAILED, i.e.
+    // the same-tenant carve-out (callerOwnsPrincipalNamespaceName) fired.
+    assertEquals(NONE.code(), r.errorCode(),
+      "a forwarded tenant principal may read configs for groups in its own namespace; the controller-side scrub must NOT refuse it")
+    assertEquals("__tenant_acme.bob-group", r.resourceName())
+  }
+
+  @Test
+  def testControllerDescribeConfigsMixedBatchSplitsRefusedAndForwarded(): Unit = {
+    val controller = mock(classOf[Controller])
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.empty())
+
+    val requestData = new DescribeConfigsRequestData().setResources(
+      util.Arrays.asList(
+        describeConfigsResource(ConfigResource.Type.TOPIC, "public-topic"),
+        describeConfigsResource(ConfigResource.Type.TOPIC, "acme.orders"),
+        describeConfigsResource(ConfigResource.Type.GROUP, "__tenant_acme.alice-group")
+      ))
+    val req = buildTokenRequest(
+      new DescribeConfigsRequest.Builder(requestData).build(1),
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    controllerApis.handleDescribeConfigsRequest(req)
+
+    val response = captureSentResponse(req).asInstanceOf[DescribeConfigsResponse]
+    val byName: Map[String, Short] = response.data().results().asScala
+      .map(r => r.resourceName() -> r.errorCode()).toMap
+
+    // The plain TOPIC name is not refused upstream; the metadata cache is
+    // empty in this fixture so ConfigHelper returns UNKNOWN_TOPIC_OR_PARTITION
+    // — what matters is that it is NOT TOPIC_AUTHORIZATION_FAILED, i.e. the
+    // scrub did not collateral-damage a cluster-namespaced topic.
+    assertEquals(UNKNOWN_TOPIC_OR_PARTITION.code(), byName("public-topic"),
+      "non-tenant TOPIC must be forwarded to ConfigHelper untouched")
+    assertEquals(TOPIC_AUTHORIZATION_FAILED.code(), byName("acme.orders"),
+      "tenant TOPIC must be refused with TOPIC_AUTHORIZATION_FAILED")
+    assertEquals(GROUP_AUTHORIZATION_FAILED.code(), byName("__tenant_acme.alice-group"),
+      "tenant GROUP must be refused with GROUP_AUTHORIZATION_FAILED")
+  }
+
+  // ---------------------------------------------------------------------------
   // F4: AlterPartitionReassignments — outside-in TOPIC scrub on the controller
   // listener. A direct `bootstrap.controllers` Admin (KIP-590) bypasses the
   // broker-side scrub in KafkaApis.handleAlterPartitionReassignmentsRequest;

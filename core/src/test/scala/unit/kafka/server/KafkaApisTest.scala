@@ -16399,6 +16399,138 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testDescribeConfigsClusterWideCallerRefusesReservedTopicNamespace(): Unit = {
+    // Outside-in pollution (#70): a cluster-wide admin on a non-tenant-bound
+    // listener submits DescribeConfigs for TOPIC `acme.orders`. Without the
+    // guard, ConfigHelper would either confirm/deny existence (existence
+    // oracle) or hand back the tenant's full topic config (retention.ms,
+    // segment.bytes, cleanup.policy, ...). Refuse with TOPIC_AUTHORIZATION_FAILED
+    // so the wire shape is indistinguishable from an ACL refusal.
+    val configRepository = mock(classOf[ConfigRepository])
+    val describeRequest = new DescribeConfigsRequest.Builder(new DescribeConfigsRequestData()
+      .setResources(List(new DescribeConfigsRequestData.DescribeConfigsResource()
+        .setResourceName("acme.orders")
+        .setResourceType(ConfigResource.Type.TOPIC.id)).asJava))
+      .build(ApiKeys.DESCRIBE_CONFIGS.latestVersion)
+    val request = buildRequest(describeRequest,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    kafkaApis = createKafkaApis(
+      configRepository = configRepository,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDescribeConfigsRequest(request)
+
+    val response = verifyNoThrottling[DescribeConfigsResponse](request)
+    val results = response.data.results.asScala
+    assertEquals(1, results.size)
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED.code, results.head.errorCode)
+    assertEquals("acme.orders", results.head.resourceName,
+      "literal name echoed back unchanged")
+    // Never reach ConfigHelper for the refused resource — no oracle, no leak.
+    verify(configRepository, never()).topicConfig("acme.orders")
+  }
+
+  @Test
+  def testDescribeConfigsClusterWideCallerRefusesReservedGroupNamespace(): Unit = {
+    // Same outside-in pollution as TOPIC, but for GROUP. The physical group
+    // form is `__tenant_<id>.<group>`; a cluster-wide admin must not be able
+    // to read group config under a tenant's namespace.
+    val configRepository = mock(classOf[ConfigRepository])
+    val describeRequest = new DescribeConfigsRequest.Builder(new DescribeConfigsRequestData()
+      .setResources(List(new DescribeConfigsRequestData.DescribeConfigsResource()
+        .setResourceName("__tenant_acme.my-consumer")
+        .setResourceType(ConfigResource.Type.GROUP.id)).asJava))
+      .build(ApiKeys.DESCRIBE_CONFIGS.latestVersion)
+    val request = buildRequest(describeRequest,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    kafkaApis = createKafkaApis(
+      configRepository = configRepository,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDescribeConfigsRequest(request)
+
+    val response = verifyNoThrottling[DescribeConfigsResponse](request)
+    val results = response.data.results.asScala
+    assertEquals(1, results.size)
+    assertEquals(Errors.GROUP_AUTHORIZATION_FAILED.code, results.head.errorCode)
+    assertEquals("__tenant_acme.my-consumer", results.head.resourceName)
+    verify(configRepository, never()).groupConfig("__tenant_acme.my-consumer")
+  }
+
+  @Test
+  def testDescribeConfigsClusterWideMergesRefusedAndPlainResources(): Unit = {
+    // Mixed batch: cluster-wide admin asks for a foreign-tenant TOPIC PLUS a
+    // legitimate non-tenant TOPIC. Refused entry must coexist with the
+    // ConfigHelper-served entry on the response.
+    metadataCache = mock(classOf[KRaftMetadataCache])
+    when(metadataCache.contains("public-topic")).thenReturn(true)
+    val plainConfigs = new Properties()
+    plainConfigs.put("min.insync.replicas", "2")
+    val configRepository = mock(classOf[ConfigRepository])
+    when(configRepository.topicConfig("public-topic")).thenReturn(plainConfigs)
+
+    val describeRequest = new DescribeConfigsRequest.Builder(new DescribeConfigsRequestData()
+      .setResources(List(
+        new DescribeConfigsRequestData.DescribeConfigsResource()
+          .setResourceName("acme.orders")
+          .setResourceType(ConfigResource.Type.TOPIC.id),
+        new DescribeConfigsRequestData.DescribeConfigsResource()
+          .setResourceName("public-topic")
+          .setResourceType(ConfigResource.Type.TOPIC.id)).asJava))
+      .build(ApiKeys.DESCRIBE_CONFIGS.latestVersion)
+    val request = buildRequest(describeRequest,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    kafkaApis = createKafkaApis(
+      configRepository = configRepository,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDescribeConfigsRequest(request)
+
+    val response = verifyNoThrottling[DescribeConfigsResponse](request)
+    val results = response.data.results.asScala
+    assertEquals(2, results.size)
+    val refused = results.find(_.resourceName == "acme.orders").get
+    val allowed = results.find(_.resourceName == "public-topic").get
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED.code, refused.errorCode)
+    assertEquals(Errors.NONE.code, allowed.errorCode)
+    verify(configRepository, never()).topicConfig("acme.orders")
+    verify(configRepository).topicConfig("public-topic")
+  }
+
+  @Test
+  def testDescribeConfigsClusterWideWithNoTenantsBoundAllowsDottedTopics(): Unit = {
+    // No tenant configured on the broker → `isReservedTenantNamespace` is
+    // false for ANY name. A pre-existing operational topic like
+    // `archive.events` must round-trip to ConfigHelper unchanged.
+    metadataCache = mock(classOf[KRaftMetadataCache])
+    when(metadataCache.contains("archive.events")).thenReturn(true)
+    val topicConfigs = new Properties()
+    topicConfigs.put("min.insync.replicas", "2")
+    val configRepository = mock(classOf[ConfigRepository])
+    when(configRepository.topicConfig("archive.events")).thenReturn(topicConfigs)
+
+    val describeRequest = new DescribeConfigsRequest.Builder(new DescribeConfigsRequestData()
+      .setResources(List(new DescribeConfigsRequestData.DescribeConfigsResource()
+        .setResourceName("archive.events")
+        .setResourceType(ConfigResource.Type.TOPIC.id)).asJava))
+      .build(ApiKeys.DESCRIBE_CONFIGS.latestVersion)
+    val request = buildRequest(describeRequest,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    // No tenants configured: tenantConfig defaults to empty.
+    kafkaApis = createKafkaApis(configRepository = configRepository)
+    kafkaApis.handleDescribeConfigsRequest(request)
+
+    val response = verifyNoThrottling[DescribeConfigsResponse](request)
+    val results = response.data.results.asScala
+    assertEquals(1, results.size)
+    assertEquals(Errors.NONE.code, results.head.errorCode,
+      "no tenants bound → dotted topic must pass through")
+    assertEquals("archive.events", results.head.resourceName)
+    verify(configRepository).topicConfig("archive.events")
+  }
+
+  @Test
   def testInitProducerIdOutsideInRefusesTenantPrincipalNamespace(): Unit = {
     // Outside-in coordinator-namespace pollution: a privileged caller on a
     // cluster-wide (non-tenant) listener submits `__tenant_acme.tx` as the

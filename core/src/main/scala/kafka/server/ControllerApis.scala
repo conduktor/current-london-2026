@@ -1083,7 +1083,55 @@ class ControllerApis(
   }
 
   def handleDescribeConfigsRequest(request: RequestChannel.Request): CompletableFuture[Unit] = {
+    // Outside-in pollution guard (#70). A caller reaching ControllerApis
+    // directly via `bootstrap.controllers` bypasses the broker-side
+    // KafkaApis.handleDescribeConfigsRequest scrub. They could submit
+    // `acme.orders` (TOPIC) or `__tenant_acme.G` (GROUP) and obtain either an
+    // existence oracle (CONFIG_RESOURCE_NOT_FOUND vs full config) or the
+    // tenant's entire topic configuration (retention.ms, segment.bytes,
+    // cleanup.policy, ...). Principal-aware via `isForeignTenantNamespace` /
+    // caller-tenant carve-out so a forwarded `__tenant_acme.alice` reading
+    // its own namespace still passes through. Mirrors the controller-side
+    // pattern used by (Incremental)AlterConfigs and the ACL handlers.
+    val describeRequest = request.body[DescribeConfigsRequest]
+    val callerTenant = callerTenantFromPrincipal(request.context.principal.getName)
+    val pollutionRefused = new util.ArrayList[DescribeConfigsResponseData.DescribeConfigsResult]()
+    val keep = new util.ArrayList[DescribeConfigsRequestData.DescribeConfigsResource]()
+    describeRequest.data.resources.forEach { r =>
+      val rt = ConfigResource.Type.forId(r.resourceType)
+      if (rt == ConfigResource.Type.TOPIC
+          && isForeignTenantNamespace(r.resourceName, callerTenant)) {
+        pollutionRefused.add(new DescribeConfigsResponseData.DescribeConfigsResult()
+          .setResourceType(r.resourceType)
+          .setResourceName(r.resourceName)
+          .setErrorCode(Errors.TOPIC_AUTHORIZATION_FAILED.code)
+          .setErrorMessage(null)
+          .setConfigs(util.Collections.emptyList[DescribeConfigsResponseData.DescribeConfigsResourceResult]))
+      } else if (rt == ConfigResource.Type.GROUP
+          && isReservedTenantPrincipalNamespace(r.resourceName)
+          && !callerTenant.exists(t =>
+            r.resourceName.startsWith(TenantNamespace.PRINCIPAL_PREFIX + t + "."))) {
+        pollutionRefused.add(new DescribeConfigsResponseData.DescribeConfigsResult()
+          .setResourceType(r.resourceType)
+          .setResourceName(r.resourceName)
+          .setErrorCode(Errors.GROUP_AUTHORIZATION_FAILED.code)
+          .setErrorMessage(null)
+          .setConfigs(util.Collections.emptyList[DescribeConfigsResponseData.DescribeConfigsResourceResult]))
+      } else {
+        keep.add(r)
+      }
+    }
+    if (!pollutionRefused.isEmpty) {
+      describeRequest.data.setResources(keep)
+    }
     val responseData = configHelper.handleDescribeConfigsRequest(request, authHelper)
+    if (!pollutionRefused.isEmpty) {
+      val merged = new util.ArrayList[DescribeConfigsResponseData.DescribeConfigsResult](
+        responseData.results.size + pollutionRefused.size)
+      merged.addAll(responseData.results)
+      merged.addAll(pollutionRefused)
+      responseData.setResults(merged)
+    }
     requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
       new DescribeConfigsResponse(responseData.setThrottleTimeMs(requestThrottleMs)))
     CompletableFuture.completedFuture[Unit](())

@@ -4625,7 +4625,39 @@ class KafkaApis(val requestChannel: RequestChannel,
     val tenantCtx = tenantContextFor(request)
 
     if (!tenantCtx.effectiveTenant.isPresent) {
+      // Outside-in pollution guard (#70). A cluster-wide caller on a non-
+      // tenant-bound listener could otherwise ask DescribeConfigs for
+      // `acme.orders` (TOPIC) or `__tenant_acme.G` (GROUP) — the cache lookup
+      // would either confirm/deny existence (oracle) or return the tenant's
+      // full topic-config (retention.ms, segment.bytes, cleanup.policy, ...).
+      // Both leak. The tenant-aware branch below already refuses both shapes
+      // for tenant principals; this branch is the mirror for cluster-wide
+      // callers naming a foreign tenant namespace structurally. Tenant
+      // principals never reach this branch (they have an effectiveTenant).
+      val pollutionRefused = new ArrayBuffer[DescribeConfigsResponseData.DescribeConfigsResult]()
+      val keep = new java.util.ArrayList[DescribeConfigsRequestData.DescribeConfigsResource]()
+      describeConfigsRequest.data.resources.forEach { r =>
+        val rt = ConfigResource.Type.forId(r.resourceType)
+        if (rt == ConfigResource.Type.TOPIC && isReservedTenantNamespace(r.resourceName)) {
+          // TOPIC_AUTHORIZATION_FAILED with null errorMessage: indistinguishable
+          // from an ACL refusal, so existence isn't disclosed.
+          pollutionRefused += refusedDescribeConfigsResult(r, Errors.TOPIC_AUTHORIZATION_FAILED, null)
+        } else if (rt == ConfigResource.Type.GROUP && isReservedTenantPrincipalNamespace(r.resourceName)) {
+          pollutionRefused += refusedDescribeConfigsResult(r, Errors.GROUP_AUTHORIZATION_FAILED, null)
+        } else {
+          keep.add(r)
+        }
+      }
+      if (pollutionRefused.nonEmpty) {
+        describeConfigsRequest.data.setResources(keep)
+      }
       val responseData = configHelper.handleDescribeConfigsRequest(request, authHelper)
+      if (pollutionRefused.nonEmpty) {
+        val merged = new java.util.ArrayList[DescribeConfigsResponseData.DescribeConfigsResult]()
+        merged.addAll(responseData.results)
+        pollutionRefused.foreach(merged.add)
+        responseData.setResults(merged)
+      }
       requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
         new DescribeConfigsResponse(responseData.setThrottleTimeMs(requestThrottleMs)))
       return
