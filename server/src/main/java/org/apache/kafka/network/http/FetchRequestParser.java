@@ -149,6 +149,20 @@ public final class FetchRequestParser {
         if (m <= 0) {
             throw new ProduceRequestParser.BadRequestException("max_bytes must be positive");
         }
+        // Cap per-fetch budget at the same ceiling the WebSocket subscribe path enforces
+        // ({@link WsSubscribeMessageParser#MAX_PER_PARTITION_FETCH_BYTES}, aligned with the broker's
+        // fetchResponseMaxBytes). The two wire formats are parallel surfaces over the same fetch path;
+        // letting the HTTP side accept Integer.MAX_VALUE while the WS side rejects > 50 MiB is a
+        // request-amplification asymmetry — an attacker who is shut out at the WS gate can still drive
+        // the broker through the HTTP endpoint with an oversized max_bytes hint. The broker applies its
+        // own ceiling, so this cap is defence-in-depth, not the only line; rejecting the input at parse
+        // time keeps the wire contract consistent across endpoints and stops the bridge being used as a
+        // fetch amplifier.
+        if (m > WsSubscribeMessageParser.MAX_PER_PARTITION_FETCH_BYTES) {
+            throw new ProduceRequestParser.BadRequestException(
+                "max_bytes exceeds the per-fetch cap of "
+                    + WsSubscribeMessageParser.MAX_PER_PARTITION_FETCH_BYTES);
+        }
         return OptionalInt.of(m);
     }
 

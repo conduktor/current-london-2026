@@ -2222,6 +2222,135 @@ class KafkaHttpServerIntegrationTest {
     }
 
     @Test
+    void wsUpgradeRacingShutdownIsRejectedWith503() throws Exception {
+        // Wave 30 axis TTT: complements the 1001-on-shutdown contract pinned above. The W29 fix walks
+        // activeWsSessions at the start of stop() to send each peer a 1001 close frame BEFORE Server.stop()
+        // takes the connectors down. That walk takes a snapshot — but the upgrade creator that registers
+        // new endpoints into activeWsSessions runs on Jetty I/O threads in parallel. Without an admission
+        // guard, an upgrade request whose creator runs AFTER the snapshot is taken but BEFORE the connector
+        // refuses further dispatches slips into activeWsSessions, misses the 1001 walk, and observes 1006
+        // (Abnormal Closure) from the connector force-close — the exact failure mode the W29 fix was meant
+        // to eliminate.
+        //
+        // The guard: stop() latches a `shuttingDown` flag BEFORE the snapshot; the creator consults the
+        // flag both before and after acquiring the limiter slot and rejects with 503 + Retry-After:1 if
+        // it has been set. We pin that contract here by driving the upgrade on a TCP connection opened
+        // BEFORE stop() begins (so the connector still services it inside the grace window) and asserting
+        // the response is 503, not 101 — proving the new upgrade is refused at the application layer
+        // rather than slipping through.
+        tearDown();
+        ControllableSubmitter localSubmitter = new ControllableSubmitter();
+        KafkaHttpServer gracefulServer = new KafkaHttpServer("127.0.0.1", 0,
+            new KafkaHttpBridge(mapper, localSubmitter), localSubmitter, mapper,
+            DEFAULT_TEST_MAX_BODY_BYTES, DEFAULT_TEST_MAX_SSE_STREAMS, DEFAULT_TEST_MAX_WS_SUBSCRIPTIONS,
+            3000L);
+        try {
+            gracefulServer.start();
+            int port = gracefulServer.boundPort();
+            WebSocketClient wsClient = new WebSocketClient();
+            wsClient.start();
+            // One live WS session keeps the grace-drain window open long enough for the race-probe socket
+            // below to fire its request against a running connector. Without a live drainee, Server.stop()
+            // would unblock immediately on the empty-active-sessions path and the connector would be torn
+            // down before the probe got a chance to write its upgrade headers.
+            ConcurrentLinkedQueue<RequestSubmitter.FetchResult> queue = new ConcurrentLinkedQueue<>();
+            queue.add(new RequestSubmitter.FetchResult(
+                new FetchResponseFormatter.PartitionFetch(
+                    0, Errors.NONE, null, 0, 0, 1,
+                    List.of(new FetchResponseFormatter.FetchedRecord(
+                        0, null, "x".getBytes(StandardCharsets.UTF_8), null, 1L))),
+                0L));
+            localSubmitter.fetchResultQueue = queue;
+
+            CapturingWsListener liveListener = new CapturingWsListener();
+            URI liveUri = URI.create("ws://127.0.0.1:" + port + "/v1/topics/orders/subscribe");
+            Session liveSession = wsClient.connect(liveListener, liveUri).get(5, TimeUnit.SECONDS);
+            try {
+                liveListener.openLatch.await(5, TimeUnit.SECONDS);
+                liveSession.sendText(
+                    "{\"type\":\"subscribe\",\"partition\":0,\"offset\":0,\"maxBytes\":200000,\"initialCredits\":1}",
+                    Callback.NOOP);
+                liveListener.awaitMessages(1, 5, TimeUnit.SECONDS);
+
+                // Open the race-probe TCP connection BEFORE stop() — the connector accepts it cleanly while
+                // the server is still in normal-running state, so the application layer (creator) is the
+                // only thing that can reject it. The connection sits idle until the upgrade request goes
+                // out below.
+                try (Socket probe = new Socket("127.0.0.1", port)) {
+                    probe.setSoTimeout(5000);
+
+                    // Kick off shutdown on a background thread so the test thread can still drive the
+                    // probe socket. The grace is 3000 ms, the live WS is parked in long-poll, so stop()
+                    // blocks for ~that window — plenty of headroom for the probe.
+                    CompletableFuture<Throwable> stopFuture = CompletableFuture.supplyAsync(() -> {
+                        try {
+                            gracefulServer.stop();
+                            return null;
+                        } catch (Throwable t) {
+                            return t;
+                        }
+                    });
+
+                    // Wait briefly for stop() to enter its synchronized block and latch shuttingDown. The
+                    // assignment is the FIRST thing inside the if(server != null) branch — a 100 ms wait
+                    // is two orders of magnitude longer than the scheduler latency, which keeps the test
+                    // reliable without making it slow.
+                    Thread.sleep(100);
+
+                    // Send a WS upgrade request through the pre-opened socket. The connector is in
+                    // graceful-shutdown mode — new TCP accepts may already be refused — but THIS socket
+                    // was accepted before stop() began, so the in-flight request flows through to the
+                    // creator. With the shuttingDown guard active, the creator returns 503 instead of
+                    // performing the upgrade.
+                    String req =
+                        "GET /v1/topics/orders/subscribe HTTP/1.1\r\n"
+                            + "Host: 127.0.0.1:" + port + "\r\n"
+                            + "Connection: Upgrade\r\n"
+                            + "Upgrade: websocket\r\n"
+                            + "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                            + "Sec-WebSocket-Version: 13\r\n"
+                            + "\r\n";
+                    OutputStream out = probe.getOutputStream();
+                    out.write(req.getBytes(StandardCharsets.US_ASCII));
+                    out.flush();
+
+                    String raw = readAllAscii(probe.getInputStream());
+                    assertTrue(raw.startsWith("HTTP/1.1 503"),
+                        "WS upgrade race-probe must be rejected with 503 once stop() has latched the flag; "
+                            + "got status line: " + raw.split("\r\n", 2)[0]);
+                    assertTrue(raw.toLowerCase(java.util.Locale.ROOT).contains("retry-after: 1"),
+                        "503 must carry Retry-After: 1 so clients back off briefly during the restart, got: "
+                            + raw);
+                    int headerEnd = raw.indexOf("\r\n\r\n");
+                    assertTrue(headerEnd > 0, "503 response must terminate its headers, got: " + raw);
+                    String body = stripChunkPrefix(raw.substring(headerEnd + 4));
+                    JsonNode envelope = mapper.readTree(body);
+                    assertEquals(503, envelope.get("errorCode").asInt(),
+                        "503 body must match the bridge's {errorCode, errorMessage} contract, got: " + body);
+                    assertTrue(envelope.get("errorMessage").asText()
+                            .toLowerCase(java.util.Locale.ROOT).contains("shutting down"),
+                        "errorMessage must name the shutdown cause, got: " + envelope.get("errorMessage"));
+
+                    Throwable stopFailure = stopFuture.get(10, TimeUnit.SECONDS);
+                    assertNull(stopFailure, "background stop() must complete cleanly, got: " + stopFailure);
+                }
+            } finally {
+                if (liveSession.isOpen()) {
+                    liveSession.close(StatusCode.NORMAL, "test cleanup", Callback.NOOP);
+                }
+                wsClient.stop();
+            }
+        } finally {
+            try {
+                gracefulServer.stop();
+            } catch (Exception ignored) {
+                // already stopped
+            }
+            startServer(DEFAULT_TEST_MAX_BODY_BYTES, DEFAULT_TEST_MAX_SSE_STREAMS, DEFAULT_TEST_MAX_WS_SUBSCRIPTIONS);
+        }
+    }
+
+    @Test
     void zeroGraceStopsImmediatelyForLegacyTestHarness() throws Exception {
         // Counterpart to gracefulShutdownLetsInFlightSseStreamSettleBeforeForceClose: confirm that the
         // 8-arg legacy constructor still produces a server that tears down without waiting, so the

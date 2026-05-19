@@ -137,6 +137,34 @@ class FetchRequestParserTest {
     }
 
     @Test
+    void maxBytesAboveTheWsCapIsRejected() {
+        // Wave 30 axis UUU: the WebSocket subscribe path enforces MAX_PER_PARTITION_FETCH_BYTES (50 MiB).
+        // The HTTP fetch path is a parallel wire format over the same broker fetch primitive — letting
+        // it accept Integer.MAX_VALUE while the WS path rejects > 50 MiB is a request-amplification
+        // asymmetry. Pin the symmetric contract: any max_bytes above the WS cap is a 400.
+        int overCap = WsSubscribeMessageParser.MAX_PER_PARTITION_FETCH_BYTES + 1;
+        ProduceRequestParser.BadRequestException ex = assertThrows(
+            ProduceRequestParser.BadRequestException.class,
+            () -> FetchRequestParser.parse("orders",
+                QueryParams.of("partition", "0", "offset", "0", "max_bytes", Integer.toString(overCap))));
+        assertTrue(ex.getMessage().contains("per-fetch cap"),
+            "rejection message must name the cap so clients can correct the call, got: " + ex.getMessage());
+        // Boundary: exactly the cap is accepted — the WS parser uses the same inclusive-cap shape.
+        FetchRequestParser.FetchCommand atCap = FetchRequestParser.parse("orders",
+            QueryParams.of("partition", "0", "offset", "0", "max_bytes",
+                Integer.toString(WsSubscribeMessageParser.MAX_PER_PARTITION_FETCH_BYTES)));
+        assertEquals(WsSubscribeMessageParser.MAX_PER_PARTITION_FETCH_BYTES, atCap.maxBytes().getAsInt(),
+            "max_bytes exactly at the cap must be accepted — clients that ask for the documented maximum "
+                + "should not see a 400");
+        // Integer.MAX_VALUE is the canonical adversarial value (and the exact concern that motivated the cap):
+        // without the guard the HTTP path would silently accept it and pass it down to the broker.
+        assertThrows(ProduceRequestParser.BadRequestException.class,
+            () -> FetchRequestParser.parse("orders",
+                QueryParams.of("partition", "0", "offset", "0", "max_bytes",
+                    Integer.toString(Integer.MAX_VALUE))));
+    }
+
+    @Test
     void topicMustNotBeBlank() {
         assertThrows(
             ProduceRequestParser.BadRequestException.class,

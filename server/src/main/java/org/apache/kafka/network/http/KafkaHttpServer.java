@@ -24,6 +24,8 @@ import org.eclipse.jetty.ee10.servlet.ErrorHandler;
 import org.eclipse.jetty.ee10.servlet.ServletContextHandler;
 import org.eclipse.jetty.ee10.servlet.ServletContextRequest;
 import org.eclipse.jetty.ee10.servlet.ServletHolder;
+import org.eclipse.jetty.ee10.websocket.server.JettyServerUpgradeRequest;
+import org.eclipse.jetty.ee10.websocket.server.JettyServerUpgradeResponse;
 import org.eclipse.jetty.ee10.websocket.server.config.JettyWebSocketServletContainerInitializer;
 import org.eclipse.jetty.http.HttpFields;
 import org.eclipse.jetty.http.HttpHeader;
@@ -104,6 +106,14 @@ public final class KafkaHttpServer {
     // transport failures on every WS client and monitoring dashboard. ConcurrentHashMap-backed set so concurrent
     // add/remove on Jetty I/O threads cannot race the snapshot taken on the broker stop thread.
     private final Set<KafkaWebSocketEndpoint> activeWsSessions = ConcurrentHashMap.newKeySet();
+    // Latched by stop() BEFORE it snapshots activeWsSessions, so any WS upgrade that races stop() between
+    // the snapshot and Server.stop() is rejected with 503 instead of slipping in and missing the 1001
+    // close-frame walk. Without this guard, the Wave 29 1001-on-shutdown contract has a narrow window:
+    // tryAcquire() in the upgrade creator could succeed AFTER the stop()-side iteration has begun but
+    // BEFORE Jetty's connector refuses new accepts, and the new session would observe 1006 from the
+    // force-close on shutdown. volatile so the upgrade thread (Jetty I/O) sees the write made on the
+    // broker stop thread without needing the start()/stop() monitor.
+    private volatile boolean shuttingDown;
 
     // volatile: written inside synchronized start()/stop(), read by boundPort() without holding the lock.
     // The synchronized writer publishes through the monitor, but unsynchronized readers (test threads and
@@ -228,66 +238,9 @@ public final class KafkaHttpServer {
         // /v1/topics/{topic}/subscribe and routes them to KafkaWebSocketEndpoint via the creator below.
         // Non-upgrade requests against the same path fall through to the servlet, which returns 404 (the
         // servlet's extractTopic enforces /topics/{topic}/records — /subscribe does not match).
-        JettyWebSocketServletContainerInitializer.configure(context, (servletContext, container) -> {
-            // Upgrade-time admission gate: extract the topic, acquire a limiter slot, and either return a
-            // freshly-constructed endpoint (counts as one accepted subscription) or send a 429 (counts as
-            // a cap rejection). The endpoint owns the token from that point onward; cleanup in onClose/onError
-            // is idempotent.
-            container.addMapping(WS_PATH_SPEC, (req, resp) -> {
-                // Strip any negotiated WebSocket extensions before the upgrade response is sent. Jetty 12 registers
-                // `permessage-deflate` in the default ExtensionRegistry and negotiates it whenever a client offers
-                // `Sec-WebSocket-Extensions: permessage-deflate` — even when the application code is unaware. The
-                // 8 KiB inbound caps in KafkaWebSocketEndpoint apply to the DECOMPRESSED message, so heap pressure
-                // is bounded, but the bridge has no protocol need for compression (frames are tiny JSON records,
-                // not bulk payloads) and silently negotiating it: (a) adds a per-session zlib state machine that
-                // isn't required by the wire spec we publish, (b) creates a CPU-cost surface where a small
-                // compressed frame expands into more decompression work, (c) makes the negotiated handshake
-                // depend on which Jetty patch version ships which extensions by default, which is exactly the
-                // kind of implementation drift Wave 23 axis G called out. Pin the contract: no extensions.
-                resp.setExtensions(java.util.Collections.emptyList());
-
-                String topic = extractSubscribeTopic(req.getRequestPath(), context.getContextPath());
-                if (topic == null) {
-                    // The path-spec was already matched by the WS filter, so this branch should be unreachable
-                    // in practice — but defending against future spec changes (e.g. trailing slashes) by
-                    // returning a sane error is cheap insurance.
-                    // sendError → HttpServletResponse.sendError → JsonErrorHandler renders the bridge's
-                    // {errorCode, errorMessage} envelope. See setErrorHandler() above.
-                    resp.sendError(404, "topic path did not match /v1/topics/{topic}/subscribe");
-                    return null;
-                }
-                WsStreamLimiter.Token token = wsLimiter.tryAcquire();
-                if (token == null) {
-                    metrics.recordWsCapRejection();
-                    // PROMPT.md AC: "429 is reserved for the WebSocket pre-flight throttle, not the HTTP
-                    // produce path." Refusing the upgrade at the concurrency cap is exactly that pre-flight
-                    // throttle, so the contract is 429 + Retry-After — matching the SSE limiter's shape so
-                    // both streaming admission gates report the same surface to clients and dashboards.
-                    // Retry-After must be set BEFORE sendError — sendError commits the response headers when
-                    // the configured ErrorHandler runs, and headers added after commit are dropped.
-                    resp.setHeader("Retry-After", "5");
-                    resp.sendError(HttpStatusMapper.TOO_MANY_REQUESTS,
-                        "WebSocket subscription cap reached; try again shortly");
-                    return null;
-                }
-                // Wrap endpoint construction so a throw between tryAcquire() and the returned endpoint does not
-                // leak the limiter slot. The token is meant to transfer to the endpoint (and from there to the
-                // streamer); if construction fails we must release it before propagating the failure as 500.
-                // Also: record the "opened" meter only after successful construction so accepted+rejected meters
-                // sum to exactly the offered load — a half-constructed endpoint that never reaches the client
-                // is neither.
-                KafkaWebSocketEndpoint endpoint;
-                try {
-                    endpoint = new KafkaWebSocketEndpoint(topic, submitter, mapper, token, httpExecutor,
-                        activeWsSessions);
-                } catch (RuntimeException e) {
-                    token.close();
-                    throw e;
-                }
-                metrics.recordWsSubscriptionOpened();
-                return endpoint;
-            });
-        });
+        JettyWebSocketServletContainerInitializer.configure(context, (servletContext, container) ->
+            container.addMapping(WS_PATH_SPEC, (req, resp) ->
+                createWsEndpoint(req, resp, context.getContextPath(), httpExecutor)));
 
         // Server-level (core) handler for errors that escape the servlet context entirely:
         //   - URI rejections by Jetty's HTTP parser (CRLF in headers, ambiguous %2F, path traversal, control chars)
@@ -316,6 +269,14 @@ public final class KafkaHttpServer {
     public synchronized void stop() throws Exception {
         try {
             if (server != null) {
+                // Latch shuttingDown BEFORE the snapshot. The upgrade creator in start() consults this flag
+                // both before and after tryAcquire — a WS upgrade in flight at this point now resolves to
+                // 503 + Retry-After:1, so no new session can register into activeWsSessions after the
+                // snapshot is taken. Without this guard a Jetty I/O thread could finish onWebSocketOpen
+                // between the snapshot and Server.stop() and observe 1006 from the connector force-close,
+                // defeating the 1001 contract this method enforces for every peer that was visible to
+                // the snapshot.
+                shuttingDown = true;
                 // Send each live WebSocket peer an RFC 6455 §5.5.1 close frame with status 1001 (Going Away)
                 // BEFORE Server.stop() begins. Without this, Jetty's connector force-close on shutdown
                 // delivers status 1006 (Abnormal Closure) — RFC 6455 §7.1.1 says a server SHOULD send a
@@ -391,6 +352,100 @@ public final class KafkaHttpServer {
             return null;
         }
         return topic;
+    }
+
+    /**
+     * Upgrade-time admission gate for WebSocket subscribe requests. Extracts the topic, enforces the
+     * shutdown-race guard and the concurrency limiter, and either returns a freshly-constructed endpoint
+     * (counts as one accepted subscription) or sends an error (counts as a cap or shutdown rejection).
+     *
+     * <p>Extracted from {@link #start()} so the start-up method stays under the project checkstyle ceiling
+     * and so the multi-stage admission logic can be reviewed without scrolling through every connector
+     * configuration knob. The lambda passed to {@code container.addMapping} is a one-line forwarder onto
+     * this method.
+     *
+     * @return the constructed endpoint on success, or {@code null} when an error has been written to
+     *         {@code resp} (Jetty interprets a {@code null} from a {@link
+     *         org.eclipse.jetty.ee10.websocket.server.JettyWebSocketCreator} as "do not perform the upgrade").
+     */
+    private Object createWsEndpoint(JettyServerUpgradeRequest req, JettyServerUpgradeResponse resp,
+                                    String contextPath, java.util.concurrent.Executor httpExecutor)
+            throws IOException {
+        // Strip any negotiated WebSocket extensions before the upgrade response is sent. Jetty 12 registers
+        // `permessage-deflate` in the default ExtensionRegistry and negotiates it whenever a client offers
+        // `Sec-WebSocket-Extensions: permessage-deflate` — even when the application code is unaware. The
+        // 8 KiB inbound caps in KafkaWebSocketEndpoint apply to the DECOMPRESSED message, so heap pressure
+        // is bounded, but the bridge has no protocol need for compression (frames are tiny JSON records,
+        // not bulk payloads) and silently negotiating it: (a) adds a per-session zlib state machine that
+        // isn't required by the wire spec we publish, (b) creates a CPU-cost surface where a small
+        // compressed frame expands into more decompression work, (c) makes the negotiated handshake
+        // depend on which Jetty patch version ships which extensions by default, which is exactly the
+        // kind of implementation drift Wave 23 axis G called out. Pin the contract: no extensions.
+        resp.setExtensions(java.util.Collections.emptyList());
+
+        String topic = extractSubscribeTopic(req.getRequestPath(), contextPath);
+        if (topic == null) {
+            // The path-spec was already matched by the WS filter, so this branch should be unreachable
+            // in practice — but defending against future spec changes (e.g. trailing slashes) by
+            // returning a sane error is cheap insurance.
+            // sendError → HttpServletResponse.sendError → JsonErrorHandler renders the bridge's
+            // {errorCode, errorMessage} envelope. See setErrorHandler() above.
+            resp.sendError(404, "topic path did not match /v1/topics/{topic}/subscribe");
+            return null;
+        }
+        // Shutdown-race guard: stop() has begun walking activeWsSessions to send 1001 close frames.
+        // Letting a new session register here would either (a) miss the snapshot and observe 1006 on
+        // the imminent connector force-close, or (b) leak a limiter slot if it races registration. A
+        // pre-tryAcquire check turns the race into a clean 503 + Retry-After. Retry-After of 1 second
+        // matches the broker stop sequence shape: by the time the client retries the listener has
+        // either fully gone or is back on a different broker via the bootstrap address.
+        if (shuttingDown) {
+            resp.setHeader("Retry-After", "1");
+            resp.sendError(HttpStatusMapper.SERVICE_UNAVAILABLE,
+                "broker is shutting down; try again shortly");
+            return null;
+        }
+        WsStreamLimiter.Token token = wsLimiter.tryAcquire();
+        if (token == null) {
+            metrics.recordWsCapRejection();
+            // PROMPT.md AC: "429 is reserved for the WebSocket pre-flight throttle, not the HTTP
+            // produce path." Refusing the upgrade at the concurrency cap is exactly that pre-flight
+            // throttle, so the contract is 429 + Retry-After — matching the SSE limiter's shape so
+            // both streaming admission gates report the same surface to clients and dashboards.
+            // Retry-After must be set BEFORE sendError — sendError commits the response headers when
+            // the configured ErrorHandler runs, and headers added after commit are dropped.
+            resp.setHeader("Retry-After", "5");
+            resp.sendError(HttpStatusMapper.TOO_MANY_REQUESTS,
+                "WebSocket subscription cap reached; try again shortly");
+            return null;
+        }
+        // Defence-in-depth: re-check after acquiring the limiter slot. The flag could have been set
+        // between the check above and tryAcquire (Jetty I/O thread vs broker stop thread). Without
+        // this, a session that won the race past the first check would still slip into
+        // activeWsSessions after stop()'s snapshot and observe 1006. Release the slot we just took.
+        if (shuttingDown) {
+            token.close();
+            resp.setHeader("Retry-After", "1");
+            resp.sendError(HttpStatusMapper.SERVICE_UNAVAILABLE,
+                "broker is shutting down; try again shortly");
+            return null;
+        }
+        // Wrap endpoint construction so a throw between tryAcquire() and the returned endpoint does not
+        // leak the limiter slot. The token is meant to transfer to the endpoint (and from there to the
+        // streamer); if construction fails we must release it before propagating the failure as 500.
+        // Also: record the "opened" meter only after successful construction so accepted+rejected meters
+        // sum to exactly the offered load — a half-constructed endpoint that never reaches the client
+        // is neither.
+        KafkaWebSocketEndpoint endpoint;
+        try {
+            endpoint = new KafkaWebSocketEndpoint(topic, submitter, mapper, token, httpExecutor,
+                activeWsSessions);
+        } catch (RuntimeException e) {
+            token.close();
+            throw e;
+        }
+        metrics.recordWsSubscriptionOpened();
+        return endpoint;
     }
 
     /**
