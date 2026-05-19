@@ -574,12 +574,16 @@ class KafkaApis(val requestChannel: RequestChannel,
       if (!authorizedTopics.contains(topicPartition.topic))
         unauthorizedTopicResponses += topicPartition -> new PartitionResponse(Errors.TOPIC_AUTHORIZATION_FAILED)
       else if (concentrationKernel.isBackingTopic(topicPartition.topic))
-        // Concentration v1: a "backing" topic is the physical container behind one or more
-        // declared logical topics. Stock clients must produce to the logical topic name, never
-        // to the backing name — direct produces would interleave records with logical-topic
-        // payloads and break per-logical-topic offset sequencing. Pin this as the topic-level
-        // error (INVALID_TOPIC_EXCEPTION) so the producer sees a clear, non-retriable failure.
-        invalidRequestResponses += topicPartition -> new PartitionResponse(Errors.INVALID_TOPIC_EXCEPTION)
+        // r25 BLOCKER #255 (Produce branch): collapse the backing-topic rejection to the SAME
+        // error code that an unknown-topic name returns (UNKNOWN_TOPIC_OR_PARTITION at :777-778).
+        // Pre-fix this branch returned INVALID_TOPIC_EXCEPTION, which a probe could distinguish
+        // from UNKNOWN_TOPIC_OR_PARTITION — leaking the existence of the backing topic to any
+        // client holding the wildcard Topic:* WRITE ACL widespread in test/monitoring fleets.
+        // The asymmetric-fix family (r25 #253/#254 for AddPartitionsToTxn/TxnOffsetCommit, and
+        // r23 #245 for OffsetCommit/OffsetDelete) collapses backing -> UNKNOWN_TOPIC_OR_PARTITION
+        // so the oracle is closed. For Produce there is no logical-rejection branch to preserve:
+        // logical topics flow into the serving path at :583+.
+        invalidRequestResponses += topicPartition -> new PartitionResponse(Errors.UNKNOWN_TOPIC_OR_PARTITION)
       else if (concentrationKernel.isLogicalTopic(topicPartition.topic)) {
         // Concentration hook #2: produce routing + offset assignment for a logical topic. The
         // record-validation step still runs against the raw client-supplied MemoryRecords so
@@ -1193,14 +1197,15 @@ class KafkaApis(val requestChannel: RequestChannel,
         if (!authorizedTopics.contains(topicIdPartition.topic))
           erroneous += topicIdPartition -> FetchResponse.partitionResponse(topicIdPartition, Errors.TOPIC_AUTHORIZATION_FAILED)
         else if (concentrationKernel.isBackingTopic(topicIdPartition.topic))
-          // Concentration v1: a backing topic's records carry headers for the multiplexed logical
-          // topics (LOGICAL_TOPIC, LOGICAL_PARTITION, LOGICAL_OFFSETS) and otherwise interleave
-          // payloads from all of them. A direct client fetch on the backing name would expose
-          // raw records belonging to other logical-topic tenants — cross-tenant leak. Reject at
-          // the same level as the Produce/DeleteRecords guards (KafkaApis.scala:423, :2040),
-          // surfacing INVALID_TOPIC_EXCEPTION. Internal backing fetches issued by
-          // routeLogicalFetch land in `interesting` directly (line 948) and are unaffected.
-          erroneous += topicIdPartition -> FetchResponse.partitionResponse(topicIdPartition, Errors.INVALID_TOPIC_EXCEPTION)
+          // r25 BLOCKER #255 (Fetch branch): asymmetric oracle-closure. Pre-fix this branch
+          // returned INVALID_TOPIC_EXCEPTION, distinguishable from UNKNOWN_TOPIC_OR_PARTITION
+          // returned on the unknown-name branch at :1206-1207 — leaking backing-topic existence
+          // to a holder of wildcard Topic:* READ ACL. Collapse to UNKNOWN_TOPIC_OR_PARTITION so
+          // the two probes are indistinguishable. The cross-tenant payload leak rationale (which
+          // is what historically motivated rejecting the backing fetch in the first place) is
+          // unchanged: routeLogicalFetch's internal backing fetches still land in `interesting`
+          // (line 948) and are unaffected. Logical topics flow through routeLogicalFetch at :1204.
+          erroneous += topicIdPartition -> FetchResponse.partitionResponse(topicIdPartition, Errors.UNKNOWN_TOPIC_OR_PARTITION)
         else if (concentrationKernel.isLogicalTopic(topicIdPartition.topic))
           routeLogicalFetch(topicIdPartition, data)
         else if (!metadataCache.contains(topicIdPartition.topicPartition))
@@ -1548,7 +1553,13 @@ class KafkaApis(val requestChannel: RequestChannel,
 
     val backingResponses: Seq[ListOffsetsTopicResponse] = backingRequested.map { topic =>
       val partResponses = topic.partitions.asScala.map { part =>
-        buildErrorResponse(Errors.INVALID_TOPIC_EXCEPTION, part)
+        // r25 BLOCKER #255 (ListOffsets branch): asymmetric oracle-closure. Pre-fix this
+        // returned INVALID_TOPIC_EXCEPTION, distinguishable from the unknown-name branch's
+        // UNKNOWN_TOPIC_OR_PARTITION (raised by replicaManager.fetchOffset via
+        // UnknownTopicOrPartitionException at ReplicaManager.scala:1472-1480). Collapsed so
+        // a backing probe is indistinguishable from an unknown probe. Logical topics flow
+        // through the normal serving path via logicalResponses above.
+        buildErrorResponse(Errors.UNKNOWN_TOPIC_OR_PARTITION, part)
       }
       new ListOffsetsTopicResponse().setName(topic.name).setPartitions(partResponses.asJava)
     }
@@ -4577,12 +4588,18 @@ class KafkaApis(val requestChannel: RequestChannel,
       if (!authorizedTopics.contains(topicIdPartition.topicPartition.topic))
         erroneous += topicIdPartition -> ShareFetchResponse.partitionResponse(topicIdPartition, Errors.TOPIC_AUTHORIZATION_FAILED)
       else if (concentrationKernel.isBackingTopic(topicIdPartition.topicPartition.topic))
-        // r19 ADV-A BLOCKER #136: backing topics carry interleaved records for multiple logical
-        // topics, demuxed only by LogicalFetchTranslator on the regular Fetch path. SharePartitionManager
-        // does not apply that translator, so a share-fetch on the backing name would return the raw
-        // multiplexed records (LOGICAL_TOPIC headers and all) to the share consumer — cross-tenant
-        // payload leak. Reject the same way Produce does (KafkaApis.scala:553).
-        erroneous += topicIdPartition -> ShareFetchResponse.partitionResponse(topicIdPartition, Errors.INVALID_TOPIC_EXCEPTION)
+        // r25 BLOCKER #256 (ShareFetch backing branch): asymmetric oracle-closure. Pre-fix
+        // returned INVALID_TOPIC_EXCEPTION here, distinguishable from the unknown branch at
+        // :4593-4594 (UNKNOWN_TOPIC_OR_PARTITION) — leaking backing-topic existence to any
+        // share-group client. ShareFetch requests are keyed by topic UUID; the metadata cache
+        // contains backing-topic UUIDs (overlayLogicalTopicIdsToNames at :4411), so a client
+        // holding the 128-bit backing UUID could probe. Closed for symmetry with the named-RPC
+        // oracle family (r23 #245, r25 #253/#254). The cross-tenant payload leak rationale
+        // (#136) is unchanged. KEEP the LOGICAL branch below at INVALID_TOPIC_EXCEPTION:
+        // logical names are public via METADATA (overlayLogicalTopicIdsToNames at :1798), so
+        // leaking their existence is not a leak, and INVALID_TOPIC_EXCEPTION correctly signals
+        // "v1 logical topics are not share-eligible" non-retriably.
+        erroneous += topicIdPartition -> ShareFetchResponse.partitionResponse(topicIdPartition, Errors.UNKNOWN_TOPIC_OR_PARTITION)
       else if (concentrationKernel.isLogicalTopic(topicIdPartition.topicPartition.topic))
         // Share groups (KIP-932) need per-record ack tracking keyed by the partition the record
         // physically lives on. Logical topics fan in to a shared backing partition where multiple
@@ -4672,12 +4689,14 @@ class KafkaApis(val requestChannel: RequestChannel,
           erroneous += topicIdPartition ->
             ShareAcknowledgeResponse.partitionResponse(topicIdPartition, Errors.TOPIC_AUTHORIZATION_FAILED)
         else if (concentrationKernel.isBackingTopic(topicIdPartition.topicPartition.topic))
-          // r19 ADV-A BLOCKER #136: symmetric with handleFetchFromShareFetchRequest. Acking the
-          // backing topic directly would bind the share-group's per-record state to backing
-          // offsets that span multiple tenants, corrupting acquisition tracking for everyone
-          // sharing that backing. Reject as INVALID_TOPIC_EXCEPTION (non-retriable).
+          // r25 BLOCKER #256 (ShareAcknowledge backing branch): asymmetric oracle-closure. Same
+          // rationale as the ShareFetch backing branch at :4579: collapse to
+          // UNKNOWN_TOPIC_OR_PARTITION (matching :4687-4689 unknown branch) so the probe is
+          // indistinguishable. KEEP the LOGICAL branch below at INVALID_TOPIC_EXCEPTION (logical
+          // names public via METADATA). The cross-tenant ack-tracking-corruption rationale (#136)
+          // is unchanged: the reject still happens; only the error code shape is collapsed.
           erroneous += topicIdPartition ->
-            ShareAcknowledgeResponse.partitionResponse(topicIdPartition, Errors.INVALID_TOPIC_EXCEPTION)
+            ShareAcknowledgeResponse.partitionResponse(topicIdPartition, Errors.UNKNOWN_TOPIC_OR_PARTITION)
         else if (concentrationKernel.isLogicalTopic(topicIdPartition.topicPartition.topic))
           // Symmetric with handleFetchFromShareFetchRequest: logical topics aren't share-group-eligible
           // in v1. A client that somehow obtained a logical TopicIdPartition (e.g. via DescribeTopicPartitions)

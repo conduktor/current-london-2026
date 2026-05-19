@@ -2861,12 +2861,17 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
-  def testProduceToBackingTopicIsRejectedWithInvalidTopicException(): Unit = {
+  def testProduceToBackingTopicIsRejectedAsUnknown(): Unit = {
     // Concentration v1 invariant: a stock producer that names the physical backing topic
     // bypasses the logical-offset reservation, would interleave its records with payloads from
     // every declared logical topic on the same backing, and would corrupt per-logical-topic
-    // offset sequencing. KafkaApis#handleProduceRequest must short-circuit the partition with
-    // INVALID_TOPIC_EXCEPTION before it ever reaches ReplicaManager.
+    // offset sequencing. KafkaApis#handleProduceRequest must short-circuit the partition.
+    //
+    // r25 BLOCKER #255: prior to this commit the rejection used INVALID_TOPIC_EXCEPTION, which
+    // a wildcard-authorized attacker could distinguish from the unknown-topic branch's
+    // UNKNOWN_TOPIC_OR_PARTITION — a backing-topic existence oracle. Collapse both branches to
+    // UNKNOWN_TOPIC_OR_PARTITION. See testProduceBackingReturnsSameErrorAsUnknownTopic for the
+    // discriminator and KafkaApis.scala:577-586 for the rationale.
     val backingTopic = "backing-topic"
     addTopicToMetadataCache(backingTopic, numPartitions = 1)
     when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
@@ -2898,10 +2903,75 @@ class KafkaApisTest extends Logging {
     val topicProduceResponse = response.data.responses.asScala.head
     assertEquals(1, topicProduceResponse.partitionResponses.size)
     val partitionProduceResponse = topicProduceResponse.partitionResponses.asScala.head
-    assertEquals(Errors.INVALID_TOPIC_EXCEPTION, Errors.forCode(partitionProduceResponse.errorCode))
+    assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION, Errors.forCode(partitionProduceResponse.errorCode),
+      "r25 BLOCKER #255: Produce to backing must return UNKNOWN_TOPIC_OR_PARTITION (same as the " +
+        "unknown-topic branch) so the response cannot be used as a backing-existence oracle.")
 
     // The ReplicaManager append path must not have been called for the rejected partition,
     // otherwise the rejection would be racing the real append rather than short-circuiting it.
+    verify(replicaManager, never()).handleProduceAppend(anyLong, anyShort, ArgumentMatchers.eq(false),
+      any(), any(), any(), any(), any(), any(), any())
+  }
+
+  @Test
+  def testProduceBackingReturnsSameErrorAsUnknownTopic(): Unit = {
+    // r25 BLOCKER #255 — explicit oracle-closure discriminator (Produce branch), modelled on
+    // testAddPartitionsToTxnBackingReturnsSameErrorAsUnknownTopic (#253). Two probes from the
+    // SAME authorized principal, one targeting a declared backing-topic name and one targeting
+    // a genuinely-unknown name, MUST receive the same error code so a wildcard-authorized
+    // attacker cannot enumerate the declared backing-topic set by observing error-code
+    // asymmetry. Without the #255 fix the two codes diverged (INVALID_TOPIC_EXCEPTION vs
+    // UNKNOWN_TOPIC_OR_PARTITION) and this assertion would fail.
+    val backingTopic = "backing-r25-255-produce"
+    val unknownTopic = "definitely-does-not-exist-r25-255-produce"
+    addTopicToMetadataCache(backingTopic, numPartitions = 1)
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+    when(concentrationKernel.isBackingTopic(unknownTopic)).thenReturn(false)
+    when(concentrationKernel.isLogicalTopic(unknownTopic)).thenReturn(false)
+
+    val backingTp = new TopicPartition(backingTopic, 0)
+    val unknownTp = new TopicPartition(unknownTopic, 0)
+    val produceRequest = ProduceRequest.builder(new ProduceRequestData()
+      .setTopicData(new ProduceRequestData.TopicProduceDataCollection(
+        java.util.Arrays.asList(
+          new ProduceRequestData.TopicProduceData()
+            .setName(backingTp.topic).setPartitionData(Collections.singletonList(
+              new ProduceRequestData.PartitionProduceData()
+                .setIndex(backingTp.partition)
+                .setRecords(MemoryRecords.withRecords(Compression.NONE, new SimpleRecord("payload".getBytes))))),
+          new ProduceRequestData.TopicProduceData()
+            .setName(unknownTp.topic).setPartitionData(Collections.singletonList(
+              new ProduceRequestData.PartitionProduceData()
+                .setIndex(unknownTp.partition)
+                .setRecords(MemoryRecords.withRecords(Compression.NONE, new SimpleRecord("payload".getBytes))))))
+          .iterator))
+      .setAcks(1.toShort)
+      .setTimeoutMs(5000))
+      .build(ApiKeys.PRODUCE.latestVersion)
+    val request = buildRequest(produceRequest)
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[ProduceResponse](request)
+    val codeByTopic = response.data.responses.asScala.map { tr =>
+      tr.name -> Errors.forCode(tr.partitionResponses.asScala.head.errorCode)
+    }.toMap
+    val backingCode = codeByTopic(backingTopic)
+    val unknownCode = codeByTopic(unknownTopic)
+
+    assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION, unknownCode,
+      "Unknown-topic branch must continue to return UNKNOWN_TOPIC_OR_PARTITION (sanity).")
+    assertEquals(unknownCode, backingCode,
+      "Existence-oracle closure (#255 Produce): a backing-name probe and an unknown-name probe " +
+        "MUST return the same error code so a wildcard-authorized attacker cannot enumerate the " +
+        "declared backing-topic set by observing error-code asymmetry. If this assertion fails, " +
+        "the oracle has reopened.")
     verify(replicaManager, never()).handleProduceAppend(anyLong, anyShort, ArgumentMatchers.eq(false),
       any(), any(), any(), any(), any(), any(), any())
   }
@@ -4022,13 +4092,19 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
-  def testFetchOnBackingTopicIsRejectedWithInvalidTopic(): Unit = {
+  def testFetchOnBackingTopicIsRejectedAsUnknown(): Unit = {
     // Codex HIGH 1. Direct client fetch against a backing topic name would expose raw
     // interleaved records belonging to every logical-topic tenant multiplexed onto the
     // backing partition — both their payloads and their concentration headers. The fetch
-    // path must reject with INVALID_TOPIC_EXCEPTION at the same level as the Produce and
-    // DeleteRecords guards. Internal backing fetches (issued by routeLogicalFetch) bypass
-    // this classification loop, so this guard does not affect legitimate logical fetches.
+    // path must reject at the same level as the Produce and DeleteRecords guards. Internal
+    // backing fetches (issued by routeLogicalFetch) bypass this classification loop, so this
+    // guard does not affect legitimate logical fetches.
+    //
+    // r25 BLOCKER #255: prior to this commit the rejection used INVALID_TOPIC_EXCEPTION, which
+    // a wildcard-authorized attacker could distinguish from the unknown-topic branch's
+    // UNKNOWN_TOPIC_OR_PARTITION — a backing-topic existence oracle. Collapse both branches to
+    // UNKNOWN_TOPIC_OR_PARTITION. See testFetchBackingReturnsSameErrorAsUnknownTopic for the
+    // discriminator and KafkaApis.scala:1200-1212 for the rationale.
     val backingTopic = "backing-topic"
     val backingTopicId = Uuid.randomUuid()
     addTopicToMetadataCache(backingTopic, numPartitions = 1, topicId = backingTopicId)
@@ -4059,9 +4135,80 @@ class KafkaApisTest extends Logging {
     val responseData = response.responseData(metadataCache.topicIdsToNames(), ApiKeys.FETCH.latestVersion)
     val partitionData = responseData.get(backingTip.topicPartition)
     assertNotNull(partitionData, "response must contain an entry for the rejected backing TIP")
-    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, partitionData.errorCode,
-      "direct fetch on a backing topic must be rejected with INVALID_TOPIC_EXCEPTION")
+    assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION.code, partitionData.errorCode,
+      "r25 BLOCKER #255: direct fetch on a backing topic must be rejected with " +
+        "UNKNOWN_TOPIC_OR_PARTITION (same as the unknown-topic branch) so the response " +
+        "cannot be used as a backing-existence oracle.")
     // ReplicaManager must never see the backing-topic fetch — the guard short-circuits it.
+    verify(replicaManager, never()).fetchMessages(
+      any[FetchParams], any[Seq[(TopicIdPartition, FetchRequest.PartitionData)]],
+      any[ReplicaQuota], any[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]())
+  }
+
+  @Test
+  def testFetchBackingReturnsSameErrorAsUnknownTopic(): Unit = {
+    // r25 BLOCKER #255 — explicit oracle-closure discriminator (Fetch branch). The classifier
+    // loop in handleFetchRequest is keyed on the resolved topic name (after topic-ID resolution
+    // for v13+); both a backing name and an unknown name should reach the same error code so
+    // the response is not a backing-existence oracle. Two probes in one FetchRequest, assert
+    // the codes match. Without the #255 fix backing returned INVALID_TOPIC_EXCEPTION and
+    // unknown returned UNKNOWN_TOPIC_OR_PARTITION — this assertion would fail.
+    val backingTopic = "backing-r25-255-fetch"
+    val unknownTopic = "definitely-does-not-exist-r25-255-fetch"
+    val backingTopicId = Uuid.randomUuid()
+    val unknownTopicId = Uuid.randomUuid()
+    addTopicToMetadataCache(backingTopic, numPartitions = 1, topicId = backingTopicId)
+    // Unknown topic intentionally NOT added to metadataCache.
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+    when(concentrationKernel.isBackingTopic(unknownTopic)).thenReturn(false)
+    when(concentrationKernel.isLogicalTopic(unknownTopic)).thenReturn(false)
+
+    val backingTip = new TopicIdPartition(backingTopicId, new TopicPartition(backingTopic, 0))
+    val unknownTip = new TopicIdPartition(unknownTopicId, new TopicPartition(unknownTopic, 0))
+    val fetchDataBuilder = new util.LinkedHashMap[TopicPartition, FetchRequest.PartitionData]()
+    fetchDataBuilder.put(backingTip.topicPartition,
+      new FetchRequest.PartitionData(backingTip.topicId, 0L, 0L, 1_000_000, Optional.empty()))
+    fetchDataBuilder.put(unknownTip.topicPartition,
+      new FetchRequest.PartitionData(unknownTip.topicId, 0L, 0L, 1_000_000, Optional.empty()))
+    val fetchData = new util.LinkedHashMap[TopicIdPartition, FetchRequest.PartitionData]()
+    fetchData.put(backingTip, new FetchRequest.PartitionData(backingTip.topicId, 0L, 0L, 1_000_000, Optional.empty()))
+    fetchData.put(unknownTip, new FetchRequest.PartitionData(unknownTip.topicId, 0L, 0L, 1_000_000, Optional.empty()))
+    val fetchMetadata = new JFetchMetadata(0, 0)
+    val fetchContext = new FullFetchContext(time, new FetchSessionCacheShard(1000, 100),
+      fetchMetadata, fetchData, false, false)
+    when(fetchManager.newContext(
+      any[Short], any[JFetchMetadata], any[Boolean],
+      any[util.Map[TopicIdPartition, FetchRequest.PartitionData]],
+      any[util.List[TopicIdPartition]], any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val fetchRequest = new FetchRequest.Builder(ApiKeys.FETCH.latestVersion,
+      ApiKeys.FETCH.latestVersion, -1, -1, 100, 0, fetchDataBuilder).build()
+    val request = buildRequest(fetchRequest)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleFetchRequest(request)
+
+    val response = verifyNoThrottling[FetchResponse](request)
+    // r25 #255 Fetch discriminator: at Fetch v13+ the response is keyed by topic-id resolved
+    // against a topicNames map. metadataCache.topicIdsToNames() omits the unknown topic's id
+    // (it was intentionally not registered), so decoding via that map would silently drop the
+    // unknown entry — making `responseData.get(unknownTip.topicPartition)` null and masking
+    // the discriminator. The classifier itself sees both names (we constructed the
+    // FullFetchContext with explicit TopicIdPartitions carrying both names); we only need to
+    // hand the decoder a map that surfaces both responses so we can compare their codes.
+    val decodeTopicNames = new util.HashMap[Uuid, String]()
+    decodeTopicNames.put(backingTopicId, backingTopic)
+    decodeTopicNames.put(unknownTopicId, unknownTopic)
+    val responseData = response.responseData(decodeTopicNames, ApiKeys.FETCH.latestVersion)
+    val backingCode = Errors.forCode(responseData.get(backingTip.topicPartition).errorCode)
+    val unknownCode = Errors.forCode(responseData.get(unknownTip.topicPartition).errorCode)
+
+    assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION, unknownCode,
+      "Unknown-topic branch must continue to return UNKNOWN_TOPIC_OR_PARTITION (sanity).")
+    assertEquals(unknownCode, backingCode,
+      "Existence-oracle closure (#255 Fetch): a backing-name probe and an unknown-name probe " +
+        "MUST return the same error code. If this assertion fails, the oracle has reopened.")
     verify(replicaManager, never()).fetchMessages(
       any[FetchParams], any[Seq[(TopicIdPartition, FetchRequest.PartitionData)]],
       any[ReplicaQuota], any[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]())
@@ -5600,10 +5747,16 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
-  def testListOffsetsOnBackingTopicReturnsInvalidTopicException(): Unit = {
+  def testListOffsetsOnBackingTopicReturnsUnknownTopicOrPartition(): Unit = {
     // Symmetric with the produce path: a stock client must never address the backing topic by
     // name. ListOffsets on a backing topic would return offsets that interleave records from
     // every logical topic mapped to that backing — meaningless to any single consumer.
+    //
+    // r25 BLOCKER #255: prior to this commit the rejection used INVALID_TOPIC_EXCEPTION, which
+    // a wildcard-authorized attacker could distinguish from the unknown-topic branch's
+    // UNKNOWN_TOPIC_OR_PARTITION — a backing-topic existence oracle. Collapse both branches to
+    // UNKNOWN_TOPIC_OR_PARTITION. See testListOffsetsBackingReturnsSameErrorAsUnknownTopic for
+    // the discriminator and KafkaApis.scala:1556-1562 for the rationale.
     val backingTopic = "concentrated"
     addTopicToMetadataCache(backingTopic, numPartitions = 4)
     when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
@@ -5625,10 +5778,82 @@ class KafkaApisTest extends Logging {
     val response = verifyNoThrottling[ListOffsetsResponse](request)
     val partitionData = response.topics.asScala.find(_.name == backingTopic).get
       .partitions.asScala.head
-    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, partitionData.errorCode)
+    assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION.code, partitionData.errorCode,
+      "r25 BLOCKER #255: ListOffsets on backing must return UNKNOWN_TOPIC_OR_PARTITION (same " +
+        "as the unknown-topic branch) so the response cannot be used as a backing-existence oracle.")
 
     verify(replicaManager, never()).fetchOffset(any(), any(), any(), anyInt, any(), anyInt, anyShort,
       any(), any(), anyInt)
+  }
+
+  @Test
+  def testListOffsetsBackingReturnsSameErrorAsUnknownTopic(): Unit = {
+    // r25 BLOCKER #255 — explicit oracle-closure discriminator (ListOffsets branch). Same
+    // pattern as #245's testOffsetCommitBackingReturnsSameErrorAsUnknownTopic and #253's
+    // AddPartitionsToTxn companion. Two probes (backing-name + unknown-name) MUST return the
+    // same error code. Without the #255 fix backing returned INVALID_TOPIC_EXCEPTION and the
+    // unknown branch returned UNKNOWN_TOPIC_OR_PARTITION via replicaManager.fetchOffset.
+    val backingTopic = "backing-r25-255-listoffsets"
+    val unknownTopic = "definitely-does-not-exist-r25-255-listoffsets"
+    addTopicToMetadataCache(backingTopic, numPartitions = 1)
+    // unknownTopic intentionally not in metadata cache.
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+    when(concentrationKernel.isBackingTopic(unknownTopic)).thenReturn(false)
+    when(concentrationKernel.isLogicalTopic(unknownTopic)).thenReturn(false)
+    // The unknown branch reaches replicaManager.fetchOffset which is expected to return
+    // UNKNOWN_TOPIC_OR_PARTITION. Stub the callback to invoke the response handler with that code.
+    when(replicaManager.fetchOffset(
+      ArgumentMatchers.any[Seq[ListOffsetsTopic]](),
+      ArgumentMatchers.eq(Set.empty[TopicPartition]),
+      ArgumentMatchers.any[IsolationLevel](),
+      ArgumentMatchers.anyInt(),
+      ArgumentMatchers.any[String](),
+      ArgumentMatchers.anyInt(),
+      ArgumentMatchers.anyShort(),
+      ArgumentMatchers.any[(Errors, ListOffsetsPartition) => ListOffsetsPartitionResponse](),
+      ArgumentMatchers.any[List[ListOffsetsTopicResponse] => Unit](),
+      ArgumentMatchers.anyInt()
+    )).thenAnswer { (invocation: org.mockito.invocation.InvocationOnMock) =>
+      val callback = invocation.getArgument[List[ListOffsetsTopicResponse] => Unit](8)
+      val partResp = new ListOffsetsPartitionResponse()
+        .setPartitionIndex(0)
+        .setErrorCode(Errors.UNKNOWN_TOPIC_OR_PARTITION.code)
+        .setOffset(ListOffsetsResponse.UNKNOWN_OFFSET)
+        .setTimestamp(ListOffsetsResponse.UNKNOWN_TIMESTAMP)
+      callback(List(new ListOffsetsTopicResponse().setName(unknownTopic).setPartitions(List(partResp).asJava)))
+    }
+
+    val targetTimes = List(
+      new ListOffsetsTopic()
+        .setName(backingTopic)
+        .setPartitions(List(
+          new ListOffsetsPartition().setPartitionIndex(0).setTimestamp(ListOffsetsRequest.LATEST_TIMESTAMP)
+        ).asJava),
+      new ListOffsetsTopic()
+        .setName(unknownTopic)
+        .setPartitions(List(
+          new ListOffsetsPartition().setPartitionIndex(0).setTimestamp(ListOffsetsRequest.LATEST_TIMESTAMP)
+        ).asJava)
+    ).asJava
+    val listOffsetRequest = ListOffsetsRequest.Builder.forConsumer(true, IsolationLevel.READ_UNCOMMITTED)
+      .setTargetTimes(targetTimes).build()
+    val request = buildRequest(listOffsetRequest)
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleListOffsetRequest(request)
+
+    val response = verifyNoThrottling[ListOffsetsResponse](request)
+    val byTopic = response.topics.asScala.map(t => t.name -> Errors.forCode(t.partitions.asScala.head.errorCode)).toMap
+    val backingCode = byTopic(backingTopic)
+    val unknownCode = byTopic(unknownTopic)
+
+    assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION, unknownCode,
+      "Unknown-topic branch must continue to return UNKNOWN_TOPIC_OR_PARTITION (sanity).")
+    assertEquals(unknownCode, backingCode,
+      "Existence-oracle closure (#255 ListOffsets): a backing-name probe and an unknown-name " +
+        "probe MUST return the same error code. If this assertion fails, the oracle has reopened.")
   }
 
   @Test
@@ -9572,13 +9797,22 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
-  def testHandleShareFetchOnBackingTopicIsRejectedWithInvalidTopic(): Unit = {
+  def testHandleShareFetchOnBackingTopicIsRejectedAsUnknown(): Unit = {
     // r19 ADV-A BLOCKER #136: a backing topic's physical log multiplexes records from N
     // logical topics; demux happens in LogicalFetchTranslator on the regular Fetch path.
     // SharePartitionManager does not apply LogicalFetchTranslator, so a share-fetch on the
     // backing name would deliver raw interleaved records (with ConcentrationHeaders) — a
-    // cross-tenant payload leak. The handler must reject with INVALID_TOPIC_EXCEPTION at
-    // the same level as Produce (KafkaApis.scala:553) and Fetch (KafkaApis.scala:1169).
+    // cross-tenant payload leak. The handler must reject at the same level as Produce
+    // (KafkaApis.scala:582) and Fetch (KafkaApis.scala:1208).
+    //
+    // r25 BLOCKER #256: prior to this commit the rejection used INVALID_TOPIC_EXCEPTION, which
+    // a wildcard-authorized attacker could distinguish from the unknown-topic branch's
+    // UNKNOWN_TOPIC_OR_PARTITION — a backing-topic existence oracle (sibling of #255 for the
+    // share path). Collapse the backing branch to UNKNOWN_TOPIC_OR_PARTITION; the logical-topic
+    // branch deliberately remains INVALID_TOPIC_EXCEPTION (logical names are public via
+    // METADATA, so leak-distinguishing logical from unknown is harmless and clients need the
+    // fatal-non-retriable signal to fail fast on a v1 logical share-fetch). See
+    // testShareFetchBackingReturnsSameErrorAsUnknownTopic for the discriminator.
     val backingTopic = "backing-topic"
     val backingTopicId = Uuid.randomUuid()
     metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
@@ -9624,19 +9858,95 @@ class KafkaApisTest extends Logging {
     assertEquals(1, fetchResult.size)
     val partitionData = fetchResult.getOrElse(backingTip, null)
     assertNotNull(partitionData, "response must contain an entry for the rejected backing TIP")
-    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, partitionData.errorCode,
-      "share-fetch on a backing topic must be rejected with INVALID_TOPIC_EXCEPTION")
+    assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION.code, partitionData.errorCode,
+      "r25 BLOCKER #256: share-fetch on a backing topic must be rejected with " +
+        "UNKNOWN_TOPIC_OR_PARTITION (same as the unknown-topic branch) so the response " +
+        "cannot be used as a backing-existence oracle.")
     // SharePartitionManager must never see the backing-topic fetch — the guard short-circuits.
     verify(sharePartitionManager, never()).fetchMessages(any(), any(), any(), any())
   }
 
   @Test
-  def testHandleShareAcknowledgeOnBackingTopicIsRejectedWithInvalidTopic(): Unit = {
+  def testShareFetchBackingReturnsSameErrorAsUnknownTopic(): Unit = {
+    // r25 BLOCKER #256 — explicit oracle-closure discriminator (ShareFetch branch). Two probes
+    // in one share-fetch (backing-name + unknown-name) MUST return the same error code so the
+    // response cannot be used as a backing-existence oracle. Without #256 the backing branch
+    // returned INVALID_TOPIC_EXCEPTION while the unknown branch returned UNKNOWN_TOPIC_OR_PARTITION.
+    val backingTopic = "backing-r25-256-share-fetch"
+    val unknownTopic = "definitely-does-not-exist-r25-256-share-fetch"
+    val backingTopicId = Uuid.randomUuid()
+    val unknownTopicId = Uuid.randomUuid()
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
+    addTopicToMetadataCache(backingTopic, 1, topicId = backingTopicId)
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+    when(concentrationKernel.isBackingTopic(unknownTopic)).thenReturn(false)
+    when(concentrationKernel.isLogicalTopic(unknownTopic)).thenReturn(false)
+
+    val backingTip = new TopicIdPartition(backingTopicId, new TopicPartition(backingTopic, 0))
+    val unknownTip = new TopicIdPartition(unknownTopicId, new TopicPartition(unknownTopic, 0))
+    val erroneousPartitions = new util.HashMap[TopicIdPartition, ShareFetchResponseData.PartitionData]()
+    val validPartitions = new util.LinkedHashMap[TopicIdPartition, ShareFetchRequest.SharePartitionData]()
+    validPartitions.put(backingTip, new ShareFetchRequest.SharePartitionData(backingTopicId, partitionMaxBytes))
+    validPartitions.put(unknownTip, new ShareFetchRequest.SharePartitionData(unknownTopicId, partitionMaxBytes))
+    val erroneousAndValidPartitionData = new ErroneousAndValidPartitionData(erroneousPartitions, validPartitions)
+
+    val authorizedTopics: Set[String] = Set(backingTopic, unknownTopic)
+
+    val shareFetchRequestData = new ShareFetchRequestData()
+      .setGroupId("group")
+      .setMemberId(Uuid.ZERO_UUID.toString)
+      .setShareSessionEpoch(0)
+      .setTopics(List(
+        new ShareFetchRequestData.FetchTopic()
+          .setTopicId(backingTopicId)
+          .setPartitions(List(new ShareFetchRequestData.FetchPartition()
+            .setPartitionIndex(0)
+            .setPartitionMaxBytes(partitionMaxBytes)).asJava),
+        new ShareFetchRequestData.FetchTopic()
+          .setTopicId(unknownTopicId)
+          .setPartitions(List(new ShareFetchRequestData.FetchPartition()
+            .setPartitionIndex(0)
+            .setPartitionMaxBytes(partitionMaxBytes)).asJava)).asJava)
+    val shareFetchRequest = new ShareFetchRequest.Builder(shareFetchRequestData).build(ApiKeys.SHARE_FETCH.latestVersion)
+    val request = buildRequest(shareFetchRequest)
+    kafkaApis = createKafkaApis(
+      overrideProperties = Map(
+        ServerConfigs.UNSTABLE_API_VERSIONS_ENABLE_CONFIG -> "true",
+        ShareGroupConfig.SHARE_GROUP_ENABLE_CONFIG -> "true"),
+      )
+
+    val fetchResult: Map[TopicIdPartition, ShareFetchResponseData.PartitionData] =
+      kafkaApis.handleFetchFromShareFetchRequest(
+        request,
+        erroneousAndValidPartitionData,
+        sharePartitionManager,
+        authorizedTopics
+      ).get()
+
+    val backingCode = Errors.forCode(fetchResult(backingTip).errorCode)
+    val unknownCode = Errors.forCode(fetchResult(unknownTip).errorCode)
+
+    assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION, unknownCode,
+      "Unknown-topic branch must continue to return UNKNOWN_TOPIC_OR_PARTITION (sanity).")
+    assertEquals(unknownCode, backingCode,
+      "Existence-oracle closure (#256 ShareFetch): a backing-name probe and an unknown-name " +
+        "probe MUST return the same error code. If this assertion fails, the oracle has reopened.")
+    verify(sharePartitionManager, never()).fetchMessages(any(), any(), any(), any())
+  }
+
+  @Test
+  def testHandleShareAcknowledgeOnBackingTopicIsRejectedAsUnknown(): Unit = {
     // r19 ADV-A BLOCKER #136 (ack side): symmetric with the share-fetch backing guard.
     // Acking a backing-topic offset would bind the share group's per-record state to backing
     // offsets that span multiple tenants, corrupting acquisition tracking for everyone sharing
-    // that backing. Reject as INVALID_TOPIC_EXCEPTION (non-retriable) at the same level as the
-    // share-fetch guard, before SharePartitionManager.acknowledge ever sees the request.
+    // that backing. Reject at the same level as the share-fetch guard, before
+    // SharePartitionManager.acknowledge ever sees the request.
+    //
+    // r25 BLOCKER #256: prior to this commit the rejection used INVALID_TOPIC_EXCEPTION, which
+    // a wildcard-authorized attacker could distinguish from the unknown-topic branch's
+    // UNKNOWN_TOPIC_OR_PARTITION — a backing-topic existence oracle. Collapse to
+    // UNKNOWN_TOPIC_OR_PARTITION (logical branch stays INVALID_TOPIC_EXCEPTION — public name).
+    // See testShareAcknowledgeBackingReturnsSameErrorAsUnknownTopic for the discriminator.
     val backingTopic = "backing-topic"
     val backingTopicId = Uuid.randomUuid()
     metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
@@ -9670,8 +9980,62 @@ class KafkaApisTest extends Logging {
     assertEquals(1, ackResult.size)
     val partitionData = ackResult.getOrElse(backingTip, null)
     assertNotNull(partitionData, "ack response must contain an entry for the rejected backing TIP")
-    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, partitionData.errorCode,
-      "share-acknowledge on a backing topic must be rejected with INVALID_TOPIC_EXCEPTION")
+    assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION.code, partitionData.errorCode,
+      "r25 BLOCKER #256: share-acknowledge on a backing topic must be rejected with " +
+        "UNKNOWN_TOPIC_OR_PARTITION (same as the unknown-topic branch) so the response " +
+        "cannot be used as a backing-existence oracle.")
+    verify(sharePartitionManager, never()).acknowledge(any(), any(), any())
+  }
+
+  @Test
+  def testShareAcknowledgeBackingReturnsSameErrorAsUnknownTopic(): Unit = {
+    // r25 BLOCKER #256 — explicit oracle-closure discriminator (ShareAcknowledge branch). Two
+    // probes (backing-name + unknown-name) in one share-ack call MUST return the same error
+    // code. Without #256 the backing branch returned INVALID_TOPIC_EXCEPTION while the unknown
+    // branch returned UNKNOWN_TOPIC_OR_PARTITION.
+    val backingTopic = "backing-r25-256-share-ack"
+    val unknownTopic = "definitely-does-not-exist-r25-256-share-ack"
+    val backingTopicId = Uuid.randomUuid()
+    val unknownTopicId = Uuid.randomUuid()
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
+    addTopicToMetadataCache(backingTopic, 1, topicId = backingTopicId)
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+    when(concentrationKernel.isBackingTopic(unknownTopic)).thenReturn(false)
+    when(concentrationKernel.isLogicalTopic(unknownTopic)).thenReturn(false)
+
+    val backingTip = new TopicIdPartition(backingTopicId, new TopicPartition(backingTopic, 0))
+    val unknownTip = new TopicIdPartition(unknownTopicId, new TopicPartition(unknownTopic, 0))
+    val acknowledgementData = mutable.Map[TopicIdPartition, util.List[ShareAcknowledgementBatch]]()
+    acknowledgementData += (backingTip -> util.Arrays.asList(
+      new ShareAcknowledgementBatch(0, 9, Collections.singletonList(1.toByte))))
+    acknowledgementData += (unknownTip -> util.Arrays.asList(
+      new ShareAcknowledgementBatch(0, 9, Collections.singletonList(1.toByte))))
+
+    val authorizedTopics: Set[String] = Set(backingTopic, unknownTopic)
+    val erroneous = mutable.Map[TopicIdPartition, ShareAcknowledgeResponseData.PartitionData]()
+
+    kafkaApis = createKafkaApis(
+      overrideProperties = Map(
+        ServerConfigs.UNSTABLE_API_VERSIONS_ENABLE_CONFIG -> "true",
+        ShareGroupConfig.SHARE_GROUP_ENABLE_CONFIG -> "true"),
+      )
+    val ackResult = kafkaApis.handleAcknowledgements(
+      acknowledgementData,
+      erroneous,
+      sharePartitionManager,
+      authorizedTopics,
+      "group",
+      Uuid.randomUuid().toString
+    ).get()
+
+    val backingCode = Errors.forCode(ackResult(backingTip).errorCode)
+    val unknownCode = Errors.forCode(ackResult(unknownTip).errorCode)
+
+    assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION, unknownCode,
+      "Unknown-topic branch must continue to return UNKNOWN_TOPIC_OR_PARTITION (sanity).")
+    assertEquals(unknownCode, backingCode,
+      "Existence-oracle closure (#256 ShareAcknowledge): a backing-name probe and an unknown-name " +
+        "probe MUST return the same error code. If this assertion fails, the oracle has reopened.")
     verify(sharePartitionManager, never()).acknowledge(any(), any(), any())
   }
 
