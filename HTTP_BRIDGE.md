@@ -201,6 +201,8 @@ The bridge has **no per-request authentication in v1.** Every inbound HTTP reque
 
 The startup WARN at `BrokerServer.scala:656` repeats the headline so it cannot be missed in operator logs. If you find yourself silencing the WARN before doing the three steps above, you are configuring the bridge wrong.
 
+**Availability is a separate threat dimension and the bridge does not protect it per source.** The SSE/WS concurrent-stream caps (`http.bridge.max.concurrent.sse.streams`, `http.bridge.max.concurrent.ws.subscriptions`) are global counters, not per-IP. The broker's request-quota bucket is also effectively shared, because every bridge request runs as `User:ANONYMOUS` — all bridge traffic competes for one principal's quota. A single misbehaving caller can saturate either dimension and starve every other client of the bridge. Per-source rate limiting and per-IP connection counting are the fronting reverse proxy's responsibility — the same proxy that performs authentication in guardrail #2 above. Do not expose the bridge port without one.
+
 Per-request authentication (a real principal derived from a client cert, JWT, or SASL handshake on the HTTP path) is a follow-up item, explicitly out of scope for v1.
 
 ---

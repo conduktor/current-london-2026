@@ -25,6 +25,7 @@ import org.eclipse.jetty.websocket.api.StatusCode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Objects;
 import java.util.concurrent.Executor;
@@ -297,16 +298,33 @@ public final class KafkaWebSocketEndpoint implements Session.Listener.AutoDemand
         }
     }
 
-    /** Close reason strings are limited to 123 bytes by RFC 6455. Trim defensively. */
-    private static String truncateReason(String reason) {
+    /**
+     * RFC 6455 §5.5.1 caps the close-frame reason at 123 UTF-8 bytes. We trim more defensively at
+     * {@value #MAX_REASON_BYTES} to leave headroom. Every caller today passes ASCII (parser literals,
+     * {@code Errors.name()}, the Wave 6 {@code sanitizeShortPreview} which ?-substitutes non-ASCII),
+     * so this never trims for the current call set. The byte-budget walk is for future Unicode
+     * callers: a {@code String.length()}-based trim would cut a non-BMP code point into 1-3 of its
+     * 4 UTF-8 bytes, and Jetty's writer would either reject the frame or emit a payload that fails
+     * RFC 6455 §8.1's UTF-8 validity requirement on the peer side.
+     */
+    static String truncateReason(String reason) {
         if (reason == null) {
             return "";
         }
-        if (reason.length() <= 100) {
+        byte[] bytes = reason.getBytes(StandardCharsets.UTF_8);
+        if (bytes.length <= MAX_REASON_BYTES) {
             return reason;
         }
-        return reason.substring(0, 100);
+        int limit = MAX_REASON_BYTES;
+        // Step back over UTF-8 continuation bytes (10xxxxxx) so the kept prefix ends at a code-point
+        // boundary. Worst case is 3 steps back (4-byte code point with 3 continuation bytes).
+        while (limit > 0 && (bytes[limit] & 0xC0) == 0x80) {
+            limit--;
+        }
+        return new String(bytes, 0, limit, StandardCharsets.UTF_8);
     }
+
+    static final int MAX_REASON_BYTES = 100;
 
     /**
      * Adapter that lets the streamer write to the Jetty Session without depending on Jetty types.

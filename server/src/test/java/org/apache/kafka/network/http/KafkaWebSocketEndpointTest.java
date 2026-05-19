@@ -31,6 +31,7 @@ import org.junit.jupiter.api.Test;
 
 import java.net.SocketAddress;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -43,6 +44,7 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -557,5 +559,78 @@ class KafkaWebSocketEndpointTest {
         @Override public void setMaxOutgoingFrames(int maxOutgoingFrames) {
             this.maxOutgoingFrames = maxOutgoingFrames;
         }
+    }
+
+    // ---- truncateReason: RFC 6455 §5.5.1 byte budget ----
+
+    @Test
+    void truncateReasonReturnsEmptyForNull() {
+        assertEquals("", KafkaWebSocketEndpoint.truncateReason(null));
+    }
+
+    @Test
+    void truncateReasonPassesShortAsciiThrough() {
+        String reason = "fetch dispatch failed";
+        assertEquals(reason, KafkaWebSocketEndpoint.truncateReason(reason));
+    }
+
+    @Test
+    void truncateReasonCapsLongAsciiAtByteBudget() {
+        String reason = "x".repeat(KafkaWebSocketEndpoint.MAX_REASON_BYTES + 50);
+        String truncated = KafkaWebSocketEndpoint.truncateReason(reason);
+
+        assertTrue(truncated.getBytes(StandardCharsets.UTF_8).length <= KafkaWebSocketEndpoint.MAX_REASON_BYTES,
+            "trimmed reason must fit in " + KafkaWebSocketEndpoint.MAX_REASON_BYTES + " UTF-8 bytes");
+        assertTrue(reason.startsWith(truncated), "trimmed reason must be a prefix of the original");
+    }
+
+    @Test
+    void truncateReasonTrimsAtCodePointBoundaryUnderMultiByteUnicode() {
+        // Each "🎉" is U+1F389, a non-BMP code point encoding to 4 UTF-8 bytes (and 2 Java chars via
+        // surrogate pair). A String.length() < 123 trim — the previous implementation — could stop in the
+        // middle of either the surrogate pair (illegal Java string) or the 4-byte UTF-8 sequence
+        // (illegal payload per RFC 6455 §8.1). The byte-budget walk must land at a code-point boundary.
+        StringBuilder builder = new StringBuilder();
+        for (int i = 0; i < 80; i++) {
+            builder.append("🎉");
+        }
+        String reason = builder.toString();
+        // Sanity: input is well over the budget.
+        assertTrue(reason.getBytes(StandardCharsets.UTF_8).length > KafkaWebSocketEndpoint.MAX_REASON_BYTES);
+
+        String truncated = KafkaWebSocketEndpoint.truncateReason(reason);
+        byte[] truncatedBytes = truncated.getBytes(StandardCharsets.UTF_8);
+
+        assertTrue(truncatedBytes.length <= KafkaWebSocketEndpoint.MAX_REASON_BYTES,
+            "trimmed reason must fit in " + KafkaWebSocketEndpoint.MAX_REASON_BYTES + " UTF-8 bytes; was "
+                + truncatedBytes.length);
+        // Re-decoding must not have introduced replacement characters — proof we landed on a boundary.
+        assertFalse(truncated.contains("�"),
+            "byte-budget trim must land on a code-point boundary (no U+FFFD substitution)");
+        assertTrue(reason.startsWith(truncated), "trimmed reason must be a prefix of the original");
+        // For 4-byte code points and a 100-byte budget, the resulting prefix should contain
+        // floor(100 / 4) = 25 emoji = 50 Java chars.
+        assertEquals(25 * 2, truncated.length(),
+            "100-byte budget at 4 UTF-8 bytes/code point should keep 25 code points");
+    }
+
+    @Test
+    void truncateReasonHandlesMixedAsciiAndMultiByteAtBoundary() {
+        // Build a reason where the budget falls in the middle of a 3-byte sequence (CJK character "中"
+        // = 0xE4 0xB8 0xAD). 99 ASCII bytes followed by one "中" puts byte 100 (the budget) on the
+        // continuation 0xB8 — the walk must step back 2 bytes to keep 99 ASCII chars and drop the
+        // partial 中 entirely.
+        String reason = "a".repeat(99) + "中" + "tail";
+        byte[] originalBytes = reason.getBytes(StandardCharsets.UTF_8);
+        assertTrue(originalBytes.length > KafkaWebSocketEndpoint.MAX_REASON_BYTES);
+
+        String truncated = KafkaWebSocketEndpoint.truncateReason(reason);
+        byte[] truncatedBytes = truncated.getBytes(StandardCharsets.UTF_8);
+
+        assertTrue(truncatedBytes.length <= KafkaWebSocketEndpoint.MAX_REASON_BYTES);
+        assertFalse(truncated.contains("�"));
+        assertEquals(99, truncatedBytes.length, "budget walk should drop the partial 中 entirely");
+        assertNotEquals("中", truncated.substring(truncated.length() - 1),
+            "the partial 3-byte CJK character must not survive the trim");
     }
 }

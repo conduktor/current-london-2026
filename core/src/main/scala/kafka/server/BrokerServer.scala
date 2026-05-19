@@ -638,6 +638,13 @@ class BrokerServer(
       //   3. Author ACLs that grant User:ANONYMOUS exactly the topic operations the bridge is meant to expose, and
       //      nothing else. A default-allow authorizer (or no authorizer at all) leaves every topic open.
       //
+      // Availability is a separate threat dimension and the bridge does not protect it per-source. The SSE/WS
+      // concurrent-stream caps (http.bridge.max.concurrent.sse.streams, http.bridge.max.concurrent.ws.subscriptions)
+      // are global counters; the broker-side request quota bucket is also shared because every bridge request runs
+      // as User:ANONYMOUS. A single misbehaving caller can saturate either and starve every other client. Per-source
+      // rate limiting and per-IP connection counting are the fronting proxy's responsibility — the same proxy that
+      // performs authentication in step (2) above. Do not expose the bridge port without one.
+      //
       // Per-request authentication is a follow-up item, not a v1 deliverable.
       if (config.httpBridgeEnabled) {
         val submitter = new KafkaApiRequestSubmitter(
