@@ -368,6 +368,43 @@ object SocketServer {
     Utils.closeQuietly(channel.socket, "channel socket")
     Utils.closeQuietly(channel, "channel")
   }
+
+  /**
+   * Builds the F-INT-LOG line emitted once per listener at Acceptor construction. Shape pinned
+   * to the resolution-matrix examples in `server/.../iouring/README.md` lines 127-130:
+   *
+   *   Listener PLAINTEXT://0.0.0.0:9092 resolved to io_uring backend
+   *   Listener SSL://0.0.0.0:9093 resolved to nio backend (PLAINTEXT-only contract for io_uring v1)
+   *
+   * The trailing PLAINTEXT-only annotation appears only when ALL of these hold:
+   *   - effective backend is nio,
+   *   - listener security protocol is non-PLAINTEXT,
+   *   - and the operator did NOT explicitly pin nio (`socket.selector.implementation=nio`).
+   *
+   * Operator who pinned nio explicitly hasn't been downgraded — adding the io_uring-flavoured
+   * annotation to their log line would be confusing. The annotation is reserved for the
+   * `auto`/`io_uring` request that fell back to nio because of the v1 PLAINTEXT-only contract.
+   *
+   * Wildcard binds (host empty or null) display as `0.0.0.0` to match the README example;
+   * actual IPv6 wildcard binds with explicit `[::]` would carry through verbatim.
+   */
+  private[network] def buildResolvedBackendLogLine(
+      listenerName: String,
+      host: String,
+      port: Int,
+      securityProtocol: SecurityProtocol,
+      requestedBackend: org.apache.kafka.network.iouring.SelectorImplementation,
+      effectiveUsesIoUring: Boolean): String = {
+    val displayHost = if (Utils.isBlank(host)) "0.0.0.0" else host
+    val backend = if (effectiveUsesIoUring) "io_uring" else "nio"
+    val annotation =
+      if (!effectiveUsesIoUring
+          && securityProtocol != SecurityProtocol.PLAINTEXT
+          && requestedBackend != org.apache.kafka.network.iouring.SelectorImplementation.NIO) {
+        " (PLAINTEXT-only contract for io_uring v1)"
+      } else ""
+    s"Listener $listenerName://$displayHost:$port resolved to $backend backend$annotation"
+  }
 }
 
 object DataPlaneAcceptor {
@@ -545,13 +582,15 @@ private[kafka] abstract class Acceptor(val socketServer: SocketServer,
   // listener. Without this line a wildcard "io_uring auto" config can silently fall through
   // to NIO (e.g. kernel without io_uring, or a non-PLAINTEXT listener that v1 forbids on the
   // io_uring path) and operators have no signal that a tuning intent was downgraded —
-  // every existing log line refers to the listener by name only. socketSelectorImplementationFor
-  // honors the per-listener `listener.name.<name>.socket.selector.implementation` override and
-  // falls back to the broker-wide value, so this log shows the requested view the resolver
-  // actually saw for this listener — not just the broker-wide default.
-  info(s"Resolved I/O backend for listener ${endPoint.listenerName} (${endPoint.securityProtocol}): " +
-    s"${if (usesIoUring) "io_uring" else "nio"} " +
-    s"(requested=${config.socketSelectorImplementationFor(endPoint.listenerName).configValue()})")
+  // every existing log line refers to the listener by name only. Shape pinned to the README
+  // resolution-matrix examples by SocketServer.buildResolvedBackendLogLine (covered by
+  // SocketServerFIntLogTest). socketSelectorImplementationFor honors the per-listener
+  // `listener.name.<name>.socket.selector.implementation` override and falls back to the
+  // broker-wide value, so the annotation logic sees the request view actually applied to
+  // this listener.
+  info(SocketServer.buildResolvedBackendLogLine(
+    endPoint.listenerName.value, endPoint.host, localPort, endPoint.securityProtocol,
+    config.socketSelectorImplementationFor(endPoint.listenerName), effectiveUsesIoUring))
 
   private[network] val processors = new ArrayBuffer[Processor]()
   // Build the metric name explicitly in order to keep the existing name for compatibility
