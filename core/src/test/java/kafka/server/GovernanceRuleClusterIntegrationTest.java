@@ -48,6 +48,7 @@ import java.util.Properties;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -274,5 +275,96 @@ public class GovernanceRuleClusterIntegrationTest {
             assertTrue(server.governanceBootstrap() != null,
                 "BrokerServer must instantiate the governanceBootstrap regardless of topic presence");
         }
+    }
+
+    /**
+     * Negative-path test for the fail-closed compaction gate
+     * ({@link BrokerServer#requireGovernanceTopicCompactPolicy}). The unit
+     * tests in {@code BrokerServerGovernanceCompactionTest} cover every
+     * branch of the helper in isolation; this test pins the end-to-end wire-
+     * up — that the gate is actually invoked from {@code BrokerServer.startup()}
+     * and that the broker actually refuses to come back up when a real KRaft
+     * cluster has {@code __governance} created with the wrong cleanup policy.
+     *
+     * <p>Without this end-to-end check, a future refactor could silently
+     * disconnect the helper from startup (e.g. dropping the call in
+     * BrokerServer.scala or wrapping it in a swallowed try/catch) and the
+     * unit tests would still pass while the production posture had become
+     * fail-OPEN. Audit task R28 #255.
+     *
+     * <p>Shape: create {@code __governance} with {@code cleanup.policy=delete}
+     * via admin (gate skips when topic is absent at boot, so we must create
+     * it before the restart), shut down broker 0, attempt to restart it,
+     * and assert that the restart throws an {@link IllegalStateException}
+     * whose message names both {@code cleanup.policy} and the topic name —
+     * the exact diagnostic the helper produces. Walking the cause chain is
+     * defensive: depending on where in startup the gate fires, the same
+     * ISE may surface directly or wrapped.
+     */
+    @ClusterTest
+    public void brokerRefusesToRestartWhenGovernanceTopicCleanupPolicyIsNotCompact(
+            ClusterInstance cluster) throws Exception {
+        try (Admin admin = cluster.admin()) {
+            // Create __governance with the WRONG cleanup.policy. RF=3 mirrors
+            // the broker count so every broker is a replica of partition 0,
+            // matching the shape the operator would create in production —
+            // we want the failure to be about cleanup.policy alone, not
+            // about replica placement.
+            NewTopic governance = new NewTopic(GovernanceTopic.NAME, 1, (short) 3)
+                .configs(Map.of(TopicConfig.CLEANUP_POLICY_CONFIG, TopicConfig.CLEANUP_POLICY_DELETE));
+            admin.createTopics(List.of(governance)).all().get();
+            cluster.waitForTopic(GovernanceTopic.NAME, 1);
+        }
+
+        // Shut broker 0 down cleanly. Brokers 1 and 2 stay up — they are
+        // already past the gate (they started before __governance existed,
+        // so the gate saw TopicAbsent and returned silently). This is fine:
+        // the test is about the RESTART path, where the gate sees the
+        // misconfigured topic in the metadata image and refuses to proceed.
+        cluster.shutdownBroker(0);
+
+        // Restarting must throw. BrokerServer.startup() catches every
+        // Throwable, fatals it, shuts down, and re-throws — so the original
+        // IllegalStateException propagates out of startBroker() as-is (the
+        // catch only unwraps ExecutionException, which an ISE is not).
+        Throwable thrown = assertThrows(Throwable.class,
+            () -> cluster.startBroker(0),
+            "broker 0 must refuse to restart when __governance has cleanup.policy=delete");
+
+        // Walk the cause chain to find the gate's diagnostic. We assert the
+        // SHAPE of the message (mentions both 'cleanup.policy' and the
+        // topic name) rather than equality, so the test survives benign
+        // wording tweaks but still fails if the gate is bypassed or replaced
+        // with a different error.
+        IllegalStateException gateFailure = findGateIllegalStateException(thrown);
+        assertNotNull(gateFailure,
+            "expected an IllegalStateException from requireGovernanceTopicCompactPolicy " +
+                "in the cause chain of: " + thrown);
+        String msg = gateFailure.getMessage();
+        assertNotNull(msg, "gate IllegalStateException must carry a non-null diagnostic");
+        assertTrue(msg.contains("cleanup.policy"),
+            "gate diagnostic must mention 'cleanup.policy' — actual: " + msg);
+        assertTrue(msg.contains(GovernanceTopic.NAME),
+            "gate diagnostic must mention the topic name '" + GovernanceTopic.NAME +
+                "' — actual: " + msg);
+    }
+
+    /**
+     * Find the first {@link IllegalStateException} in the cause chain whose
+     * message looks like the compaction gate's diagnostic. We match on
+     * 'cleanup.policy' rather than equality so the predicate is robust to
+     * the gate's long remediation message (audit/round IDs etc.) but still
+     * discriminates against unrelated ISEs that might surface during a
+     * failed startup.
+     */
+    private static IllegalStateException findGateIllegalStateException(Throwable t) {
+        for (Throwable c = t; c != null; c = c.getCause()) {
+            if (c instanceof IllegalStateException && c.getMessage() != null
+                && c.getMessage().contains("cleanup.policy")) {
+                return (IllegalStateException) c;
+            }
+            if (c.getCause() == c) break; // self-referential guard
+        }
+        return null;
     }
 }
