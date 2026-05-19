@@ -78,13 +78,19 @@ public final class KafkaWebSocketEndpoint implements Session.Listener.AutoDemand
     private static final Duration IDLE_TIMEOUT = Duration.ofMinutes(5);
 
     /**
-     * Tight idle timeout enforced from the moment the connection opens until the first valid {@code subscribe}
-     * frame is received. The limiter slot is acquired at the upgrade handshake (before the streamer exists),
-     * so a client that opens the WS, never subscribes, and never speaks would otherwise pin the slot for the
-     * full {@link #IDLE_TIMEOUT} (5 min). 30 seconds is more than enough for a real client to send the first
-     * frame after the upgrade completes; tightening this is the difference between "limiter slot held for 30s
-     * before the connection drops" and "5 min" under an open-and-sit attack pattern. After the subscribe lands
-     * we relax to {@link #IDLE_TIMEOUT} so a healthy stream tolerates the broker's long-poll dead time.
+     * Tight idle timeout enforced from the moment the connection opens until the first <em>positive</em>
+     * credit grant. The limiter slot is acquired at the upgrade handshake (before the streamer exists),
+     * so a client that opens the WS and never speaks — or subscribes with {@code credits=0} and then
+     * never grants flow — would otherwise pin the slot for the full {@link #IDLE_TIMEOUT} (5 min).
+     * 30 seconds is more than enough for a real client to land its subscribe + first credit grant after
+     * the upgrade completes; tightening this is the difference between "limiter slot held for 30s
+     * before the connection drops" and "5 min" under an open-and-sit attack pattern.
+     *
+     * <p>Why gated on credits, not on subscribe arrival: a subscribe-with-credits=0 frame issues no
+     * broker fetch, so it has the same DoS profile as an unopened connection — just a held slot with
+     * no data flowing. Relaxing to {@link #IDLE_TIMEOUT} only once a positive credit grant exists
+     * keeps the "subscribe-zero-then-flow-later" idiom available to a well-behaved client (it has
+     * 30s to grant credit) while denying the slot-pinning escape hatch.
      */
     private static final Duration PRE_SUBSCRIBE_IDLE_TIMEOUT = Duration.ofSeconds(30);
 
@@ -113,6 +119,14 @@ public final class KafkaWebSocketEndpoint implements Session.Listener.AutoDemand
      */
     private final WsStreamLimiter.Token token;
     private final AtomicBoolean released = new AtomicBoolean(false);
+
+    /**
+     * One-shot guard: the idle timeout is relaxed from {@link #PRE_SUBSCRIBE_IDLE_TIMEOUT} to
+     * {@link #IDLE_TIMEOUT} exactly once, when the first positive credit grant arrives (either an
+     * initial {@code subscribe} with non-zero credits, or the first {@code flow} after a zero-credit
+     * subscribe). Subsequent flow grants are no-ops on the timeout.
+     */
+    private final AtomicBoolean idleTimeoutRelaxed = new AtomicBoolean(false);
 
     /**
      * Shared registry of live endpoints owned by the surrounding {@link KafkaHttpServer}. The endpoint
@@ -214,15 +228,12 @@ public final class KafkaWebSocketEndpoint implements Session.Listener.AutoDemand
         streamer = WsStreamer.start(new SessionFrameSink(), submitter, mapper,
             topic, sub.partition(), sub.offset(), sub.maxBytes(), sub.initialCredits(),
             token, httpExecutor);
-        // Relax the idle timeout from the tight pre-subscribe window to the steady-state value. A live stream
-        // can legitimately sit quiet between flow grants while the broker long-polls, so we drop the watchdog
-        // back to IDLE_TIMEOUT here — only AFTER the streamer was constructed, so a constructor failure path
-        // still inherits the tight pre-subscribe cap if Jetty resurfaces this session under any code path that
-        // does not invoke tearDown.
-        Session s = this.session;
-        if (s != null) {
-            s.setIdleTimeout(IDLE_TIMEOUT);
-        }
+        // Relax the idle timeout from the tight pre-subscribe window to the steady-state value ONLY when
+        // the subscribe brings positive initial credits with it. A subscribe-with-credits=0 frame triggers
+        // no broker fetch, so it must stay under the tight 30s watchdog — otherwise it pins the limiter
+        // slot for the full IDLE_TIMEOUT (5 min) with no data flowing. The first positive flow grant in
+        // handleFlowFrame() picks up the relax for the zero-credit-then-flow-later idiom.
+        maybeRelaxIdleTimeout(sub.initialCredits());
     }
 
     private void handleFlowFrame(WsSubscribeMessageParser.WsClientMessage msg) {
@@ -234,6 +245,26 @@ public final class KafkaWebSocketEndpoint implements Session.Listener.AutoDemand
         }
         WsSubscribeMessageParser.WsFlowCommand flow = (WsSubscribeMessageParser.WsFlowCommand) msg;
         streamer.grantCredits(flow.credits());
+        // Picks up the relax for the subscribe-zero-then-flow-later idiom: a well-behaved client that
+        // subscribed with credits=0 has up to PRE_SUBSCRIBE_IDLE_TIMEOUT (30s) to send the first positive
+        // flow grant, at which point the watchdog drops back to IDLE_TIMEOUT for steady-state operation.
+        maybeRelaxIdleTimeout(flow.credits());
+    }
+
+    /**
+     * Relax the idle timeout from {@link #PRE_SUBSCRIBE_IDLE_TIMEOUT} to {@link #IDLE_TIMEOUT} on the
+     * first positive credit grant. Subsequent calls (or any call with non-positive credits) are no-ops.
+     * The CAS ensures the timeout is set exactly once: a benign client that subscribes with credits=10
+     * and then grants 5 more later sets the timeout once and never touches it again, matching the
+     * pre-fix behaviour for that path.
+     */
+    private void maybeRelaxIdleTimeout(int credits) {
+        if (credits > 0 && idleTimeoutRelaxed.compareAndSet(false, true)) {
+            Session s = this.session;
+            if (s != null) {
+                s.setIdleTimeout(IDLE_TIMEOUT);
+            }
+        }
     }
 
     @Override

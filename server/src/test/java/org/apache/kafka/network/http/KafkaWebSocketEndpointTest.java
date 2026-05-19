@@ -249,6 +249,39 @@ class KafkaWebSocketEndpointTest {
     }
 
     @Test
+    void subscribeWithZeroCreditsKeepsTightIdleTimeoutUntilFirstPositiveFlow() {
+        // Wave 40 axis AAA: a Subscribe-with-credits=0 frame triggers no broker fetch — the streamer is
+        // constructed but sends no fetch request and waits for credit. If we relaxed the idle timeout on
+        // subscribe alone, a hostile client could open + subscribe-credits=0 + sit, pinning a limiter slot
+        // for the full IDLE_TIMEOUT (5 min) and turning the 100-slot cap into a 20-conn/min sustained DoS
+        // surface. The contract: PRE_SUBSCRIBE_IDLE_TIMEOUT stays in force until the first positive credit
+        // grant — whether that arrives in the initial subscribe or in a follow-up flow frame. (Flow with
+        // credits <= 0 is rejected upstream by WsSubscribeMessageParser, so the only protocol-legal way to
+        // reach maybeRelaxIdleTimeout from handleFlowFrame is via a positive grant — pin both branches.)
+        WsStreamLimiter.Token token = limiter.tryAcquire();
+        KafkaWebSocketEndpoint endpoint = newEndpoint(token, "orders");
+        endpoint.onWebSocketOpen(session);
+        assertEquals(Duration.ofSeconds(30), session.idleTimeout, "open should arm the tight pre-subscribe window");
+
+        endpoint.onWebSocketText("{\"type\":\"subscribe\",\"partition\":0,\"offset\":0,\"initialCredits\":0}");
+        assertEquals(Duration.ofSeconds(30), session.idleTimeout,
+            "subscribe-with-credits=0 must NOT relax the idle timeout — no broker fetch, slot DoS exposure");
+
+        // First positive credit grant arrives; THIS is when the watchdog drops back to steady-state.
+        endpoint.onWebSocketText("{\"type\":\"flow\",\"credits\":5}");
+        assertEquals(Duration.ofMinutes(5), session.idleTimeout,
+            "first positive flow grant must relax the idle timeout to IDLE_TIMEOUT (5min)");
+
+        // Subsequent positive grants must be no-ops — once relaxed, the CAS is one-shot. A sentinel value
+        // detects an accidental re-fire: if maybeRelaxIdleTimeout runs again it would overwrite the
+        // sentinel back to IDLE_TIMEOUT.
+        session.idleTimeout = Duration.ofMinutes(99);
+        endpoint.onWebSocketText("{\"type\":\"flow\",\"credits\":3}");
+        assertEquals(Duration.ofMinutes(99), session.idleTimeout,
+            "subsequent positive flow grants must not re-set the timeout (CAS is one-shot)");
+    }
+
+    @Test
     void closeReleasesLimiterEvenWithoutSubscribe() {
         // Client opens the WS connection then disconnects before sending any frame. The endpoint
         // must still release the slot it was holding on the limiter — otherwise idle clients
