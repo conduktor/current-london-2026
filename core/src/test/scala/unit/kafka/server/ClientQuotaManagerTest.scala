@@ -501,6 +501,169 @@ class ClientQuotaManagerTest extends BaseClientQuotaManagerTest {
     }
   }
 
+  // ------------------------------------------------------------------------
+  // Multi-tenancy: tenant principals (`__tenant_<id>.<user>`) must NEVER share
+  // a sensor with another tenant just because the operator only configured a
+  // broker-wide client-id quota. See ClientQuotaManager
+  // DefaultQuotaCallback.quotaMetricTags / quotaLimit for the contract.
+  // ------------------------------------------------------------------------
+
+  @Test
+  def testTenantPrincipalsGetDistinctSensorKeysUnderClientIdOnlyQuota(): Unit = {
+    val clientQuotaManager = new ClientQuotaManager(new ClientQuotaManagerConfig(),
+      metrics, QuotaType.PRODUCE, time, "")
+    try {
+      // Operator-style cap on broker-wide client-id `foo` → ClientIdQuotaEnabled mode.
+      clientQuotaManager.updateQuota(
+        None,
+        Some(ClientQuotaManager.ClientIdEntity("foo")),
+        Some(new Quota(500, true))
+      )
+
+      val alice = "__tenant_acme.alice"
+      val bob = "__tenant_beta.bob"
+      maybeRecord(clientQuotaManager, alice, "foo", 100)
+      maybeRecord(clientQuotaManager, bob, "foo", 100)
+
+      val aliceSensor = metrics.getSensor(s"Produce-$alice:foo")
+      val bobSensor = metrics.getSensor(s"Produce-$bob:foo")
+      assertNotNull(aliceSensor, "Tenant acme sensor should exist")
+      assertNotNull(bobSensor, "Tenant beta sensor should exist")
+      assertNotSame(aliceSensor, bobSensor,
+        "Tenant principals reusing the same clientId must NOT share a sensor")
+      // The legacy empty-user sensor shape is the cross-tenant DoS sink —
+      // it must not materialise for tenant principals.
+      assertNull(metrics.getSensor("Produce-:foo"),
+        "Empty-user sensor must not exist when only tenant principals have recorded")
+    } finally {
+      clientQuotaManager.shutdown()
+    }
+  }
+
+  @Test
+  def testTenantPrincipalInheritsBrokerWideClientIdQuota(): Unit = {
+    val clientQuotaManager = new ClientQuotaManager(new ClientQuotaManagerConfig(),
+      metrics, QuotaType.PRODUCE, time, "")
+    try {
+      clientQuotaManager.updateQuota(
+        None,
+        Some(ClientQuotaManager.ClientIdEntity("foo")),
+        Some(new Quota(500, true))
+      )
+
+      val tenantPrincipal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_acme.alice")
+      // The operator's /config/clients/foo=500 must apply to tenant principals
+      // per-tenant. Without the tenant-prefix fallback in quotaLimit, the
+      // forced (sanitizedUser, clientId) tag shape would strand this entry
+      // and the bound would default to Long.MaxValue.
+      assertEquals(500.0, clientQuotaManager.quota(tenantPrincipal, "foo").bound, 0.0,
+        "Tenant principal must inherit the operator's /config/clients/foo cap")
+    } finally {
+      clientQuotaManager.shutdown()
+    }
+  }
+
+  @Test
+  def testTenantPrincipalInheritsDefaultClientIdQuota(): Unit = {
+    val clientQuotaManager = new ClientQuotaManager(new ClientQuotaManagerConfig(),
+      metrics, QuotaType.PRODUCE, time, "")
+    try {
+      // /config/clients/<default> — applies to any clientId.
+      clientQuotaManager.updateQuota(
+        None,
+        Some(ClientQuotaManager.DefaultClientIdEntity),
+        Some(new Quota(400, true))
+      )
+
+      val tenantPrincipal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_acme.alice")
+      assertEquals(400.0, clientQuotaManager.quota(tenantPrincipal, "any-client").bound, 0.0,
+        "Tenant principal must inherit /config/clients/<default>")
+    } finally {
+      clientQuotaManager.shutdown()
+    }
+  }
+
+  @Test
+  def testTenantPrincipalUserClientOverrideBeatsBrokerWideClientId(): Unit = {
+    val clientQuotaManager = new ClientQuotaManager(new ClientQuotaManagerConfig(),
+      metrics, QuotaType.PRODUCE, time, "")
+    try {
+      clientQuotaManager.updateQuota(
+        None,
+        Some(ClientQuotaManager.ClientIdEntity("foo")),
+        Some(new Quota(500, true))
+      )
+      clientQuotaManager.updateQuota(
+        Some(ClientQuotaManager.UserEntity("__tenant_acme.alice")),
+        Some(ClientQuotaManager.ClientIdEntity("foo")),
+        Some(new Quota(300, true))
+      )
+
+      val tenantPrincipal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_acme.alice")
+      // Per-user-client override must beat the broker-wide client-id fallback.
+      assertEquals(300.0, clientQuotaManager.quota(tenantPrincipal, "foo").bound, 0.0,
+        "Per-tenant user-client override must take precedence over /config/clients/foo")
+    } finally {
+      clientQuotaManager.shutdown()
+    }
+  }
+
+  @Test
+  def testTenantPrincipalThrottleDoesNotAffectOtherTenant(): Unit = {
+    val clientQuotaManager = new ClientQuotaManager(new ClientQuotaManagerConfig(),
+      metrics, QuotaType.PRODUCE, time, "")
+    try {
+      clientQuotaManager.updateQuota(
+        None,
+        Some(ClientQuotaManager.ClientIdEntity("foo")),
+        Some(new Quota(500, true))
+      )
+
+      val alice = "__tenant_acme.alice"
+      val bob = "__tenant_beta.bob"
+
+      val aliceThrottle = maybeRecord(clientQuotaManager, alice, "foo",
+        2500 * config.numQuotaSamples)
+      assertTrue(aliceThrottle > 0,
+        s"Tenant acme should be throttled by its own bucket. throttleTimeMs=$aliceThrottle")
+
+      // Tenant beta has recorded nothing; pre-fix it would share alice's
+      // sensor (`Produce-:foo`) and inherit the violation. Post-fix beta's
+      // sensor is distinct (`Produce-__tenant_beta.bob:foo`) and starts empty.
+      val bobThrottle = maybeRecord(clientQuotaManager, bob, "foo", 0)
+      assertEquals(0, bobThrottle,
+        s"Tenant beta must NOT inherit tenant acme's throttle. throttleTimeMs=$bobThrottle")
+    } finally {
+      clientQuotaManager.shutdown()
+    }
+  }
+
+  @Test
+  def testNonTenantPrincipalKeepsLegacyEmptyUserSensorUnderClientIdOnlyQuota(): Unit = {
+    val clientQuotaManager = new ClientQuotaManager(new ClientQuotaManagerConfig(),
+      metrics, QuotaType.PRODUCE, time, "")
+    try {
+      clientQuotaManager.updateQuota(
+        None,
+        Some(ClientQuotaManager.ClientIdEntity("foo")),
+        Some(new Quota(500, true))
+      )
+
+      // Non-tenant principal `alice` (no `__tenant_` prefix) MUST keep the
+      // legacy ("", clientId) tag shape — operators rely on a single
+      // broker-wide bucket for non-tenant traffic.
+      maybeRecord(clientQuotaManager, "alice", "foo", 100)
+      assertNotNull(metrics.getSensor("Produce-:foo"),
+        "Non-tenant principal must still use the legacy empty-user sensor")
+      // And the tenant-shaped sensor must NOT have been created for the
+      // non-tenant principal.
+      assertNull(metrics.getSensor("Produce-alice:foo"),
+        "Non-tenant principal must not get a tenant-style sensor")
+    } finally {
+      clientQuotaManager.shutdown()
+    }
+  }
+
   private case class UserClient(
     user: String,
     clientId: String,

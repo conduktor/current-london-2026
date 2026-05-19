@@ -31,6 +31,7 @@ import org.apache.kafka.common.security.auth.KafkaPrincipal
 import org.apache.kafka.common.utils.{Sanitizer, Time}
 import org.apache.kafka.server.config.ClientQuotaManagerConfig
 import org.apache.kafka.server.quota.{ClientQuotaCallback, ClientQuotaEntity, ClientQuotaType, QuotaType, QuotaUtils, SensorAccess, ThrottleCallback, ThrottledChannel}
+import org.apache.kafka.server.tenant.TenantNamespace
 import org.apache.kafka.server.util.ShutdownableThread
 import org.apache.kafka.network.Session
 
@@ -560,6 +561,24 @@ class ClientQuotaManager(private val config: ClientQuotaManagerConfig,
             // /config/users/<default>/clients/<default>
             quota = overriddenQuotas.get(DefaultUserClientIdQuotaEntity)
           }
+          if (quota == null && sanitizedUser.startsWith(TenantNamespace.PRINCIPAL_PREFIX)) {
+            // Tenant principals always carry a non-empty user tag (see the
+            // early return in {@code quotaMetricTags}), so the standard
+            // ladder above stops at /config/users/<default>/clients/<default>
+            // and the broker-wide /config/clients/<id> entries below are
+            // unreachable for them. Without this extension, an operator's
+            // /config/clients/foo=500 — meant to cap every connection using
+            // clientId=foo — would silently NOT apply to tenant principals,
+            // leaving tenants effectively unbounded. The lookup matches the
+            // /config/clients/<id> and /config/clients/<default> entries
+            // per-tenant: each tenant gets its own bucket with the operator's
+            // intended cap, instead of the pre-fix shared bucket (cross-tenant
+            // DoS).
+            quota = overriddenQuotas.get(KafkaQuotaEntity(None, clientIdEntity))
+            if (quota == null) {
+              quota = overriddenQuotas.get(DefaultClientIdQuotaEntity)
+            }
+          }
         } else if (sanitizedUser.nonEmpty) {
           // /config/users/<user>
           quota = overriddenQuotas.get(KafkaQuotaEntity(userEntity, None))
@@ -599,6 +618,24 @@ class ClientQuotaManager(private val config: ClientQuotaManagerConfig,
     override def quotaResetRequired(quotaType: ClientQuotaType): Boolean = false
 
     def quotaMetricTags(sanitizedUser: String, clientId: String) : Map[String, String] = {
+      // Tenant principals (`__tenant_<id>.<user>`) MUST carry their full identity
+      // in the user tag, regardless of which quota mode the operator has
+      // configured. The standard `quotaTypesEnabled` short-circuits below
+      // collapse the user component to `""` under `NoQuotas` /
+      // `ClientIdQuotaEnabled`, and the multi-level fallback at the bottom of
+      // the `case _` also returns `("", clientId)` when no per-user override
+      // matches. Both paths produce a sensor key of the shape `<quotaType>-:<clientId>`
+      // (see `metricTagsToSensorSuffix`, L375), shared by every principal that
+      // happens to use the same clientId — so two tenants reusing a popular
+      // client name (e.g. `console-producer`) end up on a single rate-limit
+      // bucket and one tenant's burst throttles the other. Bypassing the mode
+      // short-circuits forces a tenant-distinct sensor key. The complementary
+      // fallback in {@code quotaLimit} preserves the operator's
+      // `/config/clients/<id>` cap so a tenant client of that clientId still
+      // gets the intended limit — per-tenant, not globally shared.
+      if (sanitizedUser != null && sanitizedUser.startsWith(TenantNamespace.PRINCIPAL_PREFIX)) {
+        return Map(DefaultTags.User -> sanitizedUser, DefaultTags.ClientId -> clientId)
+      }
       val (userTag, clientIdTag) = quotaTypesEnabled match {
         case QuotaTypes.NoQuotas | QuotaTypes.ClientIdQuotaEnabled =>
           ("", clientId)
