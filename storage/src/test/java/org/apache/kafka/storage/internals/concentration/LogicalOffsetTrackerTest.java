@@ -451,4 +451,39 @@ public class LogicalOffsetTrackerTest {
         tracker.commitBatch(batch);
         assertThrows(IllegalStateException.class, () -> tracker.commitBatch(batch));
     }
+
+    @Test
+    public void restorePartitionMustWaitForOutstandingReservationLock() throws Exception {
+        // r22 BLOCKER #193 regression discriminator. The pre-fix restorePartition skipped the
+        // per-partition lock, so it could mutate startOffset/nextOffset concurrently with a
+        // commitBatchInternal or advanceStartOffset on the same partition — silent torn writes
+        // since the volatile-pair is not atomic. With the fix, restorePartition must serialise on
+        // the same lock the reservation holds: a thread calling restorePartition while another
+        // thread holds the lock (via reserveBatch) must BLOCK until the lock-holder commits or
+        // rolls back. Pre-fix, restorePartition would return immediately, leaving the asserted
+        // post-state unreliable.
+        LogicalOffsetTracker tracker = new LogicalOffsetTracker();
+        Reservation[] batch = tracker.reserveBatch("orders", 0, 3);
+
+        AtomicInteger restoreCompleted = new AtomicInteger(0);
+        Thread restorer = new Thread(() -> {
+            tracker.restorePartition("orders", 0, 0L, 999L);
+            restoreCompleted.incrementAndGet();
+        }, "restorer");
+        restorer.start();
+        // Give the restorer a chance to run. If it ignored the lock (pre-fix behaviour) it would
+        // complete here; with the fix it must wait on s.lock that we still hold via reserveBatch.
+        Thread.sleep(200);
+        assertEquals(0, restoreCompleted.get(),
+            "restorePartition must NOT complete while a reservation holds the partition lock");
+
+        // Release the lock by committing the batch. restorePartition now wins the lock and
+        // overwrites our committed nextOffset of 3 → 999.
+        tracker.commitBatch(batch);
+        restorer.join(2_000);
+        assertEquals(1, restoreCompleted.get(),
+            "restorePartition must complete once the reservation releases the lock");
+        assertEquals(999L, tracker.nextLogicalOffset("orders", 0),
+            "post-restore nextOffset must reflect the restored value (last-writer-wins under lock)");
+    }
 }

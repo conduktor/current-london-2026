@@ -225,8 +225,29 @@ public final class LogicalOffsetTracker {
     }
 
     /**
-     * Direct seeding of partition state, used during recovery from a sidecar or backing-log
-     * scan. The reservation lock is not taken because recovery is single-threaded by contract.
+     * Direct seeding of partition state, used during recovery from a sidecar or backing-log scan
+     * and by {@link ConcentrationKernel#advanceStartOffset} on its rollback path.
+     *
+     * <p>r22 BLOCKER #193: this used to skip locking on the documented assumption that recovery is
+     * single-threaded "by contract." That contract is not enforced anywhere — and the
+     * {@link ConcentrationKernel#advanceStartOffset} path on the DeleteRecords codepath does NOT
+     * consult {@code isBackingReady}, so it can be in-flight against {@code restorePartition}
+     * being called by the leader recoverer on the same partition. The PartitionState's
+     * {@code startOffset} and {@code nextOffset} are individually volatile, but the pair is not
+     * atomic — a reader (or this writer) without the lock can observe a torn snapshot where
+     * {@code startOffset} from one writer pairs with {@code nextOffset} from another. Worse, the
+     * unsynchronized writes to two volatile longs in this method can be reordered with the
+     * locked writes in {@link #advanceStartOffset} or {@link #commitBatchInternal}, leaving
+     * permanent inconsistency.
+     *
+     * <p>Taking the lock here closes both windows. The lock is reentrant, so the kernel's
+     * rollback path ({@link ConcentrationKernel#advanceStartOffset} → catch → restorePartition)
+     * remains correct — that thread has already RELEASED the lock by the time the catch runs.
+     * Boot-time recovery sees no contention because produce paths haven't started; leader-
+     * recovery sees no contention because the gate is closed (in-flight commits roll back at the
+     * commitProduce second gen-check, releasing their locks before the recoverer touches the
+     * tracker). The lock acquisition is defensive against any future caller that violates the
+     * contract; it's free on the uncontended path.
      */
     void restorePartition(String logicalTopic, int logicalPartition, long startOffset, long nextOffset) {
         if (startOffset < 0 || nextOffset < startOffset) {
@@ -234,8 +255,13 @@ public final class LogicalOffsetTracker {
                 "invalid restore: startOffset=" + startOffset + ", nextOffset=" + nextOffset);
         }
         PartitionState s = stateFor(logicalTopic, logicalPartition);
-        s.startOffset = startOffset;
-        s.nextOffset = nextOffset;
+        s.lock.lock();
+        try {
+            s.startOffset = startOffset;
+            s.nextOffset = nextOffset;
+        } finally {
+            s.lock.unlock();
+        }
     }
 
     /**
