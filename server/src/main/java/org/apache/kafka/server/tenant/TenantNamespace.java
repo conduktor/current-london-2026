@@ -49,7 +49,24 @@ public final class TenantNamespace {
 
     public static String encodePrincipalName(String tenantId, String userName) {
         validateTenantId(tenantId);
-        if (userName != null && userName.startsWith(PRINCIPAL_PREFIX)) {
+        if (userName == null) {
+            // String concatenation with null produces the literal "null", so
+            // a silent slip would materialise the principal `__tenant_<id>.null`
+            // — indistinguishable from a legitimate user named "null" and
+            // accepted by parseTenantId as tenant `<id>` with user "null". Fail
+            // fast so the bug surfaces at the call site.
+            throw new IllegalArgumentException("User name must not be null");
+        }
+        if (userName.isEmpty()) {
+            // An empty user name would produce `__tenant_<id>.` which
+            // parseTenantId (post-fix) refuses, but is otherwise a phantom
+            // identity that belongsToCallerTenant happily treats as
+            // tenant-`<id>`-owned for any write target starting with the
+            // prefix. Refuse here so no caller — admin tool, future builder —
+            // can mint such a phantom from the encode side.
+            throw new IllegalArgumentException("User name must not be empty");
+        }
+        if (userName.startsWith(PRINCIPAL_PREFIX)) {
             // Defence-in-depth: callers (TenantPrincipalBuilder) already refuse
             // a pre-stamped base name. Refuse here too so any other code path
             // that lands a `__tenant_*` user name in this function — admin
@@ -71,6 +88,20 @@ public final class TenantNamespace {
         }
         int dot = name.indexOf(SEPARATOR, PRINCIPAL_PREFIX.length());
         if (dot < 0 || dot == PRINCIPAL_PREFIX.length()) {
+            return Optional.empty();
+        }
+        if (dot == name.length() - 1) {
+            // Name is `__tenant_<id>.` (separator with no user portion). Such
+            // a principal cannot be minted via SCRAM or PLAIN (both refuse
+            // empty user names) but a deliberate operator misconfig — a
+            // planted JAAS PLAIN entry, a direct metadata-log write — could
+            // produce it. If accepted as tenant-`<id>`, the empty-user
+            // principal becomes a phantom owner: belongsToCallerTenant
+            // matches `__tenant_<id>.` against any write target starting with
+            // that prefix and grants the principal cross-target tenant-`<id>`
+            // ownership. Refuse so the principal is treated as foreign and
+            // the outside-in guard then refuses every write into the reserved
+            // namespace.
             return Optional.empty();
         }
         return Optional.of(name.substring(PRINCIPAL_PREFIX.length(), dot));

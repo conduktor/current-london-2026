@@ -70,6 +70,47 @@ class TenantNamespaceTest {
     }
 
     @Test
+    void encodePrincipalNameRefusesNullUserName() {
+        // Java string concatenation with null produces the literal "null", so
+        // encodePrincipalName("acme", null) would silently materialise the
+        // principal "__tenant_acme.null" — indistinguishable from a user
+        // named "null" and accepted by parseTenantId as tenant "acme" with
+        // user "null". Fail fast.
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+            () -> TenantNamespace.encodePrincipalName("acme", null));
+        assertTrue(ex.getMessage().contains("null"),
+            "error should mention null user name; was: " + ex.getMessage());
+    }
+
+    @Test
+    void encodePrincipalNameRefusesEmptyUserName() {
+        // An empty user name produces "__tenant_acme." — which (post-fix)
+        // parseTenantId refuses, but belongsToCallerTenant would still
+        // happily match any write target starting with "__tenant_acme.".
+        // Refuse here so no caller — admin tool, future builder — can mint
+        // such a phantom-owner principal from the encode side.
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+            () -> TenantNamespace.encodePrincipalName("acme", ""));
+        assertTrue(ex.getMessage().contains("empty"),
+            "error should mention empty user name; was: " + ex.getMessage());
+    }
+
+    @Test
+    void parseTenantFromPrincipalReturnsEmptyForEmptyUserName() {
+        // Principal "__tenant_acme." (separator with no user portion) cannot
+        // be minted via SCRAM or PLAIN (both refuse empty user names) but a
+        // deliberate operator misconfig could plant one. If accepted as
+        // tenant "acme", the empty-user principal would become a phantom
+        // owner: belongsToCallerTenant matches "__tenant_acme." against any
+        // write target starting with the prefix and would grant
+        // cross-target tenant-"acme" ownership. Treat as no tenant so the
+        // outside-in guard then refuses every write into the reserved
+        // namespace.
+        KafkaPrincipal p = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_acme.");
+        assertEquals(Optional.empty(), TenantNamespace.parseTenantId(p));
+    }
+
+    @Test
     void parseTenantFromPrincipalReturnsTenantWhenPrefixed() {
         KafkaPrincipal p = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_acme.alice");
         assertEquals(Optional.of("acme"), TenantNamespace.parseTenantId(p));
