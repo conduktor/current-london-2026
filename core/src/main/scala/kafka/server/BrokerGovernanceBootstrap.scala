@@ -932,35 +932,59 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
    * (offset, sanitised getMessage()), so a single representative sample
    * is preserved per window. The suppressed-count rollup tells the
    * operator the magnitude of the flood without emitting per-record.
+   *
+   * Round-22 HIGH (Agent 1 #216): the original single-slot design
+   * (one `lastClassName` reference) collapsed under an alternation
+   * pattern A→B→A→B — every class transition fires a fresh WARN
+   * because `previous != className`, so an attacker who can synthesise
+   * records that throw two distinct codec/walker exception classes
+   * (e.g. RuleEnvelopeException + IllegalArgumentException) defeats
+   * the throttle and re-opens the log-flood vector at 1-WARN-per-N
+   * amplification. Fix: per-class state stored in a bounded LRU.
+   * Each class has its own throttle window. Capacity 8 matches the
+   * known cardinality of Kafka __governance error classes — codec
+   * (RuleEnvelopeException, JsonProcessingException),
+   * walker (IllegalStateException), parse (IllegalArgumentException),
+   * deeper JVM throws — with headroom. If an attacker manages to
+   * sustain >8 distinct exception classes the LRU evicts the oldest
+   * (a residual amplification factor bounded by 8 × class-cardinality
+   * — still O(1) per drain tick rather than O(N)).
    */
   private class PoisonRecordThrottle {
-    private val lastClassName = new AtomicReference[String](null)
-    private val lastWarnAtNanos = new AtomicLong(0L)
-    private val suppressedSinceLastWarn = new AtomicLong(0L)
+    private val MaxTrackedClasses = 8
 
-    def emit(offset: Long, t: Throwable): Unit = {
+    private case class ClassState(var lastWarnAtNanos: Long, var suppressed: Long)
+
+    // Access-order LinkedHashMap evicts the least-recently-touched entry
+    // when capacity is exceeded. `accessOrder = true` so each `get` and
+    // `put` moves the key to the most-recently-used end, which matches
+    // the "active throttle window" intent — a class that just fired
+    // stays in the cache; a class that has not been seen for an extended
+    // run-of-records is the safest one to evict.
+    private val perClass: java.util.LinkedHashMap[String, ClassState] =
+      new java.util.LinkedHashMap[String, ClassState](MaxTrackedClasses + 1, 0.75f, true) {
+        override def removeEldestEntry(e: java.util.Map.Entry[String, ClassState]): Boolean =
+          size() > MaxTrackedClasses
+      }
+
+    def emit(offset: Long, t: Throwable): Unit = synchronized {
       val className = t.getClass.getName
       val now = failureWarnNowNanos()
-      val previous = lastClassName.get()
       val sample = sanitizePoisonMessage(t)
-      if (previous == null || previous != className) {
-        val suppressed = suppressedSinceLastWarn.getAndSet(0L)
-        lastClassName.set(className)
-        lastWarnAtNanos.set(now)
-        val msg =
-          if (suppressed > 0L && previous != null) {
-            s"skipping poisoned __governance record at offset $offset: $sample " +
-              s"(previous class '$previous' repeated and was suppressed $suppressed " +
-              s"time(s) before this new class)"
-          } else {
-            s"skipping poisoned __governance record at offset $offset: $sample"
-          }
+      val state = perClass.get(className)
+      if (state == null) {
+        // First arrival of this class within the LRU horizon.
+        perClass.put(className, ClassState(now, 0L))
+        val msg = s"skipping poisoned __governance record at offset $offset: $sample"
         warn(msg)
         lastPoisonWarnMessage.set(msg)
         warnEmissions.incrementAndGet()
-      } else if (now - lastWarnAtNanos.get() >= FailureWarnIntervalNanos) {
-        val rolled = suppressedSinceLastWarn.getAndSet(0L)
-        lastWarnAtNanos.set(now)
+      } else if (now - state.lastWarnAtNanos >= FailureWarnIntervalNanos) {
+        // Window crossed for *this specific class* — emit a rollup
+        // naming this class's suppressed count, not a cross-class total.
+        val rolled = state.suppressed
+        state.suppressed = 0L
+        state.lastWarnAtNanos = now
         val msg = s"skipping poisoned __governance record at offset $offset: $sample " +
           s"(same exception class repeated $rolled time(s) in the last " +
           s"${FailureWarnIntervalNanos / 1_000_000L}ms)"
@@ -968,7 +992,8 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
         lastPoisonWarnMessage.set(msg)
         warnEmissions.incrementAndGet()
       } else {
-        suppressedSinceLastWarn.incrementAndGet()
+        // Inside this class's window — suppress.
+        state.suppressed += 1L
       }
     }
   }

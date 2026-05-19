@@ -397,8 +397,8 @@ class BrokerGovernanceBootstrapTest {
         "(the first one); got: " + warn)
     // The single-window WARN must NOT carry a rollup tail (this fires
     // before the suppression window has rolled over).
-    assertTrue(!warn.contains("repeated and was suppressed")
-      && !warn.contains("repeated") || !warn.contains("time(s) in the last"),
+    assertTrue(!warn.contains("repeated")
+      && !warn.contains("time(s) in the last"),
       "first WARN of a fresh class with no prior class must not carry a rollup tail; got: "
         + warn)
   }
@@ -488,6 +488,142 @@ class BrokerGovernanceBootstrapTest {
     assertTrue(!newClassWarn.contains("previous class"),
       "after a rollup just cleared the suppressed counter, the class-transition WARN " +
         "must NOT carry a stale 'previous class' tail; got: " + newClassWarn)
+  }
+
+  @Test
+  def poisonRecordWarnsAreThrottledPerClassUnderAlternationAttack(): Unit = {
+    // Round-22 HIGH (Agent 1 #216): the original single-slot design used
+    // ONE `lastClassName` reference; an attacker who can synthesise
+    // records that throw two alternating exception classes
+    // (RuleEnvelopeException ↔ IllegalArgumentException are both
+    // reachable from the __governance loader's catch surface) would
+    // defeat the throttle — every transition fires `previous !=
+    // className`, so A→B→A→B emits 4 WARNs for 4 records, exactly
+    // the log-flood vector the throttle exists to neutralise.
+    //
+    // Per-class LRU fix: each class has its own throttle window. Within
+    // a single 60s window, class A fires once on first arrival and is
+    // then suppressed for every subsequent A; class B is independent.
+    // For an A→B→A→B sequence: A fires (1), B fires (2), A suppressed
+    // (still inside A's window), B suppressed (still inside B's
+    // window). Total: 2 WARNs for 4 records — no per-record
+    // amplification.
+    val rm = mock(classOf[ReplicaManager])
+    val engine = new RuleEngine()
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp)
+    val clock = new AtomicLong(0L)
+    boot.failureWarnNowNanos = () => clock.get()
+
+    // Alternation: A → B → A → B, all within one window.
+    boot.maybeWarnPoisonedRecord(200L, new RuntimeException("A-1"))
+    clock.set(100L * 1_000_000L) // +100ms
+    boot.maybeWarnPoisonedRecord(201L, new IllegalArgumentException("B-1"))
+    clock.set(200L * 1_000_000L) // +200ms total
+    boot.maybeWarnPoisonedRecord(202L, new RuntimeException("A-2"))
+    clock.set(300L * 1_000_000L) // +300ms total
+    boot.maybeWarnPoisonedRecord(203L, new IllegalArgumentException("B-2"))
+
+    assertEquals(2L, boot.warnEmissions.get(),
+      "A→B→A→B alternation in one window MUST collapse to exactly 2 WARNs " +
+        "(first arrival of each class). Pre-fix this asserted 4, defeating the " +
+        "log-flood guard. Per-class LRU keeps each class's window independent.")
+
+    // The most-recently-emitted WARN must be the one for B-1 (the
+    // second WARN in the sequence). A-2 and B-2 are both suppressed
+    // because A and B are inside their own windows.
+    val lastWarn = boot.lastPoisonWarnMessage.get()
+    assertTrue(lastWarn.startsWith("skipping poisoned __governance record at offset 201:"),
+      "last emitted WARN must be for offset 201 (B-1, first arrival of class B), " +
+        "not 202 or 203 (which must have been suppressed by per-class throttle); got: "
+        + lastWarn)
+    assertTrue(lastWarn.contains("B-1"),
+      "last emitted WARN must carry B-1's sanitised message; got: " + lastWarn)
+
+    // After both windows roll over, A's rollup count must be 1 (one
+    // suppressed A-2 inside the window). Independent of B's rollup,
+    // proving the per-class state is genuinely partitioned.
+    clock.set(60_500L * 1_000_000L) // past 60s window
+    boot.maybeWarnPoisonedRecord(300L, new RuntimeException("A-after-window"))
+    assertEquals(3L, boot.warnEmissions.get(),
+      "A's window-cross rollup must fire as the third WARN")
+    val aRollup = boot.lastPoisonWarnMessage.get()
+    assertTrue(aRollup.contains("same exception class repeated 1 time(s) in the last 60000ms"),
+      "A's window-cross rollup must report A's own suppressed count (=1 for A-2), " +
+        "not a cross-class total or B's count; got: " + aRollup)
+
+    // B's rollup must independently report B's own count (=1 for B-2).
+    clock.set(60_700L * 1_000_000L)
+    boot.maybeWarnPoisonedRecord(301L, new IllegalArgumentException("B-after-window"))
+    assertEquals(4L, boot.warnEmissions.get(),
+      "B's window-cross rollup must fire independently of A's")
+    val bRollup = boot.lastPoisonWarnMessage.get()
+    assertTrue(bRollup.contains("same exception class repeated 1 time(s) in the last 60000ms"),
+      "B's window-cross rollup must report B's own suppressed count (=1 for B-2), " +
+        "independent of A; got: " + bRollup)
+  }
+
+  @Test
+  def poisonRecordPerClassLruEvictsLeastRecentlyUsedClassesUnderHighCardinalityAttack(): Unit = {
+    // Round-22 HIGH (Agent 1 #216): the per-class LRU has capacity 8 to
+    // cover Kafka's known __governance error classes with headroom. If
+    // an attacker can synthesise more than 8 distinct exception classes
+    // within a window, the LRU evicts the oldest — at which point the
+    // evicted class's next arrival is treated as a "first arrival" and
+    // fires a fresh WARN. This is a *bounded* residual amplification
+    // (at most one re-fire per evicted class), NOT the unbounded
+    // 1-WARN-per-record vector the original single-slot design had.
+    //
+    // Pin the LRU capacity behaviorally: feed 9 distinct exception
+    // classes — first 9 fire (no eviction would mean 9 fresh WARNs,
+    // bounded by capacity+1 = 9, exactly the slots needed). Then feed
+    // the FIRST class again. With LRU capacity 8 it should have been
+    // evicted (class #1 was the oldest before class #9 was inserted),
+    // so its re-arrival fires as a fresh WARN (10th total). With a
+    // larger LRU (or a non-LRU map) the first class would still be in
+    // cache and would be suppressed inside its window, producing 9.
+    val rm = mock(classOf[ReplicaManager])
+    val engine = new RuleEngine()
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp)
+    val clock = new AtomicLong(0L)
+    boot.failureWarnNowNanos = () => clock.get()
+
+    // 9 distinct exception classes, all within the same window.
+    boot.maybeWarnPoisonedRecord(0L, new RuntimeException("c1"))
+    boot.maybeWarnPoisonedRecord(1L, new IllegalArgumentException("c2"))
+    boot.maybeWarnPoisonedRecord(2L, new IllegalStateException("c3"))
+    boot.maybeWarnPoisonedRecord(3L, new NullPointerException("c4"))
+    boot.maybeWarnPoisonedRecord(4L, new NumberFormatException("c5"))
+    boot.maybeWarnPoisonedRecord(5L, new IndexOutOfBoundsException("c6"))
+    boot.maybeWarnPoisonedRecord(6L, new ClassCastException("c7"))
+    boot.maybeWarnPoisonedRecord(7L, new ArithmeticException("c8"))
+    // class c9 — capacity exceeded, eldest entry (c1: RuntimeException) is evicted.
+    boot.maybeWarnPoisonedRecord(8L, new UnsupportedOperationException("c9"))
+    assertEquals(9L, boot.warnEmissions.get(),
+      "9 distinct classes within one window must all fire on first arrival")
+
+    // Now re-feed the FIRST class (RuntimeException, which was c1). If
+    // the LRU evicted it, this fires as a fresh WARN (10 total). If
+    // the LRU is larger than 8 or non-evicting, c1 is still in cache
+    // and this is suppressed (still 9).
+    boot.maybeWarnPoisonedRecord(9L, new RuntimeException("c1-revived"))
+    assertEquals(10L, boot.warnEmissions.get(),
+      "after 9 distinct classes evicted the first one (LRU capacity 8), re-feeding the " +
+        "evicted class must produce a fresh first-arrival WARN — this is the " +
+        "documented residual amplification factor (bounded by LRU capacity).")
+    val revivedWarn = boot.lastPoisonWarnMessage.get()
+    assertTrue(revivedWarn.startsWith("skipping poisoned __governance record at offset 9:"),
+      "revived-class WARN must carry the re-arrival offset (9); got: " + revivedWarn)
+    assertTrue(!revivedWarn.contains("repeated"),
+      "revived-class WARN is treated as a fresh first-arrival — must NOT carry a rollup " +
+        "tail; got: " + revivedWarn)
+
+    // Re-feeding a class that's STILL in the LRU (one of c2..c9) must
+    // be suppressed — proving the LRU genuinely tracks the recent 8.
+    boot.maybeWarnPoisonedRecord(10L,
+      new UnsupportedOperationException("c9-suppressed"))
+    assertEquals(10L, boot.warnEmissions.get(),
+      "re-feeding a class still in the LRU horizon must be suppressed by its own " +
+        "throttle window — eviction must NOT be over-eager. count unchanged: 10")
   }
 
   @Test
