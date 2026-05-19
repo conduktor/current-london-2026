@@ -1087,6 +1087,124 @@ public class ApiMessageActivationTest {
         assertTrue(probed > 10, "expected to probe many request types, got " + probed);
     }
 
+    @Test
+    public void accessorThrowingErrorPropagatesUnwrapped() {
+        // Round-17 HIGH: Method.invoke wraps any Throwable thrown by the
+        // invoked method inside InvocationTargetException. Before the fix,
+        // Accessor.invoke caught ReflectiveOperationException (the
+        // supertype) and re-wrapped as IllegalStateException — a
+        // RuntimeException ⇒ Exception, which is then caught by the
+        // RuleEngine's narrowed Round-15 Walker HIGH H2 `catch (Exception)`
+        // and fail-OPENs. That defeated H2's entire intent: Errors from the
+        // walker should propagate to KafkaApis's outer Throwable catch and
+        // surface as a visible 5xx, NOT silently fail-OPEN. This test pins
+        // the unwrap-and-rethrow-cause behaviour by class.
+        ExplodingErrorNode root = new ExplodingErrorNode();
+        Throwable thrown = null;
+        try {
+            ApiMessageActivation.from(root);
+        } catch (Throwable t) {
+            thrown = t;
+        }
+        assertNotNull(thrown, "Error from accessor must propagate, not be swallowed");
+        assertTrue(thrown instanceof NoClassDefFoundError,
+            "expected NoClassDefFoundError to escape unwrapped; got " + thrown.getClass().getName()
+                + ": " + thrown.getMessage());
+    }
+
+    @Test
+    public void accessorThrowingRuntimeExceptionPropagatesUnwrapped() {
+        // Sibling pin for the non-Error branch of the unwrap fix:
+        // RuntimeException thrown by an accessor must escape as-is (still
+        // fail-OPEN under the Exception catch — same overall posture as
+        // before — but no extra IllegalStateException wrapping layer).
+        ExplodingRuntimeNode root = new ExplodingRuntimeNode();
+        IllegalArgumentException thrown = assertThrows(
+            IllegalArgumentException.class,
+            () -> ApiMessageActivation.from(root));
+        assertTrue(thrown.getMessage().contains("synthetic IAE from accessor"),
+            "expected unwrapped IllegalArgumentException with original message; got: "
+                + thrown.getMessage());
+        // Defence in depth: confirm we didn't wrap into IllegalStateException
+        // (Round-17 fix replaces the old re-wrap path).
+        assertEquals(IllegalArgumentException.class, thrown.getClass(),
+            "RuntimeException must escape as its own class, not wrapped");
+    }
+
+    /** Fixture: accessor throws an Error to verify the unwrap path. */
+    @SuppressWarnings("unused")
+    public static final class ExplodingErrorNode implements org.apache.kafka.common.protocol.ApiMessage {
+        public String poisoned() {
+            throw new NoClassDefFoundError("synthetic NCDFE from accessor");
+        }
+        @Override public short apiKey() {
+            return -1;
+        }
+        @Override public short lowestSupportedVersion() {
+            return 0;
+        }
+        @Override public short highestSupportedVersion() {
+            return 0;
+        }
+        @Override public org.apache.kafka.common.protocol.Message duplicate() {
+            return new ExplodingErrorNode();
+        }
+        @Override public java.util.List<org.apache.kafka.common.protocol.types.RawTaggedField> unknownTaggedFields() {
+            return java.util.Collections.emptyList();
+        }
+        @Override public void read(org.apache.kafka.common.protocol.Readable readable, short version) {
+        }
+        @Override public void write(org.apache.kafka.common.protocol.Writable writable,
+                                    org.apache.kafka.common.protocol.ObjectSerializationCache cache,
+                                    short version) {
+        }
+        @Override public int size(org.apache.kafka.common.protocol.ObjectSerializationCache cache,
+                                  short version) {
+            return 0;
+        }
+        @Override public void addSize(org.apache.kafka.common.protocol.MessageSizeAccumulator size,
+                                      org.apache.kafka.common.protocol.ObjectSerializationCache cache,
+                                      short version) {
+        }
+    }
+
+    /** Fixture: accessor throws a RuntimeException to verify same-class propagation. */
+    @SuppressWarnings("unused")
+    public static final class ExplodingRuntimeNode implements org.apache.kafka.common.protocol.ApiMessage {
+        public String poisoned() {
+            throw new IllegalArgumentException("synthetic IAE from accessor");
+        }
+        @Override public short apiKey() {
+            return -1;
+        }
+        @Override public short lowestSupportedVersion() {
+            return 0;
+        }
+        @Override public short highestSupportedVersion() {
+            return 0;
+        }
+        @Override public org.apache.kafka.common.protocol.Message duplicate() {
+            return new ExplodingRuntimeNode();
+        }
+        @Override public java.util.List<org.apache.kafka.common.protocol.types.RawTaggedField> unknownTaggedFields() {
+            return java.util.Collections.emptyList();
+        }
+        @Override public void read(org.apache.kafka.common.protocol.Readable readable, short version) {
+        }
+        @Override public void write(org.apache.kafka.common.protocol.Writable writable,
+                                    org.apache.kafka.common.protocol.ObjectSerializationCache cache,
+                                    short version) {
+        }
+        @Override public int size(org.apache.kafka.common.protocol.ObjectSerializationCache cache,
+                                  short version) {
+            return 0;
+        }
+        @Override public void addSize(org.apache.kafka.common.protocol.MessageSizeAccumulator size,
+                                      org.apache.kafka.common.protocol.ObjectSerializationCache cache,
+                                      short version) {
+        }
+    }
+
     private static java.io.File locatePackageDir(String pkg) {
         String rel = pkg.replace('.', '/');
         for (String root : new String[]{

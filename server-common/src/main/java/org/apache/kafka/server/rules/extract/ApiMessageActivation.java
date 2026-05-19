@@ -20,6 +20,7 @@ import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.protocol.ApiMessage;
 import org.apache.kafka.common.record.BaseRecords;
 
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.nio.ByteBuffer;
@@ -671,7 +672,38 @@ public final class ApiMessageActivation {
         Object invoke(Object target) {
             try {
                 return method.invoke(target);
+            } catch (InvocationTargetException e) {
+                // Round-17 HIGH: Method.invoke wraps anything the accessor
+                // throws — including Error subclasses — inside
+                // InvocationTargetException. If we caught
+                // ReflectiveOperationException here (its supertype) and
+                // re-wrapped as IllegalStateException, an accessor throwing
+                // NoClassDefFoundError / LinkageError / InternalError /
+                // OutOfMemoryError would surface as a RuntimeException at the
+                // RuleEngine catch site — which Round-15 Walker HIGH H2
+                // narrowed to {@code catch (Exception)} precisely so that
+                // Error escapes propagate to KafkaApis's outer Throwable
+                // catch and surface as a visible 5xx, not a silent fail-OPEN.
+                // Unwrap the cause and rethrow unchanged: Error escapes as
+                // Error, RuntimeException escapes as RuntimeException, and
+                // checked exceptions (no accessor declares any today, but
+                // defence-in-depth for future generated shapes) wrap as
+                // IllegalStateException so they still fail-OPEN at the
+                // narrowed Exception catch.
+                Throwable cause = e.getCause();
+                if (cause instanceof Error) {
+                    throw (Error) cause;
+                }
+                if (cause instanceof RuntimeException) {
+                    throw (RuntimeException) cause;
+                }
+                throw new IllegalStateException(
+                    "checked exception from " + name + " on " + target.getClass().getName(), cause);
             } catch (ReflectiveOperationException e) {
+                // IllegalAccessException is the only remaining ROE that
+                // Method.invoke can throw — a walker-reach bug (accessor
+                // discovered but not actually accessible). Fail-OPEN at the
+                // narrowed Exception catch, with the failing accessor named.
                 throw new IllegalStateException(
                     "failed to invoke " + name + " on " + target.getClass().getName(), e);
             }
