@@ -774,14 +774,31 @@ public final class IoUringSelector implements BrokerSelector {
                     }
                 }
             }
-            // F4 (cross-poll case): the async write listener may have fired between the
-            // drainPendingDisconnects of the previous poll and this drain, after the channel
-            // already moved into closingChannels. Re-check maybeCompleteSend so the
-            // completedSend surfaces before we evict the channel — symmetric with the read
-            // drain above and with NIO's pollSelectionKeys + processCompletedSends ordering.
-            NetworkSend completedSend = channel.maybeCompleteSend();
-            if (completedSend != null) {
-                completedSends.add(completedSend);
+            // F4 (cross-poll case): the async writeAndFlush listener may have fired between
+            // the prior poll's drainPendingDisconnects and this drain — but
+            // ByteBufferSend.pending is only refreshed inside writeTo, NOT by the listener.
+            // maybeCompleteSend() alone reads a stale pending=true (set during the FIN
+            // poll's step-2 write when pendingWriteBytes was still positive) and returns
+            // null. Re-issue channel.write() to force writeTo to update pending against
+            // the current pendingWriteBytes counter, then maybeCompleteSend surfaces the
+            // completedSend before we evict the channel. For a fully-drained Send the
+            // inner transport.write loop writes zero bytes — no Netty allocation, just a
+            // hasPendingWrites() refresh. Symmetric with the same-poll site in
+            // drainPendingDisconnects.
+            if (channel.hasSend()) {
+                try {
+                    channel.write();
+                    NetworkSend completedSend = channel.maybeCompleteSend();
+                    if (completedSend != null) {
+                        completedSends.add(completedSend);
+                    }
+                } catch (Exception e) {
+                    // asyncWriteFailure surfaces synchronously here. Channel is already
+                    // in closingChannels with its existing state; evicting via the
+                    // !keepClosing branch below preserves that state. The failed Send is
+                    // dropped, matching NIO's behavior when its step-2 write throws.
+                    log.debug("F4 pending-refresh write on closing channel {} failed", id, e);
+                }
             }
             if (!keepClosing) {
                 explicitlyMutedChannels.remove(channel);
@@ -866,16 +883,33 @@ public final class IoUringSelector implements BrokerSelector {
                     log.debug("Final read on disconnecting channel {} failed", disconnectId, e);
                 }
             }
-            // F4: same-poll write+FIN race. Step 2 above may have called channel.write()
-            // and then channel.maybeCompleteSend() and gotten null back because Netty's
-            // async write listener had not yet decremented pendingWriteBytes; the listener
-            // may have fired between then and now. Re-check maybeCompleteSend so the
-            // completedSend is surfaced this poll instead of being dropped when the channel
-            // moves into closingChannels and its `send` reference is later closed.
-            NetworkSend completedSend = channel.maybeCompleteSend();
-            if (completedSend != null) {
-                completedSends.add(completedSend);
-                madeProgress = true;
+            // F4: same-poll write+FIN race. Step 2 above set ByteBufferSend.pending=true
+            // because writeTo read pendingWriteBytes BEFORE the async writeAndFlush
+            // listener could decrement it. The listener may have fired between then and
+            // now — but pending is ONLY refreshed inside writeTo, not by the listener,
+            // so calling maybeCompleteSend() alone reads stale state and returns null.
+            // Re-issue channel.write() to force a writeTo refresh against the current
+            // pendingWriteBytes; maybeCompleteSend then surfaces the completedSend this
+            // poll instead of dropping it when the channel moves to closingChannels.
+            // For a fully-drained ByteBufferSend the inner transport.write writes zero
+            // bytes (no allocation) and only updates the pending flag.
+            if (channel.hasSend()) {
+                try {
+                    channel.write();
+                    NetworkSend completedSend = channel.maybeCompleteSend();
+                    if (completedSend != null) {
+                        completedSends.add(completedSend);
+                        madeProgress = true;
+                    }
+                } catch (Exception e) {
+                    // asyncWriteFailure surfaces synchronously here. The channel is
+                    // already being routed to closingChannels with its existing state
+                    // (LOCAL/REMOTE_CLOSE from channelInactive). Don't override to
+                    // FAILED_SEND — the FIN is the proximate cause; the failed inflight
+                    // Send is just dropped, matching NIO's behavior when its step-2
+                    // write throws.
+                    log.debug("F4 pending-refresh write on disconnecting channel {} failed", disconnectId, e);
+                }
             }
             closingChannels.put(disconnectId, channel);
             madeProgress = true;
