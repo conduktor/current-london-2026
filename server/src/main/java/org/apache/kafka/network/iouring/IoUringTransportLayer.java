@@ -19,6 +19,9 @@ package org.apache.kafka.network.iouring;
 import org.apache.kafka.common.network.TransportLayer;
 import org.apache.kafka.common.security.auth.KafkaPrincipal;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
@@ -110,6 +113,8 @@ final class IoUringTransportLayer implements TransportLayer {
      * depth, otherwise the request-pipeline throttle is bypassed.
      */
     static final int INBOUND_LOW_WATERMARK_BYTES = 1 << 18;
+
+    private static final Logger log = LoggerFactory.getLogger(IoUringTransportLayer.class);
 
     private final Channel nettyChannel;
     private final StubSocketChannel socketChannel;
@@ -656,7 +661,17 @@ final class IoUringTransportLayer implements TransportLayer {
         closed = true;
         try {
             if (nettyChannel.isOpen()) nettyChannel.close();
-        } catch (Exception ignored) { /* close is best-effort */ }
+        } catch (Exception e) {
+            // Caller chain (Utils.closeAllQuietly via KafkaChannel.close) will not see this
+            // exception; NIO's PlaintextTransportLayer.close (clients/src/main/java/org/apache/
+            // kafka/common/network/PlaintextTransportLayer.java:81-84) propagates IOException
+            // and operators see it in the broker log. We keep best-effort semantics for the
+            // io_uring path (Netty's close is async; the channel is dead either way), but
+            // surface the failure at WARN so operators can correlate hung-disconnect tickets
+            // with the underlying Netty error instead of staring at a silent stack frame.
+            log.warn("Netty channel close raised an exception during transport-layer close (remote={})",
+                socketChannel.getRemoteAddress(), e);
+        }
         ByteBuf b;
         while ((b = inbound.poll()) != null) {
             b.release();
