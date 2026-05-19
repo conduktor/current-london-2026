@@ -18,6 +18,7 @@ package org.apache.kafka.storage.internals.concentration;
 
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.errors.NotLeaderOrFollowerException;
 import org.apache.kafka.test.TestUtils;
 
 import org.junit.jupiter.api.AfterEach;
@@ -1080,6 +1081,78 @@ public class ConcentrationKernelTest {
         assertEquals(2L, kernel.currentGeneration(tp));
         kernel.markBackingUnready(tp);
         assertEquals(3L, kernel.currentGeneration(tp));
+    }
+
+    @Test
+    public void reserveProduceRejectsWhenBackingGateIsClosed() {
+        // BLOCKER #203: the broker pre-check + commit-side generation fence are not sufficient on
+        // their own — between the pre-check (isBackingReady) and reserveProduce, a recovery
+        // thread can run markBackingUnready and atomically flip (ready→false, gen→N+1). If
+        // reserve then only read the generation it would stamp the reservation with the post-bump
+        // value, and the commit-side check (stamped=N+1, current=N+1) would pass, letting an
+        // append proceed against a closed gate. The fix is for reserveProduce to read the
+        // (ready, gen) pair as a single snapshot and reject when ready=false.
+        //
+        // Surfacing this as NotLeaderOrFollowerException (an ApiException) means it surfaces as
+        // NOT_LEADER_OR_FOLLOWER through KafkaApis's existing produce catch block — the same
+        // error code the pre-check returns. Stock idempotent producers handle this with a
+        // metadata refresh + retry.
+        kernel.declare(descriptor("orders", 4, "shared", 1));
+        TopicPartition backing = new TopicPartition("shared", 0);
+        kernel.markBackingUnready(backing);
+        NotLeaderOrFollowerException thrown = assertThrows(NotLeaderOrFollowerException.class,
+            () -> kernel.reserveProduce("orders", 0));
+        assertTrue(thrown.getMessage().contains("shared-0"),
+            "exception message should name the backing partition, got " + thrown.getMessage());
+        // Tracker high-water must be unchanged — no reservation slot was consumed.
+        assertEquals(0L, kernel.nextLogicalOffset("orders", 0),
+            "rejected reserve must NOT advance the logical high-water");
+    }
+
+    @Test
+    public void reserveProduceBatchRejectsWhenBackingGateIsClosed() {
+        // Same #203 race, batch path. Must reject BEFORE acquiring tracker.reserveBatch's
+        // per-partition lock so the lock cannot strand if the throw escapes the broker's catch.
+        kernel.declare(descriptor("orders", 4, "shared", 1));
+        TopicPartition backing = new TopicPartition("shared", 0);
+        kernel.markBackingUnready(backing);
+        assertThrows(NotLeaderOrFollowerException.class,
+            () -> kernel.reserveProduceBatch("orders", 0, 5));
+        assertEquals(0L, kernel.nextLogicalOffset("orders", 0),
+            "rejected batch reserve must NOT advance the logical high-water");
+        // And a follow-up reserveBatch on the SAME logical partition after the gate reopens must
+        // succeed at offset 0 — proving the tracker lock was not stranded by the throw.
+        assertTrue(kernel.markBackingReady(backing));
+        Reservation[] retry = kernel.reserveProduceBatch("orders", 0, 5);
+        assertEquals(0L, retry[0].logicalOffset(),
+            "after gate reopens, reserve must hand out offset 0 (no stranded reservation)");
+        kernel.rollbackProduceBatch(retry);
+    }
+
+    @Test
+    public void reserveProduceAfterGateReopensSeesPostBumpGeneration() {
+        // Sanity: the gate-close-then-reopen path produces a stamped reservation whose generation
+        // matches the kernel's current generation (post-bump). A commit on this reservation must
+        // succeed — the fence catches a generation MISMATCH, not a non-zero generation. Without
+        // this test, a regression that hard-fails any non-zero generation would break the happy
+        // path right after every leader transition.
+        kernel.declare(descriptor("orders", 4, "shared", 1));
+        TopicPartition backing = new TopicPartition("shared", 0);
+        kernel.markBackingUnready(backing);     // gen → 1, ready=false
+        assertTrue(kernel.markBackingReady(backing));  // ready=true, gen stays 1
+        long capturedGen = kernel.currentGeneration(backing);
+        assertEquals(1L, capturedGen, "precondition: gen bumped to 1 by markBackingUnready");
+        Reservation r = kernel.reserveProduce("orders", 0);
+        assertEquals(capturedGen, r.generation(),
+            "reservation must be stamped with the post-bump generation");
+        assertTrue(r.hasBackingStamp(), "reservation must carry the backing-gate stamp");
+        // commit succeeds — the fence only rejects a mismatch.
+        try {
+            kernel.commitProduce(r, 100L);
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+        assertEquals(1L, kernel.nextLogicalOffset("orders", 0));
     }
 
     @Test

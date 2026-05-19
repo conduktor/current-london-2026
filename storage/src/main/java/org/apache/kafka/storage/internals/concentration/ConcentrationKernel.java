@@ -18,6 +18,7 @@ package org.apache.kafka.storage.internals.concentration;
 
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.errors.NotLeaderOrFollowerException;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -487,7 +488,7 @@ public final class ConcentrationKernel implements AutoCloseable {
         }
         TopicPartition backing = new TopicPartition(d.backingTopic(),
             LogicalPartitionMapper.backingPartitionFor(d, logicalPartition));
-        long gen = currentGeneration(backing);
+        long gen = captureGenerationIfReady(backing);
         Reservation r = tracker.reserve(logicalTopic, logicalPartition);
         r.stampBackingGate(backing, gen);
         return r;
@@ -585,7 +586,7 @@ public final class ConcentrationKernel implements AutoCloseable {
         }
         TopicPartition backing = new TopicPartition(d.backingTopic(),
             LogicalPartitionMapper.backingPartitionFor(d, logicalPartition));
-        long gen = currentGeneration(backing);
+        long gen = captureGenerationIfReady(backing);
         Reservation[] batch = tracker.reserveBatch(logicalTopic, logicalPartition, count);
         for (Reservation r : batch) {
             r.stampBackingGate(backing, gen);
@@ -942,6 +943,47 @@ public final class ConcentrationKernel implements AutoCloseable {
         Objects.requireNonNull(backing, "backing");
         BackingGateState s = backingGateState.get(backing);
         return s == null ? 0L : s.generation;
+    }
+
+    /**
+     * Atomically reads (ready, generation) for {@code backing}: if the gate is currently closed
+     * (ready=false), throws {@link NotLeaderOrFollowerException}; otherwise returns the current
+     * generation. The reserveProduce / reserveProduceBatch paths use this in place of a separate
+     * {@link #isBackingReady} + {@link #currentGeneration} pair.
+     *
+     * <p>r22 BLOCKER #203: the broker's pre-check at the top of {@code handleProduceRequest} calls
+     * {@link #isBackingReady} once, then later calls {@code reserveProduceBatch}. Between those
+     * two calls a recovery thread can run {@link #markBackingUnready} — which atomically flips
+     * (ready→false, gen→N+1) inside the per-key compute lambda (BLOCKER #207 / HIGH #180). If
+     * reserve then read only the generation it would observe N+1 and stamp the reservation with
+     * the post-bump value; the commit-side generation check (BLOCKER #207's first and second
+     * fences) would see (stamped=N+1, current=N+1) and pass, and the append would proceed against
+     * a closed gate. The two existing safety nets — broker pre-check and commit-side gen match —
+     * are NOT sufficient on their own because the bump and the reserve race.
+     *
+     * <p>Reading the {@link BackingGateState} pair as a single CHM value snapshot closes the
+     * window: either reserve observes (ready=false) and rejects with NotLeaderOrFollowerException
+     * (a {@link org.apache.kafka.common.errors.ApiException} that surfaces through KafkaApis's
+     * existing produce catch block as {@code NOT_LEADER_OR_FOLLOWER}, the same code the broker
+     * pre-check returns) — or it observes (ready=true, gen=N) and any subsequent
+     * markBackingUnready bumps gen→N+1, which the commit-side fence catches. There is no
+     * surviving interleaving that lets a stamped-then-committed reservation cross a closed gate.
+     *
+     * <p>Throwing NotLeaderOrFollowerException — rather than introducing a new exception type —
+     * keeps the broker catch block unchanged: the {@code case e: ApiException} arm already maps
+     * via {@link org.apache.kafka.common.protocol.Errors#forException} to
+     * {@code NOT_LEADER_OR_FOLLOWER}. Stock idempotent producers handle that error with a
+     * metadata refresh + retry, identical to the pre-check rejection path.
+     */
+    private long captureGenerationIfReady(TopicPartition backing) {
+        BackingGateState s = backingGateState.get(backing);
+        if (s == null) return 0L;
+        if (!s.ready) {
+            throw new NotLeaderOrFollowerException(
+                "concentration backing " + backing + " is not ready (gate closed, generation "
+                    + s.generation + ")");
+        }
+        return s.generation;
     }
 
     /**
