@@ -189,6 +189,12 @@ public final class WsStreamer {
     public void close() {
         if (closed.compareAndSet(false, true)) {
             limiterToken.close();
+            // Drop carry-over record refs eagerly. The streamer can stay alive past close while an
+            // in-flight whenCompleteAsync chain settles (up to fetch.max.wait.ms); without this, every
+            // staged FetchedRecord (key+value byte arrays) is pinned for that window. Concurrent
+            // poll/offer racing this clear is safe: ConcurrentLinkedQueue.clear is non-blocking, racing
+            // drains see null polls and exit, and handleFetchResult gates its offers on !closed.
+            buffer.clear();
             try {
                 sink.close();
             } catch (RuntimeException e) {
@@ -207,6 +213,9 @@ public final class WsStreamer {
     private void closeOnFailure(int statusCode, String reason) {
         if (closed.compareAndSet(false, true)) {
             limiterToken.close();
+            // Same rationale as close(): drop staged record refs so they aren't pinned for the lifetime
+            // of any in-flight whenCompleteAsync chain.
+            buffer.clear();
             try {
                 sink.close(statusCode, reason);
             } catch (RuntimeException e) {

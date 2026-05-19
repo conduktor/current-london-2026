@@ -116,6 +116,49 @@ class BridgeJsonMappersTest {
     }
 
     @Test
+    void rejectsDocumentExceedingLengthCapOnByteInput() {
+        // A JSON document whose total byte length exceeds MAX_DOCUMENT_LENGTH must fail at parse time.
+        // The HTTP body path Jackson sees is byte-based (UTF8StreamJsonParser), which is the path this cap
+        // exists to protect — Jackson's _loadMore() consults validateDocumentLength on every buffer refill.
+        long over = BridgeJsonMappers.MAX_DOCUMENT_LENGTH + 1;
+        // Document shape: an array of single-byte ASCII digits separated by commas. Each entry is "1," (2 bytes);
+        // we don't put a single long string here because that would trip MAX_STRING_LENGTH first.
+        byte[] bytes = new byte[(int) over];
+        bytes[0] = '[';
+        bytes[bytes.length - 1] = ']';
+        for (int i = 1; i < bytes.length - 1; i += 2) {
+            bytes[i] = '1';
+            if (i + 1 < bytes.length - 1) {
+                bytes[i + 1] = ',';
+            }
+        }
+        ObjectMapper mapper = BridgeJsonMappers.hardened();
+        // Either the document-length cap (preferred) or the token-count cap fires first — both are valid
+        // defences against a > 1 MiB body. Asserting either-throws keeps the test honest about which cap
+        // catches it without requiring the test to recompute the exact token count.
+        assertThrows(StreamConstraintsException.class, () -> mapper.readTree(bytes));
+    }
+
+    @Test
+    void rejectsTokenCountExceedingCap() {
+        // A document packed with tokens (duplicate-key pathological shape) must fail before the parser allocates
+        // per-token binding objects across the cap. ~150K duplicate entries crosses the 200K-token floor (each
+        // {"a":1,} contributes FIELD_NAME + VALUE_NUMBER_INT).
+        long entries = BridgeJsonMappers.MAX_TOKEN_COUNT;
+        StringBuilder json = new StringBuilder((int) entries * 8);
+        json.append('{');
+        for (long i = 0; i < entries; i++) {
+            if (i > 0) {
+                json.append(',');
+            }
+            json.append("\"a\":1");
+        }
+        json.append('}');
+        ObjectMapper mapper = BridgeJsonMappers.hardened();
+        assertThrows(StreamConstraintsException.class, () -> mapper.readTree(json.toString()));
+    }
+
+    @Test
     void writePathIsUnaffectedByReadConstraints() {
         // StreamReadConstraints only govern parsing; serialization of any JsonNode tree must still work even when the
         // resulting string would itself exceed MAX_STRING_LENGTH on a subsequent read. Important because the bridge

@@ -54,6 +54,20 @@ import com.fasterxml.jackson.databind.ObjectMapper;
  *   <li>{@code maxNumberLength = 1_000} — defends against gigabyte-long numeric literals
  *       (BigDecimal parsing is the textbook Jackson DoS shape). The bridge never reads numbers
  *       longer than {@code Long.MAX_VALUE}'s 19 digits.</li>
+ *   <li>{@code maxDocumentLength = 1 MiB} — defence-in-depth duplicate of the
+ *       {@code http.bridge.max.request.body.bytes} HTTP cap and the per-frame WebSocket cap. The
+ *       byte caps run upstream of Jackson; this cap closes the gap on any future parse path that
+ *       skips them (e.g. parsing a String built from concatenated frames, or a record value bytes
+ *       buffer read after the body cap).</li>
+ *   <li>{@code maxTokenCount = 200_000} — bounds the parser's work per byte. A 1 MiB body of
+ *       {@code {"a":1,"a":1,...}} (~175K entries, each tokenising to {@code FIELD_NAME +
+ *       VALUE_NUMBER_INT}) drives ~350K tokens through the parser and allocates one binding
+ *       object per token even though the final document is a single key. The string and document
+ *       caps don't catch this — both are within bounds — but the transient heap multiplier is
+ *       material on a 1 MiB body (~15 MiB transient), and grows linearly with concurrent
+ *       requests. 200K tokens is well above any realistic produce shape (a 1 MiB body of
+ *       legitimate records reaches ~50K tokens) and well below the structural ceiling for a 1 MiB
+ *       body of pathological JSON.</li>
  * </ul>
  *
  * <p>None of these caps are surfaced via configuration. They are security floors, not tuneables.
@@ -72,10 +86,18 @@ public final class BridgeJsonMappers {
     /** Numeric literals in this protocol top out at 19 digits ({@code Long.MAX_VALUE}). */
     public static final int MAX_NUMBER_LENGTH = 1_000;
 
+    /** 1 MiB — defence-in-depth duplicate of the HTTP body cap and the per-frame WebSocket cap. */
+    public static final long MAX_DOCUMENT_LENGTH = 1L << 20;
+
+    /** Bounds per-byte parser amplification; 200K is well above realistic shapes (~50K for a full produce). */
+    public static final long MAX_TOKEN_COUNT = 200_000L;
+
     private static final StreamReadConstraints CONSTRAINTS = StreamReadConstraints.builder()
         .maxStringLength(MAX_STRING_LENGTH)
         .maxNestingDepth(MAX_NESTING_DEPTH)
         .maxNumberLength(MAX_NUMBER_LENGTH)
+        .maxDocumentLength(MAX_DOCUMENT_LENGTH)
+        .maxTokenCount(MAX_TOKEN_COUNT)
         .build();
 
     private BridgeJsonMappers() {

@@ -238,12 +238,15 @@ class WsStreamerTest {
         WsStreamer.start(sink, submitter, MAPPER, "t", 0, 0L, OptionalInt.empty(), 10, token, direct());
 
         long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(800L);
-        while (submitter.fetchCallCount() < 2 && System.nanoTime() < deadline) {
+        // Wait on the terminal condition we actually assert (records delivered), not on the upstream
+        // proxy (fetchCallCount). The whole chain runs on a single scheduler thread, but the test thread
+        // observing fetchCallCount.incrementAndGet()==2 establishes a happens-before only with writes
+        // sequenced BEFORE the increment inside submitFetch — the records are sent AFTER the increment
+        // (handleFetchResult → drainBufferWhileCredited → sink.sendText), so polling fetchCallCount can
+        // race the delivery and observe recordCount=0 or 1.
+        while ((submitter.fetchCallCount() < 2 || sink.recordCount() < 2) && System.nanoTime() < deadline) {
             Thread.sleep(10);
         }
-        // Records may or may not have been delivered yet by the time the second fetch lands — the second
-        // fetch's handleFetchResult schedules a drain that the direct executor runs synchronously. So once
-        // fetchCallCount==2 we can also assert the records flowed through.
         assertTrue(submitter.fetchCallCount() >= 2,
             "next fetch must resume after the throttle deadline; saw " + submitter.fetchCallCount());
         assertEquals(2, sink.recordCount(), "records returned after the throttle must be delivered");
