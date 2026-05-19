@@ -3867,6 +3867,37 @@ class KafkaApis(val requestChannel: RequestChannel,
       requestHelper.sendMaybeThrottle(request, shareGroupHeartbeatRequest.getErrorResponse(Errors.GROUP_AUTHORIZATION_FAILED.exception))
       CompletableFuture.completedFuture[Unit](())
     } else {
+      // r20 HIGH #158: parallel to ConsumerGroupHeartbeat — without this, a share-group member
+      // could persist a subscription to ANY topic name into share-group state with no DESCRIBE
+      // check, and a backing topic name would later leak through ShareGroupDescribe to anyone
+      // with GROUP:DESCRIBE on the group (no topic auth required). Mirror the consumer-group
+      // pattern: DESCRIBE on every subscribed topic, plus reject backing names explicitly so
+      // an internal storage topic name cannot be persisted into coordinator state.
+      if (shareGroupHeartbeatRequest.data.subscribedTopicNames != null &&
+        !shareGroupHeartbeatRequest.data.subscribedTopicNames.isEmpty) {
+        val subscribedTopicSet = shareGroupHeartbeatRequest.data.subscribedTopicNames.asScala.toSet
+        // Authorize first so an attacker cannot use this path to enumerate which names are
+        // backing topics by error-code differential (auth-first / shadow-second precedent
+        // from #137/#139/#145).
+        val authorizedTopics = authHelper.filterByAuthorized(request.context, DESCRIBE, TOPIC,
+          subscribedTopicSet)(identity)
+        if (authorizedTopics.size < subscribedTopicSet.size) {
+          val responseData = new ShareGroupHeartbeatResponseData()
+            .setErrorCode(Errors.TOPIC_AUTHORIZATION_FAILED.code)
+          requestHelper.sendMaybeThrottle(request, new ShareGroupHeartbeatResponse(responseData))
+          return CompletableFuture.completedFuture[Unit](())
+        }
+        val backingSubscriptions = subscribedTopicSet.filter(concentrationKernel.isBackingTopic)
+        if (backingSubscriptions.nonEmpty) {
+          val responseData = new ShareGroupHeartbeatResponseData()
+            .setErrorCode(Errors.INVALID_REQUEST.code)
+            .setErrorMessage(s"Share-group subscription to backing topic(s) is not allowed: " +
+              backingSubscriptions.toSeq.sorted.mkString(", "))
+          requestHelper.sendMaybeThrottle(request, new ShareGroupHeartbeatResponse(responseData))
+          return CompletableFuture.completedFuture[Unit](())
+        }
+      }
+
       groupCoordinator.shareGroupHeartbeat(
         request.context,
         shareGroupHeartbeatRequest.data,
@@ -3927,6 +3958,56 @@ class KafkaApis(val requestChannel: RequestChannel,
           } else {
             // Otherwise, we have to copy the results into the existing ones.
             response.groups.addAll(results)
+          }
+
+          // r20 HIGH #158: parallel to ConsumerGroupDescribe (above). Without this, share-group
+          // describe lets any GROUP:DESCRIBE caller see every topic name in the group's
+          // subscriptions / assignment — including backing topics if any leaked into state
+          // before #158's heartbeat-side guard landed, and including any topic the caller
+          // lacks DESCRIBE on. Mirror the consumer-group pattern: collect all topic names
+          // from subscribed + assignment, run DESCRIBE auth, and replace any group containing
+          // an unauthorized or backing topic with TOPIC_AUTHORIZATION_FAILED so neither name
+          // leaks. Backing names get bucketed into the same auth-failed path: surfacing
+          // INVALID_REQUEST here would create an enumeration oracle ("group X has backing Y
+          // in its state") that a hostile operator could use to map the concentration topology.
+          val topicsInResponse = response.groups.stream()
+            .flatMap(group => group.members.stream)
+            .flatMap(member =>
+              util.stream.Stream.concat(
+                member.subscribedTopicNames.stream,
+                member.assignment.topicPartitions.stream.map[String](tp => tp.topicName)
+              )
+            )
+            .collect(Collectors.toSet[String])
+            .asScala
+          val authorizedTopics = if (!authorizer.isEmpty)
+            authHelper.filterByAuthorized(request.context, DESCRIBE, TOPIC, topicsInResponse)(identity)
+          else
+            topicsInResponse
+          if (topicsInResponse.nonEmpty) {
+            val updatedGroups = response.groups.stream().map { group =>
+              val groupTopics = group.members.stream()
+                .flatMap(member =>
+                  util.stream.Stream.concat(
+                    member.subscribedTopicNames.stream,
+                    member.assignment.topicPartitions.stream.map[String](tp => tp.topicName)
+                  )
+                )
+                .collect(Collectors.toSet[String])
+                .asScala
+              val unauthorizedOrBacking = groupTopics.exists(t =>
+                !authorizedTopics.contains(t) || concentrationKernel.isBackingTopic(t))
+              if (unauthorizedOrBacking) {
+                new ShareGroupDescribeResponseData.DescribedGroup()
+                  .setGroupId(group.groupId)
+                  .setErrorCode(Errors.TOPIC_AUTHORIZATION_FAILED.code)
+                  .setErrorMessage("The group has subscribed or assigned topic(s) that the client is not authorized to describe.")
+                  .setMembers(List.empty.asJava)
+              } else {
+                group
+              }
+            }.collect(Collectors.toList[ShareGroupDescribeResponseData.DescribedGroup])
+            response.setGroups(updatedGroups)
           }
 
           requestHelper.sendMaybeThrottle(request, new ShareGroupDescribeResponse(response))
