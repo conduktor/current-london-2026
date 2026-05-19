@@ -774,6 +774,15 @@ public final class IoUringSelector implements BrokerSelector {
                     }
                 }
             }
+            // F4 (cross-poll case): the async write listener may have fired between the
+            // drainPendingDisconnects of the previous poll and this drain, after the channel
+            // already moved into closingChannels. Re-check maybeCompleteSend so the
+            // completedSend surfaces before we evict the channel — symmetric with the read
+            // drain above and with NIO's pollSelectionKeys + processCompletedSends ordering.
+            NetworkSend completedSend = channel.maybeCompleteSend();
+            if (completedSend != null) {
+                completedSends.add(completedSend);
+            }
             if (!keepClosing) {
                 explicitlyMutedChannels.remove(channel);
                 // Surface the channel's actual state, not a hardcoded LOCAL_CLOSE. NIO's
@@ -856,6 +865,17 @@ public final class IoUringSelector implements BrokerSelector {
                     // notification path; otherwise the disconnect notification is lost.
                     log.debug("Final read on disconnecting channel {} failed", disconnectId, e);
                 }
+            }
+            // F4: same-poll write+FIN race. Step 2 above may have called channel.write()
+            // and then channel.maybeCompleteSend() and gotten null back because Netty's
+            // async write listener had not yet decremented pendingWriteBytes; the listener
+            // may have fired between then and now. Re-check maybeCompleteSend so the
+            // completedSend is surfaced this poll instead of being dropped when the channel
+            // moves into closingChannels and its `send` reference is later closed.
+            NetworkSend completedSend = channel.maybeCompleteSend();
+            if (completedSend != null) {
+                completedSends.add(completedSend);
+                madeProgress = true;
             }
             closingChannels.put(disconnectId, channel);
             madeProgress = true;
