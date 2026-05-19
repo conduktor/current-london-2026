@@ -160,8 +160,15 @@ public class SocketServerConfigs {
     public static final String SOCKET_SELECTOR_IMPLEMENTATION_DOC = "The I/O backend the broker uses for client and inter-broker connections. " +
             "<code>nio</code> selects the historical Java NIO selector. " +
             "<code>io_uring</code> selects a Netty io_uring-backed selector; Linux only and PLAINTEXT only in this version " +
-            "(SSL, SASL_PLAINTEXT and SASL_SSL listeners fall back to NIO). " +
-            "<code>auto</code> chooses <code>io_uring</code> when supported and <code>nio</code> otherwise.";
+            "(SSL, SASL_PLAINTEXT and SASL_SSL listeners <em>silently</em> fall back to NIO regardless of this setting). " +
+            "<code>auto</code> chooses <code>io_uring</code> when supported and <code>nio</code> otherwise. " +
+            "<p>Explicit <code>io_uring</code> on a host without io_uring support (non-Linux, kernel too old, " +
+            "or the Netty native library is missing) causes the broker to <em>fail to start</em> with a message naming " +
+            "the unavailability reason; the operator must either remove the setting (falling back to <code>auto</code>) " +
+            "or set it to <code>nio</code>. <code>auto</code> never hard-fails on platform mismatch.</p> " +
+            "<p>This setting can be overridden per listener with " +
+            "<code>listener.name.&lt;listener-name&gt;.socket.selector.implementation</code> — the per-listener value, " +
+            "when set, takes precedence over the broker-wide value for that listener only.</p>";
 
     public static final ConfigDef CONFIG_DEF =  new ConfigDef()
             .define(LISTENERS_CONFIG, STRING, LISTENERS_DEFAULT, HIGH, LISTENERS_DOC)
