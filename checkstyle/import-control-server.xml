@@ -63,6 +63,11 @@
   <allow pkg="org.apache.kafka.security" />
   <allow pkg="org.apache.kafka.server.common" />
   <allow pkg="org.apache.kafka.server.metrics" />
+  <!-- R33 #292: BypassPrincipalsValidator is the ConfigDef admission test
+       for governance.bypass.principals; lives next to RuleEngine in
+       server-common, so :server (ServerConfigs.CONFIG_DEF) needs to
+       reach the rules subpackage to wire it. -->
+  <allow pkg="org.apache.kafka.server.rules" />
   <allow pkg="org.apache.kafka.server.util" />
   <allow pkg="com.yammer.metrics" />
 

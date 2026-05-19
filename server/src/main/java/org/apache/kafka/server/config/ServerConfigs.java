@@ -22,6 +22,7 @@ import org.apache.kafka.common.config.TopicConfig;
 import org.apache.kafka.common.record.CompressionType;
 import org.apache.kafka.server.authorizer.Authorizer;
 import org.apache.kafka.server.record.BrokerCompressionType;
+import org.apache.kafka.server.rules.BypassPrincipalsValidator;
 import org.apache.kafka.storage.internals.log.LogConfig;
 
 import static org.apache.kafka.common.config.ConfigDef.Importance.HIGH;
@@ -181,7 +182,14 @@ public class ServerConfigs {
             .define(AUTHORIZER_CLASS_NAME_CONFIG, STRING, AUTHORIZER_CLASS_NAME_DEFAULT, new ConfigDef.NonNullValidator(), LOW, AUTHORIZER_CLASS_NAME_DOC)
             .define(EARLY_START_LISTENERS_CONFIG, STRING, null,  HIGH, EARLY_START_LISTENERS_DOC)
             /************ Governance (CEL rule engine) Configuration ************/
-            .define(GOVERNANCE_BYPASS_PRINCIPALS_CONFIG, STRING, GOVERNANCE_BYPASS_PRINCIPALS_DEFAULT, MEDIUM, GOVERNANCE_BYPASS_PRINCIPALS_DOC)
+            // R33 #292 [HIGH]: BypassPrincipalsValidator runs the same
+            // RuleEngine.parseBypassPrincipals parser at admin-API admission
+            // time that BrokerGovernanceBootstrap runs at broker startup —
+            // closes the delayed time-bomb where a malformed dynamic-config
+            // write silently lands in KRaft metadata and only surfaces as a
+            // broker-refuses-to-start at the next restart, long after the
+            // admin who typed the bad value has lost the context.
+            .define(GOVERNANCE_BYPASS_PRINCIPALS_CONFIG, STRING, GOVERNANCE_BYPASS_PRINCIPALS_DEFAULT, new BypassPrincipalsValidator(), MEDIUM, GOVERNANCE_BYPASS_PRINCIPALS_DOC)
             /************ Rack Configuration ******************/
             .define(BROKER_RACK_CONFIG, STRING, null, MEDIUM, BROKER_RACK_DOC)
             /** ********* Controlled shutdown configuration ***********/
