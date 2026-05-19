@@ -34,6 +34,7 @@ import java.util.concurrent.TimeUnit;
 
 import io.netty.channel.Channel;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
@@ -88,6 +89,14 @@ class SustainedTrafficIT {
                         int respLen = in.readInt();
                         assertEquals(payload.length, respLen, "frame " + n + " wrong size");
                         in.readFully(recv);
+                        // TEST-1: assert byte-level content, not just length. A
+                        // partial-write that drops a byte and re-fills from a stale
+                        // buffer, or a vectored-write ordering regression, would still
+                        // pass a length-only check. The vectoredWriteStopsAtFirstPartialBufferToPreserveOrdering
+                        // unit test catches the bug at the source; this assertion makes
+                        // sure the integration path agrees.
+                        assertArrayEquals(payload, recv,
+                            "frame " + n + " body corrupted — possible partial-write or wire-ordering regression");
                         if ((n & 0x3FF) == 0 && n != lastReported) {
                             long elapsedNs = System.nanoTime() - started;
                             System.err.printf("[client] round-trip %d ok at %dms%n",

@@ -40,6 +40,7 @@ import java.util.concurrent.atomic.AtomicLong;
 
 import io.netty.channel.Channel;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.fail;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
@@ -135,6 +136,14 @@ class MultiClientSustainedTrafficIT {
                 int respLen = in.readInt();
                 assertEquals(payload.length, respLen, "client " + idx + " frame " + n + " wrong size");
                 in.readFully(recv);
+                // TEST-1: assert byte-level content, not just length. Each client builds a
+                // distinct payload (idx + b mod 256). A cross-channel routing bug would
+                // surface here — without this check, a response intended for client B
+                // delivered to client A's socket would still pass the length-only test
+                // (all payloads are 64 bytes). Same goes for partial-write drops where
+                // a byte is dropped and re-filled from another buffer.
+                assertArrayEquals(payload, recv,
+                    "client " + idx + " frame " + n + " content mismatch — possible cross-channel routing or wire-ordering regression");
                 st.progress.lazySet(n + 1);
             }
         } catch (Throwable t) {
