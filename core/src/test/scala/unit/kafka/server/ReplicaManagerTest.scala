@@ -61,6 +61,7 @@ import org.apache.kafka.server.log.remote.storage._
 import org.apache.kafka.server.metrics.{KafkaMetricsGroup, KafkaYammerMetrics}
 import org.apache.kafka.server.network.BrokerEndPoint
 import org.apache.kafka.server.purgatory.DelayedOperationPurgatory
+import org.apache.kafka.server.rules.GovernanceTopic
 import org.apache.kafka.server.storage.log.{FetchIsolation, FetchParams, FetchPartitionData}
 import org.apache.kafka.server.util.timer.MockTimer
 import org.apache.kafka.server.util.{MockScheduler, MockTime, Scheduler}
@@ -6053,6 +6054,56 @@ class ReplicaManagerTest {
     }
 
     // internal topics delete allowed
+    rm.deleteRecords(
+      timeout = 0L,
+      Map[TopicPartition, Long](topicPartition0.topicPartition() -> 0L),
+      responseCallback = callback,
+      allowInternalTopicDeletion = true
+    )
+  }
+
+  @Test
+  def testDeleteRecordsOnGovernanceTopicRejectedEvenWhenAllowInternalTopicDeletionTrue(): Unit = {
+    // R39-E-1 pin: DeleteRecords on `__governance` is rejected unconditionally,
+    // including when the operator passes the `--allow-internal-topic-deletion`
+    // escape hatch that bypasses the generic Topic.isInternal guard. The
+    // sibling tests `testDeleteRecordsInternalTopicDeleteDisallowed` and
+    // `testDeleteRecordsInternalTopicDeleteAllowed` pin the GROUP_METADATA
+    // path where the flag flips outcome; this test pins that the flag does
+    // NOT flip outcome for `__governance`. Rationale lives at the
+    // ReplicaManager.deleteRecordsOnLocalLog comment — the post-restart
+    // loader's max(logStartOffset, drainCursor) silently drops rules whose
+    // current record fell below the new logStartOffset, with no
+    // operator-visible WARN if the deletion stays below the runtime drain
+    // cursor.
+    val localId = 1
+    val topicPartition0 = new TopicIdPartition(FOO_UUID, 0, GovernanceTopic.NAME)
+    val directoryEventHandler = mock(classOf[DirectoryEventHandler])
+
+    val rm = setupReplicaManagerWithMockedPurgatories(new MockTimer(time), localId,
+      setupLogDirMetaProperties = true, directoryEventHandler = directoryEventHandler)
+    val directoryIds = rm.logManager.directoryIdsSet.toList
+    assertEquals(directoryIds.size, 2)
+    val leaderTopicsDelta: TopicsDelta = topicsCreateDelta(localId, isStartIdLeader = true, directoryIds = directoryIds)
+    val (partition: Partition, _) = rm.getOrCreatePartition(topicPartition0.topicPartition(), leaderTopicsDelta, FOO_UUID).get
+    partition.makeLeader(leaderAndIsrPartitionState(topicPartition0.topicPartition(), 1, localId, Seq(1, 2)),
+      new LazyOffsetCheckpoints(rm.highWatermarkCheckpoints.asJava),
+      None)
+
+    def callback(responseStatus: Map[TopicPartition, DeleteRecordsResponseData.DeleteRecordsPartitionResult]): Unit = {
+      // Load-bearing assertion: even with allowInternalTopicDeletion = true,
+      // the result is INVALID_TOPIC_EXCEPTION for __governance. If a future
+      // refactor lifts the unconditional check above the
+      // Topic.isInternal && !allowInternalTopicDeletion check (or removes
+      // it entirely), this assertion fails.
+      assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, responseStatus.values.head.errorCode,
+        s"DeleteRecords on ${GovernanceTopic.NAME} must be rejected with INVALID_TOPIC_EXCEPTION " +
+          s"regardless of allowInternalTopicDeletion — the post-restart loader silently drops rules " +
+          s"below the new logStartOffset (R39-E-1)")
+    }
+
+    // The escape-hatch flag that, for every OTHER internal topic, would
+    // change the outcome from rejection to success.
     rm.deleteRecords(
       timeout = 0L,
       Map[TopicPartition, Long](topicPartition0.topicPartition() -> 0L),

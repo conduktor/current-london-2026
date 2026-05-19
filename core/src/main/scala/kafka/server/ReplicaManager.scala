@@ -51,6 +51,7 @@ import org.apache.kafka.image.{LocalReplicaChanges, MetadataImage, TopicsDelta}
 import org.apache.kafka.metadata.LeaderConstants.NO_LEADER
 import org.apache.kafka.server.{ActionQueue, DelayedActionQueue, common}
 import org.apache.kafka.server.common.{DirectoryEventHandler, RequestLocal, StopPartition, TopicOptionalIdPartition}
+import org.apache.kafka.server.rules.GovernanceTopic
 import org.apache.kafka.server.metrics.KafkaMetricsGroup
 import org.apache.kafka.server.network.BrokerEndPoint
 import org.apache.kafka.server.purgatory.{DelayedOperationPurgatory, TopicPartitionOperationKey}
@@ -1069,8 +1070,31 @@ class ReplicaManager(val config: KafkaConfig,
   private def deleteRecordsOnLocalLog(offsetPerPartition: Map[TopicPartition, Long], allowInternalTopicDeletion: Boolean): Map[TopicPartition, LogDeleteRecordsResult] = {
     trace("Delete records on local logs to offsets [%s]".format(offsetPerPartition))
     offsetPerPartition.map { case (topicPartition, requestedOffset) =>
-      // reject delete records operation for internal topics unless allowInternalTopicDeletion is true
-      if (Topic.isInternal(topicPartition.topic) && !allowInternalTopicDeletion) {
+      // R39-E-1 close: reject DeleteRecords on __governance unconditionally,
+      // even when allowInternalTopicDeletion=true. The fail-open path is
+      // subtle: DeleteRecords advances logStartOffset on the partition; the
+      // broker's local rule-engine drain loop is defended against
+      // cursor-vs-HW truncation (BrokerGovernanceBootstrap holdingStalePostTruncation,
+      // L275-322) but the post-restart loader replays from
+      // max(logStartOffset, drainCursor) — any rule whose current record sat
+      // below the new logStartOffset is silently dropped on next fresh
+      // broker startup. There is no operator-visible WARN if the deletion
+      // stays below cursor. The proper resolution is to never lose those
+      // records in the first place: the topic is compacted, so legitimate
+      // GC happens via tombstones, and DeleteRecords offers no operator
+      // value here that compaction does not already provide. (Note:
+      // `__governance` is NOT in Topic.INTERNAL_TOPICS because that set
+      // lives in clients/ and is not extensible from this module — we gate
+      // by name here.)
+      if (topicPartition.topic == GovernanceTopic.NAME) {
+        (topicPartition, LogDeleteRecordsResult(-1L, -1L, Some(new InvalidTopicException(
+          s"Cannot delete records of ${GovernanceTopic.NAME}: this topic is a " +
+            s"broker-internal CEL rule store and uses compaction for GC. " +
+            s"DeleteRecords would silently drop rules below the new " +
+            s"logStartOffset on next broker restart. To remove a rule, " +
+            s"publish a tombstone (null value) for its rule-id."))))
+      } else if (Topic.isInternal(topicPartition.topic) && !allowInternalTopicDeletion) {
+        // reject delete records operation for internal topics unless allowInternalTopicDeletion is true
         (topicPartition, LogDeleteRecordsResult(-1L, -1L, Some(new InvalidTopicException(s"Cannot delete records of internal topic ${topicPartition.topic}"))))
       } else {
         try {
