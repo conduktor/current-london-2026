@@ -227,6 +227,49 @@ object BrokerServer {
           s"(audit round-14 BLOCKER N5).")
     }
   }
+
+  /**
+   * Parser for the {@code governance.bootstrap.require.local.replica} broker
+   * property. Fail-closed by design: the only values that disable the
+   * require-local-replica safety gate are exact, lowercase, trimmed matches of
+   * {@code "false"}, {@code "no"}, or {@code "0"}. Any other value — including
+   * {@code null} (absent), typos (e.g. {@code "fals"}), unknown booleans
+   * (e.g. {@code "off"}), and garbage — yields {@code true}.
+   *
+   * <p>This knob is read directly from {@link KafkaConfig#originals()} rather
+   * than through a typed accessor. We deliberately did NOT add it to
+   * {@link org.apache.kafka.server.config.ServerConfigs#CONFIG_DEF} because:
+   *   - The intended audience is a broker operator setting it once in
+   *     {@code server.properties} to bypass the safety gate in a specific
+   *     deployment topology (e.g. tiered storage where the local replica
+   *     check is intentionally loosened). Typed-config surface area (doc,
+   *     validator, dynamic-config admit path) would invite typo-driven
+   *     fail-open if a value like {@code "False "} or {@code "FALSE\n"} were
+   *     handled with permissive boolean coercion.
+   *   - Reading from {@code originals()} keeps the fail-closed contract
+   *     verbatim: only the three exact strings above flip the gate; everything
+   *     else inherits the safe default.
+   *
+   * <p>Round-39 audit (R39-E-2) flagged that this parser had only indirect
+   * test coverage (via the error-message assertions in the bootstrap-level
+   * tests). The fail-closed contract is a security-critical invariant —
+   * extracted here so a direct unit test can pin every branch without
+   * standing up a broker.
+   *
+   * @param rawValue the value read from {@code config.originals().get(key)}
+   *                 (may be {@code null} when the key is absent; otherwise
+   *                 typically a {@code String} but may be any {@code Object}
+   *                 that has a meaningful {@code toString})
+   * @return {@code false} only on exact lowercase-trimmed match of
+   *         {@code "false"}, {@code "no"}, or {@code "0"}; {@code true} for
+   *         every other input including {@code null}
+   */
+  def parseRequireLocalReplica(rawValue: AnyRef): Boolean = {
+    Option(rawValue).map(_.toString.trim.toLowerCase) match {
+      case Some("false") | Some("no") | Some("0") => false
+      case _ => true
+    }
+  }
 }
 
 /**
@@ -716,13 +759,10 @@ class BrokerServer(
       // Read directly from originals() rather than wiring through KafkaConfig
       // so this P0 broker-safety knob doesn't drag in config doc / validator
       // surface area. Promote to a first-class config if it ever sees broader
-      // operational use.
-      val requireLocalReplica: Boolean =
-        Option(config.originals().get("governance.bootstrap.require.local.replica"))
-          .map(_.toString.trim.toLowerCase) match {
-          case Some("false") | Some("no") | Some("0") => false
-          case _ => true
-        }
+      // operational use. Parser extracted to BrokerServer.parseRequireLocalReplica
+      // for direct unit-test coverage of the fail-closed contract (R39-E-2).
+      val requireLocalReplica: Boolean = BrokerServer.parseRequireLocalReplica(
+        config.originals().get("governance.bootstrap.require.local.replica"))
       // Catchup probe (Codex deep-audit P0b + P0c): tells drainStartup when
       // this broker's local log is safe to drain — i.e. when local HW
       // reflects a recent cluster-committed point on the governance
