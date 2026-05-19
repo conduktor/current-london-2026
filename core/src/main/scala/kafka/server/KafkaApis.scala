@@ -1774,7 +1774,7 @@ class KafkaApis(val requestChannel: RequestChannel,
     val unknownTopicIdsTopicMetadata = unknownTopicIds.map(topicId =>
         metadataResponseTopic(Errors.UNKNOWN_TOPIC_ID, null, topicId, isInternal = false, util.Collections.emptyList())).toSeq
 
-    val topics = if (metadataRequest.isAllTopics)
+    val topicsBeforeBackingFilter = if (metadataRequest.isAllTopics)
       // Stock listTopics() / adminClient.listTopics() callers expect every visible topic in the
       // METADATA(isAllTopics) response. Logical topics live outside the metadata cache so we
       // overlay them explicitly here — without this, tools like Kafka UI never see them and
@@ -1793,6 +1793,26 @@ class KafkaApis(val requestChannel: RequestChannel,
       knownTopicNames
     else
       metadataRequest.topics.asScala.toSet
+
+    // r22 BLOCKER #164: backing topics MUST NEVER be addressable via client-facing metadata
+    // paths. The isAllTopics branch above already strips them via filterNot(isBackingTopic);
+    // the useTopicId branch strips backing UUIDs via safePhysicalResolved (BLOCKER #167). The
+    // by-name branch, however, fell through to the auth filter and then to
+    // {@code metadataCache.getTopicMetadata}, which would return real partition leadership for
+    // a backing topic — leaking name → UUID → leader/ISR / replicas to any caller authorized
+    // (or wildcard-authorized) on the backing topic name. This re-opened every ID-based admin
+    // attack surface the recent guards closed.
+    //
+    // Filter backings here BEFORE auth (matching the isAllTopics treatment) and synthesise
+    // UNKNOWN_TOPIC_OR_PARTITION responses for each requested backing name — the same response
+    // a client would see for a topic that genuinely doesn't exist, so no existence oracle
+    // distinguishes "backing that was redacted" from "topic that never existed". A client
+    // unauthorized for a backing name still sees the same UNKNOWN response as an authorized
+    // one, so there is no auth-failed-vs-redacted oracle either.
+    val (requestedBackingTopics, topics) =
+      topicsBeforeBackingFilter.partition(concentrationKernel.isBackingTopic)
+    val backingAsUnknownTopicMetadata: Set[MetadataResponseTopic] = requestedBackingTopics.map(topic =>
+      metadataResponseTopic(Errors.UNKNOWN_TOPIC_OR_PARTITION, topic, Uuid.ZERO_UUID, isInternal = false, util.Collections.emptyList()))
 
     val authorizedForDescribeTopics = authHelper.filterByAuthorized(request.context, DESCRIBE, TOPIC,
       topics, logIfDenied = !metadataRequest.isAllTopics)(identity)
@@ -1895,7 +1915,8 @@ class KafkaApis(val requestChannel: RequestChannel,
     }
 
     val completeTopicMetadata =  unknownTopicIdsTopicMetadata ++
-      topicMetadata ++ logicalTopicMetadata ++ unauthorizedForCreateTopicMetadata ++ unauthorizedForDescribeTopicMetadata
+      topicMetadata ++ logicalTopicMetadata ++ unauthorizedForCreateTopicMetadata ++ unauthorizedForDescribeTopicMetadata ++
+      backingAsUnknownTopicMetadata
 
     val brokers = metadataCache.getAliveBrokerNodes(request.context.listenerName)
 

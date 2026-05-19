@@ -142,6 +142,17 @@ public class DescribeTopicPartitionsRequestHandler {
                 // The topic in cursor must be included in the topic list if provided.
                 throw new InvalidRequestException("DescribeTopicPartitionsRequest topic list should contain the cursor topic: " + cursor.topicName());
             }
+            // r22 BLOCKER #164: backing topics MUST NEVER be addressable via client-facing
+            // metadata paths. The isAllTopics branch above already strips them at collection
+            // time (line 119); the by-name branch fell through to the cache lookup in
+            // appendPhysicalTopic, leaking partition leadership / replica / ISR for any
+            // backing topic to any authorized (or wildcard-authorized) caller. Keep the
+            // backing name in the candidate set so we still emit a per-topic response — the
+            // dispatcher in buildResponse will route it to UNKNOWN_TOPIC_OR_PARTITION
+            // (rather than the metadata cache), matching the response a client would see for
+            // a topic that genuinely doesn't exist. The candidate set is preserved here (not
+            // partitioned off) so cursor pagination math and the alphabetical-walk ordering
+            // remain untouched.
         }
         return topics;
     }
@@ -202,6 +213,20 @@ public class DescribeTopicPartitionsRequestHandler {
                     .setTopicName(topicName)
                     .setPartitionIndex(0));
                 return response;
+            }
+            // r22 BLOCKER #164: a backing topic name reaching this point came in via the
+            // by-name request branch (the isAllTopics branch filters backings out in
+            // collectCandidateTopics). Emit UNKNOWN_TOPIC_OR_PARTITION instead of letting it
+            // flow into appendPhysicalTopic, which would hand back real backing leadership.
+            // The response shape mirrors what an authorized client sees for a topic that
+            // genuinely doesn't exist (zero UUID, zero partitions), so backing-vs-missing is
+            // indistinguishable to the caller — no existence oracle.
+            boolean isBacking = concentrationKernel != null && concentrationKernel.isBackingTopic(topicName);
+            if (isBacking) {
+                response.topics().add(describeTopicPartitionsResponseTopic(
+                    Errors.UNKNOWN_TOPIC_OR_PARTITION, topicName, Uuid.ZERO_UUID, false,
+                    Collections.emptyList()));
+                continue;
             }
             boolean isLogical = concentrationKernel != null && concentrationKernel.isLogicalTopic(topicName);
             int delta = isLogical

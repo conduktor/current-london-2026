@@ -65,6 +65,7 @@ import org.apache.kafka.server.authorizer.AuthorizationResult;
 import org.apache.kafka.server.authorizer.Authorizer;
 import org.apache.kafka.server.common.KRaftVersion;
 import org.apache.kafka.server.config.KRaftConfigs;
+import org.apache.kafka.storage.internals.concentration.ConcentrationKernel;
 
 import org.junit.jupiter.api.Test;
 
@@ -80,10 +81,12 @@ import java.util.Properties;
 import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.fail;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -475,6 +478,138 @@ class DescribeTopicPartitionsRequestHandlerTest {
         } catch (Exception e) {
             assertInstanceOf(InvalidRequestException.class, e, e.getMessage());
         }
+    }
+
+    @Test
+    void testDescribeTopicPartitionsByNameRejectsBackingTopic() {
+        // r22 BLOCKER #164 — DescribeTopicPartitions(topics=["<backing>"]) MUST NOT forward
+        // partition leadership / ISR / replicas for a backing topic. The isAllTopics branch
+        // already strips backings (testable via the existing all-topics path), but the by-name
+        // branch — the most common admin / cache-refresh codepath — used to flow into
+        // appendPhysicalTopic, leaking real backing leadership to any caller authorized (or
+        // wildcard-authorized) on that name. Treat by-name requests for backing topics as
+        // UNKNOWN_TOPIC_OR_PARTITION so backing-vs-missing is indistinguishable to clients.
+
+        // 1. Authorizer allows everything (wildcard-authz simulates the leak surface).
+        Authorizer authorizer = mock(Authorizer.class);
+        when(authorizer.authorize(any(RequestContext.class), any()))
+            .thenAnswer(invocation -> {
+                List<Action> actions = invocation.getArgument(1);
+                return actions.stream().map(a -> AuthorizationResult.ALLOWED).collect(Collectors.toList());
+            });
+
+        // 2. KRaft metadata cache holds both topics with REAL partition records — the kernel
+        // guard must short-circuit BEFORE the cache lookup so the backing's leadership / ISR
+        // never reach the response builder.
+        String backingTopic = "concentration_default_backing_0";
+        String regularTopic = "regular-topic-r22-164";
+        Uuid backingTopicId = Uuid.randomUuid();
+        Uuid regularTopicId = Uuid.randomUuid();
+
+        BrokerEndpointCollection collection = new BrokerEndpointCollection();
+        collection.add(brokerEndpoint);
+        List<ApiMessage> records = Arrays.asList(
+            new RegisterBrokerRecord()
+                .setBrokerId(brokerId)
+                .setBrokerEpoch(0)
+                .setIncarnationId(Uuid.randomUuid())
+                .setEndPoints(collection)
+                .setRack(rack)
+                .setFenced(false),
+            new TopicRecord().setName(backingTopic).setTopicId(backingTopicId),
+            new TopicRecord().setName(regularTopic).setTopicId(regularTopicId),
+            new PartitionRecord()
+                .setTopicId(backingTopicId)
+                .setPartitionId(0)
+                .setReplicas(Arrays.asList(0, 1, 2))
+                .setLeader(0)
+                .setIsr(Arrays.asList(0))
+                .setEligibleLeaderReplicas(Arrays.asList(1))
+                .setLastKnownElr(Arrays.asList(2))
+                .setLeaderEpoch(0)
+                .setPartitionEpoch(1)
+                .setLeaderRecoveryState(LeaderRecoveryState.RECOVERED.value()),
+            new PartitionRecord()
+                .setTopicId(regularTopicId)
+                .setPartitionId(0)
+                .setReplicas(Arrays.asList(0, 1, 2))
+                .setLeader(0)
+                .setIsr(Arrays.asList(0))
+                .setEligibleLeaderReplicas(Arrays.asList(1))
+                .setLastKnownElr(Arrays.asList(2))
+                .setLeaderEpoch(0)
+                .setPartitionEpoch(1)
+                .setLeaderRecoveryState(LeaderRecoveryState.RECOVERED.value())
+        );
+        KRaftMetadataCache metadataCache = new KRaftMetadataCache(0, () -> KRaftVersion.KRAFT_VERSION_1);
+        updateKraftMetadataCache(metadataCache, records);
+
+        // 3. ConcentrationKernel mock classifies the backing name correctly.
+        ConcentrationKernel concentrationKernel = mock(ConcentrationKernel.class);
+        when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true);
+        when(concentrationKernel.isBackingTopic(regularTopic)).thenReturn(false);
+        when(concentrationKernel.isLogicalTopic(anyString())).thenReturn(false);
+        when(concentrationKernel.allLogicalTopicNames()).thenReturn(java.util.Collections.emptySet());
+
+        DescribeTopicPartitionsRequestHandler handler =
+            new DescribeTopicPartitionsRequestHandler(metadataCache, new AuthHelper(scala.Option.apply(authorizer)),
+                createKafkaDefaultConfig(), concentrationKernel);
+
+        // 4. By-name request mixing backing + regular topic.
+        DescribeTopicPartitionsRequest describeRequest = new DescribeTopicPartitionsRequest(
+            new DescribeTopicPartitionsRequestData()
+                .setTopics(Arrays.asList(
+                    new DescribeTopicPartitionsRequestData.TopicRequest().setName(backingTopic),
+                    new DescribeTopicPartitionsRequestData.TopicRequest().setName(regularTopic)
+                ))
+        );
+        RequestChannel.Request request;
+        try {
+            request = buildRequest(describeRequest, plaintextListener);
+        } catch (Exception e) {
+            fail(e.getMessage());
+            return;
+        }
+        DescribeTopicPartitionsResponseData response = handler.handleDescribeTopicPartitionsRequest(request);
+        List<DescribeTopicPartitionsResponseTopic> topics = response.topics().valuesList();
+        assertEquals(2, topics.size(), "response must contain both topics");
+
+        // Topics are walked in alphabetical order: backing ("concentration_...") then regular.
+        DescribeTopicPartitionsResponseTopic backingResp = topics.stream()
+            .filter(t -> backingTopic.equals(t.name())).findFirst().orElse(null);
+        DescribeTopicPartitionsResponseTopic regularResp = topics.stream()
+            .filter(t -> regularTopic.equals(t.name())).findFirst().orElse(null);
+
+        assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION.code(), backingResp.errorCode(),
+            "backing topic by-name must surface as UNKNOWN_TOPIC_OR_PARTITION — never forwarded as a real topic");
+        assertEquals(Uuid.ZERO_UUID, backingResp.topicId(),
+            "backing topic UUID must not leak through the by-name path");
+        assertEquals(0, backingResp.partitions().size(),
+            "backing topic partitions must not be exposed via the by-name path — leader/ISR data is internal storage layout");
+
+        // Regular topic still resolves normally — the guard is scoped to backing names only.
+        assertEquals(Errors.NONE.code(), regularResp.errorCode());
+        assertEquals(regularTopicId, regularResp.topicId());
+        assertEquals(1, regularResp.partitions().size());
+
+        // 5. Defense-in-depth: the backing topic must not surface real-leader fields anywhere in
+        // the response, even for the "all topics" walk that would have an authorized caller.
+        DescribeTopicPartitionsRequest allRequest = new DescribeTopicPartitionsRequest(
+            new DescribeTopicPartitionsRequestData());
+        try {
+            request = buildRequest(allRequest, plaintextListener);
+        } catch (Exception e) {
+            fail(e.getMessage());
+            return;
+        }
+        response = handler.handleDescribeTopicPartitionsRequest(request);
+        topics = response.topics().valuesList();
+        // The all-topics branch strips backings entirely (filterNot at collection time) — only
+        // the regular topic should appear.
+        assertEquals(1, topics.size());
+        assertEquals(regularTopic, topics.get(0).name());
+        assertFalse(topics.stream().anyMatch(t -> backingTopic.equals(t.name())),
+            "backing topic name must never appear in DescribeTopicPartitions(all)");
     }
 
     void updateKraftMetadataCache(KRaftMetadataCache kRaftMetadataCache, List<ApiMessage> records) {

@@ -6903,6 +6903,74 @@ class KafkaApisTest extends Logging {
       "backing topic name must never appear in any METADATA response slot")
   }
 
+  @Test
+  def testMetadataByNameRejectsBackingTopic(): Unit = {
+    // r22 BLOCKER #164 — METADATA(topics=["<backing>"]) MUST NOT forward leadership metadata for
+    // a backing topic. The useTopicId branch is closed by #167 and the isAllTopics branch already
+    // strips backings; the by-name branch (the most common admin / client-refresh path) used to
+    // fall through to metadataCache.getTopicMetadata, returning real partition leadership / ISR /
+    // replicas for any backing topic to any caller authorized (or wildcard-authorized) on that
+    // name. Treat by-name requests for backing topics as UNKNOWN_TOPIC_OR_PARTITION so that
+    // backing-vs-missing is indistinguishable to clients.
+    val plaintextListener = ListenerName.forSecurityProtocol(SecurityProtocol.PLAINTEXT)
+    val endpoints = new BrokerEndpointCollection()
+    endpoints.add(
+      new BrokerEndpoint()
+        .setHost("broker0")
+        .setPort(9092)
+        .setSecurityProtocol(SecurityProtocol.PLAINTEXT.id)
+        .setName(plaintextListener.value)
+    )
+    MetadataCacheTest.updateCache(metadataCache,
+      Seq(new RegisterBrokerRecord().setBrokerId(0).setRack("rack").setFenced(false).setEndPoints(endpoints))
+    )
+
+    val backingTopic = "concentration_default_backing_0"
+    val backingTopicId = Uuid.randomUuid()
+    val regularTopic = "regular-topic-r22-164"
+    val regularTopicId = Uuid.randomUuid()
+
+    addTopicToMetadataCache(backingTopic, 1, topicId = backingTopicId)
+    addTopicToMetadataCache(regularTopic, 1, topicId = regularTopicId)
+
+    def partitionRecord(topicId: Uuid) = new PartitionRecord()
+      .setTopicId(topicId).setPartitionId(0).setLeader(0).setLeaderEpoch(0)
+      .setReplicas(Collections.singletonList(0)).setIsr(Collections.singletonList(0))
+    MetadataCacheTest.updateCache(metadataCache,
+      Seq(partitionRecord(backingTopicId), partitionRecord(regularTopicId)))
+
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+    when(concentrationKernel.isBackingTopic(regularTopic)).thenReturn(false)
+    when(concentrationKernel.isLogicalTopic(anyString)).thenReturn(false)
+    when(concentrationKernel.allLogicalTopicNames()).thenReturn(java.util.Collections.emptySet())
+
+    // By-name request mixing a backing topic with a regular topic.
+    val metadataReq = new MetadataRequest.Builder(
+      util.Arrays.asList(backingTopic, regularTopic), false).build()
+    val req = buildRequest(metadataReq, plaintextListener)
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), any[Long])).thenReturn(0)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleTopicMetadataRequest(req)
+    val resp = verifyNoThrottling[MetadataResponse](req)
+
+    val byName = resp.data().topics().asScala.groupBy(_.name()).map(kv => (kv._1, kv._2.head))
+
+    val backingResp = byName(backingTopic)
+    assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION.code(), backingResp.errorCode(),
+      "backing topic by-name must surface as UNKNOWN_TOPIC_OR_PARTITION — never forwarded as a real topic")
+    assertEquals(Uuid.ZERO_UUID, backingResp.topicId(),
+      "backing topic UUID must not leak through the by-name path")
+    assertEquals(0, backingResp.partitions().size(),
+      "backing topic partitions must not be exposed via the by-name path — leader/ISR data is internal storage layout")
+
+    // Regular topic still resolves normally.
+    val regularResp = byName(regularTopic)
+    assertEquals(Errors.NONE.code(), regularResp.errorCode())
+    assertEquals(regularTopicId, regularResp.topicId())
+    assertEquals(1, regularResp.partitions().size())
+  }
+
     /**
    * Verifies that sending a fetch request with version 9 works correctly when
    * ReplicaManager.getLogConfig returns None.
