@@ -35,6 +35,7 @@ import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 /**
@@ -885,11 +886,23 @@ public final class RuleEngine {
             // observation via a local boolean and bump the counter at most
             // once per evaluate() in the inner finally.
             boolean evalErrorObserved = false;
+            // R28 Axis 1 (HIGH, Task #219): hoist the activation method
+            // reference out of the per-rule loop. `activation::get` is a
+            // capturing lambda that allocates a fresh Function<String, Object>
+            // instance per evaluation site in the general case — the JIT may
+            // elide it under escape analysis but the JLS gives no guarantee.
+            // With the 128-rule per-api-key cap (CelLimits.MAX_RULES_PER_API_KEY)
+            // the pre-fix inner loop produced up to 128 short-lived Function
+            // allocations per request on the request hot path. The activation
+            // map is invariant across rules within a single evaluate(), so a
+            // single hoisted reference is correct and removes the per-rule
+            // allocation regardless of JIT behaviour.
+            Function<String, Object> activationGet = activation::get;
             try {
                 for (Rule rule : rules) {
                     boolean matched;
                     try {
-                        matched = rule.compiled().evalBoolean(activation::get);
+                        matched = rule.compiled().evalBoolean(activationGet);
                     } catch (EvaluateReentryException reentry) {
                         // R23 #224: the re-entry guard at the top of
                         // evaluate() throws EvaluateReentryException (an
