@@ -230,30 +230,46 @@ object BrokerServer {
 
   /**
    * Parser for the {@code governance.bootstrap.require.local.replica} broker
-   * property. Fail-closed by design: the only values that disable the
+   * property. Fail-CLOSED by design: the only values that disable the
    * require-local-replica safety gate are exact, lowercase, trimmed matches of
    * {@code "false"}, {@code "no"}, or {@code "0"}. Any other value — including
    * {@code null} (absent), typos (e.g. {@code "fals"}), unknown booleans
-   * (e.g. {@code "off"}), and garbage — yields {@code true}.
+   * (e.g. {@code "off"}, {@code "yes"}, {@code "1"}), and garbage — yields
+   * {@code true} and leaves the gate engaged.
    *
    * <p>This knob is read directly from {@link KafkaConfig#originals()} rather
-   * than through a typed accessor. We deliberately did NOT add it to
-   * {@link org.apache.kafka.server.config.ServerConfigs#CONFIG_DEF} because:
-   *   - The intended audience is a broker operator setting it once in
-   *     {@code server.properties} to bypass the safety gate in a specific
-   *     deployment topology (e.g. tiered storage where the local replica
-   *     check is intentionally loosened). Typed-config surface area (doc,
-   *     validator, dynamic-config admit path) would invite typo-driven
-   *     fail-open if a value like {@code "False "} or {@code "FALSE\n"} were
-   *     handled with permissive boolean coercion.
-   *   - Reading from {@code originals()} keeps the fail-closed contract
-   *     verbatim: only the three exact strings above flip the gate; everything
-   *     else inherits the safe default.
+   * than through a typed accessor. The intentional decision to keep it off the
+   * typed config surface ({@link org.apache.kafka.server.config.ServerConfigs#CONFIG_DEF})
+   * is load-bearing — not for parser semantics (ConfigDef.BOOLEAN's coercion
+   * is roughly equivalent: case-insensitive trimmed match of "true"/"false")
+   * but for the dynamic-config admit path:
+   * <ul>
+   *   <li>If this key were typed, {@link DynamicBrokerConfig#AllDynamicConfigs}
+   *       would either include it (admitting runtime AlterConfigs writes) or
+   *       have to explicitly exclude it. Either way, the admit-time gate
+   *       would consult typed validation, and a future maintainer adding a
+   *       {@code BrokerReconfigurable} listener for symmetry with other
+   *       broker configs would split-brain runtime state (consumed by the
+   *       listener) versus next-restart state (consumed here) — with no
+   *       rolling-restart story for moving the gate.</li>
+   *   <li>An admit-time ConfigException on a malformed value (which
+   *       ConfigDef.BOOLEAN would raise for, say, {@code "off"}) would
+   *       reject the ENTIRE incremental alteration batch, including
+   *       unrelated keys. A silently-accepted-and-ignored value (because the
+   *       key isn't in CONFIG_DEF) is the louder operator failure mode —
+   *       paired with the broker-startup ERROR signal at
+   *       {@code BrokerGovernanceBootstrap.scala:226-238} on the only
+   *       branch where {@code =false} is operator-visible.</li>
+   * </ul>
+   * The forcing-function test
+   * {@code governanceBootstrapRequireLocalReplicaIsUntypedAndNonDynamic}
+   * (DynamicBrokerConfigTest, R39-E-3) asserts the key is neither in
+   * {@code CONFIG_DEF} nor in {@code AllDynamicConfigs}, so any future drift
+   * toward typed/dynamic registration breaks the test before it ships.
    *
    * <p>Round-39 audit (R39-E-2) flagged that this parser had only indirect
    * test coverage (via the error-message assertions in the bootstrap-level
-   * tests). The fail-closed contract is a security-critical invariant —
-   * extracted here so a direct unit test can pin every branch without
+   * tests). Extracted here so a direct unit test can pin every branch without
    * standing up a broker.
    *
    * @param rawValue the value read from {@code config.originals().get(key)}
@@ -265,7 +281,7 @@ object BrokerServer {
    *         every other input including {@code null}
    */
   def parseRequireLocalReplica(rawValue: AnyRef): Boolean = {
-    Option(rawValue).map(_.toString.trim.toLowerCase) match {
+    Option(rawValue).map(_.toString.trim.toLowerCase(java.util.Locale.ROOT)) match {
       case Some("false") | Some("no") | Some("0") => false
       case _ => true
     }
