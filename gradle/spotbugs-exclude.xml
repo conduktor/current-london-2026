@@ -377,6 +377,16 @@ For a detailed description of spotbugs bug categories, see https://spotbugs.read
     </Match>
 
     <Match>
+        <!-- ConcentrationKernel's reserve/commit protocol intentionally holds the per-partition
+             lock acquired in reserveBatch across return, and the matching commitBatch/rollbackBatch
+             releases it. SpotBugs cannot reason about this hand-off and flags the success path as
+             a leak; the failure path (try/finally with success flag) does release it correctly. -->
+        <Class name="org.apache.kafka.storage.internals.concentration.LogicalOffsetTracker"/>
+        <Method name="reserveBatch"/>
+        <Bug pattern="UL_UNRELEASED_LOCK"/>
+    </Match>
+
+    <Match>
         <!-- Suppress warnings about synchronizing on the UnsentRequests
              ConcurrentHashMap.  This is done deliberately. -->
         <Package name="org.apache.kafka.clients.consumer.internals"/>

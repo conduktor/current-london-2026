@@ -93,13 +93,29 @@ public final class LogicalOffsetTracker {
         }
         PartitionState s = stateFor(logicalTopic, logicalPartition);
         s.lock.lock();
-        Reservation[] batch = new Reservation[count];
-        long base = s.nextOffset;
-        for (int i = 0; i < count; i++) {
-            batch[i] = new Reservation(logicalTopic, logicalPartition, base + i);
+        // BLOCKER #179: the lock is acquired BEFORE any allocation; if either
+        // {@code new Reservation[count]} or any per-element construction throws — most
+        // realistically OutOfMemoryError on a hostile {@code count} like Integer.MAX_VALUE, or
+        // any future Reservation-constructor validation — the lock leaks forever, deadlocking
+        // every subsequent reserve/commit on this partition. Hold the lock on the happy path
+        // (commit/rollback releases it) but release it on any failure path. Catching Throwable is
+        // intentional: an Error path is exactly the realistic failure mode here, and we'd rather
+        // surface the original Throwable than risk an unlock that propagates a second Throwable.
+        boolean success = false;
+        try {
+            Reservation[] batch = new Reservation[count];
+            long base = s.nextOffset;
+            for (int i = 0; i < count; i++) {
+                batch[i] = new Reservation(logicalTopic, logicalPartition, base + i);
+            }
+            s.outstandingBatch = batch;
+            success = true;
+            return batch;
+        } finally {
+            if (!success) {
+                s.lock.unlock();
+            }
         }
-        s.outstandingBatch = batch;
-        return batch;
     }
 
     /**

@@ -341,6 +341,45 @@ public class LogicalOffsetTrackerTest {
     }
 
     @Test
+    public void reserveBatchReleasesLockOnAllocationThrow() throws Exception {
+        // BLOCKER #179: the per-partition lock is acquired BEFORE the array allocation. A
+        // hostile or pathological {@code count} (Integer.MAX_VALUE) triggers OutOfMemoryError
+        // inside {@code new Reservation[count]} — before fix, that leaked the lock forever and
+        // every subsequent reserve on the partition would block. Now the lock must be released
+        // on any failure path so the partition is reusable.
+        LogicalOffsetTracker tracker = new LogicalOffsetTracker();
+        // First, prime the partition state so the lock object exists.
+        Reservation[] primer = tracker.reserveBatch("orders", 0, 1);
+        tracker.commitBatch(primer);
+
+        // Force allocation failure: Integer.MAX_VALUE reservations would need ~16 GB of heap
+        // refs. JVM throws OutOfMemoryError before the for-loop runs.
+        assertThrows(OutOfMemoryError.class,
+            () -> tracker.reserveBatch("orders", 0, Integer.MAX_VALUE));
+
+        // Lock must have been released. A subsequent reserve+commit from a SEPARATE thread must
+        // succeed within a reasonable bound — if the lock leaked, the reserve would block
+        // forever. ReentrantLock is per-thread, so the same worker thread must perform both
+        // reserve and commit to round-trip the lock cleanly.
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            Future<long[]> f = pool.submit(() -> {
+                Reservation[] retry = tracker.reserveBatch("orders", 0, 2);
+                long[] offsets = new long[] {retry[0].logicalOffset(), retry[1].logicalOffset()};
+                tracker.commitBatch(retry);
+                return offsets;
+            });
+            long[] offsets = f.get(2, TimeUnit.SECONDS);
+            assertEquals(1L, offsets[0], "first reservation after failed batch reuses the next slot");
+            assertEquals(2L, offsets[1]);
+            assertEquals(3L, tracker.nextLogicalOffset("orders", 0));
+        } finally {
+            pool.shutdownNow();
+            assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
     public void commitBatchOnForeignArrayIsRejected() {
         // The tracker requires the SAME array reference returned by reserveBatch — a forged
         // copy with the same contents must not be accepted as the outstanding batch.
