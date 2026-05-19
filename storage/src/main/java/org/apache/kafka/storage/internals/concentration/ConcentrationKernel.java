@@ -511,6 +511,18 @@ public final class ConcentrationKernel implements AutoCloseable {
         Objects.requireNonNull(reservation, "reservation");
         checkBackingGenerationOrRollback(reservation);
         LogicalSidecarIndex sidecar = sidecarFor(reservation.logicalTopic(), reservation.logicalPartition());
+        // BLOCKER #207: re-check generation AFTER acquiring the sidecar handle. The first check
+        // races with markBackingUnready — between the first check and sidecarFor(), a concurrent
+        // gate-close can bump the generation AND evict the cached sidecar; sidecarFor() then
+        // observes the empty cache and opens a FRESH handle on the same on-disk file. Recovery is
+        // about to truncate that file to zero and rebuild it from the backing log under the new
+        // generation; if we proceed to append here the write either lands and is then overwritten
+        // by recovery (best case) or races recovery's truncate (worst case, partial-page churn).
+        // Catching the bump between checks 1 and 2 forces the standard rollback path so the
+        // producer retries against the new leader with NOT_LEADER_OR_FOLLOWER. Pair with the
+        // eviction-inside-compute change in markBackingUnready, which makes (gen bump, cache
+        // evict) atomic from the perspective of this re-check.
+        checkBackingGenerationOrRollback(reservation);
         try {
             sidecar.append(backingOffset);
         } catch (IOException | RuntimeException e) {
@@ -612,6 +624,13 @@ public final class ConcentrationKernel implements AutoCloseable {
         }
         checkBackingGenerationOrRollbackBatch(batch);
         LogicalSidecarIndex sidecar = sidecarFor(batch[0].logicalTopic(), batch[0].logicalPartition());
+        // BLOCKER #207: re-check generation AFTER acquiring the sidecar handle — see the matching
+        // comment on commitProduce. Without this second check, a markBackingUnready landing between
+        // checkBackingGenerationOrRollbackBatch and sidecarFor() can leave us writing a partial
+        // batch into a file recovery is about to truncate. The batch path is more sensitive than
+        // the single-record path because a partial append here mutates sidecarSizeBefore-based
+        // truncate logic; rolling back before the loop avoids that altogether.
+        checkBackingGenerationOrRollbackBatch(batch);
         long sidecarSizeBefore = sidecar.size();
         try {
             for (int i = 0; i < batch.length; i++) {
@@ -792,28 +811,38 @@ public final class ConcentrationKernel implements AutoCloseable {
         // generation drift, not against the boolean ready flag, so a (unready → ready → unready)
         // cycle must produce two distinct generations or the second unready event will be
         // confused with the first by a recoverer that captured the first generation.
+        //
+        // BLOCKER #207 / HIGH #180: evict cached sidecars INSIDE the compute() lambda so the
+        // (generation bump, cache eviction) pair is atomic under the per-key compute lock. The
+        // previous ordering — bump first, evict afterwards — left a window where a concurrent
+        // commitProduce / commitProduceBatch could pass its first gen check, observe the
+        // pre-eviction cache state in sidecarFor(), and then race recovery's truncate. With the
+        // eviction moved inside the lambda, any commitProduce that observes the old generation
+        // ALSO observes the cache as still-populated (or about-to-be-evicted under the same
+        // lock), and the matching second gen check in commitProduce/commitProduceBatch catches
+        // the bump before any sidecar write happens.
+        //
+        // B.7: the eviction itself drops every cached LogicalSidecarIndex handle for logical
+        // partitions mapped onto this backing. Recovery (KafkaConcentrationLeaderRecoverer.runScan)
+        // opens its OWN fresh sidecar handles via BackingScanRecoverer.openSidecar, calls
+        // truncateTo(0), then re-appends from the backing log. The cached handles still in this
+        // map carry pre-recovery in-memory state (entries count, lastBackingOffset) — which
+        // becomes a SILENT DATA CORRUPTION trap once the gate reopens: the next produce routes
+        // through the cached handle, whose stale `entries` count drives a write at the WRONG
+        // byte offset in the freshly-rebuilt file, overwriting recovered data and shadowing the
+        // rest as "out of bounds" on lookup.
+        //
+        // The compute lambda runs under the ConcurrentHashMap per-key lock, so the eviction is
+        // serialised with publishIfGenerationMatches and markBackingReady on the same backing.
+        // Eviction does I/O (close() on each cached handle); that lengthens the lock-hold
+        // proportional to the number of logical partitions on this backing, but those closes are
+        // O(1) syscalls and the alternative — split atomicity — is what the BLOCKER documents as
+        // unacceptable.
         backingGateState.compute(backing, (k, prev) -> {
             long nextGen = (prev == null ? 0L : prev.generation) + 1L;
+            evictCachedSidecarsForBacking(backing);
             return new BackingGateState(false, nextGen);
         });
-        // B.7: evict cached sidecar handles for every logical partition mapped onto this backing.
-        // Recovery (KafkaConcentrationLeaderRecoverer.runScan) opens its OWN fresh sidecar handles
-        // via BackingScanRecoverer.openSidecar, calls truncateTo(0), then re-appends from the
-        // backing log. The cached handles still in this map carry pre-recovery in-memory state
-        // (entries count, lastBackingOffset) — which becomes a SILENT DATA CORRUPTION trap once
-        // the gate reopens: the next produce routes through the cached handle, whose stale
-        // `entries` count drives a write at the WRONG byte offset in the freshly-rebuilt file,
-        // overwriting recovered data and shadowing the rest as "out of bounds" on lookup.
-        //
-        // The eviction happens AFTER the gate is closed, so any subsequent produce reaching this
-        // kernel via the broker's gate check will have been rejected first. The only window
-        // remaining is the small one between an in-flight produce's gate check and its
-        // commitProduce call; if that produce holds the cached handle reference at the moment we
-        // close it, its sidecar.append throws IllegalStateException(closed), which
-        // commitProduce's existing try/catch rolls back as a reservation rollback. The client
-        // retries; on retry it hits the now-closed gate and follows the standard
-        // NOT_LEADER_OR_FOLLOWER metadata-refresh path.
-        evictCachedSidecarsForBacking(backing);
     }
 
     /**
