@@ -267,14 +267,44 @@ class HttpBridgeMetricsTest {
 
     @Test
     void closeUnregistersEveryMetricSoASecondInstanceCanBeConstructed() {
-        // Yammer rejects duplicate names: a second new HttpBridgeMetrics() against the same registry must succeed
-        // only if close() actually unregistered every name. This catches the "I forgot to add the new metric to
-        // close()" bug class.
+        // Yammer's MetricsRegistry silently de-duplicates by name: getOrAdd returns the EXISTING metric on collision
+        // rather than throwing. So a second `new HttpBridgeMetrics()` against the same registry SUCCEEDS even if
+        // close() forgot to unregister a metric — the new instance silently rebinds to the leftover registration and
+        // both lifecycle generations share a single Histogram / Meter / Gauge object. Quantiles, mean rates, and
+        // gauge bindings all bleed across the boundary, which is exactly the misleading-JMX state the class javadoc
+        // calls out.
+        //
+        // A test that only checks "did the second construction succeed?" is therefore blind to a forgotten
+        // removeMetric call. To actually pin the contract, after close() walk every metric name this class owns
+        // (matching the close() body exactly) and assert it is ABSENT from KafkaYammerMetrics.defaultRegistry().
+        // Then construct a fresh instance to confirm the full round-trip.
         metrics.close();
+
+        // Tagged metrics: latency histograms per operation, response meters per (operation, statusClass).
+        for (HttpBridgeMetrics.Operation op : HttpBridgeMetrics.Operation.values()) {
+            Map<String, String> latencyTags = new LinkedHashMap<>();
+            latencyTags.put("operation", op.tag);
+            assertNotRegistered("RequestLatencyMs", latencyTags);
+            for (String family : new String[] {"2xx", "4xx", "5xx", "other"}) {
+                Map<String, String> respTags = new LinkedHashMap<>();
+                respTags.put("operation", op.tag);
+                respTags.put("statusClass", family);
+                assertNotRegistered("ResponseCount", respTags);
+            }
+        }
+        // Untagged metrics.
+        assertNotRegistered("RejectedOversizedBody");
+        assertNotRegistered("RejectedAtSseCap");
+        assertNotRegistered("SseStreamsOpened");
+        assertNotRegistered("ActiveSseStreams");
+        assertNotRegistered("RejectedAtWsCap");
+        assertNotRegistered("WsSubscriptionsOpened");
+        assertNotRegistered("ActiveWsSubscriptions");
+
         HttpBridgeMetrics fresh = null;
         try {
             fresh = new HttpBridgeMetrics(limiter, wsLimiter);
-            // If construction succeeded, every name was cleared. Sanity-check one of the histograms exists again.
+            // Round-trip: after a clean close, a fresh instance must rebind every metric name from scratch.
             assertNotNull(lookupHistogram("RequestLatencyMs", "Produce"));
         } finally {
             if (fresh != null) fresh.close();
@@ -362,9 +392,12 @@ class HttpBridgeMetricsTest {
         return (Gauge<?>) metric;
     }
 
-    @SuppressWarnings("unused")
     private static void assertNotRegistered(String n) {
-        Object metric = KafkaYammerMetrics.defaultRegistry().allMetrics().get(name(n, new LinkedHashMap<>()));
-        assertNull(metric, "metric " + n + " should not be registered after close()");
+        assertNotRegistered(n, new LinkedHashMap<>());
+    }
+
+    private static void assertNotRegistered(String n, Map<String, String> tags) {
+        Object metric = KafkaYammerMetrics.defaultRegistry().allMetrics().get(name(n, tags));
+        assertNull(metric, "metric " + n + " " + tags + " should not be registered after close()");
     }
 }

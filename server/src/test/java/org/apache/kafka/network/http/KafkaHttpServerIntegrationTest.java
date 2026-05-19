@@ -227,6 +227,73 @@ class KafkaHttpServerIntegrationTest {
             "errorMessage must quote the configured byte cap, got: " + envelope.get("errorMessage").asText());
     }
 
+    @Test
+    void oversizedBodyResponseSetsConnectionCloseAndDoesNotProcessPipelinedRequest() throws Exception {
+        // Request-smuggling defense. When the body cap fires mid-read, the declared Content-Length bytes are still
+        // on the wire. Without Connection: close on the 413 response, Jetty drains those bytes per Content-Length
+        // and then parses any pipelined bytes as the next request — turning the 413 path into a smuggling primitive
+        // in the presence of a fronting proxy that pools upstream connections. The fix (writePayloadTooLarge sets
+        // Connection: close) makes Jetty close the socket after the 413 response so the pipelined bytes are never
+        // parsed.
+        //
+        // Wire shape:
+        //   POST /v1/topics/orders/records HTTP/1.1
+        //   Content-Length: 200     ← bigger than the 64-byte cap
+        //   <200 bytes of body>
+        //   GET /smuggled HTTP/1.1  ← pipelined; MUST NOT be executed
+        //   ...
+        //
+        // The Jetty HttpClient API used by the rest of these tests will not pipeline arbitrary requests after a
+        // partial body, so we drive the wire directly with a raw socket.
+        tearDown();
+        startServer(64, DEFAULT_TEST_MAX_SSE_STREAMS, DEFAULT_TEST_MAX_WS_SUBSCRIPTIONS);
+
+        String body = "x".repeat(200);
+        String smuggled =
+            "GET /v1/topics/smuggled/records?partition=0&offset=0 HTTP/1.1\r\n"
+                + "Host: 127.0.0.1\r\n"
+                + "\r\n";
+        String raw;
+        try (Socket s = new Socket("127.0.0.1", server.boundPort())) {
+            s.setSoTimeout(5000);
+            OutputStream out = s.getOutputStream();
+            String req =
+                "POST /v1/topics/orders/records HTTP/1.1\r\n"
+                    + "Host: 127.0.0.1\r\n"
+                    + "Content-Type: application/json\r\n"
+                    + "Content-Length: " + body.length() + "\r\n"
+                    + "\r\n"
+                    + body
+                    + smuggled;
+            out.write(req.getBytes(StandardCharsets.US_ASCII));
+            out.flush();
+
+            // readAllAscii reads until EOF. With Connection: close honoured, the server closes after the single 413
+            // response and the read returns. Without the fix, the server would (a) drain the remaining body bytes,
+            // (b) parse the pipelined GET, (c) send a second response — and readAllAscii would see two status
+            // lines on the wire, which is exactly what we assert against below.
+            raw = readAllAscii(s.getInputStream());
+        }
+
+        assertTrue(raw.startsWith("HTTP/1.1 413"),
+            "first response must be 413, got status line: " + raw.split("\r\n", 2)[0]);
+
+        int headerEnd = raw.indexOf("\r\n\r\n");
+        assertTrue(headerEnd >= 0, "413 response must terminate its headers, got: " + raw);
+        String headers = raw.substring(0, headerEnd);
+        assertTrue(headers.toLowerCase(java.util.Locale.ROOT).contains("connection: close"),
+            "413 response MUST carry Connection: close — without it the remaining body bytes are drained and a "
+                + "pipelined request is parsed, which is an HTTP request smuggling primitive. Got headers: " + headers);
+
+        // The smuggled GET must NOT be processed. A second response would show up as another HTTP/1.1 status line
+        // after the first response's body. Search the WHOLE stream for a second status line; if Connection: close
+        // is honoured there is exactly one.
+        int firstStatus = raw.indexOf("HTTP/1.1 ");
+        int secondStatus = raw.indexOf("HTTP/1.1 ", firstStatus + 1);
+        assertEquals(-1, secondStatus,
+            "smuggled GET must NOT be processed; expected exactly one response on the wire, got: " + raw);
+    }
+
     // ----- fetch -----
 
     @Test

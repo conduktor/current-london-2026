@@ -45,8 +45,13 @@ import java.util.concurrent.TimeUnit;
  * here is something an operator would put on an alert; everything else belongs in access logs.
  *
  * <p>{@link #close()} is mandatory before constructing a second instance against the same JMX namespace. The default
- * Yammer registry refuses duplicate names, so the bridge lifecycle (BrokerServer start → stop → start) must remove
- * registered metrics on stop. This is enforced by {@link KafkaHttpServer#stop()}.
+ * Yammer registry silently de-duplicates by name — {@code newHistogram}/{@code newMeter}/{@code newGauge} return the
+ * EXISTING metric on collision rather than throwing — so a missed {@code close()} does not fail loudly; it lets the
+ * second instance silently inherit the first's accumulated state (histogram quantiles and meter counts both bleed
+ * across the lifecycle boundary), and the JMX gauges keep pointing at the previous bridge's limiters. That makes the
+ * exposed metric values misleading: operators see one logical metric whose values span two bridge generations. The
+ * bridge lifecycle (BrokerServer start → stop → start) must therefore remove registered metrics on stop. This is
+ * enforced by {@link KafkaHttpServer#stop()}.
  */
 public final class HttpBridgeMetrics implements AutoCloseable {
 
@@ -99,9 +104,12 @@ public final class HttpBridgeMetrics implements AutoCloseable {
         // 5xx). Pre-allocating means recordRequest() is a hash lookup with zero allocation on the hot path.
         //
         // Registration is wrapped in a try/catch that rolls back any already-registered names if a later registration
-        // throws (e.g. a stale duplicate from a prior partial-init in the same JVM). Without rollback the leftover
-        // entries would block every subsequent KafkaHttpServer construction in the process with "duplicate metric
-        // name", because no fully-constructed HttpBridgeMetrics instance exists for stop() to close().
+        // throws. Yammer's getOrAdd is silently de-duplicating (it does NOT throw on duplicate name; it returns the
+        // existing metric), so the realistic sources of mid-construction failure are JVM-level (OOM, NPE from a bad
+        // ctor argument, JMX MBean registration failures bubbled up) rather than name collision. The rollback is
+        // still warranted: without it, a partial registration would leave orphan entries in the registry that no
+        // fully-constructed HttpBridgeMetrics instance owns and that no stop() can clean up — those entries would
+        // then silently merge into the next start()'s metrics and span lifecycle boundaries (see class javadoc).
         Map<Operation, Histogram> histograms = new LinkedHashMap<>();
         Map<Operation, Map<String, Meter>> meters = new LinkedHashMap<>();
         Meter oversized = null;
@@ -263,7 +271,10 @@ public final class HttpBridgeMetrics implements AutoCloseable {
 
     /**
      * Unregister every metric this instance owns from the Yammer registry. Required before a second instance can be
-     * constructed in the same JVM — the registry rejects duplicates. Idempotent: a second {@code close()} is a no-op.
+     * constructed in the same JVM: the registry silently de-duplicates by name, so without {@code close()} the second
+     * instance would share the first instance's metric objects (histograms / meters keep their accumulated samples
+     * across the lifecycle boundary, gauges keep pointing at the first instance's limiters). Idempotent: a second
+     * {@code close()} is a no-op.
      */
     @Override
     public synchronized void close() {

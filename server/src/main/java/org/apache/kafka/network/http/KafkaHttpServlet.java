@@ -396,6 +396,12 @@ public final class KafkaHttpServlet extends HttpServlet {
     }
 
     private void writePayloadTooLarge(HttpServletResponse resp, long limit) throws IOException {
+        // The body is mid-read when the cap fires, so the remaining declared bytes are still on the wire. Without
+        // Connection: close Jetty drains those bytes per Content-Length and then parses any pipelined bytes as the
+        // next request — which gives a fronting proxy that pools upstream connections a request-smuggling primitive
+        // (the attacker chooses Content-Length small enough that Jetty drains rather than closes). RFC 7230 §6.6
+        // covers this case: when a server cannot fully read the request body it MUST signal connection close.
+        resp.setHeader("Connection", "close");
         writeEnvelope(resp, HttpStatusMapper.PAYLOAD_TOO_LARGE,
             "request body exceeds the configured limit of " + limit + " bytes");
     }
