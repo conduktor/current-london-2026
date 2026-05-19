@@ -4247,6 +4247,78 @@ class ControllerApisTest {
   }
 
   @Test
+  def testControllerCreateAclsMixedBatchWithFilterOnlyPatternTypeReturnsPerEntryRejection(): Unit = {
+    // #172 — `CreateAclsRequest.aclBinding(c)` throws IllegalArgumentException
+    // when patternType is MATCH or ANY (filter-only types invalid for concrete
+    // bindings). Pre-#172, the IAE propagated out of AclApis through the
+    // outer ControllerApis catch, which uses
+    // `Collections.nCopies(size, INVALID_REQUEST)` — silently flipping every
+    // LEGITIMATE kept entry to INVALID_REQUEST. A client that submitted a
+    // mixed batch of {good, bad} would see the good one masquerading as bad
+    // and re-create it, doubling the metadata-log writes; worse, it conceals
+    // partial success and breaks per-entry semantics every other AdminClient
+    // method maintains.
+    //
+    // Threat model layering: L1 (`aclTenantCreationRefusal`) refuses
+    // MATCH/ANY on tenant-shaped or under-constrained TOPIC names already
+    // (#163), so the only MATCH/ANY shape that REACHES AclApis is a name
+    // that's not foreign-tenant (e.g. starts with `_` and has no dot). Those
+    // are precisely the shapes that exercise the IAE path. The fix in
+    // AclApis is to refuse MATCH/ANY per-entry (with INVALID_REQUEST) while
+    // preserving NONE for the kept entries.
+    val creations = util.Arrays.asList(
+      // Position 0: ordinary LITERAL — must be forwarded to the Authorizer
+      // and return NONE so the per-entry shape is preserved.
+      aclCreation(ResourceType.TOPIC, "plain-a", PatternType.LITERAL, "User:bob"),
+      // Position 1: MATCH on a non-foreign-tenant name. L1 lets this through
+      // (`_`-prefixed, no dot — neither LITERAL- nor PREFIXED-foreign), so
+      // AclApis sees it. `aclBinding(c)` throws IAE on the MATCH pattern type;
+      // #172 fix maps the IAE to a per-entry INVALID_REQUEST.
+      aclCreation(ResourceType.TOPIC, "_internal_thing", PatternType.MATCH, "User:bob"))
+    val req = new CreateAclsRequest.Builder(new CreateAclsRequestData()
+      .setCreations(creations)).build()
+    val request = buildControllerRequest(req)
+
+    val auth = authorizerAllowingClusterOps()
+    val createdFuture = new CompletableFuture[AclCreateResult]()
+    createdFuture.complete(AclCreateResult.SUCCESS)
+    when(auth.createAcls(any[AuthorizableRequestContext](), any[util.List[AclBinding]]()))
+      .thenAnswer(inv => {
+        val bindings = inv.getArgument[util.List[AclBinding]](1)
+        val out = new util.ArrayList[CompletableFuture[AclCreateResult]](bindings.size)
+        bindings.forEach(_ => out.add(createdFuture))
+        out
+      })
+    controllerApis = createControllerApis(
+      authorizer = Some(auth),
+      controller = new MockController.Builder().build(),
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    controllerApis.handleCreateAclsRequest(request).get()
+
+    val response = captureSentResponse(request).asInstanceOf[CreateAclsResponse]
+    val codes = response.results.asScala.map(_.errorCode).toList
+    assertEquals(List(Errors.NONE.code, Errors.INVALID_REQUEST.code), codes,
+      "legitimate entry at position 0 must keep NONE; MATCH IAE at position 1 must surface " +
+      "as per-entry INVALID_REQUEST rather than masking the whole batch")
+
+    // Defence-in-depth: the Authorizer must have seen ONLY the LITERAL binding —
+    // the IAE-throwing MATCH entry must never reach createAcls.
+    val bindingCaptor: ArgumentCaptor[util.List[AclBinding]] =
+      ArgumentCaptor.forClass(classOf[util.List[AclBinding]])
+    verify(auth).createAcls(any[AuthorizableRequestContext](), bindingCaptor.capture())
+    val passed = bindingCaptor.getValue.asScala.map(_.pattern.name).toList
+    assertEquals(List("plain-a"), passed,
+      "MATCH entry must be filtered before reaching the Authorizer")
+
+    // Defence-in-depth on the error message: the IAE's text identifies the
+    // filter-only pattern type, not a tenant name (no information leak).
+    val msg = response.results.get(1).errorMessage
+    assertNotNull(msg, "per-entry IAE must carry a non-null errorMessage")
+    assertFalse(msg.contains("acme"),
+      s"IAE refusal must not leak tenant identifiers; got: $msg")
+  }
+
+  @Test
   def testControllerDeleteAclsRefusesExplicitTenantTopicFilter(): Unit = {
     // Explicit-name filter `Topic:acme.orders` deletes every ACL of tenant
     // acme that names this resource. Refuse before the Authorizer is asked.

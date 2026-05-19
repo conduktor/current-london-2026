@@ -15802,6 +15802,123 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testAddPartitionsToTxnV4OnNonInterBrokerListenerRefusesTenantPrefixedTransactionalId(): Unit = {
+    // #171 — AddPartitionsToTxn v>=4 is admitted by `authorizeClusterOperation(
+    // CLUSTER_ACTION)` alone, but any configured super-user holds CLUSTER_ACTION
+    // too. Pre-#171 the outside-in tenant-name guard was gated on `version < 4`
+    // so a super-user with CLUSTER_ACTION on a regular client listener could
+    // submit AddPartitionsToTxn(v>=4) naming `__tenant_acme.bob` and probe /
+    // fence the tenant's coordinator slot. The fix tightens the trust-skip to
+    // `brokerOriginated = version >= 4 && on-inter-broker-listener`; here the
+    // request lands on EXTERNAL_SASL (not inter-broker, not tenant-bound), so
+    // the guard must refuse per-transaction without touching the coordinator.
+    // Mirrors the listener-pin pattern verified for WriteTxnMarkers at L2521.
+    val attackerListener = new ListenerName("EXTERNAL_SASL")
+    val transactionalId = "__tenant_acme.bob"
+    val producerId = 42L
+    val epoch = 0.toShort
+    val tp = new TopicPartition("plain-topic", 0)
+
+    val addPartitionsToTxnRequest = AddPartitionsToTxnRequest.Builder.forBroker(
+      new AddPartitionsToTxnTransactionCollection(
+        List(new AddPartitionsToTxnTransaction()
+          .setTransactionalId(transactionalId)
+          .setProducerId(producerId)
+          .setProducerEpoch(epoch)
+          .setVerifyOnly(true)
+          .setTopics(new AddPartitionsToTxnTopicCollection(
+            Collections.singletonList(new AddPartitionsToTxnTopic()
+              .setName(tp.topic)
+              .setPartitions(Collections.singletonList(tp.partition))
+            ).iterator()))
+        ).asJava.iterator())).build(ApiKeys.ADD_PARTITIONS_TO_TXN.latestVersion)
+
+    val request = buildRequest(addPartitionsToTxnRequest,
+      listenerName = attackerListener,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "cluster-admin"))
+
+    kafkaApis = createKafkaApis(
+      authorizer = None,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleAddPartitionsToTxnRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[AddPartitionsToTxnResponse](request)
+    // V4+ responses key per-transaction; refusal must be at the transaction
+    // entry, not the top-level errorCode, so callers see the same shape as
+    // the legitimate per-txn auth failure path.
+    val txnErrors = response.errors().get(transactionalId)
+    assertEquals(Collections.singletonMap(tp, Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED), txnErrors,
+      "v>=4 caller on a non-inter-broker listener must be refused TRANSACTIONAL_ID_AUTHORIZATION_FAILED " +
+      "when the txn id is `__tenant_<known>.x`, just like v<4 callers")
+    verify(txnCoordinator, never()).handleAddPartitionsToTransaction(
+      anyString(), anyLong(), anyShort(), any[Set[TopicPartition]](),
+      any[Errors => Unit](), any[TransactionVersion](), any[RequestLocal]())
+  }
+
+  @Test
+  def testAddPartitionsToTxnV4OnInterBrokerListenerAcceptsTenantPrefixedTransactionalId(): Unit = {
+    // #171 complement — the legitimate inter-broker path. A broker's outgoing
+    // rewrite mints `__tenant_<id>.<x>` on the wire when forwarding a tenant's
+    // AddPartitionsToTxn(v>=4) over `config.interBrokerListenerName`. The
+    // guard MUST skip on the inter-broker listener so transactional writes by
+    // tenants continue to complete end-to-end. PLAINTEXT is the test broker's
+    // inter-broker listener.
+    addTopicToMetadataCache("acme.orders", numPartitions = 1)
+    val transactionalId = "__tenant_acme.my-txn"
+    val producerId = 42L
+    val epoch = 0.toShort
+    val physicalTp = new TopicPartition("acme.orders", 0)
+
+    val addPartitionsToTxnRequest = AddPartitionsToTxnRequest.Builder.forBroker(
+      new AddPartitionsToTxnTransactionCollection(
+        List(new AddPartitionsToTxnTransaction()
+          .setTransactionalId(transactionalId)
+          .setProducerId(producerId)
+          .setProducerEpoch(epoch)
+          .setVerifyOnly(true)
+          .setTopics(new AddPartitionsToTxnTopicCollection(
+            Collections.singletonList(new AddPartitionsToTxnTopic()
+              .setName(physicalTp.topic)
+              .setPartitions(Collections.singletonList(physicalTp.partition))
+            ).iterator()))
+        ).asJava.iterator())).build(ApiKeys.ADD_PARTITIONS_TO_TXN.latestVersion)
+
+    // Default test broker listener PLAINTEXT == config.interBrokerListenerName;
+    // principal is the cluster-acting broker (USER_TYPE).
+    val request = buildRequest(addPartitionsToTxnRequest,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "broker-1"))
+
+    val verifyPartitionsCallback: ArgumentCaptor[AddPartitionsToTxnResult => Unit] =
+      ArgumentCaptor.forClass(classOf[AddPartitionsToTxnResult => Unit])
+    val requestLocal = RequestLocal.withThreadConfinedCaching
+    when(txnCoordinator.handleVerifyPartitionsInTransaction(
+      ArgumentMatchers.eq(transactionalId),
+      ArgumentMatchers.eq(producerId),
+      ArgumentMatchers.eq(epoch),
+      ArgumentMatchers.eq(Set(physicalTp)),
+      verifyPartitionsCallback.capture()
+    )).thenAnswer(_ => verifyPartitionsCallback.getValue.apply(
+      AddPartitionsToTxnResponse.resultForTransaction(transactionalId,
+        Map(physicalTp -> Errors.NONE).asJava)))
+
+    kafkaApis = createKafkaApis(
+      authorizer = None,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleAddPartitionsToTxnRequest(request, requestLocal)
+
+    val response = verifyNoThrottling[AddPartitionsToTxnResponse](request)
+    val txnErrors = response.errors().get(transactionalId)
+    assertEquals(Collections.singletonMap(physicalTp, Errors.NONE), txnErrors,
+      "inter-broker AddPartitionsToTxn(v>=4) on a tenant-prefixed txn id must be admitted (the trust-skip path)")
+    verify(txnCoordinator).handleVerifyPartitionsInTransaction(
+      ArgumentMatchers.eq(transactionalId),
+      ArgumentMatchers.eq(producerId),
+      ArgumentMatchers.eq(epoch),
+      ArgumentMatchers.eq(Set(physicalTp)),
+      any[AddPartitionsToTxnResult => Unit]())
+  }
+
+  @Test
   def testAddOffsetsToTxnTenantRewritesTransactionalIdAndGroupIdToPhysical(): Unit = {
     // AddOffsetsToTxn registers a group's __consumer_offsets partition with a
     // transaction. Both keys must reach the coordinator in physical form: the

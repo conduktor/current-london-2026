@@ -104,25 +104,54 @@ class AclApis(authHelper: AuthHelper,
           new SecurityDisabledException("No Authorizer is configured.")))
         CompletableFuture.completedFuture[Unit](())
       case Some(auth) =>
-        val allBindings = createAclsRequest.aclCreations.asScala.map(CreateAclsRequest.aclBinding)
-        val errorResults = mutable.Map[AclBinding, AclCreateResult]()
-        val validBindings = new ArrayBuffer[AclBinding]
-        allBindings.foreach { acl =>
-          val resource = acl.pattern
-          val throwable = if (resource.resourceType == ResourceType.CLUSTER && !AuthorizerUtils.isClusterResource(resource.name))
-              new InvalidRequestException("The only valid name for the CLUSTER resource is " + CLUSTER_NAME)
-          else if (resource.name.isEmpty)
-            new InvalidRequestException("Invalid empty resource name")
-          else
-            null
-          val tenantRefusal = if (throwable == null) preFilter(acl) else None
-          if (throwable != null) {
-            debug(s"Failed to add acl $acl to $resource", throwable)
-            errorResults(acl) = new AclCreateResult(throwable)
-          } else if (tenantRefusal.isDefined) {
-            errorResults(acl) = new AclCreateResult(tenantRefusal.get.exception())
-          } else
-            validBindings += acl
+        // Per-entry mapping via CreateAclsRequest.aclBinding is IAE-prone for
+        // PatternType.MATCH and PatternType.ANY (filter-only types — invalid for
+        // concrete bindings, see ResourcePattern's constructor). Pre-#172, an
+        // IAE on a single bad entry propagated out of this method and the
+        // outer catch in ControllerApis sent a coarse `nCopies(size,
+        // INVALID_REQUEST)` response that silently dropped LEGITIMATE kept
+        // entries. Recover per-entry so a malformed creation produces only its
+        // own positional INVALID_REQUEST result. Tracking by original index
+        // (not by AclBinding) avoids two creations colliding on the same
+        // binding and preserves positional response semantics even when a
+        // creation has no parseable binding at all.
+        val originalSize = createAclsRequest.aclCreations.size
+        val parsedAcls = new ArrayBuffer[Either[InvalidRequestException, AclBinding]](originalSize)
+        createAclsRequest.aclCreations.forEach { c =>
+          val parsed: Either[InvalidRequestException, AclBinding] =
+            try Right(CreateAclsRequest.aclBinding(c))
+            catch {
+              case e: IllegalArgumentException =>
+                // IAE thrown when PatternType is MATCH or ANY (filter-only — invalid
+                // for concrete bindings). Wrap as InvalidRequestException so the
+                // per-entry result carries an ApiException, same shape as every
+                // other refused entry below.
+                Left(new InvalidRequestException(e.getMessage, e))
+            }
+          parsedAcls += parsed
+        }
+        val errorResults = mutable.Map[Int, AclCreateResult]()
+        val validBindings = new ArrayBuffer[(Int, AclBinding)]
+        parsedAcls.zipWithIndex.foreach {
+          case (Left(e), idx) =>
+            debug(s"Failed to parse creation at index $idx", e)
+            errorResults(idx) = new AclCreateResult(e)
+          case (Right(acl), idx) =>
+            val resource = acl.pattern
+            val throwable = if (resource.resourceType == ResourceType.CLUSTER && !AuthorizerUtils.isClusterResource(resource.name))
+                new InvalidRequestException("The only valid name for the CLUSTER resource is " + CLUSTER_NAME)
+            else if (resource.name.isEmpty)
+              new InvalidRequestException("Invalid empty resource name")
+            else
+              null
+            val tenantRefusal = if (throwable == null) preFilter(acl) else None
+            if (throwable != null) {
+              debug(s"Failed to add acl $acl to $resource", throwable)
+              errorResults(idx) = new AclCreateResult(throwable)
+            } else if (tenantRefusal.isDefined) {
+              errorResults(idx) = new AclCreateResult(tenantRefusal.get.exception())
+            } else
+              validBindings += ((idx, acl))
         }
 
         val future = new CompletableFuture[util.List[AclCreationResult]]()
@@ -131,11 +160,19 @@ class AclApis(authHelper: AuthHelper,
         // tests / authorizers that assert no-op semantics on empty input.
         val createResults: scala.collection.mutable.Buffer[CompletableFuture[AclCreateResult]] =
           if (validBindings.isEmpty) scala.collection.mutable.Buffer.empty
-          else auth.createAcls(request.context, validBindings.asJava).asScala.map(_.toCompletableFuture)
+          else auth.createAcls(request.context, validBindings.map(_._2).asJava).asScala.map(_.toCompletableFuture)
 
         def sendResponseCallback(): Unit = {
-          val aclCreationResults = allBindings.map { acl =>
-            val result = errorResults.getOrElse(acl, createResults(validBindings.indexOf(acl)).get)
+          val aclCreationResults = new util.ArrayList[AclCreationResult](originalSize)
+          var idx = 0
+          while (idx < originalSize) {
+            val result = errorResults.get(idx) match {
+              case Some(r) => r
+              case None =>
+                // Position must be in validBindings; find its index there.
+                val validIdx = validBindings.indexWhere(_._1 == idx)
+                createResults(validIdx).get
+            }
             val creationResult = new AclCreationResult()
             result.exception.toScala.foreach { throwable =>
               val apiError = ApiError.fromThrowable(throwable)
@@ -143,9 +180,10 @@ class AclApis(authHelper: AuthHelper,
                 .setErrorCode(apiError.error.code)
                 .setErrorMessage(apiError.message)
             }
-            creationResult
+            aclCreationResults.add(creationResult)
+            idx += 1
           }
-          future.complete(aclCreationResults.asJava)
+          future.complete(aclCreationResults)
         }
         if (createResults.isEmpty) {
           // Nothing forwarded — complete synchronously to avoid deadlocking the

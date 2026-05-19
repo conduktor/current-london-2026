@@ -3673,6 +3673,21 @@ class KafkaApis(val requestChannel: RequestChannel,
     }
 
     // Newer versions of the request should only come from other brokers.
+    // `authorizeClusterOperation(CLUSTER_ACTION)` alone is insufficient — any
+    // configured super-user holds CLUSTER_ACTION too — so we additionally pin
+    // the "from another broker" trust to the inter-broker listener. The
+    // outside-in guard below uses `brokerOriginated` (= `version >= 4 &&
+    // on-inter-broker-listener`) to gate refusal of `__tenant_<known>.x` ids:
+    // a super-user landing AddPartitionsToTxn(v=5) on a regular client
+    // listener is refused exactly like a v<4 caller. v<4 requests are never
+    // legitimately inter-broker (brokers always use v>=4) so they are guarded
+    // regardless of which listener they arrive on. See `WriteTxnMarkers`
+    // L3542 for the same listener-pin pattern (and the same threat model:
+    // super-user planting/probing tenant coordinator state).
+    val brokerOriginated = {
+      val ibl = config.interBrokerListenerName
+      version >= 4 && ibl != null && ibl == request.context.listenerName
+    }
     if (version >= 4) authHelper.authorizeClusterOperation(request, CLUSTER_ACTION)
 
     // V4 requests introduced batches of transactions. We need all transactions to be handled before sending the
@@ -3715,12 +3730,13 @@ class KafkaApis(val requestChannel: RequestChannel,
       // Outside-in: a non-tenant client naming `__tenant_<known>.x` directly
       // would fence the tenant's coordinator slot; refuse per-transaction
       // with the same wire shape so the response cannot be used to probe
-      // for tenant existence. v >= 4 callers are inter-broker (gated by
-      // authorizeClusterOperation above) so the guard is a no-op for them
-      // but harmless — the prefix on inter-broker AddPartitions only ever
-      // arrives from the broker's own outgoing rewrite, which we minted.
+      // for tenant existence. The trust-skip key is `brokerOriginated`
+      // (= v>=4 AND inter-broker listener): only a forwarded broker request
+      // carrying its own outgoing rewrite is admitted. v<4 callers are not
+      // legitimately inter-broker, and v>=4 callers on any other listener
+      // are not brokers — both shapes get the guard.
       val maybePhysicalTransactionalId: Either[Errors, String] =
-        if (!tenantCtx.effectiveTenant.isPresent && version < 4
+        if (!tenantCtx.effectiveTenant.isPresent && !brokerOriginated
             && isReservedTenantPrincipalNamespace(logicalTransactionalId))
           Left(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED)
         else
