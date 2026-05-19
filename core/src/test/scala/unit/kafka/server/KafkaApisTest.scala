@@ -18473,6 +18473,218 @@ class KafkaApisTest extends Logging {
     verify(sharePartitionManager, never()).acknowledgeSessionUpdate(anyString(), any())
   }
 
+  // #190 + #195: cluster-wide caller naming a GUESSED tenant topicId UUID (no
+  // tenant prefix on the wire — only the UUID) must be refused before the
+  // share-partition manager fetches records. The wire-resolved physical name
+  // is `acme.orders`; without the outside-in scrub a `User:* READ Topic:*`
+  // wildcard ACL would let the caller drain tenant records. We pin the gate
+  // by asserting fetchMessages is never invoked (request only carries the
+  // tenant TIP — so the `interested` map is empty after the scrub) AND that
+  // the response surfaces TOPIC_AUTHORIZATION_FAILED for the tenant partition.
+  @Test
+  def testShareFetchOutsideInScrubsTenantPhysicalTopicResolvedFromGuessedTopicId(): Unit = {
+    val topicName = "acme.orders"
+    val topicId = Uuid.randomUuid()
+    val partitionIndex = 0
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
+    addTopicToMetadataCache(topicName, 1, topicId = topicId)
+    val memberId: Uuid = Uuid.ZERO_UUID
+    val shareSessionEpoch = 0
+
+    when(sharePartitionManager.newContext(any(), any(), any(), any(), any())).thenReturn(
+      new ShareSessionContext(new ShareRequestMetadata(memberId, shareSessionEpoch), Map(
+        new TopicIdPartition(topicId, new TopicPartition(topicName, partitionIndex)) ->
+          new ShareFetchRequest.SharePartitionData(topicId, partitionMaxBytes)
+      ).asJava)
+    )
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val shareFetchRequestData = new ShareFetchRequestData().
+      setGroupId("group").
+      setMemberId(memberId.toString).
+      setShareSessionEpoch(shareSessionEpoch).
+      setTopics(List(new ShareFetchRequestData.FetchTopic().
+        setTopicId(topicId).
+        setPartitions(List(
+          new ShareFetchRequestData.FetchPartition()
+            .setPartitionIndex(partitionIndex)
+            .setPartitionMaxBytes(partitionMaxBytes)).asJava)).asJava)
+
+    val req = new ShareFetchRequest.Builder(shareFetchRequestData).build(ApiKeys.SHARE_FETCH.latestVersion)
+    val request = buildRequest(req)
+    kafkaApis = createKafkaApis(
+      overrideProperties = Map(
+        ServerConfigs.UNSTABLE_API_VERSIONS_ENABLE_CONFIG -> "true",
+        ShareGroupConfig.SHARE_GROUP_ENABLE_CONFIG -> "true"),
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleShareFetchRequest(request)
+
+    val response = verifyNoThrottling[ShareFetchResponse](request)
+    val topicResponses = response.data.responses
+    assertEquals(1, topicResponses.size())
+    assertEquals(topicId, topicResponses.get(0).topicId)
+    val partitions = topicResponses.get(0).partitions
+    assertEquals(1, partitions.size())
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED.code, partitions.get(0).errorCode,
+      "cluster-wide caller naming a guessed tenant topicId must be refused")
+    verify(sharePartitionManager, never()).fetchMessages(any(), any(), any(), any())
+  }
+
+  // #185 widening parity: the principal-shaped topic-name `__tenant_acme.x`
+  // is also a reserved tenant namespace. ShareFetch must refuse it.
+  @Test
+  def testShareFetchOutsideInScrubsTenantPrincipalShapedTopicResolvedFromGuessedTopicId(): Unit = {
+    val topicName = "__tenant_acme.x"
+    val topicId = Uuid.randomUuid()
+    val partitionIndex = 0
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
+    addTopicToMetadataCache(topicName, 1, topicId = topicId)
+    val memberId: Uuid = Uuid.ZERO_UUID
+    val shareSessionEpoch = 0
+
+    when(sharePartitionManager.newContext(any(), any(), any(), any(), any())).thenReturn(
+      new ShareSessionContext(new ShareRequestMetadata(memberId, shareSessionEpoch), Map(
+        new TopicIdPartition(topicId, new TopicPartition(topicName, partitionIndex)) ->
+          new ShareFetchRequest.SharePartitionData(topicId, partitionMaxBytes)
+      ).asJava)
+    )
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val shareFetchRequestData = new ShareFetchRequestData().
+      setGroupId("group").
+      setMemberId(memberId.toString).
+      setShareSessionEpoch(shareSessionEpoch).
+      setTopics(List(new ShareFetchRequestData.FetchTopic().
+        setTopicId(topicId).
+        setPartitions(List(
+          new ShareFetchRequestData.FetchPartition()
+            .setPartitionIndex(partitionIndex)
+            .setPartitionMaxBytes(partitionMaxBytes)).asJava)).asJava)
+
+    val req = new ShareFetchRequest.Builder(shareFetchRequestData).build(ApiKeys.SHARE_FETCH.latestVersion)
+    val request = buildRequest(req)
+    kafkaApis = createKafkaApis(
+      overrideProperties = Map(
+        ServerConfigs.UNSTABLE_API_VERSIONS_ENABLE_CONFIG -> "true",
+        ShareGroupConfig.SHARE_GROUP_ENABLE_CONFIG -> "true"),
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleShareFetchRequest(request)
+
+    val response = verifyNoThrottling[ShareFetchResponse](request)
+    val topicResponses = response.data.responses
+    assertEquals(1, topicResponses.size())
+    val partitions = topicResponses.get(0).partitions
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED.code, partitions.get(0).errorCode,
+      "cluster-wide caller naming a guessed principal-shaped tenant topicId must be refused")
+    verify(sharePartitionManager, never()).fetchMessages(any(), any(), any(), any())
+  }
+
+  // Negative control: a plain (non-reserved) topic name must NOT be scrubbed
+  // by the outside-in guard. Without this control, an over-broad `filterNot`
+  // could silently break ShareFetch on regular topics.
+  @Test
+  def testShareFetchOutsideInDoesNotScrubPlainTopicForClusterWideCaller(): Unit = {
+    val topicName = "regular-topic"
+    val topicId = Uuid.randomUuid()
+    val partitionIndex = 0
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
+    addTopicToMetadataCache(topicName, 1, topicId = topicId)
+    val memberId: Uuid = Uuid.ZERO_UUID
+    val shareSessionEpoch = 0
+
+    when(sharePartitionManager.newContext(any(), any(), any(), any(), any())).thenReturn(
+      new ShareSessionContext(new ShareRequestMetadata(memberId, shareSessionEpoch), Map(
+        new TopicIdPartition(topicId, new TopicPartition(topicName, partitionIndex)) ->
+          new ShareFetchRequest.SharePartitionData(topicId, partitionMaxBytes)
+      ).asJava)
+    )
+    when(sharePartitionManager.fetchMessages(any(), any(), any(), any())).thenReturn(
+      CompletableFuture.completedFuture(Map[TopicIdPartition, ShareFetchResponseData.PartitionData](
+        new TopicIdPartition(topicId, new TopicPartition(topicName, partitionIndex)) ->
+          new ShareFetchResponseData.PartitionData()
+            .setPartitionIndex(partitionIndex)
+            .setErrorCode(Errors.NONE.code)
+      ).asJava)
+    )
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val shareFetchRequestData = new ShareFetchRequestData().
+      setGroupId("group").
+      setMemberId(memberId.toString).
+      setShareSessionEpoch(shareSessionEpoch).
+      setTopics(List(new ShareFetchRequestData.FetchTopic().
+        setTopicId(topicId).
+        setPartitions(List(
+          new ShareFetchRequestData.FetchPartition()
+            .setPartitionIndex(partitionIndex)
+            .setPartitionMaxBytes(partitionMaxBytes)).asJava)).asJava)
+
+    val req = new ShareFetchRequest.Builder(shareFetchRequestData).build(ApiKeys.SHARE_FETCH.latestVersion)
+    val request = buildRequest(req)
+    kafkaApis = createKafkaApis(
+      overrideProperties = Map(
+        ServerConfigs.UNSTABLE_API_VERSIONS_ENABLE_CONFIG -> "true",
+        ShareGroupConfig.SHARE_GROUP_ENABLE_CONFIG -> "true"),
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleShareFetchRequest(request)
+
+    val response = verifyNoThrottling[ShareFetchResponse](request)
+    val partitions = response.data.responses.get(0).partitions
+    assertEquals(Errors.NONE.code, partitions.get(0).errorCode,
+      "non-tenant plain topic must remain readable by cluster-wide caller")
+    verify(sharePartitionManager).fetchMessages(any(), any(), any(), any())
+  }
+
+  // #195: ShareAcknowledge has the same UUID→name resolution gap; a
+  // cluster-wide caller naming a guessed tenant topicId must be refused
+  // before sharePartitionManager.acknowledge runs (otherwise tenant
+  // share-state delivery counters can be disrupted).
+  @Test
+  def testShareAcknowledgeOutsideInScrubsTenantPhysicalTopicResolvedFromGuessedTopicId(): Unit = {
+    val topicName = "acme.orders"
+    val topicId = Uuid.randomUuid()
+    val partitionIndex = 0
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
+    addTopicToMetadataCache(topicName, 1, topicId = topicId)
+    val memberId: Uuid = Uuid.ZERO_UUID
+
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val data = new ShareAcknowledgeRequestData().
+      setGroupId("group").
+      setMemberId(memberId.toString).
+      setShareSessionEpoch(1).
+      setTopics(List(new ShareAcknowledgeRequestData.AcknowledgeTopic().
+        setTopicId(topicId).
+        setPartitions(List(new ShareAcknowledgeRequestData.AcknowledgePartition()
+          .setPartitionIndex(partitionIndex)
+          .setAcknowledgementBatches(List(new ShareAcknowledgeRequestData.AcknowledgementBatch()
+            .setFirstOffset(0)
+            .setLastOffset(0)
+            .setAcknowledgeTypes(Collections.singletonList(1.toByte))).asJava)).asJava)).asJava)
+
+    val req = new ShareAcknowledgeRequest.Builder(data).build(ApiKeys.SHARE_ACKNOWLEDGE.latestVersion)
+    val request = buildRequest(req)
+    kafkaApis = createKafkaApis(
+      overrideProperties = Map(
+        ServerConfigs.UNSTABLE_API_VERSIONS_ENABLE_CONFIG -> "true",
+        ShareGroupConfig.SHARE_GROUP_ENABLE_CONFIG -> "true"),
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleShareAcknowledgeRequest(request)
+
+    val response = verifyNoThrottling[ShareAcknowledgeResponse](request)
+    val topicResponses = response.data.responses
+    assertEquals(1, topicResponses.size())
+    val partitions = topicResponses.get(0).partitions
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED.code, partitions.get(0).errorCode,
+      "cluster-wide caller naming a guessed tenant topicId must be refused at acknowledge time")
+    verify(sharePartitionManager, never()).acknowledge(anyString(), anyString(), any())
+  }
+
   // The dispatch gate refuses tenant principals from LIST_GROUPS (not in
   // TENANT_ALLOWED_APIS). The remaining outside-in vector is a non-tenant
   // cluster admin: their wildcard DESCRIBE GROUP would otherwise return every

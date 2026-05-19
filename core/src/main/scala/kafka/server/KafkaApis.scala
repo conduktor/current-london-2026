@@ -6309,12 +6309,25 @@ class KafkaApis(val requestChannel: RequestChannel,
     }
 
     // Kafka share consumers need READ permission on each topic they are fetching.
-    val authorizedTopics = authHelper.filterByAuthorized(
-      request.context,
-      READ,
-      TOPIC,
-      topicIdPartitionSeq
-    )(_.topicPartition.topic)
+    // Outside-in guard (mirror of handleFetchRequest L1588): a cluster-wide caller
+    // on a multi-tenant broker holding `User:* READ Topic:*` could otherwise fetch
+    // tenant records by submitting a guessed tenant topicId UUID — topicIdsToNames
+    // resolves it to the physical name (e.g. `acme.orders`) and the wildcard ACL
+    // satisfies filterByAuthorized. Drop reserved-tenant-namespace names from the
+    // authorized set so foreign TIPs fall into the TOPIC_AUTHORIZATION_FAILED
+    // bucket at L6448 and never reach sharePartitionManager.fetchMessages.
+    val shareTenantCtx = tenantContextFor(request)
+    val shareOutsideInGuardActive = !shareTenantCtx.effectiveTenant.isPresent && !tenantConfig.allTenants.isEmpty
+    val authorizedTopics = {
+      val authorized = authHelper.filterByAuthorized(
+        request.context,
+        READ,
+        TOPIC,
+        topicIdPartitionSeq
+      )(_.topicPartition.topic)
+      if (shareOutsideInGuardActive) authorized.filterNot(isReservedTenantNamespace)
+      else authorized
+    }
 
     // Variable to store the topic partition wise result of piggybacked acknowledgements.
     var acknowledgeResult: CompletableFuture[Map[TopicIdPartition, ShareAcknowledgeResponseData.PartitionData]] =
@@ -6615,12 +6628,24 @@ class KafkaApis(val requestChannel: RequestChannel,
       }
     }
 
-    val authorizedTopics = authHelper.filterByAuthorized(
-      request.context,
-      READ,
-      TOPIC,
-      topicIdPartitionSeq
-    )(_.topicPartition.topic)
+    // Outside-in guard (parallel to handleShareFetchRequest above). A
+    // cluster-wide caller naming a guessed tenant topicId UUID would otherwise
+    // disrupt tenant share-state via the share-partition-manager acknowledge
+    // path — drop reserved-tenant-namespace names from the authorized set so
+    // foreign TIPs hit TOPIC_AUTHORIZATION_FAILED at L6528 and never reach
+    // sharePartitionManager.acknowledge.
+    val ackTenantCtx = tenantContextFor(request)
+    val ackOutsideInGuardActive = !ackTenantCtx.effectiveTenant.isPresent && !tenantConfig.allTenants.isEmpty
+    val authorizedTopics = {
+      val authorized = authHelper.filterByAuthorized(
+        request.context,
+        READ,
+        TOPIC,
+        topicIdPartitionSeq
+      )(_.topicPartition.topic)
+      if (ackOutsideInGuardActive) authorized.filterNot(isReservedTenantNamespace)
+      else authorized
+    }
 
     val erroneous = mutable.Map[TopicIdPartition, ShareAcknowledgeResponseData.PartitionData]()
     val acknowledgementDataFromRequest = getAcknowledgeBatchesFromShareAcknowledgeRequest(shareAcknowledgeRequest, topicIdNames, erroneous)
