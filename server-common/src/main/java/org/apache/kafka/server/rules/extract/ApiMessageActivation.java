@@ -446,7 +446,39 @@ public final class ApiMessageActivation {
         // that the walker would otherwise descend through, eventually
         // reflecting into JDK-internal Stream types and failing with
         // IllegalAccessException at request time.
-        if (v instanceof Double || v instanceof Float) {
+        //
+        // Round-20 MED C-2: extend the same posture to every Number
+        // subclass outside the schema-supported {Long, Integer, Short,
+        // Byte} set — BigDecimal, BigInteger, AtomicInteger, AtomicLong,
+        // DoubleAdder, LongAccumulator, custom Number subclasses. The
+        // Kafka message generator only emits int8/int16/int32/int64 and
+        // float32/float64 today, so a real ApiMessage will not surface
+        // any of these. The check is defence-in-depth against a future
+        // schema revision or an in-process caller exposing an atypical
+        // numeric accessor, and against the two hazards documented for
+        // Double/Float:
+        //
+        //   1. Cross-type equality truncation. CelNode's valueEquals and
+        //      compareValues coerce both sides via ((Number) v).longValue(),
+        //      truncating BigDecimal("1.5") to 1 and silently overflowing
+        //      BigInteger > 2^63. A rule `field == 100` would over-match
+        //      BigDecimal("100.5"). Same fail-silent class as Double/Float.
+        //
+        //   2. Live-mutation oracle. AtomicInteger / AtomicLong /
+        //      DoubleAdder / LongAccumulator surface a JVM-live object
+        //      whose value can change between sub-expressions of the same
+        //      predicate, defeating the activation map's snapshot
+        //      contract.
+        //
+        // BigDecimal in particular also exposes `byteValueExact()` /
+        // `shortValueExact()` / `intValueExact()` etc. via accessor
+        // reflection — these THROW ArithmeticException for fractional
+        // values, which would propagate up through walk and trip the
+        // walker error sink. Catching it here (before accessorsFor descent)
+        // avoids that throw entirely.
+        if (v instanceof Number
+                && !(v instanceof Long || v instanceof Integer
+                    || v instanceof Short || v instanceof Byte)) {
             return null;
         }
         Object scalar = convertScalar(v);
@@ -589,9 +621,12 @@ public final class ApiMessageActivation {
             descriptor.put("sizeInBytes", (long) ((ByteBuffer) v).remaining());
             return descriptor;
         }
-        if (v instanceof Number) {
-            return v;
-        }
+        // Note: exotic Number subclasses (BigDecimal, BigInteger,
+        // AtomicInteger, AtomicLong, ...) are caught upstream in
+        // `convert` and surfaced as null — see Round-20 MED C-2 comment
+        // there. No Number check is needed here: by the time
+        // convertScalar runs, v is guaranteed not to be a Number (or it
+        // matched one of the Long/Integer/Short/Byte branches above).
         // Uuid identifies topics (MetadataRequest v10+, FetchRequest v13+,
         // OffsetForLeaderEpoch, DeleteTopics by id, etc.). Without this branch
         // the walker would descend into Uuid via its mostSignificantBits/

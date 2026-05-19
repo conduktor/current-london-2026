@@ -1549,6 +1549,82 @@ public class ApiMessageActivationTest {
         }
     }
 
+    @Test
+    public void exoticNumberSubclassesSurfaceAsNull() {
+        // Round-20 MED C-2: schema-generated messages today only emit Long /
+        // Integer / Short / Byte / Double / Float, so a non-Long-family Number
+        // never reaches convertScalar from a real ApiMessage. But the
+        // activation walker also runs on hand-rolled fixtures and (in the
+        // future) on schema revisions that add atypical numeric accessors —
+        // an in-process caller could expose BigDecimal, BigInteger,
+        // AtomicInteger, AtomicLong, DoubleAdder, or LongAccumulator. Two
+        // hazards: (1) CelNode coerces both sides of `==` via longValue(),
+        // truncating BigDecimal("1.5") to 1 and silently overflowing
+        // BigInteger > 2^63, so a rule `field == 100` would silently
+        // over-match BigDecimal("100.5"); (2) Atomic* / Adder* /
+        // Accumulator* are mutable, so the activation map would surface a
+        // live reference whose value can change between sub-expressions,
+        // defeating the snapshot contract. The fix in convertScalar
+        // mirrors the Double/Float posture: the key stays present (rule
+        // cannot probe absence via `c.field == null` from the schema
+        // shape) but the value is opaque-null.
+        Map<String, Object> activation = ApiMessageActivation.from(new ExoticNumberNode());
+        assertTrue(activation.containsKey("bigDecimalField"),
+            "BigDecimal accessor must surface its key (non-leakage contract): " + activation);
+        assertNull(activation.get("bigDecimalField"),
+            "BigDecimal value MUST be null to prevent silent truncation in CEL equality: " + activation);
+        assertTrue(activation.containsKey("bigIntegerField"),
+            "BigInteger accessor must surface its key: " + activation);
+        assertNull(activation.get("bigIntegerField"),
+            "BigInteger value MUST be null to prevent silent overflow via longValue(): " + activation);
+        assertTrue(activation.containsKey("atomicIntegerField"),
+            "AtomicInteger accessor must surface its key: " + activation);
+        assertNull(activation.get("atomicIntegerField"),
+            "AtomicInteger value MUST be null to prevent live-mutation oracle: " + activation);
+        assertTrue(activation.containsKey("atomicLongField"),
+            "AtomicLong accessor must surface its key: " + activation);
+        assertNull(activation.get("atomicLongField"),
+            "AtomicLong value MUST be null to prevent live-mutation oracle: " + activation);
+    }
+
+    /**
+     * Fixture for Round-20 MED C-2: an ApiMessage exposing Number subclasses
+     * outside the schema-supported {Long, Integer, Short, Byte, Double,
+     * Float} set. Each accessor returns a fresh instance with a non-default
+     * value so a regression that surfaces the live object (instead of null)
+     * would be observable.
+     */
+    @SuppressWarnings("unused")
+    public static final class ExoticNumberNode implements org.apache.kafka.common.protocol.ApiMessage {
+        public java.math.BigDecimal bigDecimalField() {
+            return new java.math.BigDecimal("100.5");
+        }
+        public java.math.BigInteger bigIntegerField() {
+            return new java.math.BigInteger("99999999999999999999");
+        }
+        public java.util.concurrent.atomic.AtomicInteger atomicIntegerField() {
+            return new java.util.concurrent.atomic.AtomicInteger(7);
+        }
+        public java.util.concurrent.atomic.AtomicLong atomicLongField() {
+            return new java.util.concurrent.atomic.AtomicLong(11L);
+        }
+        @Override public short apiKey() { return -1; }
+        @Override public short lowestSupportedVersion() { return 0; }
+        @Override public short highestSupportedVersion() { return 0; }
+        @Override public org.apache.kafka.common.protocol.Message duplicate() { return new ExoticNumberNode(); }
+        @Override public java.util.List<org.apache.kafka.common.protocol.types.RawTaggedField> unknownTaggedFields() {
+            return java.util.Collections.emptyList();
+        }
+        @Override public void read(org.apache.kafka.common.protocol.Readable readable, short version) { }
+        @Override public void write(org.apache.kafka.common.protocol.Writable writable,
+                                    org.apache.kafka.common.protocol.ObjectSerializationCache cache,
+                                    short version) { }
+        @Override public int size(org.apache.kafka.common.protocol.ObjectSerializationCache cache, short version) { return 0; }
+        @Override public void addSize(org.apache.kafka.common.protocol.MessageSizeAccumulator size,
+                                      org.apache.kafka.common.protocol.ObjectSerializationCache cache,
+                                      short version) { }
+    }
+
     private static java.io.File locatePackageDir(String pkg) {
         String rel = pkg.replace('.', '/');
         for (String root : new String[]{
