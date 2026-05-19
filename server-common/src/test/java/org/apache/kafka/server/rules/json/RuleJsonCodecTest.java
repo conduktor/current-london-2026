@@ -115,11 +115,24 @@ public class RuleJsonCodecTest {
         // Only DENY is supported in the minimum-viable outcome. ALLOW / FILTER
         // are explicitly stretch goals — and unknown actions like "PURGE" must
         // not silently degrade to DENY or be silently dropped.
+        //
+        // The assertion below pins BOTH halves of the diagnostic contract:
+        //   (a) the input echo — operators must see the offending value
+        //       ("PURGE") so they can correlate against the source publisher;
+        //   (b) the rejection vocabulary — the diagnostic must convey *why*
+        //       the action was rejected, not merely echo input. An exception
+        //       message of just `"PURGE"` (no rejection reason) would have
+        //       passed the prior assertion and obscured a regression that
+        //       degraded the message to bare input echo.
         String json = "{\"apiKeys\":[\"METADATA\"],\"action\":\"PURGE\","
             + "\"when\":\"true\",\"errorCode\":1}";
         RuleEnvelopeException e = assertThrows(RuleEnvelopeException.class,
             () -> RuleJsonCodec.decode("k", json.getBytes(StandardCharsets.UTF_8)));
-        assertTrue(e.getMessage().contains("PURGE"));
+        String msg = e.getMessage();
+        assertTrue(msg.contains("PURGE"),
+            "diagnostic must name the offending action: " + msg);
+        assertTrue(msg.contains("unsupported action") || msg.contains("only DENY"),
+            "diagnostic must convey rejection reason, not just echo input: " + msg);
     }
 
     @Test

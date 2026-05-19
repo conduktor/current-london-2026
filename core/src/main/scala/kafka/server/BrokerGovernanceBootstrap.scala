@@ -1015,6 +1015,19 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
         suppressedSinceLastWarn.incrementAndGet()
       }
     }
+
+    // R38-D-3: cumulative `warnEmissions` proves a WARN *fired*; this peeks
+    // the other side of the same emit() — the suppressed-repeat tally that
+    // captures the silent N-1 repeats and is rolled into the next emitted
+    // line. Used by the concurrent-emit test to pin both sides of the
+    // synchronization contract: under contention on a fresh message,
+    // warnEmissions == 1 AND suppressedRepeats == N-1 (no thread's branch-3
+    // increment was lost to the race). Without this accessor, a regression
+    // that races on the third branch (the lock dropped, both threads
+    // observe `previous == msg` and one's `incrementAndGet` is shadowed
+    // by another writer to the same atomic) would still pass the
+    // warnEmissions assertion.
+    def suppressedRepeats: Long = suppressedSinceLastWarn.get()
   }
 
   // The drain-failure throttle keeps the legacy "governance rules drain
@@ -1118,6 +1131,14 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
 
   private[server] def maybeWarnSuppressed(message: String): Unit =
     drainFailureThrottle.emit(message)
+
+  // R38-D-3 test-observability accessor for the drain-failure throttle's
+  // suppressed-repeat tally. Mirrors the pattern of `warnEmissions`: tests
+  // need to assert *both* sides of a WarnThrottle.emit() under contention
+  // (the cumulative emission count AND the silently-counted repeats), so
+  // a regression that drops the third-branch increment cannot pass.
+  private[server] def drainFailureSuppressedRepeats: Long =
+    drainFailureThrottle.suppressedRepeats
 
   private[server] def maybeWarnPoisonedRecord(offset: Long, t: Throwable): Unit =
     poisonRecordThrottle.emit(offset, t)

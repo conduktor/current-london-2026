@@ -1918,6 +1918,35 @@ class BrokerGovernanceBootstrapTest {
       s"concurrent first-hit must emit exactly 1 WARN; observed " +
         s"${boot.warnEmissions.get()} which would only happen without " +
         s"the synchronization fix")
+
+    // R38-D-3: pin the OTHER side of the emit() contract — the suppressed
+    // repeat counter. The cumulative `warnEmissions` assertion above only
+    // proves that branch 1 (fresh message) fired exactly once. It does
+    // NOT prove that the remaining (threadCount - 1) threads each
+    // incremented `suppressedSinceLastWarn` from branch 3 — a race that
+    // drops one of those increments (e.g. a future refactor that moves
+    // `suppressedSinceLastWarn.incrementAndGet()` outside the lock and
+    // back to a naive read-modify-write) would silently land here with
+    // suppressedRepeats < threadCount - 1 and pass the warnEmissions
+    // assertion above.
+    //
+    // The exact-equality assertion is safe because:
+    //   1. Every thread reaches emit() (assertTrue on `started.await` and
+    //      `futures.foreach(_.get(...))` above);
+    //   2. None throws (assertEquals(null, errors.get()) above);
+    //   3. The clock is frozen, so branch 2 (rollup) is unreachable;
+    //   4. With the synchronized lock, exactly one thread observes
+    //      `previous == null` (branch 1), the remaining (threadCount - 1)
+    //      observe `previous == msg && now - lastWarn == 0` and take
+    //      branch 3 (suppressedSinceLastWarn.incrementAndGet).
+    // Therefore suppressedRepeats == threadCount - 1 is the deterministic
+    // outcome of the contract under contention; any other value indicates
+    // a regression in either the lock scope or the branch logic.
+    assertEquals((threadCount - 1).toLong, boot.drainFailureSuppressedRepeats,
+      s"concurrent first-hit must record exactly ${threadCount - 1} " +
+        s"silently-suppressed repeats; observed " +
+        s"${boot.drainFailureSuppressedRepeats} — a value below this " +
+        s"indicates an increment was lost to a race on the third branch")
   }
 
   // ── Round-14 HIGH H-1: cleanup.policy runtime drift detector ────────────
