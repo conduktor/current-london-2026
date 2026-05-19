@@ -576,6 +576,26 @@ class ControllerApis(
         iterator.remove()
       }
     }
+    // Same view-backing READ gate as handleIncrementalAlterConfigs and handleCreateTopics
+    // (see the rationale on createTopics). The legacy AlterConfigs API is full-replace, so any
+    // non-blank `view.backing.topic` in the submitted config map is treated as the new backing.
+    val configChangesIterator = configChanges.entrySet().iterator()
+    while (configChangesIterator.hasNext) {
+      val entry = configChangesIterator.next()
+      val resource = entry.getKey
+      if (resource.`type`() == ConfigResource.Type.TOPIC) {
+        val backing = entry.getValue.get(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG)
+        if (backing != null && !backing.trim.isEmpty &&
+            !authHelper.authorize(request.context, READ, TOPIC, backing)) {
+          response.responses().add(new OldAlterConfigsResourceResponse().
+            setErrorCode(TOPIC_AUTHORIZATION_FAILED.code()).
+            setErrorMessage("Authorization failed.").
+            setResourceName(resource.name()).
+            setResourceType(resource.`type`().id()))
+          configChangesIterator.remove()
+        }
+      }
+    }
     controller.legacyAlterConfigs(context, configChanges, alterConfigsRequest.data.validateOnly)
       .handle[Unit] { (controllerResults, exception) =>
         if (exception != null) {

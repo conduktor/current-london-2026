@@ -859,6 +859,57 @@ class ControllerApisTest {
     assertEquals("Authorization failed.", viewResponse.errorMessage())
   }
 
+  /**
+   * Round 24: the deprecated `ApiKeys.ALTER_CONFIGS` (full-replace) shares the round-23 threat
+   * model with `INCREMENTAL_ALTER_CONFIGS` — a principal with ALTER_CONFIGS on a topic could send
+   * a legacy AlterConfigs request setting `view.backing.topic=<sensitive>` and bypass the
+   * incremental-API gate. This test pins that the legacy handler also rejects the request when
+   * the requester lacks READ on the proposed backing.
+   */
+  @Test
+  def testLegacyAlterConfigsToSetViewBackingRequiresReadOnBacking(): Unit = {
+    val viewTopicName = "alice_view"
+    val unauthorizedBacking = "__consumer_offsets"
+    val requestData = new AlterConfigsRequestData().setResources(
+      new OldAlterConfigsResourceCollection(util.Arrays.asList(
+        new OldAlterConfigsResource().
+          setResourceName(viewTopicName).
+          setResourceType(ConfigResource.Type.TOPIC.id()).
+          setConfigs(new OldAlterableConfigCollection(util.Arrays.asList(new OldAlterableConfig().
+            setName(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG).
+            setValue(unauthorizedBacking)).iterator()))
+        ).iterator()))
+    val request = buildRequest(new AlterConfigsRequest(requestData, 0))
+
+    val authorizer = mock(classOf[Authorizer])
+    when(authorizer.authorize(
+      any[AuthorizableRequestContext],
+      any[util.List[Action]]
+    )).thenAnswer { invocation =>
+      val actions = invocation.getArgument[util.List[Action]](1).asScala
+      val results = actions.map { action =>
+        val op = action.operation()
+        val resourceName = action.resourcePattern().name()
+        // ALTER_CONFIGS on the view name is fine; READ on the backing is what we are gating.
+        if (op == AclOperation.ALTER_CONFIGS && resourceName == viewTopicName) AuthorizationResult.ALLOWED
+        else AuthorizationResult.DENIED
+      }
+      new util.ArrayList[AuthorizationResult](results.asJava)
+    }
+    controllerApis = createControllerApis(Some(authorizer), new MockController.Builder().build())
+    controllerApis.handleLegacyAlterConfigs(request)
+    val capturedResponse: ArgumentCaptor[AbstractResponse] =
+      ArgumentCaptor.forClass(classOf[AbstractResponse])
+    verify(requestChannel).sendResponse(
+      ArgumentMatchers.eq(request),
+      capturedResponse.capture(),
+      ArgumentMatchers.eq(None))
+    val response = capturedResponse.getValue.asInstanceOf[AlterConfigsResponse]
+    val viewResponse = response.data().responses().asScala.find(_.resourceName() == viewTopicName).get
+    assertEquals(TOPIC_AUTHORIZATION_FAILED.code(), viewResponse.errorCode())
+    assertEquals("Authorization failed.", viewResponse.errorMessage())
+  }
+
   @ParameterizedTest(name = "testCreateTopicsMutationQuota with throttle: {0}")
   @ValueSource(booleans = Array(true, false))
   def testCreateTopicsMutationQuota(throttle: Boolean): Unit = {
