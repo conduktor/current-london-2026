@@ -97,8 +97,8 @@ public final class KafkaHttpServlet extends HttpServlet {
         // The default doOptions reflects every doXxx defined on the class hierarchy into an Allow header — that
         // still listed TRACE before we overrode it, and would re-introduce the leak the moment HttpServlet adds
         // a new default verb. Curate the Allow set explicitly: the bridge documents POST (produce on /records),
-        // GET (SSE on /records?stream=true and fetch elsewhere), HEAD (default servlet behaviour for GET), and
-        // OPTIONS (this method). Anything else is 405.
+        // GET (SSE on /records when Accept: text/event-stream, JSON fetch otherwise), HEAD (default servlet
+        // behaviour for GET), and OPTIONS (this method). Anything else is 405.
         resp.setStatus(HttpStatusMapper.OK);
         resp.setHeader("Allow", "GET, HEAD, OPTIONS, POST");
         resp.setContentLength(0);
