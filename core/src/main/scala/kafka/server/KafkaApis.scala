@@ -169,6 +169,30 @@ class KafkaApis(val requestChannel: RequestChannel,
   private def isReservedTenantNamespace(name: String): Boolean = {
     if (name == null || Topic.isInternal(name)) return false
     if (tenantConfig.allTenants.isEmpty) return false
+    // #185: principal-prefix topic-name shape `__tenant_<id>.<rest>` is also a
+    // reserved tenant namespace. Without this branch the single-underscore
+    // short-circuit below dropped `__tenant_*` on the floor, opening a
+    // two-step pollution chain:
+    //   1) cluster-wide caller CreateTopics name=`__tenant_acme.evil` (the
+    //      pre-existing scrub at line 474 uses this same helper and missed
+    //      the principal-prefix form),
+    //   2) cluster-wide caller OffsetCommit / OffsetDelete /
+    //      TxnOffsetCommit / IncrementalAlterConfigs / DescribeProducers /
+    //      etc. against the now-existing `__tenant_acme.evil` — landing
+    //      __consumer_offsets / __transaction_state / config records keyed
+    //      under a tenant-principal-shaped topic name.
+    // Same `allTenants.isEmpty` gate as the physical-prefix path: a stock
+    // Kafka deployment with zero tenants keeps the historical "any topic
+    // name is fine" semantics so a user-created `__tenant_foo.x` topic on
+    // a non-tenant cluster is unaffected.
+    if (name.startsWith(TenantNamespace.PRINCIPAL_PREFIX)) {
+      val afterPrefix = name.substring(TenantNamespace.PRINCIPAL_PREFIX.length)
+      val pdot = afterPrefix.indexOf('.')
+      if (pdot <= 0) return false
+      val pid = afterPrefix.substring(0, pdot)
+      return try { TenantNamespace.validateTenantId(pid); true }
+             catch { case _: IllegalArgumentException => false }
+    }
     if (name.startsWith("_")) return false
     val dot = name.indexOf('.')
     if (dot <= 0) return false

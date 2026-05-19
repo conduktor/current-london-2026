@@ -18123,6 +18123,136 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testCreateTopicsClusterWideRefusesTenantPrincipalShapedTopicName(): Unit = {
+    // #185 — the `__tenant_<id>.<x>` topic-name shape was missed by
+    // isReservedTenantNamespace (single-underscore short-circuit at line 172).
+    // A cluster admin could therefore CreateTopics("__tenant_acme.evil") and
+    // chain follow-up OffsetCommit/Delete/TxnOffsetCommit/ACL writes against
+    // a topic that *looks* tenant-owned to operators and tooling but is in
+    // fact pollution. Refuse at the same gate that already refuses
+    // physical-prefix-shaped names.
+    val createReq = new CreateTopicsRequest.Builder(new CreateTopicsRequestData()
+      .setTopics(new CreateTopicsRequestData.CreatableTopicCollection(List(
+        new CreateTopicsRequestData.CreatableTopic()
+          .setName("__tenant_acme.evil")
+          .setNumPartitions(1)
+          .setReplicationFactor(1.toShort)).iterator.asJava))
+      .setTimeoutMs(1000)).build()
+    val request = buildRequest(createReq,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "cluster-admin")) // default listener — NOT tenant-bound
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleCreateTopicsRequest(request)
+
+    val response = verifyNoThrottling[CreateTopicsResponse](request)
+    val byName = response.data.topics.asScala.map(t => t.name -> t).toMap
+    assertEquals(1, byName.size)
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, byName("__tenant_acme.evil").errorCode,
+      "cluster-wide CreateTopics must refuse `__tenant_<id>.<x>` topic names — they would otherwise become a substrate for OffsetCommit/ACL/etc. pollution chains")
+    assertNotNull(byName("__tenant_acme.evil").errorMessage,
+      "refusal must carry the reserved-namespace error message rather than silent drop")
+  }
+
+  @Test
+  def testOffsetCommitClusterWideRefusesTenantPrincipalShapedTopicName(): Unit = {
+    // #185 second leg — even if the principal-shape topic somehow exists in
+    // metadataCache (planted by some prior unscrubbed write, or by an admin
+    // running pre-#185), the OffsetCommit handler must refuse the name with
+    // TOPIC_AUTHORIZATION_FAILED rather than land a __consumer_offsets record
+    // keyed under it. Same wire shape as physical-prefix refusal so no oracle
+    // is produced.
+    val data = new OffsetCommitRequestData()
+      .setGroupId("admin-probe-group")
+      .setMemberId("member-x")
+      .setTopics(List(
+        new OffsetCommitRequestData.OffsetCommitRequestTopic()
+          .setName("__tenant_acme.evil")
+          .setPartitions(List(
+            new OffsetCommitRequestData.OffsetCommitRequestPartition()
+              .setPartitionIndex(0)
+              .setCommittedOffset(1)).asJava)).asJava)
+    val request = buildRequest(new OffsetCommitRequest.Builder(data).build(),
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "cluster-admin"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleOffsetCommitRequest(request, RequestLocal.noCaching)
+
+    val response = verifyNoThrottling[OffsetCommitResponse](request)
+    val byName = response.data.topics.asScala.map(t => t.name -> t).toMap
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED.code,
+      byName("__tenant_acme.evil").partitions.asScala.head.errorCode,
+      "OffsetCommit must refuse `__tenant_<id>.<x>` topic names from cluster-wide callers before reaching metadataCache or the coordinator")
+    verify(groupCoordinator, never()).commitOffsets(
+      any[RequestContext](),
+      any[OffsetCommitRequestData](),
+      any[org.apache.kafka.common.utils.BufferSupplier]())
+  }
+
+  @Test
+  def testOffsetDeleteClusterWideRefusesTenantPrincipalShapedTopicName(): Unit = {
+    // #185 third leg — symmetric to OffsetCommit on the delete-tombstone path.
+    val req = new OffsetDeleteRequest.Builder(new OffsetDeleteRequestData()
+      .setGroupId("admin-cleanup-group")
+      .setTopics(new OffsetDeleteRequestTopicCollection(List(
+        new OffsetDeleteRequestTopic().setName("__tenant_acme.evil")
+          .setPartitions(List(
+            new OffsetDeleteRequestPartition().setPartitionIndex(0)).asJava)
+      ).iterator.asJava))).build()
+    val request = buildRequest(req,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "cluster-admin"))
+
+    // OffsetDelete has no empty-list short-circuit — stub the coordinator so
+    // the forwarded (empty-topics) call returns cleanly.
+    when(groupCoordinator.deleteOffsets(any[RequestContext](), any[OffsetDeleteRequestData](), any()))
+      .thenReturn(CompletableFuture.completedFuture(new OffsetDeleteResponseData()))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleOffsetDeleteRequest(request, RequestLocal.noCaching)
+
+    val response = verifyNoThrottling[OffsetDeleteResponse](request)
+    val byName = response.data.topics.asScala.map(t => t.name -> t).toMap
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED.code,
+      byName("__tenant_acme.evil").partitions.asScala.head.errorCode,
+      "OffsetDelete must refuse `__tenant_<id>.<x>` topic names from cluster-wide callers — no __consumer_offsets tombstone may be planted under a tenant-principal-shaped key")
+    // Coordinator may still be called (no early empty-list short-circuit) but
+    // with no topics — the principal-shape name must never reach it.
+    val coordCaptor = ArgumentCaptor.forClass(classOf[OffsetDeleteRequestData])
+    verify(groupCoordinator).deleteOffsets(any[RequestContext](), coordCaptor.capture(), any())
+    assertEquals(0, coordCaptor.getValue.topics.size,
+      "principal-shape topic name must be scrubbed before reaching the coordinator")
+  }
+
+  @Test
+  def testTxnOffsetCommitClusterWideRefusesTenantPrincipalShapedTopicName(): Unit = {
+    // #185 fourth leg — symmetric to OffsetCommit/Delete on the transactional
+    // path. Worst-case before the fix: both __consumer_offsets AND
+    // __transaction_state get records keyed under the principal-shape name.
+    val partitionOffsetCommitData = new TxnOffsetCommitRequest.CommittedOffset(15L, "", Optional.empty())
+    val offsetCommitRequest = new TxnOffsetCommitRequest.Builder(
+      "admin-txn",
+      "admin-group",
+      42L,
+      0.toShort,
+      Map(
+        new TopicPartition("__tenant_acme.evil", 0) -> partitionOffsetCommitData
+      ).asJava,
+      false
+    ).build(ApiKeys.TXN_OFFSET_COMMIT.latestVersion)
+    val request = buildRequest(offsetCommitRequest,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "cluster-admin"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleTxnOffsetCommitRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[TxnOffsetCommitResponse](request)
+    val err = response.errors().get(new TopicPartition("__tenant_acme.evil", 0))
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED, err,
+      "TxnOffsetCommit must refuse `__tenant_<id>.<x>` topic names from cluster-wide callers — no consumer-offsets or transaction-state records may be planted under a tenant-principal-shaped key")
+    verify(groupCoordinator, never()).commitTransactionalOffsets(
+      any[RequestContext](), any[TxnOffsetCommitRequestData](), any())
+  }
+
+  @Test
   def testConsumerGroupHeartbeatOutsideInRefusesTenantPrincipalNamespace(): Unit = {
     metadataCache = mock(classOf[KRaftMetadataCache])
     val req = new ConsumerGroupHeartbeatRequest.Builder(
