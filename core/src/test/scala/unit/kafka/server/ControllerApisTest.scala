@@ -1898,7 +1898,15 @@ class ControllerApisTest {
         "not the operator remediation message (which would leak the declared set)")
     assertEquals(TOPIC_AUTHORIZATION_FAILED.code(), byName("shared"),
       "unauthorized backing name must also return TOPIC_AUTHORIZATION_FAILED")
-    verify(controller, never()).incrementalAlterConfigs(any(), any(), anyBoolean())
+    // The handler may still invoke the controller with an empty map (existing Kafka behavior
+    // for fully-rejected requests), but neither rejected name must ever reach the controller.
+    // Mirrors the precedent assertion in testCreatePartitionsShadowDefersToAuthorizationFailure.
+    verify(controller, never()).incrementalAlterConfigs(
+      any(),
+      ArgumentMatchers.argThat[util.Map[ConfigResource,
+        util.Map[String, util.Map.Entry[AlterConfigOp.OpType, String]]]](changes =>
+        changes.keySet().asScala.exists(r => r.name() == "orders" || r.name() == "shared")),
+      anyBoolean())
   }
 
   /**

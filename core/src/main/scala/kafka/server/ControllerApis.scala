@@ -695,6 +695,51 @@ class ControllerApis(
         iterator.remove()
       }
     }
+    // r19 ADV-A HIGH #146 — concentration guard for AlterConfigs (legacy).
+    //
+    // Mutating retention.bytes / cleanup.policy / segment.bytes / min.insync.replicas on a
+    // backing topic silently disrupts the concentration substrate for EVERY co-tenant logical
+    // topic on that backing. For declared-logical names, v1 has no descriptor-channel wiring
+    // (task #105) so AlterConfigs would either land on a phantom physical or be silently
+    // dropped — neither is correct. Reject both with INVALID_TOPIC_EXCEPTION (mirrors the
+    // produce-side backing rejection and the AddPartitionsToTxn backing guard #140).
+    //
+    // Runs after the auth iterator: unauthorized entries have already been replaced with
+    // TOPIC_AUTHORIZATION_FAILED, so this guard cannot leak the declared-logical/declared-
+    // backing set to a principal without ALTER_CONFIGS on the name. Same auth-first /
+    // shadow-second precedence as #128/#137/#139/#145.
+    val concentrationIter = configChanges.keySet().iterator()
+    while (concentrationIter.hasNext) {
+      val resource = concentrationIter.next()
+      if (resource.`type`() == ConfigResource.Type.TOPIC) {
+        if (declaredLogicalTopicNames.contains(resource.name())) {
+          response.responses().add(new OldAlterConfigsResourceResponse().
+            setErrorCode(INVALID_TOPIC_EXCEPTION.code()).
+            setErrorMessage(s"Topic '${resource.name()}' is a declared logical topic in " +
+              "concentration.logical.topics on this controller. Configuration of logical " +
+              "topics via AlterConfigs is not supported in v1; logical-topic config is " +
+              "governed by the broker-config descriptor. Remove the declaration from the " +
+              "controller's broker config and restart, then any physical topic of the same " +
+              "name can be configured via the normal path.").
+            setResourceName(resource.name()).
+            setResourceType(resource.`type`().id()))
+          concentrationIter.remove()
+        } else if (declaredBackingTopicNames.contains(resource.name())) {
+          response.responses().add(new OldAlterConfigsResourceResponse().
+            setErrorCode(INVALID_TOPIC_EXCEPTION.code()).
+            setErrorMessage(s"Topic '${resource.name()}' is the backing topic for one or " +
+              "more declared logical topics in concentration.logical.topics on this " +
+              "controller. Backing-topic configs (retention, cleanup.policy, segment.bytes, " +
+              "min.insync.replicas, ...) govern the concentration substrate for every " +
+              "co-tenant logical topic and cannot be altered via AlterConfigs while " +
+              "declarations are active; remove the declaration(s) and restart to alter the " +
+              "backing's config.").
+            setResourceName(resource.name()).
+            setResourceType(resource.`type`().id()))
+          concentrationIter.remove()
+        }
+      }
+    }
     controller.legacyAlterConfigs(context, configChanges, alterConfigsRequest.data.validateOnly)
       .handle[Unit] { (controllerResults, exception) =>
         if (exception != null) {
@@ -934,6 +979,44 @@ class ControllerApis(
           setResourceName(resource.name()).
           setResourceType(resource.`type`().id()))
         iterator.remove()
+      }
+    }
+    // r19 ADV-A HIGH #146 — concentration guard for IncrementalAlterConfigs. See the legacy
+    // handler above for the rationale; the incremental variant is the canonical Admin client
+    // path and was the primary attack surface in finding #146. The broker-side
+    // ConfigAdminManager.preprocess() is "nothing to do" for TOPIC resources and forwards
+    // every topic-config mutation here, so the controller is the single guard point — one
+    // guard catches both broker-originated forwards and direct controller requests.
+    val concentrationIter = configChanges.keySet().iterator()
+    while (concentrationIter.hasNext) {
+      val resource = concentrationIter.next()
+      if (resource.`type`() == ConfigResource.Type.TOPIC) {
+        if (declaredLogicalTopicNames.contains(resource.name())) {
+          response.responses().add(new AlterConfigsResourceResponse().
+            setErrorCode(INVALID_TOPIC_EXCEPTION.code()).
+            setErrorMessage(s"Topic '${resource.name()}' is a declared logical topic in " +
+              "concentration.logical.topics on this controller. Configuration of logical " +
+              "topics via IncrementalAlterConfigs is not supported in v1; logical-topic " +
+              "config is governed by the broker-config descriptor. Remove the declaration " +
+              "from the controller's broker config and restart, then any physical topic of " +
+              "the same name can be configured via the normal path.").
+            setResourceName(resource.name()).
+            setResourceType(resource.`type`().id()))
+          concentrationIter.remove()
+        } else if (declaredBackingTopicNames.contains(resource.name())) {
+          response.responses().add(new AlterConfigsResourceResponse().
+            setErrorCode(INVALID_TOPIC_EXCEPTION.code()).
+            setErrorMessage(s"Topic '${resource.name()}' is the backing topic for one or " +
+              "more declared logical topics in concentration.logical.topics on this " +
+              "controller. Backing-topic configs (retention, cleanup.policy, segment.bytes, " +
+              "min.insync.replicas, ...) govern the concentration substrate for every " +
+              "co-tenant logical topic and cannot be altered via IncrementalAlterConfigs " +
+              "while declarations are active; remove the declaration(s) and restart to " +
+              "alter the backing's config.").
+            setResourceName(resource.name()).
+            setResourceType(resource.`type`().id()))
+          concentrationIter.remove()
+        }
       }
     }
     controller.incrementalAlterConfigs(context, configChanges, alterConfigsRequest.data.validateOnly)
