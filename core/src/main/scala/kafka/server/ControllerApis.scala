@@ -366,6 +366,35 @@ class ControllerApis(
     val context = new ControllerRequestContext(request.context.header.data, request.context.principal,
       requestTimeoutMsToDeadlineNs(time, createTopicsRequest.data.timeoutMs),
       controllerMutationQuotaRecorderFor(controllerMutationQuota))
+    // Outside-in pollution guard. A caller reaching ControllerApis directly via
+    // `bootstrap.controllers` bypasses KafkaApis.handleCreateTopicsRequest and
+    // its name scrub. Refuse any topic whose name lies in a reserved-tenant
+    // namespace before the request is handed to the controller, so the
+    // metadata log never records a polluting create. Each refused entry
+    // surfaces as INVALID_TOPIC_EXCEPTION (the same shape the broker emits at
+    // KafkaApis line 347) so a privileged caller sees one refusal per
+    // offender instead of a silently-truncated request.
+    val pollutionRejected = new util.ArrayList[CreatableTopicResult]()
+    val topicsIter = createTopicsRequest.data.topics().iterator()
+    while (topicsIter.hasNext) {
+      val t = topicsIter.next()
+      if (isReservedTenantNamespace(t.name())) {
+        pollutionRejected.add(new CreatableTopicResult()
+          .setName(t.name())
+          .setErrorCode(INVALID_TOPIC_EXCEPTION.code)
+          .setErrorMessage("Topic name '" + t.name() + "' is reserved (tenant namespace prefix)"))
+        topicsIter.remove()
+      }
+    }
+    if (createTopicsRequest.data.topics().isEmpty && !pollutionRejected.isEmpty) {
+      val response = new CreateTopicsResponseData()
+      val responses = new CreateTopicsResponseData.CreatableTopicResultCollection(pollutionRejected.size)
+      pollutionRejected.forEach(r => responses.add(r))
+      response.setTopics(responses)
+      requestHelper.sendResponseMaybeThrottleWithControllerQuota(controllerMutationQuota, request,
+        new CreateTopicsResponse(response))
+      return CompletableFuture.completedFuture(())
+    }
     val future = createTopics(context,
         createTopicsRequest.data,
         authHelper.authorize(request.context, CREATE, CLUSTER, CLUSTER_NAME, logIfDenied = false),
@@ -376,6 +405,7 @@ class ControllerApis(
       val response = if (exception != null) {
         createTopicsRequest.getErrorResponse(exception)
       } else {
+        if (!pollutionRejected.isEmpty) pollutionRejected.forEach(r => result.topics().add(r))
         new CreateTopicsResponse(result)
       }
       requestHelper.sendResponseMaybeThrottleWithControllerQuota(controllerMutationQuota, request, response)
@@ -992,6 +1022,26 @@ class ControllerApis(
     val afterPrefix = name.substring(TenantNamespace.PRINCIPAL_PREFIX.length)
     val dot = afterPrefix.indexOf('.')
     dot > 0
+  }
+
+  // Outside-in pollution guard for TOPIC-namespace requests. A cluster-wide
+  // admin reaching the CONTROLLER listener directly via
+  // `AdminClient.bootstrap.controllers` (KIP-590) skips every broker-side
+  // outside-in scrub in KafkaApis, and would otherwise mutate tenant topic
+  // state (create/delete/alter configs/reassign/elect/...) by naming
+  // `<tenantId>.X` literally. Mirrors KafkaApis.isReservedTenantNamespace —
+  // skip Kafka-internal topics (never tenant-prefixed) and short-circuit
+  // when no tenants are configured (split-mode KRaft is task #114; in
+  // combined mode tenantConfig is populated from server.properties).
+  private def isReservedTenantNamespace(name: String): Boolean = {
+    if (name == null || Topic.isInternal(name)) return false
+    val knownTenants = tenantConfig.allTenants
+    if (knownTenants.isEmpty) return false
+    val it = knownTenants.iterator
+    while (it.hasNext) {
+      if (name.startsWith(it.next + ".")) return true
+    }
+    false
   }
 
   // Derive the caller's tenant from their principal name when the principal

@@ -1936,6 +1936,84 @@ class ControllerApisTest {
       any(classOf[java.util.Set[String]]))
   }
 
+  // ---------------------------------------------------------------------------
+  // bootstrap.controllers TOPIC scrub (#121)
+  //
+  // Every topic-namespacing scrub in KafkaApis is bypassed when AdminClient
+  // talks directly to the controller listener via `bootstrap.controllers`
+  // (KIP-590). ControllerApis must apply its own outside-in refusal so the
+  // metadata log can never receive `<tenantId>.X` mutations from a privileged
+  // caller. The tests below pin the rule per handler: refuse the tenant-named
+  // entry, let the neutral entry through.
+  // ---------------------------------------------------------------------------
+
+  @Test
+  def testControllerCreateTopicsRefusesTenantPrefixedNameOnBootstrapControllers(): Unit = {
+    // Adversary on bootstrap.controllers sends `acme.orders`. Without the
+    // controller-side scrub the broker preprocess is skipped, so the metadata
+    // log would record the tenant-namespaced topic; tenant acme would later
+    // see it in ListTopics.
+    val controller = new MockController.Builder().build()
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    val request = new CreateTopicsRequest.Builder(
+      new CreateTopicsRequestData().setTopics(new CreatableTopicCollection(util.Arrays.asList(
+        new CreatableTopic().setName("acme.orders").setNumPartitions(1).setReplicationFactor(1)
+      ).iterator()))).build()
+    val response = handleRequest[CreateTopicsResponse](request, controllerApis)
+    val results = response.data.topics().asScala.map(t => t.name -> t.errorCode).toMap
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, results("acme.orders"),
+      "controller-direct CreateTopics must refuse tenant-prefixed topic name")
+  }
+
+  @Test
+  def testControllerCreateTopicsMixesAllowedAndRejectedOnBootstrapControllers(): Unit = {
+    // A mixed batch must reach the controller for the non-polluting entries
+    // and surface the polluting entries as per-name INVALID_TOPIC_EXCEPTION.
+    // Empty-after-scrub is exercised in a separate test.
+    val controller = new MockController.Builder().build()
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    val request = new CreateTopicsRequest.Builder(
+      new CreateTopicsRequestData().setTopics(new CreatableTopicCollection(util.Arrays.asList(
+        new CreatableTopic().setName("acme.orders").setNumPartitions(1).setReplicationFactor(1),
+        new CreatableTopic().setName("plain").setNumPartitions(1).setReplicationFactor(1)
+      ).iterator()))).build()
+    val response = handleRequest[CreateTopicsResponse](request, controllerApis)
+    val results = response.data.topics().asScala.map(t => t.name -> t.errorCode).toMap
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, results("acme.orders"),
+      "tenant-namespaced entry must surface INVALID_TOPIC_EXCEPTION")
+    assertEquals(Errors.NONE.code, results("plain"),
+      "neutral entry must still reach the controller and succeed")
+  }
+
+  @Test
+  def testControllerCreateTopicsAllTenantNamedShortCircuitsControllerCall(): Unit = {
+    // When every requested topic name is in a reserved tenant namespace, the
+    // request must never reach controller.createTopics — synthesise the
+    // response directly so no controller-state work is wasted on what is by
+    // definition all garbage.
+    val controller = mock(classOf[Controller])
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    val request = new CreateTopicsRequest.Builder(
+      new CreateTopicsRequestData().setTopics(new CreatableTopicCollection(util.Arrays.asList(
+        new CreatableTopic().setName("acme.orders").setNumPartitions(1).setReplicationFactor(1),
+        new CreatableTopic().setName("acme.payments").setNumPartitions(1).setReplicationFactor(1)
+      ).iterator()))).build()
+    val response = handleRequest[CreateTopicsResponse](request, controllerApis)
+    val results = response.data.topics().asScala.map(t => t.name -> t.errorCode).toMap
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, results("acme.orders"))
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, results("acme.payments"))
+    verify(controller, never()).createTopics(any(), any(), any())
+  }
+
   @AfterEach
   def tearDown(): Unit = {
     quotasNeverThrottleControllerMutations.shutdown()
