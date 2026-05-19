@@ -1732,9 +1732,23 @@ class KafkaApis(val requestChannel: RequestChannel,
     val topicIds = metadataRequest.topicIds.asScala.toSet.filterNot(_ == Uuid.ZERO_UUID)
     val useTopicId = topicIds.nonEmpty
 
-    // Only get topicIds and topicNames when supporting topicId
-    val physicalUnknownTopicIds = topicIds.filter(metadataCache.getTopicName(_).isEmpty)
-    val physicalKnownTopicNames = topicIds.flatMap(metadataCache.getTopicName)
+    // Resolve each requested topic-id to its physical name (if any) and PARTITION on backing
+    // status. The KRaft metadata cache holds BOTH user-facing physical topics AND concentration
+    // backing topics — backing topics are real controller-materialised topics. If a client
+    // supplies a backing-topic UUID obtained via any side channel (logs, metrics, error messages,
+    // controller events, monitoring tools) and we hand back the backing topic's leadership
+    // metadata, we leak an internal storage detail and re-open the same ID-based admin-RPC attack
+    // surface (DeleteTopics-by-id, OffsetForLeaderEpoch, etc.) that the all-topics branch at
+    // line 1766 already closes. Treat backing UUIDs as unknown — the same response a client would
+    // see if the topic genuinely didn't exist — which is the safest non-leaking answer.
+    val physicalResolved: Map[Uuid, String] = topicIds.flatMap { id =>
+      metadataCache.getTopicName(id).map(id -> _)
+    }.toMap
+    val safePhysicalResolved = physicalResolved.filterNot {
+      case (_, name) => concentrationKernel.isBackingTopic(name)
+    }
+    val physicalKnownTopicNames: Set[String] = safePhysicalResolved.values.toSet
+    val physicalUnknownTopicIds: Set[Uuid] = topicIds.diff(safePhysicalResolved.keySet)
 
     // Logical topics carry deterministic UUIDs unknown to the KRaft metadata cache, so a client
     // refreshing metadata by topic-id (the normal path once a topic has been seen once) would
