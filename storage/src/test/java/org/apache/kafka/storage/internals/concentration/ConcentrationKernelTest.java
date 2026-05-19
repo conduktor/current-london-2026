@@ -1076,6 +1076,65 @@ public class ConcentrationKernelTest {
     }
 
     @Test
+    public void closeAllBackingGatesForBootRecoveryClosesEveryBackingOfEveryDeclaredTopic() {
+        // r23 BLOCKER #239 — on broker boot after recoverFromDisk(), every backing partition of
+        // every declared logical topic must have its gate closed. The kernel must walk the
+        // registry and call markBackingUnready for each (backing, p) in [0, numBackingPartitions).
+        // Re-opening happens via onMakeLeader → runScan → publishIfGenerationMatches, not here.
+        kernel.declare(descriptor("orders", 8, "sharedA", 2));
+        kernel.declare(descriptor("returns", 4, "sharedA", 2));   // same backing — must still close 0..1
+        kernel.declare(descriptor("logs",   12, "sharedB", 3));   // distinct backing — must close 0..2
+
+        // Pre: every gate is open by default for unobserved backings.
+        assertTrue(kernel.isBackingReady(new TopicPartition("sharedA", 0)));
+        assertTrue(kernel.isBackingReady(new TopicPartition("sharedA", 1)));
+        assertTrue(kernel.isBackingReady(new TopicPartition("sharedB", 0)));
+        assertTrue(kernel.isBackingReady(new TopicPartition("sharedB", 1)));
+        assertTrue(kernel.isBackingReady(new TopicPartition("sharedB", 2)));
+
+        kernel.closeAllBackingGatesForBootRecovery();
+
+        // Post: every backing partition of every declared topic is unready.
+        assertFalse(kernel.isBackingReady(new TopicPartition("sharedA", 0)),
+            "sharedA-0 gate must close at boot");
+        assertFalse(kernel.isBackingReady(new TopicPartition("sharedA", 1)),
+            "sharedA-1 gate must close at boot");
+        assertFalse(kernel.isBackingReady(new TopicPartition("sharedB", 0)),
+            "sharedB-0 gate must close at boot");
+        assertFalse(kernel.isBackingReady(new TopicPartition("sharedB", 1)),
+            "sharedB-1 gate must close at boot");
+        assertFalse(kernel.isBackingReady(new TopicPartition("sharedB", 2)),
+            "sharedB-2 gate must close at boot");
+        // Generation must have bumped — recoverer onMakeLeader will capture the bumped value at
+        // submit time, NOT the pristine 0 that an open-gate sibling would have shown.
+        assertEquals(1L, kernel.currentGeneration(new TopicPartition("sharedA", 0)));
+        assertEquals(1L, kernel.currentGeneration(new TopicPartition("sharedB", 2)));
+
+        // Discriminator: reserveProduce after the boot close must reject. Without the close (which
+        // is what the previous shape did), reserveProduce would happily hand out logical offset 0
+        // against a sidecar whose tail bytes may not be on disk yet.
+        assertThrows(NotLeaderOrFollowerException.class, () -> kernel.reserveProduce("orders", 0));
+        assertThrows(NotLeaderOrFollowerException.class, () -> kernel.reserveProduce("returns", 0));
+        assertThrows(NotLeaderOrFollowerException.class, () -> kernel.reserveProduce("logs", 0));
+    }
+
+    @Test
+    public void closeAllBackingGatesForBootRecoveryIsIdempotentAndNoopWithoutDeclarations() {
+        // Boot close on a kernel with zero declared topics must be a clean no-op (no NPE, no map
+        // mutation). Calling twice must produce the same observable state — only the generation
+        // counter bumps for any partition that was actually marked.
+        kernel.closeAllBackingGatesForBootRecovery();
+        assertTrue(kernel.isBackingReady(new TopicPartition("nothing", 0)));
+
+        kernel.declare(descriptor("orders", 4, "shared", 1));
+        kernel.closeAllBackingGatesForBootRecovery();
+        kernel.closeAllBackingGatesForBootRecovery();
+        // Two boot closes on the same backing → generation = 2; gate state remains unready.
+        assertFalse(kernel.isBackingReady(new TopicPartition("shared", 0)));
+        assertEquals(2L, kernel.currentGeneration(new TopicPartition("shared", 0)));
+    }
+
+    @Test
     public void readinessGateIsIndependentOfIdempotentCacheAndTracker() {
         // The gate is pure metadata — flipping it must not touch the tracker or the idempotent
         // cache. This is what lets B.2 sequence the operations: close the gate FIRST, then drop

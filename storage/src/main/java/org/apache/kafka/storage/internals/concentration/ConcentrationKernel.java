@@ -880,6 +880,57 @@ public final class ConcentrationKernel implements AutoCloseable {
     }
 
     /**
+     * Close the readiness gate for every backing partition of every declared logical topic.
+     *
+     * <p>r23 BLOCKER #239: defensive close at broker boot, before {@code ReplicaManager} starts.
+     * The acceptance contract is "intact sidecar → sub-second restart"; the implementation today
+     * trusts {@code recoverFromDisk()}'s in-memory seed from the sidecar file's on-disk length.
+     * Sidecar appends are intentionally not fsync'd per-write (PROMPT.md forbids it — throughput
+     * collapse), so a host crash (not clean kill) can leave the file shorter than the backing log:
+     * the OS flushed some pages, never the tail. On restart {@code recoverFromDisk} seeds
+     * {@code (persistedStart, sidecar.size())} and trusts it. A subsequent produce arriving in the
+     * window between {@code recoverFromDisk} and {@link KafkaConcentrationLeaderRecoverer#onMakeLeader}
+     * would call {@link #reserveProduce} and be handed a logical offset that ALREADY EXISTS in the
+     * (un-flushed-on-sidecar but durable-on-backing) backing range. Once {@code onMakeLeader} fires
+     * its rescan ({@code recoverFromBackingScan}) and truncates the sidecar to 0 / re-extracts, the
+     * overlap silently overwrites the in-flight produce's logical→backing mapping.
+     *
+     * <p>{@link kafka.server.BackingLogScanRecovery} only rescans partitions whose sidecar file is
+     * ABSENT — a SHORT sidecar is not absent and is not rescanned, so this boot-time defensive
+     * close is the load-bearing safety net for single-broker / non-clean-shutdown deployments.
+     *
+     * <p>Idempotent. Safe to call on a kernel with no declared topics (no-op). Re-opening the gate
+     * happens via the normal {@code onMakeLeader → runScan → publishIfGenerationMatches} pipeline:
+     * the recoverer's leader-acquisition path will truncate every sidecar to 0 and re-extract from
+     * the backing log under the current leader epoch, then publish under generation CAS. Until
+     * that completes, {@link #reserveProduce}/{@link #reserveProduceBatch} refuse with
+     * NOT_LEADER_OR_FOLLOWER, stock idempotent producers refresh metadata and retry, and no record
+     * is silently misrouted.
+     *
+     * <p>Belt-and-braces: on a multi-broker cluster the {@code onMakeLeader} path would rebuild
+     * regardless, so this close is "redundant" — but it bounds the window to "between
+     * recoverFromDisk and the FIRST onMakeLeader for each backing", instead of "between
+     * recoverFromDisk and the FIRST onMakeLeader, OR forever on a single-broker deployment where
+     * onMakeLeader never fires at all". The cost is one CHM mutation per backing partition at
+     * startup; nothing on the hot path.
+     */
+    public void closeAllBackingGatesForBootRecovery() {
+        // Dedupe (backingTopic, partition) tuples before calling markBackingUnready: two declared
+        // logical topics on the same backing must NOT bump the generation twice — boot is a single
+        // close event from the recovery contract's perspective, and a 2-bump would be observably
+        // different from a 1-bump to a recoverer that captures the gen at submit time.
+        Set<TopicPartition> backingTps = new HashSet<>();
+        for (LogicalTopicDescriptor d : registry.all()) {
+            for (int p = 0; p < d.numBackingPartitions(); p++) {
+                backingTps.add(new TopicPartition(d.backingTopic(), p));
+            }
+        }
+        for (TopicPartition tp : backingTps) {
+            markBackingUnready(tp);
+        }
+    }
+
+    /**
      * Remove and close cached {@link LogicalSidecarIndex} handles for every logical partition
      * that maps onto {@code backing}. Called from {@link #markBackingUnready} as the second leg
      * of the gate-close → cache-evict → recovery-rebuild pipeline (Codex BLOCKER follow-up B.7).

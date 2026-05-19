@@ -393,6 +393,23 @@ class BrokerServer(
       // the kernel's recoverFromBackingScan for the operator-driven recovery API.
       concentrationKernel.recoverFromDisk()
 
+      // r23 BLOCKER #239: defensively close every backing partition's readiness gate before
+      // ReplicaManager starts. recoverFromDisk() trusts the sidecar's on-disk length, but
+      // sidecar appends are intentionally not fsync'd per-write (PROMPT.md — throughput
+      // collapse). A host crash (not clean kill) can leave the sidecar SHORTER than the backing
+      // log: pages flushed but the tail never made it. Without this close, a produce arriving
+      // between recoverFromDisk() and the first onMakeLeader (single-broker deployments: never)
+      // would reserveProduce against a stale nextOffset, hand out a logical offset that already
+      // exists in the un-flushed-on-sidecar backing range, and the eventual onMakeLeader rescan
+      // would silently overwrite that mapping. {@code BackingLogScanRecovery} only rescans
+      // partitions whose sidecar file is ABSENT — a short sidecar is not absent and is not
+      // rescanned, so a one-shot defensive close at boot is the load-bearing safety net.
+      //
+      // Re-opening happens via the normal onMakeLeader → runScan → publishIfGenerationMatches
+      // pipeline; until then logical produce/fetch is rejected with NOT_LEADER_OR_FOLLOWER and
+      // stock idempotent producers refresh metadata and retry.
+      concentrationKernel.closeAllBackingGatesForBootRecovery()
+
       // Concentration leader-acquisition recovery (Codex GAP 2, leg three).
       //
       // Constructed BEFORE ReplicaManager so that ReplicaManager can hold a reference and
