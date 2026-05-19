@@ -863,6 +863,66 @@ public final class RuleEngine {
             if (cp == 0x200E || cp == 0x200F || cp == 0x061C) {
                 return String.format("bidi mark U+%04X", cp);
             }
+            // R31 #281 [HIGH]: Hangul fillers — Lo (Other_Letter), so not
+            // detected by firstNonAsciiWhitespaceCodePointLabel (which gates
+            // on Character.isWhitespace || isSpaceChar), and not detected by
+            // firstConfusableSeparatorLabel (not a comma/semicolon shape).
+            // U+3164 is the famous spoofing vector used to register blank
+            // usernames on Twitter/Discord/Steam. The other three (U+115F
+            // CHOSEONG FILLER, U+1160 JUNGSEONG FILLER, U+FFA0 HALFWIDTH
+            // FILLER) render as the same blank glyph in most fonts.
+            // Operator-side soft-brick: "User:ㅤbroker" parses to name
+            // "ㅤbroker"; runtime peer is "User:broker"; equal returns
+            // false ⇒ silent fail-CLOSED bypass under-grant.
+            if (cp == 0x115F || cp == 0x1160 || cp == 0x3164 || cp == 0xFFA0) {
+                return String.format("Hangul filler U+%04X", cp);
+            }
+            // R31 #281 [HIGH] / closes R23 #223 scope over-claim: variation
+            // selectors VS1–VS16 (U+FE00–U+FE0F) and VS17–VS256
+            // (U+E0100–U+E01EF), combining grapheme joiner (U+034F), and
+            // Mongolian free-variation selectors / vowel separator
+            // (U+180B–U+180E) are Default_Ignorable_Code_Point per Unicode
+            // contract — visually invisible in compliant renderers but
+            // not whitespace and not punctuation. Same soft-brick class as
+            // R22 #212: invisible content in a principal entry diverges
+            // from the canonical runtime form.
+            if ((cp >= 0xFE00 && cp <= 0xFE0F)
+                    || (cp >= 0xE0100 && cp <= 0xE01EF)
+                    || cp == 0x034F
+                    || (cp >= 0x180B && cp <= 0x180E)) {
+                return String.format("invisible mark U+%04X", cp);
+            }
+            // R31 #281 [HIGH] / closes R23 #223: format characters that the
+            // Unicode standard requires renderers to suppress.
+            //   U+00AD  SOFT HYPHEN
+            //   U+2061  FUNCTION APPLICATION
+            //   U+2062  INVISIBLE TIMES
+            //   U+2063  INVISIBLE SEPARATOR
+            //   U+2064  INVISIBLE PLUS
+            //   U+FFF9  INTERLINEAR ANNOTATION ANCHOR
+            //   U+FFFA  INTERLINEAR ANNOTATION SEPARATOR
+            //   U+FFFB  INTERLINEAR ANNOTATION TERMINATOR
+            //   U+FFFC  OBJECT REPLACEMENT CHARACTER
+            if (cp == 0x00AD
+                    || (cp >= 0x2061 && cp <= 0x2064)
+                    || (cp >= 0xFFF9 && cp <= 0xFFFC)) {
+                return String.format("invisible format U+%04X", cp);
+            }
+            // R31 #281 [HIGH]: Unicode tag characters U+E0000–U+E007F.
+            // Used in real-world supply-chain attacks (trojan-source/2021)
+            // to smuggle invisible instructions into source. Operator paste
+            // from any document edited under an attacker-influenced
+            // template could carry them. None are whitespace or punctuation.
+            if (cp >= 0xE0000 && cp <= 0xE007F) {
+                return String.format("tag char U+%04X", cp);
+            }
+            // R31 #281 [HIGH]: U+2800 BRAILLE PATTERN BLANK — category So,
+            // not whitespace, but renders as a 2x4 blank cell in every
+            // braille-aware font. Same blank-glyph spoofing vector as
+            // Hangul fillers above.
+            if (cp == 0x2800) {
+                return String.format("Braille blank U+%04X", cp);
+            }
             i += Character.charCount(cp);
         }
         return null;
@@ -946,6 +1006,7 @@ public final class RuleEngine {
             // to the set that arises from real keyboards / pastes.
             //   U+055D  ARMENIAN COMMA
             //   U+060C  ARABIC COMMA
+            //   U+07F8  NKO COMMA                  ← R31 #284, Mande locale IME `,`
             //   U+1363  ETHIOPIC COMMA
             //   U+1802  MONGOLIAN COMMA
             //   U+1808  MONGOLIAN MANCHU COMMA
@@ -954,6 +1015,7 @@ public final class RuleEngine {
             //   U+2E41  REVERSED COMMA
             //   U+2E4C  MEDIEVAL COMMA            ← R30 #279, same block as U+2E32/34/41
             //   U+3001  IDEOGRAPHIC COMMA
+            //   U+A4FE  LISU PUNCTUATION COMMA    ← R31 #284, Tibeto-Burman
             //   U+A60D  VAI COMMA                 ← R30 #279, Vai script (named "COMMA")
             //   U+A6F5  BAMUM COMMA               ← R30 #279, Bamum script (named "COMMA")
             //   U+FE10  PRESENTATION FORM COMMA
@@ -962,24 +1024,31 @@ public final class RuleEngine {
             //   U+FE51  SMALL IDEOGRAPHIC COMMA
             //   U+FF0C  FULLWIDTH COMMA            ← CJK IME default
             //   U+FF64  HALFWIDTH IDEOGRAPHIC COMMA
-            if (cp == 0x055D || cp == 0x060C || cp == 0x1363
+            //   U+16E97 MEDEFAIDRIN COMMA         ← R31 #284, supplementary plane
+            if (cp == 0x055D || cp == 0x060C || cp == 0x07F8 || cp == 0x1363
                     || cp == 0x1802 || cp == 0x1808
                     || cp == 0x2E32 || cp == 0x2E34 || cp == 0x2E41
                     || cp == 0x2E4C
                     || cp == 0x3001
+                    || cp == 0xA4FE
                     || cp == 0xA60D || cp == 0xA6F5
                     || cp == 0xFE10 || cp == 0xFE11
                     || cp == 0xFE50 || cp == 0xFE51
-                    || cp == 0xFF0C || cp == 0xFF64) {
+                    || cp == 0xFF0C || cp == 0xFF64
+                    || cp == 0x16E97) {
                 return String.format("comma-confusable U+%04X", cp);
             }
             // Semicolon confusables.
             //   U+037E  GREEK QUESTION MARK   ← visually identical to ASCII `;`
+            //   U+061B  ARABIC SEMICOLON      ← R31 #284, Arabic keyboard `;`
+            //   U+1364  ETHIOPIC SEMICOLON    ← R31 #284, pair to U+1363
             //   U+204F  REVERSED SEMICOLON
             //   U+2E35  TURNED SEMICOLON
+            //   U+A6F6  BAMUM SEMICOLON       ← R31 #284, pair to U+A6F5
             //   U+FE54  SMALL SEMICOLON
             //   U+FF1B  FULLWIDTH SEMICOLON   ← CJK IME default
-            if (cp == 0x037E || cp == 0x204F || cp == 0x2E35
+            if (cp == 0x037E || cp == 0x061B || cp == 0x1364
+                    || cp == 0x204F || cp == 0x2E35 || cp == 0xA6F6
                     || cp == 0xFE54 || cp == 0xFF1B) {
                 return String.format("semicolon-confusable U+%04X", cp);
             }

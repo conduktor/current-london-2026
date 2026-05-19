@@ -2118,6 +2118,307 @@ public class RuleEngineTest {
     }
 
     @Test
+    public void parseBypassPrincipalsPinsNonAsciiWhitespaceSlotLabels() {
+        // R31 #285 (Agent E FLAW-1): the existing
+        // parseBypassPrincipalsRejectsInternalNonAsciiWhitespace test only
+        // pins the slot label "principal name" on the NBSP arm, and
+        // "principal type" on the NBSP-in-type arm. The five other
+        // codepoints (NNBSP/FIGURE/EN/EM/IDEOGRAPHIC) assert only the
+        // codepoint substring. A refactor that misrouted name-side hits
+        // through the type-side diagnostic builder (or vice versa) would
+        // slip past 5 of 6 codepoint arms. This test pins the slot
+        // label explicitly for every codepoint, on BOTH the name side
+        // and the type side, so any cross-routing or slot-label drop
+        // fails loudly.
+        //
+        // The test builds inputs via Character.toChars(int) rather than
+        // raw codepoint glyphs so the source remains unambiguous to
+        // readers and editors that may collapse or escape Unicode in
+        // display.
+
+        // NAME-side slot label pinning (Agent E FLAW-1).
+        int[] whitespaceCodepoints = new int[] {
+            0x00A0, 0x202F, 0x2007, 0x2002, 0x2003, 0x3000
+        };
+        for (int cp : whitespaceCodepoints) {
+            String input = "User:bro" + new String(Character.toChars(cp)) + "ker";
+            IllegalArgumentException ex = org.junit.jupiter.api.Assertions
+                .assertThrows(IllegalArgumentException.class,
+                    () -> RuleEngine.parseBypassPrincipals(input),
+                    "non-ASCII whitespace U+" + String.format("%04X", cp)
+                        + " in name must abort");
+            assertTrue(ex.getMessage()
+                    .contains(String.format("U+%04X", cp))
+                    && ex.getMessage().contains("principal name"),
+                "diagnostic must name BOTH the codepoint AND the 'principal "
+                    + "name' slot label; got: " + ex.getMessage());
+        }
+
+        // TYPE-side slot label pinning (Agent E FLAW-1 + R31 #285 GAP-1
+        // symmetric coverage). The type position is operator-controlled
+        // and accepts free-form strings: a paste of `Service Account`
+        // (with internal whitespace as the type) is the realistic
+        // surface. Inject a non-ASCII whitespace before the colon to
+        // exercise the type-slot branch of the helper.
+        for (int cp : whitespaceCodepoints) {
+            String input = "Service" + new String(Character.toChars(cp))
+                + "Account:bot";
+            IllegalArgumentException ex = org.junit.jupiter.api.Assertions
+                .assertThrows(IllegalArgumentException.class,
+                    () -> RuleEngine.parseBypassPrincipals(input),
+                    "non-ASCII whitespace U+" + String.format("%04X", cp)
+                        + " in type must abort");
+            assertTrue(ex.getMessage()
+                    .contains(String.format("U+%04X", cp))
+                    && ex.getMessage().contains("principal type"),
+                "diagnostic must name BOTH the codepoint AND the 'principal "
+                    + "type' slot label; got: " + ex.getMessage());
+        }
+    }
+
+    @Test
+    public void parseBypassPrincipalsRejectsHangulFillers() {
+        // R31 #281 [HIGH]: U+3164 HANGUL FILLER (and the related
+        // U+115F CHOSEONG FILLER, U+1160 JUNGSEONG FILLER, U+FFA0
+        // HALFWIDTH FILLER) are category Lo (Other_Letter), so they
+        // are NOT detected by firstNonAsciiWhitespaceCodePointLabel
+        // (which gates on Character.isWhitespace || isSpaceChar) and
+        // NOT detected by firstConfusableSeparatorLabel (no comma/
+        // semicolon shape). They render as blank glyphs in most fonts —
+        // U+3164 is the documented spoofing vector used to register
+        // blank usernames on Twitter / Discord / Steam.
+        //
+        // Hazard: an operator pastes "User:[HANGUL_FILLER]broker" from a
+        // doctored doc; the bypass entry installs as principal name
+        // "[FILLER]broker", but the runtime peer principal is "broker"
+        // (ASCII only). String.equals returns false ⇒ silent
+        // fail-CLOSED under-grant of the bypass.
+        //
+        // Java probe (verified out-of-band):
+        //   Character.isWhitespace(0x3164) == false
+        //   Character.isSpaceChar(0x3164)   == false
+        //   Character.getType(0x3164)        == OTHER_LETTER (Lo)
+        // so the only filter that can catch this is the invisible
+        // codepoint helper, which we extended in R31 #281.
+
+        int[] hangulFillers = new int[] {0x115F, 0x1160, 0x3164, 0xFFA0};
+        for (int cp : hangulFillers) {
+            String input = "User:" + new String(Character.toChars(cp)) + "broker";
+            IllegalArgumentException ex = org.junit.jupiter.api.Assertions
+                .assertThrows(IllegalArgumentException.class,
+                    () -> RuleEngine.parseBypassPrincipals(input),
+                    "Hangul filler U+" + String.format("%04X", cp)
+                        + " in name must abort startup");
+            assertTrue(ex.getMessage().contains(String.format("U+%04X", cp))
+                    && ex.getMessage().toLowerCase().contains("hangul filler")
+                    && ex.getMessage().contains("principal name"),
+                "Hangul filler diagnostic must name codepoint, helper label, "
+                    + "and slot; got: " + ex.getMessage());
+        }
+    }
+
+    @Test
+    public void parseBypassPrincipalsRejectsInvisibleMarksAndFormatChars() {
+        // R31 #281 [HIGH] / closes R23 #223 over-claim scope: variation
+        // selectors VS1-VS16 (U+FE00-U+FE0F) and VS17-VS256
+        // (U+E0100-U+E01EF), combining grapheme joiner U+034F, Mongolian
+        // FVS U+180B-U+180E, soft hyphen U+00AD, invisible math
+        // operators U+2061-U+2064, interlinear annotation U+FFF9-U+FFFB,
+        // object replacement U+FFFC, and tag characters U+E0000-U+E007F
+        // are all Default_Ignorable_Code_Point per Unicode contract.
+        // Compliant renderers suppress them; none are whitespace; none
+        // are comma/semicolon confusables. They were claimed closed by
+        // Round-23 #223 but never actually landed in code; R31 closes
+        // the over-claim.
+
+        int[] invisibleMarks = new int[] {
+            0xFE00,         // VS1
+            0xFE0F,         // VS16
+            0xE0100,        // VS17 (supplementary plane)
+            0xE01EF,        // VS256 (supplementary plane)
+            0x034F,         // COMBINING GRAPHEME JOINER
+            0x180B,         // MONGOLIAN FVS-1
+            0x180E,         // MONGOLIAN VOWEL SEPARATOR
+        };
+        for (int cp : invisibleMarks) {
+            String input = "User:bro" + new String(Character.toChars(cp)) + "ker";
+            IllegalArgumentException ex = org.junit.jupiter.api.Assertions
+                .assertThrows(IllegalArgumentException.class,
+                    () -> RuleEngine.parseBypassPrincipals(input),
+                    "invisible mark U+" + String.format("%04X", cp)
+                        + " in name must abort startup");
+            assertTrue(ex.getMessage().contains(String.format("U+%04X", cp))
+                    && ex.getMessage().toLowerCase().contains("invisible mark")
+                    && ex.getMessage().contains("principal name"),
+                "invisible-mark diagnostic must name codepoint, helper label, "
+                    + "and slot; got: " + ex.getMessage());
+        }
+
+        int[] invisibleFormat = new int[] {
+            0x00AD,         // SOFT HYPHEN
+            0x2061,         // FUNCTION APPLICATION
+            0x2062,         // INVISIBLE TIMES
+            0x2063,         // INVISIBLE SEPARATOR
+            0x2064,         // INVISIBLE PLUS
+            0xFFF9,         // INTERLINEAR ANNOTATION ANCHOR
+            0xFFFA,         // INTERLINEAR ANNOTATION SEPARATOR
+            0xFFFB,         // INTERLINEAR ANNOTATION TERMINATOR
+            0xFFFC,         // OBJECT REPLACEMENT CHARACTER
+        };
+        for (int cp : invisibleFormat) {
+            String input = "User:bro" + new String(Character.toChars(cp)) + "ker";
+            IllegalArgumentException ex = org.junit.jupiter.api.Assertions
+                .assertThrows(IllegalArgumentException.class,
+                    () -> RuleEngine.parseBypassPrincipals(input),
+                    "invisible format U+" + String.format("%04X", cp)
+                        + " in name must abort startup");
+            assertTrue(ex.getMessage().contains(String.format("U+%04X", cp))
+                    && ex.getMessage().toLowerCase().contains("invisible format")
+                    && ex.getMessage().contains("principal name"),
+                "invisible-format diagnostic must name codepoint, helper "
+                    + "label, and slot; got: " + ex.getMessage());
+        }
+
+        // Tag characters (supplementary plane).
+        int[] tagChars = new int[] {0xE0000, 0xE0020, 0xE007F};
+        for (int cp : tagChars) {
+            String input = "User:bro" + new String(Character.toChars(cp)) + "ker";
+            IllegalArgumentException ex = org.junit.jupiter.api.Assertions
+                .assertThrows(IllegalArgumentException.class,
+                    () -> RuleEngine.parseBypassPrincipals(input),
+                    "tag char U+" + String.format("%04X", cp)
+                        + " in name must abort startup");
+            assertTrue(ex.getMessage().contains(String.format("U+%04X", cp))
+                    && ex.getMessage().toLowerCase().contains("tag char")
+                    && ex.getMessage().contains("principal name"),
+                "tag-char diagnostic must name codepoint, helper label, "
+                    + "and slot; got: " + ex.getMessage());
+        }
+
+        // Braille blank — category So, renders as 2x4 blank cell.
+        IllegalArgumentException braille = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals(
+                    "User:bro" + new String(Character.toChars(0x2800)) + "ker"));
+        assertTrue(braille.getMessage().contains("U+2800")
+                && braille.getMessage().toLowerCase().contains("braille blank")
+                && braille.getMessage().contains("principal name"),
+            "braille-blank diagnostic must name codepoint, helper label, "
+                + "and slot; got: " + braille.getMessage());
+    }
+
+    @Test
+    public void parseBypassPrincipalsRejectsAdditionalConfusables() {
+        // R31 #284 [MED]: an adversarial follow-on audit of R30 #279
+        // identified six more visually-confusable punctuation
+        // codepoints still missing from firstConfusableSeparatorLabel:
+        //
+        //   U+07F8  NKO COMMA                 ← Mande IME `,`
+        //   U+A4FE  LISU PUNCTUATION COMMA    ← Tibeto-Burman
+        //   U+16E97 MEDEFAIDRIN COMMA         ← supplementary plane
+        //   U+061B  ARABIC SEMICOLON          ← Arabic keyboard `;` key
+        //   U+1364  ETHIOPIC SEMICOLON        ← pair to U+1363
+        //   U+A6F6  BAMUM SEMICOLON           ← pair to U+A6F5
+        //
+        // Bypass shape identical to R29 #278 / R30 #279: an entry like
+        // "User:admin[CP]User:broker" parses as ONE principal whose
+        // canonical form never matches the runtime peer principal.
+
+        int[] commaConfusables = new int[] {0x07F8, 0xA4FE, 0x16E97};
+        for (int cp : commaConfusables) {
+            String input = "User:admin" + new String(Character.toChars(cp))
+                + "User:broker";
+            IllegalArgumentException ex = org.junit.jupiter.api.Assertions
+                .assertThrows(IllegalArgumentException.class,
+                    () -> RuleEngine.parseBypassPrincipals(input),
+                    "comma-confusable U+" + String.format("%04X", cp)
+                        + " must be rejected");
+            assertTrue(ex.getMessage().contains(String.format("U+%04X", cp))
+                    && ex.getMessage().toLowerCase().contains("comma-confusable"),
+                "comma-confusable diagnostic must name codepoint and helper "
+                    + "label; got: " + ex.getMessage());
+        }
+
+        int[] semicolonConfusables = new int[] {0x061B, 0x1364, 0xA6F6};
+        for (int cp : semicolonConfusables) {
+            String input = "User:admin" + new String(Character.toChars(cp))
+                + "User:broker";
+            IllegalArgumentException ex = org.junit.jupiter.api.Assertions
+                .assertThrows(IllegalArgumentException.class,
+                    () -> RuleEngine.parseBypassPrincipals(input),
+                    "semicolon-confusable U+" + String.format("%04X", cp)
+                        + " must be rejected");
+            assertTrue(ex.getMessage().contains(String.format("U+%04X", cp))
+                    && ex.getMessage().toLowerCase().contains(
+                        "semicolon-confusable"),
+                "semicolon-confusable diagnostic must name codepoint and "
+                    + "helper label; got: " + ex.getMessage());
+        }
+    }
+
+    @Test
+    public void parseBypassPrincipalsAbortsOnAnyInvalidSegmentInList() {
+        // R31 #285 (Agent E GAP-2): mixed valid+invalid input must
+        // abort the whole list rather than silently dropping the
+        // invalid segment. A try/catch-per-segment refactor that
+        // skipped invalid entries would silently under-grant the
+        // bypass; this test pins that the parser fails the WHOLE call.
+        //
+        // Construction: first segment is a legitimate ASCII bypass
+        // entry; second segment carries an internal NBSP (U+00A0) in
+        // the name. The parser must reject the whole input.
+
+        String input = "User:broker;User:bro"
+            + new String(Character.toChars(0x00A0)) + "ker";
+        IllegalArgumentException ex = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals(input));
+        assertTrue(ex.getMessage().contains("U+00A0")
+                && ex.getMessage().contains("principal name"),
+            "mixed valid+invalid list must abort with the invalid-segment "
+                + "diagnostic; got: " + ex.getMessage());
+
+        // Symmetric: confusable in the second segment must also abort
+        // the whole list.
+        String inputConf = "User:broker;User:admin"
+            + new String(Character.toChars(0xFF0C)) + "User:other";
+        IllegalArgumentException exConf = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals(inputConf));
+        assertTrue(exConf.getMessage().contains("U+FF0C")
+                && exConf.getMessage().toLowerCase().contains("comma-confusable"),
+            "confusable in second segment must abort the whole list; got: "
+                + exConf.getMessage());
+    }
+
+    @Test
+    public void parseBypassPrincipalsRejectsTabInNameStandalone() {
+        // R31 #285 (Agent E GAP-3): TAB-in-name (U+0009) is rejected
+        // SOMEHOW by the existing order-of-checks arm in
+        // parseBypassPrincipalsRejectsInternalNonAsciiWhitespace,
+        // but that arm tests TAB+NBSP together. This test pins
+        // TAB-alone rejection by the C0-control branch of
+        // firstInvisibleCodePointLabel.
+        //
+        // If firstInvisibleCodePointLabel were refactored to exempt TAB
+        // ("operators paste DNs from spreadsheets"), TAB would fall
+        // through to firstNonAsciiWhitespaceCodePointLabel (which DOES
+        // match TAB since Character.isWhitespace(0x09)==true &&
+        // cp!=0x0020). This test fails that scenario by pinning the
+        // C0-control diagnostic specifically.
+
+        IllegalArgumentException ex = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals(
+                    "User:bro" + "\t" + "ker"));
+        assertTrue(ex.getMessage().contains("C0 control")
+                && ex.getMessage().contains("U+0009")
+                && ex.getMessage().contains("principal name"),
+            "TAB-in-name standalone must abort via C0-control diagnostic; "
+                + "got: " + ex.getMessage());
+    }
+
+    @Test
     public void parseBypassPrincipalsThrowsOnUnicodeBlankComponent() {
         // Codex round-4 F2: String.trim() only strips ASCII whitespace (chars
         // <= 0x20), so a non-breaking space (U+00A0) inside a component
