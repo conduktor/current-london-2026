@@ -29,19 +29,4 @@ public class GovernanceTopicTest {
         assertTrue(GovernanceTopic.NAME.startsWith("__"),
             "internal-topic convention: leading double underscore");
     }
-
-    @Test
-    public void readerClientIdEmbedsBrokerAndIsExempt() {
-        String cid = GovernanceTopic.readerClientId(7);
-        assertTrue(cid.startsWith(RuleEngine.INTERNAL_CLIENT_ID_PREFIX),
-            "reader client id must start with the engine's exempt prefix");
-        assertTrue(cid.contains("7"),
-            "client id should identify the broker for log/quota visibility");
-    }
-
-    @Test
-    public void readerClientIdIsDistinctPerBroker() {
-        assertEquals(false, GovernanceTopic.readerClientId(1)
-            .equals(GovernanceTopic.readerClientId(2)));
-    }
 }

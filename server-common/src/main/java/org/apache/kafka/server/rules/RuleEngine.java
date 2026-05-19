@@ -87,12 +87,18 @@ public final class RuleEngine {
     private static final Logger LOG = LoggerFactory.getLogger(RuleEngine.class);
 
     /**
-     * Naming convention for the broker's own governance-topic consumer.
-     * Purely diagnostic — the engine no longer treats this prefix as
-     * authoritative for the bypass. The actual bypass is granted by the
-     * {@code fromPrivilegedListener} flag set by the network layer, which
-     * external clients cannot forge. Use {@code GovernanceTopic.readerClientId}
-     * when constructing the broker-internal consumer.
+     * Sentinel client-id prefix that an attacker might plausibly set on the
+     * wire to try to spoof "I am the broker reading my own governance topic".
+     * NO PRODUCTION CALLER constructs this string today: the broker reads
+     * {@code __governance} directly via {@code ReplicaManager.getLog}, with no
+     * consumer and no client-id on the wire. This constant therefore exists
+     * solely as a defensive-test fixture — see
+     * {@code RuleEngineTest#spoofedInternalClientIdDoesNotBypassWhenNotOnPrivilegedListener},
+     * which pins that an external client setting
+     * {@code client.id=__kafka-governance-attacker} does NOT bypass any rule.
+     * The actual bypass is granted by the {@code fromPrivilegedListener} flag
+     * the network layer attaches to every request based on which TCP listener
+     * accepted the connection, which external clients cannot forge.
      */
     public static final String INTERNAL_CLIENT_ID_PREFIX = "__kafka-governance-";
 

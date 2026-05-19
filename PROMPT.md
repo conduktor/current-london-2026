@@ -5,7 +5,7 @@ A single broker-side rule engine that evaluates CEL `DENY` rules against any req
 
 ## Constraints (do not violate)
 - **Do not modify anything under `clients/`.** Rules are written as JSON records to a normal compacted topic — any stock producer can author them.
-- Bootstrap-safe: the broker's own read of `__governance` must not traverse `KafkaApis.handle()`, or you deadlock on startup. In the implementation, the broker reads the local `__governance` log directly via `ReplicaManager.getLog` (no consumer, no network round-trip), so no rule can deny it. Operator-tooling consumers of `__governance` are gated by the privileged-listener flag plus enrolment in the `governance.bypass.principals` allow-list — the bypass is principal-based, not client-id-based; the internal-reader client-id prefix is diagnostic only.
+- Bootstrap-safe: the broker's own read of `__governance` must not traverse `KafkaApis.handle()`, or you deadlock on startup. In the implementation, the broker reads the local `__governance` log directly via `ReplicaManager.getLog` (no consumer, no client-id on the wire, no network round-trip), so no rule can deny it. Operator-tooling consumers of `__governance` are network clients and are exempted only when they arrive on the privileged listener AND their peer principal is enrolled in the `governance.bypass.principals` allow-list — bypass is principal-based, never client-id-based.
 - Hot reload: atomic `RuleSet` swap on topic consumption; no broker restart.
 - Fast path: zero cost when no DENY rule targets the request's API key.
 
@@ -97,17 +97,17 @@ The engine ships a hand-written recursive-descent parser, NOT cel-java. Supporte
 
 ## Careful
 - Field extractors must be auto-generated per Kafka API type — do not hand-code them.
-- The broker's local-log read of `__governance` must not traverse `KafkaApis.handle()` — drive it via `ReplicaManager.getLog` directly. Any operator-driven consumer of `__governance` must arrive on the privileged listener AND its peer principal must be enrolled in `governance.bypass.principals`, or rules block the very read that loads them. The client-id prefix used by the internal reader is diagnostic only and is NOT authoritative for the bypass.
+- The broker's local-log read of `__governance` must not traverse `KafkaApis.handle()` — drive it via `ReplicaManager.getLog` directly. The direct-log path has no client-id on the wire at all. Any operator-driven consumer of `__governance` must arrive on the privileged listener AND its peer principal must be enrolled in `governance.bypass.principals`, or rules block the very read that loads them. Bypass is principal-based, never client-id-based.
 - Don't pay the cost of context construction for requests with no matching rules. Bitset first; full context only on hit.
 
 ## Lessons already known (don't rediscover)
 - The fast path matters more than the slow path. Bitset of active deny-targeting API keys is O(1).
-- Self-referential bootstrap deadlock is a one-bite-fits-all trap. The broker reads `__governance` directly from the local log (no consumer, no `KafkaApis.handle()` traversal); operator-tooling consumers are bypassed only when authenticated on the privileged listener AND present in the `governance.bypass.principals` allow-list. Client-id sentinels are diagnostic; they are NOT the authoritative bypass.
+- Self-referential bootstrap deadlock is a one-bite-fits-all trap. The broker reads `__governance` directly from the local log (no consumer, no client-id on the wire, no `KafkaApis.handle()` traversal); operator-tooling consumers are bypassed only when authenticated on the privileged listener AND present in the `governance.bypass.principals` allow-list. Bypass is principal-based, never client-id-based.
 - Compression policy from the sibling worktree can ultimately be expressed as a single CEL rule, but for v1 keep them independent.
 
 ## Acceptance criteria
 - Rule reload is atomic — concurrent readers always observe one of the fully-published RuleSets, never null or partially-constructed state.
-- The broker's own startup read of `__governance` does not traverse `KafkaApis.handle()` at all (direct local-log read via `ReplicaManager.getLog`) and is therefore not subject to rule evaluation even when a deny-all rule applies to the API. Operator-tooling consumers of `__governance` are exempt only when authenticated on the privileged listener AND their peer principal is enrolled in `governance.bypass.principals`; the internal-reader client-id prefix is diagnostic and NOT the authoritative bypass.
+- The broker's own startup read of `__governance` does not traverse `KafkaApis.handle()` at all (direct local-log read via `ReplicaManager.getLog`, no client-id on the wire) and is therefore not subject to rule evaluation even when a deny-all rule applies to the API. Operator-tooling consumers of `__governance` are exempt only when authenticated on the privileged listener AND their peer principal is enrolled in `governance.bypass.principals`. Bypass is principal-based, never client-id-based.
 - When no DENY rule targets a given API key, evaluation is skipped entirely — no field extraction, no principal-attribute resolution, no allocation on the fast path.
 - Rule update via tombstone is idempotent — tombstoning an absent rule succeeds, consistent with at-least-once delivery semantics from the rules topic.
 - Broker bootstrap drains all existing rules from the rules topic before accepting client connections.

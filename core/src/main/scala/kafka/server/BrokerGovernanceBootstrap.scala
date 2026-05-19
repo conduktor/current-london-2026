@@ -85,12 +85,16 @@ object LocalReplicaStatus {
  * latency for rule propagation, which is acceptable for governance state
  * that changes on human timescales.
  *
- * <p>This is the broker's own consumer of the rules topic, so the work is
- * already unconditionally exempt from rule evaluation: no
- * [[RuleEngine#evaluate]] calls are made anywhere in this class. The direct-log
- * path used here never enters [[RuleEngine#evaluate]] at all, so the
- * [[RuleEngine#INTERNAL_CLIENT_ID_PREFIX]] sentinel-clientId bypass is not
- * required on this code path.
+ * <p>This is the broker's own direct-log read of the rules topic, so the work
+ * is already unconditionally exempt from rule evaluation: no
+ * [[RuleEngine#evaluate]] calls are made anywhere in this class. The
+ * direct-log path used here never enters [[RuleEngine#evaluate]] at all, so
+ * the privileged-listener / [[RuleEngine#INTERNAL_CLIENT_ID_PREFIX]] bypass
+ * machinery (which guards network clients of `__governance`) is not required
+ * on this code path. After commit `e8a485c2ff` removed the legacy
+ * `GovernanceTopicReader` consumer, there is no internal consumer at all —
+ * `INTERNAL_CLIENT_ID_PREFIX` survives only as a defensive test fixture
+ * pinning that a forged-clientId attacker still gets denied.
  *
  * <h3>Operator-visible posture: "fail-stale-not-empty"</h3>
  *
