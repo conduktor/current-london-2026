@@ -33,11 +33,12 @@ import com.fasterxml.jackson.databind.ObjectMapper;
  * close that amplification by failing the parse early with a {@link com.fasterxml.jackson.core.exc.StreamConstraintsException}.
  *
  * <p><strong>Why the explicit limits.</strong> Jackson's package-level defaults already cap several
- * of these, but the defaults are quietly tightened across point releases (the {@code maxStringLength}
- * default dropped from 20 MiB → 5 MiB in 2.15 and may move again), and the defaults are not
- * documented as part of Jackson's public API surface. Pinning the values here makes the broker's
- * behaviour stable against silent dependency-bump regressions and makes the security guarantee
- * something a reader can verify from one file rather than the current Jackson release notes.
+ * of these, but the defaults move across point releases in either direction (e.g. {@code maxStringLength}
+ * shipped at 5 MiB in 2.15.0 and was then raised to 20 MiB in 2.15.1 in response to user feedback, per
+ * jackson-core issues #863 and #1014), and the defaults are not documented as part of Jackson's public
+ * API surface. Pinning the values here makes the broker's behaviour stable against silent
+ * dependency-bump regressions in either direction and makes the security guarantee something a reader
+ * can verify from one file rather than the current Jackson release notes.
  *
  * <p><strong>The chosen values.</strong>
  * <ul>

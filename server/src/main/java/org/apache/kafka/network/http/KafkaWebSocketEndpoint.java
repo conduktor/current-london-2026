@@ -171,9 +171,14 @@ public final class KafkaWebSocketEndpoint implements Session.Listener.AutoDemand
     @Override
     public void onWebSocketOpen(Session session) {
         this.session = session;
-        // Register before any blocking work so a stop() that races the upgrade still sees this endpoint and
-        // delivers the 1001 close frame. Jetty serialises lifecycle callbacks per session, so the matching
-        // remove() in tearDown() cannot reorder before this add().
+        // Register before any blocking work so any stop() whose snapshot is taken AFTER this point
+        // observes the entry and delivers the 1001 close frame. The complementary window — stop()'s
+        // snapshot taken between KafkaHttpServer.createWebSocket returning the endpoint and Jetty
+        // invoking onWebSocketOpen here — is closed by the double-checked {@code shuttingDown} flag in
+        // KafkaHttpServer.createWebSocket (before and after tryAcquire), which converts that race into
+        // a clean 503 instead of letting an unregistered session slip through. Jetty serialises
+        // lifecycle callbacks per session, so the matching remove() in tearDown() cannot reorder
+        // before this add().
         activeSessions.add(this);
         // Start with the tight pre-subscribe timeout; handleFirstFrame relaxes to IDLE_TIMEOUT once the
         // subscribe frame has been validated and the streamer is constructed.
