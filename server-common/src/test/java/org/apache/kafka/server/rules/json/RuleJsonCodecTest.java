@@ -802,6 +802,107 @@ public class RuleJsonCodecTest {
     }
 
     @Test
+    public void errorCodeLongOverflowRejected() {
+        // R28 Codec F2 / Task #234: parseErrorCode gates on n.isInt() which
+        // is true ONLY for Jackson's IntNode (values that fit in a Java int).
+        // A JSON number above Integer.MAX_VALUE deserializes to a LongNode
+        // and must be rejected at the type gate. Without this pin, a future
+        // refactor relaxing the gate to n.isIntegralNumber() or n.isNumber()
+        // would let n.asInt() silently truncate the value (e.g. 2147483648L
+        // → -2147483648), at which point either the negative check would
+        // reject it for the wrong reason, or — for values that truncate back
+        // into [1, 32767] — it would slip through entirely.
+        long aboveIntMax = (long) Integer.MAX_VALUE + 1L; // 2147483648
+        String json = "{\"apiKeys\":[\"METADATA\"],\"action\":\"DENY\","
+            + "\"when\":\"true\",\"errorCode\":" + aboveIntMax + "}";
+        RuleEnvelopeException ex = assertThrows(RuleEnvelopeException.class,
+            () -> RuleJsonCodec.decode("k", json.getBytes(StandardCharsets.UTF_8)));
+        assertTrue(ex.getMessage().contains("must be an integer"),
+            "LongNode must be rejected at the type gate with 'must be an integer': "
+                + ex.getMessage());
+    }
+
+    @Test
+    public void errorCodeLongMaxRejected() {
+        // Boundary clarity: Long.MAX_VALUE is the largest JSON integer
+        // Jackson can parse without overflowing to BigIntegerNode. Pin that
+        // it is also rejected at the same type gate — it must not reach
+        // n.asInt() (which would clamp to Integer.MAX_VALUE, a value the
+        // range check accepts as inside [1, Short.MAX_VALUE] is false but
+        // which would still be rejected for the wrong reason).
+        String json = "{\"apiKeys\":[\"METADATA\"],\"action\":\"DENY\","
+            + "\"when\":\"true\",\"errorCode\":" + Long.MAX_VALUE + "}";
+        RuleEnvelopeException ex = assertThrows(RuleEnvelopeException.class,
+            () -> RuleJsonCodec.decode("k", json.getBytes(StandardCharsets.UTF_8)));
+        assertTrue(ex.getMessage().contains("must be an integer"),
+            "Long.MAX_VALUE must be rejected at the type gate: " + ex.getMessage());
+    }
+
+    @Test
+    public void errorCodeFloatingPointRejected() {
+        // R28 Codec F2 / Task #234: a JSON number with a fractional part
+        // deserializes to DoubleNode (or FloatNode), neither of which
+        // satisfies n.isInt(). Pin that the type gate catches them. Without
+        // this pin, a future refactor relaxing to n.isNumber() would let
+        // n.asInt() silently truncate 1.5 → 1, accepting it as
+        // Errors.OFFSET_OUT_OF_RANGE without the operator ever noticing
+        // their typo.
+        String json = "{\"apiKeys\":[\"METADATA\"],\"action\":\"DENY\","
+            + "\"when\":\"true\",\"errorCode\":1.5}";
+        RuleEnvelopeException ex = assertThrows(RuleEnvelopeException.class,
+            () -> RuleJsonCodec.decode("k", json.getBytes(StandardCharsets.UTF_8)));
+        assertTrue(ex.getMessage().contains("must be an integer"),
+            "DoubleNode must be rejected at the type gate: " + ex.getMessage());
+    }
+
+    @Test
+    public void errorCodeIntegralDoubleRejected() {
+        // Even an "integral-valued" floating point literal like 1.0 must be
+        // rejected: Jackson deserializes "1.0" to DoubleNode regardless of
+        // the lack of fractional part, and n.isInt() returns false. The
+        // operator wrote a decimal point — that's a real type mistake we
+        // should surface, not silently coerce to 1.
+        String json = "{\"apiKeys\":[\"METADATA\"],\"action\":\"DENY\","
+            + "\"when\":\"true\",\"errorCode\":1.0}";
+        RuleEnvelopeException ex = assertThrows(RuleEnvelopeException.class,
+            () -> RuleJsonCodec.decode("k", json.getBytes(StandardCharsets.UTF_8)));
+        assertTrue(ex.getMessage().contains("must be an integer"),
+            "integral-valued DoubleNode (1.0) must still be rejected: "
+                + ex.getMessage());
+    }
+
+    @Test
+    public void errorCodeStringRejected() {
+        // Non-numeric JSON types must also be rejected at the same gate —
+        // pin that an operator who quotes the value gets the same clear
+        // "must be an integer" diagnostic rather than a stack trace from
+        // n.asInt() returning 0 (Jackson's default coercion for non-numeric
+        // TextNode) which would then trip the Errors.NONE rejection for the
+        // wrong reason.
+        String json = "{\"apiKeys\":[\"METADATA\"],\"action\":\"DENY\","
+            + "\"when\":\"true\",\"errorCode\":\"1\"}";
+        RuleEnvelopeException ex = assertThrows(RuleEnvelopeException.class,
+            () -> RuleJsonCodec.decode("k", json.getBytes(StandardCharsets.UTF_8)));
+        assertTrue(ex.getMessage().contains("must be an integer"),
+            "string-quoted errorCode must be rejected at the type gate: "
+                + ex.getMessage());
+    }
+
+    @Test
+    public void errorCodeBooleanRejected() {
+        // Boolean values must hit the same diagnostic. n.isInt() is false
+        // for BooleanNode; n.asInt() on BooleanNode returns 1 for true and
+        // 0 for false (Jackson coercion), either of which would slip past
+        // the type gate if it were ever loosened.
+        String json = "{\"apiKeys\":[\"METADATA\"],\"action\":\"DENY\","
+            + "\"when\":\"true\",\"errorCode\":true}";
+        RuleEnvelopeException ex = assertThrows(RuleEnvelopeException.class,
+            () -> RuleJsonCodec.decode("k", json.getBytes(StandardCharsets.UTF_8)));
+        assertTrue(ex.getMessage().contains("must be an integer"),
+            "BooleanNode must be rejected at the type gate: " + ex.getMessage());
+    }
+
+    @Test
     public void duplicateApiKeysAreDedupedInDeclaredOrder() {
         // A rule with apiKeys=["FETCH","FETCH",...] would, without dedup,
         // appear N times in RuleSetBuilder's per-API-key list and be
