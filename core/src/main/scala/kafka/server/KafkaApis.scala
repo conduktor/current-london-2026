@@ -5551,6 +5551,27 @@ class KafkaApis(val requestChannel: RequestChannel,
     } else {
       if (consumerGroupHeartbeatRequest.data.subscribedTopicNames != null &&
         !consumerGroupHeartbeatRequest.data.subscribedTopicNames.isEmpty) {
+        // Outside-in subscription pollution: the groupId guard above only
+        // inspects `groupId`, not `subscribedTopicNames`. A cluster-wide
+        // caller naming `groupId="g"` (not reserved-form) and
+        // `subscribedTopicNames=["acme.orders"]` would otherwise have the new
+        // group coordinator record the subscription against the tenant's
+        // PHYSICAL topic. Subsequent heartbeat responses surface that physical
+        // name in `member.assignment.topicPartitions` — leaking topic
+        // existence and end offsets, and letting a non-tenant principal
+        // disrupt the tenant's rebalance protocol. Refuse the whole heartbeat
+        // with TOPIC_AUTHORIZATION_FAILED before forwarding to the coordinator
+        // — same wire shape the existing topic-authz refusal below produces.
+        // CONSUMER_GROUP_HEARTBEAT is outside TENANT_ALLOWED_APIS so tenant
+        // principals never reach here; this guard only fires for non-tenant
+        // callers. The list-iteration cost is bounded by the request size.
+        if (!tenantContextFor(request).effectiveTenant.isPresent &&
+          consumerGroupHeartbeatRequest.data.subscribedTopicNames.asScala.exists(isReservedTenantNamespace)) {
+          val responseData = new ConsumerGroupHeartbeatResponseData()
+            .setErrorCode(Errors.TOPIC_AUTHORIZATION_FAILED.code)
+          requestHelper.sendMaybeThrottle(request, new ConsumerGroupHeartbeatResponse(responseData))
+          return CompletableFuture.completedFuture[Unit](())
+        }
         // Check the authorization if the subscribed topic names are provided.
         // Clients are not allowed to see topics that are not authorized for Describe.
         val subscribedTopicSet = consumerGroupHeartbeatRequest.data.subscribedTopicNames.asScala.toSet

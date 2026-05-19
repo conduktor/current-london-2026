@@ -17124,6 +17124,63 @@ class KafkaApisTest extends Logging {
     assertEquals(42L, part.endOffset)
   }
 
+  // ---------------------------------------------------------------------------
+  // ConsumerGroupHeartbeat (KIP-848) subscribedTopicNames outside-in scrub (#132)
+  //
+  // The existing groupId guard (#63) only inspects `groupId`. A cluster-wide
+  // caller can still pass `groupId="regular-group"` and
+  // `subscribedTopicNames=["acme.orders"]`; the new group coordinator would
+  // then record the subscription against the tenant's physical topic and the
+  // assignment surfaces the physical name back to the caller. Refuse the whole
+  // heartbeat with TOPIC_AUTHORIZATION_FAILED — the same wire shape the
+  // sibling topic-authz refusal already produces.
+  // ---------------------------------------------------------------------------
+  @Test
+  def testConsumerGroupHeartbeatOutsideInRefusesReservedSubscribedTopicName(): Unit = {
+    metadataCache = mock(classOf[KRaftMetadataCache])
+    val req = new ConsumerGroupHeartbeatRequest.Builder(
+      new ConsumerGroupHeartbeatRequestData()
+        .setGroupId("regular-group")
+        .setSubscribedTopicNames(List("regular-topic", "acme.orders").asJava)
+    ).build()
+    val request = buildRequest(req)
+
+    kafkaApis = createKafkaApis(
+      featureVersions = Seq(GroupVersion.GV_1),
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleConsumerGroupHeartbeat(request)
+
+    val response = verifyNoThrottling[ConsumerGroupHeartbeatResponse](request)
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED.code, response.data.errorCode,
+      "reserved-namespace topic in subscribedTopicNames must be refused before the coordinator")
+    verify(groupCoordinator, never()).consumerGroupHeartbeat(any(), any())
+  }
+
+  @Test
+  def testConsumerGroupHeartbeatClusterWideListenerForwardsTenantLookingNamesWhenNoTenantsConfigured(): Unit = {
+    // No tenants configured: `acme.orders` is just a dotted topic name. The
+    // outside-in guard must not fire; the request goes through to the
+    // coordinator as on stock Kafka.
+    metadataCache = mock(classOf[KRaftMetadataCache])
+    val data = new ConsumerGroupHeartbeatRequestData()
+      .setGroupId("regular-group")
+      .setSubscribedTopicNames(List("acme.orders").asJava)
+    val req = new ConsumerGroupHeartbeatRequest.Builder(data).build()
+    val request = buildRequest(req)
+
+    val future = new CompletableFuture[ConsumerGroupHeartbeatResponseData]()
+    when(groupCoordinator.consumerGroupHeartbeat(request.context, data)).thenReturn(future)
+
+    kafkaApis = createKafkaApis(featureVersions = Seq(GroupVersion.GV_1))
+    kafkaApis.handleConsumerGroupHeartbeat(request)
+
+    val coordinatorResponse = new ConsumerGroupHeartbeatResponseData().setMemberId("m")
+    future.complete(coordinatorResponse)
+    val response = verifyNoThrottling[ConsumerGroupHeartbeatResponse](request)
+    assertEquals(coordinatorResponse, response.data,
+      "with no tenants configured the dotted topic name is not reserved")
+  }
+
   @Test
   def testDescribeTopicPartitionsAllTopicsSilentlyDropsTenantPhysicalTopics(): Unit = {
     // fetchAllTopics path: the handler iterates metadataCache.getAllTopics()
