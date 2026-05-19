@@ -1780,6 +1780,158 @@ public class RuleEngineTest {
     }
 
     @Test
+    public void parseBypassPrincipalsRejectsCommaAndSemicolonConfusableCodepoints() {
+        // R29 #278 [HIGH]: an adversarial audit of the R29 #272 broader
+        // regex found a SEVENTH bypass shape: non-ASCII codepoints that
+        // are VISUALLY identical (or near-identical) to ASCII `,` or `;`
+        // are not caught by the existing ASCII-only regex, and the
+        // invisible-codepoint check (firstInvisibleCodePointLabel) only
+        // covers C0/C1/zero-width/bidi — NOT printable punctuation.
+        //
+        // The realistic operator scenario: a Japanese / Chinese / Korean
+        // IME produces FULLWIDTH COMMA (U+FF0C, `，`) by default when
+        // pressed alongside a CJK input mode. An operator pasting from
+        // a CJK-edited admin doc, or typing on a CJK keyboard, can
+        // produce `User:admin，User:broker` with U+FF0C standing in for
+        // the ASCII `,`. The string passes:
+        //
+        //   1. raw.split(";") — no ASCII `;`, single segment
+        //   2. parseKafkaPrincipal split(":", 2) → type=`User`,
+        //      name=`admin，User:broker`
+        //   3. whitespace, invisible-codepoint, type-comma, ASCII-comma
+        //      checks — all pass (U+FF0C is visible printable
+        //      punctuation, NOT in any rejected set)
+        //   4. set entry stored as `User:admin，User:broker` — non-empty
+        //      so the BrokerServer empty-set startup gate accepts.
+        //   5. runtime peer principal is `User:broker` — NEVER matches
+        //      → silent soft-brick of inter-broker traffic.
+        //
+        // The same hazard exists for SEMICOLON confusables (the
+        // `split(";")` entry separator): FULLWIDTH SEMICOLON U+FF1B
+        // (`；`) and GREEK QUESTION MARK U+037E (`;` — visually identical
+        // to ASCII `;` in most fonts).
+        //
+        // Discriminator: enumerate the well-known comma- and semicolon-
+        // confusable codepoint sets in firstConfusableSeparatorLabel,
+        // reject any occurrence with a "looks-like-a-separator" diagnostic
+        // BEFORE the ASCII checks. The list mirrors the structure of the
+        // existing firstInvisibleCodePointLabel helper.
+
+        // ---- Comma confusables (representative subset) ----
+        String[] commaConfusables = new String[] {
+            // U+FF0C FULLWIDTH COMMA — CJK IME default
+            "User:admin，User:broker",
+            // U+3001 IDEOGRAPHIC COMMA — Japanese
+            "User:admin、User:broker",
+            // U+060C ARABIC COMMA — Arabic/Persian keyboards
+            "User:admin،User:broker",
+            // U+055D ARMENIAN COMMA
+            "User:admin՝User:broker",
+            // U+FE50 SMALL COMMA — presentation form
+            "User:admin﹐User:broker",
+            // U+FF64 HALFWIDTH IDEOGRAPHIC COMMA
+            "User:admin､User:broker",
+        };
+        for (String input : commaConfusables) {
+            IllegalArgumentException ex = org.junit.jupiter.api.Assertions
+                .assertThrows(IllegalArgumentException.class,
+                    () -> RuleEngine.parseBypassPrincipals(input),
+                    "comma-confusable bypass must be rejected: '" + input + "'");
+            String msg = ex.getMessage().toLowerCase();
+            assertTrue(msg.contains("confusable") || msg.contains("look")
+                    || msg.contains("comma"),
+                "diagnostic must name the comma-confusable hazard; got: "
+                    + ex.getMessage());
+            assertTrue(ex.getMessage().contains(";"),
+                "diagnostic must name the correct separator `;`; got: "
+                    + ex.getMessage());
+        }
+
+        // ---- Semicolon confusables (split(";") entry-separator) ----
+        String[] semicolonConfusables = new String[] {
+            // U+FF1B FULLWIDTH SEMICOLON — CJK IME default
+            "User:admin；User:broker",
+            // U+037E GREEK QUESTION MARK — visually identical to ASCII `;`
+            "User:admin;User:broker",
+            // U+FE54 SMALL SEMICOLON — presentation form
+            "User:admin﹔User:broker",
+        };
+        for (String input : semicolonConfusables) {
+            IllegalArgumentException ex = org.junit.jupiter.api.Assertions
+                .assertThrows(IllegalArgumentException.class,
+                    () -> RuleEngine.parseBypassPrincipals(input),
+                    "semicolon-confusable bypass must be rejected: '"
+                        + input + "'");
+            String msg = ex.getMessage().toLowerCase();
+            assertTrue(msg.contains("confusable") || msg.contains("look")
+                    || msg.contains("semicolon"),
+                "diagnostic must name the semicolon-confusable hazard; got: "
+                    + ex.getMessage());
+        }
+
+        // ---- Confusable in TYPE (not just NAME) ----
+        // `Service，Account:bot` — a fullwidth comma inside the parsed
+        // type. The existing typeContains-comma check would not catch this
+        // (it scans for ASCII `,`). Must still reject.
+        IllegalArgumentException exType = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals(
+                    "Service，Account:bot"));
+        assertTrue(exType.getMessage().toLowerCase().contains("confusable")
+                || exType.getMessage().toLowerCase().contains("comma"),
+            "confusable in TYPE must be rejected; got: " + exType.getMessage());
+
+        // ---- LogSafe regression: diagnostic must not embed raw CR /
+        //      non-ASCII bytes that could forge a startup log line.
+        IllegalArgumentException exLog = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals(
+                    "User:admin，User:broker\rX"));
+        assertFalse(exLog.getMessage().contains("\r"),
+            "confusable diagnostic must sanitise CR; got: "
+                + exLog.getMessage());
+
+        // ---- Regression guard: legitimate CJK name (Japanese ideographs
+        //      in CN) with NO confusable separator is STILL accepted.
+        //      `User:CN=東京一郎,OU=営業,O=Example,C=JP` — every comma is
+        //      ASCII U+002C and every X.500 attribute uses `=`. The
+        //      CJK codepoints (U+6771 etc.) are NOT in any rejected set.
+        String cjkSslDn = "User:CN=東京一郎,OU=営業,"
+            + "O=Example,C=JP";
+        java.util.Set<String> okCjk = RuleEngine.parseBypassPrincipals(cjkSslDn);
+        assertEquals(1, okCjk.size(),
+            "legitimate CJK SSL DN with ASCII commas-as-X.500-separators "
+                + "must remain accepted; got: " + okCjk);
+        assertTrue(okCjk.contains(cjkSslDn));
+
+        // ---- Regression guard: legitimate Arabic name in CN is accepted.
+        //      `User:CN=محمد,OU=Ops`. The ASCII comma is the X.500
+        //      separator; the Arabic letters (U+0645 U+062D U+0645 U+062F)
+        //      are NOT comma-confusables.
+        String arabicSslDn = "User:CN=محمد,OU=Ops";
+        java.util.Set<String> okArabic =
+            RuleEngine.parseBypassPrincipals(arabicSslDn);
+        assertEquals(1, okArabic.size(),
+            "legitimate Arabic SSL DN must remain accepted; got: " + okArabic);
+        assertTrue(okArabic.contains(arabicSslDn));
+
+        // ---- Order-of-checks: an entry that has BOTH an invisible
+        //      codepoint AND a comma-confusable still throws (operator
+        //      gets ONE diagnostic; the more specific invisible-codepoint
+        //      diagnostic should win because invisible codepoints are the
+        //      higher-severity smuggling vector).
+        IllegalArgumentException exBoth = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals(
+                    "User:admin​，User:broker"));
+        assertTrue(exBoth.getMessage().toLowerCase().contains("invisible")
+                || exBoth.getMessage().toLowerCase().contains("zero-width"),
+            "when both invisible AND confusable present, the more specific "
+                + "invisible diagnostic should fire first; got: "
+                + exBoth.getMessage());
+    }
+
+    @Test
     public void parseBypassPrincipalsThrowsOnUnicodeBlankComponent() {
         // Codex round-4 F2: String.trim() only strips ASCII whitespace (chars
         // <= 0x20), so a non-breaking space (U+00A0) inside a component

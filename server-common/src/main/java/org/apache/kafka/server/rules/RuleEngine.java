@@ -570,6 +570,53 @@ public final class RuleEngine {
                     + "principal; reject at startup rather than "
                     + "under-granting the bypass silently.");
             }
+            // R29 #278 [HIGH]: detect non-ASCII comma/semicolon
+            // confusables BEFORE the ASCII-only comma-typo regex below.
+            // The invisible-codepoint check above covers smuggled
+            // codepoints (C0/C1/zero-width/bidi); the confusable set
+            // here covers VISIBLE printable punctuation that the
+            // invisible helper deliberately ignores.
+            //
+            // Hazard: an operator using a CJK / Arabic / Armenian IME
+            // can produce `User:admin，User:broker` (U+FF0C FULLWIDTH
+            // COMMA, the CJK IME default) or `User:admin；User:broker`
+            // (U+FF1B FULLWIDTH SEMICOLON) — neither is ASCII `,` or
+            // `;`, so split(";") sees one segment, the regex below
+            // sees no ASCII `,`, and the bypass entry is stored
+            // intact. The runtime peer principal NEVER matches, and
+            // inter-broker traffic silently soft-bricks.
+            //
+            // Reject any confusable in TYPE or NAME with a label that
+            // names the codepoint explicitly so the operator can find
+            // and fix it.
+            String typeConfusable = firstConfusableSeparatorLabel(type);
+            if (typeConfusable != null) {
+                throw new IllegalArgumentException(
+                    "governance.bypass.principals entry has a "
+                    + typeConfusable + " in the principal type: '"
+                    + LogSafe.sanitize(trimmed) + "'. This codepoint looks "
+                    + "like an ASCII comma/semicolon but is not — the "
+                    + "entry parses as a single segment whose canonical "
+                    + "form will never match a runtime peer principal. "
+                    + "The legitimate entry separator is `;` (ASCII "
+                    + "U+003B). Common cause: a CJK / Arabic IME or a "
+                    + "paste from a document edited in a non-Latin "
+                    + "locale.");
+            }
+            String nameConfusable = firstConfusableSeparatorLabel(name);
+            if (nameConfusable != null) {
+                throw new IllegalArgumentException(
+                    "governance.bypass.principals entry has a "
+                    + nameConfusable + " in the principal name: '"
+                    + LogSafe.sanitize(trimmed) + "'. This codepoint looks "
+                    + "like an ASCII comma/semicolon but is not — the "
+                    + "entry parses as a single segment whose canonical "
+                    + "form will never match a runtime peer principal. "
+                    + "The legitimate entry separator is `;` (ASCII "
+                    + "U+003B). Common cause: a CJK / Arabic IME or a "
+                    + "paste from a document edited in a non-Latin "
+                    + "locale.");
+            }
             // R29 #270 [HIGH]: detect the comma-as-separator typo. Every
             // other Kafka list config (listeners, bootstrap.servers,
             // advertised.listeners, controller.quorum.voters, …) uses
@@ -776,6 +823,73 @@ public final class RuleEngine {
             // under-granting the bypass.
             if (cp == 0x200E || cp == 0x200F || cp == 0x061C) {
                 return String.format("bidi mark U+%04X", cp);
+            }
+            i += Character.charCount(cp);
+        }
+        return null;
+    }
+
+    /**
+     * R29 #278 [HIGH]: detect non-ASCII codepoints that are VISUALLY
+     * identical or near-identical to ASCII {@code ,} (the comma-typo
+     * shape rejected by {@link #COMMA_SEPARATOR_TYPO}) or ASCII
+     * {@code ;} (the legitimate entry separator). Both classes produce
+     * the same silent soft-brick as R29 #270/#272: the parsed entry
+     * looks like one principal but the operator typed it as two, so
+     * the runtime peer principal never matches.
+     *
+     * <p>The {@link #firstInvisibleCodePointLabel} helper covers only
+     * invisible smuggling (C0/C1, zero-width, bidi). The codepoints
+     * enumerated here are <em>visible</em> printable punctuation and
+     * would not be caught by that helper. They are reachable from
+     * everyday CJK / Arabic / Armenian / Greek input methods —
+     * U+FF0C ({@code ，}) is the CJK IME default for the comma key,
+     * and U+037E ({@code ;}, GREEK QUESTION MARK) is visually
+     * identical to ASCII {@code ;} in most fonts.
+     *
+     * <p>Returns a label of the form {@code "comma-confusable U+FF0C"}
+     * or {@code "semicolon-confusable U+FF1B"} on first hit; null
+     * otherwise.
+     */
+    private static String firstConfusableSeparatorLabel(String s) {
+        int len = s.length();
+        for (int i = 0; i < len; ) {
+            int cp = s.codePointAt(i);
+            // Comma confusables — Unicode UTC confusables data, restricted
+            // to the set that arises from real keyboards / pastes.
+            //   U+055D  ARMENIAN COMMA
+            //   U+060C  ARABIC COMMA
+            //   U+1363  ETHIOPIC COMMA
+            //   U+1802  MONGOLIAN COMMA
+            //   U+1808  MONGOLIAN MANCHU COMMA
+            //   U+2E32  TURNED COMMA
+            //   U+2E34  RAISED COMMA
+            //   U+2E41  REVERSED COMMA
+            //   U+3001  IDEOGRAPHIC COMMA
+            //   U+FE10  PRESENTATION FORM COMMA
+            //   U+FE11  PRESENTATION FORM IDEOGRAPHIC COMMA
+            //   U+FE50  SMALL COMMA
+            //   U+FE51  SMALL IDEOGRAPHIC COMMA
+            //   U+FF0C  FULLWIDTH COMMA            ← CJK IME default
+            //   U+FF64  HALFWIDTH IDEOGRAPHIC COMMA
+            if (cp == 0x055D || cp == 0x060C || cp == 0x1363
+                    || cp == 0x1802 || cp == 0x1808
+                    || cp == 0x2E32 || cp == 0x2E34 || cp == 0x2E41
+                    || cp == 0x3001
+                    || cp == 0xFE10 || cp == 0xFE11
+                    || cp == 0xFE50 || cp == 0xFE51
+                    || cp == 0xFF0C || cp == 0xFF64) {
+                return String.format("comma-confusable U+%04X", cp);
+            }
+            // Semicolon confusables.
+            //   U+037E  GREEK QUESTION MARK   ← visually identical to ASCII `;`
+            //   U+204F  REVERSED SEMICOLON
+            //   U+2E35  TURNED SEMICOLON
+            //   U+FE54  SMALL SEMICOLON
+            //   U+FF1B  FULLWIDTH SEMICOLON   ← CJK IME default
+            if (cp == 0x037E || cp == 0x204F || cp == 0x2E35
+                    || cp == 0xFE54 || cp == 0xFF1B) {
+                return String.format("semicolon-confusable U+%04X", cp);
             }
             i += Character.charCount(cp);
         }
