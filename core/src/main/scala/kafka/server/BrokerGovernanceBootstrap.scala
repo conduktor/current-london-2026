@@ -817,7 +817,16 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
   // (NTP correction, operator clock adjustment) cannot silence WARN emission
   // by stalling `now - lastWarn` below the throttle interval. Mirrors the
   // Round-15 Recent-changes MED-1 nanoTime pattern (#172).
-  private[server] var failureWarnNowNanos: () => Long = () => System.nanoTime()
+  //
+  // Round-22 HIGH (Agent 5 H-2): @volatile because tests assign this from the
+  // test thread while the scheduler-pool thread reads it inside each throttle
+  // emit(). Without a happens-before edge the JIT can publish a stale lambda
+  // to the read site indefinitely, producing intermittent test failures where
+  // the throttle observes System.nanoTime() instead of the injected clock.
+  // The production codepath never reassigns post-construction, so the cost
+  // (one volatile read per emit, on the drain thread only) is paid only by
+  // tests that monkey-patch the clock.
+  @volatile private[server] var failureWarnNowNanos: () => Long = () => System.nanoTime()
   // Visible for tests so they can assert how many WARNs actually fired —
   // capturing SLF4J output across the codebase is heavy and brittle. Shared
   // across all three throttles (drain failures, cleanup-policy drift,
