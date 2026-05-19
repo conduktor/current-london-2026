@@ -18298,6 +18298,40 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testConsumerGroupDescribeOutsideInRefusesTenantPhysicalNamespace(): Unit = {
+    // #207: groupId in the PHYSICAL form `<bound-tenant>.<x>` — what
+    // coordinator records actually look like after rewrite-IN. The
+    // principal-prefix predicate alone misses this shape; a cluster-wide
+    // caller with wildcard DESCRIBE Group:* would otherwise pull the full
+    // DescribedGroup (member assignments, topicId UUIDs, host/clientId).
+    metadataCache = mock(classOf[KRaftMetadataCache])
+    val req = new ConsumerGroupDescribeRequest.Builder(
+      new ConsumerGroupDescribeRequestData().setGroupIds(
+        List("acme.consumer", "regular-group").asJava)).build()
+    val request = buildRequest(req)
+
+    when(groupCoordinator.consumerGroupDescribe(any(), any()))
+      .thenReturn(CompletableFuture.completedFuture(List(
+        new ConsumerGroupDescribeResponseData.DescribedGroup()
+          .setGroupId("regular-group").setErrorCode(Errors.NONE.code)
+      ).asJava))
+
+    kafkaApis = createKafkaApis(
+      featureVersions = Seq(GroupVersion.GV_1),
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleConsumerGroupDescribe(request)
+
+    val response = verifyNoThrottling[ConsumerGroupDescribeResponse](request)
+    val results = response.data.groups.asScala.map(g => g.groupId -> g.errorCode).toMap
+    assertEquals(Errors.GROUP_AUTHORIZATION_FAILED.code, results("acme.consumer"),
+      "physical-prefix bound-tenant groupId must be refused per-entry")
+    assertEquals(Errors.NONE.code, results("regular-group"),
+      "non-reserved groups in the same batch must still be processed")
+    verify(groupCoordinator, never()).consumerGroupDescribe(
+      any(), ArgumentMatchers.argThat[util.List[String]](_.contains("acme.consumer")))
+  }
+
+  @Test
   def testDescribeGroupsOutsideInRefusesTenantPrincipalNamespace(): Unit = {
     val req = new DescribeGroupsRequest.Builder(new DescribeGroupsRequestData()
       .setGroups(List("__tenant_acme.consumer", "regular-group").asJava)).build()
@@ -18873,6 +18907,32 @@ class KafkaApisTest extends Logging {
     val visible = response.data.groups.asScala.map(_.groupId).toSet
     assertEquals(Set("regular-group"), visible,
       "non-tenant caller must not see tenant-internal group ids in the listing")
+  }
+
+  @Test
+  def testListGroupsOutsideInFiltersTenantPhysicalNamespace(): Unit = {
+    // #208: coordinator stores groupIds in PHYSICAL form (`acme.<group>`)
+    // after rewrite-IN. The principal-prefix predicate alone misses every
+    // record actually persisted. A non-tenant ListGroups caller with
+    // wildcard DESCRIBE Group:* would otherwise enumerate every tenant's
+    // physical groupId verbatim.
+    val listGroupsRequest = new ListGroupsRequestData()
+    val request = buildRequest(new ListGroupsRequest.Builder(listGroupsRequest).build())
+
+    val future = new CompletableFuture[ListGroupsResponseData]()
+    when(groupCoordinator.listGroups(request.context, listGroupsRequest)).thenReturn(future)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleListGroupsRequest(request)
+
+    future.complete(new ListGroupsResponseData().setGroups(List(
+      new ListGroupsResponseData.ListedGroup().setGroupId("acme.consumer"),
+      new ListGroupsResponseData.ListedGroup().setGroupId("regular-group")
+    ).asJava))
+
+    val response = verifyNoThrottling[ListGroupsResponse](request)
+    val visible = response.data.groups.asScala.map(_.groupId).toSet
+    assertEquals(Set("regular-group"), visible,
+      "non-tenant caller must not see physical-prefix tenant group ids in the listing")
   }
 
   @Test
@@ -19489,6 +19549,35 @@ class KafkaApisTest extends Logging {
     val visible = response.data.transactionStates.asScala.map(_.transactionalId).toSet
     assertEquals(Set("regular-txn"), visible,
       "non-tenant caller must not see tenant-internal transactional ids in the listing")
+  }
+
+  @Test
+  def testListTransactionsOutsideInFiltersTenantPhysicalNamespace(): Unit = {
+    // #209: __transaction_state stores transactionalIds in PHYSICAL form
+    // (`acme.<txn>`) after rewrite-IN. The principal-prefix predicate alone
+    // misses every record actually persisted. A non-tenant ListTransactions
+    // caller would otherwise enumerate every tenant's physical txnId verbatim.
+    val data = new ListTransactionsRequestData()
+    val request = buildRequest(new ListTransactionsRequest.Builder(data).build())
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    val transactionStates = new util.ArrayList[ListTransactionsResponseData.TransactionState]()
+    transactionStates.add(new ListTransactionsResponseData.TransactionState()
+      .setTransactionalId("acme.checkout-tx").setProducerId(7L).setTransactionState("Ongoing"))
+    transactionStates.add(new ListTransactionsResponseData.TransactionState()
+      .setTransactionalId("regular-txn").setProducerId(8L).setTransactionState("Ongoing"))
+    when(txnCoordinator.handleListTransactions(Set.empty[Long], Set.empty[String], -1L))
+      .thenReturn(new ListTransactionsResponseData()
+        .setErrorCode(Errors.NONE.code)
+        .setTransactionStates(transactionStates))
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleListTransactionsRequest(request)
+
+    val response = verifyNoThrottling[ListTransactionsResponse](request)
+    val visible = response.data.transactionStates.asScala.map(_.transactionalId).toSet
+    assertEquals(Set("regular-txn"), visible,
+      "non-tenant caller must not see physical-prefix tenant transactional ids in the listing")
   }
 
   // ---------------------------------------------------------------------------

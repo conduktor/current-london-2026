@@ -2878,8 +2878,14 @@ class KafkaApis(val requestChannel: RequestChannel,
         val visibleGroups = response.groups.asScala.filter { group =>
           val authorised = hasClusterDescribe ||
             authHelper.authorize(request.context, DESCRIBE, GROUP, group.groupId, logIfDenied = false)
+          // #208: coordinator stores groupIds in PHYSICAL form (`<tenant>.<group>`)
+          // after rewrite-IN, so the principal-prefix predicate alone matches
+          // nothing actually persisted. Compose with `isReservedTenantNamespace`
+          // (since #185 catches both `<tenant>.<x>` and `__tenant_<id>.<x>`) so
+          // tenant-stored groups are hidden from a cluster-wide listing.
           val tenantInternal = !tenantCtx.effectiveTenant.isPresent &&
-            isReservedTenantPrincipalNamespace(group.groupId)
+            (isReservedTenantPrincipalNamespace(group.groupId) ||
+             isReservedTenantNamespace(group.groupId))
           authorised && !tenantInternal
         }
         val listGroupsResponse = new ListGroupsResponse(response.setGroups(visibleGroups.asJava))
@@ -5867,8 +5873,14 @@ class KafkaApis(val requestChannel: RequestChannel,
     while (transactionStateIter.hasNext) {
       val transactionState = transactionStateIter.next()
       val txnId = transactionState.transactionalId
+      // #209: __transaction_state stores txnIds in PHYSICAL form
+      // (`<tenant>.<txn>`) after rewrite-IN, so the principal-prefix
+      // predicate alone matches nothing persisted. Compose with
+      // `isReservedTenantNamespace` so tenant-stored txns are hidden from
+      // a cluster-wide listing.
       val tenantInternal = !tenantCtx.effectiveTenant.isPresent &&
-        isReservedTenantPrincipalNamespace(txnId)
+        (isReservedTenantPrincipalNamespace(txnId) ||
+         isReservedTenantNamespace(txnId))
       if (tenantInternal ||
           !authHelper.authorize(request.context, DESCRIBE, TRANSACTIONAL_ID, txnId)) {
         transactionStateIter.remove()
@@ -6007,10 +6019,18 @@ class KafkaApis(val requestChannel: RequestChannel,
       val response = new ConsumerGroupDescribeResponseData()
 
       val authorizedGroups = new ArrayBuffer[String]()
+      val cgdTenantCtx = tenantContextFor(request)
       consumerGroupDescribeRequest.data.groupIds.forEach { groupId =>
-        // Outside-in guard: refuse a cluster-wide caller naming `__tenant_<known>.*`
-        // before it reaches the coordinator. See handleDeleteGroupsRequest.
-        if (isReservedTenantPrincipalNamespace(groupId)) {
+        // Outside-in guard: refuse a cluster-wide caller naming a reserved
+        // tenant namespace before it reaches the coordinator. The principal-
+        // prefix predicate catches `__tenant_<id>.<x>` (pre-binding pollution
+        // defense even on stock clusters). The structural predicate catches
+        // physical form `<tenant>.<x>` — the form actually persisted by
+        // coordinator records — gated on `effectiveTenant.isEmpty` since
+        // tenant principals don't reach here (CONSUMER_GROUP_DESCRIBE is
+        // outside TENANT_ALLOWED_APIS). See handleDeleteGroupsRequest. #207.
+        if (isReservedTenantPrincipalNamespace(groupId) ||
+            (!cgdTenantCtx.effectiveTenant.isPresent && isReservedTenantNamespace(groupId))) {
           response.groups.add(new ConsumerGroupDescribeResponseData.DescribedGroup()
             .setGroupId(groupId)
             .setErrorCode(Errors.GROUP_AUTHORIZATION_FAILED.code)
