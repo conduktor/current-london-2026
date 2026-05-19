@@ -1546,6 +1546,135 @@ class IoUringSelectorTest {
     }
 
     @Test
+    void selfMutedClosingChannelDeliversBufferedRequestWhenMemoryRecovers() throws Exception {
+        // Contract guard for the "memory recovers between disconnect and eviction" window.
+        // recoverFromMemoryPressure walks only channels.values() and not closingChannels —
+        // an adversarial audit hypothesized this would strand the buffered receive on a
+        // channel that self-muted under memory pressure and then received a FIN. In fact
+        // drainClosingChannels (at line 866-882) ALREADY narrows the short-circuit to
+        // explicitlyMutedChannels.contains() and DOES call channel.read() on self-muted
+        // closing channels. Since KafkaChannel.read() (clients/.../KafkaChannel.java:407-419)
+        // does not gate on muted state, the retried tryAllocate succeeds once memory is
+        // available, the buffered payload drains from the transport, and the receive
+        // surfaces — even though the KafkaChannel never gets explicitly unmuted (which is
+        // fine because the channel is about to be evicted).
+        //
+        // The guard locks this in: if a future refactor of either recoverFromMemoryPressure
+        // OR drainClosingChannels breaks the recovery path for FIN'd-during-memory-pressure
+        // channels, the receive will be silently dropped — this test fails first.
+        SimpleMemoryPool pool = new SimpleMemoryPool(64, 64, false, null);
+        java.nio.ByteBuffer drain = pool.tryAllocate(64);
+        assertNotNull(drain, "sanity: SimpleMemoryPool starts with capacity");
+        assertTrue(pool.isOutOfMemory(), "sanity: pool is dry after draining");
+        selector = new IoUringSelector(LISTENER, MAX_RECEIVE, pool, IDLE_NANOS_NEVER, time);
+
+        EmbeddedChannel netty = acceptNew(selector, REMOTE_A);
+        selector.poll(0);
+        String id = selector.connected().get(0);
+        KafkaChannel channel = selector.channel(id);
+        assertNotNull(channel);
+
+        // Drive frame in. tryAllocate fails inside KafkaChannel.read → self-mute.
+        selector.onRead(netty, framed("payload"));
+        selector.poll(0);
+        assertTrue(channel.isMuted(), "preconditions: channel must be self-muted");
+        assertTrue(selector.completedReceives().isEmpty(),
+            "preconditions: self-mute must defer the receive");
+
+        // Peer FIN. drainPendingDisconnects moves the channel to closingChannels with
+        // self-mute still attached.
+        selector.onDisconnect(netty);
+        selector.poll(0);
+        assertNotNull(selector.closingChannel(id),
+            "preconditions: channel must be in closingChannels after one post-FIN poll");
+        assertTrue(channel.isMuted(),
+            "preconditions: closing channel still self-muted (recovery has not run yet)");
+
+        // Release memory BEFORE the eviction poll. This is the critical window: if the
+        // BLOCKER is real, the receive is dropped here.
+        pool.release(drain);
+        assertFalse(pool.isOutOfMemory(), "sanity: pool recovered");
+
+        selector.poll(0);
+
+        // Drain path with the prior fix (explicitlyMutedChannels-only short-circuit) runs
+        // channel.read() on self-muted closing channels. With memory now available, the
+        // retried tryAllocate succeeds and the payload drains from the transport.
+        assertEquals(1, selector.completedReceives().size(),
+            "buffered request from FIN'd-during-memory-pressure client must surface once " +
+            "memory recovers — drainClosingChannels.read() retries the allocation on the " +
+            "self-muted closing channel and the inbound bytes are still queued on the transport");
+        assertEquals(id, selector.completedReceives().iterator().next().source(),
+            "the receive must be attributed to the closing channel that produced it");
+    }
+
+    @Test
+    void closeIdOnClosingChannelDoesNotReEmitDisconnect() throws Exception {
+        // Contract guard for the "closeExcessConnections double-decs closing channel" hypothesis
+        // surfaced by an adversarial audit. The scenario: a channel C peer-FINs (moves to
+        // closingChannels via drainPendingDisconnects), then before drainClosingChannels can
+        // evict it, the Acceptor calls closeExcessConnections because broker max is exceeded.
+        // closeExcessConnections invokes lowestPriorityChannel which returns C (closing
+        // channels first), then SocketServer.close(id) which calls connectionQuotas.dec(C)
+        // and selector.close(C.id).
+        //
+        // The hypothesis predicts: subsequent poll would also surface C in disconnected,
+        // making processDisconnected call dec(C) a second time — counter walks negative.
+        //
+        // Reality: selector.close(id) on a closing channel removes it from closingChannels
+        // SILENTLY (no disconnected entry) — line 1357-1363. So the first dec via
+        // closeExcessConnections is the ONLY dec, and processDisconnected never sees C.
+        // The one-dec-per-channel invariant holds.
+        selector = newSelector(IDLE_NANOS_NEVER);
+        EmbeddedChannel netty = acceptNew(selector, REMOTE_A);
+        selector.poll(0);
+        String id = selector.connected().get(0);
+        KafkaChannel channel = selector.channel(id);
+        assertNotNull(channel);
+
+        // Buffer a request, then disconnect — channel routes through closingChannels with a
+        // pending completedReceive that would normally surface across two polls.
+        selector.onRead(netty, framed("pipelined-final-request"));
+        selector.onDisconnect(netty);
+        selector.poll(0);
+        // After this poll, the receive surfaced (step 2 drained it from `channels`) AND
+        // step 4 moved the channel to closingChannels.
+        assertNotNull(selector.closingChannel(id),
+            "preconditions: peer-FIN'd channel must be in closingChannels after one poll");
+        assertFalse(selector.disconnected().containsKey(id),
+            "preconditions: disconnect has NOT been emitted yet (deferred until eviction)");
+
+        // Simulate closeExcessConnections: lowestPriorityChannel must return the closing
+        // channel (cheaper to evict than a healthy LRU connection).
+        KafkaChannel lp = selector.lowestPriorityChannel();
+        assertNotNull(lp, "lowestPriorityChannel must surface the closing channel as cheapest victim");
+        assertEquals(id, lp.id(),
+            "lowestPriorityChannel must return the closing channel first (matches NIO " +
+            "Selector.lowestPriorityChannel() ordering — closing channels are cheapest to evict)");
+
+        // Drain any completedReceives so we're testing the post-receive state.
+        selector.completedReceives().clear();
+
+        // Simulate SocketServer.close(connectionId) on the closing channel. The
+        // selector-level close(id) must remove from closingChannels silently — NO disconnect
+        // emission, otherwise the Processor would dec(id) a second time and the per-IP
+        // connection counter would walk negative.
+        selector.close(id);
+        assertNull(selector.closingChannel(id),
+            "selector.close(id) on a closing channel must remove it from closingChannels " +
+            "(otherwise the next poll's drainClosingChannels would target a torn-down channel)");
+
+        // The decisive assertion: a subsequent poll must NOT surface this id in disconnected.
+        // If it did, processDisconnected would call connectionQuotas.dec(id) — but
+        // SocketServer.close already dec'd it. Two decs, one inc → counter walks negative.
+        selector.poll(0);
+        assertFalse(selector.disconnected().containsKey(id),
+            "after selector.close(id) on a closing channel, NO subsequent disconnect may be " +
+            "emitted — the SocketServer.close path already dec'd the quota; a second " +
+            "disconnect would drive processDisconnected to dec() the per-IP counter negative");
+    }
+
+    @Test
     void connectionIdWrapsAtIntegerMaxValue() throws Exception {
         // Regression for v9 BLOCKER 2: connection-id index used to be AtomicLong, but
         // ServerConnectionId.fromString parses the index segment with Integer.parseInt.
