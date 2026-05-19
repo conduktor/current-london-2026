@@ -5168,11 +5168,109 @@ class KafkaApis(val requestChannel: RequestChannel,
         describeClientQuotasRequest.getErrorResponse(requestThrottleMs, Errors.CLUSTER_AUTHORIZATION_FAILED.exception))
     } else {
       val result = metadataCache.asInstanceOf[KRaftMetadataCache].describeClientQuotas(describeClientQuotasRequest.data())
+      // Tenant-keyed quota records (USER or CLIENT_ID name with the
+      // `__tenant_<id>.<x>` shape) live in the same image as cluster-scoped
+      // quota records. Without a filter, a cluster-wide caller hitting this
+      // endpoint with a wide filter (e.g. USER component MATCH_TYPE_SPECIFIED
+      // or null match) enumerates every tenant's quota roster — the
+      // principal name, the quota knob, and its value all leak. The tenant
+      // path has a symmetric problem: a tenant must see ONLY their own
+      // namespace's quotas, with the prefix stripped on the wire so the
+      // logical user/client-id name is what comes back. Mirrors #115
+      // (DescribeUserScramCredentials) and #117 (AlterClientQuotas refusal).
+      val ctx = tenantContextFor(request)
+      val callerTenant = ctx.effectiveTenant
+      val kept = new util.ArrayList[DescribeClientQuotasResponseData.EntryData]()
+      result.entries().forEach { entry =>
+        val rewritten = scrubTenantQuotaEntry(entry, callerTenant)
+        if (rewritten != null) kept.add(rewritten)
+      }
+      result.setEntries(kept)
       requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs => {
         result.setThrottleTimeMs(requestThrottleMs)
         new DescribeClientQuotasResponse(result)
       })
     }
+  }
+
+  // Decide whether a single DescribeClientQuotas EntryData survives the
+  // tenant-scrub, and if so, return a (possibly rewritten) copy with the
+  // tenant prefix stripped from USER / CLIENT_ID for tenant-facing responses.
+  //
+  // Cluster-wide caller (effectiveTenant.isEmpty): drop any entry that names
+  // a reserved-tenant USER or CLIENT_ID; everything else passes through
+  // untouched.
+  //
+  // Tenant caller (effectiveTenant.isPresent): every USER and CLIENT_ID
+  // component that exists in the entry must reside in the caller's own
+  // tenant namespace. A pure cluster-scoped entry (regular user, regular
+  // client-id) is dropped — tenants must not observe the global namespace.
+  // IP-only entries are also dropped (no path to scope them per-tenant).
+  // When the entry survives, USER and CLIENT_ID names are rewritten to
+  // their logical form (`__tenant_acme.bob` → `bob`) before returning.
+  private def scrubTenantQuotaEntry(entry: DescribeClientQuotasResponseData.EntryData,
+                                    callerTenant: Optional[String])
+  : DescribeClientQuotasResponseData.EntryData = {
+    import org.apache.kafka.common.quota.ClientQuotaEntity
+    val components = entry.entity()
+    if (components == null) return entry
+    val callerPrefix: String =
+      if (callerTenant.isPresent) TenantNamespace.PRINCIPAL_PREFIX + callerTenant.get + "."
+      else null
+
+    // First pass: classify. A name with the reserved-tenant shape that does
+    // not match callerPrefix is FOREIGN and disqualifies the entire entry.
+    // A name without the reserved shape is CLUSTER-scoped.
+    var sawTenantOwnComponent = false
+    var i = 0
+    while (i < components.size()) {
+      val c = components.get(i)
+      val t = c.entityType()
+      val n = c.entityName()
+      if (t == ClientQuotaEntity.USER || t == ClientQuotaEntity.CLIENT_ID) {
+        if (n != null && isReservedTenantPrincipalNamespace(n)) {
+          if (callerPrefix == null || !n.startsWith(callerPrefix)) {
+            return null
+          }
+          sawTenantOwnComponent = true
+        } else if (n != null && callerPrefix != null) {
+          // Tenant caller, but this USER/CLIENT_ID is a plain cluster name.
+          // Tenants must not observe cluster-scoped quota state.
+          return null
+        }
+      }
+      i += 1
+    }
+    if (callerPrefix != null && !sawTenantOwnComponent) {
+      // Tenant caller and the entry has no USER/CLIENT_ID in their namespace
+      // (e.g. IP-only). Drop — tenants only see their own slice.
+      return null
+    }
+    if (callerPrefix == null) {
+      // Cluster-wide caller and no foreign-tenant component matched; keep
+      // the entry as-is.
+      return entry
+    }
+    // Tenant caller: produce a rewritten copy with prefix-stripped USER /
+    // CLIENT_ID so the logical name lands on the wire.
+    val rewritten = new util.ArrayList[DescribeClientQuotasResponseData.EntityData](components.size())
+    components.forEach { c =>
+      val t = c.entityType()
+      val n = c.entityName()
+      if ((t == ClientQuotaEntity.USER || t == ClientQuotaEntity.CLIENT_ID)
+          && n != null && n.startsWith(callerPrefix)) {
+        rewritten.add(new DescribeClientQuotasResponseData.EntityData()
+          .setEntityType(t)
+          .setEntityName(n.substring(callerPrefix.length)))
+      } else {
+        rewritten.add(new DescribeClientQuotasResponseData.EntityData()
+          .setEntityType(t)
+          .setEntityName(n))
+      }
+    }
+    new DescribeClientQuotasResponseData.EntryData()
+      .setEntity(rewritten)
+      .setValues(entry.values())
   }
 
   def handleDescribeUserScramCredentialsRequest(request: RequestChannel.Request): Unit = {

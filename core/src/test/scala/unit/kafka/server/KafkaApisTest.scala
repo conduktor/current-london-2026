@@ -18103,4 +18103,203 @@ class KafkaApisTest extends Logging {
     assertTrue(tenant.credentialInfos() == null || tenant.credentialInfos().isEmpty)
   }
 
+  // ---------------------------------------------------------------------------
+  // #116 — DescribeClientQuotas tenant scrub on the broker.
+  //
+  // The cluster-quota image holds quota records keyed on principal/client-id
+  // strings. Tenant quota records use the reserved principal form
+  // `__tenant_<id>.<user>` (USER) or, in pathological deployments, an
+  // analogous CLIENT_ID convention. Without a filter, a cluster-wide caller
+  // hitting the broker with a wide DescribeClientQuotas filter enumerates
+  // every tenant's quota roster — principal name, knob, value.
+  //
+  // Tenant view: a tenant must see ONLY their own namespace's quotas with
+  // the prefix stripped on the wire so the logical name lands at the client.
+  // ---------------------------------------------------------------------------
+
+  private def quotaEntry(entityType: String, entityName: String,
+                        knob: String = "producer_byte_rate", value: Double = 1024.0)
+  : DescribeClientQuotasResponseData.EntryData = {
+    val entity = new util.ArrayList[DescribeClientQuotasResponseData.EntityData]()
+    entity.add(new DescribeClientQuotasResponseData.EntityData()
+      .setEntityType(entityType).setEntityName(entityName))
+    val values = new util.ArrayList[DescribeClientQuotasResponseData.ValueData]()
+    values.add(new DescribeClientQuotasResponseData.ValueData().setKey(knob).setValue(value))
+    new DescribeClientQuotasResponseData.EntryData().setEntity(entity).setValues(values)
+  }
+
+  private def buildDescribeClientQuotasRequest(): DescribeClientQuotasRequest = {
+    // Wide filter: a single USER component with MATCH_TYPE_SPECIFIED (the
+    // form an adversary would use to enumerate every USER-keyed entry).
+    val componentData = new util.ArrayList[DescribeClientQuotasRequestData.ComponentData]()
+    componentData.add(new DescribeClientQuotasRequestData.ComponentData()
+      .setEntityType(org.apache.kafka.common.quota.ClientQuotaEntity.USER)
+      .setMatchType(DescribeClientQuotasRequest.MATCH_TYPE_SPECIFIED)
+      .setMatch(null))
+    val data = new DescribeClientQuotasRequestData().setComponents(componentData).setStrict(false)
+    new DescribeClientQuotasRequest(data, ApiKeys.DESCRIBE_CLIENT_QUOTAS.latestVersion)
+  }
+
+  private def stubDescribeClientQuotasImage(entries: DescribeClientQuotasResponseData.EntryData*): Unit = {
+    val cacheMock = mock(classOf[KRaftMetadataCache])
+    metadataCache = cacheMock
+    val data = new DescribeClientQuotasResponseData()
+      .setEntries(util.Arrays.asList(entries: _*))
+    when(cacheMock.describeClientQuotas(any[DescribeClientQuotasRequestData])).thenReturn(data)
+  }
+
+  // Convenience: pull entries from a response keyed by their (single) USER
+  // entityName, so assertions can ignore ordering and zero-in on the leaked
+  // names. Entries with no USER component are bucketed under None.
+  private def usersIn(resp: DescribeClientQuotasResponse): Set[String] = {
+    resp.data().entries().asScala.flatMap { entry =>
+      entry.entity().asScala.find(_.entityType() == org.apache.kafka.common.quota.ClientQuotaEntity.USER)
+        .map(_.entityName())
+    }.toSet
+  }
+
+  @Test
+  def testDescribeClientQuotasClusterWideCallerFiltersTenantPrefixedUser(): Unit = {
+    // Cluster admin runs an enumeration query. The image dump contains both
+    // a plain cluster user AND a tenant-prefixed user. The handler must
+    // strip the tenant entry before sending the response — leaking the
+    // principal name would materialise the tenant's quota roster.
+    stubDescribeClientQuotasImage(
+      quotaEntry(org.apache.kafka.common.quota.ClientQuotaEntity.USER, "regular-user"),
+      quotaEntry(org.apache.kafka.common.quota.ClientQuotaEntity.USER, "__tenant_acme.bob"))
+
+    val request = buildRequest(
+      buildDescribeClientQuotasRequest(),
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleDescribeClientQuotasRequest(request)
+
+    val response = verifyNoThrottling[DescribeClientQuotasResponse](request)
+    assertEquals(Set("regular-user"), usersIn(response),
+      "cluster-wide caller must not see the tenant-prefixed USER entry")
+  }
+
+  @Test
+  def testDescribeClientQuotasClusterWideCallerPreservesPlainUsers(): Unit = {
+    // Regression guard for #116: filtering must not over-filter. Plain users
+    // (no `__tenant_` prefix) round-trip untouched even when sitting next to
+    // tenant entries in the image dump.
+    stubDescribeClientQuotasImage(
+      quotaEntry(org.apache.kafka.common.quota.ClientQuotaEntity.USER, "bob"),
+      quotaEntry(org.apache.kafka.common.quota.ClientQuotaEntity.USER, "alice"),
+      quotaEntry(org.apache.kafka.common.quota.ClientQuotaEntity.USER, "__tenant_acme.eve"))
+
+    val request = buildRequest(
+      buildDescribeClientQuotasRequest(),
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleDescribeClientQuotasRequest(request)
+
+    val response = verifyNoThrottling[DescribeClientQuotasResponse](request)
+    assertEquals(Set("bob", "alice"), usersIn(response),
+      "plain cluster users must round-trip untouched")
+  }
+
+  @Test
+  def testDescribeClientQuotasTenantCallerSeesOwnEntriesWithPrefixStripped(): Unit = {
+    // Tenant caller on a tenant-bound listener sees ONLY their own
+    // namespace, and the wire response carries logical user names.
+    // `__tenant_acme.bob` arrives as `bob`.
+    stubDescribeClientQuotasImage(
+      quotaEntry(org.apache.kafka.common.quota.ClientQuotaEntity.USER, "__tenant_acme.bob",
+        knob = "producer_byte_rate", value = 2048.0),
+      quotaEntry(org.apache.kafka.common.quota.ClientQuotaEntity.USER, "__tenant_acme.alice",
+        knob = "consumer_byte_rate", value = 4096.0))
+
+    val request = buildRequest(
+      buildDescribeClientQuotasRequest(),
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDescribeClientQuotasRequest(request)
+
+    val response = verifyNoThrottling[DescribeClientQuotasResponse](request)
+    assertEquals(Set("bob", "alice"), usersIn(response),
+      "tenant caller must see their own users with prefix stripped")
+    // Quota values must be preserved verbatim — only the entity name field
+    // is rewritten.
+    val entries = response.data().entries().asScala
+    val knobs = entries.flatMap(_.values().asScala.map(v => v.key() -> v.value())).toMap
+    assertEquals(2048.0, knobs("producer_byte_rate"), 0.0)
+    assertEquals(4096.0, knobs("consumer_byte_rate"), 0.0)
+  }
+
+  @Test
+  def testDescribeClientQuotasTenantCallerHidesOtherTenantsEntries(): Unit = {
+    // Cross-tenant isolation: tenant `acme` must never observe tenant
+    // `beta`'s quotas, even when the image dump contains them. The two
+    // tenants share the same backing image; ONLY the prefix distinguishes
+    // them, so the filter is what gives tenant `acme` an isolated view.
+    stubDescribeClientQuotasImage(
+      quotaEntry(org.apache.kafka.common.quota.ClientQuotaEntity.USER, "__tenant_acme.bob"),
+      quotaEntry(org.apache.kafka.common.quota.ClientQuotaEntity.USER, "__tenant_beta.charlie"))
+
+    val request = buildRequest(
+      buildDescribeClientQuotasRequest(),
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDescribeClientQuotasRequest(request)
+
+    val response = verifyNoThrottling[DescribeClientQuotasResponse](request)
+    assertEquals(Set("bob"), usersIn(response),
+      "tenant `acme` must not see tenant `beta`'s quota entries")
+  }
+
+  @Test
+  def testDescribeClientQuotasTenantCallerHidesClusterScopedEntries(): Unit = {
+    // A tenant must not observe cluster-scoped quotas (which would either
+    // signal that a cluster admin exists with that name, or leak that
+    // cluster-default quotas were tuned). Drop non-tenant-prefixed USER
+    // entries from a tenant's response.
+    stubDescribeClientQuotasImage(
+      quotaEntry(org.apache.kafka.common.quota.ClientQuotaEntity.USER, "__tenant_acme.bob"),
+      quotaEntry(org.apache.kafka.common.quota.ClientQuotaEntity.USER, "regular-cluster-admin"))
+
+    val request = buildRequest(
+      buildDescribeClientQuotasRequest(),
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDescribeClientQuotasRequest(request)
+
+    val response = verifyNoThrottling[DescribeClientQuotasResponse](request)
+    assertEquals(Set("bob"), usersIn(response),
+      "tenant caller must not see cluster-scoped USER quota entries")
+  }
+
+  @Test
+  def testDescribeClientQuotasStockKafkaPassesThroughUnchanged(): Unit = {
+    // Stock Kafka deployment (no tenants configured anywhere). Every entry
+    // the image returns must round-trip verbatim — the filter must not
+    // accidentally trim a deployment with no tenancy. The presence of an
+    // unrelated `_` or `.` in a user name must not be misinterpreted as a
+    // tenant prefix.
+    stubDescribeClientQuotasImage(
+      quotaEntry(org.apache.kafka.common.quota.ClientQuotaEntity.USER, "alice"),
+      quotaEntry(org.apache.kafka.common.quota.ClientQuotaEntity.USER, "bob.smith"),
+      quotaEntry(org.apache.kafka.common.quota.ClientQuotaEntity.USER, "_internal-svc"))
+
+    val request = buildRequest(
+      buildDescribeClientQuotasRequest(),
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    kafkaApis = createKafkaApis()  // no tenantConfig — stock Kafka
+    kafkaApis.handleDescribeClientQuotasRequest(request)
+
+    val response = verifyNoThrottling[DescribeClientQuotasResponse](request)
+    assertEquals(Set("alice", "bob.smith", "_internal-svc"), usersIn(response),
+      "stock Kafka deployment must round-trip every USER entry verbatim")
+  }
+
 }
