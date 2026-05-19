@@ -67,7 +67,7 @@ public final class SseStreamLimiter {
         }
     }
 
-    /** Visible for tests. */
+    /** Visible for tests and for the {@code ActiveSseStreams} JMX gauge. */
     public int inUse() {
         return inUse.get();
     }

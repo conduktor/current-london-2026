@@ -288,8 +288,11 @@ public final class KafkaHttpServlet extends HttpServlet {
             try {
                 async = req.startAsync();
             } catch (RuntimeException e) {
-                token.close();
-                throw e;
+                // Mirror the in-band-500 invariant the class javadoc states ("The servlet never throws to
+                // the container"). The branch is extracted so doGet's NPath stays under the checkstyle
+                // ceiling — the behaviour is exactly what the inline block would do.
+                handleSseStartAsyncFailure(resp, token, command.topic(), e, startNanos);
+                return;
             }
             // No per-request status recording for the SSE branch — the stream itself can run for hours and there is
             // no single "response status" to record at the end. Instead record the accept event in
@@ -452,6 +455,32 @@ public final class KafkaHttpServlet extends HttpServlet {
             } catch (RuntimeException e) {
                 LOG.debug("AsyncContext.complete() failed on dispatch failure: {}", e.toString());
             }
+        }
+    }
+
+    /**
+     * Recovery path when {@link HttpServletRequest#startAsync} throws on the SSE branch — the limiter slot has been
+     * acquired but the AsyncContext machinery never came up. Release the slot, emit the bridge's canonical 500 envelope
+     * in-band (preserving the class invariant that the servlet never throws to the container), and record a FETCH/500
+     * metric datapoint so a servlet-context misconfiguration can be correlated with the user-visible 500. Symmetric to
+     * {@link #handleSseStartupFailure} for the streamer-construction path.
+     */
+    private void handleSseStartAsyncFailure(HttpServletResponse resp, SseStreamLimiter.Token token, String topic,
+                                            RuntimeException cause, long startNanos) {
+        token.close();
+        LOG.warn("HTTP bridge SSE startAsync failed for {}", topic, cause);
+        try {
+            metrics.recordRequest(HttpBridgeMetrics.Operation.FETCH, elapsedMs(startNanos),
+                HttpStatusMapper.INTERNAL_SERVER_ERROR);
+        } catch (RuntimeException e) {
+            LOG.debug("metrics.recordRequest failed on SSE startAsync failure: {}", e.toString());
+        }
+        try {
+            if (!resp.isCommitted()) {
+                writeInternalError(resp, "internal server error");
+            }
+        } catch (IOException io) {
+            LOG.debug("failed to write SSE startAsync-failure envelope: {}", io.toString());
         }
     }
 

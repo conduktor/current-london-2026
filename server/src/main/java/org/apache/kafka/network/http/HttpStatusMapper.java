@@ -90,9 +90,12 @@ public final class HttpStatusMapper {
         // bytes will be rejected the second time too, and a worse failure mode (retry storms on a runaway
         // producer) is what shows up in operator dashboards. Map to 400 explicitly.
         // - INVALID_RECORD: broker LogValidator rejected the produce batch on per-record validation (bad
-        //   magic byte, null key on a compacted topic, invalid timestamps, control records from clients,
-        //   inner record with a stale compression attribute). CRC failures take a different path — see
-        //   CORRUPT_MESSAGE below — because batch-level checksum verification runs in
+        //   magic byte, null key on a compacted topic, control records from clients, inner record with a
+        //   stale compression attribute, mismatched per-batch magic, invalid batch offset range or count,
+        //   negative base sequence with a producer id). Invalid timestamps are NOT in this set: LogValidator
+        //   raises {@link org.apache.kafka.common.protocol.Errors#INVALID_TIMESTAMP} for those, which the
+        //   bridge maps to 400 separately above. CRC failures take a different path — see CORRUPT_MESSAGE
+        //   below — because batch-level checksum verification runs in
         //   UnifiedLog.analyzeAndValidateRecords before LogValidator and raises CorruptRecordException.
         // - UNSUPPORTED_COMPRESSION_TYPE: produced batch uses a codec the broker / topic config does not accept.
         // - CORRUPT_MESSAGE: produce-side CRC mismatch (client wrote a bad batch). The fetch-side rationale

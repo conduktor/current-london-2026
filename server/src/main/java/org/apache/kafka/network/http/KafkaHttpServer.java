@@ -295,9 +295,11 @@ public final class KafkaHttpServer {
                 shuttingDown = true;
                 // Send each live WebSocket peer an RFC 6455 §5.5.1 close frame with status 1001 (Going Away)
                 // BEFORE Server.stop() begins. Without this, Jetty's connector force-close on shutdown
-                // delivers status 1006 (Abnormal Closure) — RFC 6455 §7.1.1 says a server SHOULD send a
-                // close frame on planned shutdown, and 1001 vs 1006 is what monitoring dashboards use to
-                // distinguish a planned restart from a transport failure. Snapshot to a local set so the
+                // delivers status 1006 (Abnormal Closure). The closing handshake is initiated by sending
+                // a Close frame (RFC 6455 §7.1.2), and §7.4.1 defines status 1001 as "going away, such as
+                // a server going down" — the canonical signal for a planned restart. 1001 vs 1006 is what
+                // monitoring dashboards use to distinguish a planned restart from a transport failure.
+                // Snapshot to a local set so the
                 // walk is isolated from concurrent remove() calls fired by tearDown(); endpoints that
                 // completed between snapshot and walk are harmless because closeForShutdown() short-circuits
                 // when the underlying session is already closed.
