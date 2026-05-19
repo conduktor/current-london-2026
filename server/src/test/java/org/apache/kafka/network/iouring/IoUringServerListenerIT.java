@@ -29,6 +29,7 @@ import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.lang.reflect.Field;
 import java.net.InetSocketAddress;
+import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -297,6 +298,70 @@ class IoUringServerListenerIT {
                 // already idempotent so the explicit call here is purely defensive.
                 keepRunning.set(false);
                 listener.close();
+            }
+        }
+    }
+
+    /**
+     * 20G-L2 regression: when {@link IoUringServerListener#start()} fails (here: bind to a port
+     * already held by a non-SO_REUSEPORT socket), {@code cleanupAfterFailedStart} must
+     * <strong>await</strong> the event-loop group shutdown, not just fire-and-forget. Pre-fix
+     * the {@code shutdownGracefully} call was issued but never awaited — so the io_uring ring
+     * fd and event-loop thread could outlive {@code start()}'s thrown exception, which both
+     * defeats tight rebind paths (a follow-up Acceptor.start() racing the prior loop's
+     * tear-down) and silently leaks a kernel-side ring per failed start under churn.
+     *
+     * <p>This test occupies a port with a plain {@link ServerSocket} (no SO_REUSEPORT, so the
+     * io_uring bind must fail with EADDRINUSE), attempts {@code listener.start()}, catches the
+     * expected throw, then asserts the listener's eventLoopGroup is {@code isTerminated()}
+     * within a bound — proving cleanupAfterFailedStart actually waited.
+     */
+    @Test
+    void failedStartAwaitsEventLoopShutdownBeforeReturning() throws Exception {
+        assumeTrue(IoUringSupport.isAvailable(),
+            "io_uring not available (" + IoUringSupport.unavailabilityReason() + "); skipping");
+
+        try (ServerSocket occupier = new ServerSocket()) {
+            // SO_REUSEADDR=false so the io_uring bind on the same port must hit EADDRINUSE
+            // rather than co-existing via REUSEPORT semantics on the kernel side.
+            occupier.setReuseAddress(false);
+            occupier.bind(new InetSocketAddress("127.0.0.1", 0));
+            int port = occupier.getLocalPort();
+
+            IoUringSelector selector = new IoUringSelector(
+                LISTENER, MAX_RECEIVE, MemoryPool.NONE, IDLE_NANOS_NEVER, Time.SYSTEM);
+            IoUringServerListener listener = new IoUringServerListener(
+                new InetSocketAddress("127.0.0.1", port), selector);
+            try {
+                // Reach the eventLoopGroup before start() throws so we can observe its
+                // post-cleanup state. Constructor created the group; bind() happens in start().
+                Field field = IoUringServerListener.class.getDeclaredField("eventLoopGroup");
+                field.setAccessible(true);
+                EventLoopGroup group = (EventLoopGroup) field.get(listener);
+                assertTrue(!group.isShutdown(),
+                    "precondition: event-loop group must be live before start() runs");
+
+                try {
+                    listener.start();
+                    throw new AssertionError("start() should have thrown — port " + port +
+                        " is occupied by a non-REUSEPORT socket; bind must fail");
+                } catch (Exception expected) {
+                    // expected — bind() failed with EADDRINUSE (Netty wraps this as
+                    // BindException via the bootstrap.bind().sync() path).
+                }
+
+                // The fix's contract: by the time start() returns its exception to the caller,
+                // the event-loop group has been awaited to termination. Pre-fix this assertion
+                // would fail because shutdownGracefully ran async and the group was still in
+                // the middle of shutting down when start() unwound.
+                assertTrue(group.isTerminated(),
+                    "cleanupAfterFailedStart must await event-loop shutdown so the ring fd " +
+                    "and loop thread don't outlive start()'s throw — pre-fix this leaked an " +
+                    "io_uring ring per failed start under churn");
+            } finally {
+                // close() is idempotent — cleanupAfterFailedStart already flipped closed=true.
+                listener.close();
+                selector.close();
             }
         }
     }

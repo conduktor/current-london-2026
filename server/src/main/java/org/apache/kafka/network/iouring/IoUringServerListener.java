@@ -206,9 +206,28 @@ public final class IoUringServerListener implements AutoCloseable {
             cleanupAfterFailedStart();
             Thread.currentThread().interrupt();
             throw new IllegalStateException("Interrupted while binding io_uring listener", ie);
-        } catch (RuntimeException e) {
+        } catch (Throwable t) {
+            // Catch Throwable rather than RuntimeException: Netty's ChannelFuture.sync() uses
+            // PlatformDependent.throwException to sneakily rethrow the failure cause without
+            // declaring it. A bind failure surfaces as a checked java.net.BindException at
+            // runtime — slipping past `catch (RuntimeException)` and skipping
+            // cleanupAfterFailedStart entirely. Pre-fix, every failed-bind leaked the io_uring
+            // event-loop group and ring file descriptor for the JVM's lifetime. Other Errors
+            // (NoClassDefFoundError from a missing native, LinkageError mid-init) follow the
+            // same path. VirtualMachineError is re-thrown to preserve JVM crash-fast semantics.
             cleanupAfterFailedStart();
-            throw e;
+            if (t instanceof VirtualMachineError) {
+                throw (VirtualMachineError) t;
+            }
+            if (t instanceof RuntimeException) {
+                throw (RuntimeException) t;
+            }
+            if (t instanceof Error) {
+                throw (Error) t;
+            }
+            // Checked exception (e.g. BindException sneakily thrown by sync()): wrap and rethrow
+            // so the caller sees a meaningful failure, not just a generic Throwable.
+            throw new IllegalStateException("Failed to bind io_uring listener to " + bindAddress, t);
         }
     }
 
@@ -217,6 +236,14 @@ public final class IoUringServerListener implements AutoCloseable {
      * (if {@code bind()} succeeded but a later step threw), and the io_uring event-loop group.
      * Sets {@code closed=true} so a subsequent {@link #close()} is a no-op and a re-{@code start()}
      * fails with "was closed before start()" instead of silently re-using a torn-down event loop.
+     *
+     * <p>The event-loop shutdown is awaited synchronously (matching {@link #close()}). Without the
+     * await, {@code shutdownGracefully} runs asynchronously and {@code start()} returns while the
+     * io_uring ring file descriptor and the event-loop thread are still alive — that breaks tight
+     * rebind paths (a follow-up Acceptor.start() racing the previous loop's tear-down) and lets a
+     * thread plus ring fd outlive the constructor on what is supposed to be a failed-cleanup
+     * return. Bound the wait the same way close() does: SHUTDOWN_QUIET_MS + SHUTDOWN_TIMEOUT_MS,
+     * then proceed regardless so a wedged loop cannot block the start() caller indefinitely.
      */
     private void cleanupAfterFailedStart() {
         if (serverChannel != null) {
@@ -228,7 +255,14 @@ public final class IoUringServerListener implements AutoCloseable {
                 log.debug("error closing io_uring server channel during failed-start cleanup", suppress);
             }
         }
-        eventLoopGroup.shutdownGracefully(SHUTDOWN_QUIET_MS, SHUTDOWN_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        long shutdownBudgetMs = SHUTDOWN_QUIET_MS + SHUTDOWN_TIMEOUT_MS;
+        boolean shutdownInTime = eventLoopGroup
+            .shutdownGracefully(SHUTDOWN_QUIET_MS, SHUTDOWN_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            .awaitUninterruptibly(shutdownBudgetMs, TimeUnit.MILLISECONDS);
+        if (!shutdownInTime) {
+            log.warn("io_uring event-loop group did not shut down within {}ms during failed-start " +
+                "cleanup; leaving it detached so the caller's start() throw isn't blocked", shutdownBudgetMs);
+        }
         closed = true;
     }
 
