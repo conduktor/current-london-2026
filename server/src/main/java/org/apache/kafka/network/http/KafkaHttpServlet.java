@@ -129,7 +129,9 @@ public final class KafkaHttpServlet extends HttpServlet {
             // an NPE class/field name, but the same defect class. A fixed generic phrase keeps the error envelope
             // shape stable across parse-failure modes.
             LOG.debug("rejected produce request with malformed JSON body", e);
-            writeBadRequest(resp, "body is not valid JSON");
+            // Jackson may abort the parse before consuming the declared Content-Length — drop the connection so the
+            // remainder cannot smuggle a follow-up request via a pooling proxy. See writeBadRequestAndClose javadoc.
+            writeBadRequestAndClose(resp, "body is not valid JSON");
             metrics.recordRequest(HttpBridgeMetrics.Operation.PRODUCE, elapsedMs(startNanos), HttpStatusMapper.BAD_REQUEST);
             return;
         } catch (IOException e) {
@@ -146,7 +148,9 @@ public final class KafkaHttpServlet extends HttpServlet {
             // can disclose Jetty internals and partial request state — same defect class as the NPE-text leak that
             // Fix #4 plugged on the 500 path.
             LOG.warn("HTTP bridge failed to read produce request body", e);
-            writeBadRequest(resp, "could not read request body");
+            // I/O fault on the body stream — partial bytes are still on the wire. Same smuggling defect class as the
+            // malformed-JSON branch above; force connection close.
+            writeBadRequestAndClose(resp, "could not read request body");
             metrics.recordRequest(HttpBridgeMetrics.Operation.PRODUCE, elapsedMs(startNanos), HttpStatusMapper.BAD_REQUEST);
             return;
         }
@@ -172,13 +176,22 @@ public final class KafkaHttpServlet extends HttpServlet {
         // never runs, async.complete() is never called, and metrics.recordRequest is never recorded. The
         // request would sit until Jetty's default async timeout (~30s) abandons it. Mirrors the streamer
         // pattern landed in commit 2e6fc859fa.
-        bridge.produce(topic, body).whenCompleteAsync((response, throwable) ->
-            writeResponseAndComplete(async, response, throwable, contentType,
-                HttpBridgeMetrics.Operation.PRODUCE, startNanos), httpExecutor)
-            .exceptionally(t -> {
-                handleDispatchFailure(async, t, HttpBridgeMetrics.Operation.PRODUCE, startNanos);
-                return null;
-            });
+        try {
+            bridge.produce(topic, body).whenCompleteAsync((response, throwable) ->
+                writeResponseAndComplete(async, response, throwable, contentType,
+                    HttpBridgeMetrics.Operation.PRODUCE, startNanos), httpExecutor)
+                .exceptionally(t -> {
+                    handleDispatchFailure(async, t, HttpBridgeMetrics.Operation.PRODUCE, startNanos);
+                    return null;
+                });
+        } catch (RuntimeException e) {
+            // Defence-in-depth. bridge.produce is contractually no-throw (every error path lands in the
+            // returned future), but with async.setTimeout(0L) above, a synchronous throw would leave the
+            // AsyncContext armed forever — no timeout, no .exceptionally hook reached, no async.complete().
+            // Future refactors that change the bridge invariant would silently wedge requests; route the
+            // throw through the same teardown path the .exceptionally branch uses.
+            handleDispatchFailure(async, e, HttpBridgeMetrics.Operation.PRODUCE, startNanos);
+        }
     }
 
     @Override
@@ -247,7 +260,11 @@ public final class KafkaHttpServlet extends HttpServlet {
             // RequestLatencyMs with stream-lifetime samples. The meter is incremented from inside start() only
             // after the priming comment write succeeds — otherwise a connection that died before producing any
             // events would inflate the open counter relative to the gauge.
-            SseStreamer.start(async, submitter, mapper, command, token, httpExecutor, metrics::recordSseStreamOpened);
+            try {
+                SseStreamer.start(async, submitter, mapper, command, token, httpExecutor, metrics::recordSseStreamOpened);
+            } catch (RuntimeException e) {
+                handleSseStartupFailure(async, token, command.topic(), e, startNanos);
+            }
             return;
         }
 
@@ -260,13 +277,18 @@ public final class KafkaHttpServlet extends HttpServlet {
         // the broker handler thread that completes the future must not be the thread that performs the
         // HTTP socket write, but executor rejection at the handoff completes the dependent future and
         // would otherwise leak the AsyncContext + metric.
-        bridge.fetch(topic, params).whenCompleteAsync((response, throwable) ->
-            writeResponseAndComplete(async, response, throwable, contentType,
-                HttpBridgeMetrics.Operation.FETCH, startNanos), httpExecutor)
-            .exceptionally(t -> {
-                handleDispatchFailure(async, t, HttpBridgeMetrics.Operation.FETCH, startNanos);
-                return null;
-            });
+        try {
+            bridge.fetch(topic, params).whenCompleteAsync((response, throwable) ->
+                writeResponseAndComplete(async, response, throwable, contentType,
+                    HttpBridgeMetrics.Operation.FETCH, startNanos), httpExecutor)
+                .exceptionally(t -> {
+                    handleDispatchFailure(async, t, HttpBridgeMetrics.Operation.FETCH, startNanos);
+                    return null;
+                });
+        } catch (RuntimeException e) {
+            // See doPost — same setTimeout(0L) wedging concern.
+            handleDispatchFailure(async, e, HttpBridgeMetrics.Operation.FETCH, startNanos);
+        }
     }
 
     /**
@@ -309,9 +331,20 @@ public final class KafkaHttpServlet extends HttpServlet {
             }
         } finally {
             // Read the status from the response object rather than from the bridge result — this catches the 500
-            // we wrote on `throwable != null` as well as anything writeBridgeResponse set.
-            metrics.recordRequest(operation, elapsedMs(startNanos), resp.getStatus());
-            async.complete();
+            // we wrote on `throwable != null` as well as anything writeBridgeResponse set. The metric write is
+            // wrapped in its own try/catch so a misconfigured Yammer histogram cannot wedge async.complete() —
+            // mirrors the handleDispatchFailure pattern. async.complete() is always the last finally step so
+            // Jetty always gets the signal to release the connection, even if metric recording explodes.
+            try {
+                metrics.recordRequest(operation, elapsedMs(startNanos), resp.getStatus());
+            } catch (RuntimeException e) {
+                LOG.debug("metrics.recordRequest failed on success path: {}", e.toString());
+            }
+            try {
+                async.complete();
+            } catch (RuntimeException e) {
+                LOG.debug("AsyncContext.complete() failed on success path: {}", e.toString());
+            }
         }
     }
 
@@ -375,6 +408,43 @@ public final class KafkaHttpServlet extends HttpServlet {
         }
     }
 
+    /**
+     * Recovery path when {@link SseStreamer#start} throws synchronously before ownership of the limiter token transfers.
+     * The streamer is the normal owner of the token from the moment it succeeds (its teardown releases the slot); a
+     * synchronous throw BEFORE that ownership transfer would leak both the limiter slot and the AsyncContext, which the
+     * caller already started. Release the slot, drop a status-500 metric, try to write the generic 500 envelope while
+     * the response is still uncommitted (no SSE priming bytes have been flushed yet), and complete the async so Jetty
+     * unsticks the connection. Extracted from {@link #doGet} purely to keep that method under the project's
+     * NPath-complexity ceiling — the behaviour is exactly what the inline block previously did.
+     */
+    private void handleSseStartupFailure(AsyncContext async, SseStreamLimiter.Token token, String topic,
+                                         RuntimeException cause, long startNanos) {
+        LOG.warn("HTTP bridge SSE streamer failed to start for {}", topic, cause);
+        token.close();
+        // Wrap recordRequest in its own try/catch — a misconfigured Yammer histogram throw here must not block the
+        // 500-envelope write or the async.complete() that follows. Mirrors handleDispatchFailure.
+        try {
+            metrics.recordRequest(HttpBridgeMetrics.Operation.FETCH, elapsedMs(startNanos),
+                HttpStatusMapper.INTERNAL_SERVER_ERROR);
+        } catch (RuntimeException e) {
+            LOG.debug("metrics.recordRequest failed on SSE startup failure: {}", e.toString());
+        }
+        try {
+            HttpServletResponse asyncResp = (HttpServletResponse) async.getResponse();
+            if (!asyncResp.isCommitted()) {
+                writeInternalError(asyncResp, "internal server error");
+            }
+        } catch (IOException io) {
+            LOG.debug("failed to write SSE startup-failure envelope: {}", io.toString());
+        } finally {
+            try {
+                async.complete();
+            } catch (RuntimeException e) {
+                LOG.debug("AsyncContext.complete() failed on SSE startup failure: {}", e.toString());
+            }
+        }
+    }
+
     private static long elapsedMs(long startNanos) {
         return Math.max(0L, (System.nanoTime() - startNanos) / 1_000_000L);
     }
@@ -392,6 +462,20 @@ public final class KafkaHttpServlet extends HttpServlet {
     }
 
     private void writeBadRequest(HttpServletResponse resp, String message) throws IOException {
+        writeEnvelope(resp, HttpStatusMapper.BAD_REQUEST, message);
+    }
+
+    /**
+     * 400 with {@code Connection: close}. Use this — never plain {@link #writeBadRequest} — when the request body is
+     * being abandoned mid-read (malformed JSON, an I/O fault on the body stream, etc.). The body is partly on the wire,
+     * Jetty's HTTP/1.1 keep-alive will otherwise drain the remaining declared bytes per Content-Length and parse any
+     * pipelined bytes as the next request — which gives a fronting proxy that pools upstream connections a
+     * request-smuggling primitive (the attacker chooses Content-Length small enough that Jetty drains rather than
+     * closes). RFC 7230 §6.6 covers this case: when a server cannot fully read the request body it MUST signal
+     * connection close. Mirror the {@link #writePayloadTooLarge} contract for the same defect class.
+     */
+    private void writeBadRequestAndClose(HttpServletResponse resp, String message) throws IOException {
+        resp.setHeader("Connection", "close");
         writeEnvelope(resp, HttpStatusMapper.BAD_REQUEST, message);
     }
 

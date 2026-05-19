@@ -168,6 +168,17 @@ public final class KafkaHttpServer {
         ServerConnector connector = new ServerConnector(jetty, new HttpConnectionFactory(httpConfig));
         connector.setHost(host);
         connector.setPort(port);
+        // Pin the connector idle timeout explicitly instead of relying on Jetty's default (30s today). The idle timeout
+        // bounds how long a TCP connection sits with no I/O before Jetty closes it — important for two reasons:
+        // (1) it backstops the CONNECT/keep-alive smuggling defence (a malicious or buggy client that opens a socket
+        // and never sends a request would otherwise pin an FD for the whole default window), and (2) it interacts with
+        // SSE's 500 ms heartbeat — the heartbeat must beat the connector timeout, so pinning the connector value here
+        // documents the contract instead of leaving it depending on whichever default Jetty 12.x ships.
+        // 30 s is comfortable for SSE (heartbeats fire every quiet-fetch iteration, well inside this window) and
+        // tight enough that an idle-attack waste of FDs is bounded. WS upgrades replace this timeout with the
+        // per-session idle (see KafkaWebSocketEndpoint.IDLE_TIMEOUT / PRE_SUBSCRIBE_IDLE_TIMEOUT), so this value does
+        // not affect long-running subscriptions.
+        connector.setIdleTimeout(30_000L);
         jetty.addConnector(connector);
 
         ServletContextHandler context = new ServletContextHandler();

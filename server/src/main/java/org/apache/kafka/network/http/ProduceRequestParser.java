@@ -48,6 +48,16 @@ import java.util.OptionalInt;
  */
 public final class ProduceRequestParser {
 
+    /**
+     * Defence-in-depth cap on the {@code records[]} array length. The body byte cap already bounds the total payload,
+     * but with the smallest valid record envelope (~20 bytes — {@code {"value":{"type":"NULL"}}}) a 1 MiB body fits
+     * ~50K records. Each one allocates a {@link RecordEntry} and a {@code SimpleRecord} on the bridge before
+     * {@code MemoryRecords.withRecords} re-walks them to encode. The cap below converts a CPU/allocation amplifier
+     * into a clean 400 — operators with legitimate batched workloads send fewer, larger records (the default
+     * {@code message.max.bytes} is 1 MiB anyway, so &gt; 1000 small records in one POST is already an unusual shape).
+     */
+    static final int MAX_RECORDS_PER_REQUEST = 1000;
+
     private ProduceRequestParser() {
     }
 
@@ -67,6 +77,10 @@ public final class ProduceRequestParser {
         }
         if (recordsNode.size() == 0) {
             throw new BadRequestException("field 'records' must not be empty");
+        }
+        if (recordsNode.size() > MAX_RECORDS_PER_REQUEST) {
+            throw new BadRequestException("field 'records' exceeds the per-request cap of "
+                + MAX_RECORDS_PER_REQUEST);
         }
 
         List<RecordEntry> entries = new ArrayList<>(recordsNode.size());

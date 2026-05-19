@@ -76,6 +76,17 @@ public final class KafkaWebSocketEndpoint implements Session.Listener.AutoDemand
     private static final Duration IDLE_TIMEOUT = Duration.ofMinutes(5);
 
     /**
+     * Tight idle timeout enforced from the moment the connection opens until the first valid {@code subscribe}
+     * frame is received. The limiter slot is acquired at the upgrade handshake (before the streamer exists),
+     * so a client that opens the WS, never subscribes, and never speaks would otherwise pin the slot for the
+     * full {@link #IDLE_TIMEOUT} (5 min). 30 seconds is more than enough for a real client to send the first
+     * frame after the upgrade completes; tightening this is the difference between "limiter slot held for 30s
+     * before the connection drops" and "5 min" under an open-and-sit attack pattern. After the subscribe lands
+     * we relax to {@link #IDLE_TIMEOUT} so a healthy stream tolerates the broker's long-poll dead time.
+     */
+    private static final Duration PRE_SUBSCRIBE_IDLE_TIMEOUT = Duration.ofSeconds(30);
+
+    /**
      * Hard cap on queued outgoing frames per session. The credit-gated subscribe protocol is the
      * primary backpressure mechanism — but it relies on the client granting credit only when it's
      * ready to consume. A misbehaving client that grants a huge credit budget then stops reading
@@ -117,7 +128,9 @@ public final class KafkaWebSocketEndpoint implements Session.Listener.AutoDemand
     @Override
     public void onWebSocketOpen(Session session) {
         this.session = session;
-        session.setIdleTimeout(IDLE_TIMEOUT);
+        // Start with the tight pre-subscribe timeout; handleFirstFrame relaxes to IDLE_TIMEOUT once the
+        // subscribe frame has been validated and the streamer is constructed.
+        session.setIdleTimeout(PRE_SUBSCRIBE_IDLE_TIMEOUT);
         // Cap the inbound text size so a hostile client cannot stream a multi-megabyte subscribe
         // frame into our heap. Subscribe/flow JSONs are tens of bytes; 8 KiB is loose but cheap.
         session.setMaxTextMessageSize(8 * 1024);
@@ -180,6 +193,15 @@ public final class KafkaWebSocketEndpoint implements Session.Listener.AutoDemand
         streamer = WsStreamer.start(new SessionFrameSink(), submitter, mapper,
             topic, sub.partition(), sub.offset(), sub.maxBytes(), sub.initialCredits(),
             token, httpExecutor);
+        // Relax the idle timeout from the tight pre-subscribe window to the steady-state value. A live stream
+        // can legitimately sit quiet between flow grants while the broker long-polls, so we drop the watchdog
+        // back to IDLE_TIMEOUT here — only AFTER the streamer was constructed, so a constructor failure path
+        // still inherits the tight pre-subscribe cap if Jetty resurfaces this session under any code path that
+        // does not invoke tearDown.
+        Session s = this.session;
+        if (s != null) {
+            s.setIdleTimeout(IDLE_TIMEOUT);
+        }
     }
 
     private void handleFlowFrame(WsSubscribeMessageParser.WsClientMessage msg) {
@@ -328,6 +350,22 @@ public final class KafkaWebSocketEndpoint implements Session.Listener.AutoDemand
                     s.close();
                 } catch (RuntimeException e) {
                     LOG.debug("FrameSink.close() failed on {}: {}", topic, e.toString());
+                }
+            }
+        }
+
+        @Override
+        public void close(int statusCode, String reason) {
+            // Streamer-initiated failure path. The error envelope was already sent as a text frame; the close
+            // frame carries the RFC 6455 code (typically 1011 Server Error) which clients use for retry/back-off
+            // decisions distinct from a clean 1000 Normal Closure. Reason text is bounded by RFC 6455 (123 bytes
+            // after UTF-8 encoding) — defer to the shared truncator that the endpoint's own close paths use.
+            Session s = KafkaWebSocketEndpoint.this.session;
+            if (s != null && s.isOpen()) {
+                try {
+                    s.close(statusCode, truncateReason(reason), Callback.NOOP);
+                } catch (RuntimeException e) {
+                    LOG.debug("FrameSink.close({}) failed on {}: {}", statusCode, topic, e.toString());
                 }
             }
         }

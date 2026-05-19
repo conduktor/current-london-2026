@@ -278,4 +278,44 @@ class ProduceRequestParserTest {
         assertEquals(200, cmd.records().size());
         assertFalse(cmd.records().get(199).partition().isEmpty());
     }
+
+    // ----- amplification cap (Wave 24) -----
+
+    @Test
+    void parserRejectsRecordsArrayExceedingCap() {
+        // The body byte cap already bounds total payload, but a 1 MiB body of ~20-byte envelopes still
+        // fits ~50K records and each one allocates a RecordEntry + a SimpleRecord on the bridge before
+        // MemoryRecords.withRecords re-walks them. The cap converts the CPU/allocation amplifier into
+        // a clean 400.
+        int over = ProduceRequestParser.MAX_RECORDS_PER_REQUEST + 1;
+        StringBuilder sb = new StringBuilder("{\"records\":[");
+        for (int i = 0; i < over; i++) {
+            if (i > 0) sb.append(',');
+            sb.append("{\"value\":{\"type\":\"NULL\"}}");
+        }
+        sb.append("]}");
+        JsonNode body = body(sb.toString());
+
+        ProduceRequestParser.BadRequestException ex = assertThrows(
+            ProduceRequestParser.BadRequestException.class,
+            () -> ProduceRequestParser.parse("orders", body));
+        assertTrue(ex.getMessage().contains("records"),
+            () -> "expected message to name the offending field, was: " + ex.getMessage());
+    }
+
+    @Test
+    void parserAcceptsRecordsArrayAtCap() {
+        // Exactly-at-cap must succeed.
+        int cap = ProduceRequestParser.MAX_RECORDS_PER_REQUEST;
+        StringBuilder sb = new StringBuilder("{\"records\":[");
+        for (int i = 0; i < cap; i++) {
+            if (i > 0) sb.append(',');
+            sb.append("{\"value\":{\"type\":\"NULL\"}}");
+        }
+        sb.append("]}");
+        JsonNode body = body(sb.toString());
+
+        ProduceRequestParser.ProduceCommand cmd = ProduceRequestParser.parse("orders", body);
+        assertEquals(cap, cmd.records().size());
+    }
 }

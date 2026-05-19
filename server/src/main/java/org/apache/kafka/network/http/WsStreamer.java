@@ -178,6 +178,9 @@ public final class WsStreamer {
         scheduleDrain();
     }
 
+    /** RFC 6455 status code for "Internal Server Error" — used by every streamer-initiated failure path. */
+    static final int WS_SERVER_ERROR = 1011;
+
     /**
      * Tear the stream down. Idempotent: redundant calls (e.g. from a close handler that also fires after an
      * error frame) leave the limiter count consistent because {@link WsStreamLimiter.Token#close()} is itself
@@ -190,6 +193,24 @@ public final class WsStreamer {
                 sink.close();
             } catch (RuntimeException e) {
                 LOG.debug("FrameSink.close() failed for {}/{}: {}", topic, partition, e.toString());
+            }
+        }
+    }
+
+    /**
+     * Tear the stream down with an explicit RFC 6455 status code (typically {@link #WS_SERVER_ERROR}). Used by
+     * every internal failure path — broker rejection, executor refusal, send-fail, fetch-dispatch fail — so the
+     * peer's close-handler can distinguish "the server is unhappy, back off" from a clean
+     * {@code 1000 Normal Closure}. The error envelope on the wire carries the precise reason; the close code is
+     * the load-bearing signal for clients that handle reconnects.
+     */
+    private void closeOnFailure(int statusCode, String reason) {
+        if (closed.compareAndSet(false, true)) {
+            limiterToken.close();
+            try {
+                sink.close(statusCode, reason);
+            } catch (RuntimeException e) {
+                LOG.debug("FrameSink.close({}) failed for {}/{}: {}", statusCode, topic, partition, e.toString());
             }
         }
     }
@@ -212,7 +233,7 @@ public final class WsStreamer {
                 // grant can try again; surface as a stream-terminal failure.
                 drainScheduled.set(false);
                 LOG.warn("WS executor rejected drain dispatch for {}/{}", topic, partition, e);
-                close();
+                closeOnFailure(WS_SERVER_ERROR, "executor rejected drain");
             }
         }
     }
@@ -266,7 +287,7 @@ public final class WsStreamer {
                     httpExecutor.execute(this::drainAndMaybeFetch);
                 } catch (RuntimeException e) {
                     LOG.warn("WS executor rejected drain recovery for {}/{}", topic, partition, e);
-                    close();
+                    closeOnFailure(WS_SERVER_ERROR, "executor rejected drain recovery");
                 }
             }
         }
@@ -297,7 +318,7 @@ public final class WsStreamer {
                 sendRecord(r);
             } catch (RuntimeException e) {
                 LOG.debug("WS send failed for {}/{}: {}", topic, partition, e.toString());
-                close();
+                closeOnFailure(WS_SERVER_ERROR, "send failed");
                 return false;
             }
             currentOffset = r.offset() + 1;
@@ -355,7 +376,7 @@ public final class WsStreamer {
             // messages (e.g. NPE "Cannot invoke X.y() because z is null") leak broker class/field names.
             LOG.warn("WS fetch submission failed for {}/{}", topic, partition, e);
             trySendErrorFrame("INTERNAL", null);
-            close();
+            closeOnFailure(WS_SERVER_ERROR, "fetch dispatch failed");
         }
     }
 
@@ -374,7 +395,7 @@ public final class WsStreamer {
         fetchInFlight.set(false);
         LOG.warn("WS fetch dispatch failed for {}/{}", topic, partition, throwable);
         trySendErrorFrame("INTERNAL", null);
-        close();
+        closeOnFailure(WS_SERVER_ERROR, "scheduling failed");
     }
 
     private void handleFetchResult(RequestSubmitter.FetchResult result, Throwable throwable) {
@@ -398,7 +419,7 @@ public final class WsStreamer {
             fetchInFlight.set(false);
             String msg = view.errorMessage() != null ? view.errorMessage() : view.error().message();
             trySendErrorFrame(view.error().name(), msg);
-            close();
+            closeOnFailure(WS_SERVER_ERROR, view.error().name());
             return;
         }
         // Stage records BEFORE clearing fetchInFlight. handleFetchResult runs on the httpExecutor (a
@@ -455,7 +476,7 @@ public final class WsStreamer {
                 });
         } catch (RuntimeException e) {
             LOG.warn("WS delayed-drain dispatch failed for {}/{}", topic, partition, e);
-            close();
+            closeOnFailure(WS_SERVER_ERROR, "delayed-drain dispatch failed");
         }
     }
 
@@ -471,7 +492,7 @@ public final class WsStreamer {
         // failFetch path is reached only on unexpected throwables where the message can leak internals.
         LOG.warn("WS fetch submission failed for {}/{} at offset {}", topic, partition, currentOffset, cause);
         trySendErrorFrame("INTERNAL", null);
-        close();
+        closeOnFailure(WS_SERVER_ERROR, "broker fetch failed");
     }
 
     private void sendRecord(FetchResponseFormatter.FetchedRecord r) {
@@ -516,6 +537,17 @@ public final class WsStreamer {
 
         /** Close the underlying session. Should be tolerant of being called multiple times. */
         void close();
+
+        /**
+         * Close the underlying session with an explicit RFC 6455 status code and reason. Default implementation
+         * falls back to {@link #close()}; production sinks should override to convey the status code to the peer.
+         * Used by the streamer's failure paths to signal {@code 1011 Server Error} for broker-initiated faults,
+         * which clients (and proxies) treat differently from a clean {@code 1000 Normal Closure} — retry/back-off
+         * heuristics on the peer side depend on the close code more than on the error envelope payload.
+         */
+        default void close(int statusCode, String reason) {
+            close();
+        }
 
         /** Whether the session is still open. The streamer consults this only as a hint. */
         boolean isOpen();

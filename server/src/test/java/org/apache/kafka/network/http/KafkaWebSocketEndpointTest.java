@@ -218,13 +218,32 @@ class KafkaWebSocketEndpointTest {
 
         endpoint.onWebSocketOpen(session);
 
-        assertEquals(Duration.ofMinutes(5), session.idleTimeout, "idle timeout must be 5 minutes");
+        // Open-time idle is the tight pre-subscribe window (30s). A separate test confirms that a successful
+        // subscribe relaxes this to the steady-state 5 min — see subscribeRelaxesIdleTimeout below.
+        assertEquals(Duration.ofSeconds(30), session.idleTimeout,
+            "idle timeout at open must be the tight pre-subscribe window (30s) until the first subscribe lands");
         assertEquals(8 * 1024L, session.maxTextMessageSize, "text message cap must be 8 KiB");
         assertEquals(8 * 1024L, session.maxBinaryMessageSize,
             "binary message cap must match text — bridge has no binary sink");
         assertEquals(8 * 1024L, session.maxFrameSize,
             "frame cap must be 8 KiB so per-frame bound matches per-message");
         assertEquals(1024, session.maxOutgoingFrames, "outgoing-frame queue cap must be MAX_OUTGOING_FRAMES");
+    }
+
+    @Test
+    void successfulSubscribeRelaxesIdleTimeoutFromPreSubscribeToSteadyState() {
+        // The W24-4 contract: open with a tight 30s idle so a client that opens and never subscribes does not
+        // pin a limiter slot for 5 minutes. Once a valid subscribe frame lands and the streamer is constructed,
+        // relax to IDLE_TIMEOUT (5min) so a quiet live-tail stream is not torn down between record arrivals.
+        WsStreamLimiter.Token token = limiter.tryAcquire();
+        KafkaWebSocketEndpoint endpoint = newEndpoint(token, "orders");
+        endpoint.onWebSocketOpen(session);
+        assertEquals(Duration.ofSeconds(30), session.idleTimeout, "open should arm the tight pre-subscribe window");
+
+        endpoint.onWebSocketText("{\"type\":\"subscribe\",\"partition\":0,\"offset\":0,\"initialCredits\":1}");
+
+        assertEquals(Duration.ofMinutes(5), session.idleTimeout,
+            "after a valid subscribe, the idle timeout must relax to the steady-state 5min");
     }
 
     @Test

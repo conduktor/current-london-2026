@@ -17,6 +17,7 @@
 package kafka.network.http
 
 import kafka.network.RequestChannel
+import kafka.utils.Logging
 
 import org.apache.kafka.common.compress.Compression
 import org.apache.kafka.common.header.Header
@@ -93,7 +94,7 @@ class KafkaApiRequestSubmitter(
   fetchMinBytes: Int = 1,
   fetchDefaultMaxBytes: Int = 1 * 1024 * 1024,
   fetchResponseMaxBytes: Int = 50 * 1024 * 1024
-) extends RequestSubmitter {
+) extends RequestSubmitter with Logging {
 
   private val correlationIds = new AtomicInteger(0)
 
@@ -373,8 +374,30 @@ class KafkaApiRequestSubmitter(
     )
 
     request.requestCompletionCallback = Some { response =>
-      try future.complete(translate(response))
-      catch { case t: Throwable => future.completeExceptionally(t) }
+      try {
+        val result = translate(response)
+        if (!future.complete(result)) {
+          // Future was already settled (almost always: the bridge's orTimeout fired before the broker
+          // responded). The translated result is dropped, which is correct — the client has already seen
+          // the 504. But operators staring at a long-tail latency dashboard need a breadcrumb that the
+          // broker reply DID land, just late, so they can distinguish "request timed out because the
+          // broker is wedged" from "request timed out because the broker replied 200ms after our cap".
+          // Debug-level: this happens on every legitimate timeout and would spam at info or higher.
+          debug(s"Submitter response landed after the future was already completed (likely orTimeout fired first); " +
+            s"dropping translated result of type ${result.getClass.getSimpleName}")
+        }
+      } catch {
+        case t: Throwable =>
+          if (!future.completeExceptionally(t)) {
+            // Same race as above but for the translation-failure path: the translate() body threw, the
+            // future was already completed, and the throwable would otherwise vanish. Translation
+            // exceptions are not user-visible (the client got a 504 from the timeout), but a real
+            // translation bug looks identical to "broker replied late" without this log line. Warn-level
+            // here — translation exceptions are not expected on the happy path, so volume is bounded
+            // by actual defects rather than legitimate timeouts.
+            warn(s"Submitter translation failed after the future was already completed; original throwable below", t)
+          }
+      }
     }
 
     requestChannel.sendRequest(request)

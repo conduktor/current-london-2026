@@ -21,10 +21,9 @@ import kafka.coordinator.group.{CoordinatorLoaderImpl, CoordinatorPartitionWrite
 import kafka.coordinator.transaction.TransactionCoordinator
 import kafka.log.LogManager
 import kafka.log.remote.RemoteLogManager
-import com.fasterxml.jackson.databind.ObjectMapper
 import kafka.network.{DataPlaneAcceptor, SocketServer}
 import kafka.network.http.KafkaApiRequestSubmitter
-import org.apache.kafka.network.http.{HostBindingValidator, KafkaHttpBridge, KafkaHttpServer}
+import org.apache.kafka.network.http.{BridgeJsonMappers, HostBindingValidator, KafkaHttpBridge, KafkaHttpServer}
 import org.apache.kafka.common.security.auth.KafkaPrincipal
 import kafka.raft.KafkaRaftManager
 import kafka.server.metadata._
@@ -648,9 +647,13 @@ class BrokerServer(
           listenerName = config.interBrokerListenerName,
           topicIdLookup = name => metadataCache.getTopicId(name)
         )
-        val bridge = new KafkaHttpBridge(new ObjectMapper(), submitter, config.httpBridgeRequestTimeoutMs.toLong)
+        // Both ObjectMappers parse untrusted JSON (request bodies via the servlet, WebSocket subscribe frames via the
+        // endpoint). BridgeJsonMappers.hardened() applies Jackson StreamReadConstraints to bound parser work per byte
+        // (max string length, nesting depth, numeric literal length) so the existing total-body and per-frame byte
+        // caps cannot be amplified by pathologically-nested or huge-string JSON shapes.
+        val bridge = new KafkaHttpBridge(BridgeJsonMappers.hardened(), submitter, config.httpBridgeRequestTimeoutMs.toLong)
         httpBridgeServer = new KafkaHttpServer(
-          config.httpBridgeHost, config.httpBridgePort, bridge, submitter, new ObjectMapper(),
+          config.httpBridgeHost, config.httpBridgePort, bridge, submitter, BridgeJsonMappers.hardened(),
           config.httpBridgeMaxRequestBodyBytes, config.httpBridgeMaxConcurrentSseStreams,
           config.httpBridgeMaxConcurrentWsSubscriptions, config.httpBridgeShutdownGraceMs.toLong)
         httpBridgeServer.start()

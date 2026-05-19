@@ -153,6 +153,13 @@ public final class FetchResponseFormatter {
             : p.records.get(p.records.size() - 1).offset + 1;
 
         ObjectNode links = mapper.createObjectNode();
+        // HAL convention: every resource has a _links.self pointing at its canonical URL. For the fetch view, that is
+        // the cursor at the offset the client just requested on the requested partition — exactly the resource the
+        // caller dereferenced to get this body. Surfacing it at the root makes the response self-describing for
+        // generic HAL clients (curl-with-hal, browsers, HATEOAS UI frameworks) that walk _links by name. The
+        // per-partition object below also carries a self link for the single-partition case; the root self is
+        // load-bearing for the multi-partition response shape PROMPT.md leaves room for in a future revision.
+        links.put("self", CursorCodec.encode(topic, p.partition, p.requestedOffset));
         links.put("first", CursorCodec.encode(topic, p.partition, p.logStartOffset));
         if (p.requestedOffset > p.logStartOffset) {
             links.put("previous", CursorCodec.encode(topic, p.partition, p.requestedOffset - 1));

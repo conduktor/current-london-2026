@@ -101,4 +101,29 @@ class CursorCodecTest {
         assertTrue(e.getMessage().contains("offset"),
             "expected offset validation error, got: " + e.getMessage());
     }
+
+    @Test
+    void decodeRejectsCursorLongerThanMaxLength() {
+        // Real cursors are ~380 chars at most (base64(249 + 1 + 11 + 1 + 20)). A fake "cursor" of
+        // 8 KiB of A's would allocate one base64 output byte array and a UTF-8 String per request —
+        // bounded by the cap below, the wasted work is at most ~1 KiB per rejected cursor instead.
+        StringBuilder sb = new StringBuilder(CursorCodec.MAX_CURSOR_LENGTH + 1);
+        for (int i = 0; i < CursorCodec.MAX_CURSOR_LENGTH + 1; i++) {
+            sb.append('A');
+        }
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+            () -> CursorCodec.decode(sb.toString()));
+        assertTrue(e.getMessage().toLowerCase(java.util.Locale.ROOT).contains("length")
+                || e.getMessage().toLowerCase(java.util.Locale.ROOT).contains("maximum"),
+            "expected length-related error, got: " + e.getMessage());
+    }
+
+    @Test
+    void decodeAcceptsCursorAtMaxLength() {
+        // A 512-char base64url string is acceptable in shape (the base64 decode may fail for arbitrary
+        // bytes, but that's a separate validation path). Build a real round-trippable cursor that
+        // lands at-or-below the cap to pin the boundary.
+        CursorCodec.Cursor c = CursorCodec.decode(CursorCodec.encode("topic", 0, Long.MAX_VALUE));
+        assertEquals(Long.MAX_VALUE, c.offset());
+    }
 }

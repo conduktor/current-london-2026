@@ -29,6 +29,15 @@ public final class CursorCodec {
 
     private static final char SEPARATOR = '|';
 
+    /**
+     * Hard cap on the wire-form cursor length. Real cursors are at most
+     * {@code base64(topic[<=249] + "|" + partition[<=11] + "|" + offset[<=20])} ≈ 380 chars; the cap below admits all
+     * legitimate cursors and rejects the byte-budget amplifier from a fake cursor (decode allocates one byte array
+     * for the base64 output and another for the UTF-8 String — at 8 KiB of A's that's ~14 KiB of allocation per
+     * request, on a hot fetch loop the cumulative GC pressure is measurable).
+     */
+    static final int MAX_CURSOR_LENGTH = 512;
+
     private CursorCodec() {
     }
 
@@ -40,6 +49,9 @@ public final class CursorCodec {
 
     public static Cursor decode(String cursor) {
         Objects.requireNonNull(cursor, "cursor must not be null");
+        if (cursor.length() > MAX_CURSOR_LENGTH) {
+            throw new IllegalArgumentException("Cursor exceeds the maximum length of " + MAX_CURSOR_LENGTH);
+        }
         byte[] decoded;
         try {
             decoded = Base64.getUrlDecoder().decode(cursor);

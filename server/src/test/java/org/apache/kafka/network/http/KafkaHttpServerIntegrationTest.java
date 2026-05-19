@@ -311,6 +311,64 @@ class KafkaHttpServerIntegrationTest {
             "smuggled GET must NOT be processed; expected exactly one response on the wire, got: " + raw);
     }
 
+    @Test
+    void malformedJsonBodyResponseSetsConnectionCloseAndDoesNotProcessPipelinedRequest() throws Exception {
+        // Same smuggling defect as the 413 case but on the 400 malformed-JSON path. Jackson aborts the parse on the
+        // first syntax error, leaving the remainder of the declared body on the wire. Without Connection: close, Jetty
+        // drains those bytes per Content-Length and parses a pipelined request afterwards — a fronting proxy that
+        // pools upstream connections has a smuggling primitive (the attacker chooses Content-Length to terminate after
+        // the malformed JSON, then appends a smuggled request).
+        //
+        // Wire shape:
+        //   POST /v1/topics/orders/records HTTP/1.1
+        //   Content-Length: <length of full body INCLUDING the smuggled GET>
+        //   <malformed JSON>{    ← Jackson aborts at first parse error
+        //   ...
+        //   GET /smuggled HTTP/1.1
+        //
+        // We use a single declared Content-Length that covers BOTH the JSON garbage and the pipelined GET. With
+        // Connection: close enforced, the server closes the socket after the 400 response and the smuggled bytes are
+        // never re-parsed as a request.
+        String malformedBody = "{ not valid json {{{";
+        String smuggled =
+            "GET /v1/topics/smuggled/records?partition=0&offset=0 HTTP/1.1\r\n"
+                + "Host: 127.0.0.1\r\n"
+                + "\r\n";
+        String pseudoBody = malformedBody + smuggled;
+        String raw;
+        try (Socket s = new Socket("127.0.0.1", server.boundPort())) {
+            s.setSoTimeout(5000);
+            OutputStream out = s.getOutputStream();
+            String req =
+                "POST /v1/topics/orders/records HTTP/1.1\r\n"
+                    + "Host: 127.0.0.1\r\n"
+                    + "Content-Type: application/json\r\n"
+                    + "Content-Length: " + pseudoBody.length() + "\r\n"
+                    + "\r\n"
+                    + pseudoBody;
+            out.write(req.getBytes(StandardCharsets.US_ASCII));
+            out.flush();
+            raw = readAllAscii(s.getInputStream());
+        }
+
+        assertTrue(raw.startsWith("HTTP/1.1 400"),
+            "first response must be 400, got status line: " + raw.split("\r\n", 2)[0]);
+
+        int headerEnd = raw.indexOf("\r\n\r\n");
+        assertTrue(headerEnd >= 0, "400 response must terminate its headers, got: " + raw);
+        String headers = raw.substring(0, headerEnd);
+        assertTrue(headers.toLowerCase(java.util.Locale.ROOT).contains("connection: close"),
+            "400 body-read response MUST carry Connection: close — without it the remaining body bytes are drained "
+                + "and a pipelined request is parsed, which is an HTTP request smuggling primitive. Got headers: "
+                + headers);
+
+        int firstStatus = raw.indexOf("HTTP/1.1 ");
+        int secondStatus = raw.indexOf("HTTP/1.1 ", firstStatus + 1);
+        assertEquals(-1, secondStatus,
+            "smuggled GET must NOT be processed after a malformed-JSON 400; expected exactly one response on the wire, got: "
+                + raw);
+    }
+
     // ----- fetch -----
 
     @Test

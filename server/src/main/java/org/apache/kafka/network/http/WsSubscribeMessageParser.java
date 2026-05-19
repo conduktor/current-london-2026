@@ -41,7 +41,35 @@ import java.util.OptionalInt;
  */
 public final class WsSubscribeMessageParser {
 
-    private static final ObjectMapper MAPPER = new ObjectMapper();
+    // Hardened against deeply-nested / oversized-string DoS shapes per BridgeJsonMappers. WS text frames are themselves
+    // capped at 8 KiB by the endpoint, but the per-frame byte cap alone does not bound parser work per byte (a 1 KiB
+    // deep-nested object still blows the stack). The Jackson StreamReadConstraints turn that into a clean 1003 close.
+    private static final ObjectMapper MAPPER = BridgeJsonMappers.hardened();
+
+    /**
+     * Defence-in-depth caps on the integer fields a client may submit. Without these, a single subscribe frame can drive
+     * the broker into a tight loop of {@code fetchResponseMaxBytes}-sized fetches against one partition until the topic
+     * is fully drained — a 1:50,000,000 byte amplification per frame byte (see Wave 24 axis L/M findings).
+     *
+     * <p>Numbers picked so that a well-behaved client is never bothered:
+     * <ul>
+     *   <li>{@code MAX_INITIAL_CREDITS = 10_000} — far more records than any realistic client would buffer before
+     *       starting to ack; a streaming consumer that wants more simply grants further credits as it drains.</li>
+     *   <li>{@code MAX_FLOW_CREDITS = 10_000} — same ceiling on each subsequent flow message; an attacker cannot bypass
+     *       the initial cap by issuing many huge {@code flow} grants because each one is checked here.</li>
+     *   <li>{@code MAX_PER_PARTITION_FETCH_BYTES = 50 * 1024 * 1024} — aligned with the broker's
+     *       {@code fetchResponseMaxBytes} (50 MiB) so a client can request as much as the broker will ever return on
+     *       one fetch, but no more. Asking for 2 GiB and getting capped at 50 MiB is invisible to a correct client
+     *       and protects the broker from the bridge being used as a fetch-amplifier.</li>
+     * </ul>
+     * The caps are not part of the wire protocol — they raise {@link BadMessageException} → 1003 close frame, the
+     * standard validation-failure path. Exposing them as configuration would be welcome in a future revision; for now
+     * they are fixed at the parser level because their primary role is "no one byte of attacker input maps to many
+     * megabytes of broker work".
+     */
+    static final int MAX_INITIAL_CREDITS = 10_000;
+    static final int MAX_FLOW_CREDITS = 10_000;
+    static final int MAX_PER_PARTITION_FETCH_BYTES = 50 * 1024 * 1024;
 
     private WsSubscribeMessageParser() {
     }
@@ -110,6 +138,14 @@ public final class WsSubscribeMessageParser {
         int partition = readNonNegativeInt(root, "partition");
         long offset = readNonNegativeLong(root, "offset");
         int initialCredits = readNonNegativeInt(root, "initialCredits");
+        if (initialCredits > MAX_INITIAL_CREDITS) {
+            // See MAX_INITIAL_CREDITS javadoc. We do not silently clamp — a clamp would let an attacker who
+            // submits initialCredits = 2_000_000_000 still drive the broker as if they had MAX_INITIAL_CREDITS
+            // permission, just one fetch loop slower; the explicit rejection forces the misbehaving client
+            // to issue a sensible request.
+            throw new BadMessageException("field 'initialCredits' exceeds the per-subscription cap of "
+                + MAX_INITIAL_CREDITS);
+        }
 
         OptionalInt maxBytes;
         JsonNode maxBytesNode = root.get("maxBytes");
@@ -125,6 +161,10 @@ public final class WsSubscribeMessageParser {
             int v = maxBytesNode.asInt();
             if (v <= 0) {
                 throw new BadMessageException("field 'maxBytes' must be a positive integer");
+            }
+            if (v > MAX_PER_PARTITION_FETCH_BYTES) {
+                throw new BadMessageException("field 'maxBytes' exceeds the per-fetch cap of "
+                    + MAX_PER_PARTITION_FETCH_BYTES);
             }
             maxBytes = OptionalInt.of(v);
         }
@@ -143,6 +183,12 @@ public final class WsSubscribeMessageParser {
         if (credits <= 0) {
             throw new BadMessageException(
                 "field 'credits' must be a positive integer (flow messages cannot retract credit)");
+        }
+        if (credits > MAX_FLOW_CREDITS) {
+            // Per-message cap. An attacker can still issue many flow messages over time, but each one is bounded;
+            // combined with the WsStreamer's saturating addExact on the credit counter, the steady-state credit
+            // is bounded by client patience rather than by one malicious frame.
+            throw new BadMessageException("field 'credits' exceeds the per-message cap of " + MAX_FLOW_CREDITS);
         }
         return new WsFlowCommand(credits);
     }

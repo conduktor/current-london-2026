@@ -203,6 +203,22 @@ class FetchResponseFormatterTest {
     }
 
     @Test
+    void rootSelfLinkPointsAtRequestedOffset() {
+        // HAL convention: every resource carries a _links.self pointing at its canonical URL. For the fetch view, the
+        // canonical URL is the cursor at the offset the client requested on the partition they requested. The
+        // per-partition entry already carries its own self link; this test pins the *root* self that generic HAL
+        // clients walk by name.
+        FetchResponseFormatter.PartitionFetch p = ok(0, 100, 50, 250, Collections.singletonList(rec(100, "x")));
+        JsonNode self = formatter.format("orders", p, 0).body().get("_links").get("self");
+        assertNotNull(self, "_links.self must be present at the root of the fetch response");
+        CursorCodec.Cursor decoded = CursorCodec.decode(self.asText());
+        assertEquals("orders", decoded.topic());
+        assertEquals(0, decoded.partition());
+        assertEquals(100, decoded.offset(),
+            "root _links.self must encode the partition the client requested at the offset they requested");
+    }
+
+    @Test
     void firstLinkPointsAtLogStartOffset() {
         FetchResponseFormatter.PartitionFetch p = ok(0, 100, 50, 250, Collections.singletonList(rec(100, "x")));
         String firstCursor = formatter.format("orders", p, 0).body().get("_links").get("first").asText();

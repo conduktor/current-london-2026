@@ -79,13 +79,15 @@ class WsSubscribeMessageParserTest {
     }
 
     @Test
-    void parsesFlowWithLargeCredits() {
+    void parsesFlowAtTheCap() {
+        // The per-message flow cap is MAX_FLOW_CREDITS (see WsSubscribeMessageParser javadoc).
+        // Exactly-at-cap must succeed — the rejection is for values strictly above.
         WsSubscribeMessageParser.WsClientMessage msg = WsSubscribeMessageParser.parse(
-            "{\"type\":\"flow\",\"credits\":1000000}");
+            "{\"type\":\"flow\",\"credits\":" + WsSubscribeMessageParser.MAX_FLOW_CREDITS + "}");
 
         WsSubscribeMessageParser.WsFlowCommand flow =
             assertInstanceOf(WsSubscribeMessageParser.WsFlowCommand.class, msg);
-        assertEquals(1_000_000, flow.credits());
+        assertEquals(WsSubscribeMessageParser.MAX_FLOW_CREDITS, flow.credits());
     }
 
     // ----- malformed JSON / structural -----
@@ -326,5 +328,68 @@ class WsSubscribeMessageParserTest {
         assertThrows(WsSubscribeMessageParser.BadMessageException.class,
             () -> WsSubscribeMessageParser.parse(
                 "{\"type\":\"subscribe\",\"partition\":0,\"offset\":0,\"initialCredits\":5,\"maxBytes\":1024.5}"));
+    }
+
+    // ----- amplification caps (Wave 24) -----
+
+    @Test
+    void subscribeRejectsInitialCreditsExceedingCap() {
+        // Without this cap, one subscribe frame with initialCredits = 2_000_000_000 drives the broker
+        // into a tight loop of MAX_PER_PARTITION_FETCH_BYTES-sized fetches until the partition drains.
+        // The cap converts the 1:50M byte amplifier into a clean BadMessageException → 1003 close.
+        int overCap = WsSubscribeMessageParser.MAX_INITIAL_CREDITS + 1;
+        WsSubscribeMessageParser.BadMessageException ex = assertThrows(
+            WsSubscribeMessageParser.BadMessageException.class,
+            () -> WsSubscribeMessageParser.parse(
+                "{\"type\":\"subscribe\",\"partition\":0,\"offset\":0,\"initialCredits\":" + overCap + "}"));
+        assertTrue(ex.getMessage().contains("initialCredits"),
+            () -> "expected message to name the offending field, was: " + ex.getMessage());
+    }
+
+    @Test
+    void subscribeAcceptsInitialCreditsAtCap() {
+        // Exactly-at-cap must succeed — the rejection is for values strictly above.
+        WsSubscribeMessageParser.WsClientMessage msg = WsSubscribeMessageParser.parse(
+            "{\"type\":\"subscribe\",\"partition\":0,\"offset\":0,\"initialCredits\":"
+                + WsSubscribeMessageParser.MAX_INITIAL_CREDITS + "}");
+        WsSubscribeMessageParser.WsSubscribeCommand sub =
+            assertInstanceOf(WsSubscribeMessageParser.WsSubscribeCommand.class, msg);
+        assertEquals(WsSubscribeMessageParser.MAX_INITIAL_CREDITS, sub.initialCredits());
+    }
+
+    @Test
+    void subscribeRejectsMaxBytesExceedingCap() {
+        // Aligned with the broker's fetchResponseMaxBytes — asking for more is asking the bridge to
+        // act as a fetch-amplifier, since the broker still caps the response at 50 MiB.
+        long overCap = (long) WsSubscribeMessageParser.MAX_PER_PARTITION_FETCH_BYTES + 1L;
+        WsSubscribeMessageParser.BadMessageException ex = assertThrows(
+            WsSubscribeMessageParser.BadMessageException.class,
+            () -> WsSubscribeMessageParser.parse(
+                "{\"type\":\"subscribe\",\"partition\":0,\"offset\":0,\"initialCredits\":5,\"maxBytes\":"
+                    + overCap + "}"));
+        assertTrue(ex.getMessage().contains("maxBytes"),
+            () -> "expected message to name the offending field, was: " + ex.getMessage());
+    }
+
+    @Test
+    void subscribeAcceptsMaxBytesAtCap() {
+        WsSubscribeMessageParser.WsClientMessage msg = WsSubscribeMessageParser.parse(
+            "{\"type\":\"subscribe\",\"partition\":0,\"offset\":0,\"initialCredits\":5,\"maxBytes\":"
+                + WsSubscribeMessageParser.MAX_PER_PARTITION_FETCH_BYTES + "}");
+        WsSubscribeMessageParser.WsSubscribeCommand sub =
+            assertInstanceOf(WsSubscribeMessageParser.WsSubscribeCommand.class, msg);
+        assertTrue(sub.maxBytes().isPresent());
+        assertEquals(WsSubscribeMessageParser.MAX_PER_PARTITION_FETCH_BYTES, sub.maxBytes().getAsInt());
+    }
+
+    @Test
+    void flowRejectsCreditsExceedingCap() {
+        int overCap = WsSubscribeMessageParser.MAX_FLOW_CREDITS + 1;
+        WsSubscribeMessageParser.BadMessageException ex = assertThrows(
+            WsSubscribeMessageParser.BadMessageException.class,
+            () -> WsSubscribeMessageParser.parse(
+                "{\"type\":\"flow\",\"credits\":" + overCap + "}"));
+        assertTrue(ex.getMessage().contains("credits"),
+            () -> "expected message to name the offending field, was: " + ex.getMessage());
     }
 }

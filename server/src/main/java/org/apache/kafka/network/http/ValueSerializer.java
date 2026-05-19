@@ -211,5 +211,10 @@ public final class ValueSerializer {
         return false;
     }
 
-    private static final ObjectMapper JSON_WRITER = new ObjectMapper();
+    // tryParseJson() runs readTree against raw record-value bytes — those bytes came from a producer (so for any
+    // multi-tenant cluster they may carry attacker-crafted JSON). Hardening here turns billion-laughs / huge-string
+    // amplification on a single record into a clean fallthrough to the STRING/BINARY branch instead of a parser
+    // explosion. The same mapper writes back JSON via writeValueAsBytes — those bytes come from already-parsed JsonNodes
+    // and are not subject to the constraints (they only apply on the read path), so the writer keeps working unchanged.
+    private static final ObjectMapper JSON_WRITER = BridgeJsonMappers.hardened();
 }
