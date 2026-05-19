@@ -37,6 +37,17 @@ import java.util.Objects;
  * model: the broker's per-partition produce serialisation already ensures only one thread
  * appends; reads from the fetch path are safe concurrently.
  *
+ * <p>r23 BLOCKER #234: clean-shutdown durability. Without an fsync the kernel page cache is
+ * not committed to the physical device by the time the broker process exits. A power loss in
+ * the window between {@code close()} returning and the OS finally flushing those pages would
+ * lose every append since the last OS-initiated writeback — silent data loss on what looks to
+ * the operator like a graceful shutdown. {@link #close()} now calls
+ * {@link #forceChannel(boolean) forceChannel(false)} (data-only fsync) before closing the
+ * channel, mirroring what Kafka's stock {@code OffsetIndex.close} does. The PROMPT
+ * "no fsync per append" rule is honoured: we still do NOT fsync inside {@link #append}; only
+ * at the close + at the explicit {@link #flush} checkpoint that the kernel can call from
+ * its own flush scheduler if/when a periodic checkpoint is wired in.
+ *
  * <p>On-disk entry layout (Codex r19 ADV-STORAGE BLOCKER #132 — data-loss without per-entry CRC):
  * <pre>
  *   offset 0..7   : 8-byte big-endian backing offset
@@ -53,7 +64,10 @@ import java.util.Objects;
  * <p>On crash mid-append the file may be inconsistent. v1 recovery rebuilds the sidecar from
  * the backing log when sanity checks fail; see {@link BackingScanRecoverer}.
  */
-public final class LogicalSidecarIndex implements Closeable {
+public class LogicalSidecarIndex implements Closeable {
+    // Non-final to allow the test in LogicalSidecarIndexTest to subclass and count fsync
+    // invocations via the package-private {@link #forceChannel} seam. No production subclass
+    // exists; the class is otherwise still "effectively final" for instantiation purposes.
 
     /**
      * 8-byte backing offset + 4-byte CRC32C of those 8 bytes. The two fields together make every
@@ -208,12 +222,58 @@ public final class LogicalSidecarIndex implements Closeable {
         lastBackingOffset = newLastBackingOffset;
     }
 
+    /**
+     * Flush data writes to the physical device. Metadata (file size, mtime) is NOT included — the
+     * sidecar's effective size is reconstructable from the on-disk byte count at open time, so
+     * paying the extra metadata-fsync cost on every flush would be wasted I/O. Callers that need
+     * a full metadata fsync (e.g. recovery rename atomicity) handle that separately.
+     *
+     * <p>Idempotent: a no-op flush on an already-flushed channel is cheap. Not legal after
+     * {@link #close()}.
+     */
+    public synchronized void flush() throws IOException {
+        ensureOpen();
+        forceChannel(false);
+    }
+
     @Override
     public synchronized void close() throws IOException {
         if (closed) return;
+        // Mark closed first so re-entry (e.g. close inside force-failure cleanup) short-circuits.
         closed = true;
-        channel.close();
-        raf.close();
+        // Best-effort: try to flush before closing so a clean shutdown is durable. If any of the
+        // three steps throws, we still attempt the remaining two, then propagate the first error
+        // with any subsequent ones suppressed. Leaving raf/channel un-closed because force threw
+        // would leak a file descriptor; leaving force un-attempted because we panicked over a
+        // suppressed close error would re-introduce the data-loss window #234 was filed against.
+        IOException firstError = null;
+        try {
+            forceChannel(false);
+        } catch (IOException e) {
+            firstError = e;
+        }
+        try {
+            channel.close();
+        } catch (IOException e) {
+            if (firstError == null) firstError = e;
+            else firstError.addSuppressed(e);
+        }
+        try {
+            raf.close();
+        } catch (IOException e) {
+            if (firstError == null) firstError = e;
+            else firstError.addSuppressed(e);
+        }
+        if (firstError != null) throw firstError;
+    }
+
+    /**
+     * Package-private seam: delegates to {@link FileChannel#force(boolean)}. Tests override this
+     * to count invocations / inject failures without having to mock the channel underneath the
+     * RandomAccessFile we own.
+     */
+    void forceChannel(boolean metaData) throws IOException {
+        channel.force(metaData);
     }
 
     private long readEntryAt(long index) throws IOException {

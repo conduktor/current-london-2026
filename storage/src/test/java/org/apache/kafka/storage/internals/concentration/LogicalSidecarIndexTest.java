@@ -32,6 +32,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.apache.kafka.storage.internals.concentration.LogicalSidecarIndex.ENTRY_SIZE;
 import static org.apache.kafka.storage.internals.concentration.LogicalSidecarIndex.OFFSET_BYTES;
@@ -439,5 +440,125 @@ public class LogicalSidecarIndexTest {
         assertEquals("org.apache.kafka.storage.internals.log.CorruptIndexException",
             thrown.getClass().getName(),
             "corrupted last entry must abort construction with CorruptIndexException: got " + thrown);
+    }
+
+    // ----------- r23 BLOCKER #234 — clean-shutdown durability -----------
+    //
+    // close() must call FileChannel.force before closing so that on a clean broker shutdown all
+    // appended sidecar entries are physically committed to the device. Without the force, the OS
+    // page cache may still hold the writes when the broker exits; a power loss before the OS
+    // writeback flushes them silently loses every append since the previous OS-initiated flush —
+    // data loss on what looked to the operator like a graceful shutdown.
+    //
+    // We can't reproduce a true power loss in a unit test, so the discriminator counts force()
+    // invocations via the `forceChannel` package-private seam. The other tests pin the
+    // surrounding API contract: flush() can be called explicitly, close() flushes even when the
+    // sidecar has zero appends (so reopen consistency holds), force-failure during close does
+    // not leak descriptors, and double-close stays a no-op.
+
+    /** Counts forceChannel invocations, optionally raising on the first call. */
+    private static final class CountingSidecar extends LogicalSidecarIndex {
+        final AtomicInteger forceCount = new AtomicInteger();
+        volatile IOException nextForceThrows;
+        CountingSidecar(File file, String topic, int partition) throws IOException {
+            super(file, topic, partition);
+        }
+        @Override
+        void forceChannel(boolean metaData) throws IOException {
+            forceCount.incrementAndGet();
+            IOException toThrow = nextForceThrows;
+            if (toThrow != null) {
+                nextForceThrows = null;
+                throw toThrow;
+            }
+            super.forceChannel(metaData);
+        }
+    }
+
+    @Test
+    public void closeForcesChannelBeforeClosing() throws IOException {
+        File file = new File(tempDir, "fsync-close-0.sidecar");
+        CountingSidecar idx = new CountingSidecar(file, "fsync-close", 0);
+        idx.append(10L);
+        idx.append(20L);
+        assertEquals(0, idx.forceCount.get(),
+            "append() must NOT fsync — that would violate the PROMPT no-fsync-per-append rule");
+        idx.close();
+        assertEquals(1, idx.forceCount.get(),
+            "close() must call forceChannel exactly once (r23 BLOCKER #234)");
+    }
+
+    @Test
+    public void closeFlushesEvenOnEmptySidecar() throws IOException {
+        // An empty sidecar still has metadata (zero-length file created on open) but no data.
+        // We force anyway: the contract is "close is durable" — making the contract conditional
+        // on whether append was called would invite a future caller to forget the path.
+        File file = new File(tempDir, "fsync-empty-0.sidecar");
+        CountingSidecar idx = new CountingSidecar(file, "fsync-empty", 0);
+        idx.close();
+        assertEquals(1, idx.forceCount.get(),
+            "close() must still fsync even when no entries were appended");
+    }
+
+    @Test
+    public void flushIsExplicitlyCallableAndIdempotent() throws IOException {
+        File file = new File(tempDir, "fsync-flush-0.sidecar");
+        CountingSidecar idx = new CountingSidecar(file, "fsync-flush", 0);
+        try {
+            idx.append(10L);
+            idx.flush();
+            idx.flush(); // idempotent — a force on an already-clean channel is cheap
+            assertEquals(2, idx.forceCount.get(),
+                "each flush() call must reach the channel; the no-op-on-clean optimisation is the "
+                    + "OS's job, not ours");
+        } finally {
+            idx.close();
+        }
+    }
+
+    @Test
+    public void flushAfterCloseIsRejected() throws IOException {
+        File file = new File(tempDir, "fsync-after-close-0.sidecar");
+        LogicalSidecarIndex idx = new LogicalSidecarIndex(file, "fsync-after-close", 0);
+        idx.close();
+        assertThrows(IllegalStateException.class, idx::flush);
+    }
+
+    @Test
+    public void closeReleasesHandlesEvenWhenForceFails() throws IOException {
+        // Disk-full / I/O-error during fsync at close must NOT leak the file descriptor — the
+        // broker may be shutting down precisely because storage is wedged, and leaking FDs into
+        // a shutdown sequence would cascade. close() must propagate the force error but still
+        // close the channel and raf.
+        File file = new File(tempDir, "fsync-force-fails-0.sidecar");
+        CountingSidecar idx = new CountingSidecar(file, "fsync-force-fails", 0);
+        idx.append(99L);
+        idx.nextForceThrows = new IOException("simulated disk-full");
+
+        IOException thrown = assertThrows(IOException.class, idx::close);
+        assertEquals("simulated disk-full", thrown.getMessage(),
+            "the first error from forceChannel must surface; suppressed errors stay attached");
+
+        // The discriminator: re-opening the file must succeed, which means the previous handle
+        // was closed even though force threw. If close() short-circuited on the force error, the
+        // underlying RandomAccessFile would still hold the lock on platforms that lock, and on
+        // platforms that don't, the FD would leak (we can't observe the leak directly in a unit
+        // test but the reopen succeeding is the proxy for "no resource held").
+        try (LogicalSidecarIndex reopened = new LogicalSidecarIndex(file, "fsync-force-fails", 0)) {
+            assertEquals(1L, reopened.size());
+            assertEquals(99L, reopened.lookup(0L));
+        }
+    }
+
+    @Test
+    public void doubleCloseDoesNotForceTwice() throws IOException {
+        File file = new File(tempDir, "fsync-double-close-0.sidecar");
+        CountingSidecar idx = new CountingSidecar(file, "fsync-double-close", 0);
+        idx.append(7L);
+        idx.close();
+        idx.close();
+        assertEquals(1, idx.forceCount.get(),
+            "double close must not re-fsync — the second close is a no-op even when the first "
+                + "succeeded");
     }
 }
