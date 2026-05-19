@@ -215,9 +215,20 @@ class BrokerServerRequireLocalReplicaTest {
   def bomPrefixedFalseKeepsGateEngaged(): Unit = {
     // U+FEFF BYTE-ORDER MARK / ZERO WIDTH NO-BREAK SPACE — common paste
     // hazard from files saved as UTF-8-with-BOM. Not stripped by
-    // String.trim(). Note: a future `replaceAll("\\s+", ...)` upstream using
-    // `Pattern.UNICODE_CHARACTER_CLASS` WOULD match U+FEFF and silently flip
-    // this to fail-OPEN — exactly the regression this test pins. R41-D-2.
+    // String.trim(). R41-D-2.
+    //
+    // R42-D follow-up: an earlier revision of this comment named
+    // `Pattern.UNICODE_CHARACTER_CLASS` `\s` as the regression vector —
+    // that was wrong. U+FEFF has Unicode property `White_Space=No`, so
+    // `\s` under UNICODE_CHARACTER_CLASS (= `\p{IsWhite_Space}`) does NOT
+    // match it. Same for `Character.isWhitespace(0xFEFF) == false`, which
+    // means a refactor to `String.strip()` would NOT regress this case
+    // either. The realistic regression vector for U+FEFF is a BOM-removal
+    // preprocessor upstream of trim — a BOM-aware Reader, an explicit
+    // `replaceFirst("^\\uFEFF", "")` to handle UTF-8-with-BOM property
+    // files, or `org.apache.commons.io.input.BOMInputStream`. Any of those
+    // would silently flip this case to fail-OPEN; this test pins the
+    // contract that no such preprocessor sits in the parser chain today.
     assertTrue(BrokerServer.parseRequireLocalReplica("\uFEFFfalse"))
   }
 
@@ -250,6 +261,20 @@ class BrokerServerRequireLocalReplicaTest {
       assertEquals(
         s, s.trim,
         f"U+$cp%04X must survive String.trim — parser fail-closed contract depends on this"
+      )
+      // R42-D follow-up: ALSO call the parser directly so a refactor that
+      // swaps `.trim` for `.strip()` (which DOES strip U+00A0, U+202F,
+      // U+2007, U+1680, U+180E etc. under JDK 11+ `Character.isWhitespace`)
+      // breaks this test on the codepoints the dedicated single-codepoint
+      // tests above do NOT cover. Without this assertion the invariant test
+      // is a JDK tautology: it would pass even if the parser was changed to
+      // a hostile permissive form, because the loop body never invoked the
+      // parser. Pinning both contracts in the same iteration closes that
+      // gap and makes the relationship between "trim is the strict primitive"
+      // and "parser inherits the strict primitive's behaviour" assertable.
+      assertTrue(
+        BrokerServer.parseRequireLocalReplica(s),
+        f"U+$cp%04X-prefixed 'false' must NOT disable the gate — parser fail-closed contract"
       )
     }
   }

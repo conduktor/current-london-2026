@@ -114,12 +114,17 @@ final class BypassPrincipalsValidatorTest {
         // must reject it.
         ConfigException ex = assertThrows(ConfigException.class,
             () -> validator.ensureValid(CONFIG_NAME, "User:broker,User:kafka-controller"));
-        // The exact wording comes from RuleEngine.parseBypassPrincipals;
-        // pin "comma" so a future rewording without preserving intent
-        // would surface as a test failure.
-        assertTrue(ex.getMessage().toLowerCase().contains("comma")
-                || ex.getMessage().contains(","),
-            "Diagnostic should call out the comma typo: " + ex.getMessage());
+        // R42-D (test-quality follow-up): assert ONLY against the helper
+        // label substring "comma". Earlier version also allowed
+        // `ex.getMessage().contains(",")` as a fallback — but ConfigException
+        // formats as `"Invalid value <raw-input> for <name>: <msg>"` and
+        // LogSafe.sanitize passes U+002C through unchanged, so the fallback
+        // was permanently satisfied by the input echo. A regression that
+        // dropped the comma-aware diagnostic (replaced with a generic
+        // "invalid principal entry" message) would have passed silently. The
+        // tightened assertion pins the operator-facing label directly.
+        assertTrue(ex.getMessage().toLowerCase().contains("comma"),
+            "Diagnostic should call out the comma typo by name: " + ex.getMessage());
     }
 
     @Test
