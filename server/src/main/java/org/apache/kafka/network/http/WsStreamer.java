@@ -97,10 +97,16 @@ public final class WsStreamer {
     // RequestChannel request has no socket for KafkaApis.requestHelper.throttle to mute, so this field is the
     // load-bearing backpressure signal for streaming fetch loops — without it a quota-exhausted subscription
     // tight-loops. nanoTime rather than currentTimeMillis so a wall-clock backstep (NTP adjust, suspend/resume)
-    // can't extend the throttle window beyond what the broker asked for. Sentinel 0L means "no throttle stamped" —
-    // nanoTime() can legitimately read 0 once per JVM (probability ≈ 1 in 2^63), so the false-negative is
-    // negligible. Note: nanoTime values are signed and can be negative (per Javadoc), but a deadline computed
-    // as nanoTime() + positive-delay is monotonically greater than the read it came from, which is all we use.
+    // can't extend the throttle window beyond what the broker asked for. Sentinel 0L means "no throttle stamped"
+    // — the stored value is the *sum* nanoTime() + throttleNanos, which can land at exactly 0L only via signed
+    // overflow wrap (probability ≈ 1 in 2^64 per stamping); the false-negative is negligible. Per the
+    // System.nanoTime() Javadoc, nanoTime values are signed and can be negative, and an additive computation
+    // like (nanoTime() + positive-delay) can wrap past Long.MAX_VALUE to a numerically smaller value. The
+    // deadline is therefore NOT guaranteed to be numerically greater than the read it came from; what IS
+    // guaranteed is that the JDK-documented overflow-safe subtraction idiom (deadline - now > 0) wraps
+    // consistently in two's-complement and gives the correct sign for any elapsed interval < 2^63 ns (~292
+    // years). The read site at maybeKickFetch() uses exactly that idiom — do NOT replace it with a direct
+    // (now < deadline) absolute compare, which is unsafe under overflow.
     private final AtomicLong throttleUntilNanos = new AtomicLong(0L);
 
     private volatile long currentOffset;
