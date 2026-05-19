@@ -1,3 +1,27 @@
+# Forking Kafka — testing what LLMs can build
+
+This repository is an experiment. It tests whether modern LLMs, working in near-total autonomy, can take non-trivial broker-side feature ideas and turn them into working implementations on top of Apache Kafka.
+
+Each experiment lives on its own `experiment/*` branch and starts from a `PROMPT.md` at the branch root that spells out: goal, constraints, minimum viable outcome, acceptance criteria, functional test scenarios, and the working-mode rules the agent must follow. A hard constraint is shared by every experiment: **zero changes under `clients/`** — stock Kafka producers and consumers must continue to work unmodified.
+
+The implementations are produced by **Claude** (Anthropic) as the primary agent, with structured peer review from **Codex** (OpenAI) and **Gemini** (Google) at every major phase. At the start of each task, Claude fans out a fleet of sub-agents to scope HOW the work should be done; after each phase, another fleet audits what happened — and two slots in that audit fleet are reserved for Codex and Gemini. When Claude gets stuck in a local minimum, the escalation order is fixed: Codex first, then Gemini, and only as a last resort, inspiration-only consultation of a reference codebase (strictly no copy-paste, with the consultation documented in the commit message).
+
+## Experiments
+
+| Branch | Feature |
+|---|---|
+| [`experiment/compression-policy`](../../tree/experiment/compression-policy) | Reject `compression.type=none` on topics configured with `compression.policy=required`, per-partition. |
+| [`experiment/cel-rules`](../../tree/experiment/cel-rules) | A broker-side rule engine evaluating CEL `DENY` rules against any request, hot-reloaded from a compacted topic. |
+| [`experiment/multi-tenancy`](../../tree/experiment/multi-tenancy) | SASL-resolved tenant prefix; logical ↔ physical topic rewrite inside every handler. |
+| [`experiment/topic-views`](../../tree/experiment/topic-views) | Read-only virtual topic backed by a physical topic and a CEL predicate, filtered server-side. |
+| [`experiment/infinite-partitions`](../../tree/experiment/infinite-partitions) | A logical topic with N partitions backed by M ≪ N physical partitions; per-logical-topic offset sequence. |
+| [`experiment/io-uring`](../../tree/experiment/io-uring) | Linux PLAINTEXT listener via Netty's `IoUringEventLoopGroup`, with NIO fallback elsewhere. |
+| [`experiment/http-ws-sse`](../../tree/experiment/http-ws-sse) | HTTP `POST/GET /v1/topics/{topic}/records` translating to `ProduceRequest` / `FetchRequest` through the existing `RequestChannel`. |
+
+The base branch `current-london-2026` is unmodified Apache Kafka. The original Kafka documentation continues below.
+
+---
+
 Apache Kafka
 =================
 
