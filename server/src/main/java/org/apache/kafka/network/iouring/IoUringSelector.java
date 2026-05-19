@@ -1113,6 +1113,16 @@ public final class IoUringSelector implements BrokerSelector {
         nettyChannels.remove(id);
         lastActiveNanos.remove(id);
         if (channel != null) {
+            // Mirror NIO Selector.close(id) (clients/.../Selector.java:891): stamp the
+            // channel as LOCAL_CLOSE before tear-down. The caller of close(id) is the
+            // Acceptor under broker-max pressure, not a peer disconnect — downstream
+            // log/metric attribution (Processor.processChannelException via
+            // openOrClosingChannel) reads channel.state() and would otherwise see the
+            // pre-close state (typically READY) and report the eviction as if it were
+            // an in-flight error. The closingChannels path below intentionally leaves
+            // state alone (same as NIO) — those channels already carry the state under
+            // which closing was first triggered.
+            channel.state(ChannelState.LOCAL_CLOSE);
             explicitlyMutedChannels.remove(channel);
             Utils.closeQuietly(channel, "channel close(" + id + ")");
             return;

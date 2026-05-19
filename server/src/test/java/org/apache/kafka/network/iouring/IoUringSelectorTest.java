@@ -671,6 +671,37 @@ class IoUringSelectorTest {
     }
 
     @Test
+    void closeByIdStampsChannelStateAsLocalCloseBeforeClose() throws Exception {
+        // Round-20 P-CLOSE-STATE parity finding: NIO's Selector.close(id) sets
+        // channel.state(LOCAL_CLOSE) before doClose (clients/.../Selector.java:891)
+        // so that downstream consumers — Processor.processChannelException reads
+        // channel.state() via openOrClosingChannel for log/metric attribution —
+        // attribute the eviction correctly rather than reporting the pre-close
+        // state (typically READY). Pre-fix the io_uring path closed without
+        // touching state, so a closeExcessConnections eviction looked, in the
+        // operator's logs, indistinguishable from a peer-side error on a healthy
+        // connection. One-line fix, but the visibility regression is corrosive on
+        // a busy broker — every excess-eviction reads as a fault.
+        IoUringSelector s = newSelector(IDLE_NANOS_NEVER);
+        acceptNew(s, REMOTE_A);
+        s.poll(0);
+        String id = s.connected().get(0);
+        KafkaChannel ch = s.channel(id);
+        assertNotNull(ch);
+        // Pre-condition: a freshly accepted PLAINTEXT channel is in READY state, not LOCAL_CLOSE.
+        assertEquals(ChannelState.READY, ch.state(),
+            "preconditions: a freshly accepted PLAINTEXT channel must report READY before close");
+
+        s.close(id);
+
+        assertNull(s.channel(id), "close(id) removed the channel from the active map");
+        assertEquals(ChannelState.LOCAL_CLOSE, ch.state(),
+            "close(id) must stamp channel.state(LOCAL_CLOSE) before tearing the channel down — "
+                + "without it, downstream log/metric attribution reads stale READY state on every "
+                + "excess-eviction and the operator can't distinguish quota evictions from faults");
+    }
+
+    @Test
     void closeByIdAlsoCleansClosingChannels() throws Exception {
         // Codex audit blocker: NIO's Selector.close(id) cleans both `channels` and
         // `closingChannels` (clients/.../Selector.java:886-899). Without that fallthrough,
