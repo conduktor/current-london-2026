@@ -243,8 +243,23 @@ class KafkaApis(val requestChannel: RequestChannel,
         // bypass check even when the operator listed it. Codex deep-audit
         // P1c — match the canonical "type:name" form the engine compares
         // against, not the toString contract.
-        val principalName = Option(request.context.principal)
-          .map(p => p.getPrincipalType + ":" + p.getName).orNull
+        //
+        // R28 Axis 2 (HIGH, Task #220): the principalName argument to
+        // RuleEngine.evaluate is only consulted inside its
+        // `if (fromPrivilegedListener && bypassIsAuthorisedFor(...))` guard
+        // (see RuleEngine.java:761). For the common data-plane request
+        // (`fromPrivilegedListener=false`) the canonical-form string was
+        // built only to be ignored. Skip the concat entirely in that case,
+        // and drop the previous `Option(...).map(p => …).orNull` chain
+        // which additionally allocated a `Some` + a function instance per
+        // deny-path request — replace with a direct null check that
+        // performs the StringBuilder concat only when the bypass guard
+        // could actually consult it.
+        val principalName =
+          if (fromPrivilegedListener) {
+            val p = request.context.principal
+            if (p != null) p.getPrincipalType + ":" + p.getName else null
+          } else null
         val ruleDecision = ruleEngine.evaluate(
           request.header.apiKey,
           request.header.clientId,
