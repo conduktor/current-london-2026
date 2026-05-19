@@ -133,6 +133,21 @@ class ControllerConfigurationValidator(kafkaConfig: KafkaConfig) extends Configu
             s"${ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG} must not equal the topic name " +
               s"'${resource.name()}'. A view cannot back itself.")
         }
+        // Internal-topic backings would let an admin (who legitimately holds READ on
+        // __consumer_offsets / __transaction_state / __share_group_state) expose coordinator
+        // state to any principal granted READ on the view: the fetch redirect at
+        // KafkaApis.scala intentionally does NOT re-check ACLs on the backing, so the view
+        // becomes an unfiltered read window onto records whose schemas encode every consumer
+        // group's offsets, every transactional PID, and every share-group's state. Reject the
+        // misconfiguration at validation time so neither CreateTopics nor IncrementalAlterConfigs
+        // / legacy AlterConfigs can persist a view bound to an internal topic — Topic.isInternal
+        // enumerates the reserved Kafka-internal set exactly, so this catches the documented
+        // cross-tenant leak without over-rejecting user topics that happen to start with '__'.
+        if (backing != null && Topic.isInternal(backing)) {
+          throw new InvalidConfigurationException(
+            s"${ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG} must not be an internal Kafka topic " +
+              s"('$backing'). Views cannot project coordinator-managed internal topics.")
+        }
       case BROKER => validateBrokerName(resource.name())
       case CLIENT_METRICS =>
         val properties = new Properties()

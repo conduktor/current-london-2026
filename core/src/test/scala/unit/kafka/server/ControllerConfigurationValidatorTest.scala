@@ -22,6 +22,7 @@ import org.apache.kafka.common.config.ConfigResource
 import org.apache.kafka.common.config.ConfigResource.Type.{BROKER, BROKER_LOGGER, CLIENT_METRICS, GROUP, TOPIC}
 import org.apache.kafka.common.config.TopicConfig.{REMOTE_LOG_STORAGE_ENABLE_CONFIG, SEGMENT_BYTES_CONFIG, SEGMENT_JITTER_MS_CONFIG, SEGMENT_MS_CONFIG}
 import org.apache.kafka.common.errors.{InvalidConfigurationException, InvalidRequestException, InvalidTopicException}
+import org.apache.kafka.common.internals.Topic
 import org.apache.kafka.coordinator.group.GroupConfig
 import org.apache.kafka.server.metrics.ClientMetricsConfigs
 import org.apache.kafka.server.views.ViewTopicConfig
@@ -225,6 +226,59 @@ class ControllerConfigurationValidatorTest {
     config.put(ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.color == 'red'")
     config.put(ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
     validator.validate(new ConfigResource(TOPIC, "events-view"), config, emptyMap())
+  }
+
+  @Test
+  def testViewBackingMustNotBeInternalConsumerOffsets(): Unit = {
+    // Without this guard, an admin holding READ on __consumer_offsets could front it with a view
+    // whose predicate=true and then grant READ on the view to a non-admin: the fetch redirect
+    // skips ACL re-check on the backing, so the non-admin would receive raw OffsetCommit records
+    // for every consumer group in the cluster. Reject at controller-validation time.
+    val config = new util.TreeMap[String, String]()
+    config.put(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, Topic.GROUP_METADATA_TOPIC_NAME)
+    config.put(ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "true")
+    config.put(ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+    val ex = assertThrows(classOf[InvalidConfigurationException], () => validator.validate(
+      new ConfigResource(TOPIC, "peek-offsets"), config, emptyMap()))
+    assert(ex.getMessage.contains("must not be an internal Kafka topic"),
+      s"unexpected message: ${ex.getMessage}")
+  }
+
+  @Test
+  def testViewBackingMustNotBeInternalTransactionState(): Unit = {
+    val config = new util.TreeMap[String, String]()
+    config.put(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, Topic.TRANSACTION_STATE_TOPIC_NAME)
+    config.put(ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "true")
+    config.put(ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+    val ex = assertThrows(classOf[InvalidConfigurationException], () => validator.validate(
+      new ConfigResource(TOPIC, "peek-txn"), config, emptyMap()))
+    assert(ex.getMessage.contains("must not be an internal Kafka topic"),
+      s"unexpected message: ${ex.getMessage}")
+  }
+
+  @Test
+  def testViewBackingMustNotBeInternalShareGroupState(): Unit = {
+    val config = new util.TreeMap[String, String]()
+    config.put(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, Topic.SHARE_GROUP_STATE_TOPIC_NAME)
+    config.put(ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "true")
+    config.put(ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+    val ex = assertThrows(classOf[InvalidConfigurationException], () => validator.validate(
+      new ConfigResource(TOPIC, "peek-share"), config, emptyMap()))
+    assert(ex.getMessage.contains("must not be an internal Kafka topic"),
+      s"unexpected message: ${ex.getMessage}")
+  }
+
+  @Test
+  def testViewBackingNamedLikeInternalButNotReservedIsAccepted(): Unit = {
+    // Topic.isInternal enumerates the reserved set exactly. A user topic that happens to start
+    // with '__' but is not in that set is a legitimate (though unusual) user topic and must not
+    // be rejected by the internal-topic gate — over-rejection would break tenants who legitimately
+    // own such names.
+    val config = new util.TreeMap[String, String]()
+    config.put(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, "__user_owned_topic")
+    config.put(ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "true")
+    config.put(ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+    validator.validate(new ConfigResource(TOPIC, "view-on-userish"), config, emptyMap())
   }
 
   @Test
