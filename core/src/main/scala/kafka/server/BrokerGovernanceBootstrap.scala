@@ -682,7 +682,21 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
           // single "repeated N times" rollup instead of separate WARN
           // bursts for each fault. Class-qualified key ensures distinct
           // failure modes surface distinctly.
-          maybeWarnSuppressed(s"${t.getClass.getName}: ${t.getMessage}")
+          //
+          // Round-16 HIGH (audit-agent-A): route the message through
+          // sanitizePoisonMessage as defense-in-depth. The per-record
+          // catch at line 962 already sanitises wire-derived exception
+          // messages (replay() commit 1846320f8e closed BLOCKER-shape
+          // log forgery for the per-record loop). This outer systemic
+          // catch is one mis-placed throw away from being an escape
+          // hatch for the same producer-controlled strings — any future
+          // refactor that lets a wire-derived exception bypass the
+          // inner per-record catch and surface here would re-open the
+          // CR/LF/ANSI/bidi forgery vector via the dedup'd WARN. The
+          // sanitizePoisonMessage helper preserves the class-qualified
+          // dedup key (its output is `${t.getClass.getName}: ${sanitized}`)
+          // so the Round-11 fault-isolation property still holds.
+          maybeWarnSuppressed(sanitizePoisonMessage(t))
       }
     }
     scheduler.schedule("governance-rules-drain", task, intervalMs, intervalMs)
