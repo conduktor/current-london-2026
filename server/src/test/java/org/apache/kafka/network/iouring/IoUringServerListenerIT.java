@@ -27,12 +27,16 @@ import org.junit.jupiter.api.Test;
 
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
+import java.lang.reflect.Field;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelOption;
+import io.netty.channel.EventLoopGroup;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -221,6 +225,78 @@ class IoUringServerListenerIT {
                 received.payload().get(body);
                 assertEquals("buffered", new String(body),
                     "listener with custom buffer sizes still round-trips the payload correctly");
+            }
+        }
+    }
+
+    /**
+     * C-18-L1 regression: {@link IoUringServerListener#close()} must return within a bounded
+     * wall-clock budget even when the io_uring event-loop thread is wedged inside a task that
+     * never honours interrupts. Pre-fix the code used {@code syncUninterruptibly()} on the
+     * {@code shutdownGracefully} future, which blocks <em>forever</em> whenever the event-loop
+     * thread fails to transition to TERMINATED — a known io_uring failure mode under
+     * submission-queue pressure or a non-interruptible kernel syscall.
+     *
+     * <p>The test wedges the loop by submitting a busy-loop {@link Runnable} that ignores
+     * interrupts, then asserts {@code close()} still returns within
+     * {@code SHUTDOWN_QUIET_MS + SHUTDOWN_TIMEOUT_MS} plus a generous CI slack. Without the
+     * L1 fix the {@code close()} call would never return and this test would time out at
+     * the JUnit deadline rather than fail with a clean assertion.
+     */
+    @Test
+    void closeReturnsWithinBoundedTimeoutEvenWithWedgedEventLoopTask() throws Exception {
+        assumeTrue(IoUringSupport.isAvailable(),
+            "io_uring not available (" + IoUringSupport.unavailabilityReason() + "); skipping");
+
+        AtomicBoolean keepRunning = new AtomicBoolean(true);
+        try (IoUringSelector selector = new IoUringSelector(
+                LISTENER, MAX_RECEIVE, MemoryPool.NONE, IDLE_NANOS_NEVER, Time.SYSTEM)) {
+            IoUringServerListener listener = new IoUringServerListener(
+                new InetSocketAddress("127.0.0.1", 0), selector);
+            try {
+                listener.start();
+
+                CountDownLatch wedgeStarted = new CountDownLatch(1);
+                // Reach into the private event-loop group field. Adding a public accessor for
+                // a test-only seam would leak production API; reflection on a final class is
+                // the contained alternative — package-private to test code only.
+                Field field = IoUringServerListener.class.getDeclaredField("eventLoopGroup");
+                field.setAccessible(true);
+                EventLoopGroup group = (EventLoopGroup) field.get(listener);
+                group.next().execute(() -> {
+                    wedgeStarted.countDown();
+                    // Busy-wait ignoring interrupts. Netty's shutdownGracefully sends an
+                    // interrupt; a busy loop that does not check Thread.interrupted() never
+                    // yields back to the loop's run() — exactly the wedge scenario the L1
+                    // fix protects against. yield() keeps a single-CPU CI runner responsive.
+                    while (keepRunning.get()) {
+                        Thread.yield();
+                    }
+                });
+                // Wait until the wedge task is actually executing on the loop thread. If we
+                // raced close() in before the task started running, we would only exercise
+                // the empty-queue shutdown path which always returned quickly even pre-fix.
+                assertTrue(wedgeStarted.await(5, TimeUnit.SECONDS),
+                    "wedge task must reach the event-loop thread before we close the listener");
+
+                long startNanos = System.nanoTime();
+                listener.close();
+                long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
+
+                // Listener's budget: SHUTDOWN_QUIET_MS (100) + SHUTDOWN_TIMEOUT_MS (5000) = 5100ms.
+                // Allow ~2x slack for CI scheduling jitter and the additional channel.close()
+                // bounded wait that runs first. Anything materially over this means the bound
+                // regressed and a real broker shutdown could hang indefinitely.
+                long maxAllowedMs = 12_000;
+                assertTrue(elapsedMs <= maxAllowedMs,
+                    "close() must return within " + maxAllowedMs + "ms even when the io_uring "
+                        + "event loop is wedged; observed " + elapsedMs + "ms. Pre-L1 this hung "
+                        + "forever via syncUninterruptibly() — the regression has returned.");
+            } finally {
+                // Release the wedge so the stray loop thread can exit. close() above is
+                // already idempotent so the explicit call here is purely defensive.
+                keepRunning.set(false);
+                listener.close();
             }
         }
     }

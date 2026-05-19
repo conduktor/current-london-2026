@@ -272,8 +272,23 @@ public final class IoUringServerListener implements AutoCloseable {
                 log.debug("error closing io_uring server channel", e);
             }
         }
-        eventLoopGroup.shutdownGracefully(SHUTDOWN_QUIET_MS, SHUTDOWN_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-            .syncUninterruptibly();
+        // C-18-L1: bound the event-loop shutdown wait the same way serverChannel.close() is
+        // bounded above. shutdownGracefully's own Future respects the SHUTDOWN_TIMEOUT_MS
+        // deadline, but syncUninterruptibly() does NOT — if the io_uring event-loop thread
+        // is wedged in a kernel syscall (a known io_uring failure mode under low-memory
+        // submission-queue pressure), syncUninterruptibly blocks forever, defeating the
+        // explicit timeout passed to shutdownGracefully. awaitUninterruptibly(timeout)
+        // gives the loop the same wall-clock budget — twice the shutdownGracefully
+        // deadline as headroom for the quiet period — then proceeds regardless so a wedged
+        // event loop does not turn into an unkillable broker shutdown.
+        long shutdownBudgetMs = SHUTDOWN_QUIET_MS + SHUTDOWN_TIMEOUT_MS;
+        boolean shutdownInTime = eventLoopGroup
+            .shutdownGracefully(SHUTDOWN_QUIET_MS, SHUTDOWN_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            .awaitUninterruptibly(shutdownBudgetMs, TimeUnit.MILLISECONDS);
+        if (!shutdownInTime) {
+            log.warn("io_uring event-loop group did not shut down within {}ms; leaving it detached " +
+                "to avoid blocking the broker shutdown thread on a wedged event loop", shutdownBudgetMs);
+        }
     }
 
     /**
