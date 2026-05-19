@@ -1748,6 +1748,70 @@ class ControllerApisTest {
   }
 
   @Test
+  def testEnvelopeRefusesForgedTenantPrincipalOnRenewDelegationToken(): Unit = {
+    // RENEW_DELEGATION_TOKEN is outside TENANT_ALLOWED_APIS — the request
+    // data carries only an HMAC (no principal-name field), so the controller
+    // handler has no caller-supplied identity to validate. Cross-tenant
+    // defence relies on the envelope gate refusing a forged tenant
+    // forwardedPrincipal here, before the handler is ever invoked. Without
+    // this gate a CLUSTER_ACTION holder could envelope a RENEW with
+    // `forwardedPrincipal=__tenant_<id>.<u>` and reach the renew handler;
+    // there, `allowedToRenew` (strict KafkaPrincipal equality) would still
+    // catch most cross-owner attempts but it would not catch the case where
+    // the forged principal coincidentally appears in the token's `renewers`
+    // list (e.g. a tenant added their own operator-bound principal at create
+    // time). The envelope gate closes the gap by structurally refusing the
+    // forwarded tenant identity for any non-tenant-allowed API.
+    val renewRequest = new RenewDelegationTokenRequest.Builder(
+      new RenewDelegationTokenRequestData()
+        .setHmac(Array.emptyByteArray)
+        .setRenewPeriodMs(86400000L)).build()
+    val forged = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_acme.alice")
+    val envelopeRequest = kafka.utils.TestUtils.buildEnvelopeRequest(
+      renewRequest, envelopePrincipalSerde, requestChannelMetrics, time.nanoseconds(),
+      forwardedPrincipal = forged,
+      outerPrincipal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = new MockController.Builder().build(),
+      tenantConfig = tenantConfigBinding("acme", "CONTROLLER"))
+    controllerApis.handle(envelopeRequest, RequestLocal.noCaching())
+
+    val response = captureEnvelopeResponse(envelopeRequest)
+    assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED, response.error,
+      "envelope gate must refuse forged tenant principal for RENEW_DELEGATION_TOKEN")
+  }
+
+  @Test
+  def testEnvelopeRefusesForgedTenantPrincipalOnExpireDelegationToken(): Unit = {
+    // Same shape as RENEW above; EXPIRE_DELEGATION_TOKEN is also outside
+    // TENANT_ALLOWED_APIS and also carries only an HMAC. A forged tenant
+    // forwardedPrincipal would otherwise reach `allowedToRenew` (which gates
+    // both renew and expire) and succeed if the forged identity matches an
+    // entry in the token's renewers list.
+    val expireRequest = new ExpireDelegationTokenRequest.Builder(
+      new ExpireDelegationTokenRequestData()
+        .setHmac(Array.emptyByteArray)
+        .setExpiryTimePeriodMs(-1L)).build()
+    val forged = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_acme.alice")
+    val envelopeRequest = kafka.utils.TestUtils.buildEnvelopeRequest(
+      expireRequest, envelopePrincipalSerde, requestChannelMetrics, time.nanoseconds(),
+      forwardedPrincipal = forged,
+      outerPrincipal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = new MockController.Builder().build(),
+      tenantConfig = tenantConfigBinding("acme", "CONTROLLER"))
+    controllerApis.handle(envelopeRequest, RequestLocal.noCaching())
+
+    val response = captureEnvelopeResponse(envelopeRequest)
+    assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED, response.error,
+      "envelope gate must refuse forged tenant principal for EXPIRE_DELEGATION_TOKEN")
+  }
+
+  @Test
   def testEnvelopeRefusesEmptyTenantIdForgedPrincipal(): Unit = {
     // `__tenant_.alice` matches the PRINCIPAL_PREFIX startsWith — the gate
     // must not require a well-formed tenant id; it must refuse on prefix
