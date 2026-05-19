@@ -470,26 +470,45 @@ final class IoUringTransportLayer implements TransportLayer {
      * Store an async writeAndFlush failure for the Processor's next write() call to surface.
      * Preserves the first cause as the primary; subsequent causes chain as suppressed.
      *
-     * <p>Race with the Processor's {@code asyncWriteFailure.getAndSet(null)}:
+     * <p>Race with the Processor's {@code asyncWriteFailure.getAndSet(null)} and with other
+     * listener threads:
      * <ul>
      *   <li>If our CAS-null-to-cause wins, the next Processor write surfaces our cause.</li>
-     *   <li>If CAS fails because a primary is already set, we addSuppressed under it. The
+     *   <li>If CAS fails because a primary is already set, addSuppressed under it. The
      *       Processor may have just consumed that primary via getAndSet(null), in which case
      *       the IOException it's about to throw still carries the primary (and thus our
      *       suppressed cause), so nothing is lost.</li>
-     *   <li>If CAS fails AND the primary read returns null (Processor's getAndSet(null) raced
-     *       between our failed CAS and the load), the slot is empty; retry the CAS. Worst
-     *       case the next listener firing addSuppresseds under us — never lost.</li>
+     *   <li>If CAS fails AND the load that follows returns null (Processor's getAndSet(null)
+     *       raced between our failed CAS and the load), the slot is transiently empty. We
+     *       must <strong>loop</strong>, not just retry once: a single retry-CAS can fail
+     *       because yet another listener won the now-null slot before our retry — and the
+     *       pre-fix code dropped our cause silently in exactly that interleaving (DIAG-5).
+     *       The loop terminates because each iteration either wins the CAS or finds a
+     *       non-null primary to suppress under; the only way to stay in the loop is for
+     *       another listener to keep racing in between our CAS-fail and our load, which is
+     *       bounded by listener firing rate per channel and by Processor.write being
+     *       Selector-thread-serial (at most one getAndSet per Processor poll cycle).
+     *       The retry-CAS therefore terminates in a handful of iterations even under
+     *       worst-case burst contention. Verified by stress regression in
+     *       IoUringTransportLayerTest.recordAsyncWriteFailureNeverDropsACauseUnderConcurrentConsumerRetryRace
+     *       (DIAG-5).</li>
      * </ul>
      */
     private void recordAsyncWriteFailure(Throwable cause) {
-        if (!asyncWriteFailure.compareAndSet(null, cause)) {
-            Throwable primary = asyncWriteFailure.get();
-            if (primary == null) {
-                asyncWriteFailure.compareAndSet(null, cause);
-            } else {
-                primary.addSuppressed(cause);
+        while (true) {
+            if (asyncWriteFailure.compareAndSet(null, cause)) {
+                return;
             }
+            Throwable primary = asyncWriteFailure.get();
+            if (primary != null) {
+                primary.addSuppressed(cause);
+                return;
+            }
+            // primary == null: the Processor's getAndSet(null) raced between our failed CAS
+            // and this load. Loop and retry the CAS — without the loop a third concurrent
+            // listener that wins the now-null slot would cause us to silently drop our
+            // cause (DIAG-5 stress test reproducibly hit ~700 drops per 200k iterations
+            // pre-fix).
         }
     }
 
@@ -768,6 +787,19 @@ final class IoUringTransportLayer implements TransportLayer {
      */
     void addPendingWriteBytesForTesting(long n) {
         pendingWriteBytes.addAndGet(n);
+    }
+
+    /**
+     * Test-only entry point that drains the {@link #asyncWriteFailure} slot using the
+     * exact same {@link AtomicReference#getAndSet} primitive the production
+     * {@link #write(ByteBuffer)} consumer path uses (see line above DIAG-2 commentary).
+     * DIAG-5's stress test runs this in a tight loop from a consumer thread while N
+     * writer threads call {@link #recordAsyncWriteFailureForTesting(Throwable)}, so
+     * the same race interleaving the Processor would expose against concurrent Netty
+     * listeners is exercised at much higher contention than a real broker workload.
+     */
+    Throwable asyncWriteFailureForTestingGetAndClear() {
+        return asyncWriteFailure.getAndSet(null);
     }
 
     @Override

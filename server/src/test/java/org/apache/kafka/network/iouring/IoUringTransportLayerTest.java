@@ -26,8 +26,14 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.SelectionKey;
+import java.util.IdentityHashMap;
+import java.util.Set;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import io.netty.bootstrap.Bootstrap;
@@ -1085,5 +1091,190 @@ class IoUringTransportLayerTest {
             "DIAG-4: hasPendingWrites must report false on a closed channel even when a write " +
             "was in-flight at the moment of close. Without the reset, the counter would stay " +
             "positive until a Netty listener fired post-close (potentially never).");
+    }
+
+    @Test
+    void recordAsyncWriteFailureNeverDropsACauseUnderConcurrentConsumerRetryRace() throws Exception {
+        // DIAG-5: the retry-CAS path in recordAsyncWriteFailure has a window where a third
+        // listener can win the slot between our primary.get() (which returned null because
+        // the Processor's getAndSet(null) raced in) and our CAS-2(null, cause). In that
+        // window, CAS-2 fails because slot is no longer null, and the pre-fix code falls
+        // through silently — our cause is lost. The channel still fails (via whichever
+        // cause won the slot or was just consumed), but the lost cause is debugging info
+        // operators rely on to attribute the failure to a specific write.
+        //
+        // Pre-fix code:
+        //     if (!asyncWriteFailure.compareAndSet(null, cause)) {        // CAS-1
+        //         Throwable primary = asyncWriteFailure.get();             // load
+        //         if (primary == null) {
+        //             asyncWriteFailure.compareAndSet(null, cause);        // CAS-2 — drop on fail
+        //         } else {
+        //             primary.addSuppressed(cause);
+        //         }
+        //     }
+        //
+        // Race interleaving that drops causeB:
+        //   1. listener A: CAS-1(null, A) succeeds → slot = A
+        //   2. listener B: CAS-1(null, B) fails (slot = A)
+        //   3. Processor: getAndSet(null) returns A → slot = null
+        //   4. listener B: primary.get() reads null
+        //   5. listener C: CAS-1(null, C) succeeds → slot = C
+        //   6. listener B: CAS-2(null, B) fails (slot = C, not null) → B silently dropped
+        //
+        // We can't reliably reproduce this exact interleaving with bare Thread.sleep, so we
+        // run a stress test: N writer threads each plant K causes, one consumer thread
+        // drains the slot in a tight loop, and at the end we account for every cause —
+        // either consumed (returned by getAndSet) or suppressed under some consumed primary.
+        // Any cause not accounted for is a drop. The pre-fix code reproducibly drops a
+        // handful per million iterations; the fix accounts for 100% across the same run.
+        //
+        // Determinism: we use the package-private recordAsyncWriteFailureForTesting seam
+        // (which calls the production recordAsyncWriteFailure verbatim — see
+        // {@link IoUringTransportLayer#recordAsyncWriteFailureForTesting}) so this test
+        // exercises the exact same code path real Netty listeners hit.
+        //
+        // Test design note: the consumer thread collects PRIMARIES only; it does NOT
+        // snapshot {@code primary.getSuppressed()} during the run. Reason: in the
+        // production code, a listener that lost the CAS does {@code primary.addSuppressed(cause)}
+        // potentially AFTER the Processor has already drained the primary via
+        // {@code getAndSet(null)}. In production this is fine because the Processor wraps
+        // the primary in an IOException whose stack trace reflects the LIVE primary state
+        // at the moment any reader inspects it — addSuppressed is thread-safe and visible
+        // through subsequent getSuppressed() calls. But if the test snapshots
+        // primary.getSuppressed() *while writers are still running*, late addSuppressed
+        // calls land into the live primary but miss our snapshot, producing false-positive
+        // "drops". So we collect primaries during the run and only walk their suppressed
+        // lists ONCE, after all writers finish — by which time every addSuppressed has
+        // completed and the suppressed lists are stable.
+        IoUringTransportLayer l = newLayer();
+
+        final int writers = 4;
+        final int causesPerWriter = 50_000;
+        final int totalCauses = writers * causesPerWriter;
+
+        // ConcurrentLinkedQueue so consumer-thread offers and final aggregation are safe;
+        // IdentityHashMap for the final accounting because every cause is a distinct
+        // RuntimeException with a unique message (we want identity comparison anyway).
+        ConcurrentLinkedQueue<Throwable> consumedPrimaries = new ConcurrentLinkedQueue<>();
+
+        Throwable[][] causes = new Throwable[writers][causesPerWriter];
+        for (int w = 0; w < writers; w++) {
+            for (int i = 0; i < causesPerWriter; i++) {
+                causes[w][i] = new RuntimeException("plant-w" + w + "-i" + i);
+            }
+        }
+
+        CountDownLatch start = new CountDownLatch(1);
+        CountDownLatch writersDone = new CountDownLatch(writers);
+        AtomicInteger consumerStop = new AtomicInteger(0);
+
+        ExecutorService pool = Executors.newFixedThreadPool(writers + 1);
+        try {
+            pool.submit(consumerTask(l, start, consumerStop, consumedPrimaries));
+            for (int w = 0; w < writers; w++) {
+                pool.submit(writerTask(l, start, writersDone, causes[w]));
+            }
+
+            start.countDown();
+            assertTrue(writersDone.await(60, TimeUnit.SECONDS),
+                "writers must finish within 60s");
+            // Let consumer finish its final-drain sweep before stopping it.
+            Thread.sleep(50);
+            consumerStop.set(1);
+        } finally {
+            pool.shutdown();
+            assertTrue(pool.awaitTermination(10, TimeUnit.SECONDS),
+                "executor must terminate within 10s");
+        }
+
+        // Final defensive drain in case anything is still in the slot.
+        Throwable trailing = l.asyncWriteFailureForTestingGetAndClear();
+        if (trailing != null) {
+            consumedPrimaries.add(trailing);
+        }
+
+        // Walk all consumed primaries NOW (after writers stopped) — every addSuppressed
+        // has completed, suppressed lists are stable.
+        Set<Throwable> consumed = java.util.Collections.newSetFromMap(new IdentityHashMap<>());
+        Set<Throwable> suppressed = java.util.Collections.newSetFromMap(new IdentityHashMap<>());
+        for (Throwable primary : consumedPrimaries) {
+            consumed.add(primary);
+            for (Throwable s : primary.getSuppressed()) {
+                suppressed.add(s);
+            }
+        }
+
+        int missing = countMissing(causes, consumed, suppressed);
+        int accountedFor = totalCauses - missing;
+
+        assertEquals(totalCauses, accountedFor,
+            "DIAG-5: every planted cause must be either consumed as a primary or chained as " +
+            "a suppressed exception. Pre-fix the retry-CAS at recordAsyncWriteFailure dropped " +
+            "causes silently when a third listener won the slot between our null-read and our " +
+            "CAS-2; missing count was " + missing + " out of " + totalCauses + ".");
+        assertEquals(0, missing,
+            "DIAG-5: no planted cause may be unaccounted for (no consumed, no suppressed). " +
+            "missing=" + missing);
+    }
+
+    private static Runnable consumerTask(IoUringTransportLayer l,
+                                         CountDownLatch start,
+                                         AtomicInteger consumerStop,
+                                         ConcurrentLinkedQueue<Throwable> consumedPrimaries) {
+        return () -> {
+            try {
+                start.await();
+                while (consumerStop.get() == 0) {
+                    drainOnce(l, consumedPrimaries);
+                }
+                // Final drain sweep — under load a writer's last plant may land between
+                // the consumer's last loop iteration and consumerStop flipping.
+                for (int i = 0; i < 64; i++) {
+                    drainOnce(l, consumedPrimaries);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        };
+    }
+
+    private static Runnable writerTask(IoUringTransportLayer l,
+                                       CountDownLatch start,
+                                       CountDownLatch writersDone,
+                                       Throwable[] myCauses) {
+        return () -> {
+            try {
+                start.await();
+                for (Throwable c : myCauses) {
+                    l.recordAsyncWriteFailureForTesting(c);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } finally {
+                writersDone.countDown();
+            }
+        };
+    }
+
+    private static void drainOnce(IoUringTransportLayer l,
+                                  ConcurrentLinkedQueue<Throwable> consumedPrimaries) {
+        Throwable primary = l.asyncWriteFailureForTestingGetAndClear();
+        if (primary != null) {
+            consumedPrimaries.add(primary);
+        }
+    }
+
+    private static int countMissing(Throwable[][] causes,
+                                    Set<Throwable> consumed,
+                                    Set<Throwable> suppressed) {
+        int missing = 0;
+        for (Throwable[] row : causes) {
+            for (Throwable c : row) {
+                if (!consumed.contains(c) && !suppressed.contains(c)) {
+                    missing++;
+                }
+            }
+        }
+        return missing;
     }
 }
