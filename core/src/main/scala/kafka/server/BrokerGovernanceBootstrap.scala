@@ -87,11 +87,10 @@ object LocalReplicaStatus {
  *
  * <p>This is the broker's own consumer of the rules topic, so the work is
  * already unconditionally exempt from rule evaluation: no
- * [[RuleEngine#evaluate]] calls are made anywhere in this class. The
- * [[RuleEngine#INTERNAL_CLIENT_ID_PREFIX]] bypass is for the
- * [[org.apache.kafka.clients.consumer.Consumer]]-driven path
- * ([[org.apache.kafka.server.rules.GovernanceTopicReader]]); the direct-log
- * path used here never enters [[RuleEngine#evaluate]] at all.
+ * [[RuleEngine#evaluate]] calls are made anywhere in this class. The direct-log
+ * path used here never enters [[RuleEngine#evaluate]] at all, so the
+ * [[RuleEngine#INTERNAL_CLIENT_ID_PREFIX]] sentinel-clientId bypass is not
+ * required on this code path.
  *
  * <h3>Operator-visible posture: "fail-stale-not-empty"</h3>
  *
