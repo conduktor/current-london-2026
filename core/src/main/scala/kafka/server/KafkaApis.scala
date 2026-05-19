@@ -116,7 +116,12 @@ class KafkaApis(val requestChannel: RequestChannel,
   // wiring the kernel surfaces here, not deep in handleProduceRequest.
   java.util.Objects.requireNonNull(concentrationKernel, "concentrationKernel")
   this.logIdent = "[KafkaApi-%d] ".format(brokerId)
-  val configHelper = new ConfigHelper(metadataCache, config, configRepository)
+  // Gemini r21 HIGH #159 — feed the backing-topic predicate into the DescribeConfigs handler so
+  // a DESCRIBE_CONFIGS-authorized principal cannot introspect the substrate's settings via the
+  // backing-topic name. The kernel is the broker's canonical source for backing-name
+  // identification (already used by METADATA(isAllTopics) #157 and DescribeTopicPartitions(all)).
+  val configHelper = new ConfigHelper(metadataCache, config, configRepository,
+    (name: String) => concentrationKernel.isBackingTopic(name))
   val authHelper = new AuthHelper(authorizer)
   val requestHelper = new RequestHandlerHelper(requestChannel, quotas, time)
   val aclApis = new AclApis(authHelper, authorizer, requestHelper, "broker", config)

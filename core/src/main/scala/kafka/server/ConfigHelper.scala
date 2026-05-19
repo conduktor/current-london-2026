@@ -42,7 +42,26 @@ import scala.collection.{Map, mutable}
 import scala.jdk.CollectionConverters._
 import scala.jdk.OptionConverters.RichOptional
 
-class ConfigHelper(metadataCache: MetadataCache, config: KafkaConfig, configRepository: ConfigRepository) extends Logging {
+/**
+ * @param isBackingTopic predicate that returns {@code true} when the named topic is the backing
+ *   substrate of a declared logical topic on this node. Returning {@code true} causes any
+ *   {@code DescribeConfigs} request targeting that name to be rejected with
+ *   {@code INVALID_TOPIC_EXCEPTION} (Gemini r21 HIGH #159). Backing topics MUST NEVER leak their
+ *   configuration through client-facing APIs — {@code cleanup.policy}, {@code retention.ms},
+ *   {@code segment.bytes}, {@code min.insync.replicas} and {@code replication.factor} describe
+ *   the substrate that hosts every co-tenant logical topic; exposing them confirms the backing
+ *   name and reveals storage internals to anyone with {@code DESCRIBE_CONFIGS} on the topic.
+ *   Default is the trivial {@code _ => false} so unit-test instantiations and pre-kernel call
+ *   sites stay source-compatible. The check runs AFTER the {@code DESCRIBE_CONFIGS} auth
+ *   partition so the declared-backing set cannot be enumerated by a principal lacking
+ *   {@code DESCRIBE_CONFIGS} on the name — same auth-first / shadow-second precedence as the
+ *   AlterConfigs concentration guard at {@link ControllerApis} (commit 0531c51617, #146).
+ */
+class ConfigHelper(
+    metadataCache: MetadataCache,
+    config: KafkaConfig,
+    configRepository: ConfigRepository,
+    isBackingTopic: String => Boolean = (_: String) => false) extends Logging {
 
   def allConfigs(config: AbstractConfig): mutable.Map[String, Any] = {
     config.originals.asScala.filter(_._2 != null) ++ config.nonInternalValues.asScala
@@ -105,7 +124,28 @@ class ConfigHelper(metadataCache: MetadataCache, config: KafkaConfig, configRepo
           case ConfigResource.Type.TOPIC =>
             val topic = resource.resourceName
             Topic.validate(topic)
-            if (metadataCache.contains(topic)) {
+            // Gemini r21 HIGH #159 — concentration guard for DescribeConfigs. A principal with
+            // DESCRIBE_CONFIGS on the backing topic name could otherwise read the substrate's
+            // cleanup.policy / retention.ms / segment.bytes / min.insync.replicas / replication.factor
+            // — confirming the backing exists AND exposing settings that govern every co-tenant
+            // logical topic on that backing. Runs AFTER the auth partition in
+            // handleDescribeConfigsRequest so the declared-backing set cannot be enumerated by a
+            // principal lacking DESCRIBE_CONFIGS on the name; same auth-first / shadow-second
+            // precedence as the AlterConfigs concentration guard (#146 — commit 0531c51617).
+            // Mirrors the configuration-side rejection: a backing name is not a client-facing
+            // topic and DescribeConfigs against it is treated as a name-shape violation rather
+            // than a missing topic so callers cannot probe the declared-backing set via the
+            // UNKNOWN_TOPIC_OR_PARTITION vs INVALID_TOPIC_EXCEPTION difference once authorized.
+            if (isBackingTopic(topic)) {
+              new DescribeConfigsResponseData.DescribeConfigsResult()
+                .setErrorCode(Errors.INVALID_TOPIC_EXCEPTION.code)
+                .setErrorMessage(s"Topic '$topic' is the backing topic for one or more " +
+                  "declared logical topics in concentration.logical.topics on this node. " +
+                  "Backing-topic configs govern the concentration substrate for every co-tenant " +
+                  "logical topic and are not addressable via DescribeConfigs while declarations " +
+                  "are active.")
+                .setConfigs(Collections.emptyList[DescribeConfigsResponseData.DescribeConfigsResourceResult])
+            } else if (metadataCache.contains(topic)) {
               val topicProps = configRepository.topicConfig(topic)
               val logConfig = LogConfig.fromProps(config.extractLogConfigMap, topicProps)
               createResponseConfig(allConfigs(logConfig), createTopicConfigEntry(logConfig, topicProps, includeSynonyms, includeDocumentation))

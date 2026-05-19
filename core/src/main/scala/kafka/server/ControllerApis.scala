@@ -83,7 +83,13 @@ class ControllerApis(
 
   this.logIdent = s"[ControllerApis nodeId=${config.nodeId}] "
   val authHelper = new AuthHelper(authorizer)
-  val configHelper = new ConfigHelper(metadataCache, config, metadataCache)
+  // Gemini r21 HIGH #159 — feed the backing-topic predicate into the DescribeConfigs handler.
+  // The controller has no ConcentrationKernel, so the canonical source is the declared-backing
+  // set parsed from concentration.logical.topics. The closure reads the field by reference, so
+  // forward-declaration order (declared sets defined below) is not a problem — the closure is
+  // only invoked at request-handling time, well after class construction completes.
+  val configHelper = new ConfigHelper(metadataCache, config, metadataCache,
+    (name: String) => declaredBackingTopicNames.contains(name))
   val requestHelper = new RequestHandlerHelper(requestChannel, quotas, time)
   val runtimeLoggerManager = new RuntimeLoggerManager(config.nodeId, logger.underlying)
   private val aclApis = new AclApis(authHelper, authorizer, requestHelper, "controller", config)

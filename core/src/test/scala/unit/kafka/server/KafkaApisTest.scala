@@ -303,6 +303,108 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testDescribeConfigsRejectsBackingTopic(): Unit = {
+    // Gemini r21 HIGH #159 — a DESCRIBE_CONFIGS-authorized principal targeting a backing topic
+    // name must receive INVALID_TOPIC_EXCEPTION, not the substrate's actual configuration.
+    // Without this guard the principal could read cleanup.policy / retention.ms / segment.bytes /
+    // min.insync.replicas / replication.factor on the substrate that hosts every co-tenant
+    // logical topic — confirming the backing name and exposing storage internals.
+    val authorizer: Authorizer = mock(classOf[Authorizer])
+
+    val operation = AclOperation.DESCRIBE_CONFIGS
+    val resourceType = ResourceType.TOPIC
+    val backingTopicName = "backing-topic-1"
+    val requestHeader = new RequestHeader(ApiKeys.DESCRIBE_CONFIGS, ApiKeys.DESCRIBE_CONFIGS.latestVersion,
+      clientId, 0)
+
+    val expectedActions = Seq(
+      new Action(operation, new ResourcePattern(resourceType, backingTopicName, PatternType.LITERAL),
+        1, true, true)
+    )
+    when(authorizer.authorize(any[RequestContext], ArgumentMatchers.eq(expectedActions.asJava)))
+      .thenReturn(Seq(AuthorizationResult.ALLOWED).asJava)
+
+    val configRepository: ConfigRepository = mock(classOf[ConfigRepository])
+    metadataCache = mock(classOf[KRaftMetadataCache])
+    // metadataCache.contains intentionally NOT stubbed — the backing rejection must short-circuit
+    // BEFORE the metadata-cache lookup so the substrate's configs are never loaded into memory.
+    when(concentrationKernel.isBackingTopic(backingTopicName)).thenReturn(true)
+
+    val describeConfigsRequest = new DescribeConfigsRequest.Builder(new DescribeConfigsRequestData()
+      .setIncludeSynonyms(true)
+      .setResources(List(new DescribeConfigsRequestData.DescribeConfigsResource()
+        .setResourceName(backingTopicName)
+        .setResourceType(ConfigResource.Type.TOPIC.id)).asJava))
+      .build(requestHeader.apiVersion)
+    val request = buildRequest(describeConfigsRequest, requestHeader = Option(requestHeader))
+
+    kafkaApis = createKafkaApis(authorizer = Some(authorizer), configRepository = configRepository)
+    kafkaApis.handleDescribeConfigsRequest(request)
+
+    val response = verifyNoThrottling[DescribeConfigsResponse](request)
+    val results = response.data.results
+    assertEquals(1, results.size)
+    val result = results.get(0)
+    assertEquals(ConfigResource.Type.TOPIC.id, result.resourceType)
+    assertEquals(backingTopicName, result.resourceName)
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, result.errorCode)
+    assertEquals(0, result.configs.size,
+      "Backing-topic rejection must return zero configs — no substrate settings may leak")
+    // Substrate must not be loaded into memory — if topicConfig were called, the rejection
+    // ran too late and a parallel codepath could have leaked the response.
+    verify(configRepository, times(0)).topicConfig(backingTopicName)
+  }
+
+  @Test
+  def testDescribeConfigsBackingShadowDefersToAuthorizationFailure(): Unit = {
+    // Gemini r21 HIGH #159 — auth-first / shadow-second precedence. A principal lacking
+    // DESCRIBE_CONFIGS on a backing topic name must receive TOPIC_AUTHORIZATION_FAILED, NOT
+    // INVALID_TOPIC_EXCEPTION. The latter would let an unauthorized principal enumerate the
+    // declared-backing set by probing names and observing the response code difference. Same
+    // precedence pattern as #128/#137/#139/#145/#146.
+    val authorizer: Authorizer = mock(classOf[Authorizer])
+
+    val operation = AclOperation.DESCRIBE_CONFIGS
+    val resourceType = ResourceType.TOPIC
+    val backingTopicName = "backing-topic-1"
+    val requestHeader = new RequestHeader(ApiKeys.DESCRIBE_CONFIGS, ApiKeys.DESCRIBE_CONFIGS.latestVersion,
+      clientId, 0)
+
+    val expectedActions = Seq(
+      new Action(operation, new ResourcePattern(resourceType, backingTopicName, PatternType.LITERAL),
+        1, true, true)
+    )
+    when(authorizer.authorize(any[RequestContext], ArgumentMatchers.eq(expectedActions.asJava)))
+      .thenReturn(Seq(AuthorizationResult.DENIED).asJava)
+
+    val configRepository: ConfigRepository = mock(classOf[ConfigRepository])
+    metadataCache = mock(classOf[KRaftMetadataCache])
+
+    val describeConfigsRequest = new DescribeConfigsRequest.Builder(new DescribeConfigsRequestData()
+      .setIncludeSynonyms(true)
+      .setResources(List(new DescribeConfigsRequestData.DescribeConfigsResource()
+        .setResourceName(backingTopicName)
+        .setResourceType(ConfigResource.Type.TOPIC.id)).asJava))
+      .build(requestHeader.apiVersion)
+    val request = buildRequest(describeConfigsRequest, requestHeader = Option(requestHeader))
+
+    kafkaApis = createKafkaApis(authorizer = Some(authorizer), configRepository = configRepository)
+    kafkaApis.handleDescribeConfigsRequest(request)
+
+    val response = verifyNoThrottling[DescribeConfigsResponse](request)
+    val results = response.data.results
+    assertEquals(1, results.size)
+    val result = results.get(0)
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED.code, result.errorCode,
+      "Auth-first precedence — unauthorized backing probe must see TOPIC_AUTHORIZATION_FAILED, " +
+        "not INVALID_TOPIC_EXCEPTION (which would leak the declared-backing set)")
+    // The backing predicate must NOT have been consulted — the unauthorized partition catches
+    // the resource before the describe loop runs. If isBackingTopic were called, an attacker
+    // who can also issue allowed probes could time-side-channel the predicate cost.
+    verify(concentrationKernel, times(0)).isBackingTopic(backingTopicName)
+  }
+
+  @Test
   def testElectLeadersForwarding(): Unit = {
     val requestBuilder = new ElectLeadersRequest.Builder(ElectionType.PREFERRED, null, 30000)
     testKraftForwarding(ApiKeys.ELECT_LEADERS, requestBuilder)
