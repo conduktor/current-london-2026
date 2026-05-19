@@ -2419,6 +2419,107 @@ public class RuleEngineTest {
     }
 
     @Test
+    public void parseBypassPrincipalsRejectsCaseVariantUserType() {
+        // R32 #287 [HIGH]: KafkaPrincipal type is case-sensitive at runtime.
+        // Every stock KafkaPrincipalBuilder (PLAINTEXT/SASL/SCRAM/PLAIN/
+        // GSSAPI/SSL) emits the literal constant KafkaPrincipal.USER_TYPE =
+        // "User". A case-variant typo of that constant (`user:broker`,
+        // `USER:broker`, `User:broker` with mixed-case alternatives) parses
+        // cleanly here but its stored canonical form never matches the
+        // runtime peer ⇒ silent fail-CLOSED soft-brick of the inter-broker
+        // bypass, same impact class as R29 #270/#278, R30 #280, R31 #281/#284.
+        //
+        // This test sweeps the realistic case-variant typos and pins:
+        //   (a) the new "case-mismatched principal type" helper diagnostic
+        //   (b) the offending type substring
+        //   (c) the suggestion "did you mean 'User'"
+        // so a refactor that loosens the check (eg. removes the
+        // equalsIgnoreCase guard) or weakens the diagnostic (no suggestion)
+        // is caught.
+        String[] caseVariants = {
+            "user",       // lowercase — Ansible / CLI examples
+            "USER",       // uppercase — env-var conventions
+            "uSer",       // mixed
+            "useR",       // mixed
+            "USer",       // mixed
+            "uSER"        // mixed
+        };
+        for (String variant : caseVariants) {
+            IllegalArgumentException ex = org.junit.jupiter.api.Assertions
+                .assertThrows(IllegalArgumentException.class,
+                    () -> RuleEngine.parseBypassPrincipals(variant + ":broker"),
+                    "variant '" + variant + "' must be rejected");
+            String msg = ex.getMessage();
+            assertTrue(msg.contains("case-mismatched principal type"),
+                "variant '" + variant + "': must hit case-mismatch helper, "
+                    + "not a different rejection arm; got: " + msg);
+            assertTrue(msg.contains("'" + variant + "'"),
+                "variant '" + variant + "': diagnostic must echo the "
+                    + "offending type; got: " + msg);
+            assertTrue(msg.contains("did you mean 'User'"),
+                "variant '" + variant + "': diagnostic must include the "
+                    + "canonical-form suggestion; got: " + msg);
+        }
+    }
+
+    @Test
+    public void parseBypassPrincipalsAcceptsCanonicalUserTypeUnchanged() {
+        // R32 #287 [HIGH] — symmetric arm: the canonical capitalisation
+        // "User" must continue to parse cleanly. This pins that the new
+        // case-mismatch reject does NOT regress the happy path or any of
+        // the existing SSL-DN / SASL forms.
+        java.util.Set<String> bypass = RuleEngine.parseBypassPrincipals(
+            "User:broker;User:CN=Broker One,OU=Kafka Brokers,O=Example Corp,C=US;"
+                + "User:ANONYMOUS");
+        org.junit.jupiter.api.Assertions.assertEquals(3, bypass.size(),
+            "all three canonical-form entries must survive");
+        assertTrue(bypass.contains("User:broker"));
+        assertTrue(bypass.contains(
+            "User:CN=Broker One,OU=Kafka Brokers,O=Example Corp,C=US"));
+        assertTrue(bypass.contains("User:ANONYMOUS"));
+    }
+
+    @Test
+    public void parseBypassPrincipalsPreservesCustomNonUserType() {
+        // R32 #287 [HIGH] — scope pin: the case-mismatch reject is
+        // SPECIFICALLY about case variants of the literal constant "User".
+        // A custom KafkaPrincipalBuilder is allowed to emit an entirely
+        // different type (eg. "Group", "Role", or a vendor identity class).
+        // The check is `USER_TYPE.equalsIgnoreCase(type) && !USER_TYPE.equals(type)`
+        // — `Group:broker` does NOT match `equalsIgnoreCase("User")` and
+        // must pass through. If we ever tighten to a closed type-whitelist
+        // (eg. `Set.of("User")`) this test will fail loud and the change
+        // can be discussed deliberately rather than silently breaking the
+        // open KafkaPrincipalBuilder SPI.
+        java.util.Set<String> bypass = RuleEngine.parseBypassPrincipals(
+            "Group:operators;Role:cluster-admin;VendorPrincipal:svc-1");
+        org.junit.jupiter.api.Assertions.assertEquals(3, bypass.size(),
+            "custom principal types must pass through unchanged");
+        assertTrue(bypass.contains("Group:operators"));
+        assertTrue(bypass.contains("Role:cluster-admin"));
+        assertTrue(bypass.contains("VendorPrincipal:svc-1"));
+    }
+
+    @Test
+    public void parseBypassPrincipalsCaseMismatchAbortsWholeList() {
+        // R32 #287 [HIGH] — list-semantics pin: a case-variant typo in the
+        // middle of an otherwise-valid list must abort the WHOLE list (not
+        // silently keep the valid head and discard the tail, nor silently
+        // keep both with one entry guaranteed never to match). This mirrors
+        // R31 #285's parseBypassPrincipalsAbortsOnAnyInvalidSegmentInList.
+        IllegalArgumentException ex = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals(
+                    "User:broker;user:other;User:third"));
+        assertTrue(ex.getMessage().contains("case-mismatched principal type"),
+            "mid-list case-variant must abort the whole list with the "
+                + "case-mismatch diagnostic; got: " + ex.getMessage());
+        assertTrue(ex.getMessage().contains("'user'"),
+            "diagnostic must identify the offending second segment, not "
+                + "blame the first; got: " + ex.getMessage());
+    }
+
+    @Test
     public void parseBypassPrincipalsThrowsOnUnicodeBlankComponent() {
         // Codex round-4 F2: String.trim() only strips ASCII whitespace (chars
         // <= 0x20), so a non-breaking space (U+00A0) inside a component

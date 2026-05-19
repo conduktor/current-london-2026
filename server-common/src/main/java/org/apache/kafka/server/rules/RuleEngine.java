@@ -520,6 +520,44 @@ public final class RuleEngine {
                     + "whitespace (ASCII or Unicode). Internal whitespace is "
                     + "allowed (eg. SSL DNs like `CN=Broker One,OU=...`).");
             }
+            // R32 #287 [HIGH]: KafkaPrincipal type is case-sensitive at
+            // runtime. KafkaApis builds `principalName = getPrincipalType() +
+            // ":" + getName()` and compares via String.equals against this
+            // set. Every stock KafkaPrincipalBuilder emits the literal
+            // constant KafkaPrincipal.USER_TYPE = "User" (see
+            // DefaultKafkaPrincipalBuilder L84/L94/L104/L106, SASL/PLAIN/
+            // GSSAPI/SCRAM/SSL all funnel through it; PLAINTEXT uses the
+            // KafkaPrincipal.ANONYMOUS constant with the same "User" type).
+            // A case-variant typo like `user:broker`, `USER:broker`, or
+            // `User:Broker` (the name capitalisation, caught implicitly by
+            // not matching the runtime peer's name) parses cleanly here but
+            // its stored canonical form never matches the runtime peer ⇒
+            // silent fail-CLOSED soft-brick of the inter-broker bypass —
+            // same impact class as R29 #270/#278, R30 #280, R31 #281/#284.
+            //
+            // Scope: this check only catches case-variant typos of the
+            // "User" type. A custom KafkaPrincipalBuilder that legitimately
+            // emits a non-"User" type (eg. "Group", "Role", a vendor-
+            // specific identity class) is allowed through unchanged — we
+            // refuse to whitelist a closed type-set because the
+            // KafkaPrincipalBuilder SPI is intentionally open. A `User`
+            // case-mismatch, however, is unambiguously a typo: if the
+            // operator meant a custom type, they would have spelled it
+            // with deliberate capitalisation, not by mangling "User".
+            if (KafkaPrincipal.USER_TYPE.equalsIgnoreCase(type)
+                    && !KafkaPrincipal.USER_TYPE.equals(type)) {
+                throw new IllegalArgumentException(
+                    "governance.bypass.principals entry has case-mismatched "
+                    + "principal type '" + LogSafe.sanitize(type)
+                    + "': KafkaPrincipal type is case-sensitive at runtime "
+                    + "and every stock KafkaPrincipalBuilder emits the "
+                    + "exact constant '" + KafkaPrincipal.USER_TYPE
+                    + "' (capital U). The stored canonical form '"
+                    + LogSafe.sanitize(type + ":" + name)
+                    + "' would never match a runtime peer principal — "
+                    + "did you mean '" + KafkaPrincipal.USER_TYPE
+                    + "'? Entry: '" + LogSafe.sanitize(trimmed) + "'.");
+            }
             // Round-19 BLOCKER (R19-A #1 / R19-D BLOCKER-1): PROMPT.md
             // operator contract claims this parser rejects "internal
             // C0/C1/zero-width/bidi codepoints". Without this check, an
