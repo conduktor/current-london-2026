@@ -1022,6 +1022,15 @@ public final class IoUringSelector implements BrokerSelector {
             nettyChannels.remove(destinationId);
             lastActiveNanos.remove(destinationId);
             channels.remove(destinationId);
+            // LEAK-1: every OTHER close path in this class pairs channels.remove with
+            // explicitlyMutedChannels.remove (enqueueClose:976, surfacePrepareFailureAsDisconnect:753,
+            // maybeExpireOldestIdleChannel:717, drainClosingChannels:846, close(id):1254).
+            // If the Processor mutes a channel and a subsequent send() trips an in-progress-send
+            // invariant, this catch block used to leak the closed KafkaChannel reference into
+            // the explicitlyMutedChannels HashSet — held strongly for the broker's lifetime,
+            // transitively pinning the IoUringTransportLayer + authenticator + KafkaPrincipalBuilder.
+            // Bytes were released by closeQuietly below, but the object graph stayed reachable.
+            explicitlyMutedChannels.remove(channel);
             failedSends.add(destinationId);
             Utils.closeQuietly(channel, "channel after setSend exception");
             throw e;
@@ -1281,6 +1290,17 @@ public final class IoUringSelector implements BrokerSelector {
     // assertion on the gate value moving forward.
     long nextIdleScanNanosForTesting() {
         return nextIdleScanNanos;
+    }
+
+    // Test-visible accessor for explicitlyMutedChannels. LEAK-1's invariant is that
+    // every close path pairs `channels.remove` with `explicitlyMutedChannels.remove`;
+    // a future regression that drops one of those pairs would still pass behavioral
+    // tests (the dead channel is no longer dispatched-to) but would leak the
+    // KafkaChannel reference + its transport + authenticator + KafkaPrincipalBuilder
+    // into the HashSet for the broker's lifetime. The size accessor lets a regression
+    // test assert the Set is empty after the close path under test runs.
+    int explicitlyMutedChannelsSizeForTesting() {
+        return explicitlyMutedChannels.size();
     }
 
     /**
