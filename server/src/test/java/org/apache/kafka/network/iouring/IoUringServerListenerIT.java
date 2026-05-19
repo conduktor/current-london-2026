@@ -34,12 +34,14 @@ import java.net.Socket;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.EventLoopGroup;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
@@ -250,6 +252,7 @@ class IoUringServerListenerIT {
             "io_uring not available (" + IoUringSupport.unavailabilityReason() + "); skipping");
 
         AtomicBoolean keepRunning = new AtomicBoolean(true);
+        AtomicLong wedgeIterations = new AtomicLong();
         try (IoUringSelector selector = new IoUringSelector(
                 LISTENER, MAX_RECEIVE, MemoryPool.NONE, IDLE_NANOS_NEVER, Time.SYSTEM)) {
             IoUringServerListener listener = new IoUringServerListener(
@@ -270,7 +273,12 @@ class IoUringServerListenerIT {
                     // interrupt; a busy loop that does not check Thread.interrupted() never
                     // yields back to the loop's run() — exactly the wedge scenario the L1
                     // fix protects against. yield() keeps a single-CPU CI runner responsive.
+                    // The counter lets us verify the wedge is STILL running when close()
+                    // returns — otherwise a regression that lets the task exit silently
+                    // (e.g. a refactor that makes the task interrupt-honouring) would still
+                    // pass this test while no longer exercising the bounded-wait path.
                     while (keepRunning.get()) {
+                        wedgeIterations.incrementAndGet();
                         Thread.yield();
                     }
                 });
@@ -280,9 +288,11 @@ class IoUringServerListenerIT {
                 assertTrue(wedgeStarted.await(5, TimeUnit.SECONDS),
                     "wedge task must reach the event-loop thread before we close the listener");
 
+                long iterationsBeforeClose = wedgeIterations.get();
                 long startNanos = System.nanoTime();
                 listener.close();
                 long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
+                long iterationsAfterClose = wedgeIterations.get();
 
                 // Listener's budget: SHUTDOWN_QUIET_MS (100) + SHUTDOWN_TIMEOUT_MS (5000) = 5100ms.
                 // Allow ~2x slack for CI scheduling jitter and the additional channel.close()
@@ -293,6 +303,16 @@ class IoUringServerListenerIT {
                     "close() must return within " + maxAllowedMs + "ms even when the io_uring "
                         + "event loop is wedged; observed " + elapsedMs + "ms. Pre-L1 this hung "
                         + "forever via syncUninterruptibly() — the regression has returned.");
+
+                // Verify the wedge was actually still running across close(). If a future
+                // refactor accidentally makes the task interrupt-honouring (or otherwise
+                // self-exits), the bounded-wait path is no longer being exercised — the test
+                // becomes a false-green. The iteration counter must have advanced during
+                // close(), proving the loop thread was alive and busy-looping the whole time.
+                assertTrue(iterationsAfterClose > iterationsBeforeClose,
+                    "wedge task must still be executing when close() returns; otherwise the "
+                        + "bounded-wait path was never exercised. iterationsBeforeClose="
+                        + iterationsBeforeClose + ", iterationsAfterClose=" + iterationsAfterClose);
             } finally {
                 // Release the wedge so the stray loop thread can exit. close() above is
                 // already idempotent so the explicit call here is purely defensive.
@@ -341,14 +361,43 @@ class IoUringServerListenerIT {
                 assertTrue(!group.isShutdown(),
                     "precondition: event-loop group must be live before start() runs");
 
-                try {
-                    listener.start();
-                    throw new AssertionError("start() should have thrown — port " + port +
-                        " is occupied by a non-REUSEPORT socket; bind must fail");
-                } catch (Exception expected) {
-                    // expected — bind() failed with EADDRINUSE (Netty wraps this as
-                    // BindException via the bootstrap.bind().sync() path).
+                // The throw must be bind-related. A bare catch (Exception) would silently
+                // accept ANY failure — an unrelated NPE / refactor regression in start()
+                // could then make this test pass without ever exercising the bind-failure
+                // cleanup path. Walk the cause chain and assert it carries a recognisable
+                // bind-failure signature: either java.net.BindException, or an IOException
+                // (Netty io_uring wraps EADDRINUSE as io.netty.channel.unix.Errors.NativeIoException
+                // which extends IOException, not BindException) whose message mentions the
+                // occupied port or "Address already in use" / "EADDRINUSE". Without this
+                // multi-signal check, a refactor that changes which Throwable type Netty
+                // surfaces could either silently fail (too strict) or silently match anything
+                // (too loose).
+                Throwable bindFailure = assertThrows(Throwable.class, listener::start,
+                    "start() must throw — port " + port + " is occupied by a non-REUSEPORT socket");
+                boolean recognisableBindFailure = false;
+                StringBuilder chainTrace = new StringBuilder();
+                for (Throwable c = bindFailure; c != null; c = c.getCause()) {
+                    chainTrace.append("\n  -> ").append(c.getClass().getName())
+                        .append(": ").append(c.getMessage());
+                    if (c instanceof java.net.BindException) {
+                        recognisableBindFailure = true;
+                        break;
+                    }
+                    String msg = c.getMessage();
+                    if (msg != null && (msg.contains("Address already in use")
+                            || msg.contains("EADDRINUSE")
+                            || msg.contains(":" + port))) {
+                        // Port-in-message OR a Linux-kernel-style address-in-use message
+                        // proves the throw is THIS bind failing, not some unrelated NPE.
+                        recognisableBindFailure = true;
+                        break;
+                    }
                 }
+                assertTrue(recognisableBindFailure,
+                    "start() must fail with a recognisable bind-failure signature in the cause "
+                        + "chain (BindException, EADDRINUSE/Address-in-use message, or port "
+                        + port + " in a chained message). Anything else means we're catching the "
+                        + "wrong failure path. Cause chain:" + chainTrace);
 
                 // The fix's contract: by the time start() returns its exception to the caller,
                 // the event-loop group has been awaited to termination. Pre-fix this assertion
