@@ -679,6 +679,66 @@ public class RuleJsonCodecTest {
     }
 
     @Test
+    public void replacementCharacterInIdRejected() {
+        // R33 #291 [HIGH]: U+FFFD REPLACEMENT CHARACTER is the canonical
+        // "this byte sequence didn't decode" glyph. The realistic threat
+        // is the compaction-key/JVM-string asymmetry on __governance:
+        // BrokerGovernanceBootstrap decodes record keys via
+        // `new String(key, UTF_8)`, which silently replaces every
+        // malformed UTF-8 byte sequence with U+FFFD. Two distinct byte
+        // keys (e.g. overlong NUL `{0xC0,0x80}`, raw `{0xFF}`, lone
+        // continuation `{0x80}`, truncated start `{0xC2}`, CESU-8 pair
+        // `{0xED,0xA0,0x80}`) collapse to the same parsed id — the log
+        // compactor sees them as distinct entries while the loader
+        // treats them as the same rule. That breaks the
+        // unambiguous-attribution promise and opens a tombstone-vs-update
+        // race in which the second arrival silently overwrites the first
+        // without any audit signal.
+        //
+        // U+FFFD is category So (Symbol-Other), so it slips through both
+        // the Character.FORMAT umbrella and the explicit Mn/Lo arms in
+        // isForbiddenIdCodepoint. R33 #291 adds it as a dedicated arm.
+        // Pin every paste shape so a future refactor that drops the arm
+        // is caught loud.
+        String fffd = new String(Character.toChars(0xFFFD));
+        String[] withReplacement = {
+            "rule-" + fffd,           // trailing (most-likely paste shape)
+            fffd + "rule-X",          // leading
+            "rule-" + fffd + "X",     // internal
+            fffd,                     // lone
+            "rule" + fffd + fffd,     // doubled (different byte sequences
+                                      // can decode to multiple U+FFFD in
+                                      // a row when the JVM emits one
+                                      // replacement per malformed byte)
+        };
+        for (String id : withReplacement) {
+            RuleEnvelopeException ex = assertThrows(RuleEnvelopeException.class,
+                () -> RuleJsonCodec.decode(id, SAMPLE.getBytes(StandardCharsets.UTF_8)),
+                "id with U+FFFD must reject: '" + id + "'");
+            assertTrue(ex.getMessage().contains("forbidden codepoint"),
+                "rejection must name the forbidden codepoint; got: "
+                    + ex.getMessage());
+            // Diagnostic must include the codepoint slot so an operator
+            // reading the WARN sees U+FFFD specifically (otherwise the
+            // "decode-failed glyph upstream" hint is lost).
+            assertTrue(ex.getMessage().contains("FFFD")
+                    || ex.getMessage().contains("U+FFFD")
+                    || ex.getMessage().contains("fffd"),
+                "U+FFFD codepoint must appear in diagnostic; got: "
+                    + ex.getMessage());
+        }
+
+        // Symmetric pre-decode helper: validateRuleId must also reject
+        // U+FFFD, matching the decode() contract.
+        RuleEnvelopeException pre = assertThrows(RuleEnvelopeException.class,
+            () -> RuleJsonCodec.validateRuleId("rule-" + fffd),
+            "validateRuleId must reject U+FFFD pre-decode");
+        assertTrue(pre.getMessage().contains("forbidden codepoint"),
+            "validateRuleId diagnostic must name forbidden codepoint; got: "
+                + pre.getMessage());
+    }
+
+    @Test
     public void unpairedSurrogatesInIdRejected() {
         // R23 #223: well-formed Java Strings built from valid UTF-8 / UTF-16
         // never carry unpaired surrogates, but a poisoned ByteBuffer-decoded

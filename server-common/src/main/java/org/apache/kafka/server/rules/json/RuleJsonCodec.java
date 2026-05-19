@@ -598,6 +598,29 @@ public final class RuleJsonCodec {
             case 0x3164: // HANGUL FILLER (Lo, renders as space)
             case 0xFFA0: // HALFWIDTH HANGUL FILLER (Lo, renders as space)
                 return true;
+            // R33 #291 [HIGH]: U+FFFD REPLACEMENT CHARACTER. Category So
+            // (Symbol-Other), so neither the Character.FORMAT umbrella
+            // above nor the explicit Mn/Lo arms catch it. The realistic
+            // hazard is the compaction-key/JVM-string asymmetry on the
+            // __governance topic: BrokerGovernanceBootstrap decodes the
+            // record key via `new String(key, UTF_8)`, which substitutes
+            // every malformed UTF-8 byte sequence (overlong encodings,
+            // CESU-8 surrogate pair bytes, truncated multi-byte starts,
+            // raw 0xFF) with U+FFFD. Two distinct byte keys can collapse
+            // to the SAME parsed id (e.g. `{0xC0,0x80}` and `{0xFF}`
+            // both decode to a single U+FFFD char) — the log compactor
+            // sees them as distinct entries while the loader treats
+            // them as the same rule id. That defeats the
+            // unambiguous-attribution promise the rest of this list
+            // rests on AND opens a tombstone-vs-update race in which a
+            // legitimate operator update gets silently overwritten by
+            // an attacker's malformed-byte tombstone (or vice-versa).
+            // Reject any rule id containing U+FFFD outright; legitimate
+            // operator ids never carry it (it is the canonical
+            // "decode-failed" glyph and its presence in any id is a
+            // strong "you mishandled bytes upstream" smell).
+            case 0xFFFD: // REPLACEMENT CHARACTER
+                return true;
             default:
                 // Fall through to the legacy switch below — historic explicit
                 // arms for FORMAT codepoints, kept for hazard-class documentation.
