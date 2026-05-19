@@ -245,6 +245,60 @@ public class CelProgramTest {
     }
 
     @Test
+    public void comprehensionPredicateRequiresBooleanResult() {
+        // Round-20 MED D-1: the engine elsewhere is fail-noisy on non-Boolean
+        // in boolean position (Not / Negate throw CelEvaluationException)
+        // and tri-state on null (Field / RegexMatch / Compare / InList
+        // propagate null). The pre-fix Comprehension.eval coerced every
+        // non-Boolean predicate result to false silently, including strings
+        // / numbers / lists / maps — hiding both an authorship bug
+        // (`xs.exists(x, x.name)` forgot the comparison) and an entire
+        // category of true matches the rule author intended.
+        //
+        // Two contracts to pin:
+        //   (a) non-null non-Boolean predicate result → throw → engine
+        //       fails open.
+        //   (b) null predicate result is treated as false-y (EXISTS skips,
+        //       ALL falsifies) — matching the engine's tri-state null
+        //       propagation in other operators. Existing null-predicate
+        //       behaviour is preserved.
+        Map<String, Object> a = new LinkedHashMap<>();
+        a.put("name", "alpha");
+        Map<String, Object> b = new LinkedHashMap<>();
+        b.put("name", "beta");
+        Map<String, Object> req = new LinkedHashMap<>();
+        req.put("topics", Arrays.asList(a, b));
+        Map<String, Object> env = new HashMap<>();
+        env.put("request", req);
+
+        // (a-EXISTS) predicate returns a String — must throw, not return false.
+        assertThrows(CelEvaluationException.class,
+            () -> evalBool("request.topics.exists(t, t.name)", env),
+            "non-Boolean predicate (String) in EXISTS must throw, not silently coerce to false");
+
+        // (a-ALL) predicate returns a String — must throw, not return true (every coercion is false → ALL of-empty-truthy is false, but the early-return path is false-by-coercion which is itself a silent bug).
+        assertThrows(CelEvaluationException.class,
+            () -> evalBool("request.topics.all(t, t.name)", env),
+            "non-Boolean predicate (String) in ALL must throw, not silently coerce to false");
+
+        // (a-numeric) predicate returns a number — must throw.
+        Map<String, Object> withNumbers = new HashMap<>();
+        withNumbers.put("xs", Arrays.asList(1L, 2L, 3L));
+        assertThrows(CelEvaluationException.class,
+            () -> evalBool("xs.exists(x, x)", withNumbers),
+            "non-Boolean predicate (Long) in EXISTS must throw");
+
+        // (b-null-prop EXISTS) predicate returns null on every element via missing field — null is false-y, EXISTS returns false without throwing.
+        // Use a list of maps where the looked-up field is missing on every element.
+        assertFalse(evalBool("request.topics.exists(t, t.missing == \"x\")", env),
+            "null-predicate via null-propagation (missing.field comparison yields null) must be treated as false in EXISTS, not throw");
+
+        // (b-null-prop ALL) symmetric: null-predicate must falsify ALL without throwing.
+        assertFalse(evalBool("request.topics.all(t, t.missing == \"x\")", env),
+            "null-predicate via null-propagation must falsify ALL without throwing");
+    }
+
+    @Test
     public void compilationFailsOnSyntaxError() {
         assertThrows(CelCompilationException.class, () -> CelCompiler.compile("foo &&"));
         assertThrows(CelCompilationException.class, () -> CelCompiler.compile("(unclosed"));

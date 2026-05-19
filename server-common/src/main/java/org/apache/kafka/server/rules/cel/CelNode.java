@@ -310,7 +310,31 @@ abstract class CelNode {
                 CelLimits.bumpStep();
                 Function<String, Object> scoped = name -> name.equals(varName) ? item : a.apply(name);
                 Object v = predicate.eval(scoped);
-                boolean b = v instanceof Boolean && (Boolean) v;
+                // Round-20 MED D-1: differentiate null-propagation from a
+                // type-shape bug. The engine elsewhere is fail-noisy on
+                // non-Boolean in boolean position (Not / Negate throw
+                // CelEvaluationException) and tri-state on null
+                // (Field / RegexMatch / Compare / InList propagate null).
+                // Match that posture here: null is treated as false-y
+                // (EXISTS skips, ALL falsifies — same as the prior
+                // behaviour for null), but a non-null non-Boolean (string,
+                // number, list, map) means the rule author wrote
+                // `xs.exists(x, x.field)` and forgot the comparison. The
+                // pre-fix code silently coerced these to false, hiding
+                // both true-positives (EXISTS never fires) and the
+                // authorship bug. Throw → CelEvaluationException →
+                // fail-open at the engine boundary so the operator sees
+                // the broken rule rather than silently denying nothing.
+                boolean b;
+                if (v == null) {
+                    b = false;
+                } else if (v instanceof Boolean) {
+                    b = (Boolean) v;
+                } else {
+                    throw new CelEvaluationException(
+                        "comprehension predicate must return boolean, got "
+                            + v.getClass().getSimpleName());
+                }
                 if (kind == Kind.EXISTS && b) {
                     return true;
                 }
