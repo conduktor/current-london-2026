@@ -1379,4 +1379,161 @@ public class RuleJsonCodecTest {
                 + "any silent transcoding here would invalidate the audit "
                 + "premise that bytes-on-wire match chars-in-source-modulo-encoding");
     }
+
+    @Test
+    public void loneHighSurrogateInWhenRejected() {
+        // R34-C-3 [HIGH]: Jackson's default JSON parser decodes 4-hex-digit
+        // backslash-u escapes into raw Java chars without enforcing UTF-16
+        // surrogate-pair validity, so an envelope whose `when` value contains
+        // the JSON escape for U+D800 followed by an ASCII char previously
+        // landed as a Rule with a Unicode-invalid whenSource. The id axis
+        // was already closed by R23 #223 (isForbiddenIdCodepoint
+        // U+D800-U+DFFF arm); this pin extends the same admission posture
+        // to the CEL source field.
+        //
+        // We hand-build the envelope so the JSON escape for U+D800 reaches
+        // the codec verbatim — using a Java string literal with that
+        // codepoint embedded directly would already be a lone-surrogate
+        // value in the test source, but the intent here is to exercise
+        // Jackson's escape-decode path which is the actual production intake.
+        String envelope = "{"
+            + "\"apiKeys\":[\"CREATE_TOPICS\"],"
+            + "\"action\":\"DENY\","
+            + "\"when\":\"x\\uD800y\","
+            + "\"errorCode\":47"
+            + "}";
+        RuleEnvelopeException ex = assertThrows(RuleEnvelopeException.class,
+            () -> RuleJsonCodec.decode("rule-surrogate-high",
+                envelope.getBytes(StandardCharsets.UTF_8)),
+            "lone high surrogate \\uD800 in CEL source must be rejected");
+        // Diagnostic must name the codepoint AND the position. Naming the
+        // codepoint (U+D800) lets an operator search for the byte sequence
+        // in their rule store; naming the position lets them find it within
+        // a long source. The id must also appear so an operator scanning
+        // the broker log can attribute the rejection to the right rule.
+        assertTrue(ex.getMessage().contains("U+D800"),
+            "diagnostic must name the offending codepoint: " + ex.getMessage());
+        assertTrue(ex.getMessage().contains("char index 1"),
+            "diagnostic must name the char index where the surrogate sits: "
+                + ex.getMessage());
+        assertTrue(ex.getMessage().contains("rule-surrogate-high"),
+            "diagnostic must name the rule id for operator triage: "
+                + ex.getMessage());
+        // Documentation seam — the diagnostic must reference the R23 #223
+        // analogue so a future audit can trace the symmetry. Soft check
+        // (substring) rather than exact phrasing to allow message rewording.
+        assertTrue(ex.getMessage().contains("Unicode")
+                || ex.getMessage().contains("surrogate"),
+            "diagnostic must explain the hazard class, not just throw: "
+                + ex.getMessage());
+    }
+
+    @Test
+    public void loneLowSurrogateInWhenRejected() {
+        // R34-C-3 [HIGH]: symmetric case — a bare low surrogate (no
+        // preceding high) is also Unicode-invalid and must be rejected.
+        // Distinct test from the high-surrogate case because a position-1
+        // low surrogate exercises the codePointAt branch that returns the
+        // surrogate value as the codepoint itself (rather than the paired
+        // supplementary codepoint).
+        String envelope = "{"
+            + "\"apiKeys\":[\"CREATE_TOPICS\"],"
+            + "\"action\":\"DENY\","
+            + "\"when\":\"\\uDC00\","
+            + "\"errorCode\":47"
+            + "}";
+        RuleEnvelopeException ex = assertThrows(RuleEnvelopeException.class,
+            () -> RuleJsonCodec.decode("rule-surrogate-low",
+                envelope.getBytes(StandardCharsets.UTF_8)),
+            "lone low surrogate \\uDC00 in CEL source must be rejected");
+        assertTrue(ex.getMessage().contains("U+DC00"),
+            "diagnostic must name the offending codepoint: " + ex.getMessage());
+        assertTrue(ex.getMessage().contains("char index 0"),
+            "diagnostic must report the position: " + ex.getMessage());
+    }
+
+    @Test
+    public void highSurrogateNotFollowedByLowSurrogateRejected() {
+        // R34-C-3 [HIGH]: high surrogate followed by a non-surrogate char
+        // (rather than end-of-string). This exercises that the rejection
+        // does not require the surrogate to be at the boundary — any
+        // unpaired position trips the gate.
+        String envelope = "{"
+            + "\"apiKeys\":[\"CREATE_TOPICS\"],"
+            + "\"action\":\"DENY\","
+            + "\"when\":\"prefix-\\uD800-suffix\","
+            + "\"errorCode\":47"
+            + "}";
+        RuleEnvelopeException ex = assertThrows(RuleEnvelopeException.class,
+            () -> RuleJsonCodec.decode("rule-high-then-ascii",
+                envelope.getBytes(StandardCharsets.UTF_8)),
+            "high surrogate not followed by a low surrogate must be rejected");
+        assertTrue(ex.getMessage().contains("U+D800"),
+            "diagnostic must identify the codepoint: " + ex.getMessage());
+        assertTrue(ex.getMessage().contains("char index 7"),
+            "diagnostic must report the correct index of the unpaired "
+                + "surrogate (after 'prefix-' = 7 chars): " + ex.getMessage());
+    }
+
+    @Test
+    public void pairedSurrogateInWhenAccepted() {
+        // R34-C-3 [HIGH] positive control: a valid supplementary-plane
+        // codepoint (here U+1F480 SKULL, encoded as the surrogate pair
+        // U+D83D + U+DC80) must pass through unchanged. The codepoint
+        // iteration in rejectLoneSurrogatesInWhen folds the pair into a
+        // single supplementary codepoint OUTSIDE the U+D800-U+DFFF range,
+        // so the rejection branch is not triggered.
+        //
+        // This pin proves the gate is narrow — it rejects ONLY
+        // Unicode-invalid lone halves, never legitimate emoji or CJK
+        // Extension B+ codepoints that operators may legitimately match
+        // in topic names.
+        String envelope = "{"
+            + "\"apiKeys\":[\"CREATE_TOPICS\"],"
+            + "\"action\":\"DENY\","
+            + "\"when\":\"request.topic == \\\"\\uD83D\\uDC80-deny\\\"\","
+            + "\"errorCode\":47"
+            + "}";
+        Rule r = RuleJsonCodec.decode("rule-emoji",
+            envelope.getBytes(StandardCharsets.UTF_8));
+        // The surrogate pair must round-trip as a 2-char Java sequence —
+        // codePointAt(start) folds it to U+1F480 in the validator's view
+        // but the storage is the original 2 chars.
+        assertTrue(r.whenSource().contains("💀"),
+            "paired surrogate U+1F480 must survive codec admission verbatim: "
+                + r.whenSource());
+    }
+
+    @Test
+    public void loneSurrogateInWhenDiagnosticDoesNotEchoSource() {
+        // R34-C-3 [HIGH] follow-up: the rejection diagnostic must NOT embed
+        // the offending CEL source verbatim. The source can be up to
+        // CelLimits.MAX_EXPR_LEN (8192 chars), and embedding it would
+        // amplify the log line proportionally — a recurring intake of a
+        // poisoned envelope (e.g. an attacker who has compromised a single
+        // producer credential and is tight-looping bad rules) would pin
+        // tens of KB per WARN. The position number + codepoint number
+        // alone are bounded-shape values, so the diagnostic length is
+        // O(id.length()) regardless of source length.
+        //
+        // This pin is symmetric with R20 #208 (truncateForLog on CEL parse
+        // failure) which bounds the analogous parse-failure WARN.
+        String longTail = new String(new char[100]).replace('\0', 'a');
+        String envelope = "{"
+            + "\"apiKeys\":[\"CREATE_TOPICS\"],"
+            + "\"action\":\"DENY\","
+            + "\"when\":\"\\uD800" + longTail + "\","
+            + "\"errorCode\":47"
+            + "}";
+        RuleEnvelopeException ex = assertThrows(RuleEnvelopeException.class,
+            () -> RuleJsonCodec.decode("rule-long-source",
+                envelope.getBytes(StandardCharsets.UTF_8)));
+        // The long tail of 'a' characters must NOT appear in the message —
+        // if any of them did, the source-amplification primitive would
+        // not be closed.
+        assertEquals(-1, ex.getMessage().indexOf(longTail),
+            "rejection diagnostic must not echo the offending CEL source — "
+                + "embedding it amplifies the WARN line per intake: "
+                + ex.getMessage());
+    }
 }

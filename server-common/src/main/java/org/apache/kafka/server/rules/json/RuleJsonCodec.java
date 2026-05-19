@@ -349,6 +349,7 @@ public final class RuleJsonCodec {
         List<ApiKeys> apiKeys = parseApiKeys(root.get(FIELD_API_KEYS));
         RuleAction action = parseAction(root.get(FIELD_ACTION));
         String when = parseRequiredString(root, FIELD_WHEN);
+        rejectLoneSurrogatesInWhen(id, when);
         int errorCode = parseErrorCode(root.get(FIELD_ERROR_CODE));
         try {
             return new Rule(id, apiKeys, action, when, errorCode, CelCompiler.compile(when));
@@ -666,6 +667,99 @@ public final class RuleJsonCodec {
                 return true;
             default:
                 return false;
+        }
+    }
+
+    /**
+     * R34-C-3 [HIGH]: reject lone surrogates in the operator-authored CEL
+     * source ({@code when} field).
+     *
+     * <p>Jackson's default JSON parser decodes 4-hex-digit JSON escapes into
+     * individual Java {@code char} values without enforcing UTF-16
+     * surrogate-pair validity. A wire envelope whose {@code when} value
+     * contains the escape for U+D800 followed by an ASCII char (or
+     * end-of-string) is admitted as a Java {@code String} whose first
+     * {@code char} is an unpaired high surrogate — the same
+     * Unicode-invalid shape that R23 #223 closes for {@code id}.
+     *
+     * <p>The id axis is already structurally closed at
+     * {@link #isForbiddenIdCodepoint(int)} ({@code cp >= 0xD800 && cp <= 0xDFFF}
+     * branch). The {@code when} axis was open because (a) the CEL lexer's
+     * quoted-string path admits any non-quote {@code char} verbatim — CEL
+     * spec admits arbitrary Unicode in string literals, so closing it at the
+     * lexer would diverge from spec without warrant — and (b) the codec did
+     * not gate the value before storage. This helper closes the codec
+     * admission axis without touching CEL semantics: legitimate paired
+     * surrogates (CJK supplementary, emoji), BMP characters, and ASCII all
+     * pass through unchanged; only the Unicode-invalid lone-surrogate shape
+     * is rejected.
+     *
+     * <h2>Threat axes this closes (and why a codec gate, not a Rule.toString
+     * gate, is the right place)</h2>
+     *
+     * <ul>
+     *   <li><b>Encode/decode asymmetry on {@code RuleJsonCodec.encode}.</b>
+     *       {@code encode} is a public API; {@code ObjectNode.put + writeValueAsBytes}
+     *       lossy-substitutes lone surrogates with {@code ?} (0x3F) on UTF-8
+     *       emit. {@code encode(decode(json)) != json} byte-for-byte was
+     *       previously possible. Today only tests call {@code encode}, but
+     *       admin tooling could legitimately want it (e.g. round-trip
+     *       checks, attestation pipelines). Closing at decode means
+     *       Rules can never carry the asymmetry-inducing shape in the
+     *       first place.</li>
+     *   <li><b>Future audit-trail dumpers.</b> {@link org.apache.kafka.server.rules.Rule#toString()}
+     *       sanitises via LogSafe (R34-C-1) — that protects today's only
+     *       contemplated display path. But the R34-C-1 javadoc itself
+     *       contemplates additional audit/JMX/HTTP rule-listing surfaces;
+     *       any one of those that bypasses {@code toString} re-opens the
+     *       hazard. The codec gate is the architecturally sound layer:
+     *       reject at intake, not at every emission site.</li>
+     *   <li><b>Symmetry with R23 #223 (id) and R28 #247 (CEL ASCII
+     *       identifiers).</b> Both prior closures live at the codec/lexer
+     *       admission boundary, not at downstream consumers. Continuing
+     *       that pattern keeps the threat-model surface uniform.</li>
+     * </ul>
+     *
+     * <h2>What this does NOT do</h2>
+     *
+     * <p>Lone surrogates in CEL source after admission are still allowed
+     * by the lexer (e.g. a test that constructs a {@code Rule} directly with
+     * a malformed source bypasses this gate). That is the same posture as
+     * R23 #223 for id, and is correct: the codec is the wire intake, and
+     * tests that bypass the codec are explicitly stipulating their input.
+     *
+     * <p>Paired surrogates — the legitimate Java {@code String} encoding of
+     * supplementary-plane codepoints (U+10000 - U+10FFFF, including most
+     * emoji and CJK Extension B+) — pass through. The iteration uses
+     * {@code String.codePointAt} which folds valid pairs into single
+     * supplementary codepoints; only an unpaired high surrogate or an
+     * unpaired low surrogate surfaces as a value in the U+D800-U+DFFF range.
+     */
+    private static void rejectLoneSurrogatesInWhen(String id, String when) {
+        int len = when.length();
+        int i = 0;
+        while (i < len) {
+            int cp = when.codePointAt(i);
+            if (cp >= 0xD800 && cp <= 0xDFFF) {
+                // Both the id and the rejection-context fragments embedded
+                // below land in the GovernanceLoader rejection WARN slot
+                // (which logs e.getMessage()); sanitise the wire-derived id
+                // through LogSafe so the diagnostic itself cannot inject
+                // control bytes back into the broker log. The when source
+                // is NOT embedded — only the position and the offending
+                // codepoint number, both bounded-shape values — so the
+                // diagnostic length is bounded regardless of source length.
+                throw new RuleEnvelopeException(
+                    "rule '" + LogSafe.sanitize(id) + "' has a lone surrogate U+"
+                        + String.format("%04X", cp) + " in its CEL source at "
+                        + "char index " + i + "; lone surrogates are not valid "
+                        + "Unicode and are rejected at codec intake — they "
+                        + "indicate a JSON envelope built from a CESU-8 or "
+                        + "char-array-derived string that does not round-trip "
+                        + "through UTF-8 emit (the same hazard class as R23 "
+                        + "#223 closes for rule ids)");
+            }
+            i += Character.charCount(cp);
         }
     }
 
