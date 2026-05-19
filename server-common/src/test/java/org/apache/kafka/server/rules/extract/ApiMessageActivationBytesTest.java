@@ -21,6 +21,8 @@ import org.apache.kafka.common.message.JoinGroupRequestData;
 import org.apache.kafka.server.rules.cel.CelCompiler;
 import org.apache.kafka.server.rules.cel.CelProgram;
 
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.nio.ByteBuffer;
@@ -61,6 +63,22 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * against credential exfiltration through the audit channel.
  */
 public class ApiMessageActivationBytesTest {
+
+    // R45-A-1: symmetric defence for CelLimits.STEPS ThreadLocal. Test pool
+    // threads are reused across test classes (build.gradle:504 forks reuse
+    // workers); a STEPS counter left near the 100k limit by a prior class
+    // would soft-brick the first evalBoolean here with budget-exceeded.
+    // Mirrors CelProgramTest @BeforeEach/@AfterEach — see that class's
+    // javadoc which names ApiMessageActivation*Test as the at-risk neighbour.
+    @BeforeEach
+    public void resetStepBudget() {
+        CelProgram.resetEvalStepBudget();
+    }
+
+    @AfterEach
+    public void leaveCounterClean() {
+        CelProgram.resetEvalStepBudget();
+    }
 
     @Test
     public void byteBufferFieldSurfacesAsSizeInBytesDescriptor() {

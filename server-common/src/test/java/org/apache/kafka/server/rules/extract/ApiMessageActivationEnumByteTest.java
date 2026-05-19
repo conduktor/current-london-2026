@@ -20,6 +20,8 @@ import org.apache.kafka.common.message.FetchRequestData;
 import org.apache.kafka.server.rules.cel.CelCompiler;
 import org.apache.kafka.server.rules.cel.CelProgram;
 
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.util.Map;
@@ -69,6 +71,18 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * later by surprise.
  */
 public class ApiMessageActivationEnumByteTest {
+
+    // R45-A-1: symmetric defence for CelLimits.STEPS ThreadLocal. See
+    // sibling class ApiMessageActivationBytesTest for the rationale.
+    @BeforeEach
+    public void resetStepBudget() {
+        CelProgram.resetEvalStepBudget();
+    }
+
+    @AfterEach
+    public void leaveCounterClean() {
+        CelProgram.resetEvalStepBudget();
+    }
 
     @Test
     public void isolationLevelSurfacesAsLongNotString() {

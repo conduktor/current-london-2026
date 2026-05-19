@@ -22,6 +22,8 @@ import org.apache.kafka.common.message.AlterClientQuotasRequestData.OpData;
 import org.apache.kafka.server.rules.cel.CelCompiler;
 import org.apache.kafka.server.rules.cel.CelProgram;
 
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.util.Collections;
@@ -68,6 +70,18 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * schema field.
  */
 public class ApiMessageActivationDoubleTest {
+
+    // R45-A-1: symmetric defence for CelLimits.STEPS ThreadLocal. See
+    // sibling class ApiMessageActivationBytesTest for the rationale.
+    @BeforeEach
+    public void resetStepBudget() {
+        CelProgram.resetEvalStepBudget();
+    }
+
+    @AfterEach
+    public void leaveCounterClean() {
+        CelProgram.resetEvalStepBudget();
+    }
 
     private static AlterClientQuotasRequestData reqWithOpValue(double v) {
         OpData op = new OpData().setKey("producer_byte_rate").setValue(v).setRemove(false);
