@@ -24,6 +24,7 @@ import org.apache.kafka.common.config.TopicConfig.{REMOTE_LOG_STORAGE_ENABLE_CON
 import org.apache.kafka.common.errors.{InvalidConfigurationException, InvalidRequestException, InvalidTopicException}
 import org.apache.kafka.common.internals.Topic
 import org.apache.kafka.coordinator.group.GroupConfig
+import org.apache.kafka.server.log.remote.metadata.storage.TopicBasedRemoteLogMetadataManagerConfig
 import org.apache.kafka.server.metrics.ClientMetricsConfigs
 import org.apache.kafka.server.views.ViewTopicConfig
 import org.junit.jupiter.api.Assertions.{assertEquals, assertThrows}
@@ -264,6 +265,40 @@ class ControllerConfigurationValidatorTest {
     config.put(ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
     val ex = assertThrows(classOf[InvalidConfigurationException], () => validator.validate(
       new ConfigResource(TOPIC, "peek-share"), config, emptyMap()))
+    assert(ex.getMessage.contains("must not be an internal Kafka topic"),
+      s"unexpected message: ${ex.getMessage}")
+  }
+
+  @Test
+  def testViewBackingMustNotBeRemoteLogMetadata(): Unit = {
+    // __remote_log_metadata is a regular fetchable Kafka topic carrying RemoteLogSegmentMetadata
+    // records — segment offsets, leader epochs, and remote storage URIs for every tiered-storage-
+    // enabled topic in the cluster. Topic.isInternal() does NOT include it (clients/Topic.java
+    // INTERNAL_TOPICS lists only the three coordinator topics), so the round-27 gate alone would
+    // let an admin with READ on __remote_log_metadata front it with a predicate=true view and
+    // leak cross-tenant tiered-storage layout to anyone granted READ on the view.
+    val config = new util.TreeMap[String, String]()
+    config.put(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, TopicBasedRemoteLogMetadataManagerConfig.REMOTE_LOG_METADATA_TOPIC_NAME)
+    config.put(ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "true")
+    config.put(ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+    val ex = assertThrows(classOf[InvalidConfigurationException], () => validator.validate(
+      new ConfigResource(TOPIC, "peek-rlmm"), config, emptyMap()))
+    assert(ex.getMessage.contains("must not be an internal Kafka topic"),
+      s"unexpected message: ${ex.getMessage}")
+  }
+
+  @Test
+  def testViewBackingMustNotBeClusterMetadata(): Unit = {
+    // __cluster_metadata is the KRaft controller metadata log. It is not currently exposed by
+    // ReplicaManager / MetadataCache, so a fetch redirect against it would fail at metadata
+    // lookup today. Defense-in-depth: reject it at config-validation time so future MetadataCache
+    // wiring changes cannot silently re-open the redirect-ACL-skip hole on cluster-internal data.
+    val config = new util.TreeMap[String, String]()
+    config.put(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, Topic.CLUSTER_METADATA_TOPIC_NAME)
+    config.put(ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "true")
+    config.put(ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+    val ex = assertThrows(classOf[InvalidConfigurationException], () => validator.validate(
+      new ConfigResource(TOPIC, "peek-cluster-metadata"), config, emptyMap()))
     assert(ex.getMessage.contains("must not be an internal Kafka topic"),
       s"unexpected message: ${ex.getMessage}")
   }

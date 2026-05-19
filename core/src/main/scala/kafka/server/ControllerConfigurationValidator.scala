@@ -25,6 +25,7 @@ import org.apache.kafka.controller.ConfigurationValidator
 import org.apache.kafka.common.errors.{InvalidConfigurationException, InvalidRequestException}
 import org.apache.kafka.common.internals.Topic
 import org.apache.kafka.coordinator.group.GroupConfigManager
+import org.apache.kafka.server.log.remote.metadata.storage.TopicBasedRemoteLogMetadataManagerConfig
 import org.apache.kafka.server.metrics.ClientMetricsConfigs
 import org.apache.kafka.server.views.ViewTopicConfig
 import org.apache.kafka.storage.internals.log.LogConfig
@@ -143,10 +144,25 @@ class ControllerConfigurationValidator(kafkaConfig: KafkaConfig) extends Configu
         // / legacy AlterConfigs can persist a view bound to an internal topic — Topic.isInternal
         // enumerates the reserved Kafka-internal set exactly, so this catches the documented
         // cross-tenant leak without over-rejecting user topics that happen to start with '__'.
-        if (backing != null && Topic.isInternal(backing)) {
+        //
+        // The two additional names below are reserved Kafka-internal topics that Topic.isInternal
+        // does NOT cover. __remote_log_metadata is a regular fetchable user-of-MetadataCache topic
+        // carrying RemoteLogSegmentMetadata records — segment offsets, leader epochs, and remote
+        // storage URIs for every tiered-storage-enabled topic in the cluster; exposing it through
+        // a view would leak cross-tenant topic existence and segment layout to any principal
+        // granted READ on the view. __cluster_metadata is the KRaft metadata log; it is not
+        // currently served by ReplicaManager, but rejecting it at config-validation time is
+        // defense-in-depth so future MetadataCache wiring changes cannot silently open the
+        // same redirect-ACL-skip hole. Both names are listed in clients/ Topic.java as constants
+        // but intentionally not added to INTERNAL_TOPICS upstream; we mirror the broader
+        // "reserved" set used elsewhere (UnifiedLog.scala remote-storage gate) here, in core,
+        // without touching the clients/ module.
+        if (backing != null && (Topic.isInternal(backing) ||
+            backing == TopicBasedRemoteLogMetadataManagerConfig.REMOTE_LOG_METADATA_TOPIC_NAME ||
+            backing == Topic.CLUSTER_METADATA_TOPIC_NAME)) {
           throw new InvalidConfigurationException(
             s"${ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG} must not be an internal Kafka topic " +
-              s"('$backing'). Views cannot project coordinator-managed internal topics.")
+              s"('$backing'). Views cannot project coordinator-managed or cluster-internal topics.")
         }
       case BROKER => validateBrokerName(resource.name())
       case CLIENT_METRICS =>
