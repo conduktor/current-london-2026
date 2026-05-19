@@ -5800,6 +5800,110 @@ class ReplicaManagerTest {
     }
   }
 
+  // ----- r22 BLOCKER #220: controlled-shutdown stop-fetching skip regression coverage -----
+  //
+  // applyLocalFollowersDelta's "controlled-shutdown stop" branch enqueues the partition into
+  // partitionsToStopFetching and SKIPS partition.invokeOnBecomingFollowerListeners(). For a
+  // backing topic-partition, that skip would otherwise leave the kernel in a stale state
+  // (gate still open, idempotent cache still populated) until JVM exit — observable to:
+  //   (a) read-path requests that may consult the idempotent batch cache, and
+  //   (b) any controlled-shutdown cancel-then-relead path where the broker becomes leader
+  //       again without going through the recoverer-driven gate-close → scan → reopen cycle.
+  //
+  // The fix introduces maybeCloseConcentrationGateOnControlledShutdownStop, called inside
+  // applyLocalFollowersDelta on the controlled-shutdown stop branch. These tests pin the
+  // helper's semantics: close gate + invalidate cache for backing topics, never touch the
+  // kernel for non-backing topics, swallow kernel exceptions (listener semantics).
+
+  @Test
+  def testMaybeCloseConcentrationGateOnControlledShutdownStopClosesGateForBackingTopic(): Unit = {
+    val kernel = mock(classOf[ConcentrationKernel])
+    val backingTp = new TopicPartition("orders-backing", 3)
+    when(kernel.isBackingTopic(backingTp.topic)).thenReturn(true)
+    val replicaManager = setupReplicaManagerWithMockedPurgatories(
+      new MockTimer(time),
+      concentrationKernel = Some(kernel)
+    )
+    try {
+      replicaManager.maybeCloseConcentrationGateOnControlledShutdownStop(backingTp)
+
+      verify(kernel).isBackingTopic(backingTp.topic)
+      verify(kernel).markBackingUnready(backingTp)
+      verify(kernel).invalidateIdempotentCacheForBacking(backingTp.topic)
+      verifyNoMoreInteractions(kernel)
+    } finally {
+      replicaManager.shutdown(checkpointHW = false)
+    }
+  }
+
+  @Test
+  def testMaybeCloseConcentrationGateOnControlledShutdownStopIsNoopForNonBackingTopic(): Unit = {
+    val kernel = mock(classOf[ConcentrationKernel])
+    val nonBackingTp = new TopicPartition("ordinary-topic", 0)
+    when(kernel.isBackingTopic(nonBackingTp.topic)).thenReturn(false)
+    val replicaManager = setupReplicaManagerWithMockedPurgatories(
+      new MockTimer(time),
+      concentrationKernel = Some(kernel)
+    )
+    try {
+      replicaManager.maybeCloseConcentrationGateOnControlledShutdownStop(nonBackingTp)
+
+      verify(kernel).isBackingTopic(nonBackingTp.topic)
+      // Non-backing partitions retain historical behaviour: zero kernel mutation. Otherwise
+      // every controlled-shutdown follower transition for an ordinary topic would pollute
+      // backingGateState and the idempotent cache.
+      verify(kernel, never()).markBackingUnready(any[TopicPartition])
+      verify(kernel, never()).invalidateIdempotentCacheForBacking(anyString())
+      verifyNoMoreInteractions(kernel)
+    } finally {
+      replicaManager.shutdown(checkpointHW = false)
+    }
+  }
+
+  @Test
+  def testMaybeCloseConcentrationGateOnControlledShutdownStopIsNoopWhenKernelAbsent(): Unit = {
+    // Broker started without concentration enabled: applyLocalFollowersDelta runs on every
+    // broker, so the helper must short-circuit without NPE when the kernel is absent.
+    val replicaManager = setupReplicaManagerWithMockedPurgatories(
+      new MockTimer(time),
+      concentrationKernel = None
+    )
+    try {
+      // No exception thrown — pure no-op.
+      replicaManager.maybeCloseConcentrationGateOnControlledShutdownStop(
+        new TopicPartition("anything", 0))
+    } finally {
+      replicaManager.shutdown(checkpointHW = false)
+    }
+  }
+
+  @Test
+  def testMaybeCloseConcentrationGateOnControlledShutdownStopSwallowsKernelException(): Unit = {
+    // Listener semantics: notification-only. A kernel-side fault must NOT escape into the
+    // controlled-shutdown path, which would otherwise crash the broker mid-shutdown.
+    val kernel = mock(classOf[ConcentrationKernel])
+    val backingTp = new TopicPartition("orders-backing", 9)
+    when(kernel.isBackingTopic(backingTp.topic)).thenReturn(true)
+    doThrow(new RuntimeException("simulated kernel fault"))
+      .when(kernel).markBackingUnready(backingTp)
+    doThrow(new RuntimeException("simulated cache fault"))
+      .when(kernel).invalidateIdempotentCacheForBacking(backingTp.topic)
+    val replicaManager = setupReplicaManagerWithMockedPurgatories(
+      new MockTimer(time),
+      concentrationKernel = Some(kernel)
+    )
+    try {
+      // Must not throw.
+      replicaManager.maybeCloseConcentrationGateOnControlledShutdownStop(backingTp)
+
+      // Both legs were attempted independently — second leg must run even if first throws.
+      verify(kernel).markBackingUnready(backingTp)
+      verify(kernel).invalidateIdempotentCacheForBacking(backingTp.topic)
+    } finally {
+      replicaManager.shutdown(checkpointHW = false)
+    }
+  }
+
   @Test
   def testReplicaAlterLogDirs(): Unit = {
     val tp = new TopicPartition(topic, 0)

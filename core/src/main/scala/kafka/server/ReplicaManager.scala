@@ -2841,6 +2841,72 @@ class ReplicaManager(val config: KafkaConfig,
     }
   }
 
+  /**
+   * Close the per-backing readiness gate and invalidate the idempotent cache for a backing
+   * topic-partition that is being stopped on the controlled-shutdown follower path.
+   *
+   * <p>Why this exists (r22 BLOCKER #220): in
+   * {@link #applyLocalFollowersDelta}, when {@code isInControlledShutdown} is set AND the
+   * partition has no leader OR this broker is not in the ISR, the partition is enqueued onto
+   * {@code partitionsToStopFetching} and {@code partition.invokeOnBecomingFollowerListeners()}
+   * is NOT called. That skip is fine for the generic follower-state machinery (the broker is
+   * heading to JVM exit anyway), but it silently bypasses the {@link KafkaConcentrationPartitionListener}
+   * which is what would otherwise close the kernel's per-backing gate and invalidate its
+   * idempotent batch cache on a leader-loss transition.
+   *
+   * <p>Concrete leak vector if we skip:
+   * <pre>
+   *   T0: broker A is leader for backing-0; kernel.isBackingReady(tp) == true
+   *   T1: broker A begins controlled shutdown; controller transitions A → follower
+   *   T2: applyLocalFollowersDelta sees isInControlledShutdown && leader==NO_LEADER,
+   *       enqueues partitionsToStopFetching, SKIPS invokeOnBecomingFollowerListeners
+   *   T3: kernel state on broker A is stale: gate still open, idempotent cache still
+   *       populated with entries from the prior leader-epoch
+   *   T4: any logical-topic produce reaching broker A in the shutdown window
+   *       observes isBackingReady == true — the primary leader check rejects with
+   *       NOT_LEADER_OR_FOLLOWER, so the produce path is covered, BUT:
+   *       (a) the cached idempotent responses for the prior leader-epoch can be served
+   *           on read paths until JVM exit, and
+   *       (b) any operator-initiated cancellation of controlled shutdown (rare but
+   *           possible) leaves the broker as a fresh leader candidate WITHOUT the
+   *           gate-close/recovery cycle that {@link KafkaConcentrationLeaderRecoverer}
+   *           depends on for tracker rehydrate.
+   * </pre>
+   *
+   * <p>Fix: explicitly close the gate AND invalidate the idempotent cache for backing
+   * topics on the stop path, matching the semantics that
+   * {@link KafkaConcentrationPartitionListener#onBecomingFollower} would have applied. The
+   * fix is narrow to backing topics — non-backing partitions retain their historical
+   * "no listener invocation on controlled-shutdown stop" behaviour.
+   *
+   * <p>Idempotent. Safe to call even if the gate was already closed (the kernel bumps the
+   * generation atomically) or the cache was already empty. Failures from either kernel
+   * call are caught and logged — listener semantics: notification-only, must not crash the
+   * controlled-shutdown path.
+   *
+   * <p>Visible for testing.
+   */
+  private[server] def maybeCloseConcentrationGateOnControlledShutdownStop(tp: TopicPartition): Unit = {
+    concentrationKernel.foreach { kernel =>
+      if (kernel.isBackingTopic(tp.topic)) {
+        try {
+          kernel.markBackingUnready(tp)
+        } catch {
+          case t: Throwable =>
+            stateChangeLogger.warn(
+              s"Concentration kernel markBackingUnready failed for $tp on controlled-shutdown stop: ${t.getMessage}", t)
+        }
+        try {
+          kernel.invalidateIdempotentCacheForBacking(tp.topic)
+        } catch {
+          case t: Throwable =>
+            stateChangeLogger.warn(
+              s"Concentration kernel idempotent-cache invalidation failed for ${tp.topic} on controlled-shutdown stop: ${t.getMessage}", t)
+        }
+      }
+    }
+  }
+
   private def applyLocalLeadersDelta(
     changedPartitions: mutable.Set[Partition],
     delta: TopicsDelta,
@@ -2936,6 +3002,12 @@ class ReplicaManager(val config: KafkaConfig,
 
           if (isInControlledShutdown && (info.partition.leader == NO_LEADER ||
               !info.partition.isr.contains(config.brokerId))) {
+            // r22 BLOCKER #220: even when stopping during controlled shutdown, close the
+            // concentration kernel's per-backing gate and invalidate the idempotent cache
+            // for backing topics. This bypass of invokeOnBecomingFollowerListeners would
+            // otherwise leave the kernel in a stale "ready=true" state until JVM exit.
+            // See maybeCloseConcentrationGateOnControlledShutdownStop for the full rationale.
+            maybeCloseConcentrationGateOnControlledShutdownStop(tp)
             // During controlled shutdown, replica with no leaders and replica
             // where this broker is not in the ISR are stopped.
             partitionsToStopFetching.put(tp, false)
