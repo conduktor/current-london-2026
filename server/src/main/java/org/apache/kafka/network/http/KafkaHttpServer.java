@@ -42,7 +42,10 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.HashSet;
 import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeoutException;
 
 import jakarta.servlet.http.HttpServletRequest;
@@ -94,6 +97,13 @@ public final class KafkaHttpServer {
     // and the test-harness default) stop() returns near-instantly and SSE/WS clients see a TCP reset mid-stream
     // instead of an orderly close. Production wiring (BrokerServer) passes the configured value.
     private final long shutdownGraceMs;
+    // Live WebSocket endpoints. Each {@link KafkaWebSocketEndpoint} adds itself in onWebSocketOpen and removes
+    // itself in tearDown. {@link #stop()} walks a snapshot of this set BEFORE Server.stop() so each live peer
+    // receives an RFC 6455 §5.5.1 close frame with status 1001 (Going Away) — otherwise Jetty's connector
+    // force-close on shutdown delivers status 1006 (Abnormal Closure), conflating planned broker restarts with
+    // transport failures on every WS client and monitoring dashboard. ConcurrentHashMap-backed set so concurrent
+    // add/remove on Jetty I/O threads cannot race the snapshot taken on the broker stop thread.
+    private final Set<KafkaWebSocketEndpoint> activeWsSessions = ConcurrentHashMap.newKeySet();
 
     // volatile: written inside synchronized start()/stop(), read by boundPort() without holding the lock.
     // The synchronized writer publishes through the monitor, but unsynchronized readers (test threads and
@@ -167,6 +177,17 @@ public final class KafkaHttpServer {
         HttpConfiguration httpConfig = new HttpConfiguration();
         httpConfig.setSendServerVersion(false);
         httpConfig.setSendXPoweredBy(false);
+        // Body-phase per-connection minimum read rate (bytes/sec). Jetty enforces this only while reading the
+        // request body — a connection that submits a Content-Length and then drips its body at less than this
+        // rate is closed with 408. Header-phase slowloris is already covered by the connector idle timeout
+        // (30s, set below) and by Wave 25's per-source connection cap delegation to a fronting proxy, but
+        // neither defence catches a peer that completes the header block within the idle window, sends one
+        // byte of body, then sits — that pattern would pin a Jetty handler thread for the full
+        // maxRequestBodyBytes budget at one byte per idle window. 64 B/s is comfortably above the floor a
+        // healthy producer ever drops to (a 1 MiB body completes in 16 s at that rate) and tight enough that a
+        // drip attacker can pin a handler for at most maxRequestBodyBytes / 64 seconds before the connection
+        // is closed. Body-phase only — does not affect SSE/WS long-poll which use the connector idle timeout.
+        httpConfig.setMinRequestDataRate(64L);
         ServerConnector connector = new ServerConnector(jetty, new HttpConnectionFactory(httpConfig));
         connector.setHost(host);
         connector.setPort(port);
@@ -257,7 +278,8 @@ public final class KafkaHttpServer {
                 // is neither.
                 KafkaWebSocketEndpoint endpoint;
                 try {
-                    endpoint = new KafkaWebSocketEndpoint(topic, submitter, mapper, token, httpExecutor);
+                    endpoint = new KafkaWebSocketEndpoint(topic, submitter, mapper, token, httpExecutor,
+                        activeWsSessions);
                 } catch (RuntimeException e) {
                     token.close();
                     throw e;
@@ -294,6 +316,22 @@ public final class KafkaHttpServer {
     public synchronized void stop() throws Exception {
         try {
             if (server != null) {
+                // Send each live WebSocket peer an RFC 6455 §5.5.1 close frame with status 1001 (Going Away)
+                // BEFORE Server.stop() begins. Without this, Jetty's connector force-close on shutdown
+                // delivers status 1006 (Abnormal Closure) — RFC 6455 §7.1.1 says a server SHOULD send a
+                // close frame on planned shutdown, and 1001 vs 1006 is what monitoring dashboards use to
+                // distinguish a planned restart from a transport failure. Snapshot to a local set so the
+                // walk is isolated from concurrent remove() calls fired by tearDown(); endpoints that
+                // completed between snapshot and walk are harmless because closeForShutdown() short-circuits
+                // when the underlying session is already closed.
+                Set<KafkaWebSocketEndpoint> snapshot = new HashSet<>(activeWsSessions);
+                for (KafkaWebSocketEndpoint endpoint : snapshot) {
+                    try {
+                        endpoint.closeForShutdown();
+                    } catch (RuntimeException e) {
+                        LOG.debug("WS shutdown close failed: {}", e.toString());
+                    }
+                }
                 try {
                     server.stop();
                 } catch (TimeoutException e) {

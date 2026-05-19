@@ -28,6 +28,7 @@ import org.slf4j.LoggerFactory;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -113,22 +114,41 @@ public final class KafkaWebSocketEndpoint implements Session.Listener.AutoDemand
     private final WsStreamLimiter.Token token;
     private final AtomicBoolean released = new AtomicBoolean(false);
 
+    /**
+     * Shared registry of live endpoints owned by the surrounding {@link KafkaHttpServer}. The endpoint
+     * adds itself in {@link #onWebSocketOpen} (which Jetty serialises per session) and removes itself
+     * in {@link #tearDown}. The server walks this registry at the start of {@code stop()} to send each
+     * live peer an RFC 6455 §5.5.1 close frame with {@link StatusCode#SHUTDOWN 1001} before the connector
+     * force-closes the underlying socket. Without this, a planned broker restart leaves every connected
+     * WS client observing close code 1006 (abnormal closure) instead of 1001 (going away) — monitoring
+     * dashboards then conflate orderly restarts with transport failures. The registry is a
+     * {@code ConcurrentHashMap}-backed set so concurrent add/remove on Jetty's I/O threads does not race
+     * the shutdown walk on the broker's stop thread.
+     */
+    private final Set<KafkaWebSocketEndpoint> activeSessions;
+
     private volatile Session session;
     private volatile WsStreamer streamer;
     private volatile boolean closed;
 
     KafkaWebSocketEndpoint(String topic, RequestSubmitter submitter, ObjectMapper mapper,
-                           WsStreamLimiter.Token token, Executor httpExecutor) {
+                           WsStreamLimiter.Token token, Executor httpExecutor,
+                           Set<KafkaWebSocketEndpoint> activeSessions) {
         this.topic = Objects.requireNonNull(topic, "topic must not be null");
         this.submitter = Objects.requireNonNull(submitter, "submitter must not be null");
         this.mapper = Objects.requireNonNull(mapper, "mapper must not be null");
         this.token = Objects.requireNonNull(token, "token must not be null");
         this.httpExecutor = Objects.requireNonNull(httpExecutor, "httpExecutor must not be null");
+        this.activeSessions = Objects.requireNonNull(activeSessions, "activeSessions must not be null");
     }
 
     @Override
     public void onWebSocketOpen(Session session) {
         this.session = session;
+        // Register before any blocking work so a stop() that races the upgrade still sees this endpoint and
+        // delivers the 1001 close frame. Jetty serialises lifecycle callbacks per session, so the matching
+        // remove() in tearDown() cannot reorder before this add().
+        activeSessions.add(this);
         // Start with the tight pre-subscribe timeout; handleFirstFrame relaxes to IDLE_TIMEOUT once the
         // subscribe frame has been validated and the streamer is constructed.
         session.setIdleTimeout(PRE_SUBSCRIBE_IDLE_TIMEOUT);
@@ -261,6 +281,35 @@ public final class KafkaWebSocketEndpoint implements Session.Listener.AutoDemand
         if (released.compareAndSet(false, true)) {
             token.close();
         }
+        // Drop from the shutdown registry last — once tearDown has reached this point the session has
+        // no further interaction with the server. remove() on a ConcurrentHashMap-backed set is
+        // idempotent so a concurrent closeForShutdown() walking the snapshot cannot trip on this.
+        activeSessions.remove(this);
+    }
+
+    /**
+     * Initiated by {@link KafkaHttpServer#stop()} at the start of the graceful-shutdown window. Sends an
+     * RFC 6455 §5.5.1 close frame with {@link StatusCode#SHUTDOWN 1001} ("Going Away") so peers can
+     * distinguish a planned broker restart from a transport failure ({@link StatusCode#ABNORMAL 1006},
+     * which is what Jetty's force-close on connector stop would otherwise deliver). After the frame is
+     * dispatched we tear down our own state — the streamer's close releases the limiter token and the
+     * outbound queue is drained inside the {@code Server.stop()} grace window.
+     *
+     * <p>Idempotent: a session that has already closed (via client disconnect, error, or a prior
+     * shutdown walk) is a no-op. Called on the broker's stop thread, not Jetty's I/O thread, so the
+     * session field is read once and the Jetty-side serialisation guarantees of {@code session.close}
+     * are still respected (it queues the close frame on the session's strand).
+     */
+    void closeForShutdown() {
+        Session s = this.session;
+        if (s != null && s.isOpen()) {
+            try {
+                s.close(StatusCode.SHUTDOWN, "broker shutting down", Callback.NOOP);
+            } catch (RuntimeException e) {
+                LOG.debug("close(1001) failed on {}: {}", topic, e.toString());
+            }
+        }
+        tearDown();
     }
 
     private void closeWithProtocolError(String reason) {

@@ -2144,6 +2144,84 @@ class KafkaHttpServerIntegrationTest {
     }
 
     @Test
+    void gracefulShutdownClosesWsSubscriptionsWith1001GoingAway() throws Exception {
+        // Wave 29 axis BBB: Jetty 12.0.25's Server.doStop does NOT walk live WebSocket sessions to send a
+        // close frame on shutdown — Graceful.shutdown() drains in-flight HTTP requests but the WS layer
+        // (WebSocketCoreSession) is not a Graceful bean. Without an explicit walk, every connected WS peer
+        // observes close code 1006 (Abnormal Closure) on a planned broker restart, which monitoring
+        // dashboards cannot distinguish from a transport failure. RFC 6455 §7.1.1 says a server SHOULD
+        // send a close frame before closing the underlying TCP connection on a planned shutdown, and
+        // §7.4.1 reserves 1001 (Going Away) for exactly this case. The endpoint now registers itself in a
+        // shared set; KafkaHttpServer.stop() walks a snapshot of that set and calls closeForShutdown() on
+        // each session BEFORE Server.stop() takes the connectors down. This test pins that the WS client
+        // observes status 1001 (not 1006) when the broker restarts cleanly.
+        tearDown();
+        ControllableSubmitter localSubmitter = new ControllableSubmitter();
+        KafkaHttpServer gracefulServer = new KafkaHttpServer("127.0.0.1", 0,
+            new KafkaHttpBridge(mapper, localSubmitter), localSubmitter, mapper,
+            DEFAULT_TEST_MAX_BODY_BYTES, DEFAULT_TEST_MAX_SSE_STREAMS, DEFAULT_TEST_MAX_WS_SUBSCRIPTIONS,
+            1500L);
+        try {
+            gracefulServer.start();
+            WebSocketClient wsClient = new WebSocketClient();
+            wsClient.start();
+            try {
+                // One record delivered up front, subsequent fetches park forever — the subscription sits in
+                // the long-poll across the entire shutdown window, mirroring the SSE graceful test above.
+                ConcurrentLinkedQueue<RequestSubmitter.FetchResult> queue = new ConcurrentLinkedQueue<>();
+                queue.add(new RequestSubmitter.FetchResult(
+                    new FetchResponseFormatter.PartitionFetch(
+                        0, Errors.NONE, null, 0, 0, 1,
+                        List.of(new FetchResponseFormatter.FetchedRecord(
+                            0, null, "x".getBytes(StandardCharsets.UTF_8), null, 1L))),
+                    0L));
+                localSubmitter.fetchResultQueue = queue;
+
+                CapturingWsListener listener = new CapturingWsListener();
+                URI uri = URI.create("ws://127.0.0.1:" + gracefulServer.boundPort()
+                    + "/v1/topics/orders/subscribe");
+                Session session = wsClient.connect(listener, uri).get(5, TimeUnit.SECONDS);
+                try {
+                    listener.openLatch.await(5, TimeUnit.SECONDS);
+                    session.sendText(
+                        "{\"type\":\"subscribe\",\"partition\":0,\"offset\":0,\"maxBytes\":200000,\"initialCredits\":1}",
+                        Callback.NOOP);
+                    // Wait until the first record has been delivered — confirms the endpoint is registered and
+                    // the subscription is live before we trigger shutdown. Without this we'd race the upgrade
+                    // against stop() and the activeSessions walk could miss the not-yet-opened session.
+                    listener.awaitMessages(1, 5, TimeUnit.SECONDS);
+
+                    gracefulServer.stop();
+                    // closeForShutdown() sends 1001 inline at the start of stop(); by the time stop() returns
+                    // the close frame is on the wire. Give the client a generous window to deliver it.
+                    assertTrue(listener.closeLatch.await(5, TimeUnit.SECONDS),
+                        "WS client must observe a close frame within the shutdown window — not a silent socket reset");
+                    assertEquals(StatusCode.SHUTDOWN, listener.closeStatus,
+                        "planned broker shutdown must surface as RFC 6455 1001 (Going Away), not "
+                            + listener.closeStatus + " — anything else conflates planned restart with transport failure");
+                    assertNotNull(listener.closeReason,
+                        "close frame must carry a reason so operators can disambiguate the source");
+                    assertTrue(listener.closeReason.toLowerCase(java.util.Locale.ROOT).contains("shutting down"),
+                        "close reason should name the shutdown cause, got: " + listener.closeReason);
+                } finally {
+                    if (session.isOpen()) {
+                        session.close(StatusCode.NORMAL, "test cleanup", Callback.NOOP);
+                    }
+                }
+            } finally {
+                wsClient.stop();
+            }
+        } finally {
+            try {
+                gracefulServer.stop();
+            } catch (Exception ignored) {
+                // already stopped
+            }
+            startServer(DEFAULT_TEST_MAX_BODY_BYTES, DEFAULT_TEST_MAX_SSE_STREAMS, DEFAULT_TEST_MAX_WS_SUBSCRIPTIONS);
+        }
+    }
+
+    @Test
     void zeroGraceStopsImmediatelyForLegacyTestHarness() throws Exception {
         // Counterpart to gracefulShutdownLetsInFlightSseStreamSettleBeforeForceClose: confirm that the
         // 8-arg legacy constructor still produces a server that tears down without waiting, so the

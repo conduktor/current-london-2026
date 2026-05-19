@@ -317,8 +317,11 @@ class KafkaWebSocketEndpointTest {
     // ----- helpers -----
 
     private KafkaWebSocketEndpoint newEndpoint(WsStreamLimiter.Token token, String topic) {
-        // Direct executor so all dispatch settles synchronously inside the test thread.
-        return new KafkaWebSocketEndpoint(topic, submitter, MAPPER, token, Runnable::run);
+        // Direct executor so all dispatch settles synchronously inside the test thread. Unit tests do not
+        // exercise the shutdown-walk path that the activeSessions set drives — a private, never-read empty
+        // set is sufficient; KafkaHttpServerIntegrationTest covers the registry end-to-end.
+        return new KafkaWebSocketEndpoint(topic, submitter, MAPPER, token, Runnable::run,
+            java.util.concurrent.ConcurrentHashMap.newKeySet());
     }
 
     private static List<FetchResponseFormatter.FetchedRecord> records(long startOffset, int count) {
