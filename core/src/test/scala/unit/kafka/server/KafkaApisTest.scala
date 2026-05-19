@@ -11214,6 +11214,74 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testProduceTenantScrubsPhysicalPrefixFromRecordErrorsMessage(): Unit = {
+    // #134: KIP-467 per-record validation errors (ProduceResponse v8+) carry a
+    // `recordErrors[].message` string that LogValidator builds by interpolating
+    // the PHYSICAL TopicPartition (e.g. "Compacted topic cannot accept message
+    // without key in topic partition acme.orders-0"). The PartitionResponse
+    // OUT-rewrite previously only scrubbed `errorMessage`, not the
+    // `recordErrors` list — so the physical tenant prefix leaked back to the
+    // tenant client via this side channel. Own-tenant only, but violates the
+    // contract that tenants never see their physical prefix on the wire.
+    // The fix rebuilds each RecordError with scrubMessage applied
+    // (RecordError.message is final, so in-place mutation isn't possible).
+    val physicalTopic = "acme.orders"
+    addTopicToMetadataCache(physicalTopic, numPartitions = 1)
+
+    val produceRequest = buildSingleTopicProduceRequest("orders")
+    val request = buildRequest(
+      produceRequest,
+      listenerName = TENANT_LISTENER,
+      principal = tenantPrincipal("acme", "alice"))
+
+    val responseCallback: ArgumentCaptor[Map[TopicPartition, PartitionResponse] => Unit] =
+      ArgumentCaptor.forClass(classOf[Map[TopicPartition, PartitionResponse] => Unit])
+
+    // Mirror what LogValidator.validateKey emits on a compacted topic with
+    // missing key — the actual production source of the physical-name leak.
+    val leakedRecordMsg =
+      s"Compacted topic cannot accept message without key in topic partition $physicalTopic-0"
+    val recordErrors = java.util.List.of(
+      new org.apache.kafka.common.requests.ProduceResponse.RecordError(0, leakedRecordMsg))
+    val pr = new PartitionResponse(Errors.INVALID_RECORD, 0L, -1L, 0L, recordErrors, null)
+    when(replicaManager.handleProduceAppend(
+      anyLong, anyShort, ArgumentMatchers.eq(false), any(),
+      any(), responseCallback.capture(),
+      any(), any(), any(), any())
+    ).thenAnswer(_ => responseCallback.getValue.apply(
+      Map(new TopicPartition(physicalTopic, 0) -> pr)))
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), any[Long])).thenReturn(0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    kafkaApis = createKafkaApis(
+      authorizer = None,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[ProduceResponse](request)
+    val topicProduceResponse = response.data.responses.asScala.head
+    assertEquals("orders", topicProduceResponse.name,
+      "topic name in response must be logical")
+    val partitionProduceResponse = topicProduceResponse.partitionResponses.asScala.head
+    assertEquals(Errors.INVALID_RECORD,
+      Errors.forCode(partitionProduceResponse.errorCode))
+    val rEs = partitionProduceResponse.recordErrors
+    assertNotNull(rEs, "recordErrors list must be propagated to the client")
+    assertEquals(1, rEs.size, "the single record error must be preserved")
+    val recordErrMsg = rEs.get(0).batchIndexErrorMessage
+    assertNotNull(recordErrMsg, "recordErrors[0] message must be propagated")
+    assertFalse(recordErrMsg.contains("acme.orders"),
+      s"physical prefix must be scrubbed from recordErrors[].message but found in: $recordErrMsg")
+    assertTrue(recordErrMsg.contains("orders"),
+      s"logical topic name must remain in scrubbed recordErrors[].message: $recordErrMsg")
+    assertEquals(0, rEs.get(0).batchIndex,
+      "batchIndex must be preserved across the scrub-rebuild")
+  }
+
+  @Test
   def testProducePrivilegedCallerOnTenantBoundListenerIsRejected(): Unit = {
     // Super-user without a `__tenant_` prefix produces on a tenant-bound
     // listener. The broker MUST refuse every partition rather than silently

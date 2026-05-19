@@ -1264,10 +1264,14 @@ class KafkaApis(val requestChannel: RequestChannel,
       // OUT rewrite — the response map keys (TopicPartitions) carry the
       // physical topic name and the PartitionResponse values may embed the
       // physical name inside `errorMessage` (e.g. validators that quote the
-      // offending topic). Rewrite both: the key via toLogical, the embedded
-      // string via scrubMessage. The PartitionResponse is mutated in place
-      // because its fields are public and at this point we own the reference;
-      // currentLeader and other state set above are preserved.
+      // offending topic) AND inside `recordErrors[].message` (KIP-467, v8+
+      // per-record validation failures emitted by LogValidator, which quote
+      // the physical TopicPartition — "in topic partition <tenant>.<topic>-N").
+      // Rewrite the key via toLogical and every embedded string via
+      // scrubMessage. PartitionResponse fields are public and at this point we
+      // own the reference, but RecordError.message is final, so each
+      // RecordError must be rebuilt rather than mutated. currentLeader and
+      // other state set above are preserved.
       // invalidLogicalTopicResponses is already keyed by the LOGICAL name the
       // client sent; merge after the toLogical pass so it doesn't strip the
       // tenant-prefix portion the caller intentionally included.
@@ -1275,6 +1279,13 @@ class KafkaApis(val requestChannel: RequestChannel,
         val rewritten: Map[TopicPartition, PartitionResponse] =
           if (tenantScoped) physicalResponseStatus.map { case (tp, pr) =>
             if (pr.errorMessage != null) pr.errorMessage = scrubMessage(pr.errorMessage, tenantCtx)
+            if (pr.recordErrors != null && !pr.recordErrors.isEmpty) {
+              pr.recordErrors = pr.recordErrors.asScala.map { re =>
+                if (re.message != null)
+                  new ProduceResponse.RecordError(re.batchIndex, scrubMessage(re.message, tenantCtx))
+                else re
+              }.asJava
+            }
             new TopicPartition(tenantCtx.toLogical(tp.topic), tp.partition) -> pr
           } else physicalResponseStatus
         rewritten ++ invalidLogicalTopicResponses
