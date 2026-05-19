@@ -150,11 +150,23 @@ public final class CelCompiler {
                     continue;
                 }
                 int start = i;
-                if (Character.isDigit(c)) {
+                // R28 adversarial (#247): identifier/numeric tokens are ASCII
+                // only. Character.isDigit and Character.isLetter admit ~700
+                // Unicode digit codepoints (Arabic-Indic, Devanagari, fullwidth)
+                // and thousands of letter codepoints (Cyrillic, Greek, CJK
+                // homoglyphs). Long.parseLong below would then reject the
+                // non-ASCII numerics with a NumberFormatException whose message
+                // embeds the raw input — wasted compile work and a misleading
+                // diagnostic. For identifiers, a Cyrillic 'р' (U+0440) would
+                // tokenise as IDENT but the activation supplier never resolves
+                // the non-ASCII name, so the rule silently never fires — a
+                // homoglyph trap for a reviewer reading the rule JSON. The
+                // CEL grammar is ASCII; pin it.
+                if (isAsciiDigit(c)) {
                     out.add(number(start));
                 } else if (c == '"' || c == '\'') {
                     out.add(string(start, c));
-                } else if (Character.isLetter(c) || c == '_') {
+                } else if (isAsciiLetter(c) || c == '_') {
                     out.add(identOrKeyword(start));
                 } else {
                     out.add(symbolOrFail(start, c));
@@ -164,8 +176,20 @@ public final class CelCompiler {
             return out;
         }
 
+        private static boolean isAsciiDigit(char c) {
+            return c >= '0' && c <= '9';
+        }
+
+        private static boolean isAsciiLetter(char c) {
+            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+        }
+
+        private static boolean isAsciiLetterOrDigit(char c) {
+            return isAsciiDigit(c) || isAsciiLetter(c);
+        }
+
         private Token number(int start) {
-            while (i < src.length() && Character.isDigit(src.charAt(i))) {
+            while (i < src.length() && isAsciiDigit(src.charAt(i))) {
                 i++;
             }
             long value = Long.parseLong(src.substring(start, i));
@@ -219,7 +243,7 @@ public final class CelCompiler {
         }
 
         private Token identOrKeyword(int start) {
-            while (i < src.length() && (Character.isLetterOrDigit(src.charAt(i)) || src.charAt(i) == '_')) {
+            while (i < src.length() && (isAsciiLetterOrDigit(src.charAt(i)) || src.charAt(i) == '_')) {
                 i++;
             }
             String name = src.substring(start, i);

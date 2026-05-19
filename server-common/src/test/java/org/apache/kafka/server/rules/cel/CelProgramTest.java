@@ -424,6 +424,94 @@ public class CelProgramTest {
     }
 
     @Test
+    public void lexerRejectsNonAsciiUnicodeDigitsInNumericLiterals() {
+        // R28 adversarial (#247): Character.isDigit(c) returns true for ~700
+        // Unicode codepoints (Arabic-Indic 0660-0669, Devanagari 0966-096F,
+        // fullwidth FF10-FF19, etc.), but Long.parseLong only accepts ASCII
+        // 0-9. Before the fix, the lexer would happily consume non-ASCII
+        // digit codepoints into number() and then Long.parseLong would throw
+        // NumberFormatException — wasted parse work and a diagnostic whose
+        // text embedded the raw non-ASCII bytes through truncateForLog
+        // (which is length-only, not codepoint-scrubbing — see #208/#213).
+        // After the fix the lexer falls through to symbolOrFail, producing
+        // "unexpected character '...' at <pos>" with just the single
+        // offending codepoint, so the operator can locate the bad char
+        // immediately.
+        //
+        // Test vectors: U+0661 ARABIC-INDIC DIGIT ONE, U+0967 DEVANAGARI
+        // DIGIT ONE, U+FF11 FULLWIDTH DIGIT ONE. All three were admitted by
+        // the old Character.isDigit; all three are now rejected at the
+        // lexer.
+        CelCompilationException ex1 = assertThrows(CelCompilationException.class,
+            () -> CelCompiler.compile("١٢٣"));
+        assertTrue(ex1.getMessage().contains("unexpected character"),
+            "lexer must surface the offending character at its lex position rather than"
+                + " bury the failure inside a NumberFormatException: " + ex1.getMessage());
+        CelCompilationException ex2 = assertThrows(CelCompilationException.class,
+            () -> CelCompiler.compile("x > １０"));
+        assertTrue(ex2.getMessage().contains("unexpected character"),
+            "fullwidth digit must be rejected even in arithmetic context: " + ex2.getMessage());
+        CelCompilationException ex3 = assertThrows(CelCompilationException.class,
+            () -> CelCompiler.compile("१२"));
+        assertTrue(ex3.getMessage().contains("unexpected character"),
+            "Devanagari digit must be rejected: " + ex3.getMessage());
+
+        // Negative control: ASCII digits still compile cleanly. This pins
+        // the fix as strict-ASCII rather than "reject all numeric tokens".
+        CelProgram p = CelCompiler.compile("123");
+        assertEquals("123", p.source());
+    }
+
+    @Test
+    public void lexerRejectsNonAsciiUnicodeLettersInIdentifiers() {
+        // R28 adversarial (#247): Character.isLetter accepts thousands of
+        // non-ASCII letter codepoints. Before the fix, a rule like
+        // `рequest.x == 1` (Cyrillic 'р' homoglyph for ASCII 'r') would
+        // lex as IDENT `рequest` and then resolve to null at runtime
+        // (the activation supplier doesn't know the non-ASCII name) —
+        // silently inert rule. An operator reviewing the rule JSON sees
+        // text that LOOKS like `request.x == 1` but does nothing. Tighten
+        // the lexer to strict-ASCII identifiers so the homoglyph trap
+        // surfaces at compile time, with the offending codepoint located
+        // precisely.
+        //
+        // The CEL spec restricts identifiers to ASCII letters/digits/'_';
+        // this is just enforcing the spec.
+        CelCompilationException ex1 = assertThrows(CelCompilationException.class,
+            () -> CelCompiler.compile("рequest.x == 1"));
+        assertTrue(ex1.getMessage().contains("unexpected character"),
+            "Cyrillic homoglyph at position 0 must surface as a lex error,"
+                + " not silently install as an inert rule: " + ex1.getMessage());
+
+        // Greek lowercase iota (U+03B9) — looks like ASCII 'i' in some fonts.
+        CelCompilationException ex2 = assertThrows(CelCompilationException.class,
+            () -> CelCompiler.compile("ιd == 1"));
+        assertTrue(ex2.getMessage().contains("unexpected character"),
+            "Greek-letter identifier must be rejected: " + ex2.getMessage());
+
+        // Non-ASCII letter EMBEDDED inside an otherwise-ASCII identifier —
+        // the continuation loop (identOrKeyword's while) also uses the
+        // strict-ASCII predicate. Old impl would consume `reqуest` as
+        // a single IDENT; new impl stops at `req`, then trips on the
+        // Cyrillic 'у' as an unexpected character.
+        CelCompilationException ex3 = assertThrows(CelCompilationException.class,
+            () -> CelCompiler.compile("reqуest == 1"));
+        assertTrue(ex3.getMessage().contains("unexpected character"),
+            "non-ASCII letter embedded inside an identifier must be rejected"
+                + " — otherwise homoglyph attacks survive at column > 0: "
+                + ex3.getMessage());
+
+        // Negative control: strings are NOT subject to the ASCII
+        // restriction — operator-authored rules can legitimately match
+        // against non-ASCII string literals (e.g., `name == "café"`).
+        // Pin that the lexer's string() path still admits Unicode bytes.
+        CelProgram p = CelCompiler.compile("name == \"café\"");
+        assertTrue(p.source().contains("caf"),
+            "ASCII-only restriction must apply ONLY to identifiers and"
+                + " numeric literals, NOT to string contents: " + p.source());
+    }
+
+    @Test
     public void evaluationOfMissingIdentifierIsFalseInBooleanContext() {
         // A reference to a non-existent identifier should not throw — it produces null,
         // which is falsy in a Boolean context. This matters because rule predicates
