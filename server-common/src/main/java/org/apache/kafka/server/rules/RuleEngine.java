@@ -427,6 +427,20 @@ public final class RuleEngine {
      * principal at request time) so that {@link #bypassIsAuthorisedFor(String)}
      * can do a verbatim string-equals match.
      *
+     * <p>R34-B-3 [HIGH]: this no-arg form is <strong>silent</strong> on
+     * DN canonicalisation rewrites by design. Both reachable callers —
+     * {@link BypassPrincipalsValidator#ensureValid(String, Object)} at
+     * ConfigDef parse time and now (post R34-B-1) at controller-direct
+     * admin admission time — invoke this method per RPC, and an
+     * authenticated principal with ALTER_CONFIGS could otherwise tight-
+     * loop validate-only IncrementalAlterConfigs RPCs with a varied
+     * openssl-padded DN to amplify INFO-level log lines (one line per
+     * canonicalisable segment per RPC). Bootstrap path
+     * {@code BrokerServer.startup} explicitly opts into the log via
+     * {@link #parseBypassPrincipals(String, boolean)} with
+     * {@code logCanonicalisation=true}, so operators still see the
+     * rewrite-at-startup line they need for DN auditing.
+     *
      * @param raw the config value (may be {@code null} or empty — both
      *            return an empty set, granting no bypass)
      * @return canonical principal strings; never {@code null}
@@ -434,6 +448,17 @@ public final class RuleEngine {
      *         parse as a Kafka principal, or has blank principal type / name
      */
     public static Set<String> parseBypassPrincipals(String raw) {
+        return parseBypassPrincipals(raw, false);
+    }
+
+    /**
+     * Logging-opt-in variant of {@link #parseBypassPrincipals(String)} for
+     * the broker-startup engine-construction path. See R34-B-3 rationale
+     * in the no-arg javadoc above. Pass {@code logCanonicalisation=true}
+     * only from a one-shot per-broker-lifetime call site — never from a
+     * per-RPC admission path.
+     */
+    public static Set<String> parseBypassPrincipals(String raw, boolean logCanonicalisation) {
         if (raw == null) {
             return Collections.emptySet();
         }
@@ -800,20 +825,31 @@ public final class RuleEngine {
             if (name.indexOf('=') >= 0) {
                 String canonical = canonicaliseDnIfPossible(name);
                 if (canonical != null && !canonical.equals(name)) {
-                    LOG.info(
-                        "governance.bypass.principals entry '{}' was "
-                        + "rewritten to its X500 canonical form '{}:{}' "
-                        + "to match the runtime peer principal that "
-                        + "DefaultKafkaPrincipalBuilder produces via "
-                        + "X500Principal.getName(). The original DN was "
-                        + "valid but in a non-canonical shape (typically "
-                        + "from `openssl x509 -noout -subject` output, "
-                        + "which space-pads `=` and `,`). The bypass set "
-                        + "now stores the canonical form so the runtime "
-                        + "match succeeds.",
-                        LogSafe.sanitize(trimmed),
-                        LogSafe.sanitize(type),
-                        LogSafe.sanitize(canonical));
+                    // R34-B-3 [HIGH]: gate the operator-facing rewrite log
+                    // behind the bootstrap-only opt-in. Validator-path
+                    // callers (config-parse + admin-API admission) MUST
+                    // pass logCanonicalisation=false so an admin with
+                    // ALTER_CONFIGS cannot tight-loop validate-only RPCs
+                    // with varying openssl-padded DNs to amplify INFO
+                    // lines. The bootstrap path passes true and logs
+                    // exactly once per broker lifetime per canonicalised
+                    // entry.
+                    if (logCanonicalisation) {
+                        LOG.info(
+                            "governance.bypass.principals entry '{}' was "
+                            + "rewritten to its X500 canonical form '{}:{}' "
+                            + "to match the runtime peer principal that "
+                            + "DefaultKafkaPrincipalBuilder produces via "
+                            + "X500Principal.getName(). The original DN was "
+                            + "valid but in a non-canonical shape (typically "
+                            + "from `openssl x509 -noout -subject` output, "
+                            + "which space-pads `=` and `,`). The bypass set "
+                            + "now stores the canonical form so the runtime "
+                            + "match succeeds.",
+                            LogSafe.sanitize(trimmed),
+                            LogSafe.sanitize(type),
+                            LogSafe.sanitize(canonical));
+                    }
                     name = canonical;
                 }
             }

@@ -21,6 +21,7 @@ import org.apache.kafka.common.message.CreateTopicsRequestData.CreatableTopic;
 import org.apache.kafka.common.message.CreateTopicsRequestData.CreatableTopicCollection;
 import org.apache.kafka.common.protocol.ApiKeys;
 import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.utils.LogCaptureAppender;
 import org.apache.kafka.server.rules.cel.CelCompiler;
 import org.apache.kafka.server.rules.extract.ActivationBudgetExceededException;
 import org.apache.kafka.server.rules.extract.ApiMessageActivation;
@@ -3124,5 +3125,87 @@ public class RuleEngineTest {
             "fourth evaluation on the same thread must DENY cleanly — "
                 + "if IN_EVALUATE leaked from any of the prior three paths, "
                 + "the guard would have thrown IllegalStateException instead");
+    }
+
+    // ----- R34-B-3 [HIGH]: parseBypassPrincipals DN-canonicalization log gate -----
+
+    @Test
+    public void parseBypassPrincipalsNoArgFormSilentOnDnCanonicalisation() {
+        // R34-B-3 [HIGH]: post R34-B-1, ControllerConfigurationValidator runs
+        // BypassPrincipalsValidator on every controller-direct admin
+        // IncrementalAlterConfigs RPC targeting governance.bypass.principals.
+        // The validator delegates to parseBypassPrincipals — if the no-arg
+        // form fires the X500 canonicalisation INFO log, an admin with
+        // ALTER_CONFIGS could tight-loop validate-only RPCs carrying varying
+        // openssl-padded DNs to amplify INFO log lines (one per
+        // canonicalisable segment per RPC), filling disks / blowing past
+        // the log-shipping pipeline budget.
+        //
+        // The fix is a silent-by-default contract: the no-arg form (used by
+        // every validator path) must NEVER emit the canonicalisation log,
+        // even when canonicalisation actually rewrites the DN.
+        try (LogCaptureAppender capture =
+                 LogCaptureAppender.createAndRegister(RuleEngine.class)) {
+            // openssl-padded DN — canonicalisation WILL fire and rewrite.
+            // We assert the rewrite happens (so the test cannot pass for
+            // the wrong reason of "input not canonicalisable") AND that the
+            // INFO log is suppressed.
+            java.util.Set<String> bypass = RuleEngine.parseBypassPrincipals(
+                "User:CN = broker-1, OU = kafka, O = corp, C = US");
+            assertTrue(
+                bypass.contains("User:CN=broker-1,OU=kafka,O=corp,C=US"),
+                "canonicalisation must still rewrite the DN (silent rewrite, "
+                    + "no log); got: " + bypass);
+            java.util.List<String> infoMsgs = capture.getMessages("INFO");
+            for (String msg : infoMsgs) {
+                assertFalse(
+                    msg.contains("rewritten to its X500 canonical form"),
+                    "no-arg parseBypassPrincipals must NOT log canonicalisation "
+                        + "(R34-B-3 log-amplification close); offending INFO "
+                        + "line: " + msg);
+            }
+        }
+    }
+
+    @Test
+    public void parseBypassPrincipalsTwoArgFalseSilentTrueLogs() {
+        // R34-B-3 [HIGH]: pin the boolean gate itself — with
+        // logCanonicalisation=false the INFO log is suppressed, with
+        // logCanonicalisation=true the INFO log fires. Both calls produce
+        // the same canonical output set. The bootstrap-only call site
+        // (BrokerServer.startup) passes true so operators still see DN
+        // rewrites at startup; every per-RPC admission path passes false.
+        String opensslPaste = "User:CN = broker-1, OU = kafka, O = corp, C = US";
+        String canonical = "User:CN=broker-1,OU=kafka,O=corp,C=US";
+
+        // Silent variant: no INFO containing the canonicalisation phrase.
+        try (LogCaptureAppender silent =
+                 LogCaptureAppender.createAndRegister(RuleEngine.class)) {
+            java.util.Set<String> bypass = RuleEngine.parseBypassPrincipals(opensslPaste, false);
+            assertTrue(bypass.contains(canonical),
+                "silent form must still canonicalise; got: " + bypass);
+            long canonInfoLines = silent.getMessages("INFO").stream()
+                .filter(m -> m.contains("rewritten to its X500 canonical form"))
+                .count();
+            assertEquals(0L, canonInfoLines,
+                "logCanonicalisation=false must suppress the canonicalisation "
+                    + "INFO log (R34-B-3); captured INFO messages: "
+                    + silent.getMessages("INFO"));
+        }
+
+        // Logging variant: exactly one INFO line per canonicalised entry.
+        try (LogCaptureAppender loud =
+                 LogCaptureAppender.createAndRegister(RuleEngine.class)) {
+            java.util.Set<String> bypass = RuleEngine.parseBypassPrincipals(opensslPaste, true);
+            assertTrue(bypass.contains(canonical),
+                "logging form must produce the same canonical output; got: " + bypass);
+            long canonInfoLines = loud.getMessages("INFO").stream()
+                .filter(m -> m.contains("rewritten to its X500 canonical form"))
+                .count();
+            assertEquals(1L, canonInfoLines,
+                "logCanonicalisation=true must emit exactly one INFO line per "
+                    + "canonicalised entry (the bootstrap-only opt-in); captured "
+                    + "INFO messages: " + loud.getMessages("INFO"));
+        }
     }
 }

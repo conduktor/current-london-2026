@@ -94,6 +94,22 @@ import org.apache.kafka.common.config.ConfigException;
  * defensive {@code null}-tolerance mirrors
  * {@link RuleEngine#parseBypassPrincipals(String)} itself, which returns
  * an empty set on {@code null}.
+ *
+ * <h2>R34-B-3: silent on DN canonicalisation</h2>
+ *
+ * <p>This validator delegates to the no-arg
+ * {@link RuleEngine#parseBypassPrincipals(String)} overload, which is
+ * silent by design on the X500 DN canonicalisation INFO log. Without
+ * that gate, an authenticated principal with ALTER_CONFIGS could
+ * tight-loop validate-only IncrementalAlterConfigs RPCs (post R34-B-1,
+ * those RPCs reach this validator on the controller-direct admin path)
+ * with a varying openssl-padded DN value to amplify INFO-level log
+ * lines on the controller — one line per canonicalisable segment per
+ * RPC. The bootstrap path in
+ * {@code BrokerServer.startup} opts into the canonicalisation log
+ * explicitly via {@code parseBypassPrincipals(raw, true)} so operators
+ * still see the rewrite-at-startup line they need for DN auditing,
+ * exactly once per broker lifetime per canonicalised entry.
  */
 public final class BypassPrincipalsValidator implements Validator {
 

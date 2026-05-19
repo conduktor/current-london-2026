@@ -654,9 +654,15 @@ class BrokerServer(
       // the ConfigDef default). The chosen production default is "" so the
       // unset case correctly fails startup; tests set this explicitly via
       // TestUtils.createBrokerConfig.
+      // R34-B-3: pass `logCanonicalisation=true` so operators see the
+      // X500 canonical-form rewrite line at startup. This is the only
+      // call site that should log canonicalisation — the validator/
+      // admin-API admission path uses the silent no-arg overload to
+      // close the log-amplification primitive opened by R34-B-1.
       val bypassPrincipals: java.util.Set[String] =
         RuleEngine.parseBypassPrincipals(
-          config.getString(ServerConfigs.GOVERNANCE_BYPASS_PRINCIPALS_CONFIG))
+          config.getString(ServerConfigs.GOVERNANCE_BYPASS_PRINCIPALS_CONFIG),
+          true)
       if (bypassPrincipals.isEmpty) {
         throw new ConfigException(
           ServerConfigs.GOVERNANCE_BYPASS_PRINCIPALS_CONFIG,
