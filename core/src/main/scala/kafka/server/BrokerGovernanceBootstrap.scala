@@ -637,19 +637,34 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
    * {@code replicaManager.shutdown()} (L1238); that ordering is documented
    * at BrokerServer.scala L1211-1216 as deliberate (to avoid LogManager /
    * scheduler interleaving during log close). {@code KafkaScheduler#shutdown}
-   * calls the underlying {@code ScheduledThreadPoolExecutor#shutdown},
-   * which cancels pending periodic iterations by JDK default
-   * ({@code continueExistingPeriodicTasksAfterShutdownPolicy=false}) and
-   * then {@code awaitTermination(1, DAY)} blocks until the in-flight tick
-   * (if any) returns. Net effect: a drain tick that begins concurrently
-   * with shutdown completes synchronously before the scheduler shutdown
-   * returns, and no subsequent tick can fire after {@code replicaManager}
-   * is closed. Capturing the {@link java.util.concurrent.ScheduledFuture}
-   * handle here would be redundant defense-in-depth; the R25-C #1 BLOCKER
-   * claim ("drain may run after replicaManager shutdown because the
-   * handle is leaked") is therefore not actionable as written. If a tick
-   * hangs inside {@code log.read()} the relevant defense is a per-tick
-   * watchdog (tracked separately as Task #218), not handle capture.
+   * calls the underlying {@code ScheduledThreadPoolExecutor#shutdown}; the
+   * "cancel pending periodic iterations" behaviour is pinned explicitly by
+   * {@code setContinueExistingPeriodicTasksAfterShutdownPolicy(false)} at
+   * {@code KafkaScheduler.java:118}, not left to JDK default — even if a
+   * future JDK changed that default, Kafka's posture is durable.
+   *
+   * <p>Shutdown then calls {@code awaitTermination(1, DAY)} at
+   * {@code KafkaScheduler.java:140}. The 1-day cap is the honest bound: a
+   * drain tick that completes within 1 day finishes synchronously before
+   * scheduler shutdown returns, and no subsequent tick can fire. A drain
+   * tick that hangs past 1 day (pathological local log I/O — NFS log dir,
+   * hardware fault, full disk) would return {@code awaitTermination} false
+   * and let broker shutdown proceed; this is the residual race window
+   * R25-C #1 names. However: {@link #drainOnce} hangs only on
+   * {@code replicaManager.getLog(...).read(...)}, which is the same local
+   * log object {@code replicaManager.shutdown()} at L1238 will itself try
+   * to close. A genuinely hung log read therefore blocks broker shutdown
+   * one step later regardless of whether this code captures the
+   * {@link java.util.concurrent.ScheduledFuture} handle and calls
+   * {@code cancel(true)} — cancellation only sets the interrupt flag, and
+   * file-channel I/O that ignores interrupts (legacy {@code FileInputStream},
+   * mmap, page-cache fault) is not unblocked by it. The "leaked handle"
+   * BLOCKER framing therefore overstates the defense available: handle
+   * capture would NOT actually rescue the hung-tick case, and the
+   * non-hung case is already covered by the explicit cancel-on-shutdown
+   * policy above. The relevant defense for a wedged tick is a per-tick
+   * watchdog (tracked separately as Task #218) that times the drain and
+   * fails it closed before the JDK awaitTermination cap matters.
    *
    * <p>If [[drainOnce]] throws on every tick (the canonical example is a
    * broker that has been reassigned away from {@code __governance-0} mid-
