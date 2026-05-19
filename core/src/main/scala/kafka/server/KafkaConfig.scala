@@ -340,6 +340,15 @@ class KafkaConfig private(doLog: Boolean, val props: util.Map[_, _])
    * override via {@link #socketSelectorImplementationFor}. Callers MUST NOT assume that an
    * io_uring listener can be served by the NIO Acceptor/Processor wiring — see Acceptor and
    * Processor for the path that diverges when this returns {@code true}.
+   *
+   * <p>The 3-arg overload additionally applies the port=0 (wildcard / kernel-assigned)
+   * runtime constraint: io_uring's per-Processor SO_REUSEPORT model requires every
+   * Processor on a listener to bind on the same explicit port, which is impossible when
+   * the operator asked for an ephemeral port. Under {@code auto}, port=0 silently
+   * downgrades to NIO and the broker still starts (the wildcard listener was almost
+   * certainly configured for integration testing); under explicit {@code io_uring},
+   * port=0 hard-fails fast with an operator-actionable message — consistent with the
+   * existing hard-fail-for-explicit-io_uring contract for platform mismatch.
    */
   def usesIoUring(listenerName: org.apache.kafka.common.network.ListenerName,
                   securityProtocol: org.apache.kafka.common.security.auth.SecurityProtocol): Boolean = {
@@ -348,6 +357,34 @@ class KafkaConfig private(doLog: Boolean, val props: util.Map[_, _])
       securityProtocol,
       org.apache.kafka.network.iouring.IoUringSupport.isAvailable())
     effective == org.apache.kafka.network.iouring.SelectorImplementation.IO_URING
+  }
+
+  /** Port-aware overload. See class-level Javadoc on the port=0 contract. */
+  def usesIoUring(listenerName: org.apache.kafka.common.network.ListenerName,
+                  securityProtocol: org.apache.kafka.common.security.auth.SecurityProtocol,
+                  port: Int): Boolean = {
+    val requested = socketSelectorImplementationFor(listenerName)
+    val byBackend = usesIoUring(listenerName, securityProtocol)
+    if (!byBackend || port != 0) {
+      byBackend
+    } else if (requested == org.apache.kafka.network.iouring.SelectorImplementation.IO_URING) {
+      // Operator pinned io_uring AND asked for a wildcard port — incompatible. Fail fast
+      // with the same shape as the platform-mismatch hard-fail in BrokerSelectorFactory,
+      // so operators see one consistent error class for "io_uring was explicitly requested
+      // but cannot be served on this listener".
+      throw new IllegalStateException(
+        SocketServerConfigs.SOCKET_SELECTOR_IMPLEMENTATION_CONFIG
+          + "=" + org.apache.kafka.network.iouring.SelectorImplementation.IO_URING.configValue()
+          + " was requested for listener " + listenerName.value
+          + " but port=0 (wildcard) is not supported: SO_REUSEPORT sharding requires every "
+          + "Processor on this listener to bind on the same explicit port. Set an explicit "
+          + "port, or use socket.selector.implementation=auto to let the broker fall back to nio.")
+    } else {
+      // requested == AUTO: port=0 silently downgrades to NIO. The F-INT-LOG line still
+      // emits one INFO per listener naming the resolved backend, so operators see the
+      // downgrade in the broker log without WARN spam.
+      false
+    }
   }
   val maxConnectionsPerIp = getInt(SocketServerConfigs.MAX_CONNECTIONS_PER_IP_CONFIG)
   val maxConnectionsPerIpOverrides: Map[String, Int] =

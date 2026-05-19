@@ -505,18 +505,40 @@ private[kafka] abstract class Acceptor(val socketServer: SocketServer,
 
   private val nioSelector = NSelector.open()
 
+  // Resolve the effective I/O backend ONCE, eagerly, before any socket-opening side effect
+  // — the 3-arg overload applies the port=0 downgrade contract:
+  //   - auto + port=0 → silent NIO downgrade (returns false).
+  //   - explicit io_uring + port=0 → hard-fail (throws IllegalStateException right here).
+  // Eager evaluation matters because the wildcard NIO pre-open below would otherwise leak a
+  // file descriptor on the hard-fail path: it runs from the var-initializer block, and a
+  // throw from a later usesIoUring lookup would propagate out of the constructor *after*
+  // serverChannel was bound, with no `closeAll` ever running (the Acceptor thread never
+  // starts on a failed construct).
+  private val effectiveUsesIoUring: Boolean =
+    config.usesIoUring(endPoint.listenerName, endPoint.securityProtocol, endPoint.port)
+
   // If the port is configured as 0, we are using a wildcard port, so we need to open the socket
   // before we can find out what port we have. If it is set to a nonzero value, defer opening
   // the socket until we start the Acceptor. The reason for deferring the socket opening is so
   // that systems which assume that the socket being open indicates readiness are not confused.
+  // Skipped on the io_uring path (effectiveUsesIoUring is true only for explicit non-zero
+  // ports — see above), where the per-Processor IoUringServerListener does the bind via Netty.
   private[network] var serverChannel: ServerSocketChannel  = _
   private[network] val localPort: Int  = if (endPoint.port != 0) {
     endPoint.port
-  } else {
+  } else if (!effectiveUsesIoUring) {
     serverChannel = openServerSocket(endPoint.host, endPoint.port, listenBacklogSize)
     val newPort = serverChannel.socket().getLocalPort
     info(s"Opened wildcard endpoint ${endPoint.host}:$newPort")
     newPort
+  } else {
+    // Unreachable: the 3-arg usesIoUring throws on explicit io_uring + port=0, and the
+    // auto + port=0 case downgrades to NIO so effectiveUsesIoUring is false. This branch
+    // is defensive — if a future change adds a third resolution outcome, the broker fails
+    // fast with the same operator-actionable shape rather than silently leaking a port=0.
+    throw new IllegalStateException(
+      s"io_uring listener ${endPoint.listenerName} resolved with port=0 (wildcard); " +
+      "SO_REUSEPORT sharding requires every Processor to bind on the same explicit port.")
   }
 
   // One-shot, operator-visible record of which I/O backend the resolver picked for this
@@ -650,9 +672,14 @@ private[kafka] abstract class Acceptor(val socketServer: SocketServer,
     }
   }
 
-  /** Whether this Acceptor's listener is served by the io_uring backend. */
-  private[network] def usesIoUring: Boolean =
-    config.usesIoUring(endPoint.listenerName, endPoint.securityProtocol)
+  /**
+   * Whether this Acceptor's listener is served by the io_uring backend. Returns the
+   * eagerly-resolved value computed once at construction (see effectiveUsesIoUring).
+   * Eager resolution ensures the port=0 hard-fail (explicit io_uring) and silent
+   * downgrade (auto) both run before the wildcard pre-open, so the NIO socket is
+   * never leaked on the hard-fail path.
+   */
+  private[network] def usesIoUring: Boolean = effectiveUsesIoUring
 
   private def closeAll(): Unit = {
     debug("Closing server socket, selector, and any throttled sockets.")
@@ -947,13 +974,11 @@ private[kafka] class Processor(
   private[network] val selector: BrokerSelector = ioBundle.selector
 
   private def buildIoBundle(): ProcessorIoBundle = {
-    if (config.usesIoUring(listenerName, securityProtocol)) {
-      if (endPoint.port == 0) {
-        throw new KafkaException(
-          s"io_uring listener ${endPoint.listenerName} requires an explicit port " +
-          "(SO_REUSEPORT sharding needs every Processor to bind on the same configured port; " +
-          "wildcard port 0 is not supported in this version)")
-      }
+    // Port-aware usesIoUring: returns false for auto + port=0 (silent NIO downgrade),
+    // and throws for explicit io_uring + port=0 — but in the latter case the Acceptor
+    // constructor already threw long before this Processor instantiated. The remaining
+    // branch here is the happy path (explicit non-zero port that resolved to io_uring).
+    if (config.usesIoUring(listenerName, securityProtocol, endPoint.port)) {
       // Threaded to IoUringPlaintextAuthenticator so a user-configured PRINCIPAL_BUILDER_CLASS_CONFIG
       // is honored on this listener — mirroring the NIO PlaintextChannelBuilder path which calls
       // configure(channelBuilderConfigs(config, listenerName)).
