@@ -204,6 +204,30 @@ class KafkaApis(val requestChannel: RequestChannel,
     ibl != null && ibl == request.context.listenerName
   }
 
+  // Sibling of `isInterBrokerFollowerFetch` for the OffsetForLeaderEpoch path.
+  //
+  // `RemoteLeaderEndPoint.fetchEpochEndOffsets` issues OFLE with
+  // `forFollower(topics, brokerConfig.brokerId)` over `config.interBrokerListenerName`
+  // every time a follower needs to re-anchor its log against a leader epoch
+  // change. The outside-in scrub added by #131 (refuse `acme.orders` from a
+  // non-tenant principal) would otherwise refuse the follower-side call with
+  // TOPIC_AUTHORIZATION_FAILED for every tenant-prefixed partition, breaking
+  // the truncation cycle and silently shrinking the ISR after any leader
+  // epoch bump.
+  //
+  // Same trust model as Fetch: `replicaId >= 0` is a CLIENT-controlled wire
+  // value; the only safe witness that the caller is a real replica is the
+  // listener the request landed on. CONSUMER_REPLICA_ID (-1) and
+  // DEBUGGING_REPLICA_ID (-2) are NOT followers and stay subject to the
+  // outside-in guard.
+  private def isInterBrokerFollowerOffsetForLeaderEpoch(
+      request: RequestChannel.Request,
+      offsetForLeaderEpoch: OffsetsForLeaderEpochRequest): Boolean = {
+    if (offsetForLeaderEpoch.replicaId < 0) return false
+    val ibl = config.interBrokerListenerName
+    ibl != null && ibl == request.context.listenerName
+  }
+
   // Outside-in guard for coordinator-keyed namespaces (consumer-group ids and
   // transactional ids). The `__tenant_` prefix is RESERVED by the multi-tenancy
   // fork: ANY name shaped `__tenant_<id>.<x>` with non-empty `<id>` is a
@@ -4065,8 +4089,16 @@ class KafkaApis(val requestChannel: RequestChannel,
     // so tenant principals never reach here — this only fires for non-tenant
     // callers. Per-entry (not whole-batch) so a cluster admin can still ask
     // about legitimate non-tenant topics in the same request.
+    //
+    // Inter-broker follower exemption (#146): a real replica fetcher names
+    // tenant physical topics by design (replication is per physical partition).
+    // `isInterBrokerFollowerOffsetForLeaderEpoch` pins that trust to the
+    // inter-broker listener — without it, this guard breaks tenant-topic
+    // replication. The exemption is symmetric with `isInterBrokerFollowerFetch`
+    // on the Fetch path (#112).
     val (cleanAuthorizedTopics, pollutionRejectedTopics) =
-      if (tenantContextFor(request).effectiveTenant.isPresent) {
+      if (tenantContextFor(request).effectiveTenant.isPresent ||
+          isInterBrokerFollowerOffsetForLeaderEpoch(request, offsetForLeaderEpoch)) {
         (authorizedTopics, Seq.empty[OffsetForLeaderTopic])
       } else {
         authorizedTopics.partition(t => !isReservedTenantNamespace(t.topic))

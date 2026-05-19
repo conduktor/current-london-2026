@@ -17590,6 +17590,122 @@ class KafkaApisTest extends Logging {
     assertEquals(42L, part.endOffset)
   }
 
+  @Test
+  def testOffsetForLeaderEpochLegitimateFollowerOnInterBrokerListenerSkipsOutsideInGuard(): Unit = {
+    // #146 — sibling of #112's `testFetchLegitimateFollowerOnInterBrokerListenerSkipsOutsideInGuard`.
+    //
+    // A real replica fetcher (`RemoteLeaderEndPoint.fetchEpochEndOffsets`) sends
+    // OFLE with `replicaId == brokerConfig.brokerId` over the inter-broker
+    // listener every time a follower needs to re-anchor its log against a
+    // leader-epoch change. Without `isInterBrokerFollowerOffsetForLeaderEpoch`
+    // the outside-in guard added by #131 would refuse every tenant-prefixed
+    // partition with TOPIC_AUTHORIZATION_FAILED, breaking log-truncation
+    // cycles and silently shrinking the ISR after any epoch bump.
+    val reservedTopic = "acme.orders"
+    val partition = 0
+
+    val topics = new OffsetForLeaderEpochRequestData.OffsetForLeaderTopicCollection()
+    topics.add(new OffsetForLeaderEpochRequestData.OffsetForLeaderTopic()
+      .setTopic(reservedTopic)
+      .setPartitions(List(new OffsetForLeaderEpochRequestData.OffsetForLeaderPartition()
+        .setPartition(partition).setLeaderEpoch(0).setCurrentLeaderEpoch(-1)).asJava))
+
+    // forFollower(topics, replicaId=2): replicaId>=0; default listener in test
+    // setup is PLAINTEXT which is also the inter-broker listener — the trust
+    // pin matches.
+    val request = buildRequest(
+      OffsetsForLeaderEpochRequest.Builder.forFollower(topics, 2).build())
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+
+    when(replicaManager.lastOffsetForLeaderEpoch(any[Seq[OffsetForLeaderEpochRequestData.OffsetForLeaderTopic]]))
+      .thenAnswer { invocation =>
+        val passed = invocation.getArgument[Seq[OffsetForLeaderEpochRequestData.OffsetForLeaderTopic]](0)
+        passed.map { t =>
+          new OffsetForLeaderEpochResponseData.OffsetForLeaderTopicResult()
+            .setTopic(t.topic)
+            .setPartitions(t.partitions.asScala.map { p =>
+              new OffsetForLeaderEpochResponseData.EpochEndOffset()
+                .setPartition(p.partition)
+                .setErrorCode(Errors.NONE.code)
+                .setLeaderEpoch(11)
+                .setEndOffset(456L)
+            }.toList.asJava)
+        }
+      }
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleOffsetForLeaderEpochRequest(request)
+
+    val response = verifyNoThrottling[OffsetsForLeaderEpochResponse](request)
+    val part = response.data.topics.asScala.head.partitions.asScala.head
+    assertEquals(Errors.NONE.code, part.errorCode,
+      "legitimate inter-broker follower OFLE on tenant-prefixed topic must NOT be refused — replication would otherwise silently break")
+    assertEquals(11, part.leaderEpoch)
+    assertEquals(456L, part.endOffset)
+
+    // Defence-in-depth witness: replicaManager must actually see the
+    // tenant-prefixed topic (i.e. the guard's partition step did NOT bucket
+    // it into pollutionRejectedTopics).
+    val captor: ArgumentCaptor[Seq[OffsetForLeaderEpochRequestData.OffsetForLeaderTopic]] =
+      ArgumentCaptor.forClass(classOf[Seq[OffsetForLeaderEpochRequestData.OffsetForLeaderTopic]])
+    verify(replicaManager).lastOffsetForLeaderEpoch(captor.capture())
+    assertEquals(Set(reservedTopic), captor.getValue.map(_.topic).toSet,
+      "follower-side OFLE must reach replicaManager.lastOffsetForLeaderEpoch unchanged")
+  }
+
+  @Test
+  def testOffsetForLeaderEpochSpoofedFollowerOnClusterWideListenerStillRefused(): Unit = {
+    // #146 complement: the inter-broker exemption is listener-pinned. A
+    // cluster-wide caller with CLUSTER_ACTION on a non-inter-broker listener
+    // cannot bypass the #131 outside-in guard by flipping replicaId from -1 to
+    // 99. This protects against the OFLE flavour of the Fetch-follower spoof
+    // closed by #112 / `testFetchFollowerSpoofOnClusterWideListenerRefusesTenantPhysicalForm`.
+    val attackerListener = new ListenerName("EXTERNAL_SASL")
+    val reservedTopic = "acme.orders"
+    val partition = 0
+
+    val topics = new OffsetForLeaderEpochRequestData.OffsetForLeaderTopicCollection()
+    topics.add(new OffsetForLeaderEpochRequestData.OffsetForLeaderTopic()
+      .setTopic(reservedTopic)
+      .setPartitions(List(new OffsetForLeaderEpochRequestData.OffsetForLeaderPartition()
+        .setPartition(partition).setLeaderEpoch(0).setCurrentLeaderEpoch(-1)).asJava))
+
+    val request = buildRequest(
+      OffsetsForLeaderEpochRequest.Builder.forFollower(topics, 99).build(),
+      listenerName = attackerListener,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "cluster-admin"))
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+    // cleanAuthorizedTopics is empty after the guard partitions the reserved
+    // topic into pollutionRejectedTopics; stub a benign empty answer so the
+    // handler can compose the response.
+    when(replicaManager.lastOffsetForLeaderEpoch(any[Seq[OffsetForLeaderEpochRequestData.OffsetForLeaderTopic]]))
+      .thenReturn(Seq.empty[OffsetForLeaderEpochResponseData.OffsetForLeaderTopicResult])
+
+    kafkaApis = createKafkaApis(
+      authorizer = None,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleOffsetForLeaderEpochRequest(request)
+
+    val response = verifyNoThrottling[OffsetsForLeaderEpochResponse](request)
+    val part = response.data.topics.asScala.head.partitions.asScala.head
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED.code, part.errorCode,
+      "spoofed-follower OFLE on a non-inter-broker listener must still be refused — replicaId is client-controlled, the listener is the trust witness")
+    assertEquals(-1, part.leaderEpoch,
+      "refused topic must not leak leaderEpoch")
+    assertEquals(-1L, part.endOffset,
+      "refused topic must not leak endOffset")
+
+    // The reserved topic must never reach replicaManager — otherwise a probe
+    // could time the partition lookup and still derive existence.
+    val captor: ArgumentCaptor[Seq[OffsetForLeaderEpochRequestData.OffsetForLeaderTopic]] =
+      ArgumentCaptor.forClass(classOf[Seq[OffsetForLeaderEpochRequestData.OffsetForLeaderTopic]])
+    verify(replicaManager).lastOffsetForLeaderEpoch(captor.capture())
+    assertFalse(captor.getValue.exists(_.topic == reservedTopic),
+      "reserved-physical topic must never reach replicaManager — probe-by-timing must be impossible")
+  }
+
   // ---------------------------------------------------------------------------
   // ConsumerGroupHeartbeat (KIP-848) subscribedTopicNames outside-in scrub (#132)
   //
