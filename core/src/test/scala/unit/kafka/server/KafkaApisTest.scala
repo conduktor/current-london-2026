@@ -13165,6 +13165,119 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testAlterConfigsClusterWideListenerRejectsTenantPrefixedGroup(): Unit = {
+    // #139: GROUP defence-in-depth. A privileged caller on the cluster-wide
+    // listener could otherwise legacy-AlterConfigs(GROUP, "__tenant_acme.foo",
+    // session.timeout.ms=2147483647) and silently degrade tenant acme's
+    // rebalance behaviour. ControllerApis #126 already refuses this on the
+    // controller side; the broker mirror short-circuits before forwarding so
+    // the merged response carries the same wire shape as an ACL refusal —
+    // GROUP_AUTHORIZATION_FAILED, NULL errorMessage (no presence oracle for
+    // tenant-acme's groups).
+    val resource = new ConfigResource(ConfigResource.Type.GROUP, "__tenant_acme.foo")
+    val configEntries = new util.ArrayList[AlterConfigsRequest.ConfigEntry]()
+    configEntries.add(new AlterConfigsRequest.ConfigEntry("session.timeout.ms", "60000"))
+    val configs = Map(resource -> new AlterConfigsRequest.Config(configEntries)).asJava
+    val alterRequest = new AlterConfigsRequest.Builder(configs, false).build()
+    val request = buildRequest(alterRequest)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleAlterConfigsRequest(request)
+
+    val response = verifyNoThrottling[AlterConfigsResponse](request)
+    val byName = response.data.responses.asScala.map(r => r.resourceName -> r).toMap
+    assertEquals(1, byName.size, "single resource in / single response out")
+    val rejected = byName("__tenant_acme.foo")
+    assertEquals(Errors.GROUP_AUTHORIZATION_FAILED.code, rejected.errorCode,
+      "tenant-namespace group must be refused on cluster-wide listener")
+    assertEquals(ConfigResource.Type.GROUP.id, rejected.resourceType)
+    assertNull(rejected.errorMessage,
+      "errorMessage must be null so refusal is indistinguishable from a plain ACL deny — no presence oracle")
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[AbstractRequest](), any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
+  def testIncrementalAlterConfigsClusterWideListenerRejectsTenantPrefixedGroup(): Unit = {
+    // #139: same defence as the legacy alter, exercised on the incremental
+    // path. Flipping group session.timeout via incremental ops is the same
+    // tenant-config pollution; refuse before forwarding.
+    val resource = new ConfigResource(ConfigResource.Type.GROUP, "__tenant_acme.foo")
+    val incrementalRequest = getIncrementalAlterConfigRequestBuilder(
+      Seq(resource), "session.timeout.ms", "60000").build()
+    val request = buildRequest(incrementalRequest)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleIncrementalAlterConfigsRequest(request)
+
+    val response = verifyNoThrottling[IncrementalAlterConfigsResponse](request)
+    val byName = response.data.responses.asScala.map(r => r.resourceName -> r).toMap
+    assertEquals(1, byName.size)
+    val rejected = byName("__tenant_acme.foo")
+    assertEquals(Errors.GROUP_AUTHORIZATION_FAILED.code, rejected.errorCode)
+    assertEquals(ConfigResource.Type.GROUP.id, rejected.resourceType)
+    assertNull(rejected.errorMessage,
+      "errorMessage must be null so refusal is indistinguishable from a plain ACL deny")
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[AbstractRequest](), any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
+  def testIncrementalAlterConfigsClusterWideListenerMixedTopicAndGroupPollution(): Unit = {
+    // #139: end-to-end mixed-batch with one polluting TOPIC, one polluting
+    // GROUP, and one legitimate TOPIC. Confirms the two pollution arms compose
+    // (each refuses with its own error code) and the neutral resource still
+    // forwards. Pins the wire shape that an admin tool would observe on a
+    // single round-trip.
+    val pollutingTopic = new ConfigResource(ConfigResource.Type.TOPIC, "acme.foo")
+    val pollutingGroup = new ConfigResource(ConfigResource.Type.GROUP, "__tenant_acme.bar")
+    val neutralTopic = new ConfigResource(ConfigResource.Type.TOPIC, "plain-topic")
+    val incrementalRequest = getIncrementalAlterConfigRequestBuilder(
+      Seq(pollutingTopic, pollutingGroup, neutralTopic), "retention.ms", "60000").build()
+    val request = buildRequest(incrementalRequest)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleIncrementalAlterConfigsRequest(request)
+
+    val bodyCaptor: ArgumentCaptor[AbstractRequest] = ArgumentCaptor.forClass(classOf[AbstractRequest])
+    val callbackCaptor: ArgumentCaptor[Option[AbstractResponse] => Unit] =
+      ArgumentCaptor.forClass(classOf[Option[AbstractResponse] => Unit])
+    verify(forwardingManager).forwardRequest(
+      ArgumentMatchers.eq(request),
+      bodyCaptor.capture(),
+      callbackCaptor.capture())
+    val forwarded = bodyCaptor.getValue.asInstanceOf[IncrementalAlterConfigsRequest]
+    val forwardedNames = forwarded.data.resources.asScala.map(r => (r.resourceName, r.resourceType)).toSet
+    assertEquals(Set(("plain-topic", ConfigResource.Type.TOPIC.id)), forwardedNames,
+      "only the neutral resource may reach the controller")
+
+    val controllerResponse = new IncrementalAlterConfigsResponseData().setResponses(asList(
+      new IAlterConfigsResourceResponse()
+        .setErrorCode(Errors.NONE.code)
+        .setResourceName("plain-topic")
+        .setResourceType(ConfigResource.Type.TOPIC.id)))
+    val mixedCallback = callbackCaptor.getValue
+    mixedCallback(Some(new IncrementalAlterConfigsResponse(controllerResponse)))
+
+    val response = verifyNoThrottling[IncrementalAlterConfigsResponse](request)
+    val byKey = response.data.responses.asScala.map(r => (r.resourceName, r.resourceType) -> r).toMap
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code,
+      byKey(("acme.foo", ConfigResource.Type.TOPIC.id)).errorCode,
+      "TOPIC pollution → INVALID_TOPIC_EXCEPTION")
+    assertEquals(Errors.GROUP_AUTHORIZATION_FAILED.code,
+      byKey(("__tenant_acme.bar", ConfigResource.Type.GROUP.id)).errorCode,
+      "GROUP pollution → GROUP_AUTHORIZATION_FAILED")
+    assertNull(byKey(("__tenant_acme.bar", ConfigResource.Type.GROUP.id)).errorMessage,
+      "GROUP refusal must carry null errorMessage")
+    assertEquals(Errors.NONE.code,
+      byKey(("plain-topic", ConfigResource.Type.TOPIC.id)).errorCode,
+      "neutral resource surfaces controller outcome")
+  }
+
+  @Test
   def testCreatePartitionsClusterWideListenerRejectsTenantPrefixedTopic(): Unit = {
     // Outside-in: a cluster-wide super-user could otherwise grow `acme.orders`
     // from 3 to 30 partitions, breaking the tenant's key-to-partition mapping

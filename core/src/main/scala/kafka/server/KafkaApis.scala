@@ -4105,15 +4105,28 @@ class KafkaApis(val requestChannel: RequestChannel,
     // — silently mutating a tenant's storage. Tenant principals never reach
     // here (ALTER_CONFIGS is outside TENANT_ALLOWED_APIS); the guard is purely
     // for cluster-wide callers. Mirrors the CreateTopics outside-in pattern.
+    //
+    // GROUP resources (`__tenant_<id>.<rest>`) are refused with
+    // GROUP_AUTHORIZATION_FAILED and a NULL errorMessage — the physical group
+    // id would otherwise serve as a presence oracle for a tenant's consumer
+    // groups. ControllerApis #126 refuses the same shape on the controller; the
+    // broker mirror prevents an unnecessary forward + reassemble round-trip and
+    // keeps both chokepoints in sync if either is ever regressed in isolation.
     val pollutionRejected = new util.ArrayList[AlterConfigsResponseData.AlterConfigsResourceResponse]()
     if (!tenantContextFor(request).effectiveTenant.isPresent) {
       val keep = new AlterConfigsRequestData.AlterConfigsResourceCollection(remaining.resources.size)
       remaining.resources.forEach { r =>
-        if (ConfigResource.Type.forId(r.resourceType) == ConfigResource.Type.TOPIC
-            && isReservedTenantNamespace(r.resourceName)) {
+        val rType = ConfigResource.Type.forId(r.resourceType)
+        if (rType == ConfigResource.Type.TOPIC && isReservedTenantNamespace(r.resourceName)) {
           pollutionRejected.add(new AlterConfigsResponseData.AlterConfigsResourceResponse()
             .setErrorCode(Errors.INVALID_TOPIC_EXCEPTION.code)
             .setErrorMessage("Topic name '" + r.resourceName + "' is reserved (tenant namespace prefix)")
+            .setResourceType(r.resourceType)
+            .setResourceName(r.resourceName))
+        } else if (rType == ConfigResource.Type.GROUP && isReservedTenantPrincipalNamespace(r.resourceName)) {
+          pollutionRejected.add(new AlterConfigsResponseData.AlterConfigsResourceResponse()
+            .setErrorCode(Errors.GROUP_AUTHORIZATION_FAILED.code)
+            .setErrorMessage(null)
             .setResourceType(r.resourceType)
             .setResourceName(r.resourceName))
         } else {
@@ -4159,16 +4172,23 @@ class KafkaApis(val requestChannel: RequestChannel,
     val remaining = ConfigAdminManager.copyWithoutPreprocessed(original.data(), preprocessingResponses)
     // Outside-in pollution guard; see handleAlterConfigsRequest. Mutating an
     // individual config key (cleanup.policy=delete on a compacted log) is the
-    // same level of damage as a full alter — same defence.
+    // same level of damage as a full alter — same defence. GROUP arm mirrors
+    // the broker-side scrub added with #139.
     val pollutionRejected = new util.ArrayList[IncrementalAlterConfigsResponseData.AlterConfigsResourceResponse]()
     if (!tenantContextFor(request).effectiveTenant.isPresent) {
       val keep = new IncrementalAlterConfigsRequestData.AlterConfigsResourceCollection(remaining.resources.size)
       remaining.resources.forEach { r =>
-        if (ConfigResource.Type.forId(r.resourceType) == ConfigResource.Type.TOPIC
-            && isReservedTenantNamespace(r.resourceName)) {
+        val rType = ConfigResource.Type.forId(r.resourceType)
+        if (rType == ConfigResource.Type.TOPIC && isReservedTenantNamespace(r.resourceName)) {
           pollutionRejected.add(new IncrementalAlterConfigsResponseData.AlterConfigsResourceResponse()
             .setErrorCode(Errors.INVALID_TOPIC_EXCEPTION.code)
             .setErrorMessage("Topic name '" + r.resourceName + "' is reserved (tenant namespace prefix)")
+            .setResourceType(r.resourceType)
+            .setResourceName(r.resourceName))
+        } else if (rType == ConfigResource.Type.GROUP && isReservedTenantPrincipalNamespace(r.resourceName)) {
+          pollutionRejected.add(new IncrementalAlterConfigsResponseData.AlterConfigsResourceResponse()
+            .setErrorCode(Errors.GROUP_AUTHORIZATION_FAILED.code)
+            .setErrorMessage(null)
             .setResourceType(r.resourceType)
             .setResourceName(r.resourceName))
         } else {
