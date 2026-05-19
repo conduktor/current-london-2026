@@ -495,7 +495,9 @@ public final class IoUringSelector implements BrokerSelector {
             try {
                 acceptedChannel.prepare();
             } catch (Exception e) {
-                log.debug("PLAINTEXT prepare unexpectedly failed for {}", acceptedChannel.id(), e);
+                surfacePrepareFailureAsDisconnect(acceptedChannel, e);
+                madeProgress = true;
+                continue;
             }
             connected.add(acceptedChannel.id());
             justAccepted.add(acceptedChannel.id());
@@ -675,6 +677,40 @@ public final class IoUringSelector implements BrokerSelector {
             Utils.closeQuietly(channel, "expired channel");
         }
         return true;
+    }
+
+    /**
+     * Mirror NIO {@code close(channel, CloseMode.GRACEFUL)} at
+     * {@code clients/.../Selector.java#929-955} for the prepare-throws path: NIO routes a
+     * prepare() failure through close(GRACEFUL) → doClose → {@code disconnected.put(id, channel.state())}
+     * and {@code connected.remove(id)} (line 934). The Processor then runs
+     * {@code processDisconnected} which decrements the connection quota.
+     *
+     * <p>Pre-fix, the io_uring path caught the exception, logged at DEBUG, and fell through
+     * to add the channel to {@code connected} + {@code channels} anyway. Because
+     * {@code channel.ready()} is false, step 2 (read) and step 3 (write) skip the channel
+     * every subsequent poll; it lingers in {@code channels} until {@code connectionsMaxIdleNanos}
+     * elapses (default ~10 minutes), at which point it surfaces as EXPIRED rather than the
+     * authenticator's reported state — the per-listener connection quota is leaked for that
+     * entire window and the metric attribution is wrong. For today's PLAINTEXT authenticator
+     * {@code prepare()} cannot actually throw, but any future SASL/SSL path on this code
+     * route would inherit the bug silently.
+     */
+    private void surfacePrepareFailureAsDisconnect(KafkaChannel acceptedChannel, Exception cause) {
+        String id = acceptedChannel.id();
+        // Mirror NIO at clients/.../Selector.java:973: disconnected.put(channel.id(), channel.state()).
+        // The authenticator is responsible for transitioning state to AUTHENTICATION_FAILED
+        // before throwing (SslAuthenticator / SaslServerAuthenticator do this). PLAINTEXT does
+        // not throw in practice, but emitting whatever state the channel reports is the contract
+        // the Processor's processDisconnected was written against — don't second-guess it.
+        ChannelState reportedState = acceptedChannel.state();
+        log.debug("prepare() failed for accepted channel {}, surfacing as {}", id, reportedState, cause);
+        channels.remove(id);
+        nettyChannels.remove(id);
+        lastActiveNanos.remove(id);
+        explicitlyMutedChannels.remove(acceptedChannel);
+        disconnected.put(id, reportedState);
+        Utils.closeQuietly(acceptedChannel, "channel after prepare() failure");
     }
 
     /**

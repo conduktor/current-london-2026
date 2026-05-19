@@ -647,6 +647,123 @@ class IoUringSelectorTest {
         assertTrue(selector.disconnected().isEmpty());
     }
 
+    /**
+     * Authenticator whose {@link #authenticate()} always throws an {@link AuthenticationException}
+     * — drives the {@code KafkaChannel.prepare()} failure path that the production
+     * {@code IoUringPlaintextAuthenticator} cannot ever reach in normal operation.
+     * {@code complete()} returns false so prepare() actually calls authenticate(); on AuthException
+     * the channel state transitions to AUTHENTICATION_FAILED before rethrowing.
+     */
+    private static final class FailingPrepareAuthenticator implements org.apache.kafka.common.network.Authenticator {
+        @Override
+        public void authenticate() throws org.apache.kafka.common.errors.AuthenticationException {
+            throw new org.apache.kafka.common.errors.AuthenticationException(
+                "simulated prepare() failure (D-PREPARE-SWALLOW regression)");
+        }
+        @Override
+        public KafkaPrincipal principal() {
+            return KafkaPrincipal.ANONYMOUS;
+        }
+        @Override
+        public java.util.Optional<org.apache.kafka.common.security.auth.KafkaPrincipalSerde> principalSerde() {
+            return java.util.Optional.empty();
+        }
+        @Override
+        public boolean complete() {
+            return false;
+        }
+        @Override
+        public void close() {
+        }
+    }
+
+    @Test
+    void prepareFailureOnAcceptedChannelSurfacesAsDisconnectNotConnected() throws Exception {
+        // D-PREPARE-SWALLOW regression: pre-fix the io_uring accept-drain loop swallowed
+        // any Exception from KafkaChannel.prepare(), logged at DEBUG, and went on to add
+        // the channel to `connected` + `channels` anyway. Because channel.ready() is
+        // false, every subsequent poll's read/write step skipped it and it lingered in
+        // `channels` until connectionsMaxIdleNanos elapsed (~10 min default) — at which
+        // point it surfaced as EXPIRED rather than the authenticator's reported state.
+        // For that entire window the per-listener connection quota was leaked.
+        //
+        // The fix mirrors NIO close(GRACEFUL) → doClose at clients/.../Selector.java:973:
+        // route the prepare-throws channel through disconnected() with channel.state(),
+        // do NOT add it to connected, and remove it from channels/nettyChannels/
+        // lastActiveNanos/explicitlyMutedChannels so the Processor's processDisconnected
+        // releases the quota promptly.
+        IoUringSelector s = newSelector(IDLE_NANOS_NEVER);
+
+        // Build the channel by hand so we can plug a Supplier that returns an authenticator
+        // whose authenticate() throws — IoUringPlaintextAuthenticator's authenticate() is a
+        // no-op in production. We then inject directly into pendingAccepts via reflection;
+        // onAccept's KafkaChannel construction would otherwise hardwire the production
+        // authenticator and there's no public seam to swap it.
+        EmbeddedChannel netty = new EmbeddedChannel();
+        channels.add(netty);
+        IoUringTransportLayer transport = new IoUringTransportLayer(netty, REMOTE_A, LOCAL);
+        IoUringChannelMetadataRegistry metadata = new IoUringChannelMetadataRegistry();
+        String id = "test-id-prepare-throws";
+        KafkaChannel kafkaChannel = new KafkaChannel(
+            id, transport, FailingPrepareAuthenticator::new, MAX_RECEIVE, MemoryPool.NONE, metadata);
+
+        java.lang.reflect.Field pendingField = IoUringSelector.class.getDeclaredField("pendingAccepts");
+        pendingField.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        java.util.Queue<KafkaChannel> queue = (java.util.Queue<KafkaChannel>) pendingField.get(s);
+        queue.offer(kafkaChannel);
+
+        java.lang.reflect.Field countField = IoUringSelector.class.getDeclaredField("pendingAcceptCount");
+        countField.setAccessible(true);
+        ((java.util.concurrent.atomic.AtomicInteger) countField.get(s)).incrementAndGet();
+
+        java.lang.reflect.Field nettyMapField = IoUringSelector.class.getDeclaredField("nettyChannels");
+        nettyMapField.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        java.util.Map<String, io.netty.channel.Channel> nettyMap =
+            (java.util.Map<String, io.netty.channel.Channel>) nettyMapField.get(s);
+        nettyMap.put(id, netty);
+
+        s.poll(0);
+
+        // 1. The channel must NOT show up in connected — pre-fix it did, because the catch
+        //    block fell through to `connected.add(acceptedChannel.id())`. Processor's
+        //    onConnected path would have re-armed reads on a half-built channel.
+        assertFalse(s.connected().contains(id),
+            "connected() must not include a channel whose prepare() failed — pre-fix it did, " +
+            "leading the Processor to treat a failed-handshake channel as ready");
+
+        // 2. disconnected() must contain the id with the authenticator-reported state.
+        //    KafkaChannel.prepare() sets state to AUTHENTICATION_FAILED before rethrowing
+        //    the AuthenticationException, so that's what the Processor must see — and that's
+        //    the signal that releases ConnectionQuotas. Pre-fix this was empty.
+        assertTrue(s.disconnected().containsKey(id),
+            "disconnected() must include the prepare-failed channel so processDisconnected " +
+            "releases the per-listener connection quota and the connection-failed metric fires");
+        assertEquals(ChannelState.State.AUTHENTICATION_FAILED, s.disconnected().get(id).state(),
+            "reported state must mirror what the authenticator set on the channel — NIO's " +
+            "doClose at clients/.../Selector.java:973 emits channel.state() verbatim, and the " +
+            "Processor's downstream accounting depends on the AUTHENTICATION_FAILED bucket");
+
+        // 3. channels() must NOT include the channel — pre-fix it sat in `channels` for the
+        //    full connectionsMaxIdleNanos window with channel.ready()==false, invisible to
+        //    every read/write step but counted against quotas until idle expiry.
+        assertFalse(s.channels().stream().anyMatch(c -> c.id().equals(id)),
+            "channels() must not retain a prepare-failed channel — pre-fix it lingered " +
+            "until connectionsMaxIdleNanos and leaked the connection quota for that window");
+
+        // 4. nettyChannels must NOT retain the channel either — leaving it lets mute/unmute
+        //    flip autoRead on a half-built transport (the user-facing effect: a stuck I/O
+        //    handler attempting to autoRead a closed netty channel).
+        @SuppressWarnings("unchecked")
+        java.util.Map<String, io.netty.channel.Channel> postNettyMap =
+            (java.util.Map<String, io.netty.channel.Channel>) nettyMapField.get(s);
+        assertFalse(postNettyMap.containsKey(id),
+            "nettyChannels map must not retain the failed-prepare channel — otherwise the " +
+            "next mute/unmute() call would flip autoRead on a transport whose KafkaChannel " +
+            "was already torn down");
+    }
+
     @Test
     void closeUnregistersAllChannelsAndIsIdempotent() {
         IoUringSelector s = newSelector(IDLE_NANOS_NEVER);
