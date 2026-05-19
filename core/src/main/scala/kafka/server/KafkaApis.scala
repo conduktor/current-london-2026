@@ -287,9 +287,15 @@ class KafkaApis(val requestChannel: RequestChannel,
     patternType match {
       case PatternType.LITERAL => isReservedTenantNamespace(name)
       case PatternType.PREFIXED => isReservedTenantTopicAclPrefix(name)
-      case PatternType.MATCH | PatternType.ANY =>
+      // MATCH / ANY policed as the union of LITERAL and PREFIXED. UNKNOWN
+      // (invalid wire byte) and any forward-compat PatternType added to the
+      // enum land on the same union branch — fail-closed: refuse if EITHER
+      // interpretation of the binding would name a reserved namespace. This
+      // closes #163 (audit F2): the prior `case _ => false` would let an
+      // attacker craft a wire byte that the StandardAuthorizer might still
+      // interpret as LITERAL or PREFIXED downstream.
+      case _ =>
         isReservedTenantNamespace(name) || isReservedTenantTopicAclPrefix(name)
-      case _ => false
     }
   }
 
@@ -320,9 +326,9 @@ class KafkaApis(val requestChannel: RequestChannel,
     patternType match {
       case PatternType.LITERAL => isReservedTenantPrincipalNamespace(name)
       case PatternType.PREFIXED => isReservedTenantPrincipalAclPrefix(name)
-      case PatternType.MATCH | PatternType.ANY =>
+      // MATCH / ANY / UNKNOWN — see isReservedTenantTopicAclName for rationale.
+      case _ =>
         isReservedTenantPrincipalNamespace(name) || isReservedTenantPrincipalAclPrefix(name)
-      case _ => false
     }
   }
 

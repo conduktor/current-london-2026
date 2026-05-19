@@ -42,7 +42,7 @@ import org.apache.kafka.common.message.IncrementalAlterConfigsResponseData.Alter
 import org.apache.kafka.common.message._
 import org.apache.kafka.common.network.{ClientInformation, ListenerName}
 import org.apache.kafka.common.protocol.Errors._
-import org.apache.kafka.common.protocol.{ApiKeys, ApiMessage, Errors}
+import org.apache.kafka.common.protocol.{ApiKeys, ApiMessage, Errors, MessageUtil}
 import org.apache.kafka.common.quota.{ClientQuotaAlteration, ClientQuotaEntity}
 import org.apache.kafka.common.requests._
 import org.apache.kafka.common.resource.{PatternType, Resource, ResourcePattern, ResourcePatternFilter, ResourceType}
@@ -4282,17 +4282,18 @@ class ControllerApisTest {
 
   @Test
   def testControllerDescribeAclsRefusesTenantTopicLiteralFilter(): Unit = {
-    // L1 oracle: a LITERAL filter `Topic:acme.orders` from a cluster caller
-    // probes whether tenant `acme` owns that topic. Scrub the MatchingAcls so
-    // the response carries nothing tenant-shaped — `acls()` may still return
-    // bindings but the postFilter drops them all here.
+    // L1 refusal: a LITERAL filter `Topic:acme.orders` from a cluster caller
+    // probes whether tenant `acme` owns that topic. The controller path now
+    // mirrors the broker (#162) by refusing the filter outright with
+    // INVALID_REQUEST — `auth.acls(...)` must NEVER be called, because the
+    // mere act of querying with a tenant-shaped filter is itself the probe
+    // we are closing. (Before #162 the response was scrubbed AFTER the
+    // Authorizer call, leaving a timing/error-shape side channel against
+    // bootstrap.controllers that differed from the broker listener.)
     val req = describeAclsRequest(ResourceType.TOPIC, "acme.orders", PatternType.LITERAL, null)
     val request = buildControllerRequest(req)
 
     val auth = authorizerAllowingClusterOps()
-    when(auth.acls(any[AclBindingFilter]()))
-      .thenReturn(util.Arrays.asList(
-        aclBinding(ResourceType.TOPIC, "acme.orders", PatternType.LITERAL, "User:bob")))
     controllerApis = createControllerApis(
       authorizer = Some(auth),
       controller = new MockController.Builder().build(),
@@ -4300,8 +4301,12 @@ class ControllerApisTest {
     controllerApis.handleDescribeAclsRequest(request).get()
 
     val response = captureSentResponse(request).asInstanceOf[DescribeAclsResponse]
+    assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED.code, response.data.errorCode,
+      "controller-direct DescribeAcls L1 must mirror the broker's CLUSTER_AUTHORIZATION_FAILED " +
+        "code so bootstrap.brokers and bootstrap.controllers cannot be fingerprinted by error-code probes (#162)")
     assertEquals(0, response.acls.size,
-      "controller-direct DescribeAcls must scrub tenant bindings from the response")
+      "L1 refusal short-circuits before any binding is enumerated")
+    verify(auth, never()).acls(any[AclBindingFilter]())
   }
 
   @Test
@@ -4545,6 +4550,249 @@ class ControllerApisTest {
     }.toSet
     assertEquals(Set((ResourceType.TOPIC.code, "plain-topic", "User:bob")), surviving,
       "PREFIXED bypass bindings (Topic:PREFIXED:acme, Group:PREFIXED:__tenant_, Group:PREFIXED:__tenant_acme) must be scrubbed")
+  }
+
+  // ---------------------------------------------------------------------------
+  // #162 / #163 / #164 / #165 follow-ups to #157 — DescribeAcls L1 mirror,
+  // fail-closed UNKNOWN PatternType, MATCH PatternType coverage, isolated
+  // entryFilter principal coverage.
+  // ---------------------------------------------------------------------------
+
+  // #162: controller DescribeAcls L1 must refuse a PREFIXED tenant-shaped filter,
+  // mirroring the broker — otherwise a caller probing bootstrap.controllers can
+  // get a different response surface than bootstrap.brokers for the same
+  // attempted enumeration.
+  @Test
+  def testControllerDescribeAclsRefusesPrefixedDotlessTenantIdTopicFilterOnBootstrapControllers(): Unit = {
+    val req = describeAclsRequest(ResourceType.TOPIC, "acme", PatternType.PREFIXED, null)
+    val request = buildControllerRequest(req)
+
+    val auth = authorizerAllowingClusterOps()
+    controllerApis = createControllerApis(
+      authorizer = Some(auth),
+      controller = new MockController.Builder().build(),
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    controllerApis.handleDescribeAclsRequest(request).get()
+
+    val response = captureSentResponse(request).asInstanceOf[DescribeAclsResponse]
+    assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED.code, response.data.errorCode,
+      "controller-direct DescribeAcls must refuse PREFIXED:acme — startsWith-matches the entire acme.* namespace")
+    assertEquals(0, response.acls.size)
+    verify(auth, never()).acls(any[AclBindingFilter]())
+  }
+
+  // #164: MATCH PatternType — `Topic:MATCH:acme.orders` is a filter pattern
+  // type that StandardAuthorizer matches against literal AND prefix bindings.
+  // The L1 refusal must catch it on every entry point (Create/Delete/Describe).
+  @Test
+  def testControllerDescribeAclsRefusesMatchTenantTopicFilter(): Unit = {
+    val req = describeAclsRequest(ResourceType.TOPIC, "acme.orders", PatternType.MATCH, null)
+    val request = buildControllerRequest(req)
+
+    val auth = authorizerAllowingClusterOps()
+    controllerApis = createControllerApis(
+      authorizer = Some(auth),
+      controller = new MockController.Builder().build(),
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    controllerApis.handleDescribeAclsRequest(request).get()
+
+    val response = captureSentResponse(request).asInstanceOf[DescribeAclsResponse]
+    assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED.code, response.data.errorCode,
+      "MATCH on a tenant topic name must be refused — it would enumerate any LITERAL or PREFIXED binding under that name")
+    verify(auth, never()).acls(any[AclBindingFilter]())
+  }
+
+  // #163: an UNKNOWN PatternType (invalid wire byte or future enum value) must
+  // be refused on every tenant-shaped name. Before the fail-closed change in
+  // #163 the `case _ => false` branch let any non-{LITERAL,PREFIXED,MATCH,ANY}
+  // wire byte through — and a downstream Authorizer might still interpret it.
+  // We use a raw byte 99 to simulate "future protocol revision" rather than
+  // sending a documented enum value.
+  @Test
+  def testControllerDescribeAclsRefusesUnknownPatternTypeFilterFailsClosed(): Unit = {
+    // Bypass DescribeAclsRequest.Builder: an AclBindingFilter collapses
+    // PatternType.fromCode(99) into the UNKNOWN enum, then `.code()` emits
+    // byte 0, which the wire validator catches. A raw-socket adversary can
+    // deliver byte 99 directly — fromCode(99) returns UNKNOWN at the helper
+    // but the wire validation (compares against UNKNOWN.code = 0) lets it through.
+    // We mirror that adversary by serialising the data with byte 99 and reparsing.
+    val data = new org.apache.kafka.common.message.DescribeAclsRequestData()
+      .setResourceTypeFilter(ResourceType.TOPIC.code)
+      .setResourceNameFilter("acme.orders")
+      .setPatternTypeFilter(99.toByte)
+      .setPrincipalFilter(null)
+      .setHostFilter(null)
+      .setOperation(AclOperation.ANY.code)
+      .setPermissionType(AclPermissionType.ANY.code)
+    val version = ApiKeys.DESCRIBE_ACLS.latestVersion
+    val req = DescribeAclsRequest.parse(MessageUtil.toByteBuffer(data, version), version)
+    val request = buildControllerRequest(req)
+
+    val auth = authorizerAllowingClusterOps()
+    controllerApis = createControllerApis(
+      authorizer = Some(auth),
+      controller = new MockController.Builder().build(),
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    controllerApis.handleDescribeAclsRequest(request).get()
+
+    val response = captureSentResponse(request).asInstanceOf[DescribeAclsResponse]
+    assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED.code, response.data.errorCode,
+      "UNKNOWN PatternType on a tenant name must fail-closed at L1 — refuses if EITHER LITERAL or PREFIXED interpretation would name a foreign tenant")
+    verify(auth, never()).acls(any[AclBindingFilter]())
+  }
+
+  // #163: same fail-closed semantics on CreateAcls.
+  @Test
+  def testControllerCreateAclsRefusesUnknownPatternTypeFailsClosed(): Unit = {
+    val creation = new CreateAclsRequestData.AclCreation()
+      .setResourceType(ResourceType.TOPIC.code)
+      .setResourceName("acme.orders")
+      .setResourcePatternType(99.toByte)  // raw wire byte — PatternType.fromCode → UNKNOWN
+      .setPrincipal("User:bob")
+      .setHost("*")
+      .setOperation(AclOperation.READ.code)
+      .setPermissionType(AclPermissionType.ALLOW.code)
+    val req = new CreateAclsRequest.Builder(new CreateAclsRequestData()
+      .setCreations(util.Arrays.asList(creation))).build()
+    val request = buildControllerRequest(req)
+
+    val auth = authorizerAllowingClusterOps()
+    controllerApis = createControllerApis(
+      authorizer = Some(auth),
+      controller = new MockController.Builder().build(),
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    controllerApis.handleCreateAclsRequest(request).get()
+
+    val response = captureSentResponse(request).asInstanceOf[CreateAclsResponse]
+    assertEquals(Errors.INVALID_REQUEST.code, response.results.get(0).errorCode,
+      "UNKNOWN PatternType on a tenant resource name must fail-closed on the controller create path")
+    verify(auth, never()).createAcls(any(), any())
+  }
+
+  // #163: same fail-closed semantics on DeleteAcls.
+  @Test
+  def testControllerDeleteAclsRefusesUnknownPatternTypeFilterFailsClosed(): Unit = {
+    val filter = new DeleteAclsRequestData.DeleteAclsFilter()
+      .setResourceTypeFilter(ResourceType.TOPIC.code)
+      .setResourceNameFilter("acme.orders")
+      .setPatternTypeFilter(99.toByte)  // raw wire byte — PatternType.fromCode → UNKNOWN
+      .setPrincipalFilter(null)
+      .setHostFilter(null)
+      .setOperation(AclOperation.READ.code)
+      .setPermissionType(AclPermissionType.ALLOW.code)
+    val req = new DeleteAclsRequest.Builder(new DeleteAclsRequestData()
+      .setFilters(util.Arrays.asList(filter))).build()
+    val request = buildControllerRequest(req)
+
+    val auth = authorizerAllowingClusterOps()
+    controllerApis = createControllerApis(
+      authorizer = Some(auth),
+      controller = new MockController.Builder().build(),
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    controllerApis.handleDeleteAclsRequest(request).get()
+
+    val response = captureSentResponse(request).asInstanceOf[DeleteAclsResponse]
+    assertEquals(Errors.INVALID_REQUEST.code, response.filterResults.get(0).errorCode,
+      "UNKNOWN PatternType on a tenant-named delete filter must fail-closed at L1")
+    verify(auth, never()).deleteAcls(any(), any())
+  }
+
+  // #164: MATCH on CreateAcls — even though MATCH bindings are nonsensical on
+  // creation, the broker/controller surface accepts the wire shape so the
+  // refusal must be structural.
+  @Test
+  def testControllerCreateAclsRefusesMatchTenantTopicOnBootstrapControllers(): Unit = {
+    val creation = aclCreation(ResourceType.TOPIC, "acme.orders", PatternType.MATCH, "User:bob")
+    val req = new CreateAclsRequest.Builder(new CreateAclsRequestData()
+      .setCreations(util.Arrays.asList(creation))).build()
+    val request = buildControllerRequest(req)
+
+    val auth = authorizerAllowingClusterOps()
+    controllerApis = createControllerApis(
+      authorizer = Some(auth),
+      controller = new MockController.Builder().build(),
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    controllerApis.handleCreateAclsRequest(request).get()
+
+    val response = captureSentResponse(request).asInstanceOf[CreateAclsResponse]
+    assertEquals(Errors.INVALID_REQUEST.code, response.results.get(0).errorCode,
+      "MATCH on a tenant resource name must be refused on the create path too")
+    verify(auth, never()).createAcls(any(), any())
+  }
+
+  // #164: MATCH on DeleteAcls.
+  @Test
+  def testControllerDeleteAclsRefusesMatchTenantTopicFilter(): Unit = {
+    val filter = aclFilter(ResourceType.TOPIC, "acme.orders", PatternType.MATCH, null)
+    val req = new DeleteAclsRequest.Builder(new DeleteAclsRequestData()
+      .setFilters(util.Arrays.asList(filter))).build()
+    val request = buildControllerRequest(req)
+
+    val auth = authorizerAllowingClusterOps()
+    controllerApis = createControllerApis(
+      authorizer = Some(auth),
+      controller = new MockController.Builder().build(),
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    controllerApis.handleDeleteAclsRequest(request).get()
+
+    val response = captureSentResponse(request).asInstanceOf[DeleteAclsResponse]
+    assertEquals(Errors.INVALID_REQUEST.code, response.filterResults.get(0).errorCode,
+      "MATCH on a tenant-named delete filter must be refused")
+    verify(auth, never()).deleteAcls(any(), any())
+  }
+
+  // #165: isolated coverage for the entryFilter principal channel — a filter
+  // with a NULL resource name and a tenant-shaped `User:__tenant_acme.*`
+  // principal must be refused on every L1 path. Existing #157 tests pair this
+  // with a tenant-shaped resource name, so the principal-channel refusal is
+  // not independently witnessed.
+  @Test
+  def testControllerDescribeAclsRefusesEntryFilterTenantPrincipalOnly(): Unit = {
+    // Resource pattern is wildcard (ANY + null) — only the entryFilter
+    // principal names a foreign tenant.
+    val req = describeAclsRequest(ResourceType.ANY, null, PatternType.ANY,
+      "User:__tenant_acme.alice")
+    val request = buildControllerRequest(req)
+
+    val auth = authorizerAllowingClusterOps()
+    controllerApis = createControllerApis(
+      authorizer = Some(auth),
+      controller = new MockController.Builder().build(),
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    controllerApis.handleDescribeAclsRequest(request).get()
+
+    val response = captureSentResponse(request).asInstanceOf[DescribeAclsResponse]
+    assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED.code, response.data.errorCode,
+      "DescribeAcls L1 must refuse a wildcard-resource filter whose entryFilter principal names a tenant")
+    verify(auth, never()).acls(any[AclBindingFilter]())
+  }
+
+  // #165: same on DeleteAcls — the principal channel must independently refuse.
+  @Test
+  def testControllerDeleteAclsRefusesEntryFilterTenantPrincipalOnly(): Unit = {
+    val filter = new DeleteAclsRequestData.DeleteAclsFilter()
+      .setResourceTypeFilter(ResourceType.ANY.code)
+      .setResourceNameFilter(null)
+      .setPatternTypeFilter(PatternType.ANY.code)
+      .setPrincipalFilter("User:__tenant_acme.alice")
+      .setHostFilter(null)
+      .setOperation(AclOperation.ANY.code)
+      .setPermissionType(AclPermissionType.ANY.code)
+    val req = new DeleteAclsRequest.Builder(new DeleteAclsRequestData()
+      .setFilters(util.Arrays.asList(filter))).build()
+    val request = buildControllerRequest(req)
+
+    val auth = authorizerAllowingClusterOps()
+    controllerApis = createControllerApis(
+      authorizer = Some(auth),
+      controller = new MockController.Builder().build(),
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    controllerApis.handleDeleteAclsRequest(request).get()
+
+    val response = captureSentResponse(request).asInstanceOf[DeleteAclsResponse]
+    assertEquals(Errors.INVALID_REQUEST.code, response.filterResults.get(0).errorCode,
+      "DeleteAcls L1 must refuse a wildcard-resource filter whose principal names a tenant")
+    verify(auth, never()).deleteAcls(any(), any())
   }
 
   @Test

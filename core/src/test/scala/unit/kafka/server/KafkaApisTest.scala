@@ -14584,6 +14584,181 @@ class KafkaApisTest extends Logging {
       "tenant caller must see bindings for its own namespace")
   }
 
+  // ---------------------------------------------------------------------------
+  // #163 / #164 / #165 — follow-up coverage on top of #157.
+  //   #163: UNKNOWN PatternType (invalid wire byte / future enum value) must
+  //         fail-closed — the prior `case _ => false` branch let any non-
+  //         {LITERAL,PREFIXED,MATCH,ANY} wire byte through.
+  //   #164: MATCH PatternType was previously only covered transitively
+  //         through ANY; pin it independently on every entry point.
+  //   #165: entryFilter principal-only — the prior tests pair a tenant-shaped
+  //         principal with a tenant-shaped resource name, masking whether the
+  //         principal channel alone is refused.
+  // ---------------------------------------------------------------------------
+
+  @Test
+  def testCreateAclsClusterWideListenerRefusesUnknownPatternTypeFailsClosed(): Unit = {
+    // Raw wire byte 99 — PatternType.fromCode(99) returns UNKNOWN, and the
+    // pattern-aware helper must refuse on the union of LITERAL+PREFIXED
+    // (a downstream Authorizer could still interpret the byte as a real
+    // pattern type once a future Kafka release adds one).
+    val creation = new CreateAclsRequestData.AclCreation()
+      .setResourceType(ResourceType.TOPIC.code)
+      .setResourceName("acme.orders")
+      .setResourcePatternType(99.toByte)
+      .setPrincipal("User:bob")
+      .setHost("*")
+      .setOperation(AclOperation.READ.code)
+      .setPermissionType(AclPermissionType.ALLOW.code)
+    val req = new CreateAclsRequest.Builder(new CreateAclsRequestData()
+      .setCreations(util.Arrays.asList(creation))).build()
+    val request = buildRequest(req)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleCreateAclsRequest(request)
+
+    val response = verifyNoThrottling[CreateAclsResponse](request)
+    assertEquals(Errors.INVALID_REQUEST.code, response.data.results.get(0).errorCode,
+      "UNKNOWN wire-byte PatternType on a tenant resource name must fail-closed at L1")
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[AbstractRequest](), any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
+  def testCreateAclsClusterWideListenerRefusesMatchTenantTopic(): Unit = {
+    val creation = aclCreation(ResourceType.TOPIC, "acme.orders", PatternType.MATCH, "User:bob")
+    val req = new CreateAclsRequest.Builder(new CreateAclsRequestData()
+      .setCreations(util.Arrays.asList(creation))).build()
+    val request = buildRequest(req)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleCreateAclsRequest(request)
+
+    val response = verifyNoThrottling[CreateAclsResponse](request)
+    assertEquals(Errors.INVALID_REQUEST.code, response.data.results.get(0).errorCode,
+      "MATCH on a tenant topic name must be refused at L1 — the union of LITERAL+PREFIXED interpretation is foreign")
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[AbstractRequest](), any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
+  def testDeleteAclsClusterWideListenerRefusesUnknownPatternTypeFailsClosed(): Unit = {
+    val filter = new DeleteAclsRequestData.DeleteAclsFilter()
+      .setResourceTypeFilter(ResourceType.TOPIC.code)
+      .setResourceNameFilter("acme.orders")
+      .setPatternTypeFilter(99.toByte)
+      .setPrincipalFilter(null)
+      .setHostFilter(null)
+      .setOperation(AclOperation.READ.code)
+      .setPermissionType(AclPermissionType.ALLOW.code)
+    val req = new DeleteAclsRequest.Builder(new DeleteAclsRequestData()
+      .setFilters(util.Arrays.asList(filter))).build()
+    val request = buildRequest(req)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDeleteAclsRequest(request)
+
+    val response = verifyNoThrottling[DeleteAclsResponse](request)
+    assertEquals(Errors.INVALID_REQUEST.code, response.data.filterResults.get(0).errorCode,
+      "UNKNOWN PatternType on a tenant delete filter must fail-closed at L1")
+  }
+
+  @Test
+  def testDeleteAclsClusterWideListenerRefusesMatchTenantTopicFilter(): Unit = {
+    val filter = aclFilter(ResourceType.TOPIC, "acme.orders", PatternType.MATCH, null)
+    val req = new DeleteAclsRequest.Builder(new DeleteAclsRequestData()
+      .setFilters(util.Arrays.asList(filter))).build()
+    val request = buildRequest(req)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDeleteAclsRequest(request)
+
+    val response = verifyNoThrottling[DeleteAclsResponse](request)
+    assertEquals(Errors.INVALID_REQUEST.code, response.data.filterResults.get(0).errorCode,
+      "MATCH on a tenant delete filter must be refused at L1")
+  }
+
+  @Test
+  def testDeleteAclsClusterWideListenerRefusesEntryFilterTenantPrincipalOnly(): Unit = {
+    // #165: wildcard resource + `User:__tenant_acme.alice` principal. Existing
+    // #157 tests pair this principal with a tenant-shaped resource, so the
+    // principal-channel refusal is not independently witnessed.
+    val filter = new DeleteAclsRequestData.DeleteAclsFilter()
+      .setResourceTypeFilter(ResourceType.ANY.code)
+      .setResourceNameFilter(null)
+      .setPatternTypeFilter(PatternType.ANY.code)
+      .setPrincipalFilter("User:__tenant_acme.alice")
+      .setHostFilter(null)
+      .setOperation(AclOperation.ANY.code)
+      .setPermissionType(AclPermissionType.ANY.code)
+    val req = new DeleteAclsRequest.Builder(new DeleteAclsRequestData()
+      .setFilters(util.Arrays.asList(filter))).build()
+    val request = buildRequest(req)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDeleteAclsRequest(request)
+
+    val response = verifyNoThrottling[DeleteAclsResponse](request)
+    assertEquals(Errors.INVALID_REQUEST.code, response.data.filterResults.get(0).errorCode,
+      "wildcard-resource + tenant principal filter must be refused via the principal channel alone")
+  }
+
+  @Test
+  def testDescribeAclsClusterWideListenerRefusesUnknownPatternTypeFailsClosed(): Unit = {
+    // Bypass DescribeAclsRequest.Builder: building an AclBindingFilter collapses
+    // PatternType.fromCode(99) into the UNKNOWN enum, then `.code()` emits byte
+    // 0, which the wire validator catches. A raw-socket adversary can deliver
+    // byte 99 directly — fromCode(99) returns UNKNOWN at the helper but the
+    // wire validation (which compares against UNKNOWN.code = 0) lets it through.
+    // We mirror that adversary by serialising the data with byte 99 and reparsing.
+    val data = new org.apache.kafka.common.message.DescribeAclsRequestData()
+      .setResourceTypeFilter(ResourceType.TOPIC.code)
+      .setResourceNameFilter("acme.orders")
+      .setPatternTypeFilter(99.toByte)
+      .setPrincipalFilter(null)
+      .setHostFilter(null)
+      .setOperation(AclOperation.ANY.code)
+      .setPermissionType(AclPermissionType.ANY.code)
+    val version = ApiKeys.DESCRIBE_ACLS.latestVersion
+    val req = DescribeAclsRequest.parse(MessageUtil.toByteBuffer(data, version), version)
+    val request = buildRequest(req)
+    val auth = authorizerAllowingClusterDescribe()
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(
+      authorizer = Some(auth),
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDescribeAcls(request)
+
+    val response = verifyNoThrottling[DescribeAclsResponse](request)
+    assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED.code, response.data.errorCode,
+      "UNKNOWN PatternType on a tenant describe filter must fail-closed at L1")
+    verify(auth, never()).acls(any[AclBindingFilter]())
+  }
+
+  @Test
+  def testDescribeAclsClusterWideListenerRefusesMatchTenantTopicFilter(): Unit = {
+    val req = describeAclsRequest(ResourceType.TOPIC, "acme.orders", PatternType.MATCH, null)
+    val request = buildRequest(req)
+    val auth = authorizerAllowingClusterDescribe()
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(
+      authorizer = Some(auth),
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDescribeAcls(request)
+
+    val response = verifyNoThrottling[DescribeAclsResponse](request)
+    assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED.code, response.data.errorCode,
+      "MATCH on a tenant describe filter must be refused at L1")
+    verify(auth, never()).acls(any[AclBindingFilter]())
+  }
+
   @Test
   def testCreatePartitionsTenantListenerForwardsUnchanged(): Unit = {
     // Tenant principals never reach handleCreatePartitionsRequest in production

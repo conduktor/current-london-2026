@@ -1605,10 +1605,15 @@ class ControllerApis(
         isForeignTenantNamespace(name, callerTenant)
       case PatternType.PREFIXED =>
         isForeignTenantTopicPrefix(name, callerTenant)
-      case PatternType.MATCH | PatternType.ANY =>
+      // MATCH / ANY / UNKNOWN (invalid wire byte or forward-compat enum) all
+      // fall through to the union: refuse if EITHER LITERAL or PREFIXED
+      // interpretation would name a foreign tenant. Fail-closed semantics —
+      // #163 (audit F2) closed the prior `case _ => false` that an attacker
+      // could weaponise by sending a wire byte the downstream Authorizer
+      // still interpreted as a real pattern.
+      case _ =>
         isForeignTenantNamespace(name, callerTenant) ||
           isForeignTenantTopicPrefix(name, callerTenant)
-      case _ => false
     }
   }
 
@@ -1659,11 +1664,11 @@ class ControllerApis(
           !callerOwnsPrincipalNamespaceName(name, callerTenant)
       case PatternType.PREFIXED =>
         isForeignTenantPrincipalPrefix(name, callerTenant)
-      case PatternType.MATCH | PatternType.ANY =>
+      // MATCH / ANY / UNKNOWN — see isForeignTenantTopicAclName for rationale.
+      case _ =>
         (isReservedTenantPrincipalNamespace(name) &&
           !callerOwnsPrincipalNamespaceName(name, callerTenant)) ||
           isForeignTenantPrincipalPrefix(name, callerTenant)
-      case _ => false
     }
   }
 
@@ -1776,8 +1781,70 @@ class ControllerApis(
       principalStr.startsWith("User:" + TenantNamespace.PRINCIPAL_PREFIX + t + "."))
   }
 
+  // Same shape as aclTenantPollutionRefusal but on the raw AclCreation — used
+  // by the L1 pre-scan below, before AclApis.handleCreateAcls calls
+  // CreateAclsRequest.aclBinding(c) which throws IllegalArgumentException for
+  // MATCH/ANY (ResourcePattern rejects them — they are filter-only pattern
+  // types, not valid for concrete bindings). Reaching aclBinding() on a raw
+  // MATCH/ANY-on-tenant-name wire byte would propagate the IAE out of the
+  // handler instead of producing a clean per-creation INVALID_REQUEST. The
+  // broker (KafkaApis.handleCreateAclsRequest) already does this pre-scan;
+  // mirror it on the controller so bootstrap.controllers and bootstrap.brokers
+  // give byte-identical refusal shape for the same wire payload (probe parity,
+  // same rationale as #162's Describe L1 mirror).
+  private def aclTenantCreationRefusal(
+      c: CreateAclsRequestData.AclCreation,
+      callerTenant: Option[String]): Option[ApiError] = {
+    val patternType = PatternType.fromCode(c.resourcePatternType)
+    val principalRefused = isReservedUserPrincipalLiteral(c.principal) &&
+      !callerOwnsUserPrincipal(c.principal, callerTenant)
+    val nameRefused = ResourceType.fromCode(c.resourceType) match {
+      case ResourceType.TOPIC =>
+        isForeignTenantTopicAclName(c.resourceName, patternType, callerTenant)
+      case ResourceType.GROUP | ResourceType.TRANSACTIONAL_ID | ResourceType.USER =>
+        isForeignTenantPrincipalAclName(c.resourceName, patternType, callerTenant)
+      case _ => false
+    }
+    if (principalRefused || nameRefused) {
+      val what =
+        if (nameRefused) "Resource name '" + c.resourceName + "'"
+        else "Principal '" + c.principal + "'"
+      Some(new ApiError(Errors.INVALID_REQUEST,
+        what + " is reserved (tenant namespace prefix)"))
+    } else None
+  }
+
   private[server] def handleCreateAclsRequest(request: RequestChannel.Request): CompletableFuture[Unit] = {
     val callerTenant = callerTenantFromPrincipal(request.context.principal.getName)
+    val creations = request.body[CreateAclsRequest].aclCreations
+    val rejections = new util.HashMap[Integer, CreateAclsResponseData.AclCreationResult]()
+    var i = 0
+    while (i < creations.size) {
+      aclTenantCreationRefusal(creations.get(i), callerTenant).foreach { err =>
+        rejections.put(i, new CreateAclsResponseData.AclCreationResult()
+          .setErrorCode(err.error.code)
+          .setErrorMessage(err.message))
+      }
+      i += 1
+    }
+    // All creations refused at L1: short-circuit so AclApis never reaches
+    // CreateAclsRequest.aclBinding() — which would throw IAE for MATCH/ANY.
+    // For the mixed case (some kept, some L1-refused) we still hand off to
+    // AclApis with the unmodified request; the kept creations are by L1
+    // definition not tenant-foreign, so the L2 postFilter is a no-op for them.
+    if (rejections.size == creations.size && !creations.isEmpty) {
+      val results = new util.ArrayList[CreateAclsResponseData.AclCreationResult](creations.size)
+      var j = 0
+      while (j < creations.size) {
+        results.add(rejections.get(j))
+        j += 1
+      }
+      requestHelper.sendResponseMaybeThrottle(request, throttleMs =>
+        new CreateAclsResponse(new CreateAclsResponseData()
+          .setThrottleTimeMs(throttleMs)
+          .setResults(results)))
+      return CompletableFuture.completedFuture[Unit](())
+    }
     aclApis.handleCreateAcls(request, b => aclTenantPollutionRefusal(b, callerTenant))
   }
 
@@ -1790,7 +1857,37 @@ class ControllerApis(
 
   private[server] def handleDescribeAclsRequest(request: RequestChannel.Request): CompletableFuture[Unit] = {
     val callerTenant = callerTenantFromPrincipal(request.context.principal.getName)
-    aclApis.handleDescribeAcls(request, b => aclTenantBindingAllowed(b, callerTenant))
+    // L1 — refuse a filter that EXPLICITLY names a foreign tenant namespace or
+    // foreign tenant principal before reaching the Authorizer. KafkaApis
+    // already does this on the broker side (#157, #98); the controller path
+    // (bootstrap.controllers reach) must mirror it so a cluster-direct caller
+    // cannot probe filter shapes against the controller and observe a
+    // different response surface than the broker (#162).
+    //
+    // `aclTenantFilterRefusal` already covers patternType-aware refusal for
+    // TOPIC / GROUP / TRANSACTIONAL_ID / USER and the entry-filter principal.
+    // It returns INVALID_REQUEST (the right code for CreateAcls/DeleteAcls,
+    // where the broker also uses INVALID_REQUEST). For DescribeAcls the
+    // broker uses CLUSTER_AUTHORIZATION_FAILED (KafkaApis L1) — we substitute
+    // here to keep the response surface identical across the two listeners.
+    // A cluster-direct caller probing the same filter against both
+    // bootstrap.brokers and bootstrap.controllers must see byte-identical
+    // refusal shape; otherwise the divergence is itself a fingerprint.
+    val describeReq = request.body[DescribeAclsRequest]
+    aclTenantFilterRefusal(describeReq.filter, callerTenant) match {
+      case Some(err) =>
+        requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
+          new DescribeAclsResponse(new DescribeAclsResponseData()
+            .setErrorCode(Errors.CLUSTER_AUTHORIZATION_FAILED.code)
+            .setErrorMessage(err.message)
+            .setThrottleTimeMs(requestThrottleMs),
+          describeReq.version))
+        CompletableFuture.completedFuture[Unit](())
+      case None =>
+        // L2 postFilter still scrubs tenant-shaped bindings from wildcard
+        // enumerations the L1 check let through (ResourceType.ANY + null name).
+        aclApis.handleDescribeAcls(request, b => aclTenantBindingAllowed(b, callerTenant))
+    }
   }
 
   private[server] def handleCreateDelegationTokenRequest(request: RequestChannel.Request): CompletableFuture[Unit] = {
