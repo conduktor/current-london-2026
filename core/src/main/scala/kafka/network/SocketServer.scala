@@ -519,6 +519,15 @@ private[kafka] abstract class Acceptor(val socketServer: SocketServer,
     newPort
   }
 
+  // One-shot, operator-visible record of which I/O backend the resolver picked for this
+  // listener. Without this line a wildcard "io_uring auto" config can silently fall through
+  // to NIO (e.g. kernel without io_uring, or a non-PLAINTEXT listener that v1 forbids on the
+  // io_uring path) and operators have no signal that a tuning intent was downgraded —
+  // every existing log line refers to the listener by name only. config.socketSelectorImplementation
+  // is the requested value (auto/nio/io_uring); usesIoUring is the resolved decision.
+  info(s"Resolved I/O backend for listener ${endPoint.listenerName} (${endPoint.securityProtocol}): " +
+    s"${if (usesIoUring) "io_uring" else "nio"} (requested=${config.socketSelectorImplementation.configValue()})")
+
   private[network] val processors = new ArrayBuffer[Processor]()
   // Build the metric name explicitly in order to keep the existing name for compatibility
   private val backwardCompatibilityMetricGroup = new KafkaMetricsGroup("kafka.network", "Acceptor")
