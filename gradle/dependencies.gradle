@@ -182,8 +182,16 @@ libs += [
   joptSimple: "net.sf.jopt-simple:jopt-simple:$versions.jopt",
   jose4j: "org.bitbucket.b_c:jose4j:$versions.jose4j",
   // Netty io_uring transport — Linux-only experimental broker networking backend.
+  // Both linux-x86_64 and linux-aarch_64 native classifiers are shipped: the
+  // classes jar carries the JVM-side bindings and one of the two .so libraries
+  // is selected by Netty's NativeLibraryLoader at runtime based on
+  // os.arch. Shipping only x86_64 would silently break Graviton / Ampere /
+  // Apple-Silicon Linux brokers — the io_uring classes would be present, the
+  // matching .so absent, and IoUringSupport.isAvailable() would return false
+  // with an UnsatisfiedLinkError-rooted reason despite a fully-capable kernel.
   nettyIoUringClasses: "io.netty:netty-transport-classes-io_uring:$versions.nettyIoUring",
   nettyIoUringNativeLinuxX86_64: "io.netty:netty-transport-native-io_uring:$versions.nettyIoUring:linux-x86_64",
+  nettyIoUringNativeLinuxAarch64: "io.netty:netty-transport-native-io_uring:$versions.nettyIoUring:linux-aarch_64",
   junitJupiter: "org.junit.jupiter:junit-jupiter:$versions.junit",
   junitJupiterApi: "org.junit.jupiter:junit-jupiter-api:$versions.junit",
   junitPlatformSuiteEngine: "org.junit.platform:junit-platform-suite-engine:$versions.junitPlatform",

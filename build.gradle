@@ -984,11 +984,15 @@ project(':server') {
     implementation libs.slf4jApi
 
     // Experimental io_uring networking backend (Linux PLAINTEXT only). The classes artifact
-    // is on the compile classpath; the native artifact is runtimeOnly because (a) it is
-    // classifier-bound to linux-x86_64 and must not break compilation on other platforms,
-    // and (b) the reflective IoUringSupport probe gates *all* references at runtime.
+    // is on the compile classpath; the native artifacts are runtimeOnly because (a) they are
+    // classifier-bound (linux-x86_64, linux-aarch_64) and must not break compilation on other
+    // platforms, and (b) the reflective IoUringSupport probe gates *all* references at runtime.
+    // Both Linux native classifiers ship together so a single tarball boots on both x86_64
+    // and aarch_64 (Graviton/Ampere/Apple-Silicon-Linux) brokers; Netty's NativeLibraryLoader
+    // selects the matching .so via os.arch at startup.
     implementation libs.nettyIoUringClasses
     runtimeOnly libs.nettyIoUringNativeLinuxX86_64
+    runtimeOnly libs.nettyIoUringNativeLinuxAarch64
 
     testImplementation project(':clients').sourceSets.test.output
 

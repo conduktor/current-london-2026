@@ -248,6 +248,7 @@ License Version 2.0:
 - netty-resolver-4.2.12.Final
 - netty-transport-4.2.12.Final
 - netty-transport-classes-io_uring-4.2.12.Final
+- netty-transport-native-io_uring-4.2.12.Final-linux-aarch_64
 - netty-transport-native-io_uring-4.2.12.Final-linux-x86_64
 - netty-transport-native-unix-common-4.2.12.Final
 - opentelemetry-proto-1.0.0-alpha
