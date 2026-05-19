@@ -38,7 +38,10 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import io.netty.bootstrap.Bootstrap;
 import io.netty.bootstrap.ServerBootstrap;
+import io.netty.buffer.AbstractByteBufAllocator;
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufAllocator;
+import io.netty.buffer.UnpooledByteBufAllocator;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelInboundHandlerAdapter;
@@ -47,6 +50,7 @@ import io.netty.channel.embedded.EmbeddedChannel;
 import io.netty.channel.local.LocalAddress;
 import io.netty.channel.local.LocalChannel;
 import io.netty.channel.local.LocalServerChannel;
+import io.netty.util.internal.OutOfDirectMemoryError;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -1152,6 +1156,89 @@ class IoUringTransportLayerTest {
         assertTrue(l.hasPendingWrites(),
             "pre-close failure must still pollute asyncWriteFailure so the next write() " +
             "call surfaces the IOException to the Processor's FAILED_SEND path");
+    }
+
+    @Test
+    void writeSurfacesOutOfDirectMemoryErrorFromAllocatorAsIOException() throws Exception {
+        // B-CHAOS-2: nettyChannel.alloc().directBuffer(safeChunk) can throw
+        // OutOfDirectMemoryError (a subclass of OutOfMemoryError → Error) when Netty's
+        // direct-memory pool ceiling is hit. Without the alloc-site try/catch, the Error
+        // escapes write() entirely — the TransportLayer contract requires IOException so
+        // the Selector's write step routes the channel through FAILED_SEND. An escaping
+        // Error bypasses FAILED_SEND, leaves the in-flight Send silently abandoned, and
+        // surfaces as an unhandled Error in the Processor's run loop.
+        //
+        // We inject the failure with a custom allocator whose directBuffer() always
+        // throws OutOfDirectMemoryError. Running the bug naturally would require pushing
+        // direct memory to the pool ceiling, which is environment-dependent and slow;
+        // the seam is honest because the production code path goes through exactly this
+        // call (nettyChannel.alloc().directBuffer(safeChunk)).
+        EmbeddedChannel netty = new EmbeddedChannel();
+        netty.config().setAllocator(ALLOC_THROWS_DIRECT_OOM);
+        IoUringTransportLayer l = new IoUringTransportLayer(netty, REMOTE, LOCAL);
+
+        ByteBuffer src = ByteBuffer.wrap(new byte[]{1, 2, 3, 4});
+        IOException ex = assertThrows(IOException.class, () -> l.write(src),
+            "B-CHAOS-2: OutOfDirectMemoryError from the allocator must be wrapped in " +
+            "IOException so the Selector's write step routes the channel through FAILED_SEND. " +
+            "Without the wrap, the Error escapes write() and bypasses FAILED_SEND entirely.");
+        assertTrue(ex.getCause() instanceof OutOfDirectMemoryError,
+            "the cause chain must preserve the original OutOfDirectMemoryError so operators " +
+            "can attribute the failure to direct-memory pressure rather than a generic write " +
+            "error; got cause: " + ex.getCause());
+        // src must not have been consumed — the failure happened before we copied bytes
+        // out of it (the alloc throws before buf.writeBytes(src)).
+        assertEquals(4, src.remaining(),
+            "src ByteBuffer must remain untouched on alloc failure: writeBytes never ran, " +
+            "so position/limit must be unchanged. Otherwise a retry by ByteBufferSend.writeTo " +
+            "would skip bytes the broker never actually sent.");
+        l.close();
+    }
+
+    /**
+     * Test fixture for {@link #writeSurfacesOutOfDirectMemoryErrorFromAllocatorAsIOException}.
+     * Heap allocations delegate to {@link UnpooledByteBufAllocator} so unrelated code paths
+     * (Netty's outbound queue accounting, etc.) keep working; only directBuffer() throws.
+     */
+    private static final ByteBufAllocator ALLOC_THROWS_DIRECT_OOM = new AbstractByteBufAllocator(false) {
+        @Override
+        protected ByteBuf newHeapBuffer(int initialCapacity, int maxCapacity) {
+            return UnpooledByteBufAllocator.DEFAULT.heapBuffer(initialCapacity, maxCapacity);
+        }
+        @Override
+        protected ByteBuf newDirectBuffer(int initialCapacity, int maxCapacity) {
+            throw newOutOfDirectMemoryError("test injection: direct memory pool exhausted");
+        }
+        @Override
+        public boolean isDirectBufferPooled() {
+            return false;
+        }
+    };
+
+    /**
+     * Constructs {@link OutOfDirectMemoryError} via reflection because Netty's
+     * {@code OutOfDirectMemoryError(String)} constructor is package-private and Netty exposes
+     * no public factory. Netty 4.x is an unnamed module on the classpath, so
+     * {@code setAccessible(true)} succeeds without {@code --add-opens} (no JPMS opens needed).
+     * A same-package bridge class would also have worked, but it forces the bridge into
+     * {@code io.netty.util.internal} — a top-level package outside this checkstyle
+     * import-control's {@code org.apache.kafka} root, which triggers
+     * "Import control file does not handle this package". Reflection keeps the test
+     * self-contained without touching checkstyle config or extending the root.
+     */
+    private static OutOfDirectMemoryError newOutOfDirectMemoryError(String message) {
+        try {
+            java.lang.reflect.Constructor<OutOfDirectMemoryError> c =
+                OutOfDirectMemoryError.class.getDeclaredConstructor(String.class);
+            c.setAccessible(true);
+            return c.newInstance(message);
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError(
+                "could not construct OutOfDirectMemoryError via reflection — Netty's " +
+                "constructor signature changed or the JVM rejected setAccessible; the " +
+                "B-CHAOS-2 fault-injection contract is broken until the test is updated",
+                e);
+        }
     }
 
     @Test

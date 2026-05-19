@@ -36,6 +36,7 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.Channel;
+import io.netty.util.internal.OutOfDirectMemoryError;
 
 /**
  * {@link TransportLayer} that bridges Kafka's {@code KafkaChannel} to a Netty
@@ -573,7 +574,25 @@ final class IoUringTransportLayer implements TransportLayer {
         // Use a pooled direct buffer so io_uring can submit the bytes without a heap-to-
         // direct intermediate copy. The buffer is released by Netty after the channel has
         // flushed it; we only own the writeAndFlush completion listener.
-        ByteBuf buf = nettyChannel.alloc().directBuffer(safeChunk);
+        //
+        // B-CHAOS-2: directBuffer() can throw OutOfDirectMemoryError when the pool's
+        // ceiling (-Dio.netty.maxDirectMemory) is hit — this is a Netty-level pool ceiling,
+        // NOT a JVM-wide OOM, so it's safe to catch. The TransportLayer contract is to
+        // throw IOException on write failures so the Selector's write step routes the
+        // channel through FAILED_SEND. An escaping OutOfDirectMemoryError (a subclass of
+        // OutOfMemoryError → Error, not RuntimeException) would bypass the FAILED_SEND
+        // path and surface as an unhandled Error in the Processor's run loop — the channel
+        // would never be marked failed, no disconnect would be emitted, and the in-flight
+        // Send would be left silently abandoned. We do NOT catch general OutOfMemoryError
+        // here: that signals a JVM-wide failure where the broker is already past saving;
+        // OutOfDirectMemoryError is the specific, recoverable signal that this pool is
+        // full while the rest of the JVM is fine.
+        ByteBuf buf;
+        try {
+            buf = nettyChannel.alloc().directBuffer(safeChunk);
+        } catch (OutOfDirectMemoryError e) {
+            throw new IOException("direct buffer allocation failed", e);
+        }
         // Anything between allocation and writeAndFlush taking ownership must release the
         // buf on failure — otherwise the pooled allocator slowly bleeds direct memory.
         boolean handedOff = false;
@@ -607,7 +626,7 @@ final class IoUringTransportLayer implements TransportLayer {
                 handedOff = true;
                 future.addListener(f -> onAsyncWriteComplete(f.isSuccess(), f.cause(), safeChunk));
                 pendingWriteBytes.addAndGet(safeChunk);
-            } catch (RuntimeException e) {
+            } catch (RuntimeException | OutOfDirectMemoryError e) {
                 // Netty's writeAndFlush / DefaultPromise.addListener can throw unchecked
                 // when the event loop is shut down (RejectedExecutionException) or in other
                 // listener-registration races. The TransportLayer contract is to throw
@@ -620,6 +639,15 @@ final class IoUringTransportLayer implements TransportLayer {
                 // and will release it on flush completion (no decrementer installed, but
                 // the inc statement after addListener didn't run either — counter stays
                 // consistent).
+                //
+                // B-CHAOS-2: writeAndFlush can also throw OutOfDirectMemoryError when a
+                // pipeline encoder allocates internally and the pool ceiling is hit. Same
+                // rationale as the alloc-site guard above (see directBuffer try/catch):
+                // a Netty-level pool ceiling is recoverable per-channel and must route
+                // through FAILED_SEND, not escape as an Error. We deliberately keep the
+                // catch narrow — we do NOT catch general OutOfMemoryError or general Error,
+                // since those signal JVM-wide failure where attempting to continue is
+                // worse than letting the process die.
                 throw new IOException("write submission failed", e);
             }
         } finally {
