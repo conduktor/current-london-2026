@@ -43,6 +43,7 @@ import org.apache.kafka.common.message._
 import org.apache.kafka.common.network.{ClientInformation, ListenerName}
 import org.apache.kafka.common.protocol.Errors._
 import org.apache.kafka.common.protocol.{ApiKeys, ApiMessage, Errors}
+import org.apache.kafka.common.quota.{ClientQuotaAlteration, ClientQuotaEntity}
 import org.apache.kafka.common.requests._
 import org.apache.kafka.common.resource.{PatternType, Resource, ResourcePattern, ResourceType}
 import org.apache.kafka.common.security.auth.{KafkaPrincipal, SecurityProtocol}
@@ -2706,6 +2707,183 @@ class ControllerApisTest {
     val forwarded = createCaptor.getValue.topics().asScala.map(_.name).toList
     assertEquals(List(Topic.GROUP_METADATA_TOPIC_NAME), forwarded,
       "internal topic must reach controller.createTopics intact in split mode")
+  }
+
+  // ---------------------------------------------------------------------------
+  // #117 — AlterClientQuotas USER-entity tenant scrub on the controller.
+  //
+  // A cluster-wide admin (super-user on a non-tenant listener, or any caller
+  // with ALTER on CLUSTER) hitting the controller listener directly through
+  // `bootstrap.controllers` — or reaching here via the broker forward at
+  // KafkaApis.scala line 808 — must NOT be able to persist a quota record
+  // keyed on `__tenant_<id>.<user>`. The broker enforces quotas by runtime
+  // principal name, so such a record silently DOS's (`producer_byte_rate=0`)
+  // or elevates a tenant principal's traffic with no tenant-side audit.
+  //
+  // Per-tenant carve-out: a forwarded tenant principal can legitimately tune
+  // quotas for its own user namespace (`__tenant_acme.alice` may set quotas
+  // on `__tenant_acme.bob`), but cross-tenant entries are refused even from
+  // a tenant principal.
+  // ---------------------------------------------------------------------------
+
+  private def buildAlterClientQuotasRequest(entries: util.Collection[ClientQuotaAlteration],
+                                            principal: KafkaPrincipal): RequestChannel.Request = {
+    val request = new AlterClientQuotasRequest.Builder(entries, false).build()
+    buildTokenRequest(request, principal)
+  }
+
+  private def quotaEntityForUser(user: String): ClientQuotaEntity = {
+    val entries = new util.HashMap[String, String]()
+    entries.put(ClientQuotaEntity.USER, user)
+    new ClientQuotaEntity(entries)
+  }
+
+  @Test
+  def testControllerAlterClientQuotasRefusesTenantPrefixedUserFromClusterWideCaller(): Unit = {
+    val controller = mock(classOf[Controller])
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.empty())
+
+    val tenantEntity = quotaEntityForUser("__tenant_acme.alice")
+    val ops = util.Collections.singletonList(
+      new ClientQuotaAlteration.Op("producer_byte_rate", 0.0))
+    val entries = util.Collections.singletonList(new ClientQuotaAlteration(tenantEntity, ops))
+    val req = buildAlterClientQuotasRequest(entries,
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    controllerApis.handleAlterClientQuotas(req)
+
+    // Short-circuit: with every entry refused, the controller must never be
+    // asked to persist the record. Otherwise a regression in the merge below
+    // could re-introduce the laundered tenant quota.
+    verify(controller, never()).alterClientQuotas(
+      any(classOf[ControllerRequestContext]),
+      any(),
+      anyBoolean())
+
+    val response = captureSentResponse(req).asInstanceOf[AlterClientQuotasResponse]
+    val entry = response.data().entries().asScala.head
+    assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED.code(), entry.errorCode(),
+      "cluster-wide caller must be refused for a tenant-prefixed USER entity")
+    assertTrue(entry.errorMessage() == null || entry.errorMessage().isEmpty,
+      "error message must not leak the physical tenant principal name back to the caller")
+  }
+
+  @Test
+  def testControllerAlterClientQuotasAllowsSameTenantUserFromTenantCaller(): Unit = {
+    val controller = mock(classOf[Controller])
+    val tenantEntity = quotaEntityForUser("__tenant_acme.bob")
+    // Stub controller to acknowledge the (legitimately-tenant-owned) entry.
+    when(controller.alterClientQuotas(
+      any(classOf[ControllerRequestContext]),
+      any(),
+      anyBoolean()))
+      .thenReturn(CompletableFuture.completedFuture(
+        java.util.Collections.singletonMap(tenantEntity, ApiError.NONE)))
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.empty())
+
+    val ops = util.Collections.singletonList(
+      new ClientQuotaAlteration.Op("producer_byte_rate", 1024.0 * 1024))
+    val entries = util.Collections.singletonList(new ClientQuotaAlteration(tenantEntity, ops))
+    val req = buildAlterClientQuotasRequest(entries,
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_acme.alice"))
+
+    controllerApis.handleAlterClientQuotas(req)
+
+    verify(controller).alterClientQuotas(
+      any(classOf[ControllerRequestContext]),
+      any(),
+      anyBoolean())
+    val response = captureSentResponse(req).asInstanceOf[AlterClientQuotasResponse]
+    val entry = response.data().entries().asScala.head
+    assertEquals(Errors.NONE.code(), entry.errorCode(),
+      "tenant caller must be allowed to tune quotas inside its own namespace")
+  }
+
+  @Test
+  def testControllerAlterClientQuotasRefusesCrossTenantUserFromTenantCaller(): Unit = {
+    val controller = mock(classOf[Controller])
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.empty())
+
+    // Caller is in tenant `acme`; target USER entity is inside tenant `evil`.
+    val crossTenantEntity = quotaEntityForUser("__tenant_evil.alice")
+    val ops = util.Collections.singletonList(
+      new ClientQuotaAlteration.Op("producer_byte_rate", 0.0))
+    val entries = util.Collections.singletonList(new ClientQuotaAlteration(crossTenantEntity, ops))
+    val req = buildAlterClientQuotasRequest(entries,
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_acme.attacker"))
+
+    controllerApis.handleAlterClientQuotas(req)
+
+    verify(controller, never()).alterClientQuotas(
+      any(classOf[ControllerRequestContext]),
+      any(),
+      anyBoolean())
+    val response = captureSentResponse(req).asInstanceOf[AlterClientQuotasResponse]
+    val entry = response.data().entries().asScala.head
+    assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED.code(), entry.errorCode(),
+      "tenant caller must NOT be able to set quotas on another tenant's USER namespace")
+    assertTrue(entry.errorMessage() == null || entry.errorMessage().isEmpty,
+      "error message must not leak the foreign tenant principal name back to the caller")
+  }
+
+  @Test
+  def testControllerAlterClientQuotasMixedBatchSplitsRefusedAndAccepted(): Unit = {
+    val controller = mock(classOf[Controller])
+    val clusterEntity = quotaEntityForUser("regular-cluster-user")
+    val tenantEntity = quotaEntityForUser("__tenant_acme.alice")
+    // The controller MUST only see the cluster entry; the tenant one is
+    // refused upstream. Stub returns NONE for the cluster entry only.
+    when(controller.alterClientQuotas(
+      any(classOf[ControllerRequestContext]),
+      any(),
+      anyBoolean()))
+      .thenReturn(CompletableFuture.completedFuture(
+        java.util.Collections.singletonMap(clusterEntity, ApiError.NONE)))
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.empty())
+
+    val ops = util.Collections.singletonList(
+      new ClientQuotaAlteration.Op("producer_byte_rate", 1024.0 * 1024))
+    val entries = new util.ArrayList[ClientQuotaAlteration]()
+    entries.add(new ClientQuotaAlteration(clusterEntity, ops))
+    entries.add(new ClientQuotaAlteration(tenantEntity, ops))
+    val req = buildAlterClientQuotasRequest(entries,
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    controllerApis.handleAlterClientQuotas(req)
+
+    // Capture the entries actually forwarded to the controller — the tenant
+    // one must NOT be present.
+    val forwarded: ArgumentCaptor[util.Collection[ClientQuotaAlteration]] =
+      ArgumentCaptor.forClass(classOf[util.Collection[ClientQuotaAlteration]])
+    verify(controller).alterClientQuotas(
+      any(classOf[ControllerRequestContext]),
+      forwarded.capture(),
+      anyBoolean())
+    val seenEntities = forwarded.getValue.asScala.map(_.entity()).toSet
+    assertEquals(Set(clusterEntity), seenEntities,
+      "only the cluster-namespaced entry must reach the controller")
+
+    val response = captureSentResponse(req).asInstanceOf[AlterClientQuotasResponse]
+    val byUser: Map[String, Short] = response.data().entries().asScala.flatMap { entry =>
+      entry.entity().asScala.find(_.entityType() == ClientQuotaEntity.USER)
+        .map(u => u.entityName() -> entry.errorCode())
+    }.toMap
+    assertEquals(Errors.NONE.code(), byUser("regular-cluster-user"),
+      "cluster user must round-trip with NONE")
+    assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED.code(), byUser("__tenant_acme.alice"),
+      "tenant user must come back with CLUSTER_AUTHORIZATION_FAILED")
   }
 
   @AfterEach

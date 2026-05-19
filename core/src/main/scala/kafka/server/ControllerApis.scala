@@ -45,6 +45,7 @@ import org.apache.kafka.common.message.IncrementalAlterConfigsResponseData.Alter
 import org.apache.kafka.common.message.{CreateTopicsRequestData, _}
 import org.apache.kafka.common.protocol.Errors._
 import org.apache.kafka.common.protocol.{ApiKeys, ApiMessage, Errors}
+import org.apache.kafka.common.quota.{ClientQuotaAlteration, ClientQuotaEntity}
 import org.apache.kafka.common.requests._
 import org.apache.kafka.common.resource.Resource.CLUSTER_NAME
 import org.apache.kafka.common.resource.ResourceType.{CLUSTER, GROUP, TOPIC, USER}
@@ -775,15 +776,65 @@ class ControllerApis(
     authHelper.authorizeClusterOperation(request, ALTER_CONFIGS)
     val context = new ControllerRequestContext(request.context.header.data, request.context.principal,
       OptionalLong.empty())
-    controller.alterClientQuotas(context, quotaRequest.entries, quotaRequest.validateOnly)
-      .handle[Unit] { (results, exception) =>
-        if (exception != null) {
-          requestHelper.handleError(request, exception)
-        } else {
-          requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
-            AlterClientQuotasResponse.fromQuotaEntities(results, requestThrottleMs))
-        }
+
+    // Outside-in defence for the USER quota entity. A cluster-wide caller
+    // hitting the broker listener or, via KIP-590 `bootstrap.controllers`,
+    // the controller listener directly, can otherwise persist a quota record
+    // keyed on `__tenant_<id>.<user>`. The broker enforces quotas by the
+    // runtime principal name, so such a record DOS's (or, with high values,
+    // silently elevates) a tenant principal's traffic with no tenant-side
+    // visibility. The metadata layer (ClientQuotaControlManager) writes the
+    // quota record unconditionally — controller is SOLE line of defence.
+    //
+    // Same-tenant exemption: a forwarded tenant principal `__tenant_acme.X`
+    // is allowed to set/modify quotas keyed on a user in its own namespace
+    // (`__tenant_acme.<user>`); cross-tenant or cluster-wide callers are
+    // refused. Mirrors the delegation-token pattern at
+    // handleCreateDelegationTokenRequest.
+    val callerTenant = callerTenantFromPrincipal(request.context.principal.getName)
+    def isForeignTenantUser(name: String): Boolean = {
+      if (name == null) return false
+      if (!isReservedTenantPrincipalNamespace(name)) return false
+      callerTenant match {
+        case Some(t) => !name.startsWith(TenantNamespace.PRINCIPAL_PREFIX + t + ".")
+        case None => true
       }
+    }
+    val refused = new util.LinkedHashMap[ClientQuotaEntity, ApiError]()
+    val allowed = new util.ArrayList[ClientQuotaAlteration](quotaRequest.entries.size)
+    quotaRequest.entries.forEach { alteration =>
+      val entity = alteration.entity()
+      val userName = entity.entries().get(ClientQuotaEntity.USER)
+      if (isForeignTenantUser(userName)) {
+        // Empty error message — leaking the physical user name back to the
+        // caller would amount to a presence oracle for that tenant principal.
+        refused.put(entity, new ApiError(Errors.CLUSTER_AUTHORIZATION_FAILED, ""))
+      } else {
+        allowed.add(alteration)
+      }
+    }
+
+    val controllerFuture =
+      if (allowed.isEmpty) {
+        // Skip the controller round-trip entirely if every entry was refused.
+        // Returning an empty-results future preserves the response shape;
+        // throttling is still applied below.
+        CompletableFuture.completedFuture(
+          java.util.Collections.emptyMap[ClientQuotaEntity, ApiError]())
+      } else {
+        controller.alterClientQuotas(context, allowed, quotaRequest.validateOnly)
+      }
+    controllerFuture.handle[Unit] { (results, exception) =>
+      if (exception != null) {
+        requestHelper.handleError(request, exception)
+      } else {
+        val merged = new util.LinkedHashMap[ClientQuotaEntity, ApiError]()
+        merged.putAll(results)
+        merged.putAll(refused)
+        requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
+          AlterClientQuotasResponse.fromQuotaEntities(merged, requestThrottleMs))
+      }
+    }
   }
 
   def handleIncrementalAlterConfigs(request: RequestChannel.Request): CompletableFuture[Unit] = {
