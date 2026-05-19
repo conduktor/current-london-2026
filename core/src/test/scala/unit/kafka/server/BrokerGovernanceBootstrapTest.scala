@@ -1447,6 +1447,86 @@ class BrokerGovernanceBootstrapTest {
         "message must roll up")
   }
 
+  @Test
+  def sameMessageRollupSurvivesBackwardsClockStep(): Unit = {
+    // Round-19 HIGH A-2: the test above (`warnThrottleUsesMonotonicTime…`)
+    // demonstrates that distinct-message WARNs fire regardless of clock
+    // direction (the dedup ledger keys on message identity for that branch).
+    // But the production-critical guarantee is different: when the SAME
+    // message repeats, the rollup branch is the one a wall-clock regression
+    // would break. Under wall-clock semantics with a backwards step:
+    //   - call #1 emits at t=t0,           lastWarn := t0
+    //   - call #2 same msg at t=t0-X,      now-lastWarn = -X, NOT ≥ 60s,
+    //                                       cumulative := 1, SUPPRESSED
+    //   - call #3 same msg at t=t0-X+Y,    where Y>60s
+    //         wall-clock: now-lastWarn = Y-X
+    //         If Y < X (clock never catches up), suppression is INFINITE.
+    //         If Y >= X+60s, rollup fires but operator just waited 2X.
+    //   - nanoTime: same arithmetic, but in production nanoTime never goes
+    //     backwards, so suppression-forever is unreachable.
+    //
+    // The test injects a backwards-stepped clock so we can pin both the
+    // suppression branch (no emission, cumulative increments) AND the
+    // eventual rollup branch (one emission claiming the suppressed count).
+    // A future regression that swapped the time source back to
+    // currentTimeMillis would still pass `warnThrottleUsesMonotonicTime…`
+    // because that test only exercises the distinct-message path; this
+    // one fails immediately because the rollup-on-forward-step assertion
+    // depends on `now - lastWarn` arithmetic that the regression would
+    // make negative until the clock catches up.
+    val rm = mock(classOf[ReplicaManager])
+    val engine = new RuleEngine()
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp)
+    val clock = new AtomicLong(1_000_000_000_000L) // 1000s in nanos
+    boot.failureWarnNowNanos = () => clock.get()
+
+    // ---- Phase 1: first emission of M at t0 ----
+    boot.maybeWarnSuppressed("disk faulted")
+    assertEquals(1L, boot.warnEmissions.get(),
+      "first occurrence of a distinct message must always fire")
+
+    // ---- Phase 2: backwards step + SAME message → suppress ----
+    // Operator NTP correction or test injection moves the clock back by
+    // 10 minutes. Under wall-clock semantics this would not just delay
+    // the rollup, it would suppress it forever unless the clock catches
+    // back up. We pin the SUPPRESSION arithmetic here so the next phase's
+    // rollup-on-forward-step assertion is non-trivial.
+    clock.set(clock.get() - 600L * 1_000_000_000L) // -600s relative to phase 1
+    boot.maybeWarnSuppressed("disk faulted")
+    assertEquals(1L, boot.warnEmissions.get(),
+      "same message under a backwards-stepped clock must be SUPPRESSED " +
+        "(now - lastWarn is negative, NOT ≥ 60s interval)")
+
+    // ---- Phase 3: forward step past original deadline → rollup fires ----
+    // From the backwards-stepped position (-600s), advance the clock by
+    // 700s so it lands at +100s relative to the original phase-1 emission.
+    // Now `now - lastWarn = 100s ≥ 60s`, so the rollup branch is taken
+    // and the suppressed counter (1) is logged.
+    clock.set(clock.get() + 700L * 1_000_000_000L) // now at +100s relative to phase 1
+    boot.maybeWarnSuppressed("disk faulted")
+    assertEquals(2L, boot.warnEmissions.get(),
+      "after monotonic forward progress past the window, the SAME repeated " +
+        "message must roll up exactly once")
+
+    // ---- Phase 4: immediate same-message repeat → suppressed again ----
+    // After the rollup, the lastWarn is reset to the rollup-tick time and
+    // the cumulative counter is back to 0. A same-message emit within the
+    // window must be suppressed; this also confirms the cumulative counter
+    // was correctly reset at phase 3 (otherwise it would still increment
+    // at phase 4 with no emission, which is invisible — but the next
+    // rollup would over-count).
+    clock.set(clock.get() + 1_000_000_000L) // +1s
+    boot.maybeWarnSuppressed("disk faulted")
+    assertEquals(2L, boot.warnEmissions.get(),
+      "same-message immediately after rollup must be suppressed (window reset)")
+
+    clock.set(clock.get() + 60L * 1_000_000_000L) // another +60s, past window
+    boot.maybeWarnSuppressed("disk faulted")
+    assertEquals(3L, boot.warnEmissions.get(),
+      "second rollup must fire after another window has elapsed — confirms " +
+        "cumulative counter and lastWarn were reset by the first rollup")
+  }
+
   // ── Round-14 HIGH H-1: cleanup.policy runtime drift detector ────────────
 
   @Test
