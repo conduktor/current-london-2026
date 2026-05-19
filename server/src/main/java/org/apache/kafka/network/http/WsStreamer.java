@@ -489,10 +489,18 @@ public final class WsStreamer {
             return;
         }
         try {
-            // Same reason as scheduleFetchAsync: the delayedExecutor dispatches via httpExecutor when
-            // the timer fires; a RejectedExecutionException at that point completes the dependent
-            // future, NOT the calling thread. Without the terminal handler the stream wedges silently
-            // — the throttle deadline arms but no drain ever runs.
+            // Delivery mechanism: the JDK static delayer fires the timer, then dispatches scheduleDrain
+            // via httpExecutor. The .exceptionally handler catches an uncaught throw from inside
+            // scheduleDrain itself — the action is already defensive (CAS-gated, closed-checked), so
+            // this is a future-proofing safety net, not a routine path.
+            // What it does NOT catch: a RejectedExecutionException raised when the delayer eventually
+            // submits to a stopped or saturated httpExecutor surfaces inside the JDK delayer's
+            // ASYNC_POOL worker (DelayedExecutor.TaskSubmitter.run has no try/catch around the inner
+            // execute), NOT through the dependent future — so the throttle-resume drain simply never
+            // runs in that race. Bounded impact: fetchInFlight is already false here, so a fresh client
+            // grant → maybeKickFetch can still kick a new fetch; if no grant arrives, Jetty's
+            // IDLE_TIMEOUT (5 min) fires onWebSocketError → tearDown and releases the limiter slot.
+            // Symmetric site: KafkaWebSocketEndpoint#scheduleSubscribeDeadline (Wave 41 axis AAA).
             CompletableFuture.runAsync(this::scheduleDrain,
                 CompletableFuture.delayedExecutor(delayMs, TimeUnit.MILLISECONDS, httpExecutor))
                 .exceptionally(t -> {
