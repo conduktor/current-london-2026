@@ -279,7 +279,15 @@ final class Evaluator {
      * gate.
      */
     private Object compare(Object l, Object r, int target, boolean inclusive) {
-        if (l == null || r == null) return null;
+        // R37: absent operand on either side → SKIP, not null. The old null encoded "unknown
+        // ordered comparison" and was safe at the TOP level (null drops the record), but when
+        // wrapped in an OUTER NEQ (e.g. `(body.absent < 5) != true`) the null became an OPERAND
+        // of equalsValuesOrNull, hit the line 231 null-vs-non-null FALSE branch, and NEQ
+        // negated FALSE → confident TRUE → admit. Same NEQ-via-null shape as R35's compareNumeric
+        // fix applied one level out. SKIP propagates through evalBinary lines 114-122 so the
+        // bypass shape is closed regardless of wrapping depth. Top-level direct boolean position
+        // still drops (SKIP → Optional.empty); OR/AND rescue semantics in evalLogical preserved.
+        if (l == null || r == null) return SKIP;
         if (l instanceof Number && r instanceof Number) {
             Integer cmp = compareNumeric((Number) l, (Number) r);
             // compareNumeric returns null ONLY from compareLongDouble's NaN/Inf or unsafe-Long
@@ -298,9 +306,8 @@ final class Evaluator {
         }
         // Type mismatch (both operands present but incompatible — e.g. string vs number, boolean
         // vs number). SKIP, not null: the value of `body.name < 5` with body.name="blocked" must
-        // not be flippable via `(body.name < 5) != true` into a confident TRUE. The null/absent
-        // case (one operand null) above keeps returning null so absent-field semantics matched
-        // by `absentFieldEvaluatesAsNullForNegatedPredicate` remain pinned.
+        // not be flippable via `(body.name < 5) != true` into a confident TRUE. The absent-operand
+        // case above is also SKIP (R37) — same NEQ-via-null shape closed at the same boundary.
         return SKIP;
     }
 

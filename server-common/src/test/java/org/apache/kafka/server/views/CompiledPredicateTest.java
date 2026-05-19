@@ -1132,6 +1132,41 @@ class CompiledPredicateTest {
     }
 
     @Test
+    void orderedComparisonOnAbsentBodyFieldDoesNotPassNegatedPredicate() {
+        // R37 (gate-CLOSED Claude follow-on to R36): compare() at Evaluator.java:282 still
+        // returns bare null on absent operand (l == null || r == null). The R34 comment claimed
+        // this preserved a pinned `absentFieldEvaluatesAsNullForNegatedPredicate` contract, but
+        // no such test exists — the contract was hypothetical, not pinned. Same NEQ-via-null
+        // shape: `(body.absent < 5) != true` evaluates inner compare to null; outer NEQ's
+        // equalsValuesOrNull(null, true) falls into the line 231 null-vs-non-null FALSE branch;
+        // NEQ negates FALSE → confident TRUE → admit. Round 10 of the same pattern, this time
+        // at the LT/LTE/GT/GTE operator boundary instead of EQ/NEQ which R36 closed.
+        for (String pred : new String[]{
+                "(body.absent < 5) != true",
+                "(body.absent <= 5) != true",
+                "(body.absent > 5) != true",
+                "(body.absent >= 5) != true",
+        }) {
+            CompiledPredicate p = compiler.compile(pred);
+            Optional<Boolean> r = p.evaluate(jsonRecord("{}"));
+            assertTrue(r.isEmpty(),
+                    () -> "absent-operand ordered compare wrapped in NEQ must yield SKIP, not "
+                            + "admit by NEQ-of-null. Pred=`" + pred + "`, got " + r);
+        }
+        // Sanity: at the TOP level (no wrapping), absent-operand ordered comparison still
+        // drops the record (was null/falsy, now SKIP — both drop) and `body.x < 5 || true`
+        // STILL admits via the OR-rescue path in evalLogical.
+        CompiledPredicate top = compiler.compile("body.absent < 5");
+        Optional<Boolean> rTop = top.evaluate(jsonRecord("{}"));
+        assertTrue(rTop.isEmpty(),
+                () -> "absent-operand ordered compare at top level must drop, got " + rTop);
+        CompiledPredicate rescued = compiler.compile("body.absent < 5 || true");
+        Optional<Boolean> rRescued = rescued.evaluate(jsonRecord("{}"));
+        assertTrue(rRescued.isPresent() && rRescued.get(),
+                () -> "OR-rescue must still admit when one side is true, got " + rRescued);
+    }
+
+    @Test
     void compoundAtLeafPositionDoesNotPassNegatedPredicate() {
         // R36 BLOCKER #2b (Codex): a compound (object or array) at the LEAF path position was
         // captured as `null` by extractLeaf's default branch, then propagated through NEQ as
