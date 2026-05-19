@@ -515,6 +515,86 @@ public class RuleEngineTest {
     }
 
     @Test
+    public void evalErrorCumulativeCounterIsPerEvaluateNotPerRule() {
+        // Round-16 MED (audit-agent-A): pin that evalErrorFailOpenCount
+        // dedupes to once per evaluate() call, not once per rule that
+        // tripped. The pre-fix shape would bump the counter K times for
+        // K buggy rules on the same api-key — a single attacker request
+        // could amplify the counter by up to 128× under the per-api-key
+        // rule cap, making JMX-derived fail-open rate dashboards
+        // over-report by orders of magnitude. The post-fix shape bumps
+        // the counter at most once per evaluate(), regardless of how
+        // many rules tripped during that one request.
+        //
+        // The per-rule WARN log still fires per rule (each buggy rule's
+        // diagnostic is independently useful); only the cumulative
+        // counter is deduped. We verify both contracts here.
+        RuleEngine engine = new RuleEngine();
+        // Three buggy rules on the SAME api-key. Each rule's CEL throws
+        // independently (1/0 division). Under the pre-fix code, a
+        // single evaluate() would land in the per-rule catch three times
+        // and bump the counter three times.
+        engine.install(new RuleSetBuilder()
+            .put(denyRule("explody-1", ApiKeys.METADATA, "1 / 0 == 0", 99))
+            .put(denyRule("explody-2", ApiKeys.METADATA, "1 / 0 == 1", 99))
+            .put(denyRule("explody-3", ApiKeys.METADATA, "1 / 0 == 2", 99))
+            .build());
+
+        assertEquals(0L, engine.evalErrorFailOpenCount(),
+            "fresh engine baseline");
+        long preEvalSuppressed = engine.suppressedEvalErrorWarnings.get();
+
+        // Exactly one evaluate() call. Three rules trip inside it.
+        RuleDecision d = engine.evaluate(
+            ApiKeys.METADATA, "client", null, false,
+            () -> Collections.singletonMap("request", Collections.emptyMap()));
+        assertSame(RuleDecision.ALLOW, d,
+            "all three rules fail open, request resolves ALLOW");
+
+        // Cumulative counter: bumped EXACTLY once, not three times.
+        assertEquals(1L, engine.evalErrorFailOpenCount(),
+            "three rules tripped in one evaluate() must bump the cumulative "
+                + "counter exactly once — per-evaluate dedup contract");
+
+        // Per-rule WARN log still fires per rule. The first WARN emits
+        // (lastEvalErrorWarnNanos is well in the past from construction);
+        // the remaining two land in the throttle's else-branch and bump
+        // the suppressed counter. Net: at least 2 entries in the
+        // suppressed counter (rules 2 and 3, post-emit-of-rule-1). The
+        // exact value depends on whether the wall-clock window rolled
+        // mid-test; >=2 is the robust lower bound.
+        long postEvalSuppressed = engine.suppressedEvalErrorWarnings.get();
+        assertTrue(postEvalSuppressed - preEvalSuppressed >= 2L,
+            "per-rule WARN log must still fire independently per rule — "
+                + "expected >= 2 throttled WARN events for the 3 buggy rules, got "
+                + (postEvalSuppressed - preEvalSuppressed));
+
+        // A second evaluate() bumps the counter again — to 2, not to 4.
+        // (Sanity check on the per-evaluate semantics.)
+        engine.evaluate(
+            ApiKeys.METADATA, "client", null, false,
+            () -> Collections.singletonMap("request", Collections.emptyMap()));
+        assertEquals(2L, engine.evalErrorFailOpenCount(),
+            "second evaluate() bumps counter by exactly one more — per-evaluate semantics");
+
+        // A third evaluate() with NO buggy rules in the activation map
+        // (still using the same 3-buggy-rules engine, just observe that
+        // the per-evaluate count is on the evaluate() call itself, not
+        // on whether rules tripped). Actually, with the buggy rules
+        // installed, every evaluate() trips them — there's no "no
+        // tripping" path in this engine state. So this third call also
+        // bumps the counter: post-condition = 3. Test the negative path
+        // separately: a fresh engine with NO rules at all.
+        RuleEngine emptyEngine = new RuleEngine();
+        emptyEngine.install(RuleSet.EMPTY);
+        emptyEngine.evaluate(
+            ApiKeys.METADATA, "client", null, false,
+            () -> Collections.singletonMap("request", Collections.emptyMap()));
+        assertEquals(0L, emptyEngine.evalErrorFailOpenCount(),
+            "evaluate() with no rules cannot trip eval errors — counter stays 0");
+    }
+
+    @Test
     public void ruleEvaluatesWhenApiKeyMatchesAndPredicateIsTrue() {
         RuleEngine engine = new RuleEngine();
         engine.install(new RuleSetBuilder()

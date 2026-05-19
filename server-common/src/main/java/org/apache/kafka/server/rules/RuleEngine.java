@@ -255,10 +255,14 @@ public final class RuleEngine {
      *       walker bug, a partially-constructed protocol object reaching
      *       evaluate(), or a published rule shape that exercises a brittle
      *       accessor.</li>
-     *   <li>{@code evalErrorFailOpenCount}: every time a rule's
-     *       {@code evalBoolean} threw and the engine moved on to the next
-     *       rule. A non-zero rate here indicates a published rule with a
-     *       bug, or a malformed activation map for an in-effect rule.</li>
+     *   <li>{@code evalErrorFailOpenCount}: every {@link #evaluate} call
+     *       during which at least one rule's {@code evalBoolean} threw and
+     *       the engine moved on. Counted PER-EVALUATE, not per-rule —
+     *       multiple buggy rules tripping inside a single request still
+     *       only bump the counter by one. A non-zero rate here indicates
+     *       a published rule with a bug, or a malformed activation map
+     *       for an in-effect rule. Per-rule diagnostic detail is in the
+     *       throttled WARN log, not in this counter.</li>
      *   <li>{@code activationBudgetFailClosedCount}: every time the walker
      *       exhausted its budget and the request was fail-CLOSED with
      *       POLICY_VIOLATION + {@link #ACTIVATION_BUDGET_RULE_ID}. A
@@ -689,12 +693,28 @@ public final class RuleEngine {
             // StackOverflowError, OutOfMemoryError) cannot poison the next
             // request's budget on the same broker thread.
             CelProgram.resetEvalStepBudget();
+            // Round-16 MED (audit-agent-A): per-evaluate dedup for the
+            // evalErrorFailOpenCount cumulative counter. The previous shape
+            // (increment inside maybeWarnEvalError) bumped the counter once
+            // per rule-eval that threw. A single request to an api-key with
+            // K rules whose first rule trips the per-request CEL step budget
+            // would retrip on entry for every subsequent rule (each lands in
+            // the catch below — see the per-rule catch comment) and bump the
+            // counter K times for what is, semantically, one fail-OPEN
+            // event. With the 128-rule per-api-key cap, a single attacker
+            // request could amplify the counter by up to 128× — JMX-derived
+            // fail-open rate dashboards would over-report and alert thresholds
+            // calibrated on event-rate would fire on a single request. Track
+            // observation via a local boolean and bump the counter at most
+            // once per evaluate() in the inner finally.
+            boolean evalErrorObserved = false;
             try {
                 for (Rule rule : rules) {
                     boolean matched;
                     try {
                         matched = rule.compiled().evalBoolean(activation::get);
                     } catch (Exception e) {
+                        evalErrorObserved = true;
                         // Round-15 Walker HIGH H2: narrowed from {@code Throwable}
                         // to {@code Exception}. The CEL step-budget cap
                         // (CelProgram.MAX_EVAL_STEPS) plus the parse-depth and
@@ -750,6 +770,17 @@ public final class RuleEngine {
                 return RuleDecision.ALLOW;
             } finally {
                 CelProgram.resetEvalStepBudget();
+                // Round-16 MED (audit-agent-A): per-evaluate dedup. Bumps
+                // once per evaluate() that observed at least one caught
+                // Exception during per-rule eval, regardless of how many
+                // rules tripped. Slight over-report under Error-escape is
+                // accepted: Error propagation is independently visible as
+                // 5xx-rate in KafkaApis metrics, and per-request CEL
+                // step-budget + MAX_DEPTH walker caps make Error escape
+                // exceptionally rare in practice.
+                if (evalErrorObserved) {
+                    evalErrorFailOpenCount.incrementAndGet();
+                }
             }
         } finally {
             // Pair with IN_EVALUATE.set(TRUE) above. remove() (not set(FALSE))
@@ -867,10 +898,12 @@ public final class RuleEngine {
      * operators see the rate of the storm, not just one example.
      */
     private void maybeWarnEvalError(String ruleId, ApiKeys apiKey, Throwable t) {
-        // Round-15 Request-path HIGH-3: cumulative fail-open counter, see
-        // field javadoc on evalErrorFailOpenCount. Incremented BEFORE the
-        // throttle CAS so suppressed events still register.
-        evalErrorFailOpenCount.incrementAndGet();
+        // Round-16 MED (audit-agent-A): cumulative counter increment moved
+        // out of this per-rule WARN method to a per-evaluate finally block
+        // in evaluate(). The WARN itself stays per-rule (each buggy rule's
+        // diagnostic is independently useful); only the cumulative counter
+        // is deduped to once-per-evaluate, since that is what an operator
+        // sampling JMX for "fail-open request rate" expects.
         long now = System.nanoTime();
         long last = lastEvalErrorWarnNanos.get();
         if (now - last >= EVAL_ERROR_WARN_INTERVAL_NANOS
