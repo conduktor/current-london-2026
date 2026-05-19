@@ -675,7 +675,19 @@ public final class IoUringSelector implements BrokerSelector {
                     // the channel is never closed, the connection quota is never decremented,
                     // and the unread Netty ByteBufs accumulate until idle expiry or direct-
                     // memory failure. Matches NIO Selector.pollSelectionKeys's catch (Exception).
-                    log.debug("Read failed on channel {}", channel.id(), e);
+                    //
+                    // Log-level discrimination mirrors NIO Selector:609-626: an IOException
+                    // is a normal peer disconnect (debug), anything else is unexpected (warn).
+                    // Logging an InvalidReceiveException at debug would bury the symptom an
+                    // operator needs when a hostile/buggy peer is shipping oversized requests.
+                    // PLAINTEXT v1 cannot throw AuthenticationException here; that branch is
+                    // deferred until SelectorMetrics + SSL/SASL channel builders land (#123).
+                    String desc = String.format("%s (channelId=%s)", channel.socketDescription(), channel.id());
+                    if (e instanceof IOException) {
+                        log.debug("Connection with {} disconnected", desc, e);
+                    } else {
+                        log.warn("Unexpected error from {}; closing connection", desc, e);
+                    }
                     enqueueClose(channel.id(), ChannelState.LOCAL_CLOSE);
                     if (closedThisStep == null) closedThisStep = new ArrayList<>(2);
                     closedThisStep.add(channel.id());
@@ -703,7 +715,17 @@ public final class IoUringSelector implements BrokerSelector {
                     // so a RuntimeException from inside the send chain (e.g. an outbound
                     // ByteBufferSend tripping over a malformed message) routes through
                     // FAILED_SEND instead of escaping poll() and stranding the channel.
-                    log.debug("Write failed on channel {}", channel.id(), e);
+                    //
+                    // Log-level discrimination mirrors NIO Selector:609-626: IOException is
+                    // a normal peer disconnect during write (debug); anything else is an
+                    // unexpected error in our own send pipeline and operators need to see
+                    // it at WARN. PLAINTEXT v1 cannot throw AuthenticationException here.
+                    String desc = String.format("%s (channelId=%s)", channel.socketDescription(), channel.id());
+                    if (e instanceof IOException) {
+                        log.debug("Connection with {} disconnected during write", desc, e);
+                    } else {
+                        log.warn("Unexpected error from {}; closing connection", desc, e);
+                    }
                     enqueueClose(channel.id(), ChannelState.FAILED_SEND);
                     if (closedThisStep == null) closedThisStep = new ArrayList<>(2);
                     closedThisStep.add(channel.id());

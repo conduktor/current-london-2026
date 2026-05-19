@@ -28,8 +28,10 @@ import org.apache.kafka.common.network.NetworkSend;
 import org.apache.kafka.common.security.auth.AuthenticationContext;
 import org.apache.kafka.common.security.auth.KafkaPrincipal;
 import org.apache.kafka.common.security.auth.KafkaPrincipalBuilder;
+import org.apache.kafka.common.utils.LogCaptureAppender;
 import org.apache.kafka.common.utils.MockTime;
 
+import org.apache.logging.log4j.Level;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -318,6 +320,52 @@ class IoUringSelectorTest {
             "oversized frame must surface as a disconnect, not escape poll(): id2=" + id2
                 + " disconnected=" + s2.disconnected());
         assertEquals(ChannelState.LOCAL_CLOSE, s2.disconnected().get(id2));
+    }
+
+    @Test
+    void unexpectedReadFailureLogsAtWarnWithSocketDescription() throws Exception {
+        // LOG-PARITY-1: NIO Selector:609-626 discriminates by exception type when
+        // an exception escapes the read step. IOException is a normal peer disconnect
+        // (debug); a RuntimeException — InvalidReceiveException from a hostile/buggy
+        // peer that shipped a negative or oversized request — is "Unexpected error
+        // from {}; closing connection" at WARN. The io_uring path previously logged
+        // everything at debug, so on a mixed-broker fleet the NIO broker would warn
+        // about the oversized request and the io_uring broker would silently swallow
+        // it. Forensic correlation diverged.
+        //
+        // This test pins the WARN message and the socketDescription enrichment: the
+        // log entry must include the remote IP (so an operator can grep by source).
+        // Pre-fix this fails because every catch path called log.debug unconditionally.
+        try (LogCaptureAppender appender =
+                 LogCaptureAppender.createAndRegister(IoUringSelector.class)) {
+            // Test classpath inherits clients/log4j2.yaml, which sets
+            // org.apache.kafka to ERROR. Force WARN so the level we are
+            // verifying actually reaches the appender.
+            appender.setClassLogger(IoUringSelector.class, Level.WARN);
+            IoUringSelector s = newSelector(IDLE_NANOS_NEVER);
+            EmbeddedChannel netty = acceptNew(s, REMOTE_A);
+            s.poll(0); // accept
+            String id = s.connected().get(0);
+            // Negative size prefix -> InvalidReceiveException (RuntimeException).
+            ByteBuf bad = Unpooled.buffer(4).writeInt(-1);
+            s.onRead(netty, bad);
+            s.poll(0);
+
+            assertTrue(s.disconnected().containsKey(id),
+                "precondition: malformed frame must close the channel");
+
+            boolean sawWarn = appender.getEvents().stream()
+                .anyMatch(e -> "WARN".equals(e.getLevel())
+                    && e.getMessage().contains("Unexpected error from")
+                    && e.getMessage().contains(REMOTE_A.getAddress().getHostAddress()));
+            assertTrue(sawWarn,
+                "LOG-PARITY-1: a RuntimeException from KafkaChannel.read() (here, "
+                    + "InvalidReceiveException from a negative size prefix) must log at WARN "
+                    + "with 'Unexpected error from <remote>'. Captured events: "
+                    + appender.getEvents().stream()
+                        .map(e -> e.getLevel() + ":" + e.getMessage())
+                        .toList());
+        }
     }
 
     @Test

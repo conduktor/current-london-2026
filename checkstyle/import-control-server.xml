@@ -107,6 +107,10 @@
     <subpackage name="iouring">
       <!-- Netty io_uring transport is the implementation backend for this subpackage only. -->
       <allow pkg="io.netty" />
+      <!-- Tests in this subpackage use LogCaptureAppender.setClassLogger(...) to verify
+           log-level discrimination (LOG-PARITY-1). The class is needed only by tests;
+           production io_uring code logs via SLF4J. Same allowance pattern as clients/. -->
+      <allow class="org.apache.logging.log4j.Level" />
     </subpackage>
   </subpackage>
 
