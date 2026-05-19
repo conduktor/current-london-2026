@@ -24,14 +24,26 @@ import org.junit.jupiter.api.Test;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.SelectionKey;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
+import io.netty.bootstrap.Bootstrap;
+import io.netty.bootstrap.ServerBootstrap;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.channel.DefaultEventLoopGroup;
 import io.netty.channel.embedded.EmbeddedChannel;
+import io.netty.channel.local.LocalAddress;
+import io.netty.channel.local.LocalChannel;
+import io.netty.channel.local.LocalServerChannel;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -806,5 +818,77 @@ class IoUringTransportLayerTest {
             "otherwise the Processor stays asleep with asyncWriteFailure stashed and " +
             "FAILED_SEND routing is delayed by the full poll timeout");
         l.close();
+    }
+
+    @Test
+    void writeWakeCallbackFiresFromNettyEventLoopThreadNotCallerThread() throws Exception {
+        // Round-16 audit BLOCKER B-T3. The two writeWakeCallback tests above use
+        // EmbeddedChannel, which runs the writeAndFlush listener synchronously on the
+        // caller thread. That shape verifies the listener PATH invokes the callback but
+        // says nothing about the cross-thread hand-off the production wire actually
+        // depends on: in production the listener runs on the Netty event-loop thread,
+        // and the callback must wake a Processor sleeping on a Semaphore on a DIFFERENT
+        // thread. If the EmbeddedChannel tests stay green while the cross-thread wake
+        // silently regresses, the v10 hang re-enters with no test coverage to catch it.
+        //
+        // Use a real Netty channel pair on a DefaultEventLoopGroup so writeAndFlush
+        // listeners fire on the event-loop thread, off the test thread. LocalChannel is
+        // the lightest weight option that exercises a real EventLoop without requiring
+        // a TCP socket or io_uring kernel support.
+        DefaultEventLoopGroup serverGroup = new DefaultEventLoopGroup(1);
+        DefaultEventLoopGroup clientGroup = new DefaultEventLoopGroup(1);
+        Channel server = null;
+        Channel client = null;
+        IoUringTransportLayer layer = null;
+        try {
+            LocalAddress addr = new LocalAddress("iouring-wake-test-" + System.nanoTime());
+
+            ServerBootstrap sb = new ServerBootstrap();
+            sb.group(serverGroup);
+            sb.channel(LocalServerChannel.class);
+            sb.childHandler(new ChannelInboundHandlerAdapter() {
+                @Override
+                public void channelRead(io.netty.channel.ChannelHandlerContext ctx, Object msg) {
+                    // Drop inbound — we only care about the outbound write completing.
+                    io.netty.util.ReferenceCountUtil.release(msg);
+                }
+            });
+            server = sb.bind(addr).syncUninterruptibly().channel();
+
+            Bootstrap b = new Bootstrap();
+            b.group(clientGroup);
+            b.channel(LocalChannel.class);
+            b.handler(new ChannelInboundHandlerAdapter());
+            client = b.connect(addr).syncUninterruptibly().channel();
+
+            Thread callerThread = Thread.currentThread();
+            AtomicReference<Thread> wakeThread = new AtomicReference<>();
+            CountDownLatch wokenUp = new CountDownLatch(1);
+            layer = new IoUringTransportLayer(client, REMOTE, LOCAL, () -> {
+                wakeThread.compareAndSet(null, Thread.currentThread());
+                wokenUp.countDown();
+            });
+
+            ByteBuffer src = ByteBuffer.wrap(new byte[128]);
+            long wrote = layer.write(src);
+            assertEquals(128, wrote, "write must hand off all bytes to the Netty outbound");
+
+            assertTrue(wokenUp.await(5, TimeUnit.SECONDS),
+                "writeWakeCallback must fire across thread boundaries — the Netty event-loop " +
+                "thread runs the writeAndFlush listener and must signal the Processor on a " +
+                "different thread. If the callback never lands, poll() sleeps the full " +
+                "timeout and small-request latency degrades by ~timeoutMs per round trip.");
+            assertNotSame(callerThread, wakeThread.get(),
+                "wake callback must execute on the Netty event-loop thread, NOT the caller " +
+                "thread that invoked write() — EmbeddedChannel's synchronous behaviour was " +
+                "masking the real cross-thread hand-off the production wire depends on. " +
+                "Caller=" + callerThread.getName() + " wake=" + wakeThread.get().getName());
+        } finally {
+            if (layer != null) layer.close();
+            if (client != null) client.close().syncUninterruptibly();
+            if (server != null) server.close().syncUninterruptibly();
+            serverGroup.shutdownGracefully(0, 1, TimeUnit.SECONDS).syncUninterruptibly();
+            clientGroup.shutdownGracefully(0, 1, TimeUnit.SECONDS).syncUninterruptibly();
+        }
     }
 }
