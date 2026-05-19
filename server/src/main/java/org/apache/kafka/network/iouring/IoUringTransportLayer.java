@@ -32,6 +32,7 @@ import java.security.Principal;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.Channel;
@@ -156,12 +157,34 @@ final class IoUringTransportLayer implements TransportLayer {
      * {@code ChannelState.FAILED_SEND} — matching how NIO surfaces a peer-RST'd write
      * through its {@code Selector.poll} loop.
      *
-     * <p>Volatile so the Processor sees the latest cause without an explicit memory barrier:
-     * the only writer is the event-loop listener thread, the only reader is the Processor
-     * thread, and a {@code happens-before} relationship is not strictly required (we re-check
-     * each call), but volatile keeps reasoning simple.
+     * <p>{@link AtomicReference} (not bare {@code volatile}) so the Processor's read-and-clear
+     * is atomic and so multiple concurrent listener firings preserve all causes via
+     * {@link Throwable#addSuppressed(Throwable)} rather than the last-one-wins overwrite a
+     * raw {@code volatile} assignment produces. Concretely:
+     *
+     * <ol>
+     *   <li><b>DIAG-1 (multiple listener stomp).</b> A peer RST against a channel with N
+     *       in-flight writes causes Netty to fail every queued promise; each listener fires
+     *       on the event-loop thread, sequentially. A raw {@code = f.cause()} keeps only the
+     *       last one. Operators investigating a flapping client see the tail cause and miss
+     *       the head — which is often the actual triggering exception (the rest are
+     *       {@code ClosedChannelException}s reacting to the first one's tear-down).</li>
+     *   <li><b>DIAG-2 (read-then-clear race).</b> The previous shape
+     *       {@code Throwable f = field; if (f != null) field = null; throw …;} has a window
+     *       between the load and the clear where a listener could store a new cause; the
+     *       clear then wipes it and the next {@link #write(ByteBuffer)} returns normally,
+     *       silently swallowing the failure. {@link AtomicReference#getAndSet(Object)}
+     *       collapses the read and clear into one CAS so a concurrent set is either seen
+     *       (and surfaced) or happens after the clear (and surfaces on the next write).</li>
+     * </ol>
+     *
+     * <p>The listener thread is single-threaded per channel (Netty event loop), so listener-
+     * vs-listener races are not possible — only listener vs Processor. Per analysis: with
+     * the addSuppressed pattern below, every cause is either (a) the primary thrown
+     * IOException's cause, (b) suppressed under that primary, or (c) the primary of a
+     * subsequent {@link #write(ByteBuffer)} throw. None are dropped.
      */
-    private volatile Throwable asyncWriteFailure;
+    private final AtomicReference<Throwable> asyncWriteFailure = new AtomicReference<>();
 
     /**
      * Wakes the owning {@link IoUringSelector}'s blocking {@code poll(timeoutMs)} when the
@@ -443,15 +466,50 @@ final class IoUringTransportLayer implements TransportLayer {
         return read(dsts, 0, dsts.length);
     }
 
+    /**
+     * Store an async writeAndFlush failure for the Processor's next write() call to surface.
+     * Preserves the first cause as the primary; subsequent causes chain as suppressed.
+     *
+     * <p>Race with the Processor's {@code asyncWriteFailure.getAndSet(null)}:
+     * <ul>
+     *   <li>If our CAS-null-to-cause wins, the next Processor write surfaces our cause.</li>
+     *   <li>If CAS fails because a primary is already set, we addSuppressed under it. The
+     *       Processor may have just consumed that primary via getAndSet(null), in which case
+     *       the IOException it's about to throw still carries the primary (and thus our
+     *       suppressed cause), so nothing is lost.</li>
+     *   <li>If CAS fails AND the primary read returns null (Processor's getAndSet(null) raced
+     *       between our failed CAS and the load), the slot is empty; retry the CAS. Worst
+     *       case the next listener firing addSuppresseds under us — never lost.</li>
+     * </ul>
+     */
+    private void recordAsyncWriteFailure(Throwable cause) {
+        if (!asyncWriteFailure.compareAndSet(null, cause)) {
+            Throwable primary = asyncWriteFailure.get();
+            if (primary == null) {
+                asyncWriteFailure.compareAndSet(null, cause);
+            } else {
+                primary.addSuppressed(cause);
+            }
+        }
+    }
+
     @Override
     public int write(ByteBuffer src) throws IOException {
         if (closed) throw new IOException("transport layer is closed");
         // If a prior async write already failed, surface it now so the Processor's write
         // step routes the channel through FAILED_SEND rather than reporting completedSend
         // for bytes the kernel never delivered.
-        Throwable failure = asyncWriteFailure;
+        //
+        // DIAG-2: read-and-clear must be atomic. A naive load-then-store-null shape leaves
+        // a window where a listener could store a fresh cause between our load (which sees
+        // the prior cause) and our clear (which wipes the fresh one). The fresh cause is
+        // silently dropped — the next write proceeds normally and Send.completed() returns
+        // true on bytes the kernel never delivered. {@link AtomicReference#getAndSet}
+        // collapses the two operations into one CAS: a concurrent set is either reflected
+        // in our return value (and surfaces here) or happens strictly after our clear (and
+        // surfaces on the next write call).
+        Throwable failure = asyncWriteFailure.getAndSet(null);
         if (failure != null) {
-            asyncWriteFailure = null;
             throw new IOException("async write failed", failure);
         }
         int remaining = src.remaining();
@@ -540,7 +598,12 @@ final class IoUringTransportLayer implements TransportLayer {
                         // (pendingWriteBytes == 0 && asyncWriteFailure == null) — that window is
                         // the exact false-success window where ByteBufferSend.completed() returns
                         // true and KafkaChannel.maybeCompleteSend() emits a Send the kernel rejected.
-                        asyncWriteFailure = f.cause();
+                        //
+                        // DIAG-1: preserve all causes when multiple listeners fire (e.g. a
+                        // peer RST against a channel with N in-flight writes). First cause
+                        // wins as the IOException's cause; subsequent causes are chained as
+                        // suppressed exceptions. See field Javadoc for the race analysis.
+                        recordAsyncWriteFailure(f.cause());
                     }
                     pendingWriteBytes.addAndGet(-safeChunk);
                     // Wake the Processor's poll(). The listener runs on Netty's event loop
@@ -589,9 +652,9 @@ final class IoUringTransportLayer implements TransportLayer {
         // path that converts the volatile failure into the synchronous IOException the
         // Selector's write step needs to route the channel through FAILED_SEND.
         if (closed) throw new IOException("transport layer is closed");
-        Throwable failure = asyncWriteFailure;
+        // See DIAG-2 note on the scalar write() — same atomic getAndSet rationale.
+        Throwable failure = asyncWriteFailure.getAndSet(null);
         if (failure != null) {
-            asyncWriteFailure = null;
             throw new IOException("async write failed", failure);
         }
         long total = 0;
@@ -636,7 +699,7 @@ final class IoUringTransportLayer implements TransportLayer {
         // next Processor write call surfaces the throw. Holding "pending" until the next
         // write() throws keeps {@code Send.completed} false in that interleaving, so
         // {@code KafkaChannel.maybeCompleteSend} does NOT fire on the failed bytes.
-        return pendingWriteBytes.get() > 0 || asyncWriteFailure != null;
+        return pendingWriteBytes.get() > 0 || asyncWriteFailure.get() != null;
     }
 
     @Override
@@ -682,6 +745,19 @@ final class IoUringTransportLayer implements TransportLayer {
         return offerInboundCalls.get();
     }
 
+    /**
+     * Test-only entry point that invokes the same code path as the Netty writeAndFlush
+     * failure listener — namely {@link #recordAsyncWriteFailure(Throwable)} — without
+     * needing a real failed promise. Used by DIAG-1's regression test to drive multiple
+     * listener firings without the intervening read-and-clear that EmbeddedChannel
+     * forces when its synchronous future-completion races against the next write() call.
+     * The production listener path is identical; this method exists solely so the test
+     * can stack two unconsumed causes deterministically.
+     */
+    void recordAsyncWriteFailureForTesting(Throwable cause) {
+        recordAsyncWriteFailure(cause);
+    }
+
     @Override
     public void close() {
         if (closed) return;
@@ -704,6 +780,17 @@ final class IoUringTransportLayer implements TransportLayer {
             b.release();
         }
         inboundBytes.set(0);
+        // DIAG-3: clear any stashed async write failure. Without this, a writeAndFlush
+        // promise that completes (failed) AFTER close() — possible when Netty had the
+        // write in-flight at the moment of close — would leave asyncWriteFailure set
+        // forever. {@link #hasPendingWrites()} reads it and would return true on a
+        // closed channel: harmless in v1 because the Selector tears the channel down
+        // and never polls it again, but it violates the closed-resource invariant
+        // ("after close(), every accessor reports a clean drained state") and makes
+        // {@link KafkaChannel#maybeCompleteSend} reasoning subtler than it needs to
+        // be. {@link AtomicReference#set} is the right primitive here: we don't care
+        // about the previous value (close() destroys all paths to surface it anyway).
+        asyncWriteFailure.set(null);
         selectionKey.cancel();
     }
 }
