@@ -272,9 +272,17 @@ public class CelProgramTest {
         env.put("request", req);
 
         // (a-EXISTS) predicate returns a String — must throw, not return false.
-        assertThrows(CelEvaluationException.class,
+        CelEvaluationException existsStringEx = assertThrows(CelEvaluationException.class,
             () -> evalBool("request.topics.exists(t, t.name)", env),
             "non-Boolean predicate (String) in EXISTS must throw, not silently coerce to false");
+        // Round-21 MED (Agent 5 F-4 follow-up): pin the throw MESSAGE shape and the
+        // offending type so the engine's diagnostic identifies the failed contract
+        // by name (rather than the test being green on any throw, including an
+        // arithmetic budget trip or a re-entry guard fire).
+        assertTrue(existsStringEx.getMessage().contains("comprehension predicate must return boolean"),
+            "throw message must identify the contract violated; got: " + existsStringEx.getMessage());
+        assertTrue(existsStringEx.getMessage().contains("String"),
+            "throw message must include the offending Java type; got: " + existsStringEx.getMessage());
 
         // (a-ALL) predicate returns a String — must throw, not return true (every coercion is false → ALL of-empty-truthy is false, but the early-return path is false-by-coercion which is itself a silent bug).
         assertThrows(CelEvaluationException.class,
@@ -284,18 +292,39 @@ public class CelProgramTest {
         // (a-numeric) predicate returns a number — must throw.
         Map<String, Object> withNumbers = new HashMap<>();
         withNumbers.put("xs", Arrays.asList(1L, 2L, 3L));
-        assertThrows(CelEvaluationException.class,
+        CelEvaluationException existsLongEx = assertThrows(CelEvaluationException.class,
             () -> evalBool("xs.exists(x, x)", withNumbers),
             "non-Boolean predicate (Long) in EXISTS must throw");
+        assertTrue(existsLongEx.getMessage().contains("Long"),
+            "throw message must include the offending Java type; got: " + existsLongEx.getMessage());
 
-        // (b-null-prop EXISTS) predicate returns null on every element via missing field — null is false-y, EXISTS returns false without throwing.
-        // Use a list of maps where the looked-up field is missing on every element.
+        // (b-null EXISTS) — Round-21 MED (Agent 5 F-4): the prior shape
+        // `t.missing == "x"` was unsuitable for pinning the null arm.
+        // valueEquals delegates to Objects.equals(null, "x"), which returns
+        // Boolean.FALSE — not null. So that case hit branch (2)
+        // `v instanceof Boolean` of Comprehension.eval, not branch (1)
+        // `v == null`. A mutation that removed branch (1) would have left
+        // the test green. Switch to a BARE missing field access
+        // (`t.missing`): Field.eval(CelNode.java:84-91) returns null
+        // when the receiver Map lacks the key, and the comprehension then
+        // sees v == null directly. THIS is the case branch (1) defends.
+        assertFalse(evalBool("request.topics.exists(t, t.missing)", env),
+            "bare null predicate (Field.eval on missing key returns null) must be coerced "
+                + "to false in EXISTS via Comprehension's `v == null` arm — not throw");
+
+        // (b-null ALL) symmetric: null-predicate must falsify ALL without throwing.
+        assertFalse(evalBool("request.topics.all(t, t.missing)", env),
+            "bare null predicate must falsify ALL via Comprehension's `v == null` arm — not throw");
+
+        // (b-control) — pin that the (b) cases above truly exercise the null
+        // arm rather than the false-from-equality arm: a predicate
+        // `t.missing == "x"` (the old shape) ALSO returns false but via
+        // `valueEquals(null, "x") == Boolean.FALSE`. Keeping it here as a
+        // companion so a future reader sees BOTH paths exercised:
+        //   - bare `t.missing`         → null   → branch (1)  [the new pin]
+        //   - `t.missing == "x"`       → false  → branch (2)  [the prior pin]
         assertFalse(evalBool("request.topics.exists(t, t.missing == \"x\")", env),
-            "null-predicate via null-propagation (missing.field comparison yields null) must be treated as false in EXISTS, not throw");
-
-        // (b-null-prop ALL) symmetric: null-predicate must falsify ALL without throwing.
-        assertFalse(evalBool("request.topics.all(t, t.missing == \"x\")", env),
-            "null-predicate via null-propagation must falsify ALL without throwing");
+            "null-then-equality path must also resolve to false (branch (2) via Boolean.FALSE)");
     }
 
     @Test
