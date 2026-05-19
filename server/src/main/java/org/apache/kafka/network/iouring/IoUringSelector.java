@@ -50,6 +50,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.Channel;
@@ -1233,12 +1234,22 @@ public final class IoUringSelector implements BrokerSelector {
     public void close() {
         if (closed) return;
         closed = true;
+        // PARITY-4: mirror NIO Selector.close (clients/src/main/java/org/apache/kafka/common/
+        // network/Selector.java:369-385). NIO collects the first exception across all child
+        // close() calls into a single AtomicReference, continues closing remaining resources
+        // even if one throws, then re-throws the first RuntimeException at the end (skipping
+        // SecurityException so policy denials don't bubble out of a teardown path). Without
+        // this, an exception thrown by a KafkaChannel.close (e.g. an Authenticator.close that
+        // hit a brittle SaslServer state) was silently dropped on io_uring while NIO would
+        // surface it in the Processor's stack trace — operators saw the symptom (broker hung,
+        // listener dead) without the proximate cause.
+        AtomicReference<Throwable> firstException = new AtomicReference<>();
         for (KafkaChannel channel : channels.values()) {
-            Utils.closeQuietly(channel, "channel on selector close");
+            Utils.closeQuietly(channel, "channel on selector close", firstException);
         }
         channels.clear();
         for (KafkaChannel channel : closingChannels.values()) {
-            Utils.closeQuietly(channel, "closing channel on selector close");
+            Utils.closeQuietly(channel, "closing channel on selector close", firstException);
         }
         closingChannels.clear();
         explicitlyMutedChannels.clear();
@@ -1248,10 +1259,15 @@ public final class IoUringSelector implements BrokerSelector {
         KafkaChannel pending;
         while ((pending = pendingAccepts.poll()) != null) {
             pendingAcceptCount.decrementAndGet();
-            Utils.closeQuietly(pending, "pending-accept on close");
+            Utils.closeQuietly(pending, "pending-accept on close", firstException);
         }
         pendingDisconnects.clear();
         wakeup.release();
+
+        Throwable exception = firstException.get();
+        if (exception instanceof RuntimeException && !(exception instanceof SecurityException)) {
+            throw (RuntimeException) exception;
+        }
     }
 
     @Override
