@@ -1283,6 +1283,198 @@ public class ApiMessageActivationTest {
         }
     }
 
+    @Test
+    public void mapValuedFieldsAreNullEvenWhenNestedInsideRecordOrList() {
+        // Round-19 MED A-3: the existing mapValuedFieldsSurfaceAsNullNotDescendedThrough
+        // test only covers a TOP-LEVEL Map field. The walker also descends into
+        // nested records and list elements, so a Map nested inside a record or
+        // inside a list element must surface as null at any depth — otherwise
+        // the carve-out is one-deep and a future schema with a list of
+        // map-bearing records would still leak via the inner-element path.
+        //
+        // Two coverage shapes:
+        //   1. record-of-map: `outer.inner.labels` — inner record has a Map field
+        //   2. list-of-record-of-map: `outer.entries[i].labels` — list elements
+        //      each have a Map field
+
+        // ---- record-of-map ----
+        Map<String, Object> a1 = ApiMessageActivation.from(new RecordContainingMapNode());
+        @SuppressWarnings("unchecked")
+        Map<String, Object> inner = (Map<String, Object>) a1.get("inner");
+        assertNotNull(inner,
+            "record-typed sibling must walk into a sub-map (not be replaced wholesale); got: " + a1);
+        assertTrue(inner.containsKey("labels"),
+            "nested record's Map-typed field accessor must still surface as a key; got inner: " + inner);
+        assertNull(inner.get("labels"),
+            "Map nested inside a record MUST also surface as null (carve-out is depth-agnostic); got: " + inner);
+
+        // ---- list-of-record-of-map ----
+        Map<String, Object> a2 = ApiMessageActivation.from(new ListOfMapBearingRecordsNode());
+        @SuppressWarnings("unchecked")
+        java.util.List<Object> entries = (java.util.List<Object>) a2.get("entries");
+        assertNotNull(entries,
+            "list-typed accessor must walk into a list; got: " + a2);
+        assertEquals(2, entries.size(),
+            "list element count must be preserved; got: " + entries);
+        for (int i = 0; i < entries.size(); i++) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> el = (Map<String, Object>) entries.get(i);
+            assertTrue(el.containsKey("labels"),
+                "list element " + i + ": Map-typed field key must still surface; got: " + el);
+            assertNull(el.get("labels"),
+                "list element " + i + ": Map nested inside a list element MUST surface as null; got: " + el);
+        }
+    }
+
+    @Test
+    public void mapImplementingIterableStillSurfacesAsNull() {
+        // Round-19 MED A-4 ordering: the convert() method now checks
+        // `instanceof Map` BEFORE `instanceof Iterable`. The standard JDK Map
+        // types ({@code HashMap}, {@code LinkedHashMap}, {@code TreeMap})
+        // do not implement Iterable, so the ordering is moot for them. But a
+        // third-party Map (or a hypothetical future schema choice) that
+        // implements both would, under the previous ordering, walk via
+        // convertIterable — bypassing the Map carve-out entirely and
+        // exposing the operator to whatever the iterator() method yields
+        // (typically the entrySet's iterator, leaking key+value pairs).
+        //
+        // Pin the ordering directly: a fixture whose field is a Map that
+        // ALSO implements Iterable must still surface as null. If the
+        // ordering ever regresses, this test fails immediately.
+        Map<String, Object> activation = ApiMessageActivation.from(new MapAlsoIterableFieldNode());
+        assertTrue(activation.containsKey("blob"),
+            "field accessor must still surface as a key; got: " + activation);
+        assertNull(activation.get("blob"),
+            "Map-that-also-implements-Iterable MUST surface as null (Map check must "
+                + "win over the Iterable check); got: " + activation);
+    }
+
+    /**
+     * Fixture for Round-19 MED A-3: an outer ApiMessage whose accessor returns
+     * a nested record, and the nested record has a Map-typed field. Pins that
+     * the carve-out applies at depth, not just to top-level Map fields.
+     */
+    @SuppressWarnings("unused")
+    public static final class RecordContainingMapNode implements org.apache.kafka.common.protocol.ApiMessage {
+        public InnerWithMap inner() {
+            return new InnerWithMap();
+        }
+        @Override public short apiKey() { return -1; }
+        @Override public short lowestSupportedVersion() { return 0; }
+        @Override public short highestSupportedVersion() { return 0; }
+        @Override public org.apache.kafka.common.protocol.Message duplicate() { return new RecordContainingMapNode(); }
+        @Override public java.util.List<org.apache.kafka.common.protocol.types.RawTaggedField> unknownTaggedFields() {
+            return java.util.Collections.emptyList();
+        }
+        @Override public void read(org.apache.kafka.common.protocol.Readable readable, short version) { }
+        @Override public void write(org.apache.kafka.common.protocol.Writable writable,
+                                    org.apache.kafka.common.protocol.ObjectSerializationCache cache,
+                                    short version) { }
+        @Override public int size(org.apache.kafka.common.protocol.ObjectSerializationCache cache, short version) { return 0; }
+        @Override public void addSize(org.apache.kafka.common.protocol.MessageSizeAccumulator size,
+                                      org.apache.kafka.common.protocol.ObjectSerializationCache cache,
+                                      short version) { }
+    }
+
+    @SuppressWarnings("unused")
+    public static final class InnerWithMap implements org.apache.kafka.common.protocol.Message {
+        public java.util.Map<String, String> labels() {
+            java.util.Map<String, String> m = new java.util.LinkedHashMap<>();
+            m.put("k1", "v1");
+            return m;
+        }
+        public long idx() { return 7L; }
+        @Override public short lowestSupportedVersion() { return 0; }
+        @Override public short highestSupportedVersion() { return 0; }
+        @Override public org.apache.kafka.common.protocol.Message duplicate() { return new InnerWithMap(); }
+        @Override public java.util.List<org.apache.kafka.common.protocol.types.RawTaggedField> unknownTaggedFields() {
+            return java.util.Collections.emptyList();
+        }
+        @Override public void read(org.apache.kafka.common.protocol.Readable readable, short version) { }
+        @Override public void write(org.apache.kafka.common.protocol.Writable writable,
+                                    org.apache.kafka.common.protocol.ObjectSerializationCache cache,
+                                    short version) { }
+        @Override public int size(org.apache.kafka.common.protocol.ObjectSerializationCache cache, short version) { return 0; }
+        @Override public void addSize(org.apache.kafka.common.protocol.MessageSizeAccumulator size,
+                                      org.apache.kafka.common.protocol.ObjectSerializationCache cache,
+                                      short version) { }
+    }
+
+    /**
+     * Fixture for Round-19 MED A-3: an outer ApiMessage whose accessor returns
+     * a List of records, each carrying a Map-typed field. Pins that walking
+     * through a list does not silently descend into the per-element Map.
+     */
+    @SuppressWarnings("unused")
+    public static final class ListOfMapBearingRecordsNode implements org.apache.kafka.common.protocol.ApiMessage {
+        public java.util.List<InnerWithMap> entries() {
+            return java.util.Arrays.asList(new InnerWithMap(), new InnerWithMap());
+        }
+        @Override public short apiKey() { return -1; }
+        @Override public short lowestSupportedVersion() { return 0; }
+        @Override public short highestSupportedVersion() { return 0; }
+        @Override public org.apache.kafka.common.protocol.Message duplicate() { return new ListOfMapBearingRecordsNode(); }
+        @Override public java.util.List<org.apache.kafka.common.protocol.types.RawTaggedField> unknownTaggedFields() {
+            return java.util.Collections.emptyList();
+        }
+        @Override public void read(org.apache.kafka.common.protocol.Readable readable, short version) { }
+        @Override public void write(org.apache.kafka.common.protocol.Writable writable,
+                                    org.apache.kafka.common.protocol.ObjectSerializationCache cache,
+                                    short version) { }
+        @Override public int size(org.apache.kafka.common.protocol.ObjectSerializationCache cache, short version) { return 0; }
+        @Override public void addSize(org.apache.kafka.common.protocol.MessageSizeAccumulator size,
+                                      org.apache.kafka.common.protocol.ObjectSerializationCache cache,
+                                      short version) { }
+    }
+
+    /**
+     * Fixture for Round-19 MED A-4: an ApiMessage whose accessor returns a
+     * value that implements BOTH {@link java.util.Map} and
+     * {@link java.lang.Iterable}. With the wrong ordering (Iterable first),
+     * convertIterable would walk via the iterator() method and leak Map
+     * internals. With the correct ordering (Map first), the value surfaces
+     * as null exactly like any other Map-shaped field.
+     */
+    @SuppressWarnings("unused")
+    public static final class MapAlsoIterableFieldNode implements org.apache.kafka.common.protocol.ApiMessage {
+        public MapAlsoIterable blob() {
+            return new MapAlsoIterable();
+        }
+        @Override public short apiKey() { return -1; }
+        @Override public short lowestSupportedVersion() { return 0; }
+        @Override public short highestSupportedVersion() { return 0; }
+        @Override public org.apache.kafka.common.protocol.Message duplicate() { return new MapAlsoIterableFieldNode(); }
+        @Override public java.util.List<org.apache.kafka.common.protocol.types.RawTaggedField> unknownTaggedFields() {
+            return java.util.Collections.emptyList();
+        }
+        @Override public void read(org.apache.kafka.common.protocol.Readable readable, short version) { }
+        @Override public void write(org.apache.kafka.common.protocol.Writable writable,
+                                    org.apache.kafka.common.protocol.ObjectSerializationCache cache,
+                                    short version) { }
+        @Override public int size(org.apache.kafka.common.protocol.ObjectSerializationCache cache, short version) { return 0; }
+        @Override public void addSize(org.apache.kafka.common.protocol.MessageSizeAccumulator size,
+                                      org.apache.kafka.common.protocol.ObjectSerializationCache cache,
+                                      short version) { }
+    }
+
+    /**
+     * Pathological hybrid: a class that is both a Map<K,V> and an
+     * Iterable<V> over its values. Its iterator() yields concrete sensitive
+     * strings so that if the Map check is bypassed, the leak is observable.
+     */
+    @SuppressWarnings({"NullableProblems", "unused"})
+    public static final class MapAlsoIterable extends java.util.LinkedHashMap<String, String>
+            implements Iterable<String> {
+        private static final long serialVersionUID = 1L;
+        public MapAlsoIterable() {
+            put("secret-key", "TOKEN-DO-NOT-LEAK");
+            put("audit-key", "OPERATOR-DO-NOT-LEAK");
+        }
+        @Override public java.util.Iterator<String> iterator() {
+            return values().iterator();
+        }
+    }
+
     private static java.io.File locatePackageDir(String pkg) {
         String rel = pkg.replace('.', '/');
         for (String root : new String[]{

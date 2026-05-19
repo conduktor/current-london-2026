@@ -469,22 +469,20 @@ public final class ApiMessageActivation {
             descriptor.put("sizeInBytes", (long) records.sizeInBytes());
             return descriptor;
         }
-        if (v instanceof Iterable) {
-            return convertIterable((Iterable<?>) v, depth, invocations);
-        }
-        // Round-18 MED E-1 (defense-in-depth): no Kafka {@link ApiMessage}
-        // shape today carries a {@link java.util.Map} field — the message
-        // generator emits {@code ArrayList<...Element>} for repeated entries
-        // and there is no map-typed field in any current schema. But if a
-        // future KIP adds one, the fall-through below would descend into the
-        // concrete Map type's public no-arg accessors:
-        // {@code keySet}, {@code values}, {@code entrySet}, {@code clone}, ...
-        // — surfacing the operator with a junk-shaped sub-tree of JDK
-        // collection internals, with the entry-set itself walked as an
-        // Iterable of {@code Map.Entry} (an interface with {@code getKey}
-        // and {@code getValue} accessors that would be discovered). The
-        // result would be a confusing partial leak whose shape depends on
-        // the exact Map implementation chosen by the schema author.
+        // Round-18 MED E-1 / Round-19 MED A-4 (defense-in-depth ordering):
+        // no Kafka {@link ApiMessage} shape today carries a
+        // {@link java.util.Map} field — the message generator emits
+        // {@code ArrayList<...Element>} for repeated entries and there is
+        // no map-typed field in any current schema. But if a future KIP
+        // adds one, the fall-through below would descend into the concrete
+        // Map type's public no-arg accessors: {@code keySet},
+        // {@code values}, {@code entrySet}, {@code clone}, ... — surfacing
+        // the operator with a junk-shaped sub-tree of JDK collection
+        // internals, with the entry-set itself walked as an Iterable of
+        // {@code Map.Entry} (an interface with {@code getKey} and
+        // {@code getValue} accessors that would be discovered). The result
+        // would be a confusing partial leak whose shape depends on the
+        // exact Map implementation chosen by the schema author.
         //
         // Surface as null — same posture as Double/Float above — so a future
         // schema addition forces an explicit decision in this file rather
@@ -495,8 +493,21 @@ public final class ApiMessageActivation {
         // explicit place to add a {@code convertMap(Map<?,?>, ...)} helper
         // with the same step-charging and depth-cap rigor as
         // {@link #convertIterable}.
+        //
+        // Round-19 MED A-4: the Map check sits ABOVE the Iterable branch
+        // so it wins on any class that implements both. The standard JDK
+        // Map types ({@code HashMap}, {@code LinkedHashMap}, {@code TreeMap},
+        // {@code ConcurrentHashMap}) do not implement Iterable, so the
+        // ordering is moot for them. But a third-party Map (or a future
+        // hypothetical schema choice) that does implement Iterable would
+        // otherwise walk as an Iterable here — bypassing the Map carve-out
+        // entirely. Reorder defensively: anything Map-shaped is null,
+        // period.
         if (v instanceof Map) {
             return null;
+        }
+        if (v instanceof Iterable) {
+            return convertIterable((Iterable<?>) v, depth, invocations);
         }
         // Anything else with accessors: walk recursively. We do NOT restrict to
         // ApiMessage — nested records inside generated classes implement just
