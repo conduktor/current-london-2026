@@ -762,6 +762,74 @@ public class RuleJsonCodecTest {
     }
 
     @Test
+    public void fullwidthAsciiLatinInIdRejected() {
+        // R48-E F3 [MED]: fullwidth ASCII block U+FF01..U+FF5E (FULLWIDTH
+        // EXCLAMATION MARK .. FULLWIDTH TILDE). Category Lu/Ll/Nd/Po —
+        // NONE in Cf — so neither the Character.FORMAT umbrella nor the
+        // explicit Mn/Lo arms in isForbiddenIdCodepoint catch them.
+        // Renders as visibly *wider* glyphs of ASCII in CJK-aware
+        // terminals, so an attacker (or accidentally-fullwidth operator
+        // paste) publishing rule id `ｒｕｌｅ-ｄｅｎｙ` defeats the
+        // unambiguous-attribution promise: it surfaces in operator
+        // dashboards as a near-duplicate of `rule-deny` but admins
+        // searching for the ASCII form would never find it.
+        //
+        // Sibling defect to the parseBypassPrincipals fullwidth gap
+        // (R48-E F1); both surfaces share the same admission asymmetry
+        // because fullwidth Latin escapes every category-based predicate.
+        // Pin the boundaries + representative codepoints from each
+        // fullwidth sub-block, then sweep the entire range as a coverage
+        // floor.
+        int[] fullwidthSweep = {
+            0xFF01, // FULLWIDTH EXCLAMATION MARK (block start, Po)
+            0xFF10, // FULLWIDTH DIGIT ZERO       (Nd)
+            0xFF19, // FULLWIDTH DIGIT NINE       (Nd)
+            0xFF21, // FULLWIDTH LATIN CAPITAL A  (Lu)
+            0xFF3A, // FULLWIDTH LATIN CAPITAL Z  (Lu)
+            0xFF41, // FULLWIDTH LATIN SMALL A    (Ll)
+            0xFF5A, // FULLWIDTH LATIN SMALL Z    (Ll)
+            0xFF5E, // FULLWIDTH TILDE            (Sm, block end)
+        };
+        for (int cp : fullwidthSweep) {
+            String id = "rule" + new String(Character.toChars(cp)) + "X";
+            RuleEnvelopeException ex = assertThrows(RuleEnvelopeException.class,
+                () -> RuleJsonCodec.decode(id, SAMPLE.getBytes(StandardCharsets.UTF_8)),
+                "id should be rejected: '" + id + "' (U+"
+                    + String.format("%04X", cp) + ")");
+            assertTrue(ex.getMessage().contains("forbidden codepoint"),
+                "rejection must name the forbidden codepoint: "
+                    + ex.getMessage());
+        }
+
+        // Symmetric: validateRuleId must reject pre-decode (admin-API
+        // and tombstone paths use this directly).
+        String fullwidthB = new String(Character.toChars(0xFF42));
+        RuleEnvelopeException pre = assertThrows(RuleEnvelopeException.class,
+            () -> RuleJsonCodec.validateRuleId("rule-" + fullwidthB + "X"),
+            "validateRuleId must reject fullwidth ASCII pre-decode");
+        assertTrue(pre.getMessage().contains("forbidden codepoint"),
+            "validateRuleId diagnostic must name forbidden codepoint; got: "
+                + pre.getMessage());
+
+        // Coverage-floor sweep — pin every codepoint in the contiguous
+        // U+FF01..U+FF5E range. A future refactor that narrows the
+        // range (e.g. `cp >= 0xFF21 && cp <= 0xFF5A` for just letters,
+        // missing digits + punctuation) is caught loud here.
+        for (int cp = 0xFF01; cp <= 0xFF5E; cp++) {
+            String id = "rule" + new String(Character.toChars(cp)) + "X";
+            int cpf = cp;
+            RuleEnvelopeException ex = assertThrows(RuleEnvelopeException.class,
+                () -> RuleJsonCodec.decode(id, SAMPLE.getBytes(StandardCharsets.UTF_8)),
+                "U+" + String.format("%04X", cpf)
+                    + " must reject (fullwidth ASCII family floor)");
+            assertTrue(ex.getMessage().contains("forbidden codepoint"),
+                "U+" + String.format("%04X", cpf)
+                    + " rejection must name forbidden codepoint; got: "
+                    + ex.getMessage());
+        }
+    }
+
+    @Test
     public void unpairedSurrogatesInIdRejected() {
         // R23 #223: well-formed Java Strings built from valid UTF-8 / UTF-16
         // never carry unpaired surrogates, but a poisoned ByteBuffer-decoded

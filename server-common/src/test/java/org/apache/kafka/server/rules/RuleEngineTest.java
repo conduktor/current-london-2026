@@ -2497,6 +2497,162 @@ public class RuleEngineTest {
     }
 
     @Test
+    public void parseBypassPrincipalsRejectsFullwidthAsciiLatin() {
+        // R48-E F1 [MED]: fullwidth ASCII block U+FF01..U+FF5E renders as
+        // visibly *wider* glyphs of ASCII letters/digits/punctuation in
+        // CJK-aware terminals. None are caught by Character.FORMAT (Lu/Ll/
+        // Nd/Po, not Cf), by Character.isWhitespace, or by the existing
+        // invisible/Hangul/VS/CGJ/comma/semicolon arms. An operator with
+        // a CJK IME in fullwidth-input mode (or pasting from a fullwidth-
+        // converted document) produces `User:ｂｒｏｋｅｒ` whose canonical
+        // form NEVER matches the runtime peer `User:broker` — silent
+        // fail-CLOSED bypass under-grant, identical impact class to
+        // R29 #270/#272/#278, R30 #279/#280, R31 #281, R32 #287, R33 #290.
+        //
+        // Sweep representative codepoints from each fullwidth sub-block:
+        //   U+FF01  FULLWIDTH EXCLAMATION MARK   (Po — block start)
+        //   U+FF10  FULLWIDTH DIGIT ZERO         (Nd)
+        //   U+FF19  FULLWIDTH DIGIT NINE         (Nd — digit-range end)
+        //   U+FF21  FULLWIDTH LATIN CAPITAL A    (Lu — capital-range start)
+        //   U+FF3A  FULLWIDTH LATIN CAPITAL Z    (Lu — capital-range end)
+        //   U+FF41  FULLWIDTH LATIN SMALL A      (Ll — small-range start)
+        //   U+FF5A  FULLWIDTH LATIN SMALL Z      (Ll — small-range end)
+        //   U+FF5E  FULLWIDTH TILDE              (Sm — block end)
+        // Plus boundary cases U+FF01 / U+FF5E to pin range edges.
+        int[] fullwidthSweep = new int[] {
+            0xFF01, // FULLWIDTH EXCLAMATION MARK (block start)
+            0xFF10, // FULLWIDTH DIGIT ZERO
+            0xFF19, // FULLWIDTH DIGIT NINE
+            0xFF21, // FULLWIDTH LATIN CAPITAL A
+            0xFF3A, // FULLWIDTH LATIN CAPITAL Z
+            0xFF41, // FULLWIDTH LATIN SMALL A
+            0xFF5A, // FULLWIDTH LATIN SMALL Z
+            0xFF5E, // FULLWIDTH TILDE (block end)
+        };
+        for (int cp : fullwidthSweep) {
+            String input = "User:bro" + new String(Character.toChars(cp)) + "ker";
+            IllegalArgumentException ex = org.junit.jupiter.api.Assertions
+                .assertThrows(IllegalArgumentException.class,
+                    () -> RuleEngine.parseBypassPrincipals(input),
+                    "fullwidth ASCII U+" + String.format("%04X", cp)
+                        + " in name must abort startup");
+            assertTrue(ex.getMessage().contains(String.format("U+%04X", cp))
+                    && ex.getMessage().toLowerCase().contains("fullwidth ascii")
+                    && ex.getMessage().contains("principal name"),
+                "fullwidth-ASCII diagnostic must name codepoint, helper "
+                    + "label, and slot; got: " + ex.getMessage());
+        }
+
+        // Mid-type slot — same hazard class on the principal type half.
+        // A CJK IME could produce `Ｕｓｅｒ:broker` if the operator types
+        // the type field with fullwidth-input on.
+        IllegalArgumentException midType = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals(
+                    "Us" + new String(Character.toChars(0xFF45)) + "r:broker"),
+                "mid-type fullwidth ASCII must abort startup");
+        assertTrue(midType.getMessage().contains("U+FF45")
+                && midType.getMessage().toLowerCase().contains("fullwidth ascii")
+                && midType.getMessage().contains("principal type"),
+            "mid-type fullwidth-ASCII diagnostic must name codepoint, "
+                + "helper label, and slot; got: " + midType.getMessage());
+
+        // End-to-end paste scenario: the realistic operator footgun is
+        // an entire principal in fullwidth (CJK IME left in fullwidth mode
+        // throughout the paste, or a document auto-converted to fullwidth).
+        // The full string never matches the runtime ASCII peer — pin that
+        // the parser rejects this most-likely shape.
+        StringBuilder fullPaste = new StringBuilder("User:");
+        // "ｂｒｏｋｅｒ" — fullwidth Latin small b/r/o/k/e/r.
+        int[] fullwidthBroker = {0xFF42, 0xFF52, 0xFF4F, 0xFF4B, 0xFF45, 0xFF52};
+        for (int cp : fullwidthBroker) {
+            fullPaste.append(new String(Character.toChars(cp)));
+        }
+        IllegalArgumentException paste = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals(fullPaste.toString()),
+                "entire-name fullwidth paste must abort startup");
+        // The parser stops at the FIRST hostile codepoint — so we expect
+        // U+FF42 (the leading 'ｂ') to be the codepoint named.
+        assertTrue(paste.getMessage().contains("U+FF42")
+                && paste.getMessage().toLowerCase().contains("fullwidth ascii"),
+            "fullwidth-paste diagnostic must name the first offending "
+                + "codepoint and helper label; got: " + paste.getMessage());
+
+        // Coverage-floor sweep — every codepoint in U+FF01..U+FF5E must
+        // reject with the SAME helper label. Without this, a future
+        // refactor that narrows the range (e.g. accidentally typing
+        // `cp >= 0xFF21 && cp <= 0xFF5A` for just letters) goes unnoticed
+        // because the spot-check above only hits 8 representatives.
+        //
+        // U+FF0C (fullwidth comma) and U+FF1B (fullwidth semicolon) are
+        // intentionally excluded from this arm: they pre-date this fix
+        // and continue to dispatch through firstConfusableSeparatorLabel
+        // (R29 #278), which produces a more-specific "comma-confusable"
+        // / "semicolon-confusable" diagnostic naming the legitimate
+        // separator. The dedicated test
+        // parseBypassPrincipalsRejectsCommaAndSemicolonConfusableCodepoints
+        // pins that behaviour.
+        for (int cp = 0xFF01; cp <= 0xFF5E; cp++) {
+            if (cp == 0xFF0C || cp == 0xFF1B) {
+                continue;
+            }
+            String s = new String(Character.toChars(cp));
+            int cpf = cp;
+            IllegalArgumentException ex = org.junit.jupiter.api.Assertions
+                .assertThrows(IllegalArgumentException.class,
+                    () -> RuleEngine.parseBypassPrincipals(
+                        "User:bro" + s + "ker"),
+                    "U+" + String.format("%04X", cpf)
+                        + " must reject (fullwidth ASCII family floor)");
+            assertTrue(ex.getMessage().contains(String.format("U+%04X", cpf))
+                    && ex.getMessage().toLowerCase()
+                            .contains("fullwidth ascii"),
+                "fullwidth-ASCII family-floor diagnostic for U+"
+                    + String.format("%04X", cpf)
+                    + " must name codepoint and helper label; got: "
+                    + ex.getMessage());
+        }
+    }
+
+    @Test
+    public void parseBypassPrincipalsRejectsDeprecatedBidiFormatChars() {
+        // R48-E F5 [LOW]: U+206A..U+206F are deprecated bidi format chars
+        // (INHIBIT/ACTIVATE SYMMETRIC SWAPPING, INHIBIT/ACTIVATE ARABIC
+        // FORM SHAPING, NATIONAL/NOMINAL DIGIT SHAPES — Cf-category). The
+        // codec catches them via the `Character.getType == FORMAT`
+        // umbrella but the parser previously enumerated only the
+        // (U+2060..U+2064) slice immediately below the bidi-isolate range
+        // (U+2066..U+2069) — same drift class as R33 #290 where U+2060
+        // itself was off-by-one below U+2061. Closing the gap symmetrises
+        // parser with codec.
+        //
+        // Pin every codepoint in the contiguous range so a future
+        // refactor that shrinks it again is caught loud.
+        int[] deprecatedBidi = new int[] {
+            0x206A, // INHIBIT SYMMETRIC SWAPPING
+            0x206B, // ACTIVATE SYMMETRIC SWAPPING
+            0x206C, // INHIBIT ARABIC FORM SHAPING
+            0x206D, // ACTIVATE ARABIC FORM SHAPING
+            0x206E, // NATIONAL DIGIT SHAPES
+            0x206F, // NOMINAL DIGIT SHAPES
+        };
+        for (int cp : deprecatedBidi) {
+            String input = "User:bro" + new String(Character.toChars(cp)) + "ker";
+            IllegalArgumentException ex = org.junit.jupiter.api.Assertions
+                .assertThrows(IllegalArgumentException.class,
+                    () -> RuleEngine.parseBypassPrincipals(input),
+                    "deprecated bidi format U+" + String.format("%04X", cp)
+                        + " in name must abort startup");
+            assertTrue(ex.getMessage().contains(String.format("U+%04X", cp))
+                    && ex.getMessage().toLowerCase().contains("invisible format")
+                    && ex.getMessage().contains("principal name"),
+                "deprecated bidi format diagnostic must name codepoint, "
+                    + "helper label, and slot; got: " + ex.getMessage());
+        }
+    }
+
+    @Test
     public void parseBypassPrincipalsAbortsOnAnyInvalidSegmentInList() {
         // R31 #285 (Agent E GAP-2): mixed valid+invalid input must
         // abort the whole list rather than silently dropping the

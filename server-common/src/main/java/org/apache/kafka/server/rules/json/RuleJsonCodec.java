@@ -669,6 +669,21 @@ public final class RuleJsonCodec {
                 // arms for FORMAT codepoints, kept for hazard-class documentation.
                 break;
         }
+        // R48-E F3 [MED]: fullwidth ASCII block U+FF01..U+FF5E (FULLWIDTH
+        // EXCLAMATION MARK .. FULLWIDTH TILDE). Category Lu/Ll/Nd/Po, NONE
+        // in Cf — so the Character.FORMAT umbrella above does not catch
+        // them. These render as visibly *wider* glyphs of ASCII letters/
+        // digits/punctuation in CJK-aware terminals. An attacker
+        // controlling a __governance publisher could enqueue a rule with
+        // id `ｒｕｌｅ-ｄｅｎｙ` (fullwidth) — visually distinguishable from
+        // `rule-deny` only by glyph width, defeating the
+        // unambiguous-attribution promise the rest of this list rests on.
+        // Sibling defect to the parseBypassPrincipals fullwidth gap
+        // (R48-E F1); both surfaces share the same admission asymmetry
+        // because fullwidth Latin escapes every category-based predicate.
+        if (cp >= 0xFF01 && cp <= 0xFF5E) {
+            return true;
+        }
         switch (cp) {
             case '​': // ZERO-WIDTH SPACE
             case '‌': // ZERO-WIDTH NON-JOINER

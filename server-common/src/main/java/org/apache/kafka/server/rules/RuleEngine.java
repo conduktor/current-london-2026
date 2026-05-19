@@ -1095,6 +1095,19 @@ public final class RuleEngine {
             //   U+2062  INVISIBLE TIMES
             //   U+2063  INVISIBLE SEPARATOR
             //   U+2064  INVISIBLE PLUS
+            //   U+206A  INHIBIT SYMMETRIC SWAPPING   (R48-E F5 — deprecated
+            //                                        bidi format chars,
+            //                                        Cf-category, were the
+            //                                        last range gap the
+            //                                        codec catches via its
+            //                                        Character.FORMAT
+            //                                        umbrella but the
+            //                                        parser missed)
+            //   U+206B  ACTIVATE SYMMETRIC SWAPPING
+            //   U+206C  INHIBIT ARABIC FORM SHAPING
+            //   U+206D  ACTIVATE ARABIC FORM SHAPING
+            //   U+206E  NATIONAL DIGIT SHAPES
+            //   U+206F  NOMINAL DIGIT SHAPES
             //   U+FFF9  INTERLINEAR ANNOTATION ANCHOR
             //   U+FFFA  INTERLINEAR ANNOTATION SEPARATOR
             //   U+FFFB  INTERLINEAR ANNOTATION TERMINATOR
@@ -1113,10 +1126,60 @@ public final class RuleEngine {
             // both via the `Character.FORMAT` umbrella AND an explicit
             // `case '⁠'` arm — this parser was the only remaining
             // path with the gap.
+            //
+            // R48-E F5 [LOW] extension: U+206A-U+206F are deprecated bidi
+            // format chars (INHIBIT/ACTIVATE SYMMETRIC SWAPPING, INHIBIT/
+            // ACTIVATE ARABIC FORM SHAPING, NATIONAL/NOMINAL DIGIT SHAPES).
+            // The codec catches them via `Character.getType == FORMAT` but
+            // the parser previously enumerated only the (U+2060..U+2064)
+            // slice — same drift class as R33 #290 where U+2060 itself was
+            // off-by-one below U+2061. Note: U+2065 is unassigned and
+            // U+2066..U+2069 (bidi isolates) are caught by an earlier arm.
             if (cp == 0x00AD
                     || (cp >= 0x2060 && cp <= 0x2064)
+                    || (cp >= 0x206A && cp <= 0x206F)
                     || (cp >= 0xFFF9 && cp <= 0xFFFC)) {
                 return String.format("invisible format U+%04X", cp);
+            }
+            // R48-E F1 [MED]: fullwidth ASCII block U+FF01..U+FF5E
+            // (FULLWIDTH EXCLAMATION MARK .. FULLWIDTH TILDE) — Lu/Ll/Nd/Po
+            // category codepoints that render as visibly *wider* versions
+            // of ASCII in CJK-aware terminals. None of the existing filters
+            // catch them: not whitespace (Lu/Ll/Nd are letters/digits, Po
+            // is punctuation), not Character.FORMAT, not invisible (the
+            // glyph is visible, just wider). The parser only enumerated
+            // fullwidth comma (U+FF0C) and fullwidth semicolon (U+FF1B) in
+            // firstConfusableSeparatorLabel — every other fullwidth ASCII
+            // codepoint slipped through.
+            //
+            // Hazard: an operator with a CJK IME in fullwidth-input mode,
+            // or pasting from a document auto-converted to fullwidth (some
+            // Asian word processors and rich-text editors do this),
+            // produces `User:ｂｒｏｋｅｒ` (ASCII colon + fullwidth name).
+            // No structural parser check trips: split(":",2) matches the
+            // ASCII colon, trim() leaves the fullwidth letters intact, no
+            // codepoint is invisible/Hangul-filler/CGJ/whitespace/
+            // comma-confusable. The entry is stored verbatim. Runtime peer
+            // principal is `User:broker` (ASCII). Mismatch → silent
+            // fail-CLOSED bypass under-grant, identical impact class to
+            // R29 #270/#272/#278, R30 #279/#280, R31 #281, R32 #287,
+            // R33 #290.
+            //
+            // Severity capped at MED (not HIGH) because fullwidth glyphs
+            // are *visibly distinguishable* (wider) in CJK-aware terminals
+            // — unlike Hangul fillers (totally blank) or zero-width chars
+            // (totally invisible). But the codepoint-admission asymmetry
+            // with the already-enumerated fullwidth comma/semicolon arms
+            // makes this a cheap completion of existing coverage.
+            //
+            // Exclude U+FF0C (fullwidth comma) and U+FF1B (fullwidth
+            // semicolon): firstInvisibleCodePointLabel runs BEFORE
+            // firstConfusableSeparatorLabel in parseBypassPrincipals, so
+            // catching them here would steal the more-specific
+            // "comma-confusable"/"semicolon-confusable" diagnostic the
+            // R29 #278 arm produces. Leave them to that arm.
+            if ((cp >= 0xFF01 && cp <= 0xFF5E) && cp != 0xFF0C && cp != 0xFF1B) {
+                return String.format("fullwidth ASCII U+%04X", cp);
             }
             // R31 #281 [HIGH]: Unicode tag characters U+E0000–U+E007F.
             // Used in real-world supply-chain attacks (trojan-source/2021)
