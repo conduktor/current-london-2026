@@ -233,6 +233,28 @@ public final class RuleEngine {
     static final long EVAL_ERROR_WARN_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(1);
 
     /**
+     * R46-B Finding B: throttle the EvaluateReentryException WARN. Mirrors
+     * {@link #lastEvalErrorWarnNanos} above. The re-entry guard at L1308 is
+     * the engine's signal that a CEL host function, custom accessor, or
+     * activation supplier reentered {@link #evaluate} on the same thread.
+     * Re-entry is caught at L1463 and re-thrown so the request fail-CLOSES
+     * (KafkaApis maps the exception to UNKNOWN_SERVER_ERROR / 5xx, R29 #266),
+     * but PRIOR to this throttle the re-throw was the engine's only signal —
+     * the throwable never reached any LOG site. PROMPT.md L125 instructs
+     * operators to grep for {@code EvaluateReentryException}; the token did
+     * not appear in any log line. R29 #266 closed the spec side; this closes
+     * the operator-visibility side.
+     *
+     * <p>Window-and-suppressed-count posture is identical to the per-rule
+     * eval-error WARN: a reentry trigger (buggy custom CEL host fn, hostile
+     * future plugin) firing once per request would otherwise emit a WARN per
+     * request. The throttle bounds the rate.
+     */
+    private final AtomicLong lastReentryWarnNanos =
+        new AtomicLong(System.nanoTime() - EVAL_ERROR_WARN_INTERVAL_NANOS - 1);
+    final AtomicLong suppressedReentryWarnings = new AtomicLong(0L);
+
+    /**
      * Round-15 recent-changes BLOCKER-1: throttle the activation-supplier
      * fail-open WARN. Mirrors {@link #lastEvalErrorWarnNanos} above (which
      * fixed the per-rule eval-error path in round-14 L-1) for the structurally
@@ -1488,6 +1510,18 @@ public final class RuleEngine {
                         // This narrowed re-throw covers the path where a
                         // future CEL host function or custom accessor
                         // re-enters evaluate() from inside evalBoolean.
+                        //
+                        // R46-B Finding B: operator visibility. Before this
+                        // line was added, the re-entry throwable was the
+                        // engine's ONLY signal — it propagated past every
+                        // LOG site straight to KafkaApis's outer Throwable
+                        // catch (5xx). PROMPT.md L125 tells operators to
+                        // grep for {@code EvaluateReentryException}; the
+                        // token did not appear in any log line. Emit a
+                        // throttled WARN at the catch site so the symptom
+                        // (5xx burst from this rule) is correlatable in
+                        // logs without DEBUG-level instrumentation.
+                        maybeWarnReentry(rule.id(), apiKey, reentry);
                         throw reentry;
                     } catch (Exception e) {
                         evalErrorObserved = true;
@@ -1714,6 +1748,42 @@ public final class RuleEngine {
             }
         } else {
             suppressedEvalErrorWarnings.incrementAndGet();
+        }
+    }
+
+    /**
+     * R46-B Finding B: throttled WARN for the re-entry signal. Shares the
+     * same window/posture as {@link #maybeWarnEvalError} (1 s CAS window,
+     * suppressed-count tail, {@link LogSafe#sanitize} on the throwable
+     * toString). The {@code apiKey} is enum-typed.
+     *
+     * <p>Unlike {@code maybeWarnEvalError} this does NOT bump a cumulative
+     * fail-OPEN counter — re-entry fails CLOSED (the throwable is re-raised
+     * past the catch in {@link #evaluate}, KafkaApis maps it to a 5xx). A
+     * dedicated counter would be useful for sustained-storm visibility but
+     * is out of scope of the per-WARN throttle fix; field
+     * {@code evalErrorFailOpenCount} explicitly excludes this path.
+     */
+    private void maybeWarnReentry(String ruleId, ApiKeys apiKey, Throwable t) {
+        long now = System.nanoTime();
+        long last = lastReentryWarnNanos.get();
+        if (now - last >= EVAL_ERROR_WARN_INTERVAL_NANOS
+            && lastReentryWarnNanos.compareAndSet(last, now)) {
+            long suppressed = suppressedReentryWarnings.getAndSet(0L);
+            if (suppressed > 0) {
+                LOG.warn("rule '{}' triggered EvaluateReentryException on apiKey {} "
+                    + "— failing CLOSED (5xx) "
+                    + "(suppressed {} similar events in the previous window): {}",
+                    LogSafe.sanitize(ruleId), apiKey, suppressed,
+                    LogSafe.sanitize(t.toString()));
+            } else {
+                LOG.warn("rule '{}' triggered EvaluateReentryException on apiKey {} "
+                    + "— failing CLOSED (5xx): {}",
+                    LogSafe.sanitize(ruleId), apiKey,
+                    LogSafe.sanitize(t.toString()));
+            }
+        } else {
+            suppressedReentryWarnings.incrementAndGet();
         }
     }
 

@@ -365,6 +365,52 @@ public class RuleEngineTest {
     }
 
     @Test
+    public void reentryWarnIsEmittedAndThrottledUnderRapidFire() {
+        // R46-B Finding B: before this fix the EvaluateReentryException was
+        // the engine's only signal — it propagated past every LOG site
+        // straight to KafkaApis's outer Throwable catch (5xx). PROMPT.md
+        // L125 instructs operators to grep for the token; the token did
+        // not appear in any log line. The fix adds a throttled WARN at
+        // the catch site so the symptom is correlatable from logs without
+        // DEBUG instrumentation, AND bounds the WARN rate so a buggy CEL
+        // host function firing per request does not let the same
+        // reentrant trigger amplify into an appender-saturation primitive
+        // — the exact log-amplification hazard round-14 BLOCKER L-1 closed
+        // for the eval-error WARN.
+        //
+        // The package-private {@code suppressedReentryWarnings} counter
+        // exposes the throttle state without a wall-clock pause.
+        RuleEngine engine = new RuleEngine();
+        engine.install(new RuleSetBuilder()
+            .put(denyRule("deny-on-x", ApiKeys.METADATA, "r.x == 1", 99))
+            .build());
+        // Custom activation Map whose get("r") recursively calls
+        // engine.evaluate() — the same shape as the sibling
+        // perRuleCatchMustNotSwallowReentryFromInsideEvalBoolean test.
+        Map<String, Object> reentrantActivation = new java.util.HashMap<String, Object>() {
+            @Override
+            public Object get(Object key) {
+                if ("r".equals(key)) {
+                    engine.evaluate(ApiKeys.METADATA, "c", null, false, Collections::emptyMap);
+                }
+                return super.get(key);
+            }
+        };
+        final int rapidFireCalls = 1_000;
+        for (int i = 0; i < rapidFireCalls; i++) {
+            // The outer evaluate must throw EvaluateReentryException —
+            // re-entry fails CLOSED via re-throw past the per-rule catch.
+            assertThrows(RuleEngine.EvaluateReentryException.class,
+                () -> engine.evaluate(
+                    ApiKeys.METADATA, "c", null, false, () -> reentrantActivation));
+        }
+        long suppressed = engine.suppressedReentryWarnings.get();
+        assertTrue(suppressed >= rapidFireCalls - 2,
+            "expected the reentry throttle to suppress most rapid-fire WARNs, got " + suppressed
+                + " out of " + rapidFireCalls + " reentry events");
+    }
+
+    @Test
     public void budgetOverflowWarnIsThrottledUnderRapidFire() {
         // DoS-P1: the fail-closed posture in
         // activationBudgetExceededFailsClosedWithPolicyViolation correctly
