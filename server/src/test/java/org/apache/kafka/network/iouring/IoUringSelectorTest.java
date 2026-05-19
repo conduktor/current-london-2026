@@ -1080,6 +1080,84 @@ class IoUringSelectorTest {
     }
 
     @Test
+    void addCompletedReceiveThrowsIllegalStateExceptionOnDuplicateId() throws Exception {
+        // CONCERN-23A (also closes #89 P-COMPLETED-RECV-DUP): NIO's
+        // Selector.addToCompletedReceives (clients/.../Selector.java:1056-1062) throws
+        // IllegalStateException when called twice for the same channel id in one poll —
+        // the safety backstop for the "one request per channel per poll" invariant that
+        // the Processor's MUTED_AND_RESPONSE_PENDING state machine depends on. Without
+        // this guard, a future refactor that adds a fourth call-site to addCompletedReceive
+        // and forgets to consult receivesThisPoll would silently double-emit, and the
+        // request channel would enqueue two requests for one connection — the resulting
+        // mute-state ISE would fire far from the proximate cause and be hard to diagnose.
+        // The three production call-sites are gated upstream so this throw cannot fire
+        // today; the test pins the invariant directly via the test seam so the next
+        // refactor cannot regress it silently.
+        IoUringSelector s = newSelector(IDLE_NANOS_NEVER);
+        String id = "test-id-1";
+        s.addCompletedReceiveForTesting(id, new NetworkReceive(id));
+
+        IllegalStateException ex = assertThrows(IllegalStateException.class,
+            () -> s.addCompletedReceiveForTesting(id, new NetworkReceive(id)),
+            "second addCompletedReceive for the same id in one poll must throw IllegalStateException — "
+                + "mirroring NIO's Selector.addToCompletedReceives safety backstop");
+        assertTrue(ex.getMessage().contains(id),
+            "the IllegalStateException message must name the offending channel id, " +
+            "got: " + ex.getMessage());
+
+        // The first receive is still in completedReceives — the throw must not roll it back
+        // (mirroring NIO's behaviour: the duplicate is rejected, the first wins).
+        assertEquals(1, s.completedReceives().size(),
+            "the first receive survives — the throw rejects the duplicate, not the original");
+    }
+
+    @Test
+    void addCompletedReceivePermitsDifferentIdsInSamePoll() throws Exception {
+        // CONCERN-23A counterpart: the invariant is per-channel, not per-poll. Two
+        // different channels each producing one completedReceive in the same poll is the
+        // common case under any non-trivial load and must remain accepted.
+        IoUringSelector s = newSelector(IDLE_NANOS_NEVER);
+        s.addCompletedReceiveForTesting("id-a", new NetworkReceive("id-a"));
+        s.addCompletedReceiveForTesting("id-b", new NetworkReceive("id-b"));
+
+        assertEquals(2, s.completedReceives().size(),
+            "two different ids must coexist in completedReceives in the same poll");
+    }
+
+    @Test
+    void closeByIdPurgesConnectedList() throws Exception {
+        // CONCERN-23B parity finding: NIO's Selector.close(channel, CloseMode)
+        // (clients/.../Selector.java:929-934) always runs `connected.remove(channel.id())`
+        // so any observer iterating `selector.connected()` between close and the next
+        // poll's `connected.clear()` cannot see a dangling id whose channel was already
+        // torn down. io_uring previously omitted this purge — the stale id survived
+        // until the next poll. Same-poll race: Acceptor calls closeExcessConnections →
+        // selector.close(id) for a channel SocketServer just produced in `connected`
+        // during the current poll (still being processed by
+        // applyConnectionQuotasForNewlyAcceptedChannels). Today only the Processor
+        // walks `connected` once immediately after poll, BEFORE any close(id) could
+        // land — so this is defence-in-depth for future observers + same-poll-race
+        // correctness rather than a live bug. Pin the invariant.
+        IoUringSelector s = newSelector(IDLE_NANOS_NEVER);
+        acceptNew(s, REMOTE_A);
+        s.poll(0);
+        String id = s.connected().get(0);
+        assertNotNull(s.channel(id),
+            "preconditions: the freshly accepted channel must be in the active map");
+        assertTrue(s.connected().contains(id),
+            "preconditions: the freshly accepted id must be in connected()");
+
+        s.close(id);
+
+        assertFalse(s.connected().contains(id),
+            "close(id) must purge the id from connected() — otherwise an observer iterating "
+                + "selector.connected() between close and the next poll sees a dangling id whose "
+                + "channel was already torn down. Mirrors NIO Selector.close(channel, CloseMode).");
+        assertNull(s.channel(id),
+            "post-condition: close(id) removed the channel from the active map");
+    }
+
+    @Test
     void closeByIdAlsoCleansClosingChannels() throws Exception {
         // Codex audit blocker: NIO's Selector.close(id) cleans both `channels` and
         // `closingChannels` (clients/.../Selector.java:886-899). Without that fallthrough,

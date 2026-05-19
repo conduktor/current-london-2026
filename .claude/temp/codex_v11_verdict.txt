@@ -1,0 +1,19 @@
+I found one remaining production blocker. The latest `808a8d9c86` write-wakeup fix itself looks sound: `Semaphore.release` is cross-thread safe, no selector reentrancy is introduced, permits are drained by `poll()`, and close/write-completion races do not corrupt transport state.
+
+BLOCKER: [SocketServer.scala](/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/core/src/main/scala/kafka/network/SocketServer.scala:957)
+
+Exact problem: the io_uring path builds `new InetSocketAddress(endPoint.host, endPoint.port)` directly. Kafka stores wildcard listener hosts from configs like `PLAINTEXT://:9092` as `null` (`SocketServerConfigs.listenerListToEndPoints`), while the NIO path explicitly maps blank/null hosts to `new InetSocketAddress(port)`.
+
+Failure scenario: with the default `socket.selector.implementation=auto` on Linux + PLAINTEXT, a normal wildcard listener `PLAINTEXT://:9092` resolves to io_uring and the Processor construction throws `IllegalArgumentException: hostname can't be null` before the broker can start. If a blank string ever reaches this path, Java binds it to localhost rather than wildcard, also diverging from NIO.
+
+Suggested fix: mirror `Acceptor.openServerSocket`:
+
+```scala
+val bindAddress =
+  if (Utils.isBlank(endPoint.host)) new java.net.InetSocketAddress(endPoint.port)
+  else new java.net.InetSocketAddress(endPoint.host, endPoint.port)
+```
+
+Add a regression test covering io_uring bundle construction or bind-address derivation for `PLAINTEXT://:9092`.
+
+Verification: targeted selector/transport tests passed with `./gradlew :server:test --tests org.apache.kafka.network.iouring.IoUringSelectorTest --tests org.apache.kafka.network.iouring.IoUringTransportLayerTest -x spotbugsMain`. The unexcluded run is blocked in this environment by SpotBugs not supporting Java 27 class files.

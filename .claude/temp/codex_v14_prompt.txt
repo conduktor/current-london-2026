@@ -1,0 +1,42 @@
+Audit the cumulative io_uring transport on this branch (experiment/io-uring) of Apache Kafka.
+
+Constraints from PROMPT.md:
+- v1: PLAINTEXT only on Linux
+- Do not modify anything under clients/
+- Use Netty (no Panama FFI)
+- No virtual threads
+- socket.selector.implementation = auto | nio | io_uring
+
+Focus first on the last two commits and confirm whether v13 BLOCKERs are correctly resolved:
+- d85e5fa6fc — defer io_uring LISTEN bind from Processor constructor to Acceptor.start()
+- beb52b45f4 — addInterestOps must gate autoRead re-enable on inboundBytes <= INBOUND_LOW_WATERMARK_BYTES
+
+Then perform a fresh end-to-end audit on the cumulative state. Look for:
+- DoS surfaces (direct-memory leaks, slowloris, pipelined-writes, accept floods)
+- Lifecycle (close ordering, shutdown races, half-open / closingChannels)
+- ConnectionQuotas correctness on accept/throw/disconnect
+- Metrics parity with NIO
+- Authorizer/principal-builder contract parity
+- mute/unmute, MemoryPool self-mute, watermark gates
+- Event-loop vs Processor thread visibility
+- Wire-protocol parity (frame boundaries, partial reads, pipelined requests)
+- Silent NIO-vs-io_uring divergence
+
+Key files:
+- server/src/main/java/org/apache/kafka/network/iouring/IoUringSelector.java
+- server/src/main/java/org/apache/kafka/network/iouring/IoUringTransportLayer.java
+- server/src/main/java/org/apache/kafka/network/iouring/IoUringServerListener.java
+- server/src/main/java/org/apache/kafka/network/iouring/IoUringPlaintextAuthenticator.java
+- server/src/main/java/org/apache/kafka/network/iouring/BrokerSelectorFactory.java
+- server/src/main/java/org/apache/kafka/network/iouring/IoUringChannelMetadataRegistry.java
+- server/src/main/java/org/apache/kafka/common/network/KafkaChannelMuteBridge.java
+- core/src/main/scala/kafka/network/SocketServer.scala (io_uring sections)
+- core/src/main/scala/kafka/server/KafkaConfig.scala (usesIoUring)
+
+Output:
+1. VERDICT — exactly one of: PRODUCTION-GRADE FOR V1 (PLAINTEXT) | NOT PRODUCTION-GRADE
+2. BLOCKER list (numbered, file:line, terse)
+3. CORRECTNESS list (should fix soon)
+4. POLISH list (nice-to-have)
+
+Be terse, no preamble. Bias toward NOT PRODUCTION-GRADE if you find anything substantive.

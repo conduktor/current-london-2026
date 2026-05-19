@@ -1,0 +1,37 @@
+Manifest-Version: 1.0
+Created-By: Apache Maven Bundle Plugin 5.1.8
+Built-By: root
+Build-Jdk: 11.0.30
+Specification-Title: Netty/Transport/Classes/io_uring
+Specification-Version: 4.2
+Specification-Vendor: The Netty Project
+Implementation-Title: Netty/Transport/Classes/io_uring
+Implementation-Version: 4.2.12.Final
+Implementation-Vendor-Id: io.netty
+Implementation-Vendor: The Netty Project
+Implementation-URL: https://netty.io/netty-transport-classes-io_uring/
+Multi-Release: true
+Bnd-LastModified: 1774462953835
+Build-Jdk-Spec: 11
+Bundle-Description: Netty is an asynchronous event-driven network applic
+ ation framework for    rapid development of maintainable high performan
+ ce protocol servers and    clients.
+Bundle-DocURL: https://netty.io/
+Bundle-License: https://www.apache.org/licenses/LICENSE-2.0
+Bundle-ManifestVersion: 2
+Bundle-Name: Netty/Transport/Classes/io_uring
+Bundle-SymbolicName: io.netty.transport-classes-io_uring
+Bundle-Vendor: The Netty Project
+Bundle-Version: 4.2.12.Final
+Export-Package: io.netty.channel.uring;uses:="io.netty.buffer,io.netty.c
+ hannel,io.netty.channel.socket,io.netty.channel.unix";version="4.2.12"
+Import-Package: io.netty.buffer;version="[4.2,5)",io.netty.channel;versi
+ on="[4.2,5)",io.netty.channel.socket;version="[4.2,5)",io.netty.channel
+ .unix;version="[4.2,5)",io.netty.util;version="[4.2,5)",io.netty.util.c
+ ollection;version="[4.2,5)",io.netty.util.concurrent;version="[4.2,5)",
+ io.netty.util.internal;version="[4.2,5)",io.netty.util.internal.logging
+ ;version="[4.2,5)",sun.nio.ch;resolution:=optional,org.bouncycastle.jca
+ jce.provider;version="[1.0,2)";resolution:=optional
+Require-Capability: osgi.ee;filter:="(&(osgi.ee=JavaSE)(version=9))"
+Tool: Bnd-6.3.1.202206071316
+

@@ -1,0 +1,7 @@
+The audit of the `io_uring` networking layer reveals a robust implementation that adheres to the established Kafka networking contracts and threading invariants. The cross-thread signaling between the Netty event-loop thread and the `Processor` thread (via `ConcurrentLinkedQueue` and `Semaphore`) is correctly implemented.
+
+The recent fix (808a8d9c86) properly utilizes `Semaphore.release()` within the Netty write-completion listener. The use of `wakeup.drainPermits()` at the end of `poll()` ensures that the semaphore does not accumulate stale permits under high write volume, preventing spurious wakeups in subsequent polls. The interaction between `IoUringTransportLayer` and `IoUringSelector` maintains thread safety, and exception isolation in the listener and `poll` loop correctly routes failures to the expected Kafka `ChannelState` (e.g., `FAILED_SEND`). The lifecycle management, including `closingChannels` eviction and connection quota handling, correctly mirrors the `NIO Selector` contract.
+
+No production-critical blockers remain.
+
+VERDICT: PRODUCTION-GRADE FOR V1 (PLAINTEXT)

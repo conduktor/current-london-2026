@@ -1,0 +1,53 @@
+diff --git a/server/src/main/java/org/apache/kafka/network/iouring/IoUringSelector.java b/server/src/main/java/org/apache/kafka/network/iouring/IoUringSelector.java
+index fbb2bcaeb1..c4ddb91870 100644
+--- a/server/src/main/java/org/apache/kafka/network/iouring/IoUringSelector.java
++++ b/server/src/main/java/org/apache/kafka/network/iouring/IoUringSelector.java
+@@ -463,6 +463,14 @@ public final class IoUringSelector implements BrokerSelector {
+ 
+     @Override
+     public void poll(long timeoutMs) throws IOException {
++        // Mirror NIO Selector.poll (clients/.../Selector.java:445-447): a negative
++        // timeout is a caller bug, not a "wait forever" sentinel. Without this guard,
++        // io_uring silently accepts it and the awaitForWork branch below falls
++        // through to "no wait, return immediately" — turning the bug into a 100% CPU
++        // spin on the Processor thread. NIO throws IllegalArgumentException which
++        // surfaces via the Processor's catch Throwable as a clear stack trace.
++        if (timeoutMs < 0)
++            throw new IllegalArgumentException("timeout should be >= 0");
+         if (closed) throw new IOException("selector is closed");
+ 
+         // Reset per-poll outputs BEFORE evicting closingChannels: the eviction populates
+@@ -1014,6 +1022,15 @@ public final class IoUringSelector implements BrokerSelector {
+             nettyChannels.remove(destinationId);
+             lastActiveNanos.remove(destinationId);
+             channels.remove(destinationId);
++            // LEAK-1: every OTHER close path in this class pairs channels.remove with
++            // explicitlyMutedChannels.remove (enqueueClose:976, surfacePrepareFailureAsDisconnect:753,
++            // maybeExpireOldestIdleChannel:717, drainClosingChannels:846, close(id):1254).
++            // If the Processor mutes a channel and a subsequent send() trips an in-progress-send
++            // invariant, this catch block used to leak the closed KafkaChannel reference into
++            // the explicitlyMutedChannels HashSet — held strongly for the broker's lifetime,
++            // transitively pinning the IoUringTransportLayer + authenticator + KafkaPrincipalBuilder.
++            // Bytes were released by closeQuietly below, but the object graph stayed reachable.
++            explicitlyMutedChannels.remove(channel);
+             failedSends.add(destinationId);
+             Utils.closeQuietly(channel, "channel after setSend exception");
+             throw e;
+@@ -1275,6 +1292,17 @@ public final class IoUringSelector implements BrokerSelector {
+         return nextIdleScanNanos;
+     }
+ 
++    // Test-visible accessor for explicitlyMutedChannels. LEAK-1's invariant is that
++    // every close path pairs `channels.remove` with `explicitlyMutedChannels.remove`;
++    // a future regression that drops one of those pairs would still pass behavioral
++    // tests (the dead channel is no longer dispatched-to) but would leak the
++    // KafkaChannel reference + its transport + authenticator + KafkaPrincipalBuilder
++    // into the HashSet for the broker's lifetime. The size accessor lets a regression
++    // test assert the Set is empty after the close path under test runs.
++    int explicitlyMutedChannelsSizeForTesting() {
++        return explicitlyMutedChannels.size();
++    }
++
+     /**
+      * Mirror NIO {@code Selector.openOrClosingChannelOrFail} (clients/.../Selector.java:985-992).
+      * NIO's mute/unmute/send all route id lookups through this helper so that a request on a

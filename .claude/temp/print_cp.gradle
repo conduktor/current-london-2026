@@ -1,0 +1,14 @@
+// Init script to print the test runtime classpath of :server for direct `java` invocation.
+gradle.projectsEvaluated {
+    rootProject.allprojects.each { p ->
+        if (p.path == ':server') {
+            p.tasks.register('printTestRuntimeCp') {
+                doLast {
+                    println "BENCH_CLASSPATH=" + (
+                        p.sourceSets.test.runtimeClasspath.files.collect { it.absolutePath }
+                    ).join(':')
+                }
+            }
+        }
+    }
+}

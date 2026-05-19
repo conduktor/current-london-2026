@@ -1,0 +1,1853 @@
+Initialized native services in: /home/florent/.gradle/native
+Initialized jansi services in: /home/florent/.gradle/native
+Received JVM installation metadata from '/usr/lib/jvm/java-21-openjdk-amd64': {JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64, JAVA_VERSION=21.0.10, JAVA_VENDOR=Ubuntu, RUNTIME_NAME=OpenJDK Runtime Environment, RUNTIME_VERSION=21.0.10+7-Ubuntu-124.04, VM_NAME=OpenJDK 64-Bit Server VM, VM_VERSION=21.0.10+7-Ubuntu-124.04, VM_VENDOR=Ubuntu, OS_ARCH=amd64}
+Found daemon DaemonInfo{pid=3914555, address=[fcbd3e79-3900-4e4d-8bc3-9f29217dee95 port:45141, addresses:[/127.0.0.1]], state=Idle, lastBusy=1779119309497, context=DefaultDaemonContext[uid=079fb8e8-5be4-4111-ac8c-1f88d3315ec2,javaHome=/usr/lib/jvm/jdk-27,javaVersion=27,javaVendor=Oracle Corporation,daemonRegistryDir=/home/florent/.gradle/daemon,pid=3914555,idleTimeout=10800000,priority=NORMAL,applyInstrumentationAgent=true,nativeServicesMode=ENABLED,daemonOpts=-Xss4m,-XX:+UseParallelGC,--add-opens=java.base/java.util=ALL-UNNAMED,--add-opens=java.base/java.lang=ALL-UNNAMED,--add-opens=java.base/java.lang.invoke=ALL-UNNAMED,--add-opens=java.prefs/java.util.prefs=ALL-UNNAMED,--add-exports=jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED,--add-exports=jdk.compiler/com.sun.tools.javac.util=ALL-UNNAMED,--add-opens=java.base/java.nio.charset=ALL-UNNAMED,--add-opens=java.base/java.net=ALL-UNNAMED,--add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED,-Xmx4g,-Dfile.encoding=UTF-8,-Duser.country=US,-Duser.language=en,-Duser.variant]} however its context does not match the desired criteria.
+JVM is incompatible.
+Wanted: DaemonRequestContext{jvmCriteria=/usr/lib/jvm/java-21-openjdk-amd64 (no JDK specified, using current Java home), daemonOpts=[-Xss4m, -XX:+UseParallelGC, --add-opens=java.base/java.util=ALL-UNNAMED, --add-opens=java.base/java.lang=ALL-UNNAMED, --add-opens=java.base/java.lang.invoke=ALL-UNNAMED, --add-opens=java.prefs/java.util.prefs=ALL-UNNAMED, --add-exports=jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED, --add-exports=jdk.compiler/com.sun.tools.javac.util=ALL-UNNAMED, --add-opens=java.base/java.nio.charset=ALL-UNNAMED, --add-opens=java.base/java.net=ALL-UNNAMED, --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED, -Xmx4g, -Dfile.encoding=UTF-8, -Duser.country=US, -Duser.language=en, -Duser.variant], applyInstrumentationAgent=true, nativeServicesMode=ENABLED, priority=NORMAL}
+Actual: DefaultDaemonContext[uid=079fb8e8-5be4-4111-ac8c-1f88d3315ec2,javaHome=/usr/lib/jvm/jdk-27,javaVersion=27,javaVendor=Oracle Corporation,daemonRegistryDir=/home/florent/.gradle/daemon,pid=3914555,idleTimeout=10800000,priority=NORMAL,applyInstrumentationAgent=true,nativeServicesMode=ENABLED,daemonOpts=-Xss4m,-XX:+UseParallelGC,--add-opens=java.base/java.util=ALL-UNNAMED,--add-opens=java.base/java.lang=ALL-UNNAMED,--add-opens=java.base/java.lang.invoke=ALL-UNNAMED,--add-opens=java.prefs/java.util.prefs=ALL-UNNAMED,--add-exports=jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED,--add-exports=jdk.compiler/com.sun.tools.javac.util=ALL-UNNAMED,--add-opens=java.base/java.nio.charset=ALL-UNNAMED,--add-opens=java.base/java.net=ALL-UNNAMED,--add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED,-Xmx4g,-Dfile.encoding=UTF-8,-Duser.country=US,-Duser.language=en,-Duser.variant]
+
+  Looking for a different daemon...
+The client will now receive all logging from the daemon (pid: 4125991). The daemon log file: /home/florent/.gradle/daemon/8.10.2/daemon-4125991.out.log
+Starting 3rd build in daemon [uptime: 37.984 secs, performance: 99%, GC rate: 0.40/s, heap usage: 1% of 2.6 GiB]
+Using 16 worker leases.
+Now considering [/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring, /home/florent/kafka-current-london-2026/.claude/worktrees/cel-rules] as hierarchies to watch
+Watching the file system is configured to be enabled if available
+File system watching is active
+Starting Build
+Transforming develocity-gradle-plugin-3.19.jar (com.gradle:develocity-gradle-plugin:3.19) with InstrumentationAnalysisTransform
+Transforming common-custom-user-data-gradle-plugin-2.0.2.jar (com.gradle:common-custom-user-data-gradle-plugin:2.0.2) with InstrumentationAnalysisTransform
+Transforming develocity-gradle-plugin-3.19.jar (com.gradle:develocity-gradle-plugin:3.19) with InstrumentationAnalysisTransform
+Transforming develocity-gradle-plugin-3.19.jar (com.gradle:develocity-gradle-plugin:3.19) with MergeInstrumentationAnalysisTransform
+Transforming common-custom-user-data-gradle-plugin-2.0.2.jar (com.gradle:common-custom-user-data-gradle-plugin:2.0.2) with InstrumentationAnalysisTransform
+Transforming common-custom-user-data-gradle-plugin-2.0.2.jar (com.gradle:common-custom-user-data-gradle-plugin:2.0.2) with MergeInstrumentationAnalysisTransform
+Transforming develocity-gradle-plugin-3.19.jar (com.gradle:develocity-gradle-plugin:3.19) with ExternalDependencyInstrumentingArtifactTransform
+Transforming common-custom-user-data-gradle-plugin-2.0.2.jar (com.gradle:common-custom-user-data-gradle-plugin:2.0.2) with ExternalDependencyInstrumentingArtifactTransform
+Invalidating in-memory cache of /home/florent/.gradle/caches/8.10.2/fileHashes/fileHashes.bin
+Invalidating in-memory cache of /home/florent/.gradle/caches/8.10.2/fileHashes/resourceHashesCache.bin
+Settings evaluated using settings file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/settings.gradle'.
+Projects loaded. Root project using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/build.gradle'.
+Included projects: [root project 'kafka', project ':clients', project ':connect', project ':coordinator-common', project ':core', project ':examples', project ':generator', project ':group-coordinator', project ':jmh-benchmarks', project ':metadata', project ':raft', project ':server', project ':server-common', project ':share-coordinator', project ':shell', project ':storage', project ':streams', project ':test-common', project ':tools', project ':transaction-coordinator', project ':trogdor', project ':connect:api', project ':connect:basic-auth-extension', project ':connect:file', project ':connect:json', project ':connect:mirror', project ':connect:mirror-client', project ':connect:runtime', project ':connect:test-plugins', project ':connect:transforms', project ':group-coordinator:group-coordinator-api', project ':storage:storage-api', project ':streams:examples', project ':streams:integration-tests', project ':streams:streams-scala', project ':streams:test-utils', project ':streams:upgrade-system-tests-0110', project ':streams:upgrade-system-tests-10', project ':streams:upgrade-system-tests-11', project ':streams:upgrade-system-tests-20', project ':streams:upgrade-system-tests-21', project ':streams:upgrade-system-tests-22', project ':streams:upgrade-system-tests-23', project ':streams:upgrade-system-tests-24', project ':streams:upgrade-system-tests-25', project ':streams:upgrade-system-tests-26', project ':streams:upgrade-system-tests-27', project ':streams:upgrade-system-tests-28', project ':streams:upgrade-system-tests-30', project ':streams:upgrade-system-tests-31', project ':streams:upgrade-system-tests-32', project ':streams:upgrade-system-tests-33', project ':streams:upgrade-system-tests-34', project ':streams:upgrade-system-tests-35', project ':streams:upgrade-system-tests-36', project ':streams:upgrade-system-tests-37', project ':streams:upgrade-system-tests-38', project ':streams:upgrade-system-tests-39', project ':test-common:test-common-internal-api', project ':test-common:test-common-runtime', project ':test-common:test-common-util', project ':tools:tools-api']
+
+> Configure project :
+Evaluating root project 'kafka' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/build.gradle'.
+Transforming grgit-core-4.1.1.jar (org.ajoberstar.grgit:grgit-core:4.1.1) with InstrumentationAnalysisTransform
+Transforming shadow-8.1.0.jar (com.github.johnrengelman:shadow:8.1.0) with InstrumentationAnalysisTransform
+Transforming log4j-core-2.20.0.jar (org.apache.logging.log4j:log4j-core:2.20.0) with InstrumentationAnalysisTransform
+Transforming spotless-plugin-gradle-6.25.0.jar (com.diffplug.spotless:spotless-plugin-gradle:6.25.0) with InstrumentationAnalysisTransform
+Transforming spotless-lib-extra-2.45.0.jar (com.diffplug.spotless:spotless-lib-extra:2.45.0) with InstrumentationAnalysisTransform
+Transforming org.eclipse.jgit-6.7.0.202309050840-r.jar (org.eclipse.jgit:org.eclipse.jgit:6.7.0.202309050840-r) with InstrumentationAnalysisTransform
+Transforming gradle-versions-plugin-0.48.0.jar (com.github.ben-manes:gradle-versions-plugin:0.48.0) with InstrumentationAnalysisTransform
+Transforming dependency-check-gradle-8.2.1.jar (org.owasp:dependency-check-gradle:8.2.1) with InstrumentationAnalysisTransform
+Transforming creadur-rat-gradle-0.8.1.jar (org.nosphere.apache:creadur-rat-gradle:0.8.1) with InstrumentationAnalysisTransform
+Transforming swagger-gradle-plugin-2.2.25.jar (io.swagger.core.v3:swagger-gradle-plugin:2.2.25) with InstrumentationAnalysisTransform
+Transforming spotbugs-gradle-plugin-6.0.25.jar (com.github.spotbugs.snom:spotbugs-gradle-plugin:6.0.25) with InstrumentationAnalysisTransform
+Transforming gradle-scoverage-8.0.3.jar (org.scoverage:gradle-scoverage:8.0.3) with InstrumentationAnalysisTransform
+Transforming JavaEWAH-1.2.3.jar (com.googlecode.javaewah:JavaEWAH:1.2.3) with InstrumentationAnalysisTransform
+Transforming dependency-check-core-8.2.1.jar (org.owasp:dependency-check-core:8.2.1) with InstrumentationAnalysisTransform
+Transforming dependency-check-utils-8.2.1.jar (org.owasp:dependency-check-utils:8.2.1) with InstrumentationAnalysisTransform
+Transforming cpe-parser-2.0.2.jar (us.springett:cpe-parser:2.0.2) with InstrumentationAnalysisTransform
+Transforming velocity-engine-core-2.3.jar (org.apache.velocity:velocity-engine-core:2.3) with InstrumentationAnalysisTransform
+Transforming ossindex-service-client-1.8.2.jar (org.sonatype.ossindex:ossindex-service-client:1.8.2) with InstrumentationAnalysisTransform
+Transforming packager-rpm-0.19.0.jar (org.eclipse.packager:packager-rpm:0.19.0) with InstrumentationAnalysisTransform
+Transforming solstice-1.7.5.jar (dev.equo.ide:solstice:1.7.5) with InstrumentationAnalysisTransform
+Transforming ossindex-service-api-1.8.2.jar (org.sonatype.ossindex:ossindex-service-api:1.8.2) with InstrumentationAnalysisTransform
+Transforming jcl-over-slf4j-1.7.28.jar (org.slf4j:jcl-over-slf4j:1.7.28) with InstrumentationAnalysisTransform
+Transforming slf4j-api-1.7.36.jar (org.slf4j:slf4j-api:1.7.36) with InstrumentationAnalysisTransform
+Transforming moshi-kotlin-1.12.0.jar (com.squareup.moshi:moshi-kotlin:1.12.0) with InstrumentationAnalysisTransform
+Transforming kotlin-reflect-1.8.20.jar (org.jetbrains.kotlin:kotlin-reflect:1.8.20) with InstrumentationAnalysisTransform
+Transforming moshi-1.12.0.jar (com.squareup.moshi:moshi:1.12.0) with InstrumentationAnalysisTransform
+Transforming okhttp-4.12.0.jar (com.squareup.okhttp3:okhttp:4.12.0) with InstrumentationAnalysisTransform
+Transforming okio-jvm-3.6.0.jar (com.squareup.okio:okio-jvm:3.6.0) with InstrumentationAnalysisTransform
+Transforming kotlin-stdlib-jdk7-1.9.10.jar (org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.9.10) with InstrumentationAnalysisTransform
+Transforming kotlin-stdlib-2.0.21.jar (org.jetbrains.kotlin:kotlin-stdlib:2.0.21) with InstrumentationAnalysisTransform
+Transforming kotlin-stdlib-jdk8-1.9.10.jar (org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.9.10) with InstrumentationAnalysisTransform
+Transforming xstream-1.4.20.jar (com.thoughtworks.xstream:xstream:1.4.20) with InstrumentationAnalysisTransform
+Transforming slack-webhook-1.4.0.jar (net.gpedro.integrations.slack:slack-webhook:1.4.0) with InstrumentationAnalysisTransform
+Transforming commons-text-1.10.0.jar (org.apache.commons:commons-text:1.10.0) with InstrumentationAnalysisTransform
+Transforming commons-lang3-3.14.0.jar (org.apache.commons:commons-lang3:3.14.0) with InstrumentationAnalysisTransform
+Transforming commons-io-2.11.0.jar (commons-io:commons-io:2.11.0) with InstrumentationAnalysisTransform
+Transforming jdom2-2.0.6.1.jar (org.jdom:jdom2:2.0.6.1) with InstrumentationAnalysisTransform
+Transforming asm-commons-9.4.jar (org.ow2.asm:asm-commons:9.4) with InstrumentationAnalysisTransform
+Transforming asm-tree-9.4.jar (org.ow2.asm:asm-tree:9.4) with InstrumentationAnalysisTransform
+Transforming asm-9.4.jar (org.ow2.asm:asm:9.4) with InstrumentationAnalysisTransform
+Transforming ant-1.10.13.jar (org.apache.ant:ant:1.10.13) with InstrumentationAnalysisTransform
+Transforming plexus-utils-3.5.0.jar (org.codehaus.plexus:plexus-utils:3.5.0) with InstrumentationAnalysisTransform
+Transforming jdependency-2.8.0.jar (org.vafer:jdependency:2.8.0) with InstrumentationAnalysisTransform
+Transforming durian-io-1.2.0.jar (com.diffplug.durian:durian-io:1.2.0) with InstrumentationAnalysisTransform
+Transforming durian-collect-1.2.0.jar (com.diffplug.durian:durian-collect:1.2.0) with InstrumentationAnalysisTransform
+Transforming durian-core-1.2.0.jar (com.diffplug.durian:durian-core:1.2.0) with InstrumentationAnalysisTransform
+Transforming spotless-lib-2.45.0.jar (com.diffplug.spotless:spotless-lib:2.45.0) with InstrumentationAnalysisTransform
+Transforming mxparser-1.2.2.jar (io.github.x-stream:mxparser:1.2.2) with InstrumentationAnalysisTransform
+Transforming jdiagnostics-1.0.7.jar (org.anarres.jdiagnostics:jdiagnostics:1.0.7) with InstrumentationAnalysisTransform
+Transforming pecoff4j-0.0.2.1.jar (org.whitesource:pecoff4j:0.0.2.1) with InstrumentationAnalysisTransform
+Transforming commons-jcs-core-2.2.1.jar (org.apache.commons:commons-jcs-core:2.2.1) with InstrumentationAnalysisTransform
+Transforming packageurl-java-1.4.1.jar (com.github.package-url:packageurl-java:1.4.1) with InstrumentationAnalysisTransform
+Transforming semver4j-4.3.0.jar (org.semver4j:semver4j:4.3.0) with InstrumentationAnalysisTransform
+Transforming commons-collections4-4.4.jar (org.apache.commons:commons-collections4:4.4) with InstrumentationAnalysisTransform
+Transforming commons-compress-1.23.0.jar (org.apache.commons:commons-compress:1.23.0) with InstrumentationAnalysisTransform
+Transforming commons-dbcp2-2.9.0.jar (org.apache.commons:commons-dbcp2:2.9.0) with InstrumentationAnalysisTransform
+Transforming lucene-analyzers-common-8.11.2.jar (org.apache.lucene:lucene-analyzers-common:8.11.2) with InstrumentationAnalysisTransform
+Transforming lucene-queryparser-8.11.2.jar (org.apache.lucene:lucene-queryparser:8.11.2) with InstrumentationAnalysisTransform
+Transforming lucene-core-8.11.2.jar (org.apache.lucene:lucene-core:8.11.2) with InstrumentationAnalysisTransform
+Transforming h2-2.1.214.jar (com.h2database:h2:2.1.214) with InstrumentationAnalysisTransform
+Transforming javax.json-1.1.4.jar (org.glassfish:javax.json:1.1.4) with InstrumentationAnalysisTransform
+Transforming jsoup-1.15.4.jar (org.jsoup:jsoup:1.15.4) with InstrumentationAnalysisTransform
+Transforming jackson-module-blackbird-2.14.2.jar (com.fasterxml.jackson.module:jackson-module-blackbird:2.14.2) with InstrumentationAnalysisTransform
+Transforming jackson-dataformat-yaml-2.14.2.jar (com.fasterxml.jackson.dataformat:jackson-dataformat-yaml:2.14.2) with InstrumentationAnalysisTransform
+Transforming jackson-annotations-2.14.2.jar (com.fasterxml.jackson.core:jackson-annotations:2.14.2) with InstrumentationAnalysisTransform
+Transforming jackson-core-2.14.2.jar (com.fasterxml.jackson.core:jackson-core:2.14.2) with InstrumentationAnalysisTransform
+Transforming jackson-module-afterburner-2.14.2.jar (com.fasterxml.jackson.module:jackson-module-afterburner:2.14.2) with InstrumentationAnalysisTransform
+Transforming jackson-databind-2.14.2.jar (com.fasterxml.jackson.core:jackson-databind:2.14.2) with InstrumentationAnalysisTransform
+Transforming retirejs-core-3.0.4.jar (com.h3xstream.retirejs:retirejs-core:3.0.4) with InstrumentationAnalysisTransform
+Transforming guava-31.1-jre.jar (com.google.guava:guava:31.1-jre) with InstrumentationAnalysisTransform
+Transforming toml4j-0.7.2.jar (com.moandjiezana.toml:toml4j:0.7.2) with InstrumentationAnalysisTransform
+Transforming aho-corasick-double-array-trie-1.2.3.jar (com.hankcs:aho-corasick-double-array-trie:1.2.3) with InstrumentationAnalysisTransform
+Transforming commons-validator-1.7.jar (commons-validator:commons-validator:1.7) with InstrumentationAnalysisTransform
+Transforming commons-beanutils-1.9.4.jar (commons-beanutils:commons-beanutils:1.9.4) with InstrumentationAnalysisTransform
+Transforming gson-2.9.0.jar (com.google.code.gson:gson:2.9.0) with InstrumentationAnalysisTransform
+Transforming annotations-13.0.jar (org.jetbrains:annotations:13.0) with InstrumentationAnalysisTransform
+Transforming ant-launcher-1.10.13.jar (org.apache.ant:ant-launcher:1.10.13) with InstrumentationAnalysisTransform
+Transforming log4j-api-2.20.0.jar (org.apache.logging.log4j:log4j-api:2.20.0) with InstrumentationAnalysisTransform
+Transforming commons-codec-1.16.0.jar (commons-codec:commons-codec:1.16.0) with InstrumentationAnalysisTransform
+Transforming concurrent-trees-2.6.1.jar (com.googlecode.concurrent-trees:concurrent-trees:2.6.1) with InstrumentationAnalysisTransform
+Transforming xmlpull-1.1.3.1.jar (xmlpull:xmlpull:1.1.3.1) with InstrumentationAnalysisTransform
+Transforming commons-logging-1.2.jar (commons-logging:commons-logging:1.2) with InstrumentationAnalysisTransform
+Transforming commons-pool2-2.10.0.jar (org.apache.commons:commons-pool2:2.10.0) with InstrumentationAnalysisTransform
+Transforming lucene-queries-8.11.2.jar (org.apache.lucene:lucene-queries:8.11.2) with InstrumentationAnalysisTransform
+Transforming lucene-sandbox-8.11.2.jar (org.apache.lucene:lucene-sandbox:8.11.2) with InstrumentationAnalysisTransform
+Transforming snakeyaml-1.33.jar (org.yaml:snakeyaml:1.33) with InstrumentationAnalysisTransform
+Transforming android-json-0.0.20131108.vaadin1.jar (com.vaadin.external.google:android-json:0.0.20131108.vaadin1) with InstrumentationAnalysisTransform
+Transforming minlog-1.3.1.jar (com.esotericsoftware:minlog:1.3.1) with InstrumentationAnalysisTransform
+Transforming compiler-0.9.6.jar (com.github.spullara.mustache.java:compiler:0.9.6) with InstrumentationAnalysisTransform
+Transforming javax.inject-1.jar (javax.inject:javax.inject:1) with InstrumentationAnalysisTransform
+Transforming joda-time-2.10.4.jar (joda-time:joda-time:2.10.4) with InstrumentationAnalysisTransform
+Transforming jaxb-api-2.3.1.jar (javax.xml.bind:jaxb-api:2.3.1) with InstrumentationAnalysisTransform
+Transforming failureaccess-1.0.1.jar (com.google.guava:failureaccess:1.0.1) with InstrumentationAnalysisTransform
+Transforming listenablefuture-9999.0-empty-to-avoid-conflict-with-guava.jar (com.google.guava:listenablefuture:9999.0-empty-to-avoid-conflict-with-guava) with InstrumentationAnalysisTransform
+Transforming jsr305-3.0.2.jar (com.google.code.findbugs:jsr305:3.0.2) with InstrumentationAnalysisTransform
+Transforming checker-qual-3.12.0.jar (org.checkerframework:checker-qual:3.12.0) with InstrumentationAnalysisTransform
+Transforming error_prone_annotations-2.11.0.jar (com.google.errorprone:error_prone_annotations:2.11.0) with InstrumentationAnalysisTransform
+Transforming j2objc-annotations-1.3.jar (com.google.j2objc:j2objc-annotations:1.3) with InstrumentationAnalysisTransform
+Transforming commons-digester-2.1.jar (commons-digester:commons-digester:2.1) with InstrumentationAnalysisTransform
+Transforming commons-collections-3.2.2.jar (commons-collections:commons-collections:3.2.2) with InstrumentationAnalysisTransform
+Transforming packager-core-0.19.0.jar (org.eclipse.packager:packager-core:0.19.0) with InstrumentationAnalysisTransform
+Transforming xz-1.9.jar (org.tukaani:xz:1.9) with InstrumentationAnalysisTransform
+Transforming durian-swt.os-4.2.2.jar (com.diffplug.durian:durian-swt.os:4.2.2) with InstrumentationAnalysisTransform
+Transforming org.eclipse.osgi-3.18.300.jar (org.eclipse.platform:org.eclipse.osgi:3.18.300) with InstrumentationAnalysisTransform
+Transforming javax.ws.rs-api-2.0.1.jar (javax.ws.rs:javax.ws.rs-api:2.0.1) with InstrumentationAnalysisTransform
+Transforming package-url-java-1.1.1.jar (org.sonatype.goodies:package-url-java:1.1.1) with InstrumentationAnalysisTransform
+Transforming javax.activation-api-1.2.0.jar (javax.activation:javax.activation-api:1.2.0) with InstrumentationAnalysisTransform
+Transforming bcpg-jdk18on-1.71.jar (org.bouncycastle:bcpg-jdk18on:1.71) with InstrumentationAnalysisTransform
+Transforming bcprov-jdk18on-1.71.jar (org.bouncycastle:bcprov-jdk18on:1.71) with InstrumentationAnalysisTransform
+Transforming grgit-core-4.1.1.jar (org.ajoberstar.grgit:grgit-core:4.1.1) with InstrumentationAnalysisTransform
+Transforming grgit-core-4.1.1.jar (org.ajoberstar.grgit:grgit-core:4.1.1) with MergeInstrumentationAnalysisTransform
+Transforming shadow-8.1.0.jar (com.github.johnrengelman:shadow:8.1.0) with InstrumentationAnalysisTransform
+Transforming shadow-8.1.0.jar (com.github.johnrengelman:shadow:8.1.0) with MergeInstrumentationAnalysisTransform
+Transforming log4j-core-2.20.0.jar (org.apache.logging.log4j:log4j-core:2.20.0) with InstrumentationAnalysisTransform
+Transforming log4j-core-2.20.0.jar (org.apache.logging.log4j:log4j-core:2.20.0) with MergeInstrumentationAnalysisTransform
+Transforming grgit-core-4.1.1.jar (org.ajoberstar.grgit:grgit-core:4.1.1) with ExternalDependencyInstrumentingArtifactTransform
+Transforming spotless-plugin-gradle-6.25.0.jar (com.diffplug.spotless:spotless-plugin-gradle:6.25.0) with InstrumentationAnalysisTransform
+Transforming spotless-plugin-gradle-6.25.0.jar (com.diffplug.spotless:spotless-plugin-gradle:6.25.0) with MergeInstrumentationAnalysisTransform
+Transforming shadow-8.1.0.jar (com.github.johnrengelman:shadow:8.1.0) with ExternalDependencyInstrumentingArtifactTransform
+Transforming log4j-core-2.20.0.jar (org.apache.logging.log4j:log4j-core:2.20.0) with ExternalDependencyInstrumentingArtifactTransform
+Transforming spotless-lib-extra-2.45.0.jar (com.diffplug.spotless:spotless-lib-extra:2.45.0) with InstrumentationAnalysisTransform
+Transforming spotless-lib-extra-2.45.0.jar (com.diffplug.spotless:spotless-lib-extra:2.45.0) with MergeInstrumentationAnalysisTransform
+Transforming org.eclipse.jgit-6.7.0.202309050840-r.jar (org.eclipse.jgit:org.eclipse.jgit:6.7.0.202309050840-r) with InstrumentationAnalysisTransform
+Transforming org.eclipse.jgit-6.7.0.202309050840-r.jar (org.eclipse.jgit:org.eclipse.jgit:6.7.0.202309050840-r) with MergeInstrumentationAnalysisTransform
+Transforming gradle-versions-plugin-0.48.0.jar (com.github.ben-manes:gradle-versions-plugin:0.48.0) with InstrumentationAnalysisTransform
+Transforming gradle-versions-plugin-0.48.0.jar (com.github.ben-manes:gradle-versions-plugin:0.48.0) with MergeInstrumentationAnalysisTransform
+Transforming dependency-check-gradle-8.2.1.jar (org.owasp:dependency-check-gradle:8.2.1) with InstrumentationAnalysisTransform
+Transforming dependency-check-gradle-8.2.1.jar (org.owasp:dependency-check-gradle:8.2.1) with MergeInstrumentationAnalysisTransform
+Transforming creadur-rat-gradle-0.8.1.jar (org.nosphere.apache:creadur-rat-gradle:0.8.1) with InstrumentationAnalysisTransform
+Transforming creadur-rat-gradle-0.8.1.jar (org.nosphere.apache:creadur-rat-gradle:0.8.1) with MergeInstrumentationAnalysisTransform
+Transforming spotless-plugin-gradle-6.25.0.jar (com.diffplug.spotless:spotless-plugin-gradle:6.25.0) with ExternalDependencyInstrumentingArtifactTransform
+Transforming spotless-lib-extra-2.45.0.jar (com.diffplug.spotless:spotless-lib-extra:2.45.0) with ExternalDependencyInstrumentingArtifactTransform
+Transforming org.eclipse.jgit-6.7.0.202309050840-r.jar (org.eclipse.jgit:org.eclipse.jgit:6.7.0.202309050840-r) with ExternalDependencyInstrumentingArtifactTransform
+Transforming gradle-versions-plugin-0.48.0.jar (com.github.ben-manes:gradle-versions-plugin:0.48.0) with ExternalDependencyInstrumentingArtifactTransform
+Transforming dependency-check-gradle-8.2.1.jar (org.owasp:dependency-check-gradle:8.2.1) with ExternalDependencyInstrumentingArtifactTransform
+Transforming creadur-rat-gradle-0.8.1.jar (org.nosphere.apache:creadur-rat-gradle:0.8.1) with ExternalDependencyInstrumentingArtifactTransform
+Transforming swagger-gradle-plugin-2.2.25.jar (io.swagger.core.v3:swagger-gradle-plugin:2.2.25) with InstrumentationAnalysisTransform
+Transforming swagger-gradle-plugin-2.2.25.jar (io.swagger.core.v3:swagger-gradle-plugin:2.2.25) with MergeInstrumentationAnalysisTransform
+Transforming spotbugs-gradle-plugin-6.0.25.jar (com.github.spotbugs.snom:spotbugs-gradle-plugin:6.0.25) with InstrumentationAnalysisTransform
+Transforming spotbugs-gradle-plugin-6.0.25.jar (com.github.spotbugs.snom:spotbugs-gradle-plugin:6.0.25) with MergeInstrumentationAnalysisTransform
+Transforming swagger-gradle-plugin-2.2.25.jar (io.swagger.core.v3:swagger-gradle-plugin:2.2.25) with ExternalDependencyInstrumentingArtifactTransform
+Transforming gradle-scoverage-8.0.3.jar (org.scoverage:gradle-scoverage:8.0.3) with InstrumentationAnalysisTransform
+Transforming gradle-scoverage-8.0.3.jar (org.scoverage:gradle-scoverage:8.0.3) with MergeInstrumentationAnalysisTransform
+Transforming spotbugs-gradle-plugin-6.0.25.jar (com.github.spotbugs.snom:spotbugs-gradle-plugin:6.0.25) with ExternalDependencyInstrumentingArtifactTransform
+Transforming JavaEWAH-1.2.3.jar (com.googlecode.javaewah:JavaEWAH:1.2.3) with InstrumentationAnalysisTransform
+Transforming JavaEWAH-1.2.3.jar (com.googlecode.javaewah:JavaEWAH:1.2.3) with MergeInstrumentationAnalysisTransform
+Transforming gradle-scoverage-8.0.3.jar (org.scoverage:gradle-scoverage:8.0.3) with ExternalDependencyInstrumentingArtifactTransform
+Transforming dependency-check-core-8.2.1.jar (org.owasp:dependency-check-core:8.2.1) with InstrumentationAnalysisTransform
+Transforming dependency-check-core-8.2.1.jar (org.owasp:dependency-check-core:8.2.1) with MergeInstrumentationAnalysisTransform
+Transforming JavaEWAH-1.2.3.jar (com.googlecode.javaewah:JavaEWAH:1.2.3) with ExternalDependencyInstrumentingArtifactTransform
+Transforming dependency-check-utils-8.2.1.jar (org.owasp:dependency-check-utils:8.2.1) with InstrumentationAnalysisTransform
+Transforming dependency-check-utils-8.2.1.jar (org.owasp:dependency-check-utils:8.2.1) with MergeInstrumentationAnalysisTransform
+Transforming dependency-check-core-8.2.1.jar (org.owasp:dependency-check-core:8.2.1) with ExternalDependencyInstrumentingArtifactTransform
+Transforming cpe-parser-2.0.2.jar (us.springett:cpe-parser:2.0.2) with InstrumentationAnalysisTransform
+Transforming cpe-parser-2.0.2.jar (us.springett:cpe-parser:2.0.2) with MergeInstrumentationAnalysisTransform
+Transforming velocity-engine-core-2.3.jar (org.apache.velocity:velocity-engine-core:2.3) with InstrumentationAnalysisTransform
+Transforming velocity-engine-core-2.3.jar (org.apache.velocity:velocity-engine-core:2.3) with MergeInstrumentationAnalysisTransform
+Transforming ossindex-service-client-1.8.2.jar (org.sonatype.ossindex:ossindex-service-client:1.8.2) with InstrumentationAnalysisTransform
+Transforming ossindex-service-client-1.8.2.jar (org.sonatype.ossindex:ossindex-service-client:1.8.2) with MergeInstrumentationAnalysisTransform
+Transforming packager-rpm-0.19.0.jar (org.eclipse.packager:packager-rpm:0.19.0) with InstrumentationAnalysisTransform
+Transforming packager-rpm-0.19.0.jar (org.eclipse.packager:packager-rpm:0.19.0) with MergeInstrumentationAnalysisTransform
+Transforming solstice-1.7.5.jar (dev.equo.ide:solstice:1.7.5) with InstrumentationAnalysisTransform
+Transforming solstice-1.7.5.jar (dev.equo.ide:solstice:1.7.5) with MergeInstrumentationAnalysisTransform
+Transforming ossindex-service-api-1.8.2.jar (org.sonatype.ossindex:ossindex-service-api:1.8.2) with InstrumentationAnalysisTransform
+Transforming ossindex-service-api-1.8.2.jar (org.sonatype.ossindex:ossindex-service-api:1.8.2) with MergeInstrumentationAnalysisTransform
+Transforming jcl-over-slf4j-1.7.28.jar (org.slf4j:jcl-over-slf4j:1.7.28) with InstrumentationAnalysisTransform
+Transforming jcl-over-slf4j-1.7.28.jar (org.slf4j:jcl-over-slf4j:1.7.28) with MergeInstrumentationAnalysisTransform
+Transforming slf4j-api-1.7.36.jar (org.slf4j:slf4j-api:1.7.36) with InstrumentationAnalysisTransform
+Transforming slf4j-api-1.7.36.jar (org.slf4j:slf4j-api:1.7.36) with MergeInstrumentationAnalysisTransform
+Transforming moshi-kotlin-1.12.0.jar (com.squareup.moshi:moshi-kotlin:1.12.0) with InstrumentationAnalysisTransform
+Transforming dependency-check-utils-8.2.1.jar (org.owasp:dependency-check-utils:8.2.1) with ExternalDependencyInstrumentingArtifactTransform
+Transforming velocity-engine-core-2.3.jar (org.apache.velocity:velocity-engine-core:2.3) with ExternalDependencyInstrumentingArtifactTransform
+Transforming cpe-parser-2.0.2.jar (us.springett:cpe-parser:2.0.2) with ExternalDependencyInstrumentingArtifactTransform
+Transforming ossindex-service-client-1.8.2.jar (org.sonatype.ossindex:ossindex-service-client:1.8.2) with ExternalDependencyInstrumentingArtifactTransform
+Transforming packager-rpm-0.19.0.jar (org.eclipse.packager:packager-rpm:0.19.0) with ExternalDependencyInstrumentingArtifactTransform
+Transforming solstice-1.7.5.jar (dev.equo.ide:solstice:1.7.5) with ExternalDependencyInstrumentingArtifactTransform
+Transforming ossindex-service-api-1.8.2.jar (org.sonatype.ossindex:ossindex-service-api:1.8.2) with ExternalDependencyInstrumentingArtifactTransform
+Transforming jcl-over-slf4j-1.7.28.jar (org.slf4j:jcl-over-slf4j:1.7.28) with ExternalDependencyInstrumentingArtifactTransform
+Transforming slf4j-api-1.7.36.jar (org.slf4j:slf4j-api:1.7.36) with ExternalDependencyInstrumentingArtifactTransform
+Transforming moshi-kotlin-1.12.0.jar (com.squareup.moshi:moshi-kotlin:1.12.0) with MergeInstrumentationAnalysisTransform
+Transforming kotlin-reflect-1.8.20.jar (org.jetbrains.kotlin:kotlin-reflect:1.8.20) with InstrumentationAnalysisTransform
+Transforming kotlin-reflect-1.8.20.jar (org.jetbrains.kotlin:kotlin-reflect:1.8.20) with MergeInstrumentationAnalysisTransform
+Transforming moshi-1.12.0.jar (com.squareup.moshi:moshi:1.12.0) with InstrumentationAnalysisTransform
+Transforming moshi-1.12.0.jar (com.squareup.moshi:moshi:1.12.0) with MergeInstrumentationAnalysisTransform
+Transforming okhttp-4.12.0.jar (com.squareup.okhttp3:okhttp:4.12.0) with InstrumentationAnalysisTransform
+Transforming okhttp-4.12.0.jar (com.squareup.okhttp3:okhttp:4.12.0) with MergeInstrumentationAnalysisTransform
+Transforming okio-jvm-3.6.0.jar (com.squareup.okio:okio-jvm:3.6.0) with InstrumentationAnalysisTransform
+Transforming okio-jvm-3.6.0.jar (com.squareup.okio:okio-jvm:3.6.0) with MergeInstrumentationAnalysisTransform
+Transforming kotlin-stdlib-jdk7-1.9.10.jar (org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.9.10) with InstrumentationAnalysisTransform
+Transforming kotlin-stdlib-jdk7-1.9.10.jar (org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.9.10) with MergeInstrumentationAnalysisTransform
+Transforming kotlin-stdlib-2.0.21.jar (org.jetbrains.kotlin:kotlin-stdlib:2.0.21) with InstrumentationAnalysisTransform
+Transforming kotlin-stdlib-2.0.21.jar (org.jetbrains.kotlin:kotlin-stdlib:2.0.21) with MergeInstrumentationAnalysisTransform
+Transforming kotlin-stdlib-jdk8-1.9.10.jar (org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.9.10) with InstrumentationAnalysisTransform
+Transforming kotlin-stdlib-jdk8-1.9.10.jar (org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.9.10) with MergeInstrumentationAnalysisTransform
+Transforming xstream-1.4.20.jar (com.thoughtworks.xstream:xstream:1.4.20) with InstrumentationAnalysisTransform
+Transforming xstream-1.4.20.jar (com.thoughtworks.xstream:xstream:1.4.20) with MergeInstrumentationAnalysisTransform
+Transforming slack-webhook-1.4.0.jar (net.gpedro.integrations.slack:slack-webhook:1.4.0) with InstrumentationAnalysisTransform
+Transforming slack-webhook-1.4.0.jar (net.gpedro.integrations.slack:slack-webhook:1.4.0) with MergeInstrumentationAnalysisTransform
+Transforming commons-text-1.10.0.jar (org.apache.commons:commons-text:1.10.0) with InstrumentationAnalysisTransform
+Transforming commons-text-1.10.0.jar (org.apache.commons:commons-text:1.10.0) with MergeInstrumentationAnalysisTransform
+Transforming commons-lang3-3.14.0.jar (org.apache.commons:commons-lang3:3.14.0) with InstrumentationAnalysisTransform
+Transforming commons-lang3-3.14.0.jar (org.apache.commons:commons-lang3:3.14.0) with MergeInstrumentationAnalysisTransform
+Transforming commons-io-2.11.0.jar (commons-io:commons-io:2.11.0) with InstrumentationAnalysisTransform
+Transforming commons-io-2.11.0.jar (commons-io:commons-io:2.11.0) with MergeInstrumentationAnalysisTransform
+Transforming jdom2-2.0.6.1.jar (org.jdom:jdom2:2.0.6.1) with InstrumentationAnalysisTransform
+Transforming jdom2-2.0.6.1.jar (org.jdom:jdom2:2.0.6.1) with MergeInstrumentationAnalysisTransform
+Transforming asm-commons-9.4.jar (org.ow2.asm:asm-commons:9.4) with InstrumentationAnalysisTransform
+Transforming asm-commons-9.4.jar (org.ow2.asm:asm-commons:9.4) with MergeInstrumentationAnalysisTransform
+Transforming asm-tree-9.4.jar (org.ow2.asm:asm-tree:9.4) with InstrumentationAnalysisTransform
+Transforming asm-tree-9.4.jar (org.ow2.asm:asm-tree:9.4) with MergeInstrumentationAnalysisTransform
+Transforming asm-9.4.jar (org.ow2.asm:asm:9.4) with InstrumentationAnalysisTransform
+Transforming asm-9.4.jar (org.ow2.asm:asm:9.4) with MergeInstrumentationAnalysisTransform
+Transforming ant-1.10.13.jar (org.apache.ant:ant:1.10.13) with InstrumentationAnalysisTransform
+Transforming ant-1.10.13.jar (org.apache.ant:ant:1.10.13) with MergeInstrumentationAnalysisTransform
+Transforming plexus-utils-3.5.0.jar (org.codehaus.plexus:plexus-utils:3.5.0) with InstrumentationAnalysisTransform
+Transforming plexus-utils-3.5.0.jar (org.codehaus.plexus:plexus-utils:3.5.0) with MergeInstrumentationAnalysisTransform
+Transforming jdependency-2.8.0.jar (org.vafer:jdependency:2.8.0) with InstrumentationAnalysisTransform
+Transforming jdependency-2.8.0.jar (org.vafer:jdependency:2.8.0) with MergeInstrumentationAnalysisTransform
+Transforming durian-io-1.2.0.jar (com.diffplug.durian:durian-io:1.2.0) with InstrumentationAnalysisTransform
+Transforming durian-io-1.2.0.jar (com.diffplug.durian:durian-io:1.2.0) with MergeInstrumentationAnalysisTransform
+Transforming durian-collect-1.2.0.jar (com.diffplug.durian:durian-collect:1.2.0) with InstrumentationAnalysisTransform
+Transforming durian-collect-1.2.0.jar (com.diffplug.durian:durian-collect:1.2.0) with MergeInstrumentationAnalysisTransform
+Transforming durian-core-1.2.0.jar (com.diffplug.durian:durian-core:1.2.0) with InstrumentationAnalysisTransform
+Transforming durian-core-1.2.0.jar (com.diffplug.durian:durian-core:1.2.0) with MergeInstrumentationAnalysisTransform
+Transforming spotless-lib-2.45.0.jar (com.diffplug.spotless:spotless-lib:2.45.0) with InstrumentationAnalysisTransform
+Transforming spotless-lib-2.45.0.jar (com.diffplug.spotless:spotless-lib:2.45.0) with MergeInstrumentationAnalysisTransform
+Transforming mxparser-1.2.2.jar (io.github.x-stream:mxparser:1.2.2) with InstrumentationAnalysisTransform
+Transforming mxparser-1.2.2.jar (io.github.x-stream:mxparser:1.2.2) with MergeInstrumentationAnalysisTransform
+Transforming jdiagnostics-1.0.7.jar (org.anarres.jdiagnostics:jdiagnostics:1.0.7) with InstrumentationAnalysisTransform
+Transforming jdiagnostics-1.0.7.jar (org.anarres.jdiagnostics:jdiagnostics:1.0.7) with MergeInstrumentationAnalysisTransform
+Transforming pecoff4j-0.0.2.1.jar (org.whitesource:pecoff4j:0.0.2.1) with InstrumentationAnalysisTransform
+Transforming pecoff4j-0.0.2.1.jar (org.whitesource:pecoff4j:0.0.2.1) with MergeInstrumentationAnalysisTransform
+Transforming commons-jcs-core-2.2.1.jar (org.apache.commons:commons-jcs-core:2.2.1) with InstrumentationAnalysisTransform
+Transforming commons-jcs-core-2.2.1.jar (org.apache.commons:commons-jcs-core:2.2.1) with MergeInstrumentationAnalysisTransform
+Transforming packageurl-java-1.4.1.jar (com.github.package-url:packageurl-java:1.4.1) with InstrumentationAnalysisTransform
+Transforming packageurl-java-1.4.1.jar (com.github.package-url:packageurl-java:1.4.1) with MergeInstrumentationAnalysisTransform
+Transforming semver4j-4.3.0.jar (org.semver4j:semver4j:4.3.0) with InstrumentationAnalysisTransform
+Transforming moshi-kotlin-1.12.0.jar (com.squareup.moshi:moshi-kotlin:1.12.0) with ExternalDependencyInstrumentingArtifactTransform
+Transforming kotlin-reflect-1.8.20.jar (org.jetbrains.kotlin:kotlin-reflect:1.8.20) with ExternalDependencyInstrumentingArtifactTransform
+Transforming moshi-1.12.0.jar (com.squareup.moshi:moshi:1.12.0) with ExternalDependencyInstrumentingArtifactTransform
+Transforming okhttp-4.12.0.jar (com.squareup.okhttp3:okhttp:4.12.0) with ExternalDependencyInstrumentingArtifactTransform
+Transforming okio-jvm-3.6.0.jar (com.squareup.okio:okio-jvm:3.6.0) with ExternalDependencyInstrumentingArtifactTransform
+Transforming kotlin-stdlib-jdk7-1.9.10.jar (org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.9.10) with ExternalDependencyInstrumentingArtifactTransform
+Transforming kotlin-stdlib-2.0.21.jar (org.jetbrains.kotlin:kotlin-stdlib:2.0.21) with ExternalDependencyInstrumentingArtifactTransform
+Transforming xstream-1.4.20.jar (com.thoughtworks.xstream:xstream:1.4.20) with ExternalDependencyInstrumentingArtifactTransform
+Transforming semver4j-4.3.0.jar (org.semver4j:semver4j:4.3.0) with MergeInstrumentationAnalysisTransform
+Transforming commons-collections4-4.4.jar (org.apache.commons:commons-collections4:4.4) with InstrumentationAnalysisTransform
+Transforming commons-collections4-4.4.jar (org.apache.commons:commons-collections4:4.4) with MergeInstrumentationAnalysisTransform
+Transforming commons-compress-1.23.0.jar (org.apache.commons:commons-compress:1.23.0) with InstrumentationAnalysisTransform
+Transforming commons-compress-1.23.0.jar (org.apache.commons:commons-compress:1.23.0) with MergeInstrumentationAnalysisTransform
+Transforming commons-dbcp2-2.9.0.jar (org.apache.commons:commons-dbcp2:2.9.0) with InstrumentationAnalysisTransform
+Transforming commons-dbcp2-2.9.0.jar (org.apache.commons:commons-dbcp2:2.9.0) with MergeInstrumentationAnalysisTransform
+Transforming lucene-analyzers-common-8.11.2.jar (org.apache.lucene:lucene-analyzers-common:8.11.2) with InstrumentationAnalysisTransform
+Transforming lucene-analyzers-common-8.11.2.jar (org.apache.lucene:lucene-analyzers-common:8.11.2) with MergeInstrumentationAnalysisTransform
+Transforming lucene-queryparser-8.11.2.jar (org.apache.lucene:lucene-queryparser:8.11.2) with InstrumentationAnalysisTransform
+Transforming lucene-queryparser-8.11.2.jar (org.apache.lucene:lucene-queryparser:8.11.2) with MergeInstrumentationAnalysisTransform
+Transforming lucene-core-8.11.2.jar (org.apache.lucene:lucene-core:8.11.2) with InstrumentationAnalysisTransform
+Transforming lucene-core-8.11.2.jar (org.apache.lucene:lucene-core:8.11.2) with MergeInstrumentationAnalysisTransform
+Transforming h2-2.1.214.jar (com.h2database:h2:2.1.214) with InstrumentationAnalysisTransform
+Transforming h2-2.1.214.jar (com.h2database:h2:2.1.214) with MergeInstrumentationAnalysisTransform
+Transforming javax.json-1.1.4.jar (org.glassfish:javax.json:1.1.4) with InstrumentationAnalysisTransform
+Transforming javax.json-1.1.4.jar (org.glassfish:javax.json:1.1.4) with MergeInstrumentationAnalysisTransform
+Transforming jsoup-1.15.4.jar (org.jsoup:jsoup:1.15.4) with InstrumentationAnalysisTransform
+Transforming jsoup-1.15.4.jar (org.jsoup:jsoup:1.15.4) with MergeInstrumentationAnalysisTransform
+Transforming jackson-module-blackbird-2.14.2.jar (com.fasterxml.jackson.module:jackson-module-blackbird:2.14.2) with InstrumentationAnalysisTransform
+Transforming kotlin-stdlib-jdk8-1.9.10.jar (org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.9.10) with ExternalDependencyInstrumentingArtifactTransform
+Transforming commons-lang3-3.14.0.jar (org.apache.commons:commons-lang3:3.14.0) with ExternalDependencyInstrumentingArtifactTransform
+Transforming commons-io-2.11.0.jar (commons-io:commons-io:2.11.0) with ExternalDependencyInstrumentingArtifactTransform
+Transforming jdom2-2.0.6.1.jar (org.jdom:jdom2:2.0.6.1) with ExternalDependencyInstrumentingArtifactTransform
+Transforming slack-webhook-1.4.0.jar (net.gpedro.integrations.slack:slack-webhook:1.4.0) with ExternalDependencyInstrumentingArtifactTransform
+Transforming asm-commons-9.4.jar (org.ow2.asm:asm-commons:9.4) with ExternalDependencyInstrumentingArtifactTransform
+Transforming asm-tree-9.4.jar (org.ow2.asm:asm-tree:9.4) with ExternalDependencyInstrumentingArtifactTransform
+Transforming jackson-module-blackbird-2.14.2.jar (com.fasterxml.jackson.module:jackson-module-blackbird:2.14.2) with MergeInstrumentationAnalysisTransform
+Transforming jackson-dataformat-yaml-2.14.2.jar (com.fasterxml.jackson.dataformat:jackson-dataformat-yaml:2.14.2) with InstrumentationAnalysisTransform
+Transforming jackson-dataformat-yaml-2.14.2.jar (com.fasterxml.jackson.dataformat:jackson-dataformat-yaml:2.14.2) with MergeInstrumentationAnalysisTransform
+Transforming jackson-annotations-2.14.2.jar (com.fasterxml.jackson.core:jackson-annotations:2.14.2) with InstrumentationAnalysisTransform
+Transforming jackson-annotations-2.14.2.jar (com.fasterxml.jackson.core:jackson-annotations:2.14.2) with MergeInstrumentationAnalysisTransform
+Transforming jackson-core-2.14.2.jar (com.fasterxml.jackson.core:jackson-core:2.14.2) with InstrumentationAnalysisTransform
+Transforming jackson-core-2.14.2.jar (com.fasterxml.jackson.core:jackson-core:2.14.2) with MergeInstrumentationAnalysisTransform
+Transforming jackson-module-afterburner-2.14.2.jar (com.fasterxml.jackson.module:jackson-module-afterburner:2.14.2) with InstrumentationAnalysisTransform
+Transforming jdependency-2.8.0.jar (org.vafer:jdependency:2.8.0) with ExternalDependencyInstrumentingArtifactTransform
+Transforming jackson-module-afterburner-2.14.2.jar (com.fasterxml.jackson.module:jackson-module-afterburner:2.14.2) with MergeInstrumentationAnalysisTransform
+Transforming commons-text-1.10.0.jar (org.apache.commons:commons-text:1.10.0) with ExternalDependencyInstrumentingArtifactTransform
+Transforming durian-collect-1.2.0.jar (com.diffplug.durian:durian-collect:1.2.0) with ExternalDependencyInstrumentingArtifactTransform
+Transforming durian-core-1.2.0.jar (com.diffplug.durian:durian-core:1.2.0) with ExternalDependencyInstrumentingArtifactTransform
+Transforming spotless-lib-2.45.0.jar (com.diffplug.spotless:spotless-lib:2.45.0) with ExternalDependencyInstrumentingArtifactTransform
+Transforming ant-1.10.13.jar (org.apache.ant:ant:1.10.13) with ExternalDependencyInstrumentingArtifactTransform
+Transforming jackson-databind-2.14.2.jar (com.fasterxml.jackson.core:jackson-databind:2.14.2) with InstrumentationAnalysisTransform
+Transforming jackson-databind-2.14.2.jar (com.fasterxml.jackson.core:jackson-databind:2.14.2) with MergeInstrumentationAnalysisTransform
+Transforming retirejs-core-3.0.4.jar (com.h3xstream.retirejs:retirejs-core:3.0.4) with InstrumentationAnalysisTransform
+Transforming retirejs-core-3.0.4.jar (com.h3xstream.retirejs:retirejs-core:3.0.4) with MergeInstrumentationAnalysisTransform
+Transforming guava-31.1-jre.jar (com.google.guava:guava:31.1-jre) with InstrumentationAnalysisTransform
+Transforming guava-31.1-jre.jar (com.google.guava:guava:31.1-jre) with MergeInstrumentationAnalysisTransform
+Transforming toml4j-0.7.2.jar (com.moandjiezana.toml:toml4j:0.7.2) with InstrumentationAnalysisTransform
+Transforming toml4j-0.7.2.jar (com.moandjiezana.toml:toml4j:0.7.2) with MergeInstrumentationAnalysisTransform
+Transforming aho-corasick-double-array-trie-1.2.3.jar (com.hankcs:aho-corasick-double-array-trie:1.2.3) with InstrumentationAnalysisTransform
+Transforming aho-corasick-double-array-trie-1.2.3.jar (com.hankcs:aho-corasick-double-array-trie:1.2.3) with MergeInstrumentationAnalysisTransform
+Transforming commons-validator-1.7.jar (commons-validator:commons-validator:1.7) with InstrumentationAnalysisTransform
+Transforming commons-validator-1.7.jar (commons-validator:commons-validator:1.7) with MergeInstrumentationAnalysisTransform
+Transforming commons-beanutils-1.9.4.jar (commons-beanutils:commons-beanutils:1.9.4) with InstrumentationAnalysisTransform
+Transforming commons-beanutils-1.9.4.jar (commons-beanutils:commons-beanutils:1.9.4) with MergeInstrumentationAnalysisTransform
+Transforming gson-2.9.0.jar (com.google.code.gson:gson:2.9.0) with InstrumentationAnalysisTransform
+Transforming gson-2.9.0.jar (com.google.code.gson:gson:2.9.0) with MergeInstrumentationAnalysisTransform
+Transforming annotations-13.0.jar (org.jetbrains:annotations:13.0) with InstrumentationAnalysisTransform
+Transforming annotations-13.0.jar (org.jetbrains:annotations:13.0) with MergeInstrumentationAnalysisTransform
+Transforming ant-launcher-1.10.13.jar (org.apache.ant:ant-launcher:1.10.13) with InstrumentationAnalysisTransform
+Transforming ant-launcher-1.10.13.jar (org.apache.ant:ant-launcher:1.10.13) with MergeInstrumentationAnalysisTransform
+Transforming log4j-api-2.20.0.jar (org.apache.logging.log4j:log4j-api:2.20.0) with InstrumentationAnalysisTransform
+Transforming log4j-api-2.20.0.jar (org.apache.logging.log4j:log4j-api:2.20.0) with MergeInstrumentationAnalysisTransform
+Transforming commons-codec-1.16.0.jar (commons-codec:commons-codec:1.16.0) with InstrumentationAnalysisTransform
+Transforming commons-codec-1.16.0.jar (commons-codec:commons-codec:1.16.0) with MergeInstrumentationAnalysisTransform
+Transforming concurrent-trees-2.6.1.jar (com.googlecode.concurrent-trees:concurrent-trees:2.6.1) with InstrumentationAnalysisTransform
+Transforming concurrent-trees-2.6.1.jar (com.googlecode.concurrent-trees:concurrent-trees:2.6.1) with MergeInstrumentationAnalysisTransform
+Transforming xmlpull-1.1.3.1.jar (xmlpull:xmlpull:1.1.3.1) with InstrumentationAnalysisTransform
+Transforming xmlpull-1.1.3.1.jar (xmlpull:xmlpull:1.1.3.1) with MergeInstrumentationAnalysisTransform
+Transforming commons-logging-1.2.jar (commons-logging:commons-logging:1.2) with InstrumentationAnalysisTransform
+Transforming commons-logging-1.2.jar (commons-logging:commons-logging:1.2) with MergeInstrumentationAnalysisTransform
+Transforming commons-pool2-2.10.0.jar (org.apache.commons:commons-pool2:2.10.0) with InstrumentationAnalysisTransform
+Transforming commons-pool2-2.10.0.jar (org.apache.commons:commons-pool2:2.10.0) with MergeInstrumentationAnalysisTransform
+Transforming lucene-queries-8.11.2.jar (org.apache.lucene:lucene-queries:8.11.2) with InstrumentationAnalysisTransform
+Transforming lucene-queries-8.11.2.jar (org.apache.lucene:lucene-queries:8.11.2) with MergeInstrumentationAnalysisTransform
+Transforming lucene-sandbox-8.11.2.jar (org.apache.lucene:lucene-sandbox:8.11.2) with InstrumentationAnalysisTransform
+Transforming lucene-sandbox-8.11.2.jar (org.apache.lucene:lucene-sandbox:8.11.2) with MergeInstrumentationAnalysisTransform
+Transforming snakeyaml-1.33.jar (org.yaml:snakeyaml:1.33) with InstrumentationAnalysisTransform
+Transforming snakeyaml-1.33.jar (org.yaml:snakeyaml:1.33) with MergeInstrumentationAnalysisTransform
+Transforming android-json-0.0.20131108.vaadin1.jar (com.vaadin.external.google:android-json:0.0.20131108.vaadin1) with InstrumentationAnalysisTransform
+Transforming android-json-0.0.20131108.vaadin1.jar (com.vaadin.external.google:android-json:0.0.20131108.vaadin1) with MergeInstrumentationAnalysisTransform
+Transforming minlog-1.3.1.jar (com.esotericsoftware:minlog:1.3.1) with InstrumentationAnalysisTransform
+Transforming minlog-1.3.1.jar (com.esotericsoftware:minlog:1.3.1) with MergeInstrumentationAnalysisTransform
+Transforming compiler-0.9.6.jar (com.github.spullara.mustache.java:compiler:0.9.6) with InstrumentationAnalysisTransform
+Transforming compiler-0.9.6.jar (com.github.spullara.mustache.java:compiler:0.9.6) with MergeInstrumentationAnalysisTransform
+Transforming javax.inject-1.jar (javax.inject:javax.inject:1) with InstrumentationAnalysisTransform
+Transforming javax.inject-1.jar (javax.inject:javax.inject:1) with MergeInstrumentationAnalysisTransform
+Transforming joda-time-2.10.4.jar (joda-time:joda-time:2.10.4) with InstrumentationAnalysisTransform
+Transforming joda-time-2.10.4.jar (joda-time:joda-time:2.10.4) with MergeInstrumentationAnalysisTransform
+Transforming jaxb-api-2.3.1.jar (javax.xml.bind:jaxb-api:2.3.1) with InstrumentationAnalysisTransform
+Transforming packageurl-java-1.4.1.jar (com.github.package-url:packageurl-java:1.4.1) with ExternalDependencyInstrumentingArtifactTransform
+Transforming commons-collections4-4.4.jar (org.apache.commons:commons-collections4:4.4) with ExternalDependencyInstrumentingArtifactTransform
+Transforming asm-9.4.jar (org.ow2.asm:asm:9.4) with ExternalDependencyInstrumentingArtifactTransform
+Transforming commons-compress-1.23.0.jar (org.apache.commons:commons-compress:1.23.0) with ExternalDependencyInstrumentingArtifactTransform
+Transforming commons-dbcp2-2.9.0.jar (org.apache.commons:commons-dbcp2:2.9.0) with ExternalDependencyInstrumentingArtifactTransform
+Transforming lucene-analyzers-common-8.11.2.jar (org.apache.lucene:lucene-analyzers-common:8.11.2) with ExternalDependencyInstrumentingArtifactTransform
+Transforming lucene-queryparser-8.11.2.jar (org.apache.lucene:lucene-queryparser:8.11.2) with ExternalDependencyInstrumentingArtifactTransform
+Transforming lucene-core-8.11.2.jar (org.apache.lucene:lucene-core:8.11.2) with ExternalDependencyInstrumentingArtifactTransform
+Transforming commons-jcs-core-2.2.1.jar (org.apache.commons:commons-jcs-core:2.2.1) with ExternalDependencyInstrumentingArtifactTransform
+Transforming h2-2.1.214.jar (com.h2database:h2:2.1.214) with ExternalDependencyInstrumentingArtifactTransform
+Transforming mxparser-1.2.2.jar (io.github.x-stream:mxparser:1.2.2) with ExternalDependencyInstrumentingArtifactTransform
+Transforming javax.json-1.1.4.jar (org.glassfish:javax.json:1.1.4) with ExternalDependencyInstrumentingArtifactTransform
+Transforming jackson-module-blackbird-2.14.2.jar (com.fasterxml.jackson.module:jackson-module-blackbird:2.14.2) with ExternalDependencyInstrumentingArtifactTransform
+Transforming jsoup-1.15.4.jar (org.jsoup:jsoup:1.15.4) with ExternalDependencyInstrumentingArtifactTransform
+Transforming jackson-dataformat-yaml-2.14.2.jar (com.fasterxml.jackson.dataformat:jackson-dataformat-yaml:2.14.2) with ExternalDependencyInstrumentingArtifactTransform
+Transforming jackson-core-2.14.2.jar (com.fasterxml.jackson.core:jackson-core:2.14.2) with ExternalDependencyInstrumentingArtifactTransform
+Transforming jackson-module-afterburner-2.14.2.jar (com.fasterxml.jackson.module:jackson-module-afterburner:2.14.2) with ExternalDependencyInstrumentingArtifactTransform
+Transforming jackson-databind-2.14.2.jar (com.fasterxml.jackson.core:jackson-databind:2.14.2) with ExternalDependencyInstrumentingArtifactTransform
+Transforming retirejs-core-3.0.4.jar (com.h3xstream.retirejs:retirejs-core:3.0.4) with ExternalDependencyInstrumentingArtifactTransform
+Transforming durian-io-1.2.0.jar (com.diffplug.durian:durian-io:1.2.0) with ExternalDependencyInstrumentingArtifactTransform
+Transforming aho-corasick-double-array-trie-1.2.3.jar (com.hankcs:aho-corasick-double-array-trie:1.2.3) with ExternalDependencyInstrumentingArtifactTransform
+Transforming commons-beanutils-1.9.4.jar (commons-beanutils:commons-beanutils:1.9.4) with ExternalDependencyInstrumentingArtifactTransform
+Transforming gson-2.9.0.jar (com.google.code.gson:gson:2.9.0) with ExternalDependencyInstrumentingArtifactTransform
+Transforming annotations-13.0.jar (org.jetbrains:annotations:13.0) with ExternalDependencyInstrumentingArtifactTransform
+Transforming plexus-utils-3.5.0.jar (org.codehaus.plexus:plexus-utils:3.5.0) with ExternalDependencyInstrumentingArtifactTransform
+Transforming ant-launcher-1.10.13.jar (org.apache.ant:ant-launcher:1.10.13) with ExternalDependencyInstrumentingArtifactTransform
+Transforming commons-codec-1.16.0.jar (commons-codec:commons-codec:1.16.0) with ExternalDependencyInstrumentingArtifactTransform
+Transforming concurrent-trees-2.6.1.jar (com.googlecode.concurrent-trees:concurrent-trees:2.6.1) with ExternalDependencyInstrumentingArtifactTransform
+Transforming commons-validator-1.7.jar (commons-validator:commons-validator:1.7) with ExternalDependencyInstrumentingArtifactTransform
+Transforming commons-logging-1.2.jar (commons-logging:commons-logging:1.2) with ExternalDependencyInstrumentingArtifactTransform
+Transforming commons-pool2-2.10.0.jar (org.apache.commons:commons-pool2:2.10.0) with ExternalDependencyInstrumentingArtifactTransform
+Transforming lucene-queries-8.11.2.jar (org.apache.lucene:lucene-queries:8.11.2) with ExternalDependencyInstrumentingArtifactTransform
+Transforming toml4j-0.7.2.jar (com.moandjiezana.toml:toml4j:0.7.2) with ExternalDependencyInstrumentingArtifactTransform
+Transforming snakeyaml-1.33.jar (org.yaml:snakeyaml:1.33) with ExternalDependencyInstrumentingArtifactTransform
+Transforming jaxb-api-2.3.1.jar (javax.xml.bind:jaxb-api:2.3.1) with MergeInstrumentationAnalysisTransform
+Transforming failureaccess-1.0.1.jar (com.google.guava:failureaccess:1.0.1) with InstrumentationAnalysisTransform
+Transforming failureaccess-1.0.1.jar (com.google.guava:failureaccess:1.0.1) with MergeInstrumentationAnalysisTransform
+Transforming listenablefuture-9999.0-empty-to-avoid-conflict-with-guava.jar (com.google.guava:listenablefuture:9999.0-empty-to-avoid-conflict-with-guava) with InstrumentationAnalysisTransform
+Transforming minlog-1.3.1.jar (com.esotericsoftware:minlog:1.3.1) with ExternalDependencyInstrumentingArtifactTransform
+Transforming listenablefuture-9999.0-empty-to-avoid-conflict-with-guava.jar (com.google.guava:listenablefuture:9999.0-empty-to-avoid-conflict-with-guava) with MergeInstrumentationAnalysisTransform
+Transforming guava-31.1-jre.jar (com.google.guava:guava:31.1-jre) with ExternalDependencyInstrumentingArtifactTransform
+Transforming compiler-0.9.6.jar (com.github.spullara.mustache.java:compiler:0.9.6) with ExternalDependencyInstrumentingArtifactTransform
+Transforming javax.inject-1.jar (javax.inject:javax.inject:1) with ExternalDependencyInstrumentingArtifactTransform
+Transforming joda-time-2.10.4.jar (joda-time:joda-time:2.10.4) with ExternalDependencyInstrumentingArtifactTransform
+Transforming jaxb-api-2.3.1.jar (javax.xml.bind:jaxb-api:2.3.1) with ExternalDependencyInstrumentingArtifactTransform
+Transforming failureaccess-1.0.1.jar (com.google.guava:failureaccess:1.0.1) with ExternalDependencyInstrumentingArtifactTransform
+Transforming jackson-annotations-2.14.2.jar (com.fasterxml.jackson.core:jackson-annotations:2.14.2) with ExternalDependencyInstrumentingArtifactTransform
+Transforming jsr305-3.0.2.jar (com.google.code.findbugs:jsr305:3.0.2) with InstrumentationAnalysisTransform
+Transforming semver4j-4.3.0.jar (org.semver4j:semver4j:4.3.0) with ExternalDependencyInstrumentingArtifactTransform
+Transforming pecoff4j-0.0.2.1.jar (org.whitesource:pecoff4j:0.0.2.1) with ExternalDependencyInstrumentingArtifactTransform
+Transforming jdiagnostics-1.0.7.jar (org.anarres.jdiagnostics:jdiagnostics:1.0.7) with ExternalDependencyInstrumentingArtifactTransform
+Transforming jsr305-3.0.2.jar (com.google.code.findbugs:jsr305:3.0.2) with MergeInstrumentationAnalysisTransform
+Transforming android-json-0.0.20131108.vaadin1.jar (com.vaadin.external.google:android-json:0.0.20131108.vaadin1) with ExternalDependencyInstrumentingArtifactTransform
+Transforming checker-qual-3.12.0.jar (org.checkerframework:checker-qual:3.12.0) with InstrumentationAnalysisTransform
+Transforming checker-qual-3.12.0.jar (org.checkerframework:checker-qual:3.12.0) with MergeInstrumentationAnalysisTransform
+Transforming error_prone_annotations-2.11.0.jar (com.google.errorprone:error_prone_annotations:2.11.0) with InstrumentationAnalysisTransform
+Transforming error_prone_annotations-2.11.0.jar (com.google.errorprone:error_prone_annotations:2.11.0) with MergeInstrumentationAnalysisTransform
+Transforming jsr305-3.0.2.jar (com.google.code.findbugs:jsr305:3.0.2) with ExternalDependencyInstrumentingArtifactTransform
+Transforming checker-qual-3.12.0.jar (org.checkerframework:checker-qual:3.12.0) with ExternalDependencyInstrumentingArtifactTransform
+Transforming error_prone_annotations-2.11.0.jar (com.google.errorprone:error_prone_annotations:2.11.0) with ExternalDependencyInstrumentingArtifactTransform
+Transforming lucene-sandbox-8.11.2.jar (org.apache.lucene:lucene-sandbox:8.11.2) with ExternalDependencyInstrumentingArtifactTransform
+Transforming xmlpull-1.1.3.1.jar (xmlpull:xmlpull:1.1.3.1) with ExternalDependencyInstrumentingArtifactTransform
+Transforming log4j-api-2.20.0.jar (org.apache.logging.log4j:log4j-api:2.20.0) with ExternalDependencyInstrumentingArtifactTransform
+Transforming j2objc-annotations-1.3.jar (com.google.j2objc:j2objc-annotations:1.3) with InstrumentationAnalysisTransform
+Transforming listenablefuture-9999.0-empty-to-avoid-conflict-with-guava.jar (com.google.guava:listenablefuture:9999.0-empty-to-avoid-conflict-with-guava) with ExternalDependencyInstrumentingArtifactTransform
+Transforming j2objc-annotations-1.3.jar (com.google.j2objc:j2objc-annotations:1.3) with MergeInstrumentationAnalysisTransform
+Transforming commons-digester-2.1.jar (commons-digester:commons-digester:2.1) with InstrumentationAnalysisTransform
+Transforming commons-digester-2.1.jar (commons-digester:commons-digester:2.1) with MergeInstrumentationAnalysisTransform
+Transforming commons-collections-3.2.2.jar (commons-collections:commons-collections:3.2.2) with InstrumentationAnalysisTransform
+Transforming commons-collections-3.2.2.jar (commons-collections:commons-collections:3.2.2) with MergeInstrumentationAnalysisTransform
+Transforming packager-core-0.19.0.jar (org.eclipse.packager:packager-core:0.19.0) with InstrumentationAnalysisTransform
+Transforming packager-core-0.19.0.jar (org.eclipse.packager:packager-core:0.19.0) with MergeInstrumentationAnalysisTransform
+Transforming xz-1.9.jar (org.tukaani:xz:1.9) with InstrumentationAnalysisTransform
+Transforming xz-1.9.jar (org.tukaani:xz:1.9) with MergeInstrumentationAnalysisTransform
+Transforming durian-swt.os-4.2.2.jar (com.diffplug.durian:durian-swt.os:4.2.2) with InstrumentationAnalysisTransform
+Transforming durian-swt.os-4.2.2.jar (com.diffplug.durian:durian-swt.os:4.2.2) with MergeInstrumentationAnalysisTransform
+Transforming j2objc-annotations-1.3.jar (com.google.j2objc:j2objc-annotations:1.3) with ExternalDependencyInstrumentingArtifactTransform
+Transforming commons-collections-3.2.2.jar (commons-collections:commons-collections:3.2.2) with ExternalDependencyInstrumentingArtifactTransform
+Transforming packager-core-0.19.0.jar (org.eclipse.packager:packager-core:0.19.0) with ExternalDependencyInstrumentingArtifactTransform
+Transforming xz-1.9.jar (org.tukaani:xz:1.9) with ExternalDependencyInstrumentingArtifactTransform
+Transforming org.eclipse.osgi-3.18.300.jar (org.eclipse.platform:org.eclipse.osgi:3.18.300) with InstrumentationAnalysisTransform
+Transforming org.eclipse.osgi-3.18.300.jar (org.eclipse.platform:org.eclipse.osgi:3.18.300) with MergeInstrumentationAnalysisTransform
+Transforming javax.ws.rs-api-2.0.1.jar (javax.ws.rs:javax.ws.rs-api:2.0.1) with InstrumentationAnalysisTransform
+Transforming commons-digester-2.1.jar (commons-digester:commons-digester:2.1) with ExternalDependencyInstrumentingArtifactTransform
+Transforming javax.ws.rs-api-2.0.1.jar (javax.ws.rs:javax.ws.rs-api:2.0.1) with MergeInstrumentationAnalysisTransform
+Transforming package-url-java-1.1.1.jar (org.sonatype.goodies:package-url-java:1.1.1) with InstrumentationAnalysisTransform
+Transforming package-url-java-1.1.1.jar (org.sonatype.goodies:package-url-java:1.1.1) with MergeInstrumentationAnalysisTransform
+Transforming javax.activation-api-1.2.0.jar (javax.activation:javax.activation-api:1.2.0) with InstrumentationAnalysisTransform
+Transforming org.eclipse.osgi-3.18.300.jar (org.eclipse.platform:org.eclipse.osgi:3.18.300) with ExternalDependencyInstrumentingArtifactTransform
+Transforming javax.ws.rs-api-2.0.1.jar (javax.ws.rs:javax.ws.rs-api:2.0.1) with ExternalDependencyInstrumentingArtifactTransform
+Transforming javax.activation-api-1.2.0.jar (javax.activation:javax.activation-api:1.2.0) with MergeInstrumentationAnalysisTransform
+Transforming package-url-java-1.1.1.jar (org.sonatype.goodies:package-url-java:1.1.1) with ExternalDependencyInstrumentingArtifactTransform
+Transforming javax.activation-api-1.2.0.jar (javax.activation:javax.activation-api:1.2.0) with ExternalDependencyInstrumentingArtifactTransform
+Transforming durian-swt.os-4.2.2.jar (com.diffplug.durian:durian-swt.os:4.2.2) with ExternalDependencyInstrumentingArtifactTransform
+Transforming bcpg-jdk18on-1.71.jar (org.bouncycastle:bcpg-jdk18on:1.71) with InstrumentationAnalysisTransform
+Transforming bcpg-jdk18on-1.71.jar (org.bouncycastle:bcpg-jdk18on:1.71) with MergeInstrumentationAnalysisTransform
+Transforming bcprov-jdk18on-1.71.jar (org.bouncycastle:bcprov-jdk18on:1.71) with InstrumentationAnalysisTransform
+Transforming bcprov-jdk18on-1.71.jar (org.bouncycastle:bcprov-jdk18on:1.71) with MergeInstrumentationAnalysisTransform
+Transforming bcpg-jdk18on-1.71.jar (org.bouncycastle:bcpg-jdk18on:1.71) with ExternalDependencyInstrumentingArtifactTransform
+Transforming bcprov-jdk18on-1.71.jar (org.bouncycastle:bcprov-jdk18on:1.71) with ExternalDependencyInstrumentingArtifactTransform
+Starting build with version 4.0.2 (commit id unknown) using Gradle 8.10.2, Java 21 and Scala 2.13.15
+Build properties: ignoreFailures=false, maxParallelForks=16, maxScalacThreads=8, maxTestRetries=0
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/connect/src/test/resources', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/connect/src/test/java', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/coordinator-common/src/test/resources', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/examples/src/test/resources', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/examples/src/test/java', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/generator/src/test/resources', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/jmh-benchmarks/src/test/resources', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/jmh-benchmarks/src/test/java', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/server/src/test/resources', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/share-coordinator/src/test/resources', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/test-common/src/test/resources', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/test-common/src/test/java', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/transaction-coordinator/src/test/resources', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/connect/basic-auth-extension/src/test/resources', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/connect/mirror-client/src/test/resources', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/connect/test-plugins/src/test/resources', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/connect/test-plugins/src/test/java', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/connect/transforms/src/test/resources', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/group-coordinator/group-coordinator-api/src/test/resources', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/group-coordinator/group-coordinator-api/src/test/java', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/storage/api/src/test/resources', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/examples/src/test/resources', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-0110/src/test/resources', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-10/src/test/resources', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-11/src/test/resources', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-20/src/test/resources', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-21/src/test/resources', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-22/src/test/resources', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-23/src/test/resources', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-24/src/test/resources', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-25/src/test/resources', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-26/src/test/resources', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-27/src/test/resources', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-28/src/test/resources', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-30/src/test/resources', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-31/src/test/resources', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-32/src/test/resources', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-33/src/test/resources', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-34/src/test/resources', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-35/src/test/resources', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-36/src/test/resources', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-37/src/test/resources', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-38/src/test/resources', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-39/src/test/resources', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/test-common/test-common-runtime/src/test/resources', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/test-common/test-common-util/src/test/resources', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/tools/tools-api/src/test/resources', not found
+
+> Configure project :clients
+Evaluating project ':clients' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/clients/build.gradle'.
+
+> Configure project :connect
+Evaluating project ':connect' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/connect/build.gradle'.
+
+> Configure project :coordinator-common
+Evaluating project ':coordinator-common' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/coordinator-common/build.gradle'.
+
+> Configure project :core
+Evaluating project ':core' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/core/build.gradle'.
+
+> Configure project :examples
+Evaluating project ':examples' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/examples/build.gradle'.
+
+> Configure project :generator
+Evaluating project ':generator' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/generator/build.gradle'.
+
+> Configure project :group-coordinator
+Evaluating project ':group-coordinator' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/group-coordinator/build.gradle'.
+
+> Configure project :jmh-benchmarks
+Evaluating project ':jmh-benchmarks' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/jmh-benchmarks/build.gradle'.
+
+> Configure project :metadata
+Evaluating project ':metadata' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/metadata/build.gradle'.
+
+> Configure project :raft
+Evaluating project ':raft' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/raft/build.gradle'.
+
+> Configure project :server
+Evaluating project ':server' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/server/build.gradle'.
+
+> Configure project :server-common
+Evaluating project ':server-common' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/server-common/build.gradle'.
+
+> Configure project :share-coordinator
+Evaluating project ':share-coordinator' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/share-coordinator/build.gradle'.
+
+> Configure project :shell
+Evaluating project ':shell' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/shell/build.gradle'.
+
+> Configure project :storage
+Evaluating project ':storage' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/storage/build.gradle'.
+
+> Configure project :streams
+Evaluating project ':streams' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/build.gradle'.
+
+> Configure project :test-common
+Evaluating project ':test-common' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/test-common/build.gradle'.
+
+> Configure project :tools
+Evaluating project ':tools' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/tools/build.gradle'.
+
+> Configure project :transaction-coordinator
+Evaluating project ':transaction-coordinator' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/transaction-coordinator/build.gradle'.
+
+> Configure project :trogdor
+Evaluating project ':trogdor' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/trogdor/build.gradle'.
+
+> Configure project :connect:api
+Evaluating project ':connect:api' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/connect/api/build.gradle'.
+
+> Configure project :connect:basic-auth-extension
+Evaluating project ':connect:basic-auth-extension' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/connect/basic-auth-extension/build.gradle'.
+
+> Configure project :connect:file
+Evaluating project ':connect:file' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/connect/file/build.gradle'.
+
+> Configure project :connect:json
+Evaluating project ':connect:json' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/connect/json/build.gradle'.
+
+> Configure project :connect:mirror
+Evaluating project ':connect:mirror' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/connect/mirror/build.gradle'.
+
+> Configure project :connect:mirror-client
+Evaluating project ':connect:mirror-client' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/connect/mirror-client/build.gradle'.
+
+> Configure project :connect:runtime
+Evaluating project ':connect:runtime' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/connect/runtime/build.gradle'.
+
+> Configure project :connect:test-plugins
+Evaluating project ':connect:test-plugins' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/connect/test-plugins/build.gradle'.
+
+> Configure project :connect:transforms
+Evaluating project ':connect:transforms' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/connect/transforms/build.gradle'.
+
+> Configure project :group-coordinator:group-coordinator-api
+Evaluating project ':group-coordinator:group-coordinator-api' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/group-coordinator/group-coordinator-api/build.gradle'.
+
+> Configure project :storage:storage-api
+Evaluating project ':storage:storage-api' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/storage/api/build.gradle'.
+
+> Configure project :streams:examples
+Evaluating project ':streams:examples' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/examples/build.gradle'.
+
+> Configure project :streams:integration-tests
+Evaluating project ':streams:integration-tests' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/integration-tests/build.gradle'.
+
+> Configure project :streams:streams-scala
+Evaluating project ':streams:streams-scala' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/streams-scala/build.gradle'.
+
+> Configure project :streams:test-utils
+Evaluating project ':streams:test-utils' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/test-utils/build.gradle'.
+
+> Configure project :streams:upgrade-system-tests-0110
+Evaluating project ':streams:upgrade-system-tests-0110' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-0110/build.gradle'.
+
+> Configure project :streams:upgrade-system-tests-10
+Evaluating project ':streams:upgrade-system-tests-10' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-10/build.gradle'.
+
+> Configure project :streams:upgrade-system-tests-11
+Evaluating project ':streams:upgrade-system-tests-11' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-11/build.gradle'.
+
+> Configure project :streams:upgrade-system-tests-20
+Evaluating project ':streams:upgrade-system-tests-20' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-20/build.gradle'.
+
+> Configure project :streams:upgrade-system-tests-21
+Evaluating project ':streams:upgrade-system-tests-21' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-21/build.gradle'.
+
+> Configure project :streams:upgrade-system-tests-22
+Evaluating project ':streams:upgrade-system-tests-22' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-22/build.gradle'.
+
+> Configure project :streams:upgrade-system-tests-23
+Evaluating project ':streams:upgrade-system-tests-23' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-23/build.gradle'.
+
+> Configure project :streams:upgrade-system-tests-24
+Evaluating project ':streams:upgrade-system-tests-24' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-24/build.gradle'.
+
+> Configure project :streams:upgrade-system-tests-25
+Evaluating project ':streams:upgrade-system-tests-25' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-25/build.gradle'.
+
+> Configure project :streams:upgrade-system-tests-26
+Evaluating project ':streams:upgrade-system-tests-26' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-26/build.gradle'.
+
+> Configure project :streams:upgrade-system-tests-27
+Evaluating project ':streams:upgrade-system-tests-27' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-27/build.gradle'.
+
+> Configure project :streams:upgrade-system-tests-28
+Evaluating project ':streams:upgrade-system-tests-28' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-28/build.gradle'.
+
+> Configure project :streams:upgrade-system-tests-30
+Evaluating project ':streams:upgrade-system-tests-30' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-30/build.gradle'.
+
+> Configure project :streams:upgrade-system-tests-31
+Evaluating project ':streams:upgrade-system-tests-31' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-31/build.gradle'.
+
+> Configure project :streams:upgrade-system-tests-32
+Evaluating project ':streams:upgrade-system-tests-32' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-32/build.gradle'.
+
+> Configure project :streams:upgrade-system-tests-33
+Evaluating project ':streams:upgrade-system-tests-33' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-33/build.gradle'.
+
+> Configure project :streams:upgrade-system-tests-34
+Evaluating project ':streams:upgrade-system-tests-34' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-34/build.gradle'.
+
+> Configure project :streams:upgrade-system-tests-35
+Evaluating project ':streams:upgrade-system-tests-35' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-35/build.gradle'.
+
+> Configure project :streams:upgrade-system-tests-36
+Evaluating project ':streams:upgrade-system-tests-36' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-36/build.gradle'.
+
+> Configure project :streams:upgrade-system-tests-37
+Evaluating project ':streams:upgrade-system-tests-37' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-37/build.gradle'.
+
+> Configure project :streams:upgrade-system-tests-38
+Evaluating project ':streams:upgrade-system-tests-38' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-38/build.gradle'.
+
+> Configure project :streams:upgrade-system-tests-39
+Evaluating project ':streams:upgrade-system-tests-39' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/streams/upgrade-system-tests-39/build.gradle'.
+
+> Configure project :test-common:test-common-internal-api
+Evaluating project ':test-common:test-common-internal-api' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/test-common/test-common-internal-api/build.gradle'.
+
+> Configure project :test-common:test-common-runtime
+Evaluating project ':test-common:test-common-runtime' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/test-common/test-common-runtime/build.gradle'.
+
+> Configure project :test-common:test-common-util
+Evaluating project ':test-common:test-common-util' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/test-common/test-common-util/build.gradle'.
+
+> Configure project :tools:tools-api
+Evaluating project ':tools:tools-api' using build file '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/tools/tools-api/build.gradle'.
+All projects evaluated.
+Task path ':server:test' matched project ':server'
+Task name matched 'test'
+Selected primary task 'test' from project :server
+Tasks to be executed: [task ':generator:compileJava', task ':generator:processResources', task ':generator:classes', task ':generator:jar', task ':clients:processMessages', task ':clients:compileJava', task ':clients:processResources', task ':clients:classes', task ':clients:processTestMessages', task ':test-common:test-common-util:compileJava', task ':clients:compileTestJava', task ':clients:createVersionFile', task ':clients:shadowJar', task ':clients:jar', task ':clients:processTestResources', task ':clients:testClasses', task ':metadata:processMessages', task ':raft:processMessages', task ':server-common:compileJava', task ':raft:compileJava', task ':metadata:compileJava', task ':storage:processMessages', task ':transaction-coordinator:processMessages', task ':transaction-coordinator:compileJava', task ':storage:storage-api:compileJava', task ':storage:compileJava', task ':coordinator-common:compileJava', task ':coordinator-common:processResources', task ':coordinator-common:classes', task ':coordinator-common:jar', task ':group-coordinator:processMessages', task ':group-coordinator:group-coordinator-api:compileJava', task ':group-coordinator:compileJava', task ':group-coordinator:processResources', task ':group-coordinator:classes', task ':group-coordinator:jar', task ':metadata:processResources', task ':metadata:classes', task ':metadata:jar', task ':raft:processResources', task ':raft:classes', task ':raft:createVersionFile', task ':raft:jar', task ':share-coordinator:processMessages', task ':share-coordinator:compileJava', task ':server:compileJava', task ':server:processResources', task ':server:classes', task ':server:checkstyleMain', task ':server:compileTestJava', task ':server:processTestResources', task ':server:testClasses', task ':server:checkstyleTest', task ':server:javadoc', task ':server:spotbugsMain', task ':server-common:processResources', task ':server-common:classes', task ':server-common:createVersionFile', task ':server-common:jar', task ':share-coordinator:processResources', task ':share-coordinator:classes', task ':share-coordinator:jar', task ':storage:processResources', task ':storage:classes', task ':storage:createVersionFile', task ':storage:jar', task ':transaction-coordinator:processResources', task ':transaction-coordinator:classes', task ':transaction-coordinator:jar', task ':group-coordinator:group-coordinator-api:processResources', task ':group-coordinator:group-coordinator-api:classes', task ':group-coordinator:group-coordinator-api:createVersionFile', task ':group-coordinator:group-coordinator-api:jar', task ':storage:storage-api:processResources', task ':storage:storage-api:classes', task ':storage:storage-api:createVersionFile', task ':storage:storage-api:jar', task ':test-common:test-common-util:processResources', task ':test-common:test-common-util:classes', task ':test-common:test-common-util:jar', task ':server:test']
+Tasks that were excluded: []
+Resolve mutations for :generator:compileJava (Thread[#622,Execution worker,5,main]) started.
+Resolve mutations for :clients:processResources (Thread[#623,Execution worker Thread 2,5,main]) started.
+Resolve mutations for :test-common:test-common-util:compileJava (Thread[#624,Execution worker Thread 3,5,main]) started.
+Resolve mutations for :coordinator-common:processResources (Thread[#625,Execution worker Thread 4,5,main]) started.
+Resolve mutations for :group-coordinator:processResources (Thread[#626,Execution worker Thread 5,5,main]) started.
+Resolve mutations for :metadata:processResources (Thread[#627,Execution worker Thread 6,5,main]) started.
+:clients:processResources (Thread[#628,Execution worker Thread 7,5,main]) started.
+Resolve mutations for :raft:processResources (Thread[#629,Execution worker Thread 8,5,main]) started.
+:group-coordinator:processResources (Thread[#626,Execution worker Thread 5,5,main]) started.
+Resolve mutations for :server:processResources (Thread[#630,Execution worker Thread 9,5,main]) started.
+:raft:processResources (Thread[#631,Execution worker Thread 10,5,main]) started.
+:metadata:processResources (Thread[#632,Execution worker Thread 11,5,main]) started.
+:generator:compileJava (Thread[#622,Execution worker,5,main]) started.
+:server:processResources (Thread[#633,Execution worker Thread 12,5,main]) started.
+:coordinator-common:processResources (Thread[#625,Execution worker Thread 4,5,main]) started.
+Resolve mutations for :server-common:processResources (Thread[#635,Execution worker Thread 13,5,main]) started.
+Resolve mutations for :share-coordinator:processResources (Thread[#623,Execution worker Thread 2,5,main]) started.
+Resolve mutations for :storage:processResources (Thread[#636,Execution worker Thread 14,5,main]) started.
+Resolve mutations for :transaction-coordinator:processResources (Thread[#630,Execution worker Thread 9,5,main]) started.
+Resolve mutations for :group-coordinator:group-coordinator-api:processResources (Thread[#627,Execution worker Thread 6,5,main]) started.
+Resolve mutations for :storage:storage-api:processResources (Thread[#629,Execution worker Thread 8,5,main]) started.
+:test-common:test-common-util:compileJava (Thread[#624,Execution worker Thread 3,5,main]) started.
+:transaction-coordinator:processResources (Thread[#630,Execution worker Thread 9,5,main]) started.
+:storage:processResources (Thread[#636,Execution worker Thread 14,5,main]) started.
+:share-coordinator:processResources (Thread[#623,Execution worker Thread 2,5,main]) started.
+:server-common:processResources (Thread[#635,Execution worker Thread 13,5,main]) started.
+:storage:storage-api:processResources (Thread[#629,Execution worker Thread 8,5,main]) started.
+:group-coordinator:group-coordinator-api:processResources (Thread[#627,Execution worker Thread 6,5,main]) started.
+
+> Task :server-common:processResources NO-SOURCE
+Skipping task ':server-common:processResources' as it has no source files and no previous output files.
+
+> Task :coordinator-common:processResources NO-SOURCE
+Skipping task ':coordinator-common:processResources' as it has no source files and no previous output files.
+
+> Task :storage:storage-api:processResources NO-SOURCE
+Skipping task ':storage:storage-api:processResources' as it has no source files and no previous output files.
+Resolve mutations for :server-common:createVersionFile (Thread[#635,Execution worker Thread 13,5,main]) started.
+:server-common:createVersionFile (Thread[#635,Execution worker Thread 13,5,main]) started.
+Resolve mutations for :storage:storage-api:createVersionFile (Thread[#629,Execution worker Thread 8,5,main]) started.
+:storage:storage-api:createVersionFile (Thread[#629,Execution worker Thread 8,5,main]) started.
+
+> Task :server:processResources NO-SOURCE
+Skipping task ':server:processResources' as it has no source files and no previous output files.
+
+> Task :transaction-coordinator:processResources UP-TO-DATE
+Caching disabled for task ':transaction-coordinator:processResources' because:
+  Build cache is disabled
+  Not worth caching
+Skipping task ':transaction-coordinator:processResources' as it is up-to-date.
+
+> Task :raft:processResources UP-TO-DATE
+Caching disabled for task ':raft:processResources' because:
+  Build cache is disabled
+  Not worth caching
+Skipping task ':raft:processResources' as it is up-to-date.
+Resolve mutations for :server:processTestResources (Thread[#633,Execution worker Thread 12,5,main]) started.
+Resolve mutations for :raft:createVersionFile (Thread[#631,Execution worker Thread 10,5,main]) started.
+
+> Task :storage:processResources UP-TO-DATE
+Caching disabled for task ':storage:processResources' because:
+  Build cache is disabled
+  Not worth caching
+Skipping task ':storage:processResources' as it is up-to-date.
+Resolve mutations for :storage:createVersionFile (Thread[#636,Execution worker Thread 14,5,main]) started.
+:raft:createVersionFile (Thread[#631,Execution worker Thread 10,5,main]) started.
+:storage:createVersionFile (Thread[#636,Execution worker Thread 14,5,main]) started.
+:server:processTestResources (Thread[#633,Execution worker Thread 12,5,main]) started.
+
+> Task :server:processTestResources NO-SOURCE
+Skipping task ':server:processTestResources' as it has no source files and no previous output files.
+
+> Task :raft:createVersionFile UP-TO-DATE
+Custom actions are attached to task ':raft:createVersionFile'.
+Caching disabled for task ':raft:createVersionFile' because:
+  Build cache is disabled
+Skipping task ':raft:createVersionFile' as it is up-to-date.
+
+> Task :storage:createVersionFile UP-TO-DATE
+Custom actions are attached to task ':storage:createVersionFile'.
+Caching disabled for task ':storage:createVersionFile' because:
+  Build cache is disabled
+Skipping task ':storage:createVersionFile' as it is up-to-date.
+
+> Task :server-common:createVersionFile UP-TO-DATE
+Custom actions are attached to task ':server-common:createVersionFile'.
+Caching disabled for task ':server-common:createVersionFile' because:
+  Build cache is disabled
+Skipping task ':server-common:createVersionFile' as it is up-to-date.
+
+> Task :share-coordinator:processResources UP-TO-DATE
+Caching disabled for task ':share-coordinator:processResources' because:
+  Build cache is disabled
+  Not worth caching
+Skipping task ':share-coordinator:processResources' as it is up-to-date.
+
+> Task :storage:storage-api:createVersionFile UP-TO-DATE
+Custom actions are attached to task ':storage:storage-api:createVersionFile'.
+Caching disabled for task ':storage:storage-api:createVersionFile' because:
+  Build cache is disabled
+Skipping task ':storage:storage-api:createVersionFile' as it is up-to-date.
+
+> Task :group-coordinator:group-coordinator-api:processResources NO-SOURCE
+Skipping task ':group-coordinator:group-coordinator-api:processResources' as it has no source files and no previous output files.
+Resolve mutations for :group-coordinator:group-coordinator-api:createVersionFile (Thread[#627,Execution worker Thread 6,5,main]) started.
+:group-coordinator:group-coordinator-api:createVersionFile (Thread[#627,Execution worker Thread 6,5,main]) started.
+
+> Task :metadata:processResources UP-TO-DATE
+Caching disabled for task ':metadata:processResources' because:
+  Build cache is disabled
+  Not worth caching
+Skipping task ':metadata:processResources' as it is up-to-date.
+
+> Task :group-coordinator:group-coordinator-api:createVersionFile UP-TO-DATE
+Custom actions are attached to task ':group-coordinator:group-coordinator-api:createVersionFile'.
+Caching disabled for task ':group-coordinator:group-coordinator-api:createVersionFile' because:
+  Build cache is disabled
+Skipping task ':group-coordinator:group-coordinator-api:createVersionFile' as it is up-to-date.
+
+> Task :group-coordinator:processResources UP-TO-DATE
+Caching disabled for task ':group-coordinator:processResources' because:
+  Build cache is disabled
+  Not worth caching
+Skipping task ':group-coordinator:processResources' as it is up-to-date.
+
+> Task :clients:processResources UP-TO-DATE
+Caching disabled for task ':clients:processResources' because:
+  Build cache is disabled
+  Not worth caching
+Skipping task ':clients:processResources' as it is up-to-date.
+Resolve mutations for :clients:createVersionFile (Thread[#628,Execution worker Thread 7,5,main]) started.
+:clients:createVersionFile (Thread[#628,Execution worker Thread 7,5,main]) started.
+
+> Task :test-common:test-common-util:compileJava UP-TO-DATE
+Caching disabled for task ':test-common:test-common-util:compileJava' because:
+  Build cache is disabled
+Skipping task ':test-common:test-common-util:compileJava' as it is up-to-date.
+No compile result for :test-common:test-common-util:compileJava
+work action resolve main (project :test-common:test-common-util) (Thread[#624,Execution worker Thread 3,5,main]) started.
+Resolve mutations for :test-common:test-common-util:processResources (Thread[#624,Execution worker Thread 3,5,main]) started.
+:test-common:test-common-util:processResources (Thread[#624,Execution worker Thread 3,5,main]) started.
+
+> Task :clients:createVersionFile UP-TO-DATE
+Custom actions are attached to task ':clients:createVersionFile'.
+Caching disabled for task ':clients:createVersionFile' because:
+  Build cache is disabled
+Skipping task ':clients:createVersionFile' as it is up-to-date.
+Resolve mutations for :clients:processTestResources (Thread[#628,Execution worker Thread 7,5,main]) started.
+:clients:processTestResources (Thread[#628,Execution worker Thread 7,5,main]) started.
+
+> Task :test-common:test-common-util:processResources UP-TO-DATE
+Caching disabled for task ':test-common:test-common-util:processResources' because:
+  Build cache is disabled
+  Not worth caching
+Skipping task ':test-common:test-common-util:processResources' as it is up-to-date.
+Resolve mutations for :test-common:test-common-util:classes (Thread[#624,Execution worker Thread 3,5,main]) started.
+:test-common:test-common-util:classes (Thread[#624,Execution worker Thread 3,5,main]) started.
+
+> Task :test-common:test-common-util:classes UP-TO-DATE
+Skipping task ':test-common:test-common-util:classes' as it has no actions.
+Resolve mutations for :test-common:test-common-util:jar (Thread[#624,Execution worker Thread 3,5,main]) started.
+:test-common:test-common-util:jar (Thread[#624,Execution worker Thread 3,5,main]) started.
+
+> Task :clients:processTestResources UP-TO-DATE
+Caching disabled for task ':clients:processTestResources' because:
+  Build cache is disabled
+  Not worth caching
+Skipping task ':clients:processTestResources' as it is up-to-date.
+
+> Task :generator:compileJava UP-TO-DATE
+Caching disabled for task ':generator:compileJava' because:
+  Build cache is disabled
+Skipping task ':generator:compileJava' as it is up-to-date.
+No compile result for :generator:compileJava
+
+> Task :test-common:test-common-util:jar UP-TO-DATE
+Caching disabled for task ':test-common:test-common-util:jar' because:
+  Build cache is disabled
+  Not worth caching
+Skipping task ':test-common:test-common-util:jar' as it is up-to-date.
+Resolve mutations for :generator:processResources (Thread[#622,Execution worker,5,main]) started.
+work action resolve kafka-test-common-util-4.0.2.jar (project :test-common:test-common-util) (Thread[#624,Execution worker Thread 3,5,main]) started.
+:generator:processResources (Thread[#622,Execution worker,5,main]) started.
+
+> Task :generator:processResources NO-SOURCE
+Skipping task ':generator:processResources' as it has no source files and no previous output files.
+Resolve mutations for :generator:classes (Thread[#622,Execution worker,5,main]) started.
+:generator:classes (Thread[#623,Execution worker Thread 2,5,main]) started.
+
+> Task :generator:classes UP-TO-DATE
+Skipping task ':generator:classes' as it has no actions.
+Resolve mutations for :generator:jar (Thread[#623,Execution worker Thread 2,5,main]) started.
+:generator:jar (Thread[#623,Execution worker Thread 2,5,main]) started.
+
+> Task :generator:jar UP-TO-DATE
+Caching disabled for task ':generator:jar' because:
+  Build cache is disabled
+  Not worth caching
+Skipping task ':generator:jar' as it is up-to-date.
+work action resolve generator-4.0.2.jar (project :generator) (Thread[#623,Execution worker Thread 2,5,main]) started.
+Resolve mutations for :clients:processMessages (Thread[#623,Execution worker Thread 2,5,main]) started.
+Resolve mutations for :metadata:processMessages (Thread[#626,Execution worker Thread 5,5,main]) started.
+Resolve mutations for :raft:processMessages (Thread[#627,Execution worker Thread 6,5,main]) started.
+:clients:processMessages (Thread[#623,Execution worker Thread 2,5,main]) started.
+Resolve mutations for :storage:processMessages (Thread[#637,Execution worker Thread 15,5,main]) started.
+Resolve mutations for :transaction-coordinator:processMessages (Thread[#631,Execution worker Thread 10,5,main]) started.
+Resolve mutations for :group-coordinator:processMessages (Thread[#636,Execution worker Thread 14,5,main]) started.
+Resolve mutations for :share-coordinator:processMessages (Thread[#632,Execution worker Thread 11,5,main]) started.
+:storage:processMessages (Thread[#637,Execution worker Thread 15,5,main]) started.
+:transaction-coordinator:processMessages (Thread[#631,Execution worker Thread 10,5,main]) started.
+:raft:processMessages (Thread[#627,Execution worker Thread 6,5,main]) started.
+:metadata:processMessages (Thread[#626,Execution worker Thread 5,5,main]) started.
+:share-coordinator:processMessages (Thread[#625,Execution worker Thread 4,5,main]) started.
+:group-coordinator:processMessages (Thread[#636,Execution worker Thread 14,5,main]) started.
+
+> Task :share-coordinator:processMessages UP-TO-DATE
+Caching disabled for task ':share-coordinator:processMessages' because:
+  Build cache is disabled
+Skipping task ':share-coordinator:processMessages' as it is up-to-date.
+
+> Task :transaction-coordinator:processMessages UP-TO-DATE
+Caching disabled for task ':transaction-coordinator:processMessages' because:
+  Build cache is disabled
+Skipping task ':transaction-coordinator:processMessages' as it is up-to-date.
+
+> Task :raft:processMessages UP-TO-DATE
+Caching disabled for task ':raft:processMessages' because:
+  Build cache is disabled
+Skipping task ':raft:processMessages' as it is up-to-date.
+
+> Task :storage:processMessages UP-TO-DATE
+Caching disabled for task ':storage:processMessages' because:
+  Build cache is disabled
+Skipping task ':storage:processMessages' as it is up-to-date.
+
+> Task :group-coordinator:processMessages UP-TO-DATE
+Caching disabled for task ':group-coordinator:processMessages' because:
+  Build cache is disabled
+Skipping task ':group-coordinator:processMessages' as it is up-to-date.
+
+> Task :metadata:processMessages UP-TO-DATE
+Caching disabled for task ':metadata:processMessages' because:
+  Build cache is disabled
+Skipping task ':metadata:processMessages' as it is up-to-date.
+
+> Task :clients:processMessages UP-TO-DATE
+Caching disabled for task ':clients:processMessages' because:
+  Build cache is disabled
+Skipping task ':clients:processMessages' as it is up-to-date.
+Resolve mutations for :clients:compileJava (Thread[#623,Execution worker Thread 2,5,main]) started.
+:clients:compileJava (Thread[#623,Execution worker Thread 2,5,main]) started.
+
+> Task :clients:compileJava UP-TO-DATE
+Caching disabled for task ':clients:compileJava' because:
+  Build cache is disabled
+Skipping task ':clients:compileJava' as it is up-to-date.
+No compile result for :clients:compileJava
+work action resolve main (project :clients) (Thread[#623,Execution worker Thread 2,5,main]) started.
+Resolve mutations for :clients:classes (Thread[#623,Execution worker Thread 2,5,main]) started.
+Resolve mutations for :server-common:compileJava (Thread[#629,Execution worker Thread 8,5,main]) started.
+Resolve mutations for :group-coordinator:group-coordinator-api:compileJava (Thread[#628,Execution worker Thread 7,5,main]) started.
+:clients:classes (Thread[#623,Execution worker Thread 2,5,main]) started.
+
+> Task :clients:classes UP-TO-DATE
+Skipping task ':clients:classes' as it has no actions.
+Resolve mutations for :clients:processTestMessages (Thread[#623,Execution worker Thread 2,5,main]) started.
+:server-common:compileJava (Thread[#629,Execution worker Thread 8,5,main]) started.
+:clients:processTestMessages (Thread[#623,Execution worker Thread 2,5,main]) started.
+:group-coordinator:group-coordinator-api:compileJava (Thread[#628,Execution worker Thread 7,5,main]) started.
+
+> Task :clients:processTestMessages UP-TO-DATE
+Caching disabled for task ':clients:processTestMessages' because:
+  Build cache is disabled
+Skipping task ':clients:processTestMessages' as it is up-to-date.
+Resolve mutations for :clients:compileTestJava (Thread[#623,Execution worker Thread 2,5,main]) started.
+:clients:compileTestJava (Thread[#623,Execution worker Thread 2,5,main]) started.
+
+> Task :group-coordinator:group-coordinator-api:compileJava UP-TO-DATE
+Caching disabled for task ':group-coordinator:group-coordinator-api:compileJava' because:
+  Build cache is disabled
+Skipping task ':group-coordinator:group-coordinator-api:compileJava' as it is up-to-date.
+No compile result for :group-coordinator:group-coordinator-api:compileJava
+work action resolve main (project :group-coordinator:group-coordinator-api) (Thread[#628,Execution worker Thread 7,5,main]) started.
+Resolve mutations for :group-coordinator:group-coordinator-api:classes (Thread[#628,Execution worker Thread 7,5,main]) started.
+:group-coordinator:group-coordinator-api:classes (Thread[#628,Execution worker Thread 7,5,main]) started.
+
+> Task :group-coordinator:group-coordinator-api:classes UP-TO-DATE
+Skipping task ':group-coordinator:group-coordinator-api:classes' as it has no actions.
+Resolve mutations for :group-coordinator:group-coordinator-api:jar (Thread[#628,Execution worker Thread 7,5,main]) started.
+:group-coordinator:group-coordinator-api:jar (Thread[#628,Execution worker Thread 7,5,main]) started.
+
+> Task :group-coordinator:group-coordinator-api:jar UP-TO-DATE
+Caching disabled for task ':group-coordinator:group-coordinator-api:jar' because:
+  Build cache is disabled
+  Not worth caching
+Skipping task ':group-coordinator:group-coordinator-api:jar' as it is up-to-date.
+work action resolve kafka-group-coordinator-api-4.0.2.jar (project :group-coordinator:group-coordinator-api) (Thread[#628,Execution worker Thread 7,5,main]) started.
+
+> Task :server-common:compileJava UP-TO-DATE
+Caching disabled for task ':server-common:compileJava' because:
+  Build cache is disabled
+Skipping task ':server-common:compileJava' as it is up-to-date.
+No compile result for :server-common:compileJava
+work action resolve main (project :server-common) (Thread[#627,Execution worker Thread 6,5,main]) started.
+Resolve mutations for :raft:compileJava (Thread[#627,Execution worker Thread 6,5,main]) started.
+Resolve mutations for :server-common:classes (Thread[#636,Execution worker Thread 14,5,main]) started.
+:server-common:classes (Thread[#636,Execution worker Thread 14,5,main]) started.
+:raft:compileJava (Thread[#627,Execution worker Thread 6,5,main]) started.
+Resolve mutations for :storage:storage-api:compileJava (Thread[#637,Execution worker Thread 15,5,main]) started.
+Resolve mutations for :transaction-coordinator:compileJava (Thread[#633,Execution worker Thread 12,5,main]) started.
+:transaction-coordinator:compileJava (Thread[#633,Execution worker Thread 12,5,main]) started.
+
+> Task :server-common:classes UP-TO-DATE
+Skipping task ':server-common:classes' as it has no actions.
+Resolve mutations for :server-common:jar (Thread[#636,Execution worker Thread 14,5,main]) started.
+:storage:storage-api:compileJava (Thread[#637,Execution worker Thread 15,5,main]) started.
+:server-common:jar (Thread[#636,Execution worker Thread 14,5,main]) started.
+
+> Task :server-common:jar UP-TO-DATE
+Caching disabled for task ':server-common:jar' because:
+  Build cache is disabled
+  Not worth caching
+Skipping task ':server-common:jar' as it is up-to-date.
+work action resolve kafka-server-common-4.0.2.jar (project :server-common) (Thread[#636,Execution worker Thread 14,5,main]) started.
+
+> Task :transaction-coordinator:compileJava UP-TO-DATE
+Caching disabled for task ':transaction-coordinator:compileJava' because:
+  Build cache is disabled
+Skipping task ':transaction-coordinator:compileJava' as it is up-to-date.
+No compile result for :transaction-coordinator:compileJava
+work action resolve main (project :transaction-coordinator) (Thread[#633,Execution worker Thread 12,5,main]) started.
+Resolve mutations for :transaction-coordinator:classes (Thread[#633,Execution worker Thread 12,5,main]) started.
+:transaction-coordinator:classes (Thread[#633,Execution worker Thread 12,5,main]) started.
+
+> Task :transaction-coordinator:classes UP-TO-DATE
+Skipping task ':transaction-coordinator:classes' as it has no actions.
+Resolve mutations for :transaction-coordinator:jar (Thread[#633,Execution worker Thread 12,5,main]) started.
+:transaction-coordinator:jar (Thread[#632,Execution worker Thread 11,5,main]) started.
+
+> Task :transaction-coordinator:jar UP-TO-DATE
+Caching disabled for task ':transaction-coordinator:jar' because:
+  Build cache is disabled
+  Not worth caching
+Skipping task ':transaction-coordinator:jar' as it is up-to-date.
+work action resolve kafka-transaction-coordinator-4.0.2.jar (project :transaction-coordinator) (Thread[#632,Execution worker Thread 11,5,main]) started.
+
+> Task :storage:storage-api:compileJava UP-TO-DATE
+Caching disabled for task ':storage:storage-api:compileJava' because:
+  Build cache is disabled
+Skipping task ':storage:storage-api:compileJava' as it is up-to-date.
+No compile result for :storage:storage-api:compileJava
+work action resolve main (project :storage:storage-api) (Thread[#637,Execution worker Thread 15,5,main]) started.
+Resolve mutations for :storage:compileJava (Thread[#635,Execution worker Thread 13,5,main]) started.
+Resolve mutations for :storage:storage-api:classes (Thread[#629,Execution worker Thread 8,5,main]) started.
+:storage:storage-api:classes (Thread[#629,Execution worker Thread 8,5,main]) started.
+
+> Task :storage:storage-api:classes UP-TO-DATE
+Skipping task ':storage:storage-api:classes' as it has no actions.
+:storage:compileJava (Thread[#637,Execution worker Thread 15,5,main]) started.
+Resolve mutations for :storage:storage-api:jar (Thread[#629,Execution worker Thread 8,5,main]) started.
+:storage:storage-api:jar (Thread[#629,Execution worker Thread 8,5,main]) started.
+
+> Task :raft:compileJava UP-TO-DATE
+Caching disabled for task ':raft:compileJava' because:
+  Build cache is disabled
+Skipping task ':raft:compileJava' as it is up-to-date.
+No compile result for :raft:compileJava
+work action resolve main (project :raft) (Thread[#627,Execution worker Thread 6,5,main]) started.
+Resolve mutations for :metadata:compileJava (Thread[#627,Execution worker Thread 6,5,main]) started.
+Resolve mutations for :raft:classes (Thread[#635,Execution worker Thread 13,5,main]) started.
+:raft:classes (Thread[#635,Execution worker Thread 13,5,main]) started.
+
+> Task :raft:classes UP-TO-DATE
+Skipping task ':raft:classes' as it has no actions.
+Resolve mutations for :raft:jar (Thread[#635,Execution worker Thread 13,5,main]) started.
+:raft:jar (Thread[#635,Execution worker Thread 13,5,main]) started.
+:metadata:compileJava (Thread[#627,Execution worker Thread 6,5,main]) started.
+
+> Task :storage:storage-api:jar UP-TO-DATE
+Caching disabled for task ':storage:storage-api:jar' because:
+  Build cache is disabled
+  Not worth caching
+Skipping task ':storage:storage-api:jar' as it is up-to-date.
+work action resolve kafka-storage-api-4.0.2.jar (project :storage:storage-api) (Thread[#628,Execution worker Thread 7,5,main]) started.
+
+> Task :raft:jar UP-TO-DATE
+Caching disabled for task ':raft:jar' because:
+  Build cache is disabled
+  Not worth caching
+Skipping task ':raft:jar' as it is up-to-date.
+work action resolve kafka-raft-4.0.2.jar (project :raft) (Thread[#635,Execution worker Thread 13,5,main]) started.
+
+> Task :clients:compileTestJava UP-TO-DATE
+Caching disabled for task ':clients:compileTestJava' because:
+  Build cache is disabled
+Skipping task ':clients:compileTestJava' as it is up-to-date.
+No compile result for :clients:compileTestJava
+Resolve mutations for :clients:shadowJar (Thread[#623,Execution worker Thread 2,5,main]) started.
+:clients:shadowJar (Thread[#623,Execution worker Thread 2,5,main]) started.
+
+> Task :storage:compileJava UP-TO-DATE
+Caching disabled for task ':storage:compileJava' because:
+  Build cache is disabled
+Skipping task ':storage:compileJava' as it is up-to-date.
+No compile result for :storage:compileJava
+work action resolve main (project :storage) (Thread[#637,Execution worker Thread 15,5,main]) started.
+Resolve mutations for :storage:classes (Thread[#637,Execution worker Thread 15,5,main]) started.
+:storage:classes (Thread[#637,Execution worker Thread 15,5,main]) started.
+
+> Task :storage:classes UP-TO-DATE
+Skipping task ':storage:classes' as it has no actions.
+Resolve mutations for :storage:jar (Thread[#637,Execution worker Thread 15,5,main]) started.
+:storage:jar (Thread[#637,Execution worker Thread 15,5,main]) started.
+
+> Task :storage:jar UP-TO-DATE
+Caching disabled for task ':storage:jar' because:
+  Build cache is disabled
+  Not worth caching
+Skipping task ':storage:jar' as it is up-to-date.
+
+> Task :metadata:compileJava UP-TO-DATE
+Caching disabled for task ':metadata:compileJava' because:
+  Build cache is disabled
+Skipping task ':metadata:compileJava' as it is up-to-date.
+No compile result for :metadata:compileJava
+work action resolve kafka-storage-4.0.2.jar (project :storage) (Thread[#637,Execution worker Thread 15,5,main]) started.
+work action resolve main (project :metadata) (Thread[#627,Execution worker Thread 6,5,main]) started.
+Resolve mutations for :coordinator-common:compileJava (Thread[#622,Execution worker,5,main]) started.
+Resolve mutations for :metadata:classes (Thread[#624,Execution worker Thread 3,5,main]) started.
+:metadata:classes (Thread[#624,Execution worker Thread 3,5,main]) started.
+
+> Task :metadata:classes UP-TO-DATE
+Skipping task ':metadata:classes' as it has no actions.
+Resolve mutations for :metadata:jar (Thread[#624,Execution worker Thread 3,5,main]) started.
+:coordinator-common:compileJava (Thread[#622,Execution worker,5,main]) started.
+:metadata:jar (Thread[#624,Execution worker Thread 3,5,main]) started.
+
+> Task :clients:shadowJar UP-TO-DATE
+Custom actions are attached to task ':clients:shadowJar'.
+Caching disabled for task ':clients:shadowJar' because:
+  Build cache is disabled
+Skipping task ':clients:shadowJar' as it is up-to-date.
+Resolve mutations for :clients:jar (Thread[#623,Execution worker Thread 2,5,main]) started.
+:clients:jar (Thread[#623,Execution worker Thread 2,5,main]) started.
+
+> Task :clients:jar SKIPPED
+Skipping task ':clients:jar' as task onlyIf 'Task is enabled' is false.
+work action resolve kafka-clients-4.0.2.jar (project :clients) (Thread[#623,Execution worker Thread 2,5,main]) started.
+Resolve mutations for :clients:testClasses (Thread[#623,Execution worker Thread 2,5,main]) started.
+:clients:testClasses (Thread[#623,Execution worker Thread 2,5,main]) started.
+
+> Task :clients:testClasses UP-TO-DATE
+Skipping task ':clients:testClasses' as it has no actions.
+
+> Task :metadata:jar UP-TO-DATE
+Caching disabled for task ':metadata:jar' because:
+  Build cache is disabled
+  Not worth caching
+Skipping task ':metadata:jar' as it is up-to-date.
+work action resolve kafka-metadata-4.0.2.jar (project :metadata) (Thread[#624,Execution worker Thread 3,5,main]) started.
+
+> Task :coordinator-common:compileJava UP-TO-DATE
+Caching disabled for task ':coordinator-common:compileJava' because:
+  Build cache is disabled
+Skipping task ':coordinator-common:compileJava' as it is up-to-date.
+No compile result for :coordinator-common:compileJava
+work action resolve main (project :coordinator-common) (Thread[#622,Execution worker,5,main]) started.
+Resolve mutations for :coordinator-common:classes (Thread[#624,Execution worker Thread 3,5,main]) started.
+:coordinator-common:classes (Thread[#624,Execution worker Thread 3,5,main]) started.
+
+> Task :coordinator-common:classes UP-TO-DATE
+Skipping task ':coordinator-common:classes' as it has no actions.
+Resolve mutations for :coordinator-common:jar (Thread[#624,Execution worker Thread 3,5,main]) started.
+:coordinator-common:jar (Thread[#624,Execution worker Thread 3,5,main]) started.
+Resolve mutations for :group-coordinator:compileJava (Thread[#622,Execution worker,5,main]) started.
+:group-coordinator:compileJava (Thread[#622,Execution worker,5,main]) started.
+Resolve mutations for :share-coordinator:compileJava (Thread[#623,Execution worker Thread 2,5,main]) started.
+:share-coordinator:compileJava (Thread[#623,Execution worker Thread 2,5,main]) started.
+
+> Task :coordinator-common:jar UP-TO-DATE
+Caching disabled for task ':coordinator-common:jar' because:
+  Build cache is disabled
+  Not worth caching
+Skipping task ':coordinator-common:jar' as it is up-to-date.
+work action resolve kafka-coordinator-common-4.0.2.jar (project :coordinator-common) (Thread[#633,Execution worker Thread 12,5,main]) started.
+
+> Task :share-coordinator:compileJava UP-TO-DATE
+Caching disabled for task ':share-coordinator:compileJava' because:
+  Build cache is disabled
+Skipping task ':share-coordinator:compileJava' as it is up-to-date.
+No compile result for :share-coordinator:compileJava
+work action resolve main (project :share-coordinator) (Thread[#623,Execution worker Thread 2,5,main]) started.
+Resolve mutations for :share-coordinator:classes (Thread[#623,Execution worker Thread 2,5,main]) started.
+:share-coordinator:classes (Thread[#623,Execution worker Thread 2,5,main]) started.
+
+> Task :share-coordinator:classes UP-TO-DATE
+Skipping task ':share-coordinator:classes' as it has no actions.
+Resolve mutations for :share-coordinator:jar (Thread[#623,Execution worker Thread 2,5,main]) started.
+:share-coordinator:jar (Thread[#623,Execution worker Thread 2,5,main]) started.
+
+> Task :share-coordinator:jar UP-TO-DATE
+Caching disabled for task ':share-coordinator:jar' because:
+  Build cache is disabled
+  Not worth caching
+Skipping task ':share-coordinator:jar' as it is up-to-date.
+work action resolve kafka-share-coordinator-4.0.2.jar (project :share-coordinator) (Thread[#623,Execution worker Thread 2,5,main]) started.
+
+> Task :group-coordinator:compileJava UP-TO-DATE
+Caching disabled for task ':group-coordinator:compileJava' because:
+  Build cache is disabled
+Skipping task ':group-coordinator:compileJava' as it is up-to-date.
+No compile result for :group-coordinator:compileJava
+work action resolve main (project :group-coordinator) (Thread[#622,Execution worker,5,main]) started.
+Resolve mutations for :group-coordinator:classes (Thread[#622,Execution worker,5,main]) started.
+:group-coordinator:classes (Thread[#622,Execution worker,5,main]) started.
+Resolve mutations for :server:compileJava (Thread[#623,Execution worker Thread 2,5,main]) started.
+
+> Task :group-coordinator:classes UP-TO-DATE
+Skipping task ':group-coordinator:classes' as it has no actions.
+Resolve mutations for :group-coordinator:jar (Thread[#622,Execution worker,5,main]) started.
+:server:compileJava (Thread[#631,Execution worker Thread 10,5,main]) started.
+:group-coordinator:jar (Thread[#622,Execution worker,5,main]) started.
+
+> Task :group-coordinator:jar UP-TO-DATE
+Caching disabled for task ':group-coordinator:jar' because:
+  Build cache is disabled
+  Not worth caching
+Skipping task ':group-coordinator:jar' as it is up-to-date.
+work action resolve kafka-group-coordinator-4.0.2.jar (project :group-coordinator) (Thread[#622,Execution worker,5,main]) started.
+
+> Task :server:compileJava UP-TO-DATE
+Caching disabled for task ':server:compileJava' because:
+  Build cache is disabled
+Skipping task ':server:compileJava' as it is up-to-date.
+No compile result for :server:compileJava
+Resolve mutations for :server:classes (Thread[#631,Execution worker Thread 10,5,main]) started.
+:server:classes (Thread[#631,Execution worker Thread 10,5,main]) started.
+
+> Task :server:classes UP-TO-DATE
+Skipping task ':server:classes' as it has no actions.
+Resolve mutations for :server:checkstyleMain (Thread[#631,Execution worker Thread 10,5,main]) started.
+:server:checkstyleMain (Thread[#631,Execution worker Thread 10,5,main]) started.
+
+> Task :server:checkstyleMain UP-TO-DATE
+Caching disabled for task ':server:checkstyleMain' because:
+  Build cache is disabled
+Skipping task ':server:checkstyleMain' as it is up-to-date.
+Resolve mutations for :server:compileTestJava (Thread[#631,Execution worker Thread 10,5,main]) started.
+:server:compileTestJava (Thread[#631,Execution worker Thread 10,5,main]) started.
+
+> Task :server:compileTestJava
+Caching disabled for task ':server:compileTestJava' because:
+  Build cache is disabled
+Task ':server:compileTestJava' is not up-to-date because:
+  Input property 'stableSources' file /home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/server/src/test/java/org/apache/kafka/network/iouring/MultiClientSustainedTrafficIT.java has changed.
+Compilation mode: in-process compilation
+Invalidating in-memory cache of /home/florent/.gradle/caches/8.10.2/javaCompile/jarAnalysis.bin
+Invalidating in-memory cache of /home/florent/.gradle/caches/8.10.2/javaCompile/classAnalysis.bin
+Created classpath snapshot for incremental compilation in 0.047 secs.
+Compiling with toolchain '/usr/lib/jvm/java-21-openjdk-amd64'.
+Compiling with JDK Java compiler API.
+Incremental compilation of 2 classes completed in 0.181 secs.
+Class dependency analysis for incremental compilation took 0.011 secs.
+Resolve mutations for :server:testClasses (Thread[#631,Execution worker Thread 10,5,main]) started.
+:server:testClasses (Thread[#631,Execution worker Thread 10,5,main]) started.
+
+> Task :server:testClasses
+Skipping task ':server:testClasses' as it has no actions.
+Resolve mutations for :server:checkstyleTest (Thread[#631,Execution worker Thread 10,5,main]) started.
+:server:checkstyleTest (Thread[#631,Execution worker Thread 10,5,main]) started.
+Resolve mutations for :server:javadoc (Thread[#632,Execution worker Thread 11,5,main]) started.
+:server:javadoc (Thread[#632,Execution worker Thread 11,5,main]) started.
+
+> Task :server:javadoc SKIPPED
+Skipping task ':server:javadoc' as task onlyIf 'Task is enabled' is false.
+Resolve mutations for :server:spotbugsMain (Thread[#632,Execution worker Thread 11,5,main]) started.
+:server:spotbugsMain (Thread[#632,Execution worker Thread 11,5,main]) started.
+
+> Task :server:spotbugsMain UP-TO-DATE
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/server/build/resources/main', not found
+file or directory '/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/server/build/resources/main', not found
+Caching disabled for task ':server:spotbugsMain' because:
+  Build cache is disabled
+Skipping task ':server:spotbugsMain' as it is up-to-date.
+This JVM does not support getting OS memory, so no OS memory status updates will be broadcast
+
+> Task :server:checkstyleTest
+Invalidating in-memory cache of /home/florent/.gradle/caches/8.10.2/fileHashes/fileHashes.bin
+Invalidating in-memory cache of /home/florent/.gradle/caches/8.10.2/fileHashes/resourceHashesCache.bin
+Caching disabled for task ':server:checkstyleTest' because:
+  Build cache is disabled
+Task ':server:checkstyleTest' is not up-to-date because:
+  Task has failed previously.
+Starting process 'Gradle Worker Daemon 16'. Working directory: /home/florent/.gradle/workers Command: /usr/lib/jvm/java-21-openjdk-amd64/bin/java -Dcheckstyle.enableExternalDtdLoad=false --add-opens java.prefs/java.util.prefs=ALL-UNNAMED @/home/florent/.gradle/.tmp/gradle-worker-classpath1801161170867152409txt -Xms200m -Xmx1g -Dfile.encoding=UTF-8 -Duser.country=US -Duser.language=en -Duser.variant worker.org.gradle.process.internal.worker.GradleWorkerMain 'Gradle Worker Daemon 16'
+Successfully started process 'Gradle Worker Daemon 16'
+Started Gradle worker daemon (0.336 secs) with fork options DaemonForkOptions{executable=/usr/lib/jvm/java-21-openjdk-amd64/bin/java, minHeapSize=200m, maxHeapSize=1g, jvmArgs=[--add-opens, java.prefs/java.util.prefs=ALL-UNNAMED], keepAliveMode=SESSION}.
+Running checkstyle with toolchain '/usr/lib/jvm/java-21-openjdk-amd64'.
+[ant:checkstyle] Running Checkstyle 10.20.2 on 35 files
+[ant:xslt] Processing /home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/server/build/reports/checkstyle/test.xml to /home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/server/build/reports/checkstyle/test.html
+[ant:xslt] Loading stylesheet <?xml version="1.0"?>
+<!--
+   Licensed to the Apache Software Foundation (ASF) under one or more
+   contributor license agreements.  See the NOTICE file distributed with
+   this work for additional information regarding copyright ownership.
+   The ASF licenses this file to You under the Apache License, Version 2.0
+   (the "License"); you may not use this file except in compliance with
+   the License.  You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-->
+<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:xl="http://www.w3.org/1999/XSL/Transform">
+    <xsl:output method="html" indent="yes"/>
+    <xsl:param name="gradleVersion"/>
+
+    <xsl:decimal-format decimal-separator="." grouping-separator="," />
+
+    <xsl:template match="checkstyle">
+        <html>
+            <head>
+                <title>Checkstyle Violations</title>
+                <!-- vaguely adapted from Gradle's CSS -->
+                <style type="text/css">
+                    body {
+                        background-color: #fff;
+                        color: #02303A;
+                    }
+
+                    a {
+                        color: #1DA2BD;
+                    }
+                    a.link {
+                        color: #02303A;
+                    }
+
+                    p {
+                        font-size: 1rem;
+                    }
+
+                    h1 a[name] {
+                        margin: 0;
+                        padding: 0;
+                    }
+
+                    tr:nth-child(even) {
+                        background: white;
+                    }
+
+                    th {
+                        font-weight:bold;
+                    }
+                    tr {
+                        background: #efefef;
+                    }
+                    table th, td, tr {
+                        font-size:100%;
+                        border: none;
+                        text-align: left;
+                        vertical-align: top;
+                    }
+                </style>
+            </head>
+            <body>
+                <p>
+                    <a name="top"><h1>Checkstyle Results</h1></a>
+                </p>
+                <hr align="left" width="95%" size="1"/>
+                <h2>Summary</h2>
+                <table class="summary" width="95%" >
+                    <tr>
+                        <th>Total files checked</th>
+                        <th>Total violations</th>
+                        <th>Files with violations</th>
+                    </tr>
+                    <tr>
+                        <td>
+                            <xsl:number level="any" value="count(descendant::file)"/>
+                        </td>
+                        <td>
+                            <xsl:number level="any" value="count(descendant::error)"/>
+                        </td>
+                        <td>
+                            <xsl:number level="any" value="count(descendant::file[error])"/>
+                        </td>
+                    </tr>
+                </table>
+                <hr align="left" width="95%" size="1"/>
+                <div class="violations">
+                    <h2>Violations</h2>
+                    <p>
+                        <xsl:choose>
+                            <xsl:when test="count(descendant::error) > 0">
+                                <table class="filelist" width="95%">
+                                    <tr>
+                                        <th>File</th>
+                                        <th>Total violations</th>
+                                    </tr>
+                                    <xsl:for-each select="file[error]">
+                                        <!-- sort by number of errors and then alphabetically -->
+                                        <xsl:sort data-type="number" order="descending" select="count(descendant::error)"/>
+                                        <xsl:sort select="@name"/>
+                                        <xsl:variable name="errors" select="count(descendant::error)"/>
+                                        <tr>
+                                            <td><a href="#{generate-id(@name)}"><xsl:value-of select="@name"/></a></td>
+                                            <td><xsl:value-of select="$errors"/></td>
+                                        </tr>
+                                    </xsl:for-each>
+                                </table>
+                                <p/>
+                                <xsl:apply-templates>
+                                    <!-- sort entries by file name alphabetically -->
+                                    <xsl:sort select="@name"/>
+                                </xsl:apply-templates>
+                                <p/>
+                            </xsl:when>
+                            <xsl:otherwise>
+                                No violations were found.
+                            </xsl:otherwise>
+                        </xsl:choose>
+                    </p>
+                </div>
+                <hr align="left" width="95%" size="1"/>
+                <p>Generated by <a href="https://gradle.org"><xsl:value-of select="$gradleVersion"/></a> with <a href="https://checkstyle.sourceforge.io/">Checkstyle <xsl:value-of select="@version"/></a>.</p>
+            </body>
+        </html>
+    </xsl:template>
+
+    <!-- A single file with violations -->
+    <xsl:template match="file[error]">
+        <div class="file-violation">
+            <h3>
+                <a class="link" name="{generate-id(@name)}"><xsl:value-of select="@name"/></a>
+            </h3>
+            <table class="violationlist" width="95%">
+                <tr>
+                    <th>Severity</th>
+                    <th>Description</th>
+                    <th>Line Number</th>
+                </tr>
+                <xsl:apply-templates select="error"/>
+            </table>
+            <p/>
+            <a href="#top">Back to top</a>
+            <p/>
+        </div>
+    </xsl:template>
+
+    <!-- A single row in the list of violations -->
+    <xsl:template match="error">
+        <tr>
+            <td>
+                <xsl:value-of select="@severity"/>
+            </td>
+            <td>
+                <xsl:value-of select="@message"/>
+            </td>
+            <td>
+                <xsl:value-of select="@line"/>
+            </td>
+        </tr>
+    </xsl:template>
+
+</xsl:stylesheet>
+Resolve mutations for :server:test (Thread[#631,Execution worker Thread 10,5,main]) started.
+:server:test (Thread[#631,Execution worker Thread 10,5,main]) started.
+Gradle Test Executor 17 started executing tests.
+
+> Task :server:test
+Invalidating in-memory cache of /home/florent/.gradle/caches/journal-1/file-access.bin
+Custom actions are attached to task ':server:test'.
+Caching disabled for task ':server:test' because:
+  Build cache is disabled
+Task ':server:test' is not up-to-date because:
+  Task has failed previously.
+Starting process 'Gradle Test Executor 17'. Working directory: /home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/server Command: /usr/lib/jvm/java-21-openjdk-amd64/bin/java -Dkafka.cluster.test.repeat -Dkafka.test.catalog.file -Dkafka.test.run.quarantined=false -Dorg.gradle.internal.worker.tmpdir=/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/server/build/tmp/test/work -Xss4m -XX:+UseParallelGC --add-opens=java.base/java.io=ALL-UNNAMED --add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/java.nio.file=ALL-UNNAMED --add-opens=java.base/java.util=ALL-UNNAMED --add-opens=java.base/java.util.concurrent=ALL-UNNAMED --add-opens=java.base/java.util.regex=ALL-UNNAMED --add-opens=java.base/java.util.stream=ALL-UNNAMED --add-opens=java.base/java.text=ALL-UNNAMED --add-opens=java.base/java.time=ALL-UNNAMED --add-opens=java.security.jgss/sun.security.krb5=ALL-UNNAMED @/home/florent/.gradle/.tmp/gradle-worker-classpath16414953912748692002txt -Xmx2g -Dfile.encoding=UTF-8 -Duser.country=US -Duser.language=en -Duser.variant -ea worker.org.gradle.process.internal.worker.GradleWorkerMain 'Gradle Test Executor 17'
+Successfully started process 'Gradle Test Executor 17'
+
+MultiClientSustainedTrafficIT > manyConcurrentClientsEachComplete5kRoundTrips() STANDARD_ERROR
+    [multi-client] progress sum=8659/20000  per-client=[2557, 686, 5000, 416]
+      [chan=127.0.0.1:42655-127.0.0.1:52396-0-0] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=173880 offers=3440
+      [chan=127.0.0.1:42655-127.0.0.1:52404-0-1] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=46652 offers=815
+      [chan=127.0.0.1:42655-127.0.0.1:52408-0-2] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=340000 offers=7220
+      [chan=127.0.0.1:42655-127.0.0.1:52424-0-3] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=28292 offers=488
+    [multi-client] progress sum=8659/20000  per-client=[2557, 686, 5000, 416]
+      [chan=127.0.0.1:42655-127.0.0.1:52396-0-0] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=173880 offers=3440
+      [chan=127.0.0.1:42655-127.0.0.1:52404-0-1] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=46652 offers=815
+      [chan=127.0.0.1:42655-127.0.0.1:52408-0-2] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=340000 offers=7220
+      [chan=127.0.0.1:42655-127.0.0.1:52424-0-3] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=28292 offers=488
+    [multi-client] progress sum=8659/20000  per-client=[2557, 686, 5000, 416]
+      [chan=127.0.0.1:42655-127.0.0.1:52396-0-0] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=173880 offers=3440
+      [chan=127.0.0.1:42655-127.0.0.1:52404-0-1] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=46652 offers=815
+      [chan=127.0.0.1:42655-127.0.0.1:52408-0-2] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=340000 offers=7220
+      [chan=127.0.0.1:42655-127.0.0.1:52424-0-3] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=28292 offers=488
+    [multi-client] progress sum=8659/20000  per-client=[2557, 686, 5000, 416]
+      [chan=127.0.0.1:42655-127.0.0.1:52396-0-0] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=173880 offers=3440
+      [chan=127.0.0.1:42655-127.0.0.1:52404-0-1] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=46652 offers=815
+      [chan=127.0.0.1:42655-127.0.0.1:52408-0-2] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=340000 offers=7220
+      [chan=127.0.0.1:42655-127.0.0.1:52424-0-3] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=28292 offers=488
+    [multi-client] progress sum=8659/20000  per-client=[2557, 686, 5000, 416]
+      [chan=127.0.0.1:42655-127.0.0.1:52396-0-0] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=173880 offers=3440
+      [chan=127.0.0.1:42655-127.0.0.1:52404-0-1] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=46652 offers=815
+      [chan=127.0.0.1:42655-127.0.0.1:52408-0-2] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=340000 offers=7220
+      [chan=127.0.0.1:42655-127.0.0.1:52424-0-3] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=28292 offers=488
+    [multi-client] progress sum=8659/20000  per-client=[2557, 686, 5000, 416]
+      [chan=127.0.0.1:42655-127.0.0.1:52396-0-0] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=173880 offers=3440
+      [chan=127.0.0.1:42655-127.0.0.1:52404-0-1] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=46652 offers=815
+      [chan=127.0.0.1:42655-127.0.0.1:52408-0-2] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=340000 offers=7220
+      [chan=127.0.0.1:42655-127.0.0.1:52424-0-3] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=28292 offers=488
+    [multi-client] progress sum=8659/20000  per-client=[2557, 686, 5000, 416]
+      [chan=127.0.0.1:42655-127.0.0.1:52396-0-0] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=173880 offers=3440
+      [chan=127.0.0.1:42655-127.0.0.1:52404-0-1] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=46652 offers=815
+      [chan=127.0.0.1:42655-127.0.0.1:52408-0-2] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=340000 offers=7220
+      [chan=127.0.0.1:42655-127.0.0.1:52424-0-3] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=28292 offers=488
+    [multi-client] progress sum=8659/20000  per-client=[2557, 686, 5000, 416]
+      [chan=127.0.0.1:42655-127.0.0.1:52396-0-0] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=173880 offers=3440
+      [chan=127.0.0.1:42655-127.0.0.1:52404-0-1] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=46652 offers=815
+      [chan=127.0.0.1:42655-127.0.0.1:52408-0-2] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=340000 offers=7220
+      [chan=127.0.0.1:42655-127.0.0.1:52424-0-3] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=28292 offers=488
+    [multi-client] progress sum=8659/20000  per-client=[2557, 686, 5000, 416]
+      [chan=127.0.0.1:42655-127.0.0.1:52396-0-0] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=173880 offers=3440
+      [chan=127.0.0.1:42655-127.0.0.1:52404-0-1] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=46652 offers=815
+      [chan=127.0.0.1:42655-127.0.0.1:52408-0-2] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=340000 offers=7220
+      [chan=127.0.0.1:42655-127.0.0.1:52424-0-3] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=28292 offers=488
+    [multi-client] progress sum=8659/20000  per-client=[2557, 686, 5000, 416]
+      [chan=127.0.0.1:42655-127.0.0.1:52396-0-0] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=173880 offers=3440
+      [chan=127.0.0.1:42655-127.0.0.1:52404-0-1] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=46652 offers=815
+      [chan=127.0.0.1:42655-127.0.0.1:52408-0-2] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=340000 offers=7220
+      [chan=127.0.0.1:42655-127.0.0.1:52424-0-3] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=28292 offers=488
+    [multi-client] STALL detected — 10s without progress
+      [chan=127.0.0.1:42655-127.0.0.1:52396-0-0] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=173880 offers=3440
+      [chan=127.0.0.1:42655-127.0.0.1:52404-0-1] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=46652 offers=815
+      [chan=127.0.0.1:42655-127.0.0.1:52408-0-2] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=340000 offers=7220
+      [chan=127.0.0.1:42655-127.0.0.1:52424-0-3] autoRead=true writable=true active=true bbu=65537 muted=false hasSend=false inboundB=0 inboundQ=0 pendingOut=0 totalIn=28292 offers=488
+    [multi-client] ===== ALL THREAD NAMES =====
+    [thread] 'iouring-echo' state=TIMED_WAITING daemon=true
+    [thread] 'client-1' state=RUNNABLE daemon=true
+    [thread] '/127.0.0.1:38252 to /127.0.0.1:35591 workers Thread 3' state=RUNNABLE daemon=false
+    [thread] 'Test worker' state=RUNNABLE daemon=false
+    [thread] 'Notification Thread' state=RUNNABLE daemon=true
+    [thread] 'Signal Dispatcher' state=RUNNABLE daemon=true
+    [thread] 'client-3' state=RUNNABLE daemon=true
+    [thread] 'Finalizer' state=WAITING daemon=true
+    [thread] 'Common-Cleaner' state=TIMED_WAITING daemon=true
+    [thread] '/127.0.0.1:38252 to /127.0.0.1:35591 workers' state=WAITING daemon=false
+    [thread] 'multiThreadIoEventLoopGroup-2-1' state=RUNNABLE daemon=false
+    [thread] '/127.0.0.1:38252 to /127.0.0.1:35591 workers Thread 2' state=RUNNABLE daemon=false
+    [thread] 'Reference Handler' state=RUNNABLE daemon=true
+    [thread] 'client-0' state=RUNNABLE daemon=true
+    [multi-client] ===== THREAD STACKS =====
+    [stack] iouring-echo state=TIMED_WAITING
+        at java.base@21.0.10/jdk.internal.misc.Unsafe.park(Native Method)
+        at java.base@21.0.10/java.util.concurrent.locks.LockSupport.parkNanos(LockSupport.java:269)
+        at java.base@21.0.10/java.util.concurrent.locks.AbstractQueuedSynchronizer.acquire(AbstractQueuedSynchronizer.java:790)
+        at java.base@21.0.10/java.util.concurrent.locks.AbstractQueuedSynchronizer.tryAcquireSharedNanos(AbstractQueuedSynchronizer.java:1160)
+        at java.base@21.0.10/java.util.concurrent.Semaphore.tryAcquire(Semaphore.java:415)
+        at app//org.apache.kafka.network.iouring.IoUringSelector.acquireWithTimeout(IoUringSelector.java:740)
+        at app//org.apache.kafka.network.iouring.IoUringSelector.poll(IoUringSelector.java:563)
+        at app//org.apache.kafka.network.iouring.MultiClientSustainedTrafficIT.echoLoop(MultiClientSustainedTrafficIT.java:240)
+        at app//org.apache.kafka.network.iouring.MultiClientSustainedTrafficIT.lambda$manyConcurrentClientsEachComplete5kRoundTrips$0(MultiClientSustainedTrafficIT.java:78)
+        at app//org.apache.kafka.network.iouring.MultiClientSustainedTrafficIT$$Lambda/0x00007aa7302c7750.run(Unknown Source)
+        at java.base@21.0.10/java.lang.Thread.runWith(Thread.java:1596)
+        at java.base@21.0.10/java.lang.Thread.run(Thread.java:1583)
+    [stack] client-1 state=RUNNABLE
+        at java.base@21.0.10/sun.nio.ch.Net.poll(Native Method)
+        at java.base@21.0.10/sun.nio.ch.NioSocketImpl.park(NioSocketImpl.java:191)
+        at java.base@21.0.10/sun.nio.ch.NioSocketImpl.timedRead(NioSocketImpl.java:280)
+        at java.base@21.0.10/sun.nio.ch.NioSocketImpl.implRead(NioSocketImpl.java:304)
+        at java.base@21.0.10/sun.nio.ch.NioSocketImpl.read(NioSocketImpl.java:346)
+        at java.base@21.0.10/sun.nio.ch.NioSocketImpl$1.read(NioSocketImpl.java:796)
+        at java.base@21.0.10/java.net.Socket$SocketInputStream.read(Socket.java:1099)
+        at java.base@21.0.10/java.io.DataInputStream.readFully(DataInputStream.java:208)
+        at java.base@21.0.10/java.io.DataInputStream.readInt(DataInputStream.java:385)
+        at app//org.apache.kafka.network.iouring.MultiClientSustainedTrafficIT.runClient(MultiClientSustainedTrafficIT.java:134)
+        at app//org.apache.kafka.network.iouring.MultiClientSustainedTrafficIT.lambda$startClient$1(MultiClientSustainedTrafficIT.java:116)
+        at app//org.apache.kafka.network.iouring.MultiClientSustainedTrafficIT$$Lambda/0x00007aa7302ca798.run(Unknown Source)
+        at java.base@21.0.10/java.lang.Thread.runWith(Thread.java:1596)
+        at java.base@21.0.10/java.lang.Thread.run(Thread.java:1583)
+    [stack] /127.0.0.1:38252 to /127.0.0.1:35591 workers Thread 3 state=RUNNABLE
+        at java.base@21.0.10/sun.nio.ch.EPoll.wait(Native Method)
+        at java.base@21.0.10/sun.nio.ch.EPollSelectorImpl.doSelect(EPollSelectorImpl.java:121)
+        at java.base@21.0.10/sun.nio.ch.SelectorImpl.lockAndDoSelect(SelectorImpl.java:130)
+        at java.base@21.0.10/sun.nio.ch.SelectorImpl.select(SelectorImpl.java:147)
+        at org.gradle.internal.remote.internal.inet.SocketConnection$SocketInputStream.read(SocketConnection.java:190)
+        at com.esotericsoftware.kryo.io.Input.fill(Input.java:146)
+        at com.esotericsoftware.kryo.io.Input.require(Input.java:178)
+        at com.esotericsoftware.kryo.io.Input.readByte(Input.java:295)
+        at org.gradle.internal.serialize.kryo.KryoBackedDecoder.readByte(KryoBackedDecoder.java:88)
+        at org.gradle.internal.remote.internal.hub.InterHubMessageSerializer$MessageReader.read(InterHubMessageSerializer.java:64)
+        at org.gradle.internal.remote.internal.hub.InterHubMessageSerializer$MessageReader.read(InterHubMessageSerializer.java:52)
+        at org.gradle.internal.remote.internal.inet.SocketConnection.receive(SocketConnection.java:86)
+        at org.gradle.internal.remote.internal.hub.MessageHub$ConnectionReceive.run(MessageHub.java:270)
+        at org.gradle.internal.concurrent.ExecutorPolicy$CatchAndRecordFailures.onExecute(ExecutorPolicy.java:64)
+        at org.gradle.internal.concurrent.AbstractManagedExecutor$1.run(AbstractManagedExecutor.java:48)
+        at java.base@21.0.10/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1144)
+        at java.base@21.0.10/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:642)
+        at java.base@21.0.10/java.lang.Thread.runWith(Thread.java:1596)
+        at java.base@21.0.10/java.lang.Thread.run(Thread.java:1583)
+    [stack] Test worker state=RUNNABLE
+        at java.base@21.0.10/java.lang.Thread.dumpThreads(Native Method)
+        at java.base@21.0.10/java.lang.Thread.getAllStackTraces(Thread.java:2522)
+        at app//org.apache.kafka.network.iouring.MultiClientSustainedTrafficIT.dumpAllStacks(MultiClientSustainedTrafficIT.java:187)
+        at app//org.apache.kafka.network.iouring.MultiClientSustainedTrafficIT.trackStall(MultiClientSustainedTrafficIT.java:180)
+        at app//org.apache.kafka.network.iouring.MultiClientSustainedTrafficIT.awaitOrDumpOnStall(MultiClientSustainedTrafficIT.java:167)
+        at app//org.apache.kafka.network.iouring.MultiClientSustainedTrafficIT.manyConcurrentClientsEachComplete5kRoundTrips(MultiClientSustainedTrafficIT.java:90)
+        at java.base@21.0.10/java.lang.invoke.LambdaForm$DMH/0x00007aa73023c000.invokeVirtual(LambdaForm$DMH)
+        at java.base@21.0.10/java.lang.invoke.LambdaForm$MH/0x00007aa73009c800.invoke(LambdaForm$MH)
+        at java.base@21.0.10/java.lang.invoke.Invokers$Holder.invokeExact_MT(Invokers$Holder)
+        at java.base@21.0.10/jdk.internal.reflect.DirectMethodHandleAccessor.invokeImpl(DirectMethodHandleAccessor.java:153)
+        at java.base@21.0.10/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:103)
+        at java.base@21.0.10/java.lang.reflect.Method.invoke(Method.java:580)
+        at app//org.junit.platform.commons.util.ReflectionUtils.invokeMethod(ReflectionUtils.java:728)
+        at app//org.junit.jupiter.engine.execution.MethodInvocation.proceed(MethodInvocation.java:60)
+        at app//org.junit.jupiter.engine.execution.InvocationInterceptorChain$ValidatingInvocation.proceed(InvocationInterceptorChain.java:131)
+        at app//org.junit.jupiter.engine.extension.TimeoutExtension.intercept(TimeoutExtension.java:156)
+        at app//org.junit.jupiter.engine.extension.TimeoutExtension.interceptTestableMethod(TimeoutExtension.java:147)
+        at app//org.junit.jupiter.engine.extension.TimeoutExtension.interceptTestMethod(TimeoutExtension.java:86)
+        at app//org.junit.jupiter.engine.descriptor.TestMethodTestDescriptor$$Lambda/0x00007aa7302037c8.apply(Unknown Source)
+        at app//org.junit.jupiter.engine.execution.InterceptingExecutableInvoker$ReflectiveInterceptorCall.lambda$ofVoidMethod$0(InterceptingExecutableInvoker.java:103)
+        at app//org.junit.jupiter.engine.execution.InterceptingExecutableInvoker$ReflectiveInterceptorCall$$Lambda/0x00007aa730203be8.apply(Unknown Source)
+        at app//org.junit.jupiter.engine.execution.InterceptingExecutableInvoker.lambda$invoke$0(InterceptingExecutableInvoker.java:93)
+        at app//org.junit.jupiter.engine.execution.InterceptingExecutableInvoker$$Lambda/0x00007aa7302368a0.apply(Unknown Source)
+        at app//org.junit.jupiter.engine.execution.InvocationInterceptorChain$InterceptedInvocation.proceed(InvocationInterceptorChain.java:106)
+        at app//org.junit.jupiter.engine.execution.InvocationInterceptorChain.proceed(InvocationInterceptorChain.java:64)
+        at app//org.junit.jupiter.engine.execution.InvocationInterceptorChain.chainAndInvoke(InvocationInterceptorChain.java:45)
+        at app//org.junit.jupiter.engine.execution.InvocationInterceptorChain.invoke(InvocationInterceptorChain.java:37)
+        at app//org.junit.jupiter.engine.execution.InterceptingExecutableInvoker.invoke(InterceptingExecutableInvoker.java:92)
+        at app//org.junit.jupiter.engine.execution.InterceptingExecutableInvoker.invoke(InterceptingExecutableInvoker.java:86)
+        at app//org.junit.jupiter.engine.descriptor.TestMethodTestDescriptor.lambda$invokeTestMethod$7(TestMethodTestDescriptor.java:218)
+        at app//org.junit.jupiter.engine.descriptor.TestMethodTestDescriptor$$Lambda/0x00007aa730238000.execute(Unknown Source)
+        at app//org.junit.platform.engine.support.hierarchical.ThrowableCollector.execute(ThrowableCollector.java:73)
+        at app//org.junit.jupiter.engine.descriptor.TestMethodTestDescriptor.invokeTestMethod(TestMethodTestDescriptor.java:214)
+        at app//org.junit.jupiter.engine.descriptor.TestMethodTestDescriptor.execute(TestMethodTestDescriptor.java:139)
+        at app//org.junit.jupiter.engine.descriptor.TestMethodTestDescriptor.execute(TestMethodTestDescriptor.java:69)
+        at app//org.junit.platform.engine.support.hierarchical.NodeTestTask.lambda$executeRecursively$6(NodeTestTask.java:151)
+        at app//org.junit.platform.engine.support.hierarchical.NodeTestTask$$Lambda/0x00007aa730224520.execute(Unknown Source)
+        at app//org.junit.platform.engine.support.hierarchical.ThrowableCollector.execute(ThrowableCollector.java:73)
+        at app//org.junit.platform.engine.support.hierarchical.NodeTestTask.lambda$executeRecursively$8(NodeTestTask.java:141)
+        at app//org.junit.platform.engine.support.hierarchical.NodeTestTask$$Lambda/0x00007aa7302242f8.invoke(Unknown Source)
+        at app//org.junit.platform.engine.support.hierarchical.Node.around(Node.java:137)
+        at app//org.junit.platform.engine.support.hierarchical.NodeTestTask.lambda$executeRecursively$9(NodeTestTask.java:139)
+        at app//org.junit.platform.engine.support.hierarchical.NodeTestTask$$Lambda/0x00007aa730223ed0.execute(Unknown Source)
+        at app//org.junit.platform.engine.support.hierarchical.ThrowableCollector.execute(ThrowableCollector.java:73)
+        at app//org.junit.platform.engine.support.hierarchical.NodeTestTask.executeRecursively(NodeTestTask.java:138)
+        at app//org.junit.platform.engine.support.hierarchical.NodeTestTask.execute(NodeTestTask.java:95)
+        at app//org.junit.platform.engine.support.hierarchical.SameThreadHierarchicalTestExecutorService$$Lambda/0x00007aa730225038.accept(Unknown Source)
+        at java.base@21.0.10/java.util.ArrayList.forEach(ArrayList.java:1596)
+        at app//org.junit.platform.engine.support.hierarchical.SameThreadHierarchicalTestExecutorService.invokeAll(SameThreadHierarchicalTestExecutorService.java:41)
+        at app//org.junit.platform.engine.support.hierarchical.NodeTestTask.lambda$executeRecursively$6(NodeTestTask.java:155)
+        at app//org.junit.platform.engine.support.hierarchical.NodeTestTask$$Lambda/0x00007aa730224520.execute(Unknown Source)
+        at app//org.junit.platform.engine.support.hierarchical.ThrowableCollector.execute(ThrowableCollector.java:73)
+        at app//org.junit.platform.engine.support.hierarchical.NodeTestTask.lambda$executeRecursively$8(NodeTestTask.java:141)
+        at app//org.junit.platform.engine.support.hierarchical.NodeTestTask$$Lambda/0x00007aa7302242f8.invoke(Unknown Source)
+        at app//org.junit.platform.engine.support.hierarchical.Node.around(Node.java:137)
+        at app//org.junit.platform.engine.support.hierarchical.NodeTestTask.lambda$executeRecursively$9(NodeTestTask.java:139)
+        at app//org.junit.platform.engine.support.hierarchical.NodeTestTask$$Lambda/0x00007aa730223ed0.execute(Unknown Source)
+        at app//org.junit.platform.engine.support.hierarchical.ThrowableCollector.execute(ThrowableCollector.java:73)
+        at app//org.junit.platform.engine.support.hierarchical.NodeTestTask.executeRecursively(NodeTestTask.java:138)
+        at app//org.junit.platform.engine.support.hierarchical.NodeTestTask.execute(NodeTestTask.java:95)
+        at app//org.junit.platform.engine.support.hierarchical.SameThreadHierarchicalTestExecutorService$$Lambda/0x00007aa730225038.accept(Unknown Source)
+        at java.base@21.0.10/java.util.ArrayList.forEach(ArrayList.java:1596)
+        at app//org.junit.platform.engine.support.hierarchical.SameThreadHierarchicalTestExecutorService.invokeAll(SameThreadHierarchicalTestExecutorService.java:41)
+        at app//org.junit.platform.engine.support.hierarchical.NodeTestTask.lambda$executeRecursively$6(NodeTestTask.java:155)
+        at app//org.junit.platform.engine.support.hierarchical.NodeTestTask$$Lambda/0x00007aa730224520.execute(Unknown Source)
+        at app//org.junit.platform.engine.support.hierarchical.ThrowableCollector.execute(ThrowableCollector.java:73)
+        at app//org.junit.platform.engine.support.hierarchical.NodeTestTask.lambda$executeRecursively$8(NodeTestTask.java:141)
+        at app//org.junit.platform.engine.support.hierarchical.NodeTestTask$$Lambda/0x00007aa7302242f8.invoke(Unknown Source)
+        at app//org.junit.platform.engine.support.hierarchical.Node.around(Node.java:137)
+        at app//org.junit.platform.engine.support.hierarchical.NodeTestTask.lambda$executeRecursively$9(NodeTestTask.java:139)
+        at app//org.junit.platform.engine.support.hierarchical.NodeTestTask$$Lambda/0x00007aa730223ed0.execute(Unknown Source)
+        at app//org.junit.platform.engine.support.hierarchical.ThrowableCollector.execute(ThrowableCollector.java:73)
+        at app//org.junit.platform.engine.support.hierarchical.NodeTestTask.executeRecursively(NodeTestTask.java:138)
+        at app//org.junit.platform.engine.support.hierarchical.NodeTestTask.execute(NodeTestTask.java:95)
+        at app//org.junit.platform.engine.support.hierarchical.SameThreadHierarchicalTestExecutorService.submit(SameThreadHierarchicalTestExecutorService.java:35)
+        at app//org.junit.platform.engine.support.hierarchical.HierarchicalTestExecutor.execute(HierarchicalTestExecutor.java:57)
+        at app//org.junit.platform.engine.support.hierarchical.HierarchicalTestEngine.execute(HierarchicalTestEngine.java:54)
+        at app//org.junit.platform.launcher.core.EngineExecutionOrchestrator.execute(EngineExecutionOrchestrator.java:198)
+        at app//org.junit.platform.launcher.core.EngineExecutionOrchestrator.execute(EngineExecutionOrchestrator.java:169)
+        at app//org.junit.platform.launcher.core.EngineExecutionOrchestrator.execute(EngineExecutionOrchestrator.java:93)
+        at app//org.junit.platform.launcher.core.EngineExecutionOrchestrator.lambda$execute$0(EngineExecutionOrchestrator.java:58)
+        at app//org.junit.platform.launcher.core.EngineExecutionOrchestrator$$Lambda/0x00007aa730211a58.accept(Unknown Source)
+        at app//org.junit.platform.launcher.core.EngineExecutionOrchestrator.withInterceptedStreams(EngineExecutionOrchestrator.java:141)
+        at app//org.junit.platform.launcher.core.EngineExecutionOrchestrator.execute(EngineExecutionOrchestrator.java:57)
+        at app//org.junit.platform.launcher.core.DefaultLauncher.execute(DefaultLauncher.java:103)
+        at app//org.junit.platform.launcher.core.DefaultLauncher.execute(DefaultLauncher.java:85)
+        at app//org.junit.platform.launcher.core.DelegatingLauncher.execute(DelegatingLauncher.java:47)
+        at org.gradle.api.internal.tasks.testing.junitplatform.JUnitPlatformTestClassProcessor$CollectAllTestClassesExecutor.processAllTestClasses(JUnitPlatformTestClassProcessor.java:124)
+        at org.gradle.api.internal.tasks.testing.junitplatform.JUnitPlatformTestClassProcessor$CollectAllTestClassesExecutor.access$000(JUnitPlatformTestClassProcessor.java:99)
+        at org.gradle.api.internal.tasks.testing.junitplatform.JUnitPlatformTestClassProcessor.stop(JUnitPlatformTestClassProcessor.java:94)
+        at org.gradle.api.internal.tasks.testing.SuiteTestClassProcessor.stop(SuiteTestClassProcessor.java:63)
+        at java.base@21.0.10/java.lang.invoke.LambdaForm$DMH/0x00007aa73009c000.invokeInterface(LambdaForm$DMH)
+        at java.base@21.0.10/java.lang.invoke.LambdaForm$MH/0x00007aa73009c800.invoke(LambdaForm$MH)
+        at java.base@21.0.10/java.lang.invoke.Invokers$Holder.invokeExact_MT(Invokers$Holder)
+        at java.base@21.0.10/jdk.internal.reflect.DirectMethodHandleAccessor.invokeImpl(DirectMethodHandleAccessor.java:153)
+        at java.base@21.0.10/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:103)
+        at java.base@21.0.10/java.lang.reflect.Method.invoke(Method.java:580)
+        at org.gradle.internal.dispatch.ReflectionDispatch.dispatch(ReflectionDispatch.java:36)
+        at org.gradle.internal.dispatch.ReflectionDispatch.dispatch(ReflectionDispatch.java:24)
+        at org.gradle.internal.dispatch.ContextClassLoaderDispatch.dispatch(ContextClassLoaderDispatch.java:33)
+        at org.gradle.internal.dispatch.ProxyDispatchAdapter$DispatchingInvocationHandler.invoke(ProxyDispatchAdapter.java:92)
+        at jdk.proxy1/jdk.proxy1.$Proxy4.stop(Unknown Source)
+        at org.gradle.api.internal.tasks.testing.worker.TestWorker$3.run(TestWorker.java:200)
+        at org.gradle.api.internal.tasks.testing.worker.TestWorker.executeAndMaintainThreadName(TestWorker.java:132)
+        at org.gradle.api.internal.tasks.testing.worker.TestWorker.execute(TestWorker.java:103)
+        at org.gradle.api.internal.tasks.testing.worker.TestWorker.execute(TestWorker.java:63)
+        at org.gradle.process.internal.worker.child.ActionExecutionWorker.execute(ActionExecutionWorker.java:56)
+        at org.gradle.process.internal.worker.child.SystemApplicationClassLoaderWorker.call(SystemApplicationClassLoaderWorker.java:121)
+        at org.gradle.process.internal.worker.child.SystemApplicationClassLoaderWorker.call(SystemApplicationClassLoaderWorker.java:71)
+        at app//worker.org.gradle.process.internal.worker.GradleWorkerMain.run(GradleWorkerMain.java:69)
+        at app//worker.org.gradle.process.internal.worker.GradleWorkerMain.main(GradleWorkerMain.java:74)
+    [stack] Notification Thread state=RUNNABLE
+    [stack] Signal Dispatcher state=RUNNABLE
+    [stack] client-3 state=RUNNABLE
+        at java.base@21.0.10/sun.nio.ch.Net.poll(Native Method)
+        at java.base@21.0.10/sun.nio.ch.NioSocketImpl.park(NioSocketImpl.java:191)
+        at java.base@21.0.10/sun.nio.ch.NioSocketImpl.timedRead(NioSocketImpl.java:280)
+        at java.base@21.0.10/sun.nio.ch.NioSocketImpl.implRead(NioSocketImpl.java:304)
+        at java.base@21.0.10/sun.nio.ch.NioSocketImpl.read(NioSocketImpl.java:346)
+        at java.base@21.0.10/sun.nio.ch.NioSocketImpl$1.read(NioSocketImpl.java:796)
+        at java.base@21.0.10/java.net.Socket$SocketInputStream.read(Socket.java:1099)
+        at java.base@21.0.10/java.io.DataInputStream.readFully(DataInputStream.java:208)
+        at java.base@21.0.10/java.io.DataInputStream.readInt(DataInputStream.java:385)
+        at app//org.apache.kafka.network.iouring.MultiClientSustainedTrafficIT.runClient(MultiClientSustainedTrafficIT.java:134)
+        at app//org.apache.kafka.network.iouring.MultiClientSustainedTrafficIT.lambda$startClient$1(MultiClientSustainedTrafficIT.java:116)
+        at app//org.apache.kafka.network.iouring.MultiClientSustainedTrafficIT$$Lambda/0x00007aa7302ca798.run(Unknown Source)
+        at java.base@21.0.10/java.lang.Thread.runWith(Thread.java:1596)
+        at java.base@21.0.10/java.lang.Thread.run(Thread.java:1583)
+    [stack] Finalizer state=WAITING
+        at java.base@21.0.10/java.lang.Object.wait0(Native Method)
+        at java.base@21.0.10/java.lang.Object.wait(Object.java:366)
+        at java.base@21.0.10/java.lang.Object.wait(Object.java:339)
+        at java.base@21.0.10/java.lang.ref.NativeReferenceQueue.await(NativeReferenceQueue.java:48)
+        at java.base@21.0.10/java.lang.ref.ReferenceQueue.remove0(ReferenceQueue.java:158)
+        at java.base@21.0.10/java.lang.ref.NativeReferenceQueue.remove(NativeReferenceQueue.java:89)
+        at java.base@21.0.10/java.lang.ref.Finalizer$FinalizerThread.run(Finalizer.java:173)
+    [stack] Common-Cleaner state=TIMED_WAITING
+        at java.base@21.0.10/jdk.internal.misc.Unsafe.park(Native Method)
+        at java.base@21.0.10/java.util.concurrent.locks.LockSupport.parkNanos(LockSupport.java:269)
+        at java.base@21.0.10/java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject.await(AbstractQueuedSynchronizer.java:1886)
+        at java.base@21.0.10/java.lang.ref.ReferenceQueue.await(ReferenceQueue.java:71)
+        at java.base@21.0.10/java.lang.ref.ReferenceQueue.remove0(ReferenceQueue.java:143)
+        at java.base@21.0.10/java.lang.ref.ReferenceQueue.remove(ReferenceQueue.java:218)
+        at java.base@21.0.10/jdk.internal.ref.CleanerImpl.run(CleanerImpl.java:140)
+        at java.base@21.0.10/java.lang.Thread.runWith(Thread.java:1596)
+        at java.base@21.0.10/java.lang.Thread.run(Thread.java:1583)
+        at java.base@21.0.10/jdk.internal.misc.InnocuousThread.run(InnocuousThread.java:186)
+    [stack] /127.0.0.1:38252 to /127.0.0.1:35591 workers state=WAITING
+        at java.base@21.0.10/jdk.internal.misc.Unsafe.park(Native Method)
+        at java.base@21.0.10/java.util.concurrent.locks.LockSupport.park(LockSupport.java:371)
+        at java.base@21.0.10/java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionNode.block(AbstractQueuedSynchronizer.java:519)
+        at java.base@21.0.10/java.util.concurrent.ForkJoinPool.unmanagedBlock(ForkJoinPool.java:3780)
+        at java.base@21.0.10/java.util.concurrent.ForkJoinPool.managedBlock(ForkJoinPool.java:3725)
+        at java.base@21.0.10/java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject.await(AbstractQueuedSynchronizer.java:1746)
+        at org.gradle.internal.remote.internal.hub.queue.EndPointQueue.take(EndPointQueue.java:49)
+        at org.gradle.internal.remote.internal.hub.MessageHub$Handler.run(MessageHub.java:403)
+        at org.gradle.internal.concurrent.ExecutorPolicy$CatchAndRecordFailures.onExecute(ExecutorPolicy.java:64)
+        at org.gradle.internal.concurrent.AbstractManagedExecutor$1.run(AbstractManagedExecutor.java:48)
+        at java.base@21.0.10/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1144)
+        at java.base@21.0.10/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:642)
+        at java.base@21.0.10/java.lang.Thread.runWith(Thread.java:1596)
+        at java.base@21.0.10/java.lang.Thread.run(Thread.java:1583)
+    [stack] multiThreadIoEventLoopGroup-2-1 state=RUNNABLE
+        at app//io.netty.channel.uring.Native.ioUringEnter(Native Method)
+        at app//io.netty.channel.uring.SubmissionQueue.ioUringEnter0(SubmissionQueue.java:316)
+        at app//io.netty.channel.uring.SubmissionQueue.ioUringEnter(SubmissionQueue.java:289)
+        at app//io.netty.channel.uring.SubmissionQueue.submit(SubmissionQueue.java:275)
+        at app//io.netty.channel.uring.SubmissionQueue.submitAndGet0(SubmissionQueue.java:263)
+        at app//io.netty.channel.uring.SubmissionQueue.submitAndGet(SubmissionQueue.java:247)
+        at app//io.netty.channel.uring.IoUringIoHandler.submitAndWaitWithTimeout(IoUringIoHandler.java:349)
+        at app//io.netty.channel.uring.IoUringIoHandler.run(IoUringIoHandler.java:172)
+        at app//io.netty.channel.SingleThreadIoEventLoop.runIo(SingleThreadIoEventLoop.java:225)
+        at app//io.netty.channel.SingleThreadIoEventLoop.run(SingleThreadIoEventLoop.java:196)
+        at app//io.netty.util.concurrent.SingleThreadEventExecutor$5.run(SingleThreadEventExecutor.java:1195)
+        at app//io.netty.util.internal.ThreadExecutorMap$2.run(ThreadExecutorMap.java:74)
+        at app//io.netty.util.concurrent.FastThreadLocalRunnable.run(FastThreadLocalRunnable.java:30)
+        at java.base@21.0.10/java.lang.Thread.runWith(Thread.java:1596)
+        at java.base@21.0.10/java.lang.Thread.run(Thread.java:1583)
+    [stack] /127.0.0.1:38252 to /127.0.0.1:35591 workers Thread 2 state=RUNNABLE
+        at org.gradle.internal.remote.internal.hub.queue.MultiEndPointQueue.flush(MultiEndPointQueue.java:71)
+        at org.gradle.internal.remote.internal.hub.queue.MultiEndPointQueue.empty(MultiEndPointQueue.java:53)
+        at org.gradle.internal.remote.internal.hub.queue.EndPointQueue.take(EndPointQueue.java:46)
+        at org.gradle.internal.remote.internal.hub.MessageHub$ConnectionDispatch.run(MessageHub.java:322)
+        at org.gradle.internal.concurrent.ExecutorPolicy$CatchAndRecordFailures.onExecute(ExecutorPolicy.java:64)
+        at org.gradle.internal.concurrent.AbstractManagedExecutor$1.run(AbstractManagedExecutor.java:48)
+        at java.base@21.0.10/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1144)
+        at java.base@21.0.10/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:642)
+        at java.base@21.0.10/java.lang.Thread.runWith(Thread.java:1596)
+        at java.base@21.0.10/java.lang.Thread.run(Thread.java:1583)
+    [stack] Reference Handler state=RUNNABLE
+        at java.base@21.0.10/java.lang.ref.Reference.waitForReferencePendingList(Native Method)
+        at java.base@21.0.10/java.lang.ref.Reference.processPendingReferences(Reference.java:246)
+        at java.base@21.0.10/java.lang.ref.Reference$ReferenceHandler.run(Reference.java:208)
+    [stack] client-0 state=RUNNABLE
+        at java.base@21.0.10/sun.nio.ch.Net.poll(Native Method)
+        at java.base@21.0.10/sun.nio.ch.NioSocketImpl.park(NioSocketImpl.java:191)
+        at java.base@21.0.10/sun.nio.ch.NioSocketImpl.timedRead(NioSocketImpl.java:280)
+        at java.base@21.0.10/sun.nio.ch.NioSocketImpl.implRead(NioSocketImpl.java:304)
+        at java.base@21.0.10/sun.nio.ch.NioSocketImpl.read(NioSocketImpl.java:346)
+        at java.base@21.0.10/sun.nio.ch.NioSocketImpl$1.read(NioSocketImpl.java:796)
+        at java.base@21.0.10/java.net.Socket$SocketInputStream.read(Socket.java:1099)
+        at java.base@21.0.10/java.io.DataInputStream.readFully(DataInputStream.java:208)
+        at java.base@21.0.10/java.io.DataInputStream.readInt(DataInputStream.java:385)
+        at app//org.apache.kafka.network.iouring.MultiClientSustainedTrafficIT.runClient(MultiClientSustainedTrafficIT.java:134)
+        at app//org.apache.kafka.network.iouring.MultiClientSustainedTrafficIT.lambda$startClient$1(MultiClientSustainedTrafficIT.java:116)
+        at app//org.apache.kafka.network.iouring.MultiClientSustainedTrafficIT$$Lambda/0x00007aa7302ca798.run(Unknown Source)
+        at java.base@21.0.10/java.lang.Thread.runWith(Thread.java:1596)
+        at java.base@21.0.10/java.lang.Thread.run(Thread.java:1583)
+    [multi-client] ===== END THREAD DUMP =====
+
+Gradle Test Executor 17 finished executing tests.
+
+> Task :server:test
+org.apache.kafka.network.iouring.MultiClientSustainedTrafficIT.manyConcurrentClientsEachComplete5kRoundTrips() failed, log available in /home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/server/build/reports/testOutput/org.apache.kafka.network.iouring.MultiClientSustainedTrafficIT.manyConcurrentClientsEachComplete5kRoundTrips().test.stdout
+
+MultiClientSustainedTrafficIT > manyConcurrentClientsEachComplete5kRoundTrips() FAILED
+    java.lang.AssertionError: client 0 failed
+        at org.apache.kafka.network.iouring.MultiClientSustainedTrafficIT.assertAllClientsCompleted(MultiClientSustainedTrafficIT.java:210)
+        at org.apache.kafka.network.iouring.MultiClientSustainedTrafficIT.manyConcurrentClientsEachComplete5kRoundTrips(MultiClientSustainedTrafficIT.java:92)
+
+        Caused by:
+        java.net.SocketTimeoutException: Read timed out
+            at java.base/sun.nio.ch.NioSocketImpl.timedRead(NioSocketImpl.java:278)
+            at java.base/sun.nio.ch.NioSocketImpl.implRead(NioSocketImpl.java:304)
+            at java.base/sun.nio.ch.NioSocketImpl.read(NioSocketImpl.java:346)
+            at java.base/sun.nio.ch.NioSocketImpl$1.read(NioSocketImpl.java:796)
+            at java.base/java.net.Socket$SocketInputStream.read(Socket.java:1099)
+            at java.base/java.io.DataInputStream.readFully(DataInputStream.java:208)
+            at java.base/java.io.DataInputStream.readInt(DataInputStream.java:385)
+            at org.apache.kafka.network.iouring.MultiClientSustainedTrafficIT.runClient(MultiClientSustainedTrafficIT.java:134)
+            at org.apache.kafka.network.iouring.MultiClientSustainedTrafficIT.lambda$startClient$1(MultiClientSustainedTrafficIT.java:116)
+Finished generating test XML results (0.004 secs) into: /home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/server/build/test-results/test
+Generating HTML test report...
+Finished generating test html results (0.005 secs) into: /home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/server/build/reports/tests/test
+
+> Task :server:test FAILED
+
+Deprecated Gradle features were used in this build, making it incompatible with Gradle 9.0.
+
+You can use '--warning-mode all' to show the individual deprecation warnings and determine if they come from your own scripts or plugins.
+
+For more on this, please refer to https://docs.gradle.org/8.10.2/userguide/command_line_interface.html#sec:command_line_warnings in the Gradle documentation.
+56 actionable tasks: 3 executed, 53 up-to-date
+Stopped 1 worker daemon(s).

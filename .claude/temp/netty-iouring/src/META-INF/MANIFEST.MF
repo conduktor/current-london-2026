@@ -1,0 +1,10 @@
+Manifest-Version: 1.0
+Created-By: Maven Source Plugin 3.2.0
+Bundle-ManifestVersion: 2
+Bundle-Name: Netty/Transport/Classes/io_uring
+Bundle-SymbolicName: io.netty.netty-transport-classes-io_uring.source
+Bundle-Vendor: The Netty Project
+Bundle-Version: 4.2.12.Final
+Eclipse-SourceBundle: io.netty.netty-transport-classes-io_uring;version=
+ "4.2.12.Final";roots:="."
+

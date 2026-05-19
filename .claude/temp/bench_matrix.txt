@@ -1,0 +1,48 @@
+=== io_uring benchmark result ===
+elapsed:        15.00 s
+throughput:     86 rps
+bandwidth:      44,511 B/s (0.04 MB/s)
+latency samples 10 (1-in-128 sampling)
+p50 latency:    188 us
+p99 latency:    286 us
+max latency:    286 us
+=== nio benchmark result ===
+elapsed:        15.00 s
+throughput:     72,675 rps
+bandwidth:      37,790,978 B/s (36.04 MB/s)
+latency samples 8,507 (1-in-128 sampling)
+p50 latency:    212 us
+p99 latency:    386 us
+max latency:    1,100 us
+=== io_uring benchmark result ===
+elapsed:        15.00 s
+throughput:     3,706 rps
+bandwidth:      1,927,347 B/s (1.84 MB/s)
+latency samples 433 (1-in-128 sampling)
+p50 latency:    661 us
+p99 latency:    1,887 us
+max latency:    1,906 us
+=== nio benchmark result ===
+elapsed:        15.00 s
+throughput:     70,573 rps
+bandwidth:      36,697,734 B/s (35.00 MB/s)
+latency samples 8,262 (1-in-128 sampling)
+p50 latency:    220 us
+p99 latency:    400 us
+max latency:    1,158 us
+=== io_uring benchmark result ===
+elapsed:        15.00 s
+throughput:     2,233 rps
+bandwidth:      1,161,282 B/s (1.11 MB/s)
+latency samples 260 (1-in-128 sampling)
+p50 latency:    1,425 us
+p99 latency:    2,835 us
+max latency:    3,389 us
+=== nio benchmark result ===
+elapsed:        15.00 s
+throughput:     69,767 rps
+bandwidth:      36,278,691 B/s (34.60 MB/s)
+latency samples 8,168 (1-in-128 sampling)
+p50 latency:    221 us
+p99 latency:    394 us
+max latency:    542 us

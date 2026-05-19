@@ -1,0 +1,17 @@
+JarIndex-Version: 1.0
+
+netty-transport-classes-io_uring-4.2.12.Final.jar
+META-INF
+META-INF/maven
+META-INF/maven/io.netty
+META-INF/maven/io.netty/netty-transport-classes-io_uring
+META-INF/native-image
+META-INF/native-image/io.netty
+META-INF/native-image/io.netty/netty-transport-classess-io_uring
+META-INF/versions
+META-INF/versions/11
+io
+io/netty
+io/netty/channel
+io/netty/channel/uring
+

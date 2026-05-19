@@ -1,0 +1,9 @@
+BLOCKER [IoUringTransportLayer.java](/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/server/src/main/java/org/apache/kafka/network/iouring/IoUringTransportLayer.java:443): async write completion does not wake the selector.
+
+Exact problem: the Netty `writeAndFlush` listener only decrements `pendingWriteBytes` and records `asyncWriteFailure`. It never calls back into `IoUringSelector.wakeup()`. `IoUringSelector.poll()` can then sleep at [IoUringSelector.java:545](/home/florent/kafka-current-london-2026/.claude/worktrees/io-uring/server/src/main/java/org/apache/kafka/network/iouring/IoUringSelector.java:545) even after the event loop has completed the write.
+
+Failure scenario: a normal small response is queued from the Processor thread. In real Netty, off-event-loop `writeAndFlush` is scheduled onto the channel event loop, so the future may complete just after the next `poll()` observes `hasPendingWrites() == true` and goes to sleep. Because small writes do not necessarily trigger `channelWritabilityChanged`, nothing wakes the Processor. The channel stays muted until the 300 ms poll timeout, delaying `completedSends()`, `RESPONSE_SENT`, and unmute. This can impose 300 ms stalls on ordinary request/response flow.
+
+Suggested fix: give `IoUringTransportLayer` a write-completion callback, passed from `IoUringSelector` as `wakeup::release`, and invoke it from the `ChannelFuture` listener after decrementing `pendingWriteBytes` and after recording async failure. Add a test with an asynchronously completed write future; `EmbeddedChannel`’s synchronous completion masks this.
+
+Latest-fix checks: the `AtomicInteger.getAndUpdate(i -> i == Integer.MAX_VALUE ? 0 : i + 1)` wrap is atomic, no caller I found depends on monotonic indexes, and `connectionIdWrapsAtIntegerMaxValue` exercises the wrap branch. I also found no remaining dangling Javadocs in `IoUringSelector.java`; `:server:compileJava` and the io_uring server tests passed.

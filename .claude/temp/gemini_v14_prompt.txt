@@ -1,0 +1,34 @@
+You are reviewing branch experiment/io-uring of Apache Kafka in /home/florent/kafka-current-london-2026/.claude/worktrees/io-uring.
+
+The branch adds an io_uring transport for the broker's PLAINTEXT listener using Netty's io_uring transport. Constraints from PROMPT.md:
+- v1: PLAINTEXT only, Linux only.
+- Do not modify anything under clients/.
+- Use Netty (no Panama FFI).
+- No virtual threads.
+
+Task: Audit the code for any **BLOCKER** that would prevent labelling v1 PRODUCTION-GRADE. Focus on:
+- DoS surfaces (direct-memory ceilings, accept queue caps, watermark gates)
+- Lifecycle and shutdown races (Processor.start, listener bind, selector close)
+- Quota correctness on accept/disconnect/throw paths
+- Cross-thread visibility (event loop vs Processor thread)
+- Frame-boundary parity with NIO Selector
+- Silent NIO-vs-io_uring divergence (TCP_NODELAY/KEEPALIVE/buffers/auth/connection-id)
+
+Read the actual code; don't speculate. Key files:
+- server/src/main/java/org/apache/kafka/network/iouring/IoUringSelector.java
+- server/src/main/java/org/apache/kafka/network/iouring/IoUringTransportLayer.java
+- server/src/main/java/org/apache/kafka/network/iouring/IoUringServerListener.java
+- server/src/main/java/org/apache/kafka/network/iouring/IoUringPlaintextAuthenticator.java
+- server/src/main/java/org/apache/kafka/network/iouring/BrokerSelectorFactory.java
+- core/src/main/scala/kafka/network/SocketServer.scala (io_uring sections)
+
+Two recent BLOCKER fixes (verify they are correct and don't introduce regressions):
+- d85e5fa6fc — defer io_uring LISTEN bind from Processor constructor to Acceptor.start()
+- beb52b45f4 — addInterestOps must gate autoRead re-enable on inboundBytes <= LOW watermark
+
+Output format:
+1. VERDICT (one of: PRODUCTION-GRADE | NOT PRODUCTION-GRADE)
+2. BLOCKERS (numbered list, each with file:line)
+3. CORRECTNESS / POLISH (non-blocking, numbered)
+
+Be ruthless. Bias toward NOT PRODUCTION-GRADE if you find anything substantive.

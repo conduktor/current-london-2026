@@ -1,0 +1,52 @@
+Manifest-Version: 1.0
+Created-By: Apache Maven Bundle Plugin 5.1.8
+Built-By: root
+Build-Jdk: 11.0.30
+Specification-Title: Netty/Transport
+Specification-Version: 4.2
+Specification-Vendor: The Netty Project
+Implementation-Title: Netty/Transport
+Implementation-Version: 4.2.12.Final
+Implementation-Vendor-Id: io.netty
+Implementation-Vendor: The Netty Project
+Implementation-URL: https://netty.io/netty-transport/
+Multi-Release: true
+Bnd-LastModified: 1774462563029
+Build-Jdk-Spec: 11
+Bundle-Description: Netty is an asynchronous event-driven network applic
+ ation framework for    rapid development of maintainable high performan
+ ce protocol servers and    clients.
+Bundle-DocURL: https://netty.io/
+Bundle-License: https://www.apache.org/licenses/LICENSE-2.0
+Bundle-ManifestVersion: 2
+Bundle-Name: Netty/Transport
+Bundle-SymbolicName: io.netty.transport
+Bundle-Vendor: The Netty Project
+Bundle-Version: 4.2.12.Final
+Export-Package: io.netty.bootstrap;uses:="io.netty.channel,io.netty.reso
+ lver,io.netty.util";version="4.2.12",io.netty.channel;uses:="io.netty.b
+ ootstrap,io.netty.buffer,io.netty.util,io.netty.util.concurrent";versio
+ n="4.2.12",io.netty.channel.embedded;uses:="io.netty.channel,io.netty.u
+ til.concurrent";version="4.2.12",io.netty.channel.group;uses:="io.netty
+ .channel,io.netty.util.concurrent";version="4.2.12",io.netty.channel.in
+ ternal;version="4.2.12",io.netty.channel.local;uses:="io.netty.channel"
+ ;version="4.2.12",io.netty.channel.nio;uses:="io.netty.buffer,io.netty.
+ channel,io.netty.util,io.netty.util.concurrent";version="4.2.12",io.net
+ ty.channel.oio;uses:="io.netty.buffer,io.netty.channel";version="4.2.12
+ ",io.netty.channel.pool;uses:="io.netty.bootstrap,io.netty.channel,io.n
+ etty.util.concurrent";version="4.2.12",io.netty.channel.socket;uses:="i
+ o.netty.buffer,io.netty.channel,io.netty.util";version="4.2.12",io.nett
+ y.channel.socket.nio;uses:="io.netty.buffer,io.netty.channel,io.netty.c
+ hannel.nio,io.netty.channel.socket";version="4.2.12",io.netty.channel.s
+ ocket.oio;uses:="io.netty.buffer,io.netty.channel,io.netty.channel.oio,
+ io.netty.channel.socket";version="4.2.12"
+Import-Package: io.netty.bootstrap,io.netty.buffer;version="[4.2,5)",io.
+ netty.channel,io.netty.channel.nio,io.netty.channel.oio,io.netty.channe
+ l.socket,io.netty.resolver;version="[4.2,5)",io.netty.util;version="[4.
+ 2,5)",io.netty.util.concurrent;version="[4.2,5)",io.netty.util.internal
+ ;version="[4.2,5)",io.netty.util.internal.logging;version="[4.2,5)",sun
+ .nio.ch;resolution:=optional,org.bouncycastle.jcajce.provider;version="
+ [1.0,2)";resolution:=optional
+Require-Capability: osgi.ee;filter:="(&(osgi.ee=JavaSE)(version=1.8))"
+Tool: Bnd-6.3.1.202206071316
+

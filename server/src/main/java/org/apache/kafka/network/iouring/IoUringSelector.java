@@ -483,6 +483,30 @@ public final class IoUringSelector implements BrokerSelector {
         wakeup.release();
     }
 
+    /**
+     * Records a completed receive for {@code id}, enforcing the
+     * "one completed receive per channel per poll" invariant. Mirrors NIO's
+     * {@code Selector.addToCompletedReceives} (clients/.../Selector.java:1056-1062)
+     * which throws {@link IllegalStateException} on duplicate insert.
+     *
+     * <p>The {@link Set#add Set.add} on {@link #receivesThisPoll} is the duplicate
+     * detector: it returns {@code false} if the id is already present. Throwing
+     * <em>before</em> the {@link #completedReceives} add — same order as NIO — keeps the
+     * per-poll output free of the second receive even if a future caller catches the ISE.
+     *
+     * <p>Why a single helper instead of inlining the check at three call-sites: the
+     * invariant only holds if every call-site goes through it. Centralising the
+     * duplicate-check makes "a fourth call-site is added and forgets the guard" a
+     * compile-time impossibility — the helper is the only place that can mutate the
+     * pair {@code (completedReceives, receivesThisPoll)} together.
+     */
+    private void addCompletedReceive(String id, NetworkReceive completed) {
+        if (!receivesThisPoll.add(id))
+            throw new IllegalStateException(
+                "Attempting to add second completed receive to channel " + id);
+        completedReceives.add(completed);
+    }
+
     // -------------------------------------------------------------------------
     // Selectable / BrokerSelector API (called from the Processor thread)
     // -------------------------------------------------------------------------
@@ -655,8 +679,7 @@ public final class IoUringSelector implements BrokerSelector {
                     }
                     NetworkReceive completed = channel.maybeCompleteReceive();
                     if (completed != null) {
-                        completedReceives.add(completed);
-                        receivesThisPoll.add(channel.id());
+                        addCompletedReceive(channel.id(), completed);
                         madeProgress = true;
                     }
                     // Self-mute detection: KafkaChannel.read() flips muteState to MUTED when
@@ -906,8 +929,7 @@ public final class IoUringSelector implements BrokerSelector {
                         channel.read();
                         NetworkReceive completed = channel.maybeCompleteReceive();
                         if (completed != null) {
-                            completedReceives.add(completed);
-                            receivesThisPoll.add(id);
+                            addCompletedReceive(id, completed);
                             keepClosing = true;
                         }
                     } catch (Exception e) {
@@ -1013,8 +1035,7 @@ public final class IoUringSelector implements BrokerSelector {
                         long read = channel.read();
                         NetworkReceive completed = channel.maybeCompleteReceive();
                         if (completed != null) {
-                            completedReceives.add(completed);
-                            receivesThisPoll.add(disconnectId);
+                            addCompletedReceive(disconnectId, completed);
                             madeProgress = true;
                             break;
                         }
@@ -1379,6 +1400,17 @@ public final class IoUringSelector implements BrokerSelector {
             // which closing was first triggered.
             channel.state(ChannelState.LOCAL_CLOSE);
             explicitlyMutedChannels.remove(channel);
+            // Mirror NIO Selector.close(channel, CloseMode) (clients/.../Selector.java:929-934):
+            // every active-channel close path purges {@link #connected}. Without this, if
+            // close(id) is called from the Acceptor under broker-max pressure during a poll
+            // that just produced the id in {@link #connected} (same-poll accept then refusal),
+            // the stale id survives until the NEXT poll's {@code connected.clear()}. Any
+            // observer iterating {@link #connected()} between now and the next poll (test
+            // accessor, debug log, JMX) would observe an id whose channel was already torn
+            // down. The Processor's own walk happens immediately after poll, BEFORE any
+            // close(id) call could land — so this is defence-in-depth for future observers
+            // and same-poll-race correctness rather than a live regression.
+            connected.remove(id);
             Utils.closeQuietly(channel, "channel close(" + id + ")");
             return;
         }
@@ -1441,6 +1473,19 @@ public final class IoUringSelector implements BrokerSelector {
     boolean maybeExpireOldestIdleChannelForTesting(long nowNanos) {
         nextIdleScanNanos = 0L;
         return maybeExpireOldestIdleChannel(nowNanos);
+    }
+
+    // Test seam for the duplicate-receive invariant (CONCERN-23A). The natural call-sites
+    // of {@link #addCompletedReceive} (step-2 read, closingChannels final-read drain, and
+    // pendingDisconnect drain) are gated by upstream conditions that today prevent two
+    // sites from firing for the same id in one poll — so a behavioral test cannot trip
+    // the throw without contriving a state corruption that the gates already block.
+    // Exposing the helper as a test seam lets the test pin the invariant directly: any
+    // future caller path (added or refactored) that forgets the {@code receivesThisPoll}
+    // gate will throw on the second add — mirroring NIO's
+    // {@code addToCompletedReceives}.
+    void addCompletedReceiveForTesting(String id, NetworkReceive completed) {
+        addCompletedReceive(id, completed);
     }
 
     /**

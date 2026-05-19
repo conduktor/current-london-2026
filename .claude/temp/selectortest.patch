@@ -1,0 +1,83 @@
+diff --git a/server/src/test/java/org/apache/kafka/network/iouring/IoUringSelectorTest.java b/server/src/test/java/org/apache/kafka/network/iouring/IoUringSelectorTest.java
+index c51666883b..fa2f4b8ddb 100644
+--- a/server/src/test/java/org/apache/kafka/network/iouring/IoUringSelectorTest.java
++++ b/server/src/test/java/org/apache/kafka/network/iouring/IoUringSelectorTest.java
+@@ -106,6 +106,22 @@ class IoUringSelectorTest {
+         return Unpooled.wrappedBuffer(buf);
+     }
+ 
++    @Test
++    void pollRejectsNegativeTimeoutWithIllegalArgumentException() throws Exception {
++        // PARITY-1 / NIO parity: NIO Selector.poll throws IllegalArgumentException for
++        // a negative timeout (clients/.../Selector.java:445-447). Without that guard,
++        // io_uring silently fell through and the awaitForWork branch returned
++        // immediately, turning the caller bug into a 100% CPU spin on the Processor
++        // thread. The throw routes through the Processor's catch Throwable into the
++        // shutdown path with a clear stack trace; the silent spin used to manifest
++        // as "broker is using 100% CPU but nothing is happening".
++        IoUringSelector s = newSelector(IDLE_NANOS_NEVER);
++        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class, () -> s.poll(-1));
++        assertEquals("timeout should be >= 0", ex.getMessage(),
++            "must match NIO's message byte-for-byte so log searches and alerts work uniformly");
++        assertDoesNotThrow(() -> s.poll(0), "zero timeout remains valid (NIO parity)");
++    }
++
+     @Test
+     void pollWithNoChannelsReturnsEmptyOutputs() throws Exception {
+         IoUringSelector s = newSelector(IDLE_NANOS_NEVER);
+@@ -1017,6 +1033,55 @@ class IoUringSelectorTest {
+             () -> s.send(new NetworkSend("never-existed", ByteBufferSend.sizePrefixed(body))));
+     }
+ 
++    @Test
++    void setSendExceptionOnOperatorMutedChannelMustClearExplicitlyMutedChannels() throws Exception {
++        // LEAK-1 regression: every other close path in IoUringSelector pairs
++        // channels.remove with explicitlyMutedChannels.remove (enqueueClose:976,
++        // surfacePrepareFailureAsDisconnect:753, maybeExpireOldestIdleChannel:717,
++        // drainClosingChannels:846, close(id):1254). The send() catch block at line
++        // 1021 used to skip the explicitlyMutedChannels.remove step, so on an
++        // operator-muted channel that subsequently tripped the "prior send still in
++        // progress" invariant (KafkaChannel.setSend, clients/.../KafkaChannel.java:391),
++        // the closed KafkaChannel reference stayed pinned in the HashSet for the
++        // broker's lifetime — transitively holding its IoUringTransportLayer,
++        // authenticator, and KafkaPrincipalBuilder. Bytes were freed by closeQuietly
++        // but the object graph stayed reachable. This test wires up that exact race
++        // and asserts the set is empty after the catch path runs.
++        IoUringSelector s = newSelector(IDLE_NANOS_NEVER);
++        acceptNew(s, REMOTE_A);
++        s.poll(0);
++        String id = s.connected().get(0);
++
++        // Operator-mute: lands the channel in explicitlyMutedChannels.
++        s.mute(id);
++        assertEquals(1, s.explicitlyMutedChannelsSizeForTesting(),
++            "preconditions: operator mute must populate explicitlyMutedChannels");
++
++        // First send establishes a NetworkSend on the channel (no exception).
++        ByteBuffer body = ByteBuffer.wrap("first".getBytes());
++        s.send(new NetworkSend(id, ByteBufferSend.sizePrefixed(body)));
++
++        // Second send while the first is still in progress triggers KafkaChannel.setSend's
++        // "Attempt to begin a send operation with prior send operation still in progress"
++        // — caught by send()'s catch (Exception e) block, which closes the channel and
++        // rethrows. This is the LEAK-1 vector.
++        ByteBuffer body2 = ByteBuffer.wrap("second".getBytes());
++        Exception thrown = assertThrows(Exception.class,
++            () -> s.send(new NetworkSend(id, ByteBufferSend.sizePrefixed(body2))));
++        assertTrue(thrown.getMessage() != null && thrown.getMessage().contains("prior send"),
++            "must be the in-progress-send invariant, not some other exception — got: " + thrown);
++
++        // The fix: explicitlyMutedChannels.remove(channel) inside the catch block.
++        // Without the fix this assertion would fail with size=1 — the closed channel
++        // would still be pinned in the HashSet even though channels.remove cleared it
++        // from the live map.
++        assertEquals(0, s.explicitlyMutedChannelsSizeForTesting(),
++            "setSend-throws catch path must drop the channel from explicitlyMutedChannels — "
++                + "otherwise the closed KafkaChannel ref + its transport/authenticator/principal "
++                + "builder graph is pinned in the HashSet for the broker's lifetime");
++        assertNull(s.channel(id), "preconditions cross-check: the channel was also removed from `channels`");
++    }
++
+     @Test
+     void atMostOneCompletedReceivePerChannelAcrossStep2AndStep3InSamePoll() throws Exception {
+         // Regression for the cross-step variant of "one receive per channel per poll":

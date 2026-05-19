@@ -1,0 +1,10 @@
+benchmark config: backend=io_uring, connections=4, threads=1, payload=64, warmupMs=1000, durationMs=3000
+warming up...
+measuring...
+
+=== io_uring benchmark result ===
+elapsed:        3.00 s
+messages:       0
+throughput:     0 rps
+bandwidth:      0 B/s (0.00 MB/s)
+latency samples 0 (1-in-128 sampling)

@@ -1,0 +1,61 @@
+You are auditing an Apache Kafka io_uring networking layer for production-readiness.
+
+CONTEXT
+========
+PROMPT.md scope:
+  - io_uring transport on broker side only, gated by `socket.selector.implementation = io_uring | nio | auto` (DEFAULT: auto — io_uring on Linux + PLAINTEXT, NIO otherwise).
+  - Linux PLAINTEXT only for v1.
+  - Wraps Netty 4.2.x IoUringSocketChannel inside a custom Selectable matching `org.apache.kafka.common.network.Selectable` contract.
+  - Do NOT modify anything under `clients/`. Selector lives broker-side only.
+  - No virtual threads. No Panama FFI.
+
+NB on default: PROMPT.md says `default auto` with `io_uring|nio|auto` as legal values. An audit comment claiming default should be `nio` or value should be `iouring` is wrong about the contract.
+
+This is Round 11. The cumulative state under audit is the io_uring transport AFTER the latest commit:
+
+  808a8d9c86  io_uring: wake selector from async writeAndFlush listener
+  975a7f2f32  io_uring: cap connection-id index at Integer.MAX_VALUE + un-dangle Javadoc
+  de82396238  io_uring: drop stale queued.max.bytes refusal — MemoryPool recovery is implemented
+  5cf28535da  io_uring: preserve vectored-write byte ordering on partial chunk
+  e33cd3bee9  io_uring: bound transport-layer direct memory under DoS (inbound + outbound)
+  30e2e2d372  io_uring: drain self-muted closing channels (NIO line 702 parity)
+  6e5b5a9e43  io_uring: recover self-muted channels when MemoryPool releases pressure
+  586e8a83fd  io_uring: bound pendingAccepts queue to prevent unbounded growth
+  65e29cd570  io_uring: gate writes when Netty outboundBuffer hits high water mark
+  a9138aabdc  io_uring: route InvalidReceiveException through LOCAL_CLOSE
+  3cc6c37569  io_uring: apply NIO Acceptor's TCP options to accepted child channels
+  ae6603566f  io_uring: land four v4 audit BLOCKERs
+
+YOUR TASK
+Find any REMAINING production blockers, or confirm "production-grade" if none exist. Pay particular attention to the latest fix (808a8d9c86):
+  - IoUringTransportLayer now takes a `Runnable writeWakeCallback` and invokes it from inside the writeAndFlush listener (after decrementing pendingWriteBytes and stashing asyncWriteFailure).
+  - IoUringSelector passes `wakeup::release` (Semaphore.release) as the callback.
+  - Verify: thread safety of Semaphore.release from event-loop, no reentrancy issues if Processor is mid-poll, no spurious-wakeup amplification, listener exception isolation (what if writeWakeCallback throws?), behavior under high write volume (Semaphore permit growth), and behavior when transport.close() races with an in-flight write completion.
+
+FILES TO READ (in order of priority, all under server/src/main/java/org/apache/kafka/network/iouring/ and server/src/test/java/org/apache/kafka/network/iouring/):
+  1. IoUringSelector.java           — poll lifecycle, wakeup semaphore, recoverFromMemoryPressure, closingChannels, mute/unmute, quotas, idGen
+  2. IoUringTransportLayer.java     — Netty bridge, watermarks, chunked write, vectored write loop, writeWakeCallback
+  3. IoUringServerListener.java
+  4. IoUringSelectorTest.java
+  5. IoUringTransportLayerTest.java
+  6. (reference, READ-ONLY) clients/src/main/java/org/apache/kafka/common/network/Selector.java
+
+WHAT TO LOOK FOR — production BLOCKERs only, not nits:
+  - Memory safety: ByteBuf leaks, unbounded direct-memory growth, unreleased pooled allocations on error paths
+  - Thread safety: event-loop ↔ Processor races on shared state, Semaphore release reentrancy
+  - Lifecycle: connection-quota leaks, closingChannels eviction, disconnect ordering, send-failed routing
+  - Mute semantics: self vs explicit, one-receive-per-poll, MemoryPool recovery
+  - Backpressure: watermark transitions, autoRead, write chunking
+  - Parity with NIO Selector.java contract
+  - Exception isolation: per-channel failures must not break poll()
+
+WHAT TO IGNORE:
+  - Code style, naming, comment density
+  - TLS / SASL — out of scope for v1
+  - Anything in clients/ — frozen
+  - Whether the default should be `nio` vs `auto` — contract says `auto`
+
+OUTPUT FORMAT
+  Per finding: BLOCKER / CONCERN / NIT label, file:line, the exact problem, the failure scenario, the suggested fix. If no BLOCKERs remain, end with exactly: `VERDICT: PRODUCTION-GRADE FOR V1 (PLAINTEXT)`.
+
+The maintainer is using your verdict to decide whether v1 can ship. Don't hedge — if there is no real BLOCKER, say so.
