@@ -4319,6 +4319,69 @@ class ControllerApisTest {
       "tenant-named TOPIC, tenant-shaped GROUP, and tenant principal echo must all be scrubbed")
   }
 
+  @Test
+  def testDescribeUserScramCredentialsNotDispatchedOnControllerListener(): Unit = {
+    // Anchors the fail-closed dispatch invariant for DESCRIBE_USER_SCRAM_CREDENTIALS.
+    // The schema (clients/.../DescribeUserScramCredentialsRequest.json) declares
+    // `"listeners": ["broker", "controller"]`, so the wire framework accepts the
+    // request on the controller listener — but `ControllerApis.handle` has no
+    // `case ApiKeys.DESCRIBE_USER_SCRAM_CREDENTIALS`, so the request lands on the
+    // fall-through `case _` and is refused with an error response.
+    //
+    // That fall-through is the load-bearing fact: if a future contributor wires
+    // a controller-side handler (mirroring `handleAlterUserScramCredentials`),
+    // they MUST also wire the tenant scrub that `KafkaApis` applies on the
+    // broker side (closed by #115), otherwise the controller path silently
+    // enumerates every tenant SCRAM user to any cluster-wide caller. This test
+    // turns red the moment a case is added, forcing the contributor to read
+    // #115 / #122 and add the scrub before the test is updated.
+    val controller = mock(classOf[Controller])
+    val request = buildRequest(new DescribeUserScramCredentialsRequest.Builder(
+      new DescribeUserScramCredentialsRequestData()).build())
+    controllerApis = createControllerApis(None, controller)
+
+    controllerApis.handle(request, RequestLocal.noCaching)
+
+    verifyNoInteractions(controller)
+    val response = captureSentResponse(request).asInstanceOf[DescribeUserScramCredentialsResponse]
+    // The unmapped-ApiKey path throws `new ApiException("Unsupported ApiKey ...")`; ApiError
+    // deliberately scrubs the message for UNKNOWN_SERVER_ERROR (to avoid leaking internals),
+    // so the message itself is null on the wire. The errorCode is the load-bearing assertion:
+    // it pins the fall-through path. The day someone wires a real handler, the code will
+    // change and turn this test red — the comment then leads them to #115 / #109 / #122.
+    assertEquals(Errors.UNKNOWN_SERVER_ERROR.code, response.data.errorCode,
+      "ControllerApis.handle must hit the fail-closed `case _` path for DESCRIBE_USER_SCRAM_CREDENTIALS; "
+        + "any other code means a dispatch case was added — before re-tightening this assertion, "
+        + "wire the same tenant scrub KafkaApis applies on the broker side (closed by #115).")
+  }
+
+  @Test
+  def testDescribeDelegationTokenNotDispatchedOnControllerListener(): Unit = {
+    // Companion to testDescribeUserScramCredentialsNotDispatchedOnControllerListener.
+    // DescribeDelegationTokenRequest.json also declares `"listeners": ["broker", "controller"]`
+    // and ControllerApis.handle has no case — the request falls through to the
+    // fail-closed `case _` and the request channel returns an error response.
+    //
+    // Closes the regression path that #109 cleaned up on the broker side: the
+    // broker handler now scrubs raw HMACs for cross-tenant callers. A future
+    // contributor adding a controller-side case must read #109 / #122 and wire
+    // the same scrub before this test passes again.
+    val controller = mock(classOf[Controller])
+    val request = buildRequest(new DescribeDelegationTokenRequest(
+      new DescribeDelegationTokenRequestData(), ApiKeys.DESCRIBE_DELEGATION_TOKEN.latestVersion))
+    controllerApis = createControllerApis(None, controller)
+
+    controllerApis.handle(request, RequestLocal.noCaching)
+
+    verifyNoInteractions(controller)
+    val response = captureSentResponse(request).asInstanceOf[DescribeDelegationTokenResponse]
+    // See sibling test for the rationale on UNKNOWN_SERVER_ERROR — same fall-through.
+    assertEquals(Errors.UNKNOWN_SERVER_ERROR, response.error,
+      "ControllerApis.handle must hit the fail-closed `case _` path for DESCRIBE_DELEGATION_TOKEN; "
+        + "any other code means a dispatch case was added — before re-tightening this assertion, "
+        + "wire the same tenant scrub KafkaApis applies on the broker side (closed by #109).")
+  }
+
   @AfterEach
   def tearDown(): Unit = {
     quotasNeverThrottleControllerMutations.shutdown()
