@@ -365,6 +365,34 @@ public class RuleJsonCodecTest {
     }
 
     @Test
+    public void trailingTokensAfterEnvelopeRejected() {
+        // R28 #250: Jackson's ObjectMapper.readTree(byte[]) by default reads
+        // ONE complete tree and silently discards everything after the closing
+        // brace, so a record body like `{...valid envelope...}TRAILING_GARBAGE`
+        // would otherwise decode as if the trailing bytes were absent. That's
+        // the same canonical-form-drift threat class as duplicate keys: a
+        // signer / audit-replay tool that fingerprints the published bytes
+        // sees one value, the broker loads another. MAX_ENVELOPE_BYTES caps
+        // the wasted-bytes axis at 65 KB; FAIL_ON_TRAILING_TOKENS closes the
+        // drift axis at intake.
+        //
+        // Negative control: disabling FAIL_ON_TRAILING_TOKENS on the MAPPER
+        // would silently accept this envelope, decode an Action.DENY rule
+        // for METADATA with errorCode 47, and this test would fail because
+        // the assertThrows would not see a RuleEnvelopeException.
+        String json = "{\"apiKeys\":[\"METADATA\"],"
+            + "\"action\":\"DENY\","
+            + "\"when\":\"true\","
+            + "\"errorCode\":47}"
+            + "TRAILING_GARBAGE_AFTER_ENVELOPE";
+        RuleEnvelopeException ex = assertThrows(RuleEnvelopeException.class,
+            () -> RuleJsonCodec.decode("k", json.getBytes(StandardCharsets.UTF_8)));
+        assertTrue(ex.getMessage().contains("malformed JSON envelope"),
+            "trailing-token rejection must surface as a malformed-JSON failure: "
+                + ex.getMessage());
+    }
+
+    @Test
     public void duplicateJsonKeysRejected() {
         // Round-11 audit (JSON-codec sub-agent, MEDIUM): default Jackson
         // applies last-wins semantics to duplicate JSON keys — a rule

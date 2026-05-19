@@ -78,8 +78,22 @@ public final class RuleJsonCodec {
     // second — Jackson's default keeps the last and drops the first without
     // warning. Cheap defence-in-depth at rule-load cadence; no impact on
     // legitimate envelopes which never have duplicate keys.
+    //
+    // R28 #250: also enable FAIL_ON_TRAILING_TOKENS. By default
+    // ObjectMapper.readTree(byte[]) reads ONE complete tree and silently
+    // discards everything after the closing brace, so a record like
+    // `{...valid envelope...}TRAILING_GARBAGE` would decode as if the
+    // garbage were absent. Same canonical-form-drift threat class as the
+    // duplicate-keys case: a signer / audit-replay tool that hashes the
+    // published bytes would see a different fingerprint than the broker's
+    // loaded view. Enabling FAIL_ON_TRAILING_TOKENS makes the second pass
+    // of the parser hit the trailing material and throw, which the
+    // parseJson catch wraps as "malformed JSON envelope". MAX_ENVELOPE_BYTES
+    // already caps the wasted-bytes axis at 65 KB; this closes the
+    // canonical-drift axis.
     private static final ObjectMapper MAPPER = new ObjectMapper()
-        .configure(com.fasterxml.jackson.core.JsonParser.Feature.STRICT_DUPLICATE_DETECTION, true);
+        .configure(com.fasterxml.jackson.core.JsonParser.Feature.STRICT_DUPLICATE_DETECTION, true)
+        .configure(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_TRAILING_TOKENS, true);
 
     private static final String FIELD_API_KEYS = "apiKeys";
     private static final String FIELD_ACTION = "action";
