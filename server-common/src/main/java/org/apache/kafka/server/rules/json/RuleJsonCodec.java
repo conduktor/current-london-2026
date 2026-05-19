@@ -25,6 +25,7 @@ import org.apache.kafka.server.rules.cel.CelCompilationException;
 import org.apache.kafka.server.rules.cel.CelCompiler;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.StreamReadConstraints;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
@@ -69,6 +70,30 @@ import java.util.Set;
  */
 public final class RuleJsonCodec {
 
+    /**
+     * Maximum envelope size accepted by {@link #decode(String, byte[])}.
+     * A legitimate envelope is well under 1 KB — four fields, with the longest
+     * being the CEL source (itself bounded by
+     * {@code CelLimits.MAX_EXPR_LEN}=8192) and an apiKeys array (bounded by
+     * ApiKeys.values().length). 65 KB leaves three orders of magnitude of
+     * headroom for any legitimate authoring tool while bounding the work the
+     * broker's drain thread does on a malicious or accidentally-large record
+     * before Jackson's parser has to walk it.
+     *
+     * <p>The cap is a defense-in-depth complement to the broker-side
+     * {@code max.message.bytes} (default 1 MiB). Without this cap a single
+     * adversarial admin-published record at the broker-config limit would
+     * force the drain thread to allocate a multi-MB JsonNode tree before
+     * even hitting the per-field validation.
+     *
+     * <p><b>R35-A2 [MED]:</b> declared <i>before</i> {@link #MAPPER} so the
+     * {@code MAPPER}'s {@code StreamReadConstraints.maxStringLength} can
+     * reference it without a forward-declaration error. Logical home is
+     * still alongside the other byte/char caps in this class — see also
+     * {@link #MAX_RULE_ID_BYTES}.
+     */
+    static final int MAX_ENVELOPE_BYTES = 65 * 1024;
+
     // Round-11 audit (JSON-codec sub-agent, MEDIUM): enable strict-duplicate
     // detection so an envelope like {"apiKeys":["A"],"apiKeys":["METADATA"]}
     // is rejected rather than silently last-wins. Without this, a rule-
@@ -91,7 +116,42 @@ public final class RuleJsonCodec {
     // parseJson catch wraps as "malformed JSON envelope". MAX_ENVELOPE_BYTES
     // already caps the wasted-bytes axis at 65 KB; this closes the
     // canonical-drift axis.
-    private static final ObjectMapper MAPPER = new ObjectMapper()
+    //
+    // R35-A2 [MED]: pin Jackson's StreamReadConstraints explicitly. Jackson's
+    // defaults (maxStringLength=20_000_000, maxNumberLength=1000,
+    // maxNestingDepth=1000) are set at the upstream library and have been
+    // tightened in past Jackson releases — but they can also be *relaxed* in
+    // future releases or by a transitive-dep override. This codebase already
+    // saw one Jackson CVE bump (`d139c56df0`: "MINOR: Update jackson due to
+    // CVE"); a future bump that changes a default would silently weaken the
+    // codec on a path the broker depends on for fail-closed admission.
+    //
+    // The 65 KB MAX_ENVELOPE_BYTES cap upper-bounds the document length, so
+    // maxStringLength and maxNumberLength are bound by transitivity — but
+    // *maxNestingDepth* is the worst-case footgun: at 1 byte per `[`, an
+    // attacker can pack 65000 levels of nesting into 65 KB. With
+    // `maxNestingDepth=1000` (current default), 65000 / 1000 = 65 — but
+    // each level still costs Jackson a stack frame plus a NodeBuilder entry.
+    // Pinning the cap at 32 matches the walker's depth ceiling
+    // (`ApiMessageActivation`'s `MAX_DEPTH`), giving the two layers a
+    // *symmetric* blast radius: a request the walker would reject at depth
+    // 33 should not be admittable through the codec either.
+    //
+    // The 65 KB envelope cap upper-bounds total bytes; the explicit
+    // maxStringLength = MAX_ENVELOPE_BYTES is defense-in-depth in case the
+    // envelope cap is bypassed by a future change (e.g. a fan-out producer
+    // that batches multiple envelopes into one record). maxNumberLength=20
+    // is wider than any valid `errorCode` (Kafka short range, ≤5 digits) and
+    // serves only as a runaway-input bound — `parseErrorCode`'s range check
+    // remains the actual semantic gate.
+    private static final ObjectMapper MAPPER = new ObjectMapper(
+        com.fasterxml.jackson.core.JsonFactory.builder()
+            .streamReadConstraints(StreamReadConstraints.builder()
+                .maxNestingDepth(32)
+                .maxStringLength(MAX_ENVELOPE_BYTES)
+                .maxNumberLength(20)
+                .build())
+            .build())
         .configure(com.fasterxml.jackson.core.JsonParser.Feature.STRICT_DUPLICATE_DETECTION, true)
         .configure(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_TRAILING_TOKENS, true);
 
@@ -99,24 +159,6 @@ public final class RuleJsonCodec {
     private static final String FIELD_ACTION = "action";
     private static final String FIELD_WHEN = "when";
     private static final String FIELD_ERROR_CODE = "errorCode";
-
-    /**
-     * Maximum envelope size accepted by {@link #decode(String, byte[])}.
-     * A legitimate envelope is well under 1 KB — four fields, with the longest
-     * being the CEL source (itself bounded by
-     * {@code CelLimits.MAX_EXPR_LEN}=8192) and an apiKeys array (bounded by
-     * ApiKeys.values().length). 65 KB leaves three orders of magnitude of
-     * headroom for any legitimate authoring tool while bounding the work the
-     * broker's drain thread does on a malicious or accidentally-large record
-     * before Jackson's parser has to walk it.
-     *
-     * <p>The cap is a defense-in-depth complement to the broker-side
-     * {@code max.message.bytes} (default 1 MiB). Without this cap a single
-     * adversarial admin-published record at the broker-config limit would
-     * force the drain thread to allocate a multi-MB JsonNode tree before
-     * even hitting the per-field validation.
-     */
-    static final int MAX_ENVELOPE_BYTES = 65 * 1024;
 
     /**
      * Maximum rule-id length accepted by {@link #decode(String, byte[])},

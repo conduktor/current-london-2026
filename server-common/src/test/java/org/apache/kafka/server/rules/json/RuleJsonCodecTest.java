@@ -1536,4 +1536,75 @@ public class RuleJsonCodecTest {
                 + "embedding it amplifies the WARN line per intake: "
                 + ex.getMessage());
     }
+
+    @Test
+    public void deeplyNestedJsonRejectedByStreamReadConstraints() {
+        // R35-A2 [MED]: pin the explicit StreamReadConstraints. Jackson's
+        // default `maxNestingDepth=1000` is set upstream and has been changed
+        // in past Jackson releases. A future Jackson bump that relaxed the
+        // default would silently weaken the codec — pin our own cap so that
+        // any future drift surfaces as a test failure, not a quiet weakening
+        // of the security envelope.
+        //
+        // The cap is set to 32, matching the walker's `MAX_DEPTH`. This
+        // makes the two layers symmetric: a request the walker would reject
+        // at depth 33 should not be admittable through the codec either.
+        //
+        // The attack envelope: at 1 byte per `[`, an attacker can pack
+        // tens of thousands of levels of nesting into the 65 KB envelope
+        // cap. With `maxNestingDepth=32`, the codec throws *before*
+        // allocating the deeper JsonNode tree.
+        //
+        // We construct an `apiKeys` array with 35 levels of nesting (just
+        // past the cap). The codec must throw RuleEnvelopeException wrapping
+        // Jackson's StreamConstraintsException, not silently parse the
+        // pathological tree.
+        StringBuilder sb = new StringBuilder();
+        sb.append("{\"apiKeys\":");
+        int nestDepth = 35;
+        for (int i = 0; i < nestDepth; i++) {
+            sb.append('[');
+        }
+        sb.append("\"METADATA\"");
+        for (int i = 0; i < nestDepth; i++) {
+            sb.append(']');
+        }
+        sb.append(",\"action\":\"DENY\",\"when\":\"true\",\"errorCode\":47}");
+        byte[] envelope = sb.toString().getBytes(StandardCharsets.UTF_8);
+
+        RuleEnvelopeException ex = assertThrows(RuleEnvelopeException.class,
+            () -> RuleJsonCodec.decode("nested-attack", envelope));
+        // The exception path goes through `parseJson` which wraps the
+        // Jackson StreamConstraintsException as "malformed JSON envelope".
+        assertTrue(ex.getMessage().toLowerCase().contains("malformed")
+                || ex.getMessage().toLowerCase().contains("nesting")
+                || ex.getMessage().toLowerCase().contains("depth"),
+            "diagnostic must name the structural failure mode: "
+                + ex.getMessage());
+
+        // Negative control: 30 levels (under the cap) must decode cleanly
+        // *modulo* the apiKeys type check (the deeply-nested apiKeys is
+        // wrong-shape, but it must reach the per-field validator instead
+        // of being rejected at parse time).
+        StringBuilder sb2 = new StringBuilder();
+        sb2.append("{\"apiKeys\":");
+        for (int i = 0; i < 30; i++) {
+            sb2.append('[');
+        }
+        sb2.append("\"METADATA\"");
+        for (int i = 0; i < 30; i++) {
+            sb2.append(']');
+        }
+        sb2.append(",\"action\":\"DENY\",\"when\":\"true\",\"errorCode\":47}");
+        // This should reach the apiKeys-shape validator and fail there —
+        // proving the parse itself succeeded (we're below the depth cap).
+        // The exact diagnostic differs (per-field, not "malformed JSON"),
+        // which is the negative-control we want.
+        RuleEnvelopeException underCapEx = assertThrows(RuleEnvelopeException.class,
+            () -> RuleJsonCodec.decode("under-cap", sb2.toString().getBytes(StandardCharsets.UTF_8)));
+        assertEquals(false, underCapEx.getMessage().toLowerCase().contains("nesting depth"),
+            "under-cap envelope must NOT be rejected for nesting depth — "
+                + "should reach the per-field validator: "
+                + underCapEx.getMessage());
+    }
 }
