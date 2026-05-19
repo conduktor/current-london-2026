@@ -1170,12 +1170,18 @@ public final class ConcentrationKernel implements AutoCloseable {
         try {
             recoverer.persistStartOffset(logicalTopic, logicalPartition, newStartOffset);
         } catch (IOException | RuntimeException e) {
-            // Best-effort rollback: re-seat the tracker at the previous startOffset so a retry can
-            // succeed. advanceStartOffset rejects newStartOffset < currentStartOffset, so we use
-            // tracker.restorePartition (which has no monotonicity guard) to undo. The sidecar
-            // size component is unchanged because DeleteRecords doesn't touch the sidecar.
-            tracker.restorePartition(logicalTopic, logicalPartition, previousStart,
-                tracker.nextLogicalOffset(logicalTopic, logicalPartition));
+            // Best-effort rollback: re-seat the tracker at the previous startOffset so a retry
+            // can succeed. advanceStartOffset rejects newStartOffset < currentStartOffset, so we
+            // need a path that bypasses that monotonicity guard.
+            //
+            // r23 BLOCKER #240: this used to call tracker.restorePartition(..., previousStart,
+            // tracker.nextLogicalOffset(...)) — but that nextOffset read was UNLOCKED, and a
+            // concurrent commitProduce that advanced nextOffset between the read and the
+            // restorePartition lock-acquire would have its advance silently regressed when
+            // restorePartition wrote the stale snapshot back. The new
+            // restoreStartOffsetOnly takes the lock and mutates startOffset only, so any
+            // concurrent commit's nextOffset advance survives the rollback intact.
+            tracker.restoreStartOffsetOnly(logicalTopic, logicalPartition, previousStart);
             throw e;
         }
         // Also evict any idempotent-cache entries whose logicalLastOffset is now below

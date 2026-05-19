@@ -26,6 +26,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -135,6 +136,140 @@ public class LogicalOffsetTrackerTest {
         assertThrows(IllegalArgumentException.class,
             () -> tracker.advanceStartOffset("orders", 0, 11),
             "start offset must not exceed the next-to-be-assigned offset");
+    }
+
+    @Test
+    public void restoreStartOffsetOnlyLeavesNextOffsetUntouched() {
+        // r23 BLOCKER #240 — API-contract pin. The kernel's advanceStartOffset rollback path
+        // depends on this method NEVER mutating nextOffset. The whole motivation is that a
+        // concurrent commit may have advanced nextOffset between our snapshot and the rollback,
+        // and that advance MUST survive intact. If a future change starts touching nextOffset
+        // here, the race the #240 fix closed will silently re-open.
+        LogicalOffsetTracker tracker = new LogicalOffsetTracker();
+        for (int i = 0; i < 10; i++) tracker.commit(tracker.reserve("orders", 0));
+        tracker.advanceStartOffset("orders", 0, 7);
+        assertEquals(7L, tracker.startOffset("orders", 0));
+        assertEquals(10L, tracker.nextLogicalOffset("orders", 0));
+
+        tracker.restoreStartOffsetOnly("orders", 0, 3);
+
+        assertEquals(3L, tracker.startOffset("orders", 0),
+            "startOffset must be rolled back to the previous value");
+        assertEquals(10L, tracker.nextLogicalOffset("orders", 0),
+            "nextOffset must NOT be touched by restoreStartOffsetOnly — that is the entire "
+                + "point of the #240 fix");
+    }
+
+    @Test
+    public void restoreStartOffsetOnlyAllowsRegressionUnlikeAdvance() {
+        // advanceStartOffset enforces monotonicity (rejects newStartOffset < current). The
+        // rollback path needs to bypass that guard — restoreStartOffsetOnly does, by design.
+        LogicalOffsetTracker tracker = new LogicalOffsetTracker();
+        for (int i = 0; i < 5; i++) tracker.commit(tracker.reserve("orders", 0));
+        tracker.advanceStartOffset("orders", 0, 4);
+        assertThrows(IllegalArgumentException.class,
+            () -> tracker.advanceStartOffset("orders", 0, 2),
+            "advanceStartOffset must reject regression (monotonicity guard)");
+        tracker.restoreStartOffsetOnly("orders", 0, 2);
+        assertEquals(2L, tracker.startOffset("orders", 0),
+            "restoreStartOffsetOnly must permit regression — it is the rollback primitive");
+    }
+
+    @Test
+    public void restoreStartOffsetOnlyRejectsValueAboveNextOffset() {
+        LogicalOffsetTracker tracker = new LogicalOffsetTracker();
+        for (int i = 0; i < 3; i++) tracker.commit(tracker.reserve("orders", 0));
+        assertThrows(IllegalArgumentException.class,
+            () -> tracker.restoreStartOffsetOnly("orders", 0, 5),
+            "previousStartOffset > nextOffset would break the start<=next invariant");
+    }
+
+    @Test
+    public void restoreStartOffsetOnlyRejectsNegative() {
+        LogicalOffsetTracker tracker = new LogicalOffsetTracker();
+        assertThrows(IllegalArgumentException.class,
+            () -> tracker.restoreStartOffsetOnly("orders", 0, -1));
+    }
+
+    @Test
+    public void restoreStartOffsetOnlySurvivesConcurrentCommitAdvance() throws Exception {
+        // r23 BLOCKER #240 race discriminator. The buggy rollback (which used restorePartition
+        // with an unlocked nextOffset snapshot) could regress a concurrent commit's nextOffset
+        // advance. This test interleaves the two operations and pins that
+        // restoreStartOffsetOnly NEVER regresses nextOffset, regardless of timing.
+        //
+        // We can't directly reproduce the *kernel's* race deterministically without injecting
+        // a barrier into the recoverer, but we CAN drive the tracker through every interleaving
+        // that the rollback path can produce, and assert that nextOffset is never seen to
+        // regress.
+        LogicalOffsetTracker tracker = new LogicalOffsetTracker();
+        for (int i = 0; i < 5; i++) tracker.commit(tracker.reserve("orders", 0));
+        tracker.advanceStartOffset("orders", 0, 3);
+
+        final int iterations = 1_000;
+        CountDownLatch start = new CountDownLatch(1);
+        AtomicLong observedRegressions = new AtomicLong();
+        AtomicLong maxNext = new AtomicLong(tracker.nextLogicalOffset("orders", 0));
+
+        Thread committer = new Thread(() -> runCommitter(tracker, start, maxNext, iterations));
+        Thread roller = new Thread(
+            () -> runRoller(tracker, start, maxNext, observedRegressions, iterations));
+        committer.start();
+        roller.start();
+        start.countDown();
+        committer.join();
+        roller.join();
+
+        assertEquals(0L, observedRegressions.get(),
+            "restoreStartOffsetOnly must never regress nextOffset, even under contention "
+                + "(if this fails the #240 race has reopened)");
+        assertEquals(5L + iterations, tracker.nextLogicalOffset("orders", 0),
+            "all committed offsets must survive every rollback");
+    }
+
+    // Helpers for restoreStartOffsetOnlySurvivesConcurrentCommitAdvance. Extracted out of the
+    // @Test method so checkstyle NPathComplexity (max 500) stays satisfied — keeping the
+    // CAS-update loop and each thread body in their own method dramatically lowers the path-
+    // count of the test itself.
+    private static void runCommitter(
+        LogicalOffsetTracker tracker, CountDownLatch start, AtomicLong maxNext, int iterations) {
+        if (!awaitStart(start)) return;
+        for (int i = 0; i < iterations; i++) {
+            tracker.commit(tracker.reserve("orders", 0));
+            casMax(maxNext, tracker.nextLogicalOffset("orders", 0));
+        }
+    }
+
+    private static void runRoller(
+        LogicalOffsetTracker tracker, CountDownLatch start, AtomicLong maxNext,
+        AtomicLong observedRegressions, int iterations) {
+        if (!awaitStart(start)) return;
+        for (int i = 0; i < iterations; i++) {
+            long peakBefore = maxNext.get();
+            tracker.restoreStartOffsetOnly("orders", 0, i % 2 == 0 ? 1L : 2L);
+            long after = tracker.nextLogicalOffset("orders", 0);
+            if (after < peakBefore) {
+                observedRegressions.incrementAndGet();
+            }
+        }
+    }
+
+    private static boolean awaitStart(CountDownLatch start) {
+        try {
+            start.await();
+            return true;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+
+    private static void casMax(AtomicLong target, long candidate) {
+        long prev;
+        do {
+            prev = target.get();
+            if (candidate <= prev) return;
+        } while (!target.compareAndSet(prev, candidate));
     }
 
     @Test

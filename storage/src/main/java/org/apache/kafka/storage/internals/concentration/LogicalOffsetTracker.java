@@ -225,8 +225,49 @@ public final class LogicalOffsetTracker {
     }
 
     /**
-     * Direct seeding of partition state, used during recovery from a sidecar or backing-log scan
-     * and by {@link ConcentrationKernel#advanceStartOffset} on its rollback path.
+     * Roll back ONLY the startOffset to a previous value, leaving nextOffset untouched.
+     *
+     * <p>r23 BLOCKER #240: the kernel's {@link ConcentrationKernel#advanceStartOffset} rollback
+     * path used to call {@link #restorePartition} with a SNAPSHOT of nextOffset captured outside
+     * any lock. A concurrent commitProduce that advanced nextOffset between the snapshot and the
+     * rollback write would have its advance silently regressed when restorePartition wrote the
+     * stale nextOffset back — producing logical-offset gaps and lost commits on the very next
+     * read. This method closes that race by re-acquiring the lock and mutating startOffset only;
+     * any concurrent commit's nextOffset write is unaffected.
+     *
+     * <p>Monotonicity is NOT enforced (previousStartOffset may be less than the current
+     * startOffset) because the entire point of the rollback is to UNDO an in-memory advance that
+     * never made it to disk. The only bound enforced is the invariant
+     * {@code 0 <= previousStartOffset <= nextOffset}, which prevents a buggy caller from leaving
+     * the partition in a state where startOffset > nextOffset.
+     *
+     * @throws IllegalArgumentException if {@code previousStartOffset < 0} or
+     *     {@code previousStartOffset > current nextOffset}.
+     */
+    void restoreStartOffsetOnly(String logicalTopic, int logicalPartition, long previousStartOffset) {
+        Objects.requireNonNull(logicalTopic, "logicalTopic");
+        if (previousStartOffset < 0) {
+            throw new IllegalArgumentException(
+                "previousStartOffset must be >= 0, was " + previousStartOffset);
+        }
+        PartitionState s = stateFor(logicalTopic, logicalPartition);
+        s.lock.lock();
+        try {
+            if (previousStartOffset > s.nextOffset) {
+                throw new IllegalArgumentException(
+                    "previousStartOffset (" + previousStartOffset
+                        + ") > current nextOffset (" + s.nextOffset + ")");
+            }
+            s.startOffset = previousStartOffset;
+        } finally {
+            s.lock.unlock();
+        }
+    }
+
+    /**
+     * Direct seeding of partition state, used during recovery from a sidecar or backing-log scan.
+     * Atomically (under the partition lock) installs the given {@code startOffset} and
+     * {@code nextOffset} as the partition's bookkeeping.
      *
      * <p>r22 BLOCKER #193: this used to skip locking on the documented assumption that recovery is
      * single-threaded "by contract." That contract is not enforced anywhere — and the
@@ -240,14 +281,16 @@ public final class LogicalOffsetTracker {
      * locked writes in {@link #advanceStartOffset} or {@link #commitBatchInternal}, leaving
      * permanent inconsistency.
      *
-     * <p>Taking the lock here closes both windows. The lock is reentrant, so the kernel's
-     * rollback path ({@link ConcentrationKernel#advanceStartOffset} → catch → restorePartition)
-     * remains correct — that thread has already RELEASED the lock by the time the catch runs.
-     * Boot-time recovery sees no contention because produce paths haven't started; leader-
-     * recovery sees no contention because the gate is closed (in-flight commits roll back at the
-     * commitProduce second gen-check, releasing their locks before the recoverer touches the
-     * tracker). The lock acquisition is defensive against any future caller that violates the
-     * contract; it's free on the uncontended path.
+     * <p>Taking the lock here closes both windows. Boot-time recovery sees no contention because
+     * produce paths haven't started; leader-recovery sees no contention because the gate is
+     * closed (in-flight commits roll back at the commitProduce second gen-check, releasing their
+     * locks before the recoverer touches the tracker). The lock acquisition is defensive against
+     * any future caller that violates the contract; it's free on the uncontended path.
+     *
+     * <p>r23 BLOCKER #240: the kernel's advanceStartOffset rollback path used to call this method
+     * with a stale snapshot of nextOffset, regressing concurrent commits. That rollback now uses
+     * {@link #restoreStartOffsetOnly}; this method is reserved for recovery codepaths that
+     * legitimately need to install BOTH coordinates atomically.
      */
     void restorePartition(String logicalTopic, int logicalPartition, long startOffset, long nextOffset) {
         if (startOffset < 0 || nextOffset < startOffset) {
