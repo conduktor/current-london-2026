@@ -758,6 +758,18 @@ final class IoUringTransportLayer implements TransportLayer {
         recordAsyncWriteFailure(cause);
     }
 
+    /**
+     * Test-only entry point that plants a pending-write byte count without driving a
+     * real write through Netty. Used by DIAG-4's regression test to assert that
+     * {@link #close()} resets {@link #pendingWriteBytes}: with a real {@link EmbeddedChannel}
+     * write, the in-place success listener races to decrement the counter back to zero
+     * before close() runs, so the test would pass even without the close-side reset.
+     * Planting via this seam keeps the counter positive at the moment close() is invoked.
+     */
+    void addPendingWriteBytesForTesting(long n) {
+        pendingWriteBytes.addAndGet(n);
+    }
+
     @Override
     public void close() {
         if (closed) return;
@@ -775,22 +787,46 @@ final class IoUringTransportLayer implements TransportLayer {
             log.warn("Netty channel close raised an exception during transport-layer close (remote={})",
                 socketChannel.getRemoteAddress(), e);
         }
-        ByteBuf b;
-        while ((b = inbound.poll()) != null) {
-            b.release();
+        // CLOSE-F1: wrap the ByteBuf release loop + closed-state resets in try/finally so
+        // that even if {@link ByteBuf#release} throws (e.g. PARANOID leak detector throws
+        // IllegalReferenceCountException for a double-release, or a pooled-allocator
+        // assertion fires under custom JVM options) we still reach the inboundBytes /
+        // asyncWriteFailure / pendingWriteBytes resets and selectionKey.cancel(). The
+        // resets are the "closed channel is drained" contract that downstream callers
+        // (Selector.disconnected, KafkaChannel.maybeCompleteSend, hasPendingWrites
+        // accessors) rely on; skipping them on a release exception would strand the
+        // channel in a half-closed state where hasPendingWrites() lies and selection-key
+        // de-registration never happens.
+        try {
+            ByteBuf b;
+            while ((b = inbound.poll()) != null) {
+                b.release();
+            }
+        } finally {
+            inboundBytes.set(0);
+            // DIAG-3: clear any stashed async write failure. Without this, a writeAndFlush
+            // promise that completes (failed) AFTER close() — possible when Netty had the
+            // write in-flight at the moment of close — would leave asyncWriteFailure set
+            // forever. {@link #hasPendingWrites()} reads it and would return true on a
+            // closed channel: harmless in v1 because the Selector tears the channel down
+            // and never polls it again, but it violates the closed-resource invariant
+            // ("after close(), every accessor reports a clean drained state") and makes
+            // {@link KafkaChannel#maybeCompleteSend} reasoning subtler than it needs to
+            // be. {@link AtomicReference#set} is the right primitive here: we don't care
+            // about the previous value (close() destroys all paths to surface it anyway).
+            asyncWriteFailure.set(null);
+            // DIAG-4: drain the pending-write-bytes counter for the same closed-resource
+            // invariant. Counter is bumped at writeAndFlush submission and decremented in
+            // the per-write listener: if Netty completes (success or failure) the promise
+            // AFTER close() — possible when a write was in-flight at the moment of close —
+            // the decrement still fires but the counter may already be torn down logically
+            // even though it remains positive. Worse, if the listener is dropped because
+            // the EventLoop is gone before the promise completes, the counter stays
+            // positive forever and {@link #hasPendingWrites()} returns true on a closed
+            // channel. Resetting here makes the drained-state contract unconditional and
+            // matches the asyncWriteFailure handling immediately above.
+            pendingWriteBytes.set(0);
+            selectionKey.cancel();
         }
-        inboundBytes.set(0);
-        // DIAG-3: clear any stashed async write failure. Without this, a writeAndFlush
-        // promise that completes (failed) AFTER close() — possible when Netty had the
-        // write in-flight at the moment of close — would leave asyncWriteFailure set
-        // forever. {@link #hasPendingWrites()} reads it and would return true on a
-        // closed channel: harmless in v1 because the Selector tears the channel down
-        // and never polls it again, but it violates the closed-resource invariant
-        // ("after close(), every accessor reports a clean drained state") and makes
-        // {@link KafkaChannel#maybeCompleteSend} reasoning subtler than it needs to
-        // be. {@link AtomicReference#set} is the right primitive here: we don't care
-        // about the previous value (close() destroys all paths to surface it anyway).
-        asyncWriteFailure.set(null);
-        selectionKey.cancel();
     }
 }

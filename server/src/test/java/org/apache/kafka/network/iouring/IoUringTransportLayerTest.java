@@ -22,6 +22,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 
+import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.SelectionKey;
@@ -1026,47 +1027,63 @@ class IoUringTransportLayerTest {
         // on a closed channel. Operators inspecting the channel state see a misleading
         // "pending writes" signal long after the layer was torn down. close() must clear
         // the stashed failure as part of its drain-all invariant.
+        //
+        // Determinism: we use the recordAsyncWriteFailureForTesting seam to plant the
+        // failure synchronously. The earlier shape of this test relied on triggering an
+        // async failure through EmbeddedChannel's writeAndFlush — but EmbeddedChannel
+        // surfaces the listener synchronously, so the very next write() called from the
+        // catch block consumed the stashed failure via getAndSet(null) and zeroed it
+        // before close() ever ran. The original test passed even when close() did NOT
+        // clear the field; the seam removes that loophole.
         EmbeddedChannel netty = new EmbeddedChannel();
         IoUringTransportLayer l = new IoUringTransportLayer(netty, REMOTE, LOCAL);
 
-        // Provoke an async failure: close the netty channel so writeAndFlush completes
-        // with ClosedChannelException, then call write() — the listener fires inline and
-        // stashes the failure. We do NOT call the next write() that would clear the
-        // failure via the synchronous throw, simulating the case where close() happens
-        // while a failure is still in flight to the Processor.
-        netty.close().syncUninterruptibly();
-        ByteBuffer src = ByteBuffer.wrap("inflight".getBytes());
-        try {
-            l.write(src);
-        } catch (java.io.IOException ignored) {
-            // Some EmbeddedChannel versions surface the failure on the first write itself.
-            // That's fine for the post-DIAG-1 path — but to specifically test DIAG-3 we need
-            // a layer with asyncWriteFailure SET at the moment close() is called. The first
-            // throw clears it, so we drive another write to re-populate.
-            try {
-                l.write(ByteBuffer.wrap("again".getBytes()));
-            } catch (java.io.IOException ignored2) {
-                // ditto — drive one more
-                try {
-                    l.write(ByteBuffer.wrap("more".getBytes()));
-                } catch (java.io.IOException ignored3) {
-                    // give up gracefully — the field is in whatever state EmbeddedChannel
-                    // leaves it; we still proceed to assert close() clears it.
-                }
-            }
-        }
+        IOException planted = new IOException("planted DIAG-3 async write failure");
+        l.recordAsyncWriteFailureForTesting(planted);
+        assertTrue(l.hasPendingWrites(),
+            "precondition: a stashed asyncWriteFailure must make hasPendingWrites return true " +
+            "(seam matches production recordAsyncWriteFailure path)");
 
-        // Now close the transport layer. DIAG-3's fix clears asyncWriteFailure here.
         l.close();
 
-        // The invariant: after close(), hasPendingWrites() reports clean drained state.
-        // Without the DIAG-3 fix, if any listener fired between the last consumed throw
-        // and close(), asyncWriteFailure would be non-null and hasPendingWrites() would
-        // return true on a closed channel.
         assertFalse(l.hasPendingWrites(),
             "DIAG-3: close() must clear asyncWriteFailure so hasPendingWrites() reports " +
             "false on a closed channel. A non-null stashed failure would otherwise persist " +
             "indefinitely and operators inspecting channel state would see a misleading " +
             "'pending writes' signal long after the layer was torn down.");
+    }
+
+    @Test
+    void closeResetsPendingWriteBytesSoHasPendingWritesReportsCleanState() throws Exception {
+        // DIAG-4: symmetric to DIAG-3 for pendingWriteBytes. write() addAndGets the chunk
+        // size BEFORE addListener fires the decrement. If close() runs while a write is
+        // in flight inside Netty's event loop (the listener has not yet decremented),
+        // pendingWriteBytes stays positive forever and hasPendingWrites() reports true
+        // on a closed channel — violating the same drain-all invariant DIAG-3 closed for
+        // asyncWriteFailure. close() must reset pendingWriteBytes as part of its drain.
+        //
+        // Determinism: we use the addPendingWriteBytesForTesting seam to plant the bytes
+        // synchronously, because EmbeddedChannel's writeAndFlush success listener fires
+        // in-place and decrements the counter back to zero before close() runs — the
+        // test would pass without the close-side reset.
+        EmbeddedChannel netty = new EmbeddedChannel();
+        IoUringTransportLayer l = new IoUringTransportLayer(netty, REMOTE, LOCAL);
+
+        l.addPendingWriteBytesForTesting(128);
+        assertEquals(128, l.pendingWriteBytesSnapshot(),
+            "precondition: planted bytes must show up in the snapshot");
+        assertTrue(l.hasPendingWrites(),
+            "precondition: positive pendingWriteBytes must make hasPendingWrites return true");
+
+        l.close();
+
+        assertEquals(0, l.pendingWriteBytesSnapshot(),
+            "DIAG-4: close() must reset pendingWriteBytes so the closed-resource invariant " +
+            "(every accessor reports a clean drained state) holds for the write-side counter, " +
+            "symmetric to the DIAG-3 reset of asyncWriteFailure.");
+        assertFalse(l.hasPendingWrites(),
+            "DIAG-4: hasPendingWrites must report false on a closed channel even when a write " +
+            "was in-flight at the moment of close. Without the reset, the counter would stay " +
+            "positive until a Netty listener fired post-close (potentially never).");
     }
 }
