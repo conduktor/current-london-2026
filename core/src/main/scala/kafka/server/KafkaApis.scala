@@ -6237,6 +6237,45 @@ class KafkaApis(val requestChannel: RequestChannel,
             response.groups.addAll(results)
           }
 
+          // #189: post-handler tenant-namespace scrub on the response. The
+          // outside-in input guard at line 6199 only refuses the principal-
+          // prefix literal `__tenant_<id>.<x>` form on the groupId — a
+          // cluster-wide caller asking for the physical-prefix form
+          // `acme.share-grp` (where `acme` is a bound tenant) sails through.
+          // With a wildcard `User:* DESCRIBE Group:*` ACL, the coordinator
+          // returns the full member roster including:
+          //   - physical tenant topic names in `members[].subscribedTopicNames`,
+          //   - physical names AND topic UUIDs in `members[].assignment.topicPartitions[]`,
+          //   - tenant member identity (memberId/clientId/clientHost).
+          // For non-tenant callers, replace any group whose payload names a
+          // reserved tenant namespace with bare `groupId + GROUP_AUTHORIZATION_FAILED`
+          // (the caller already typed `groupId`, so echoing it does not leak
+          // additional information). Tenant-bound callers already only see
+          // their own namespace through the rewrite layer, so the scrub is
+          // gated on `effectiveTenant` being empty.
+          if (!tenantContextFor(request).effectiveTenant.isPresent && !response.groups.isEmpty) {
+            val scrubbed = new util.ArrayList[ShareGroupDescribeResponseData.DescribedGroup](response.groups.size)
+            response.groups.forEach { g =>
+              val groupLeak = g.groupId != null && isReservedTenantNamespace(g.groupId)
+              val memberLeak = g.members != null && g.members.asScala.exists { m =>
+                val subsLeak = m.subscribedTopicNames != null &&
+                  m.subscribedTopicNames.asScala.exists(n => n != null && isReservedTenantNamespace(n))
+                val assignLeak = m.assignment != null && m.assignment.topicPartitions != null &&
+                  m.assignment.topicPartitions.asScala
+                    .exists(tp => tp.topicName != null && isReservedTenantNamespace(tp.topicName))
+                subsLeak || assignLeak
+              }
+              if (groupLeak || memberLeak) {
+                scrubbed.add(new ShareGroupDescribeResponseData.DescribedGroup()
+                  .setGroupId(g.groupId)
+                  .setErrorCode(Errors.GROUP_AUTHORIZATION_FAILED.code))
+              } else {
+                scrubbed.add(g)
+              }
+            }
+            response.setGroups(scrubbed)
+          }
+
           requestHelper.sendMaybeThrottle(request, new ShareGroupDescribeResponse(response))
         }
       }

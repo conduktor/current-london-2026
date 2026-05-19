@@ -18685,6 +18685,170 @@ class KafkaApisTest extends Logging {
     verify(sharePartitionManager, never()).acknowledge(anyString(), anyString(), any())
   }
 
+  // #189: a non-tenant cluster-wide caller asking ShareGroupDescribe for the
+  // physical-prefix groupId form (`acme.share-grp`) sails through the L6199
+  // outside-in guard (which only catches the principal-prefix form). Without
+  // a response scrub, the coordinator returns the full member roster — leaking
+  // physical tenant topic names from `members[].assignment.topicPartitions[].topicName`,
+  // plus member identity (clientId/clientHost). The scrub replaces the entire
+  // group entry with bare `groupId + GROUP_AUTHORIZATION_FAILED`.
+  @Test
+  def testShareGroupDescribeResponseScrubsPhysicalTenantTopicInAssignment(): Unit = {
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
+    val req = new ShareGroupDescribeRequest.Builder(
+      new ShareGroupDescribeRequestData().setGroupIds(
+        List("acme.share-grp").asJava), true).build()
+    val request = buildRequest(req)
+
+    when(groupCoordinator.shareGroupDescribe(any(), any()))
+      .thenReturn(CompletableFuture.completedFuture(List(
+        new ShareGroupDescribeResponseData.DescribedGroup()
+          .setGroupId("acme.share-grp")
+          .setErrorCode(Errors.NONE.code)
+          .setMembers(List(
+            new ShareGroupDescribeResponseData.Member()
+              .setMemberId("m1")
+              .setClientId("tenant-acme-consumer")
+              .setClientHost("/10.0.0.42")
+              .setSubscribedTopicNames(List("acme.orders").asJava)
+              .setAssignment(new ShareGroupDescribeResponseData.Assignment()
+                .setTopicPartitions(List(new ShareGroupDescribeResponseData.TopicPartitions()
+                  .setTopicId(Uuid.randomUuid())
+                  .setTopicName("acme.orders")
+                  .setPartitions(List[java.lang.Integer](0, 1, 2).asJava)).asJava))
+          ).asJava)
+      ).asJava))
+
+    kafkaApis = createKafkaApis(
+      overrideProperties = Map(ShareGroupConfig.SHARE_GROUP_ENABLE_CONFIG -> "true"),
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleShareGroupDescribe(request)
+
+    val response = verifyNoThrottling[ShareGroupDescribeResponse](request)
+    assertEquals(1, response.data.groups.size)
+    val g = response.data.groups.get(0)
+    assertEquals("acme.share-grp", g.groupId, "groupId is echoed back (caller already typed it)")
+    assertEquals(Errors.GROUP_AUTHORIZATION_FAILED.code, g.errorCode,
+      "response must be scrubbed when assignment names a foreign tenant topic")
+    assertTrue(g.members.isEmpty, "member roster must not leak when the group is scrubbed")
+  }
+
+  // #189: same response scrub must catch the principal-prefix topic-name shape
+  // `__tenant_acme.evil` in the assignment payload (#185 widening parity).
+  @Test
+  def testShareGroupDescribeResponseScrubsPrincipalShapedTopicInAssignment(): Unit = {
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
+    val req = new ShareGroupDescribeRequest.Builder(
+      new ShareGroupDescribeRequestData().setGroupIds(
+        List("regular-group").asJava), true).build()
+    val request = buildRequest(req)
+
+    when(groupCoordinator.shareGroupDescribe(any(), any()))
+      .thenReturn(CompletableFuture.completedFuture(List(
+        new ShareGroupDescribeResponseData.DescribedGroup()
+          .setGroupId("regular-group")
+          .setErrorCode(Errors.NONE.code)
+          .setMembers(List(
+            new ShareGroupDescribeResponseData.Member()
+              .setMemberId("m1")
+              .setAssignment(new ShareGroupDescribeResponseData.Assignment()
+                .setTopicPartitions(List(new ShareGroupDescribeResponseData.TopicPartitions()
+                  .setTopicId(Uuid.randomUuid())
+                  .setTopicName("__tenant_acme.evil")
+                  .setPartitions(List[java.lang.Integer](0).asJava)).asJava))
+          ).asJava)
+      ).asJava))
+
+    kafkaApis = createKafkaApis(
+      overrideProperties = Map(ShareGroupConfig.SHARE_GROUP_ENABLE_CONFIG -> "true"),
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleShareGroupDescribe(request)
+
+    val response = verifyNoThrottling[ShareGroupDescribeResponse](request)
+    val g = response.data.groups.get(0)
+    assertEquals(Errors.GROUP_AUTHORIZATION_FAILED.code, g.errorCode,
+      "principal-shaped topic name in assignment must also trigger the scrub")
+    assertTrue(g.members.isEmpty)
+  }
+
+  // #189: subscribedTopicNames is a separate leak axis from assignment. A
+  // member subscribed (but not yet assigned) to a foreign tenant topic still
+  // leaks the physical name via the response.
+  @Test
+  def testShareGroupDescribeResponseScrubsPhysicalTenantTopicInSubscriptions(): Unit = {
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
+    val req = new ShareGroupDescribeRequest.Builder(
+      new ShareGroupDescribeRequestData().setGroupIds(
+        List("regular-group").asJava), true).build()
+    val request = buildRequest(req)
+
+    when(groupCoordinator.shareGroupDescribe(any(), any()))
+      .thenReturn(CompletableFuture.completedFuture(List(
+        new ShareGroupDescribeResponseData.DescribedGroup()
+          .setGroupId("regular-group")
+          .setErrorCode(Errors.NONE.code)
+          .setMembers(List(
+            new ShareGroupDescribeResponseData.Member()
+              .setMemberId("m1")
+              .setSubscribedTopicNames(List("acme.orders", "beta.events").asJava)
+              .setAssignment(new ShareGroupDescribeResponseData.Assignment())
+          ).asJava)
+      ).asJava))
+
+    kafkaApis = createKafkaApis(
+      overrideProperties = Map(ShareGroupConfig.SHARE_GROUP_ENABLE_CONFIG -> "true"),
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleShareGroupDescribe(request)
+
+    val response = verifyNoThrottling[ShareGroupDescribeResponse](request)
+    val g = response.data.groups.get(0)
+    assertEquals(Errors.GROUP_AUTHORIZATION_FAILED.code, g.errorCode,
+      "foreign tenant topic in subscribedTopicNames must trigger the scrub")
+    assertTrue(g.members.isEmpty)
+  }
+
+  // #189 negative control: a plain (non-reserved) group with only plain topics
+  // must pass through unmodified. Without this, an over-eager scrub would
+  // break legitimate non-tenant ShareGroupDescribe traffic.
+  @Test
+  def testShareGroupDescribeResponseDoesNotScrubPlainTopicForNonTenant(): Unit = {
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
+    val req = new ShareGroupDescribeRequest.Builder(
+      new ShareGroupDescribeRequestData().setGroupIds(
+        List("regular-group").asJava), true).build()
+    val request = buildRequest(req)
+
+    when(groupCoordinator.shareGroupDescribe(any(), any()))
+      .thenReturn(CompletableFuture.completedFuture(List(
+        new ShareGroupDescribeResponseData.DescribedGroup()
+          .setGroupId("regular-group")
+          .setErrorCode(Errors.NONE.code)
+          .setMembers(List(
+            new ShareGroupDescribeResponseData.Member()
+              .setMemberId("m1")
+              .setClientId("plain-consumer")
+              .setSubscribedTopicNames(List("regular-topic").asJava)
+              .setAssignment(new ShareGroupDescribeResponseData.Assignment()
+                .setTopicPartitions(List(new ShareGroupDescribeResponseData.TopicPartitions()
+                  .setTopicId(Uuid.randomUuid())
+                  .setTopicName("regular-topic")
+                  .setPartitions(List[java.lang.Integer](0).asJava)).asJava))
+          ).asJava)
+      ).asJava))
+
+    kafkaApis = createKafkaApis(
+      overrideProperties = Map(ShareGroupConfig.SHARE_GROUP_ENABLE_CONFIG -> "true"),
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleShareGroupDescribe(request)
+
+    val response = verifyNoThrottling[ShareGroupDescribeResponse](request)
+    val g = response.data.groups.get(0)
+    assertEquals(Errors.NONE.code, g.errorCode,
+      "plain group must pass through the scrub untouched")
+    assertEquals(1, g.members.size, "member roster must be preserved for plain group")
+    assertEquals("plain-consumer", g.members.get(0).clientId)
+  }
+
   // The dispatch gate refuses tenant principals from LIST_GROUPS (not in
   // TENANT_ALLOWED_APIS). The remaining outside-in vector is a non-tenant
   // cluster admin: their wildcard DESCRIBE GROUP would otherwise return every
