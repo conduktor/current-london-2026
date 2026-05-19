@@ -107,6 +107,55 @@ public class CelProgramTest {
     }
 
     @Test
+    public void equalityPromotesAcrossIntegerWrapperTypesInsideNestedCollections() {
+        // R28 Axis Walker F8 follow-up (Task #245): the outer Compare/InList
+        // dispatch already promotes top-level Integer↔Long via the
+        // `instanceof Number` arm at the head of valueEquals. The asymmetric
+        // hazard was the previous valueEquals fallback that called
+        // Objects.equals on Lists/Maps — which delegates to
+        // AbstractList.equals / AbstractMap.equals, both of which compare
+        // elements/values via .equals(). Long(5).equals(Integer(5)) is FALSE
+        // (Long.equals checks getClass() identity), so a nested shape like
+        // `topics[].partitions[].leaderId` with one side an Integer and the
+        // other a Long would silently MISS even though the CEL contract
+        // promises numeric promotion. With listEqualsDeep / mapEqualsDeep
+        // (the Task #244 fix) recursing through valueEquals at every layer,
+        // the Number arm fires at the innermost compare and promotion is
+        // honoured at all depths.
+        //
+        // Negative control verified by reverting listEqualsDeep to a direct
+        // Objects.equals call: this test fails on `assertTrue` for the nested
+        // list and nested map cases (== returns false), while the existing
+        // equalityPromotesAcrossIntegerWrapperTypes case still passes.
+        Map<String, Object> env = new HashMap<>();
+        env.put("xsInt", Arrays.asList(Arrays.asList(1, 2), Arrays.asList(3, 4)));
+        env.put("xsLong", Arrays.asList(Arrays.asList(1L, 2L), Arrays.asList(3L, 4L)));
+        java.util.Map<String, Object> mInt = new HashMap<>();
+        mInt.put("a", 1);
+        mInt.put("b", 2);
+        java.util.Map<String, Object> mLong = new HashMap<>();
+        mLong.put("a", 1L);
+        mLong.put("b", 2L);
+        env.put("mInt", mInt);
+        env.put("mLong", mLong);
+
+        // Nested-list equality: Integer 1 == Long 1 at the inner layer.
+        assertTrue(evalBool("xsInt == xsLong", env));
+        // Same shape via `in`: dispatch goes through InList → valueEquals.
+        assertTrue(evalBool("xsInt in [xsLong]", env));
+        // Nested-map equality (Object values are mixed Integer/Long).
+        assertTrue(evalBool("mInt == mLong", env));
+        assertTrue(evalBool("mInt in [mLong]", env));
+        // Mismatched values still compare false (the promotion fix must not
+        // collapse distinct integers into equal).
+        java.util.Map<String, Object> mLongMismatch = new HashMap<>();
+        mLongMismatch.put("a", 1L);
+        mLongMismatch.put("b", 99L);
+        env.put("mLongMismatch", mLongMismatch);
+        assertFalse(evalBool("mInt == mLongMismatch", env));
+    }
+
+    @Test
     public void stringEquality() {
         Map<String, Object> env = new HashMap<>();
         env.put("name", "foo");

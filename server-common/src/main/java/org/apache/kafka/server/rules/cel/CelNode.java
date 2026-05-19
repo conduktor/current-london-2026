@@ -798,6 +798,19 @@ abstract class CelNode {
      * {@link Compare}/{@link InList}. With deep helpers here, every recursion
      * layer charges its size before walking, so nested == nested converges to
      * O(total-leaves) charges instead of O(outermost-size).
+     *
+     * <p><b>R28 Axis Walker F8 follow-up (Task #245):</b> the recursive
+     * dispatch also fixes a correctness bug in the Objects.equals fallback.
+     * {@code AbstractList.equals} / {@code AbstractMap.equals} compare
+     * elements/values with {@code .equals()}, and {@code Long(5).equals(Integer(5))}
+     * is {@code false} (Long.equals checks getClass() identity). So a nested
+     * shape mixing Integer and Long at the leaves — common in walker output
+     * because generated Kafka data classes have a mix of {@code int} and
+     * {@code long} getters that autobox into different wrappers — would have
+     * silently compared {@code false} despite CEL's contract that all
+     * integers belong to the same value type. Routing through valueEquals at
+     * every layer means the {@code instanceof Number} arm fires at the
+     * innermost compare, restoring numeric promotion at any depth.
      */
     private static boolean valueEquals(Object l, Object r) {
         if (l instanceof Number && r instanceof Number) {
