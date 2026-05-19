@@ -674,6 +674,56 @@ public class CelProgramTest {
     }
 
     @Test
+    public void nestedComprehensionResolvesOuterAndInnerBindingsIndependently() {
+        // R36-A pin: with the per-iteration scoped lambda hoisted out of
+        // Comprehension.eval, each comprehension now mutates its OWN
+        // Object[1] holder in place. The correctness invariant under
+        // nesting is that the outer's holder and the inner's holder are
+        // SEPARATE — a refactor that accidentally shared a single holder
+        // across nesting levels would silently corrupt `a` mid-iteration
+        // (the inner would write `b`'s value into the shared slot and the
+        // outer-name lookup would return whatever `b` last was).
+        //
+        // The expression `outer.exists(a, inner.exists(b, a == "ax" && b == "bx"))`
+        // can only return true if BOTH bindings resolve correctly: there
+        // must be SOME iteration where the outer holder reads "ax" while
+        // the inner is iterating and the inner finds "bx". A buggy shared
+        // holder would write "b1"/"b2"/"bx" into the slot during inner's
+        // sweep, so `a == "ax"` would only ever hold on the iteration
+        // where the inner is currently looking at "ax" — which it never
+        // does, because inner iterates the `inner` list, not `outer`.
+        Map<String, Object> env = new HashMap<>();
+        env.put("outer", java.util.Arrays.asList("a1", "ax", "a3"));
+        env.put("inner", java.util.Arrays.asList("b1", "b2", "bx"));
+        assertTrue(
+            evalBool("outer.exists(a, inner.exists(b, a == \"ax\" && b == \"bx\"))", env),
+            "nested .exists must keep outer and inner bindings in separate holders; "
+                + "if `a` were corrupted by the inner loop, the predicate could not match");
+
+        // Stability of the outer binding across inner's full sweep:
+        // pair `a` with `b` arithmetically. For every outer value `a`,
+        // the inner sweep must see the SAME `a` from start to finish,
+        // otherwise the only-correct (a, b) pair would not be found.
+        env.put("xs", java.util.Arrays.asList(1L, 2L, 3L));
+        env.put("ys", java.util.Arrays.asList(10L, 20L, 30L));
+        // Per-pair match: (1,10), (2,20), (3,30) all satisfy a*10 == b.
+        // If `a` got clobbered during inner iteration, this would either
+        // miss all pairs or match the wrong pair.
+        assertTrue(
+            evalBool("xs.exists(a, ys.exists(b, a * 10 == b))", env),
+            "outer binding must remain stable across the full inner sweep");
+
+        // Negative control: predicate that needs `a` to drift inside the
+        // inner sweep must remain false. (a*10 == b only matches at the
+        // aligned pairs above; if `a` drifted, off-diagonal pairs like
+        // (1,20) might spuriously match — they must not.)
+        assertFalse(
+            evalBool("xs.exists(a, ys.exists(b, a == 99))", env),
+            "outer binding must not be writeable by the inner loop; "
+                + "a == 99 has no match anywhere in xs");
+    }
+
+    @Test
     public void evalStepCounterIsResetBetweenInvocationsWhenCallerResets() {
         // Round-8 audit HIGH (concurrency): the per-thread step counter is
         // now reset by RuleEngine.evaluate once per REQUEST, not by

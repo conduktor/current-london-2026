@@ -300,6 +300,39 @@ abstract class CelNode {
             if (!(r instanceof List)) {
                 return kind == Kind.ALL;
             }
+            // R36-A [MED]: hoist the scoped name-resolution closure out of
+            // the per-iteration loop. Sibling of R23 #219 (which hoisted the
+            // OUTER `activation::get` lambda out of the per-rule loop):
+            // this hoist closes the per-iteration allocation inside the
+            // comprehension itself. Without the hoist, each iteration of a
+            // comprehension over an N-element list allocates a fresh closure
+            // capturing `varName`, `item`, and `a` — at MAX_EVAL_STEPS=100_000
+            // the worst case is ~100k closures per request (~3-4 MB
+            // transient allocation, real GC pressure on a hot request path).
+            //
+            // The hoist swaps `item` (a fresh capture per iteration) for an
+            // `Object[1]` holder mutated in-place. The single closure
+            // allocated here captures the SAME holder reference on every
+            // iteration; we just update its contents. Net allocation drops
+            // from N closures to one closure + one 1-element array.
+            //
+            // Thread safety: CelProgram.eval is single-threaded per-request
+            // (RuleEngine.evaluate holds the IN_EVALUATE guard), so no
+            // parallel reader of `itemHolder` exists.
+            //
+            // Correctness under nested comprehensions: `xs.exists(a, xs.exists(b, ...))`
+            // builds two distinct Comprehension instances, each with its
+            // own `itemHolder` per `eval` call. The inner comprehension's
+            // scoped lambda calls `a.apply(name)` to escape — where `a` is
+            // the OUTER scoped lambda, which reads the outer holder. The
+            // outer never mutates its holder while the inner is iterating
+            // (the outer's `for` body calls `predicate.eval(scoped)` which
+            // returns before the outer advances), so cross-level reads
+            // see consistent values. Pinned by `evalStepBudgetKillsNested
+            // ComprehensionBlowup` and the surrounding nested-tests.
+            final Object[] itemHolder = new Object[1];
+            final Function<String, Object> scoped =
+                name -> name.equals(varName) ? itemHolder[0] : a.apply(name);
             for (Object item : (List<?>) r) {
                 // Per-iteration step budget. The motivation is nested
                 // comprehensions over attacker-controlled list sizes:
@@ -309,7 +342,7 @@ abstract class CelNode {
                 // "normal". Bump before doing per-element work so a runaway
                 // loop is killed at the budget, not after.
                 CelLimits.bumpStep();
-                Function<String, Object> scoped = name -> name.equals(varName) ? item : a.apply(name);
+                itemHolder[0] = item;
                 Object v = predicate.eval(scoped);
                 // Round-20 MED D-1: differentiate null-propagation from a
                 // type-shape bug. The engine elsewhere is fail-noisy on
