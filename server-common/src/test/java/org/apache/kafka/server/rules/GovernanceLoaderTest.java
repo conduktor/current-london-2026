@@ -539,4 +539,73 @@ public class GovernanceLoaderTest {
         assertTrue(d.denied());
         assertEquals(99, d.errorCode());
     }
+
+    @Test
+    public void malformedUtf8KeyDecodedByBootstrapPathIsRejected() {
+        // R34-A-3 [HIGH] pin: the bootstrap-layer decode chain in
+        // BrokerGovernanceBootstrap uses `new String(key, UTF_8)` which
+        // SILENTLY substitutes malformed UTF-8 bytes with U+FFFD. The
+        // security gap is closed at `RuleJsonCodec.validateRuleId`
+        // (R33 #291) which rejects U+FFFD outright — but the chain is
+        // long, and no test pins it end-to-end at the loader layer.
+        //
+        // This test reproduces the bootstrap's exact decode pattern on
+        // raw malformed UTF-8 bytes, feeds the substituted String to
+        // loader.apply, and asserts:
+        //   1. The decoded String contains U+FFFD (the substitution
+        //      actually happened, so the test exercises the chain
+        //      rather than a degenerate input).
+        //   2. loader.apply returns false (the chain rejects).
+        //   3. Working state is unchanged (no rule for the malformed
+        //      key landed in the RuleSet).
+        //
+        // A future refactor — e.g., a decode-time charset decoder with
+        // a different error action, or a validator that admits U+FFFD —
+        // would break one of those assertions and surface here.
+        RuleEngine engine = new RuleEngine();
+        GovernanceLoader loader = new GovernanceLoader(engine);
+        // Seed a legitimate operator rule so we can prove the malformed
+        // key was rejected without disturbing prior good state.
+        assertTrue(loader.apply("operator-rule", envelope("true", ApiKeys.METADATA, 7)));
+
+        // (a) Single stray 0xFE byte — a classic malformed UTF-8 lead.
+        byte[] singleStrayLead = { (byte) 0xFE };
+        String decodedA = new String(singleStrayLead, StandardCharsets.UTF_8);
+        assertTrue(decodedA.indexOf('�') >= 0,
+            "JVM UTF-8 decoder must substitute 0xFE → U+FFFD; "
+                + "if this changes, the test premise is invalid");
+        assertFalse(loader.apply(decodedA, envelope("true", ApiKeys.METADATA, 8)),
+            "malformed UTF-8 key (substituted to U+FFFD) must be rejected");
+        assertFalse(loader.apply(decodedA, null),
+            "tombstone via malformed UTF-8 key must also be rejected — "
+                + "asymmetric admission would re-open R23 BLOCKER #211");
+
+        // (b) Compaction-collision shape: TWO distinct byte sequences
+        //     both decode to the same U+FFFD-only String. R33 #291's
+        //     original motivating attack was exactly this — log
+        //     compactor compares raw bytes (different keys) but the
+        //     loader sees the same decoded String (collapsed). Pin
+        //     that BOTH inputs are rejected so neither flavour lands.
+        byte[] strayTrail = { (byte) 0xFF };
+        String decodedB = new String(strayTrail, StandardCharsets.UTF_8);
+        assertEquals(decodedA, decodedB,
+            "both malformed-byte inputs must decode to the same "
+                + "U+FFFD-only String — that is the collapse the codec "
+                + "validator rejects");
+        assertFalse(loader.apply(decodedB, envelope("true", ApiKeys.METADATA, 9)),
+            "second flavour of malformed UTF-8 key (collapsed via "
+                + "U+FFFD substitution) must also be rejected");
+
+        // (c) Working state survived: the operator-rule remains the
+        //     only rule in the RuleSet, with its original errorCode
+        //     untouched by the malformed-bytes update attempts.
+        loader.commit();
+        RuleDecision d = engine.evaluate(
+            ApiKeys.METADATA, "client", false, Collections::emptyMap);
+        assertTrue(d.denied(), "operator-rule survived malformed-UTF-8 keys");
+        assertEquals("operator-rule", d.denyingRuleId());
+        assertEquals(7, d.errorCode(),
+            "operator-rule errorCode untouched — neither malformed "
+                + "update displaced it (would be 8 or 9 if it had)");
+    }
 }
