@@ -1845,4 +1845,51 @@ class KafkaConfigTest {
     props.put(ShareGroupConfig.SHARE_GROUP_RECORD_LOCK_DURATION_MS_CONFIG, "30000")
     assertDoesNotThrow(() => KafkaConfig.fromProps(props))
   }
+
+  @Test
+  def testSocketSelectorImplementationPerListenerOverride(): Unit = {
+    // Broker-wide setting is `nio`, but listener `PLAINTEXT` is explicitly overridden to
+    // `io_uring`. socketSelectorImplementationFor must return the override for that listener
+    // and the broker-wide value for any other listener — otherwise an operator's per-listener
+    // tuning intent (a legitimate canary scenario) is silently dropped.
+    val props = TestUtils.createBrokerConfig(0, port = 8181)
+    props.setProperty(SocketServerConfigs.SOCKET_SELECTOR_IMPLEMENTATION_CONFIG, "nio")
+    props.setProperty(
+      "listener.name.plaintext." + SocketServerConfigs.SOCKET_SELECTOR_IMPLEMENTATION_CONFIG,
+      "io_uring")
+    val cfg = KafkaConfig.fromProps(props)
+
+    val plaintext = new ListenerName("PLAINTEXT")
+    val other = new ListenerName("INTERNAL")
+
+    assertEquals(
+      org.apache.kafka.network.iouring.SelectorImplementation.IO_URING,
+      cfg.socketSelectorImplementationFor(plaintext),
+      "per-listener override on PLAINTEXT should resolve to io_uring")
+    assertEquals(
+      org.apache.kafka.network.iouring.SelectorImplementation.NIO,
+      cfg.socketSelectorImplementationFor(other),
+      "no override on INTERNAL listener should fall back to broker-wide nio")
+    assertEquals(
+      org.apache.kafka.network.iouring.SelectorImplementation.NIO,
+      cfg.socketSelectorImplementation,
+      "broker-wide value remains nio regardless of per-listener overrides")
+  }
+
+  @Test
+  def testSocketSelectorImplementationFallsBackToBrokerWide(): Unit = {
+    // Without any per-listener override, socketSelectorImplementationFor must return the
+    // broker-wide value for every listener — proving the lookup path doesn't accidentally
+    // null-out (e.g., returning IO_URING by mistake when the prefix lookup misses).
+    val props = TestUtils.createBrokerConfig(0, port = 8181)
+    props.setProperty(SocketServerConfigs.SOCKET_SELECTOR_IMPLEMENTATION_CONFIG, "io_uring")
+    val cfg = KafkaConfig.fromProps(props)
+
+    assertEquals(
+      org.apache.kafka.network.iouring.SelectorImplementation.IO_URING,
+      cfg.socketSelectorImplementationFor(new ListenerName("PLAINTEXT")))
+    assertEquals(
+      org.apache.kafka.network.iouring.SelectorImplementation.IO_URING,
+      cfg.socketSelectorImplementationFor(new ListenerName("ANY_OTHER")))
+  }
 }

@@ -317,15 +317,34 @@ class KafkaConfig private(doLog: Boolean, val props: util.Map[_, _])
       getString(SocketServerConfigs.SOCKET_SELECTOR_IMPLEMENTATION_CONFIG))
 
   /**
-   * Whether a listener with the given security protocol should be served by the io_uring
-   * backend. Delegates to {@code BrokerSelectorFactory.resolve} so v1 PLAINTEXT-only and
-   * non-Linux fallback rules live in exactly one place. Callers MUST NOT assume that an
+   * Effective {@code socket.selector.implementation} for the given listener: returns the
+   * per-listener override (set as {@code listener.name.<name>.socket.selector.implementation})
+   * if present, otherwise the broker-wide value. Operators legitimately want this granularity
+   * — e.g. canary one listener on io_uring while the rest stay on nio, or carve out a single
+   * listener back to nio if a broker-wide io_uring rollout exposes a regression on one protocol.
+   * Without listener-scoped resolution, a tuning override silently has no effect — the
+   * operator's expressed intent is dropped on the floor with no log signal.
+   */
+  def socketSelectorImplementationFor(listenerName: org.apache.kafka.common.network.ListenerName)
+    : org.apache.kafka.network.iouring.SelectorImplementation = {
+    val raw = valuesWithPrefixOverride(listenerName.configPrefix)
+      .get(SocketServerConfigs.SOCKET_SELECTOR_IMPLEMENTATION_CONFIG)
+    if (raw == null) socketSelectorImplementation
+    else org.apache.kafka.network.iouring.SelectorImplementation.fromConfig(raw.toString)
+  }
+
+  /**
+   * Whether the given listener should be served by the io_uring backend. Delegates to
+   * {@code BrokerSelectorFactory.resolve} so v1 PLAINTEXT-only and non-Linux fallback rules
+   * live in exactly one place. Honors the per-listener {@code socket.selector.implementation}
+   * override via {@link #socketSelectorImplementationFor}. Callers MUST NOT assume that an
    * io_uring listener can be served by the NIO Acceptor/Processor wiring — see Acceptor and
    * Processor for the path that diverges when this returns {@code true}.
    */
-  def usesIoUring(securityProtocol: org.apache.kafka.common.security.auth.SecurityProtocol): Boolean = {
+  def usesIoUring(listenerName: org.apache.kafka.common.network.ListenerName,
+                  securityProtocol: org.apache.kafka.common.security.auth.SecurityProtocol): Boolean = {
     val effective = org.apache.kafka.network.iouring.BrokerSelectorFactory.resolve(
-      socketSelectorImplementation,
+      socketSelectorImplementationFor(listenerName),
       securityProtocol,
       org.apache.kafka.network.iouring.IoUringSupport.isAvailable())
     effective == org.apache.kafka.network.iouring.SelectorImplementation.IO_URING

@@ -523,10 +523,13 @@ private[kafka] abstract class Acceptor(val socketServer: SocketServer,
   // listener. Without this line a wildcard "io_uring auto" config can silently fall through
   // to NIO (e.g. kernel without io_uring, or a non-PLAINTEXT listener that v1 forbids on the
   // io_uring path) and operators have no signal that a tuning intent was downgraded —
-  // every existing log line refers to the listener by name only. config.socketSelectorImplementation
-  // is the requested value (auto/nio/io_uring); usesIoUring is the resolved decision.
+  // every existing log line refers to the listener by name only. socketSelectorImplementationFor
+  // honors the per-listener `listener.name.<name>.socket.selector.implementation` override and
+  // falls back to the broker-wide value, so this log shows the requested view the resolver
+  // actually saw for this listener — not just the broker-wide default.
   info(s"Resolved I/O backend for listener ${endPoint.listenerName} (${endPoint.securityProtocol}): " +
-    s"${if (usesIoUring) "io_uring" else "nio"} (requested=${config.socketSelectorImplementation.configValue()})")
+    s"${if (usesIoUring) "io_uring" else "nio"} " +
+    s"(requested=${config.socketSelectorImplementationFor(endPoint.listenerName).configValue()})")
 
   private[network] val processors = new ArrayBuffer[Processor]()
   // Build the metric name explicitly in order to keep the existing name for compatibility
@@ -649,7 +652,7 @@ private[kafka] abstract class Acceptor(val socketServer: SocketServer,
 
   /** Whether this Acceptor's listener is served by the io_uring backend. */
   private[network] def usesIoUring: Boolean =
-    config.usesIoUring(endPoint.securityProtocol)
+    config.usesIoUring(endPoint.listenerName, endPoint.securityProtocol)
 
   private def closeAll(): Unit = {
     debug("Closing server socket, selector, and any throttled sockets.")
@@ -944,7 +947,7 @@ private[kafka] class Processor(
   private[network] val selector: BrokerSelector = ioBundle.selector
 
   private def buildIoBundle(): ProcessorIoBundle = {
-    if (config.usesIoUring(securityProtocol)) {
+    if (config.usesIoUring(listenerName, securityProtocol)) {
       if (endPoint.port == 0) {
         throw new KafkaException(
           s"io_uring listener ${endPoint.listenerName} requires an explicit port " +
