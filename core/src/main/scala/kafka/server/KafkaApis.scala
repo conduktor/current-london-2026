@@ -4826,18 +4826,24 @@ class KafkaApis(val requestChannel: RequestChannel,
     }
   }
 
-  // True iff `principalStr` is in the legacy `User:<name>` form AND the
-  // <name> portion is any tenant-prefixed principal (`__tenant_<id>.<x>` with
-  // non-empty `<id>`). ACL bindings serialize the principal as `User:foo`; the
+  // True iff `principalStr` carries a tenant-prefixed principal name
+  // (`__tenant_<id>.<x>` with non-empty `<id>`) after its type prefix. ACL
+  // bindings serialise the principal as `<Type>:<Name>`; the legitimate
   // tenant-encoded form is `User:__tenant_<id>.<user>`. The `__tenant_` prefix
-  // is RESERVED — even an unknown `<id>` is treated as foreign because pre-
-  // binding pollution would otherwise let an admin plant ACLs that the tenant
-  // inherits on binding. The narrow ownership check is callerTenantFromPrincipal.
+  // is RESERVED regardless of the principal type — even an unknown `<id>`
+  // and even types other than `User` (e.g. `Group:__tenant_acme.bob`,
+  // `Role:__tenant_acme.bob`, or a lowercase `user:`) are treated as foreign:
+  // pre-binding pollution would otherwise let an admin plant ACLs that the
+  // tenant inherits on binding, and a future custom authorizer or principal
+  // builder that emits a non-`User` type would silently match such an ACL
+  // and cross the isolation boundary. The narrow same-tenant ownership check
+  // (callerOwnsUserPrincipal) still keys on the `User:` type only — only
+  // legitimate tenant identities pass that carve-out.
   private def isReservedUserPrincipalLiteral(principalStr: String): Boolean = {
     if (principalStr == null) return false
-    val userPrefix = "User:"
-    if (!principalStr.startsWith(userPrefix)) return false
-    isReservedTenantPrincipalNamespace(principalStr.substring(userPrefix.length))
+    val colon = principalStr.indexOf(':')
+    if (colon < 0) return false
+    isReservedTenantPrincipalNamespace(principalStr.substring(colon + 1))
   }
 
   def handleDescribeConfigsRequest(request: RequestChannel.Request): Unit = {

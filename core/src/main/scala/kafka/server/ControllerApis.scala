@@ -1534,16 +1534,21 @@ class ControllerApis(
     }
   }
 
-  // True iff `principalStr` is in the legacy `User:<name>` form AND the
-  // `<name>` portion lies in a reserved tenant principal namespace. ACL bindings
-  // serialise the principal as `User:foo`; the tenant-encoded form is
-  // `User:__tenant_<id>.<user>`. Mirrors KafkaApis.isReservedUserPrincipalLiteral
-  // so the structural check stays in lock-step across broker and controller.
+  // True iff `principalStr` carries a tenant-prefixed principal name
+  // (`__tenant_<id>.<x>`) after its type prefix, regardless of whether the
+  // type is `User`, `Group`, `Role`, lowercase `user`, or any other custom
+  // value. Mirrors KafkaApis.isReservedUserPrincipalLiteral so the
+  // structural check stays in lock-step across broker and controller. See
+  // the broker-side comment for the threat model — a custom authorizer or
+  // principal builder that emits a non-`User` type would otherwise let a
+  // forged `Group:__tenant_acme.bob` ACL plant authority that this scrub is
+  // meant to block. The narrow same-tenant ownership check
+  // (callerOwnsUserPrincipal) still keys on the `User:` type only.
   private def isReservedUserPrincipalLiteral(principalStr: String): Boolean = {
     if (principalStr == null) return false
-    val userPrefix = "User:"
-    if (!principalStr.startsWith(userPrefix)) return false
-    isReservedTenantPrincipalNamespace(principalStr.substring(userPrefix.length))
+    val colon = principalStr.indexOf(':')
+    if (colon < 0) return false
+    isReservedTenantPrincipalNamespace(principalStr.substring(colon + 1))
   }
 
   // ACL handler outside-in pollution / leak guard for the controller listener.

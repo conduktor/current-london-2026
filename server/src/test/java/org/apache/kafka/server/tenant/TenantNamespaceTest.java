@@ -136,6 +136,33 @@ class TenantNamespaceTest {
     }
 
     @Test
+    void parseTenantFromPrincipalReturnsEmptyForGroupTypedPrincipal() {
+        // Tenant identity is a USER-typed principal. A Group-typed principal
+        // carrying `__tenant_acme.bob` in its name (e.g. produced by a custom
+        // principal builder, a SCRAM extension, or an Envelope-forwarded
+        // principal whose principalType was tampered with) would otherwise be
+        // treated as tenant `acme` by every L1/L2 guard while remaining
+        // invisible to the StandardAuthorizer comparing against `User:` ACL
+        // bindings — crossing the isolation boundary with no authority. Refuse
+        // here so the caller is treated as non-tenant.
+        KafkaPrincipal p = new KafkaPrincipal("Group", "__tenant_acme.bob");
+        assertEquals(Optional.empty(), TenantNamespace.parseTenantId(p));
+    }
+
+    @Test
+    void parseTenantFromPrincipalReturnsEmptyForCustomTypePrincipal() {
+        // Same as the Group case: any non-User type is refused. Custom
+        // principal types ("Role", "ServiceAccount", lowercase "user") never
+        // confer tenant identity.
+        assertEquals(Optional.empty(),
+            TenantNamespace.parseTenantId(new KafkaPrincipal("Role", "__tenant_acme.bob")));
+        assertEquals(Optional.empty(),
+            TenantNamespace.parseTenantId(new KafkaPrincipal("ServiceAccount", "__tenant_acme.bob")));
+        assertEquals(Optional.empty(),
+            TenantNamespace.parseTenantId(new KafkaPrincipal("user", "__tenant_acme.bob")));
+    }
+
+    @Test
     void toPhysicalPrefixesUserTopics() {
         assertEquals("acme.orders", TenantNamespace.toPhysical("acme", "orders"));
     }

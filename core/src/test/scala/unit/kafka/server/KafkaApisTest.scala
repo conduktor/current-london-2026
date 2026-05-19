@@ -13846,6 +13846,53 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testCreateAclsClusterWideListenerRejectsGroupTypedTenantPrincipal(): Unit = {
+    // #169: the principal-literal scrub must refuse ANY <type>:__tenant_*
+    // form, not just `User:`. A forged ACL with principal field
+    // `Group:__tenant_acme.bob` would otherwise sail through L1 — a custom
+    // principal builder or authorizer that interprets a non-User type as
+    // tenant identity (which `parseTenantId` itself now refuses post-#168)
+    // would then match this ACL on what should be a foreign-tenant principal.
+    val creation = aclCreation(ResourceType.TOPIC, "plain-topic", "Group:__tenant_acme.bob")
+    val req = new CreateAclsRequest.Builder(new CreateAclsRequestData()
+      .setCreations(util.Arrays.asList(creation))).build()
+    val request = buildRequest(req)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleCreateAclsRequest(request)
+
+    val response = verifyNoThrottling[CreateAclsResponse](request)
+    assertEquals(1, response.data.results.size)
+    assertEquals(Errors.INVALID_REQUEST.code, response.data.results.get(0).errorCode,
+      "broker CreateAcls must refuse `Group:__tenant_acme.*` from a cluster-wide caller")
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[AbstractRequest](), any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
+  def testCreateAclsClusterWideListenerRejectsLowercaseUserTypedTenantPrincipal(): Unit = {
+    // #169: a lowercase `user:` type prefix would otherwise slip through the
+    // (case-sensitive) startsWith("User:") check. The widened scrub keys on
+    // the first colon, not the literal `User:` string.
+    val creation = aclCreation(ResourceType.TOPIC, "plain-topic", "user:__tenant_acme.bob")
+    val req = new CreateAclsRequest.Builder(new CreateAclsRequestData()
+      .setCreations(util.Arrays.asList(creation))).build()
+    val request = buildRequest(req)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleCreateAclsRequest(request)
+
+    val response = verifyNoThrottling[CreateAclsResponse](request)
+    assertEquals(1, response.data.results.size)
+    assertEquals(Errors.INVALID_REQUEST.code, response.data.results.get(0).errorCode,
+      "broker CreateAcls must refuse `user:__tenant_acme.*` (lowercase type) from a cluster-wide caller")
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[AbstractRequest](), any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
   def testCreateAclsClusterWideListenerMixesAllowedAndRejectedEntries(): Unit = {
     // Mixed batch [tenant-topic, neutral, tenant-principal, neutral]: only
     // entries 1 and 3 (0-indexed) reach the controller; entries 0 and 2 are

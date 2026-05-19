@@ -4155,6 +4155,55 @@ class ControllerApisTest {
   }
 
   @Test
+  def testControllerCreateAclsRefusesGroupTypedTenantPrincipalOnBootstrapControllers(): Unit = {
+    // #169: the principal-literal scrub must refuse ANY <type>:__tenant_*
+    // form, not just `User:`. A forged ACL with principal field
+    // `Group:__tenant_acme.bob` would otherwise sail through L1 — and if a
+    // future custom principal builder or authorizer emits a Group-typed
+    // tenant principal (which `parseTenantId` now refuses post-#168), the
+    // dead ACL would still pollute the metadata log. Refuse at L1.
+    val creation = aclCreation(ResourceType.TOPIC, "plain-topic", "Group:__tenant_acme.bob")
+    val req = new CreateAclsRequest.Builder(new CreateAclsRequestData()
+      .setCreations(util.Arrays.asList(creation))).build()
+    val request = buildControllerRequest(req)
+
+    val auth = authorizerAllowingClusterOps()
+    controllerApis = createControllerApis(
+      authorizer = Some(auth),
+      controller = new MockController.Builder().build(),
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    controllerApis.handleCreateAclsRequest(request).get()
+
+    val response = captureSentResponse(request).asInstanceOf[CreateAclsResponse]
+    assertEquals(Errors.INVALID_REQUEST.code, response.results.get(0).errorCode,
+      "controller-direct CreateAcls must refuse `Group:__tenant_acme.*` from a cluster caller")
+    verify(auth, never()).createAcls(any(), any())
+  }
+
+  @Test
+  def testControllerCreateAclsRefusesLowercaseUserTypedTenantPrincipalOnBootstrapControllers(): Unit = {
+    // #169: a lowercase `user:` type prefix on the ACL principal field would
+    // otherwise slip through the (case-sensitive) startsWith("User:") check.
+    // The widened scrub keys on the first colon, not the literal "User:".
+    val creation = aclCreation(ResourceType.TOPIC, "plain-topic", "user:__tenant_acme.bob")
+    val req = new CreateAclsRequest.Builder(new CreateAclsRequestData()
+      .setCreations(util.Arrays.asList(creation))).build()
+    val request = buildControllerRequest(req)
+
+    val auth = authorizerAllowingClusterOps()
+    controllerApis = createControllerApis(
+      authorizer = Some(auth),
+      controller = new MockController.Builder().build(),
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    controllerApis.handleCreateAclsRequest(request).get()
+
+    val response = captureSentResponse(request).asInstanceOf[CreateAclsResponse]
+    assertEquals(Errors.INVALID_REQUEST.code, response.results.get(0).errorCode,
+      "controller-direct CreateAcls must refuse `user:__tenant_acme.*` (lowercase type) from a cluster caller")
+    verify(auth, never()).createAcls(any(), any())
+  }
+
+  @Test
   def testControllerCreateAclsMixesAllowedAndRejectedOnBootstrapControllers(): Unit = {
     // Mixed batch: a tenant-polluting binding sits next to a neutral one.
     // The scrub must refuse the tenant binding per-entry and forward the

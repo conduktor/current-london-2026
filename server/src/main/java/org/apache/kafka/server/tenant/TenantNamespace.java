@@ -82,6 +82,21 @@ public final class TenantNamespace {
     }
 
     public static Optional<String> parseTenantId(KafkaPrincipal principal) {
+        // Tenant identity is a USER-typed principal — that is the type SASL,
+        // SCRAM, mTLS and the stock principal builders all emit, and the only
+        // type the StandardAuthorizer compares ACL `User:` bindings against.
+        // A non-User principal carrying `__tenant_<id>.<x>` in its name (a
+        // Group, a Role, a custom builder's output, an Envelope-forwarded
+        // principal whose principalType field was tampered with) would
+        // otherwise be treated as tenant-`<id>` by every L1/L2 guard while
+        // remaining invisible to `User:__tenant_<id>.<x>` ACL matching —
+        // crossing the isolation boundary with no authority bound to it.
+        // Refuse here so the caller is treated as non-tenant and the
+        // outside-in guards then refuse every write/read into the reserved
+        // namespace.
+        if (!KafkaPrincipal.USER_TYPE.equals(principal.getPrincipalType())) {
+            return Optional.empty();
+        }
         String name = principal.getName();
         if (!name.startsWith(PRINCIPAL_PREFIX)) {
             return Optional.empty();
