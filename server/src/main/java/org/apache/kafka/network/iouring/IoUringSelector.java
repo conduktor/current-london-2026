@@ -153,6 +153,18 @@ public final class IoUringSelector implements BrokerSelector {
     private final Map<String, Channel> nettyChannels = new ConcurrentHashMap<>();
     private final Map<String, Long> lastActiveNanos = new HashMap<>();
     /**
+     * Gate for {@link #maybeExpireOldestIdleChannel(long)}. The O(n) min-scan over
+     * {@link #lastActiveNanos} only runs when {@code nowNanos > nextIdleScanNanos};
+     * outside that window every poll short-circuits in O(1). Mirrors NIO's
+     * {@code IdleExpiryManager.nextIdleCloseCheckTime}
+     * (clients/.../Selector.java:1430, 1444, 1454). Without this gate, a Processor with
+     * 10k idle channels and the default 10-minute idle would run the full min-scan on
+     * every poll iteration — orders of magnitude more map lookups than NIO and a real
+     * regression at the 10k-client benchmark target in PROMPT.md. Initialized to 0 so
+     * the very first poll runs the scan.
+     */
+    private long nextIdleScanNanos = 0L;
+    /**
      * Tracks channels that the operator explicitly muted via {@link #mute(String)} or
      * {@link #muteAll()}, distinct from channels that {@link KafkaChannel#read()} self-muted
      * because {@link MemoryPool#tryAllocate(int)} returned null. Mirrors NIO's
@@ -657,6 +669,15 @@ public final class IoUringSelector implements BrokerSelector {
         if (connectionsMaxIdleNanos <= 0 || lastActiveNanos.isEmpty()) {
             return false;
         }
+        // Gate the O(n) min-scan: no entry can expire before the current oldest does,
+        // and after each scan we know exactly when that earliest expiry could occur.
+        // Skip the walk entirely when we are still within that window. NIO does the
+        // same via IdleExpiryManager.nextIdleCloseCheckTime — without it, every poll
+        // pays the full scan even though no entry could possibly have expired since
+        // the previous scan. Quadratic-per-channel cost vanishes here.
+        if (nowNanos <= nextIdleScanNanos) {
+            return false;
+        }
         String oldestId = null;
         long oldestNanos = Long.MAX_VALUE;
         for (Map.Entry<String, Long> entry : lastActiveNanos.entrySet()) {
@@ -665,7 +686,20 @@ public final class IoUringSelector implements BrokerSelector {
                 oldestId = entry.getKey();
             }
         }
-        if (oldestId == null || nowNanos - oldestNanos <= connectionsMaxIdleNanos) {
+        if (oldestId == null) {
+            // The isEmpty() guard above should make this unreachable, but if a future
+            // refactor changes the entry-set semantics we still want to bound the next
+            // scan rather than busy-looping.
+            nextIdleScanNanos = nowNanos + connectionsMaxIdleNanos;
+            return false;
+        }
+        // Reset the gate to the earliest possible expiry of the new oldest entry.
+        // Whether or not we evict on this poll, no entry can expire before this
+        // moment. Set BEFORE the expiry check so a not-yet-expired oldest still
+        // pushes the gate forward — otherwise we'd re-scan on every subsequent poll
+        // until the oldest actually crosses the threshold.
+        nextIdleScanNanos = oldestNanos + connectionsMaxIdleNanos;
+        if (nowNanos - oldestNanos <= connectionsMaxIdleNanos) {
             return false;
         }
         KafkaChannel channel = channels.remove(oldestId);
@@ -1234,5 +1268,14 @@ public final class IoUringSelector implements BrokerSelector {
             failedSends.remove(id);
             Utils.closeQuietly(closing, "closing channel close(" + id + ")");
         }
+    }
+
+    // Test-visible accessor for the idle-scan gate. The scan is intentionally a
+    // performance optimization (transparent to correctness), so we expose this only
+    // to assert that the gate is in fact set after a poll — a future regression that
+    // removed the gating would still pass behavioral tests, but would fail an
+    // assertion on the gate value moving forward.
+    long nextIdleScanNanosForTesting() {
+        return nextIdleScanNanos;
     }
 }

@@ -538,6 +538,60 @@ class IoUringSelectorTest {
     }
 
     @Test
+    void idleScanIsGatedBetweenPollsWhenNoChannelCouldHaveExpired() throws Exception {
+        // BUG-N1 regression: without nextIdleScanNanos, every poll ran the full O(n)
+        // min-scan over lastActiveNanos even though no entry could possibly have expired
+        // since the previous scan. At 10k channels and a 600s idle (defaults), that's
+        // ~10^9 wasted map lookups per minute per Processor — a direct throughput
+        // regression vs NIO at PROMPT.md's 10k-client benchmark target. NIO gates the
+        // scan via IdleExpiryManager.nextIdleCloseCheckTime (clients/.../Selector.java:1444).
+        //
+        // The gate's contract: after a poll that did NOT evict, the next scan can be
+        // skipped until at least oldestNanos + connectionsMaxIdleNanos. This test asserts
+        // (a) the gate is advanced past the current time after a no-op scan, and (b) a
+        // subsequent poll BEFORE the gate elapses does not re-scan (gate value unchanged).
+        long idle = TimeUnit.MILLISECONDS.toNanos(100);
+        IoUringSelector s = newSelector(idle);
+        acceptNew(s, REMOTE_A);
+        s.poll(0); // accept stamps lastActive; scan runs and sets the gate.
+
+        long firstGate = s.nextIdleScanNanosForTesting();
+        long now = time.nanoseconds();
+        assertTrue(firstGate > now,
+            "after the first poll, the idle gate must be set strictly past 'now' — "
+                + "otherwise every subsequent poll will re-run the O(n) scan even though "
+                + "no entry could have expired yet. gate=" + firstGate + " now=" + now);
+        // The gate should be at least one idle window in the future.
+        assertTrue(firstGate >= now + idle - TimeUnit.MILLISECONDS.toNanos(20),
+            "gate must extend at least one near-full idle window ahead so the scan is "
+                + "actually amortized; gate=" + firstGate + " now=" + now + " idle=" + idle);
+
+        // Tick forward by less than the idle window, then poll again. The gate must NOT
+        // move — proving the scan was short-circuited. If the gate were re-set to a new
+        // value (e.g. because the scan ran and the oldest entry got refreshed at the same
+        // nanosecond), the inequality below would catch a regression that removed the
+        // short-circuit and made the gate jitter.
+        time.sleep(idle / 1_000_000 / 4);
+        s.poll(0);
+        assertEquals(firstGate, s.nextIdleScanNanosForTesting(),
+            "polling within the gated window must NOT re-run the scan; the gate "
+                + "value must be identical to the value set by the previous scan");
+
+        // Cross the gate and prove the scan does run again — the observable signal is
+        // an eviction (the scan would have found the now-expired channel and surfaced
+        // EXPIRED in disconnected). The gate value itself stays at oldestNanos+maxIdle
+        // after a single-channel eviction (the new oldest is "none", so the gate is
+        // left alone — that's the lastActiveNanos.isEmpty() short-circuit), so
+        // disconnected() is the cleaner correctness signal here.
+        time.sleep(idle / 1_000_000 + 50);
+        s.poll(0);
+        assertEquals(1, s.disconnected().size(),
+            "polling past the gate must re-run the scan and find the expired channel; "
+                + "if the gate is sticky, an actually-expired channel will linger forever");
+        assertEquals(ChannelState.State.EXPIRED, s.disconnected().values().iterator().next().state());
+    }
+
+    @Test
     void idleExpiryReapsAtMostOneChannelPerPoll() throws Exception {
         // Round-20C F12 regression: pre-fix the idle expiry block walked the whole
         // lastActiveNanos map and reaped every expired entry in one pass. On a host
