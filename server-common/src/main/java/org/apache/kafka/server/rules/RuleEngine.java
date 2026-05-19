@@ -415,8 +415,24 @@ public final class RuleEngine {
             }
             // SecurityUtils.parseKafkaPrincipal throws IllegalArgumentException
             // on a missing ':' separator. We let that propagate so broker
-            // startup fails loudly.
-            KafkaPrincipal principal = SecurityUtils.parseKafkaPrincipal(trimmed);
+            // startup fails loudly — but we re-throw with `LogSafe.sanitize`
+            // applied, because the upstream message format
+            // "expected a string in format principalType:principalName but
+            // got <str>" embeds the raw operator-supplied value, and that
+            // value can contain CR/LF or other control codepoints (no
+            // separator means `String.trim()` at the top of the loop only
+            // strips edge whitespace, so interior CR/LF survive). The fatal
+            // SLF4J log line emitted from BrokerServer.startup must not be
+            // forgeable by a malicious config value. Round-20 HIGH A-1.
+            KafkaPrincipal principal;
+            try {
+                principal = SecurityUtils.parseKafkaPrincipal(trimmed);
+            } catch (IllegalArgumentException e) {
+                throw new IllegalArgumentException(
+                    "governance.bypass.principals entry is not in `type:name` "
+                    + "format: '" + LogSafe.sanitize(trimmed) + "' (e.g. "
+                    + "`User:broker`).");
+            }
             // Codex round-3 P1 + round-4 F2: SecurityUtils does not validate
             // that the type and name are non-blank, nor that they have no
             // inner whitespace. Reject both failure modes here — the runtime
@@ -447,18 +463,30 @@ public final class RuleEngine {
             String type = principal.getPrincipalType();
             String name = principal.getName();
             if (type.isEmpty() || isAllWhitespace(type) || hasLeadingOrTrailingWhitespace(type)) {
+                // Round-20 HIGH A-1: `trimmed` is operator-supplied config
+                // and `String.trim()` at the top of the loop only strips
+                // edge ASCII whitespace — interior \r/\n survive (e.g.
+                // `raw = "User\r:broker"` → type="User\r" trips the
+                // trailing-whitespace branch with `\r` still embedded in
+                // `trimmed`). Sanitise before interpolating so the fatal
+                // SLF4J log line emitted from BrokerServer.startup cannot
+                // be forged by a malicious config value.
                 throw new IllegalArgumentException(
                     "governance.bypass.principals entry has blank, whitespace-"
-                    + "only or whitespace-padded principal type: '" + trimmed
+                    + "only or whitespace-padded principal type: '"
+                    + LogSafe.sanitize(trimmed)
                     + "'. Format is `type:name` (eg. `User:broker`); the type "
                     + "must be non-empty and must not start or end with "
                     + "whitespace (ASCII or Unicode). Internal whitespace is "
                     + "allowed (eg. inside an SSL DN).");
             }
             if (name.isEmpty() || isAllWhitespace(name) || hasLeadingOrTrailingWhitespace(name)) {
+                // Round-20 HIGH A-1: see type-branch comment above for the
+                // sanitisation rationale.
                 throw new IllegalArgumentException(
                     "governance.bypass.principals entry has blank, whitespace-"
-                    + "only or whitespace-padded principal name: '" + trimmed
+                    + "only or whitespace-padded principal name: '"
+                    + LogSafe.sanitize(trimmed)
                     + "'. Format is `type:name` (eg. `User:broker`); the name "
                     + "must be non-empty and must not start or end with "
                     + "whitespace (ASCII or Unicode). Internal whitespace is "
@@ -482,27 +510,37 @@ public final class RuleEngine {
             // failure at broker startup, where it can be fixed.
             String typeInvisible = firstInvisibleCodePointLabel(type);
             if (typeInvisible != null) {
+                // Round-20 HIGH A-1: the offending entry is operator-supplied
+                // config that has just been shown to contain a CR/LF/other
+                // control codepoint. This exception propagates to
+                // BrokerServer.startup's fatal(...) log via SLF4J; without
+                // LogSafe.sanitize the embedded `trimmed` would carry that
+                // codepoint into the startup log and could forge a second
+                // log line (CR/LF) or smuggle bidi/ANSI bytes. The codepoint
+                // label itself (`U+%04X` formatted) is already safe.
                 throw new IllegalArgumentException(
                     "governance.bypass.principals entry has invisible "
                     + "codepoint (" + typeInvisible + ") in principal "
-                    + "type: '" + trimmed + "'. Invisible codepoints "
-                    + "(C0/C1 controls, zero-width, bidi overrides) "
-                    + "produce an allow-list entry whose canonical form "
-                    + "can never match a runtime peer principal; reject "
-                    + "at startup rather than under-granting the bypass "
-                    + "silently.");
+                    + "type: '" + LogSafe.sanitize(trimmed) + "'. Invisible "
+                    + "codepoints (C0/C1 controls, zero-width, bidi "
+                    + "overrides) produce an allow-list entry whose "
+                    + "canonical form can never match a runtime peer "
+                    + "principal; reject at startup rather than "
+                    + "under-granting the bypass silently.");
             }
             String nameInvisible = firstInvisibleCodePointLabel(name);
             if (nameInvisible != null) {
+                // Round-20 HIGH A-1: see typeInvisible branch above for the
+                // sanitisation rationale.
                 throw new IllegalArgumentException(
                     "governance.bypass.principals entry has invisible "
                     + "codepoint (" + nameInvisible + ") in principal "
-                    + "name: '" + trimmed + "'. Invisible codepoints "
-                    + "(C0/C1 controls, zero-width, bidi overrides) "
-                    + "produce an allow-list entry whose canonical form "
-                    + "can never match a runtime peer principal; reject "
-                    + "at startup rather than under-granting the bypass "
-                    + "silently.");
+                    + "name: '" + LogSafe.sanitize(trimmed) + "'. Invisible "
+                    + "codepoints (C0/C1 controls, zero-width, bidi "
+                    + "overrides) produce an allow-list entry whose "
+                    + "canonical form can never match a runtime peer "
+                    + "principal; reject at startup rather than "
+                    + "under-granting the bypass silently.");
             }
             out.add(principal.toString());
         }

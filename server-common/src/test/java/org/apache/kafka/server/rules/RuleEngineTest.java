@@ -1466,6 +1466,106 @@ public class RuleEngineTest {
     }
 
     @Test
+    public void parseBypassPrincipalsErrorMessagesAreLogSafe() {
+        // Round-20 HIGH A-1: every diagnostic in parseBypassPrincipals
+        // embeds the operator-supplied `trimmed` slot, which is then
+        // propagated by BrokerServer.startup into a fatal SLF4J log line.
+        // `String.trim()` at the top of the loop only strips edge ASCII
+        // whitespace, so interior CR/LF/DEL/other-control codepoints reach
+        // every throw site below. Without LogSafe.sanitize, a value like
+        // `"User\r:broker"` would forge a second log line, and a value
+        // carrying a bidi-override could smuggle ANSI sequences. Pin that
+        // each of the five throw sites in parseBypassPrincipals replaces
+        // raw control codepoints with the printable backslash-uXXXX form.
+        //
+        // Five sites total (in source order):
+        //   1. SecurityUtils.parseKafkaPrincipal missing-':'-separator
+        //      (clients/ — re-thrown locally with sanitised message)
+        //   2. blank/all-whitespace/padded principal TYPE
+        //   3. blank/all-whitespace/padded principal NAME
+        //   4. invisible codepoint in TYPE
+        //   5. invisible codepoint in NAME
+        //
+        // The exact escape form is LogSafe's contract: control chars become
+        // backslash-uXXXX literal text — assert the raw CR is gone AND the
+        // sanitised form is present.
+
+        // ---- site 1: missing-':' separator with embedded \r ----
+        IllegalArgumentException miss = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals("User\rbroker"));
+        assertFalse(miss.getMessage().contains("\r"),
+            "missing-separator diagnostic must not embed raw CR; got: "
+                + miss.getMessage());
+        assertTrue(miss.getMessage().contains("\\u000D"),
+            "missing-separator diagnostic must show CR as \\u000D; got: "
+                + miss.getMessage());
+
+        // ---- site 2: trailing whitespace in TYPE via interior \r ----
+        // `raw = "User\r:broker"` → segment.trim() is a no-op (`U` and `r`
+        // are non-whitespace), trimmed = "User\r:broker". parseKafkaPrincipal
+        // succeeds (one ':'), type="User\r", name="broker".
+        // hasLeadingOrTrailingWhitespace(type) is TRUE because \r is
+        // whitespace — branch fires with trimmed embedded.
+        IllegalArgumentException wsType = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals("User\r:broker"));
+        assertFalse(wsType.getMessage().contains("\r"),
+            "type-whitespace diagnostic must not embed raw CR; got: "
+                + wsType.getMessage());
+        assertTrue(wsType.getMessage().contains("\\u000D"),
+            "type-whitespace diagnostic must show CR as \\u000D; got: "
+                + wsType.getMessage());
+
+        // ---- site 3: leading whitespace in NAME with embedded LF ----
+        // `raw = "User: broker\nX"` → segment.trim() no-op (edges 'U' and
+        // 'X' are non-whitespace), trimmed="User: broker\nX".
+        // parseKafkaPrincipal gives type="User", name=" broker\nX". The
+        // leading space in `name` trips the trailing-whitespace branch
+        // with `\n` still embedded in trimmed — this is the realistic
+        // attack path: an operator config like `User: broker\n[FATAL]`
+        // would otherwise inject a forged FATAL log line into startup.
+        IllegalArgumentException wsName = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals("User: broker\nX"));
+        assertFalse(wsName.getMessage().contains("\n"),
+            "name-whitespace diagnostic must not embed raw LF; got: "
+                + wsName.getMessage());
+        assertTrue(wsName.getMessage().contains("\\u000A"),
+            "name-whitespace diagnostic must show LF as \\u000A; got: "
+                + wsName.getMessage());
+
+        // ---- site 4: invisible codepoint in TYPE with DEL embedded ----
+        // DEL (U+007F) is interior in `User` so the whitespace check
+        // does not fire — but the codepoint check rejects it. The trimmed
+        // slot in that diagnostic must be sanitised too.
+        IllegalArgumentException cpType = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals("User:broker"));
+        assertFalse(cpType.getMessage().contains(""),
+            "codepoint-type diagnostic must not embed raw DEL; got: "
+                + cpType.getMessage());
+        assertTrue(cpType.getMessage().contains("\\u007F"),
+            "codepoint-type diagnostic must show DEL as \\u007F in trimmed "
+                + "slot; got: " + cpType.getMessage());
+
+        // ---- site 5: invisible codepoint in NAME with C1 control ----
+        // NEL (U+0085) is interior in `broker` — codepoint check
+        // rejects with trimmed in the message. The codepoint label itself
+        // is already safe (formatted via `U+%04X`), but the trimmed slot
+        // contains the raw NEL byte and must be sanitised.
+        IllegalArgumentException cpName = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals("User:broker"));
+        assertFalse(cpName.getMessage().contains(""),
+            "codepoint-name diagnostic must not embed raw C1 NEL; got: "
+                + cpName.getMessage());
+        assertTrue(cpName.getMessage().contains("\\u0085"),
+            "codepoint-name diagnostic must show NEL as \\u0085 in trimmed "
+                + "slot; got: " + cpName.getMessage());
+    }
+
+    @Test
     public void reentrantEvaluateFromActivationSupplierIsCaughtAndFailsOpen() {
         // Round-8 audit task #100: the per-request CEL step budget is reset
         // on entry and again in a finally on exit. A re-entrant evaluate()
