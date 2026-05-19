@@ -13434,6 +13434,74 @@ class KafkaApisTest extends Logging {
     assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED.code, response.data.errorCode)
   }
 
+  // r22 BLOCKER #210: a stock KIP-848 consumer that explicitly subscribes to a backing topic
+  // name must be rejected with INVALID_REQUEST and a name-redacted message — without this
+  // guard the subscription persists into __consumer_offsets and the assignment plumbing
+  // forwards the backing UUID to the consumer, exposing co-tenant data via stock fetch.
+  @Test
+  def testConsumerGroupHeartbeatRequestRejectsBackingTopicSubscription(): Unit = {
+    metadataCache = mock(classOf[KRaftMetadataCache])
+    val groupId = "group"
+    val logicalTopic = "tenant-logical"
+    val backingTopic = "__concentration_backing_0"
+
+    val consumerGroupHeartbeatRequest = new ConsumerGroupHeartbeatRequestData()
+      .setGroupId(groupId)
+      .setSubscribedTopicNames(List(logicalTopic, backingTopic).asJava)
+
+    val requestChannelRequest = buildRequest(new ConsumerGroupHeartbeatRequest.Builder(consumerGroupHeartbeatRequest).build())
+
+    val authorizer: Authorizer = mock(classOf[Authorizer])
+    when(authorizer.authorize(any[RequestContext], any[util.List[Action]])).thenAnswer { invocation =>
+      val actions = invocation.getArgument(1, classOf[util.List[Action]])
+      actions.asScala.map(_ => AuthorizationResult.ALLOWED).asJava
+    }
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+    when(concentrationKernel.isBackingTopic(logicalTopic)).thenReturn(false)
+
+    kafkaApis = createKafkaApis(
+      authorizer = Some(authorizer),
+      featureVersions = Seq(GroupVersion.GV_1)
+    )
+    kafkaApis.handle(requestChannelRequest, RequestLocal.noCaching)
+
+    val response = verifyNoThrottling[ConsumerGroupHeartbeatResponse](requestChannelRequest)
+    assertEquals(Errors.INVALID_REQUEST.code, response.data.errorCode)
+    // The error message must not echo the backing-topic name (existence oracle for wildcard-authorized callers).
+    assertFalse(response.data.errorMessage == null || response.data.errorMessage.contains(backingTopic),
+      s"error message must not leak backing-topic name, was: ${response.data.errorMessage}")
+    // The coordinator must NOT be invoked once we reject — backing must never reach group state.
+    verify(groupCoordinator, never()).consumerGroupHeartbeat(any[RequestContext], any[ConsumerGroupHeartbeatRequestData])
+  }
+
+  // r22 #163 companion: with no authorizer configured, the backing-topic guard must still
+  // run — backings are a deployment invariant, not an ACL concern.
+  @Test
+  def testConsumerGroupHeartbeatRequestRejectsBackingTopicWithoutAuthorizer(): Unit = {
+    metadataCache = mock(classOf[KRaftMetadataCache])
+    val groupId = "group"
+    val backingTopic = "__concentration_backing_0"
+
+    val consumerGroupHeartbeatRequest = new ConsumerGroupHeartbeatRequestData()
+      .setGroupId(groupId)
+      .setSubscribedTopicNames(List(backingTopic).asJava)
+
+    val requestChannelRequest = buildRequest(new ConsumerGroupHeartbeatRequest.Builder(consumerGroupHeartbeatRequest).build())
+
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+
+    kafkaApis = createKafkaApis(
+      featureVersions = Seq(GroupVersion.GV_1)
+    )
+    kafkaApis.handle(requestChannelRequest, RequestLocal.noCaching)
+
+    val response = verifyNoThrottling[ConsumerGroupHeartbeatResponse](requestChannelRequest)
+    assertEquals(Errors.INVALID_REQUEST.code, response.data.errorCode)
+    assertFalse(response.data.errorMessage == null || response.data.errorMessage.contains(backingTopic),
+      s"error message must not leak backing-topic name, was: ${response.data.errorMessage}")
+    verify(groupCoordinator, never()).consumerGroupHeartbeat(any[RequestContext], any[ConsumerGroupHeartbeatRequestData])
+  }
+
   @ParameterizedTest
   @ValueSource(booleans = Array(true, false))
   def testConsumerGroupDescribe(includeAuthorizedOperations: Boolean): Unit = {
@@ -13705,6 +13773,100 @@ class KafkaApisTest extends Logging {
     assertEquals(expectedConsumerGroupDescribeResponseData, response.data)
   }
 
+  // r22 BLOCKER #211: a group whose member assignment contains a backing topic must be
+  // collapsed to TOPIC_AUTHORIZATION_FAILED with empty members and a generic message — the
+  // response must be indistinguishable from a vanilla unauthorized-topic case so an attacker
+  // cannot use the error code differential as an existence oracle for backing topics.
+  // Mirrors the r20 #173/#174 pattern.
+  @Test
+  def testConsumerGroupDescribeStripsBackingTopicFromAssignment(): Unit = {
+    val logicalTopic = "tenant-logical"
+    val backingTopic = "__concentration_backing_0"
+    val errorMessage = "The group has described topic(s) that the client is not authorized to describe."
+
+    metadataCache = mock(classOf[KRaftMetadataCache])
+
+    val groupIds = List("group-id-clean", "group-id-tainted").asJava
+    val consumerGroupDescribeRequestData = new ConsumerGroupDescribeRequestData()
+      .setGroupIds(groupIds)
+    val requestChannelRequest = buildRequest(new ConsumerGroupDescribeRequest.Builder(consumerGroupDescribeRequestData, true).build())
+
+    val authorizer: Authorizer = mock(classOf[Authorizer])
+    val acls = Map(
+      groupIds.get(0) -> AuthorizationResult.ALLOWED,
+      groupIds.get(1) -> AuthorizationResult.ALLOWED,
+      logicalTopic    -> AuthorizationResult.ALLOWED,
+      // Backing name is also authorized for DESCRIBE (wildcard authz) — the kernel guard
+      // must still strip it. This pins auth-first + shadow-second precedence.
+      backingTopic    -> AuthorizationResult.ALLOWED,
+    )
+    when(authorizer.authorize(
+      any[RequestContext],
+      any[util.List[Action]]
+    )).thenAnswer { invocation =>
+      val actions = invocation.getArgument(1, classOf[util.List[Action]])
+      actions.asScala.map { action =>
+        acls.getOrElse(action.resourcePattern.name, AuthorizationResult.DENIED)
+      }.asJava
+    }
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+    when(concentrationKernel.isBackingTopic(logicalTopic)).thenReturn(false)
+
+    val future = new CompletableFuture[util.List[ConsumerGroupDescribeResponseData.DescribedGroup]]()
+    when(groupCoordinator.consumerGroupDescribe(
+      any[RequestContext],
+      any[util.List[String]]
+    )).thenReturn(future)
+    kafkaApis = createKafkaApis(
+      authorizer = Some(authorizer),
+      featureVersions = Seq(GroupVersion.GV_1)
+    )
+    kafkaApis.handle(requestChannelRequest, RequestLocal.noCaching)
+
+    val cleanMember = new ConsumerGroupDescribeResponseData.Member()
+      .setMemberId("clean-member")
+      .setAssignment(new ConsumerGroupDescribeResponseData.Assignment()
+        .setTopicPartitions(List(new TopicPartitions().setTopicName(logicalTopic)).asJava))
+      .setTargetAssignment(new ConsumerGroupDescribeResponseData.Assignment()
+        .setTopicPartitions(List(new TopicPartitions().setTopicName(logicalTopic)).asJava))
+
+    val taintedMember = new ConsumerGroupDescribeResponseData.Member()
+      .setMemberId("tainted-member")
+      .setAssignment(new ConsumerGroupDescribeResponseData.Assignment()
+        .setTopicPartitions(List(new TopicPartitions().setTopicName(logicalTopic)).asJava))
+      .setTargetAssignment(new ConsumerGroupDescribeResponseData.Assignment()
+        // Backing in target assignment — could only have got there via a regex match or
+        // a classic JoinGroup path; the response filter is the last line of defence.
+        .setTopicPartitions(List(new TopicPartitions().setTopicName(backingTopic)).asJava))
+
+    future.complete(List(
+      new DescribedGroup()
+        .setGroupId(groupIds.get(0))
+        .setMembers(List(cleanMember).asJava),
+      new DescribedGroup()
+        .setGroupId(groupIds.get(1))
+        .setMembers(List(taintedMember).asJava)
+    ).asJava)
+
+    val response = verifyNoThrottling[ConsumerGroupDescribeResponse](requestChannelRequest)
+    val groups = response.data.groups.asScala.toList
+    assertEquals(2, groups.size)
+
+    // Clean group passes through unchanged.
+    val cleanGroup = groups.find(_.groupId == groupIds.get(0)).get
+    assertEquals(Errors.NONE.code, cleanGroup.errorCode)
+    assertEquals(1, cleanGroup.members.size)
+
+    // Tainted group: collapsed to TOPIC_AUTHORIZATION_FAILED, empty members, generic message
+    // that does NOT mention the backing-topic name.
+    val taintedGroup = groups.find(_.groupId == groupIds.get(1)).get
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED.code, taintedGroup.errorCode)
+    assertEquals(errorMessage, taintedGroup.errorMessage)
+    assertEquals(0, taintedGroup.members.size)
+    assertFalse(taintedGroup.errorMessage.contains(backingTopic),
+      s"error message must not leak backing-topic name, was: ${taintedGroup.errorMessage}")
+  }
+
   @Test
   def testGetTelemetrySubscriptions(): Unit = {
     val request = buildRequest(new GetTelemetrySubscriptionsRequest.Builder(
@@ -13903,6 +14065,42 @@ class KafkaApisTest extends Logging {
     future.completeExceptionally(Errors.FENCED_MEMBER_EPOCH.exception)
     val response = verifyNoThrottling[ShareGroupHeartbeatResponse](requestChannelRequest)
     assertEquals(Errors.FENCED_MEMBER_EPOCH.code, response.data.errorCode)
+  }
+
+  // r22 HIGH #162: regression for the #158 share-group backing-name reject. The original
+  // error message echoed the rejected backing names, which let a wildcard-authorized caller
+  // distinguish real backing topics from arbitrary names that happen to authz. The redacted
+  // message must NOT mention any backing-topic name.
+  @Test
+  def testShareGroupHeartbeatRejectsBackingTopicWithoutLeakingName(): Unit = {
+    val groupId = "share-group"
+    val backingTopic = "__concentration_backing_0"
+    val shareGroupHeartbeatRequest = new ShareGroupHeartbeatRequestData()
+      .setGroupId(groupId)
+      .setSubscribedTopicNames(List(backingTopic).asJava)
+
+    val requestChannelRequest = buildRequest(new ShareGroupHeartbeatRequest.Builder(shareGroupHeartbeatRequest, true).build())
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
+
+    val authorizer: Authorizer = mock(classOf[Authorizer])
+    when(authorizer.authorize(any[RequestContext], any[util.List[Action]])).thenAnswer { invocation =>
+      val actions = invocation.getArgument(1, classOf[util.List[Action]])
+      actions.asScala.map(_ => AuthorizationResult.ALLOWED).asJava
+    }
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+
+    kafkaApis = createKafkaApis(
+      authorizer = Some(authorizer),
+      overrideProperties = Map(ShareGroupConfig.SHARE_GROUP_ENABLE_CONFIG -> "true"),
+    )
+    kafkaApis.handle(requestChannelRequest, RequestLocal.noCaching)
+
+    val response = verifyNoThrottling[ShareGroupHeartbeatResponse](requestChannelRequest)
+    assertEquals(Errors.INVALID_REQUEST.code, response.data.errorCode)
+    assertNotNull(response.data.errorMessage)
+    assertFalse(response.data.errorMessage.contains(backingTopic),
+      s"error message must not leak backing-topic name, was: ${response.data.errorMessage}")
+    verify(groupCoordinator, never()).shareGroupHeartbeat(any[RequestContext], any[ShareGroupHeartbeatRequestData])
   }
 
   @Test

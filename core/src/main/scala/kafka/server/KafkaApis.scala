@@ -3817,11 +3817,29 @@ class KafkaApis(val requestChannel: RequestChannel,
         // Check the authorization if the subscribed topic names are provided.
         // Clients are not allowed to see topics that are not authorized for Describe.
         val subscribedTopicSet = consumerGroupHeartbeatRequest.data.subscribedTopicNames.asScala.toSet
+        // Authorize first so an unauthorized caller cannot use the backing-name reject below as an
+        // existence oracle. Auth-first / shadow-second precedence — same pattern as the
+        // share-group #158 fix and #210's r22 mirror of it.
         val authorizedTopics = authHelper.filterByAuthorized(request.context, DESCRIBE, TOPIC,
           subscribedTopicSet)(identity)
         if (authorizedTopics.size < subscribedTopicSet.size) {
           val responseData = new ConsumerGroupHeartbeatResponseData()
             .setErrorCode(Errors.TOPIC_AUTHORIZATION_FAILED.code)
+          requestHelper.sendMaybeThrottle(request, new ConsumerGroupHeartbeatResponse(responseData))
+          return CompletableFuture.completedFuture[Unit](())
+        }
+        // r22 BLOCKER #210: without this, a consumer-group member could persist a subscription to
+        // any backing topic name into coordinator state. The classic-protocol code (KIP-848) then
+        // resolves that name → topic-id and the assignment plumbing would forward the backing UUID
+        // to the consumer, exposing the substrate's logical-internal data via stock fetch. Mirror
+        // the share-group #158 pattern: reject explicit backing-name subscriptions with a
+        // name-redacted INVALID_REQUEST so an authorized caller cannot use the error as an
+        // enumeration oracle either.
+        val backingSubscriptions = subscribedTopicSet.filter(concentrationKernel.isBackingTopic)
+        if (backingSubscriptions.nonEmpty) {
+          val responseData = new ConsumerGroupHeartbeatResponseData()
+            .setErrorCode(Errors.INVALID_REQUEST.code)
+            .setErrorMessage("Consumer-group subscription contains internal topic name(s) that are not allowed.")
           requestHelper.sendMaybeThrottle(request, new ConsumerGroupHeartbeatResponse(responseData))
           return CompletableFuture.completedFuture[Unit](())
         }
@@ -3890,35 +3908,46 @@ class KafkaApis(val requestChannel: RequestChannel,
             response.groups.addAll(results)
           }
 
-          // Clients are not allowed to see topics that are not authorized for Describe.
-          if (!authorizer.isEmpty) {
-            val topicsToCheck = response.groups.stream()
-              .flatMap(group => group.members.stream)
-              .flatMap(member => util.stream.Stream.of(member.assignment, member.targetAssignment))
-              .flatMap(assignment => assignment.topicPartitions.stream)
-              .map(topicPartition => topicPartition.topicName)
-              .collect(Collectors.toSet[String])
-              .asScala
-            val authorizedTopics = authHelper.filterByAuthorized(request.context, DESCRIBE, TOPIC,
+          // Clients are not allowed to see topics that are not authorized for Describe, AND no
+          // client may see internal backing topics regardless of auth (r22 BLOCKER #211). The
+          // backing-topic filter runs unconditionally — backings are a deployment invariant of
+          // the concentration kernel, not an ACL concern. A backing name reaching this point
+          // would have entered the coordinator state via a regex resolution (#209), a classic
+          // JoinGroup protocol-metadata blob (#212), or any prior commit, and would surface here
+          // verbatim without this guard.
+          val topicsToCheck = response.groups.stream()
+            .flatMap(group => group.members.stream)
+            .flatMap(member => util.stream.Stream.of(member.assignment, member.targetAssignment))
+            .flatMap(assignment => assignment.topicPartitions.stream)
+            .map(topicPartition => topicPartition.topicName)
+            .collect(Collectors.toSet[String])
+            .asScala
+          val authorizedTopics: Set[String] = if (authorizer.isEmpty) topicsToCheck.toSet
+            else authHelper.filterByAuthorized(request.context, DESCRIBE, TOPIC,
               topicsToCheck)(identity)
-            val updatedGroups = response.groups.stream().map { group =>
-              val hasUnauthorizedTopic = group.members.stream()
-                .flatMap(member => util.stream.Stream.of(member.assignment, member.targetAssignment))
-                .flatMap(assignment => assignment.topicPartitions.stream())
-                .anyMatch(tp => !authorizedTopics.contains(tp.topicName))
+          // Treat any backing topic in the assignment as if it were unauthorized — the entire
+          // group response is dropped with TOPIC_AUTHORIZATION_FAILED and empty members,
+          // indistinguishable from the unauthorized-topic case (no backing-vs-unauthorized
+          // oracle). The message stays generic — no name leakage.
+          val sieve: String => Boolean =
+            name => authorizedTopics.contains(name) && !concentrationKernel.isBackingTopic(name)
+          val updatedGroups = response.groups.stream().map { group =>
+            val hasForbiddenTopic = group.members.stream()
+              .flatMap(member => util.stream.Stream.of(member.assignment, member.targetAssignment))
+              .flatMap(assignment => assignment.topicPartitions.stream())
+              .anyMatch(tp => !sieve(tp.topicName))
 
-              if (hasUnauthorizedTopic) {
-                new ConsumerGroupDescribeResponseData.DescribedGroup()
-                  .setGroupId(group.groupId)
-                  .setErrorCode(Errors.TOPIC_AUTHORIZATION_FAILED.code)
-                  .setErrorMessage("The group has described topic(s) that the client is not authorized to describe.")
-                  .setMembers(List.empty.asJava)
-              } else {
-                group
-              }
-            }.collect(Collectors.toList[ConsumerGroupDescribeResponseData.DescribedGroup])
-            response.setGroups(updatedGroups)
-          }
+            if (hasForbiddenTopic) {
+              new ConsumerGroupDescribeResponseData.DescribedGroup()
+                .setGroupId(group.groupId)
+                .setErrorCode(Errors.TOPIC_AUTHORIZATION_FAILED.code)
+                .setErrorMessage("The group has described topic(s) that the client is not authorized to describe.")
+                .setMembers(List.empty.asJava)
+            } else {
+              group
+            }
+          }.collect(Collectors.toList[ConsumerGroupDescribeResponseData.DescribedGroup])
+          response.setGroups(updatedGroups)
 
           requestHelper.sendMaybeThrottle(request, new ConsumerGroupDescribeResponse(response))
         }
@@ -3992,10 +4021,14 @@ class KafkaApis(val requestChannel: RequestChannel,
         }
         val backingSubscriptions = subscribedTopicSet.filter(concentrationKernel.isBackingTopic)
         if (backingSubscriptions.nonEmpty) {
+          // r22 #162: previously the error message echoed back the backing names — even though
+          // auth-first guarantees the caller had TOPIC:DESCRIBE on every name, that still permits
+          // wildcard-authorized callers to enumerate which names are real backings (vs. names
+          // that happen to authz but don't exist). Redact the name list — the caller already
+          // knows what they sent; the broker must not confirm which subset is internal.
           val responseData = new ShareGroupHeartbeatResponseData()
             .setErrorCode(Errors.INVALID_REQUEST.code)
-            .setErrorMessage(s"Share-group subscription to backing topic(s) is not allowed: " +
-              backingSubscriptions.toSeq.sorted.mkString(", "))
+            .setErrorMessage("Share-group subscription contains internal topic name(s) that are not allowed.")
           requestHelper.sendMaybeThrottle(request, new ShareGroupHeartbeatResponse(responseData))
           return CompletableFuture.completedFuture[Unit](())
         }
