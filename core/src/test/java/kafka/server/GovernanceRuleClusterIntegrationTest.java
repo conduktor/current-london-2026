@@ -367,4 +367,89 @@ public class GovernanceRuleClusterIntegrationTest {
         }
         return null;
     }
+
+    /**
+     * Negative-path test for the fail-closed partition-count gate
+     * ({@link BrokerServer#requireGovernanceTopicSinglePartition}). Parallels
+     * the cleanup.policy gate test above
+     * ({@code brokerRefusesToRestartWhenGovernanceTopicCleanupPolicyIsNotCompact},
+     * audit R28 #255). Unit tests in {@code BrokerServerGovernanceCompactionTest}
+     * cover the helper branches in isolation; this test pins the end-to-end
+     * wire-up — that the partition gate is actually invoked from
+     * {@link BrokerServer#startup} and the broker really refuses to come back
+     * up when {@code __governance} has been created with more than one
+     * partition. Audit task R29 #257.
+     *
+     * <p>Shape: create {@code __governance} with {@code partitions=3} and
+     * {@code cleanup.policy=compact} (so the compaction gate passes — we
+     * want the failure to be isolated to the partition gate). Shut down
+     * broker 0 and assert that the restart throws an
+     * {@link IllegalStateException} whose message names the topic and the
+     * partition-gate's distinctive phrasing.
+     *
+     * <p>The partition gate diagnostic also contains
+     * {@code --config cleanup.policy=compact} in its remediation text, so
+     * we must NOT predicate on {@code cleanup.policy} alone (audit R29 #259).
+     * The new predicate matches on {@code "partition count"} — a phrase that
+     * appears in the partition-gate diagnostic
+     * ("A non-1 partition count silently drops every rule …") and is absent
+     * from the cleanup.policy gate's diagnostic, so the two gates cannot
+     * collide on the same predicate.
+     */
+    @ClusterTest
+    public void brokerRefusesToRestartWhenGovernanceTopicHasMultiplePartitions(
+            ClusterInstance cluster) throws Exception {
+        try (Admin admin = cluster.admin()) {
+            // partitions=3 trips requireGovernanceTopicSinglePartition; we
+            // explicitly set cleanup.policy=compact so the compaction gate
+            // (which runs FIRST per BrokerServer.scala lines 1008-1015)
+            // passes and the failure is isolated to the partition gate.
+            NewTopic governance = new NewTopic(GovernanceTopic.NAME, 3, (short) 3)
+                .configs(Map.of(TopicConfig.CLEANUP_POLICY_CONFIG, TopicConfig.CLEANUP_POLICY_COMPACT));
+            admin.createTopics(List.of(governance)).all().get();
+            cluster.waitForTopic(GovernanceTopic.NAME, 3);
+        }
+
+        // Brokers 1 and 2 were already past the gate at cluster init (when
+        // __governance did not exist, requireGovernanceTopicSinglePartition
+        // saw topicExists=false and returned silently). The gate fires on
+        // the RESTART path of broker 0, where the metadata image now
+        // contains the misshapen topic.
+        cluster.shutdownBroker(0);
+
+        Throwable thrown = assertThrows(Throwable.class,
+            () -> cluster.startBroker(0),
+            "broker 0 must refuse to restart when __governance has 3 partitions");
+
+        IllegalStateException gateFailure = findPartitionGateIllegalStateException(thrown);
+        assertNotNull(gateFailure,
+            "expected an IllegalStateException from requireGovernanceTopicSinglePartition " +
+                "in the cause chain of: " + thrown);
+        String msg = gateFailure.getMessage();
+        assertNotNull(msg, "gate IllegalStateException must carry a non-null diagnostic");
+        assertTrue(msg.contains("partition count"),
+            "gate diagnostic must mention 'partition count' — actual: " + msg);
+        assertTrue(msg.contains(GovernanceTopic.NAME),
+            "gate diagnostic must mention the topic name '" + GovernanceTopic.NAME +
+                "' — actual: " + msg);
+    }
+
+    /**
+     * Find the partition-gate's diagnostic in the cause chain. Predicate:
+     * {@code "partition count"} — appears in the partition-gate diagnostic
+     * ("A non-1 partition count silently drops …") and is absent from the
+     * compaction-gate diagnostic, so the two gates cannot collide on this
+     * predicate. Self-referential-cause guard mirrors
+     * {@link #findGateIllegalStateException}.
+     */
+    private static IllegalStateException findPartitionGateIllegalStateException(Throwable t) {
+        for (Throwable c = t; c != null; c = c.getCause()) {
+            if (c instanceof IllegalStateException && c.getMessage() != null
+                && c.getMessage().contains("partition count")) {
+                return (IllegalStateException) c;
+            }
+            if (c.getCause() == c) break; // self-referential guard
+        }
+        return null;
+    }
 }
