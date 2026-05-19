@@ -16,7 +16,10 @@
  */
 package org.apache.kafka.server.views;
 
+import org.apache.kafka.common.internals.Topic;
+
 import java.util.Objects;
+import java.util.Set;
 
 /**
  * Immutable description of a view topic.
@@ -51,6 +54,43 @@ import java.util.Objects;
  */
 public final class ViewSpec {
 
+    /**
+     * Kafka-internal topic name that {@link Topic#isInternal} does not (currently) report as
+     * internal: the tiered-storage remote-log metadata topic. Defined in
+     * {@code TopicBasedRemoteLogMetadataManagerConfig.REMOTE_LOG_METADATA_TOPIC_NAME} in the
+     * {@code storage} module; mirrored as a literal here because {@code server-common} is
+     * upstream of {@code storage} in the build graph and cannot import that constant.
+     */
+    static final String REMOTE_LOG_METADATA_TOPIC_NAME = "__remote_log_metadata";
+
+    /**
+     * Backing-topic names that {@code ControllerConfigurationValidator} rejects at config-set
+     * time, repeated here for defense-in-depth at compile time. Mirrors the same set the
+     * validator enforces:
+     * <ul>
+     *   <li>{@link Topic#isInternal} — coordinator-managed topics ({@code __consumer_offsets},
+     *       {@code __transaction_state}, {@code __share_group_state})</li>
+     *   <li>{@link Topic#CLUSTER_METADATA_TOPIC_NAME} — KRaft metadata log</li>
+     *   <li>{@link #REMOTE_LOG_METADATA_TOPIC_NAME} — tiered-storage remote-log metadata</li>
+     * </ul>
+     */
+    private static final Set<String> RESERVED_NON_INTERNAL_BACKINGS = Set.of(
+            Topic.CLUSTER_METADATA_TOPIC_NAME,
+            REMOTE_LOG_METADATA_TOPIC_NAME);
+
+    /**
+     * @return {@code true} if {@code topic} names a Kafka-internal topic that must never be
+     *         used as a view's backing. Mirrors the set enforced by the controller-side
+     *         configuration validator; used as a runtime gate so a stale metadata-log entry
+     *         (e.g. persisted before this gate was added, then replayed by a new broker, or a
+     *         direct metadata-log write that bypassed the validator) cannot serve fetches
+     *         against coordinator-managed or cluster-internal data.
+     */
+    public static boolean isReservedInternalBacking(String topic) {
+        return topic != null
+                && (Topic.isInternal(topic) || RESERVED_NON_INTERNAL_BACKINGS.contains(topic));
+    }
+
     private final String viewTopic;
     private final String backingTopic;
     private final CompiledPredicate predicate;
@@ -67,6 +107,18 @@ public final class ViewSpec {
         if (viewTopic.equals(backingTopic)) {
             throw new IllegalArgumentException(
                     "A view cannot back itself: viewTopic = backingTopic = " + viewTopic);
+        }
+        // Defense-in-depth against a stale metadata-log entry whose internal-topic backing
+        // bypassed the controller-side validator: e.g. a ConfigRecord persisted before that
+        // validator was added and now replayed by an upgraded broker (replay paths in
+        // ConfigurationControlManager.replay and ConfigurationDelta.replay do not invoke
+        // the validator), or a direct write to the metadata log. Without this check the
+        // first fetch against such a view would compile a ViewSpec, and KafkaApis would
+        // redirect to read the internal backing without re-checking the backing ACL.
+        if (isReservedInternalBacking(backingTopic)) {
+            throw new IllegalArgumentException(
+                    "View backing topic '" + backingTopic + "' is a reserved Kafka-internal "
+                            + "topic and cannot be exposed through a view.");
         }
         if (!ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE.equals(offsetMode)) {
             throw new IllegalArgumentException(

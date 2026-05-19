@@ -155,6 +155,47 @@ class ViewRegistryTest {
         assertThrows(IllegalArgumentException.class, () -> registry.viewFor("loop-view"));
     }
 
+    /**
+     * Replay paths in {@code ConfigurationControlManager} and {@code ConfigurationDelta} do not
+     * run {@code ControllerConfigurationValidator}, so a {@code ConfigRecord} persisted before
+     * the validator was tightened (or written directly to the metadata log) can resurface on a
+     * new broker carrying a view whose backing is a coordinator-managed or cluster-internal
+     * topic. The runtime gate in {@link ViewSpec} must fail the compile before {@code KafkaApis}
+     * has a chance to redirect a fetch.
+     */
+    @Test
+    void rejectsCoordinatorManagedBackings() {
+        for (String backing : java.util.List.of(
+                "__consumer_offsets", "__transaction_state", "__share_group_state")) {
+            ViewRegistry registry = new ViewRegistry(name -> Optional.of(
+                    new ViewRegistry.TopicViewConfigs(
+                            backing, "body.x == 1", ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)));
+            IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                    () -> registry.viewFor("v-" + backing),
+                    "internal coordinator backing '" + backing + "' must be rejected at compile");
+            assertTrue(e.getMessage().contains(backing),
+                    "error message must name the rejected backing: " + e.getMessage());
+        }
+    }
+
+    @Test
+    void rejectsClusterMetadataBacking() {
+        ViewRegistry registry = new ViewRegistry(name -> Optional.of(
+                new ViewRegistry.TopicViewConfigs(
+                        "__cluster_metadata", "body.x == 1",
+                        ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)));
+        assertThrows(IllegalArgumentException.class, () -> registry.viewFor("v-meta"));
+    }
+
+    @Test
+    void rejectsRemoteLogMetadataBacking() {
+        ViewRegistry registry = new ViewRegistry(name -> Optional.of(
+                new ViewRegistry.TopicViewConfigs(
+                        "__remote_log_metadata", "body.x == 1",
+                        ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)));
+        assertThrows(IllegalArgumentException.class, () -> registry.viewFor("v-rlm"));
+    }
+
     @Test
     void rejectsUnsupportedOffsetMode() {
         ViewRegistry registry = new ViewRegistry(name -> Optional.of(
