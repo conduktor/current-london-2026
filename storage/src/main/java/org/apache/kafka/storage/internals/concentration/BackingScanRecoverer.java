@@ -26,6 +26,7 @@ import java.nio.file.StandardOpenOption;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.Objects;
@@ -284,60 +285,106 @@ public final class BackingScanRecoverer {
         // of surviving past the gate-open. The helper closes all opened handles on failure so
         // the main try/finally below only deals with the steady-state cleanup.
         Map<LogicalPartition, LogicalSidecarIndex> open = preTruncateFilter(filter);
+        // BLOCKER #181: track sidecars CREATED inline by this scan (i.e., not in the original
+        // filter). If the scan throws partway, every such file holds a partial prefix of the
+        // partition's logical offsets — fewer than what the backing log actually contains. On
+        // the startup path (BackingLogScanRecovery → 2-arg recoverFromScan with empty filter),
+        // there is NO readiness gate to fence subsequent access: the next broker restart's
+        // recoverFromDisk() finds the partial file, treats it as authoritative, and the
+        // backing log's true tail records become permanently invisible to the partition. Rolling
+        // back means deleting those files so partitionsWithoutSidecar() re-flags them for a
+        // fresh scan on the retry. Filter partitions are NOT deleted: the caller (leader-
+        // acquisition recoverer) already holds the readiness gate closed, so its next attempt
+        // will preTruncateFilter them back to 0 on its own — and the file may pre-date this
+        // call, so it is not ours to delete.
+        Set<LogicalPartition> createdInline = new HashSet<>();
+        boolean success = false;
         try {
-            while (stream.hasNext()) {
-                RecoveryRecord r = stream.next();
-                LogicalPartition key = new LogicalPartition(r.logicalTopic(), r.logicalPartition());
-                LogicalSidecarIndex sidecar = open.get(key);
-                if (sidecar == null) {
-                    // Open + truncate must be one transaction wrt the open map. If truncateTo
-                    // throws after the sidecar handle has been allocated but before we register
-                    // it, close it inline — otherwise the file descriptor leaks past the finally.
-                    LogicalSidecarIndex fresh = openSidecar(r.logicalTopic(), r.logicalPartition());
-                    try {
-                        fresh.truncateTo(0);
-                    } catch (IOException | RuntimeException e) {
-                        try {
-                            fresh.close();
-                        } catch (IOException ignored) {
-                            // original exception takes precedence
-                        }
-                        throw e;
-                    }
-                    open.put(key, fresh);
-                    sidecar = fresh;
-                }
-                long expected = sidecar.size();
-                if (r.logicalOffset() != expected) {
-                    throw new IllegalStateException(
-                        "logical-offset discontinuity for " + key
-                            + ": expected " + expected + ", got " + r.logicalOffset());
-                }
-                sidecar.append(r.backingOffset());
-            }
-            for (Map.Entry<LogicalPartition, LogicalSidecarIndex> e : open.entrySet()) {
-                LogicalPartition key = e.getKey();
-                LogicalSidecarIndex sidecar = e.getValue();
-                // Same rationale as recoverFromSidecars: a persisted startOffset must survive a
-                // full backing-log scan too. The scan rebuilds the sidecar from records on disk
-                // but the start-offset file is independent — losing it here would re-expose
-                // "deleted" records the moment the broker decided to take the scan path
-                // (e.g. corrupt sidecar triggered a rebuild).
-                long persistedStart = readStartOffset(key.logicalTopic(), key.logicalPartition());
-                long size = sidecar.size();
-                if (persistedStart > size) {
-                    throw new IOException("startOffset " + persistedStart + " > rebuilt sidecar "
-                        + "size " + size + " for " + key);
-                }
-                tracker.restorePartition(key.logicalTopic(), key.logicalPartition(), persistedStart, size);
-            }
+            consumeStream(stream, open, filter, createdInline);
+            restoreTrackerForOpened(open, tracker);
+            success = true;
         } finally {
             for (LogicalSidecarIndex sidecar : open.values()) {
-                try {
-                    sidecar.close();
-                } catch (IOException ignored) {
-                    // best-effort close; the recovery exception (if any) takes precedence
+                closeQuietly(sidecar);
+            }
+            if (!success) {
+                // Delete must happen AFTER close: on Windows the open handle would otherwise
+                // block File.delete; on Linux it works either way but the order is harmless.
+                rollbackInlineSidecars(createdInline);
+            }
+        }
+    }
+
+    private void consumeStream(Iterator<RecoveryRecord> stream,
+                                Map<LogicalPartition, LogicalSidecarIndex> open,
+                                Set<LogicalPartition> filter,
+                                Set<LogicalPartition> createdInline) throws IOException {
+        while (stream.hasNext()) {
+            RecoveryRecord r = stream.next();
+            LogicalPartition key = new LogicalPartition(r.logicalTopic(), r.logicalPartition());
+            LogicalSidecarIndex sidecar = open.get(key);
+            if (sidecar == null) {
+                sidecar = openAndTruncate(key);
+                open.put(key, sidecar);
+                if (!filter.contains(key)) {
+                    createdInline.add(key);
                 }
+            }
+            long expected = sidecar.size();
+            if (r.logicalOffset() != expected) {
+                throw new IllegalStateException(
+                    "logical-offset discontinuity for " + key
+                        + ": expected " + expected + ", got " + r.logicalOffset());
+            }
+            sidecar.append(r.backingOffset());
+        }
+    }
+
+    private LogicalSidecarIndex openAndTruncate(LogicalPartition key) throws IOException {
+        // Open + truncate must be one transaction wrt the open map. If truncateTo throws after
+        // the sidecar handle has been allocated but before we register it, close it inline —
+        // otherwise the file descriptor leaks past the caller's finally.
+        LogicalSidecarIndex fresh = openSidecar(key.logicalTopic(), key.logicalPartition());
+        try {
+            fresh.truncateTo(0);
+        } catch (IOException | RuntimeException e) {
+            closeQuietly(fresh);
+            throw e;
+        }
+        return fresh;
+    }
+
+    private void restoreTrackerForOpened(Map<LogicalPartition, LogicalSidecarIndex> open,
+                                          LogicalOffsetTracker tracker) throws IOException {
+        for (Map.Entry<LogicalPartition, LogicalSidecarIndex> e : open.entrySet()) {
+            LogicalPartition key = e.getKey();
+            LogicalSidecarIndex sidecar = e.getValue();
+            // Same rationale as recoverFromSidecars: a persisted startOffset must survive a
+            // full backing-log scan too. The scan rebuilds the sidecar from records on disk
+            // but the start-offset file is independent — losing it here would re-expose
+            // "deleted" records the moment the broker decided to take the scan path
+            // (e.g. corrupt sidecar triggered a rebuild).
+            long persistedStart = readStartOffset(key.logicalTopic(), key.logicalPartition());
+            long size = sidecar.size();
+            if (persistedStart > size) {
+                throw new IOException("startOffset " + persistedStart + " > rebuilt sidecar "
+                    + "size " + size + " for " + key);
+            }
+            tracker.restorePartition(key.logicalTopic(), key.logicalPartition(), persistedStart, size);
+        }
+    }
+
+    private void rollbackInlineSidecars(Set<LogicalPartition> createdInline) {
+        // Best-effort delete: a failure here doesn't mask the original scan exception, but it
+        // does leave a partial file on disk. The operator can recover by manually removing the
+        // sidecar; recoverFromDisk on the next startup will then see it as missing and trigger
+        // a fresh scan. We deliberately do NOT throw from here: a delete failure during error
+        // handling must not eclipse the original cause (an I/O error mid-scan, a corruption
+        // failure, etc.) that the caller is about to receive.
+        for (LogicalPartition key : createdInline) {
+            File f = sidecarFile(key.logicalTopic(), key.logicalPartition());
+            if (f.exists() && !f.delete()) {
+                // best-effort — see comment above
             }
         }
     }

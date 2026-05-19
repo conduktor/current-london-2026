@@ -24,6 +24,7 @@ import org.junit.jupiter.api.Test;
 import java.io.File;
 import java.io.IOException;
 import java.util.Collections;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
 
@@ -292,6 +293,131 @@ public class BackingScanRecovererTest {
         assertEquals(7L, tracker.nextLogicalOffset("topicA", 0));
         try (LogicalSidecarIndex sidecar = recoverer.openSidecar("topicA", 0)) {
             assertEquals(7L, sidecar.size());
+        }
+    }
+
+    @Test
+    public void scanRollsBackInlineCreatedSidecarsOnIteratorThrow() throws IOException {
+        // BLOCKER #181: a scan that fails mid-stream must NOT leave a partial sidecar file on
+        // disk. The startup path (BackingLogScanRecovery) calls the 2-arg form with empty
+        // filter, has no readiness gate, and the next broker restart's recoverFromDisk() will
+        // pick up any leftover sidecar file as authoritative — silently truncating the
+        // partition's logical-offset sequence to whatever prefix the failed scan happened to
+        // write. The fix must delete inline-created sidecars on exceptional exit so
+        // partitionsWithoutSidecar() re-flags them for a fresh scan on the next attempt.
+        //
+        // Pre-state: no sidecar files on disk for topicA[0] or topicA[1].
+        LogicalPartition p0 = new LogicalPartition("topicA", 0);
+        LogicalPartition p1 = new LogicalPartition("topicA", 1);
+        assertTrue(!recoverer.sidecarFile(p0.logicalTopic(), p0.logicalPartition()).exists(),
+            "precondition: topicA[0] sidecar must not exist before scan");
+        assertTrue(!recoverer.sidecarFile(p1.logicalTopic(), p1.logicalPartition()).exists(),
+            "precondition: topicA[1] sidecar must not exist before scan");
+
+        // Iterator yields two successful records for topicA[0], one for topicA[1], then throws
+        // mid-stream. Without the rollback fix, topicA[0].sidecar would have 2 entries on disk
+        // and topicA[1].sidecar would have 1 — both partial files would survive the broker's
+        // exit and be silently trusted as complete on the next startup.
+        Iterator<RecoveryRecord> failing = new Iterator<RecoveryRecord>() {
+            private final List<RecoveryRecord> records = List.of(
+                new RecoveryRecord("topicA", 0, 0L, 0L),
+                new RecoveryRecord("topicA", 0, 1L, 1L),
+                new RecoveryRecord("topicA", 1, 0L, 2L)
+            );
+            private int idx = 0;
+            @Override public boolean hasNext() {
+                // After yielding all records, simulate a backing-log read failure mid-scan.
+                return true;
+            }
+            @Override public RecoveryRecord next() {
+                if (idx < records.size()) {
+                    return records.get(idx++);
+                }
+                throw new SimulatedScanFailure("backing-log read failed at offset " + idx);
+            }
+        };
+
+        LogicalOffsetTracker tracker = new LogicalOffsetTracker();
+        assertThrows(SimulatedScanFailure.class,
+            () -> recoverer.recoverFromScan(failing, tracker));
+
+        // POST-CONDITION (the new invariant): both partial sidecar files are gone from disk.
+        // Without the fix, BOTH files would still exist with partial content, and
+        // recoverFromDisk on the next restart would seed the tracker with those stale prefixes
+        // — exactly the silent-data-loss mode BLOCKER #181 describes.
+        assertTrue(!recoverer.sidecarFile(p0.logicalTopic(), p0.logicalPartition()).exists(),
+            "topicA[0] sidecar must be deleted on scan failure (was partial)");
+        assertTrue(!recoverer.sidecarFile(p1.logicalTopic(), p1.logicalPartition()).exists(),
+            "topicA[1] sidecar must be deleted on scan failure (was partial)");
+        // The tracker must NOT carry any partial state either — restorePartition is only
+        // reached on success.
+        assertEquals(0L, tracker.nextLogicalOffset("topicA", 0));
+        assertEquals(0L, tracker.nextLogicalOffset("topicA", 1));
+    }
+
+    @Test
+    public void scanRollsBackInlineCreatedSidecarsOnGapException() throws IOException {
+        // Same invariant as the iterator-throw case, but driven through the kernel's own
+        // gap-detection path. A logical-offset gap on record N+1 leaves the partial sidecar
+        // for the affected partition on disk under the pre-fix code, where it would later
+        // be silently picked up by recoverFromDisk and treated as authoritative.
+        LogicalPartition p = new LogicalPartition("topicB", 0);
+        assertTrue(!recoverer.sidecarFile(p.logicalTopic(), p.logicalPartition()).exists());
+
+        List<RecoveryRecord> stream = List.of(
+            new RecoveryRecord("topicB", 0, 0L, 10L),
+            new RecoveryRecord("topicB", 0, 1L, 11L),
+            new RecoveryRecord("topicB", 0, 3L, 12L)   // gap: expected 2, got 3
+        );
+        LogicalOffsetTracker tracker = new LogicalOffsetTracker();
+        assertThrows(IllegalStateException.class,
+            () -> recoverer.recoverFromScan(stream.iterator(), tracker));
+
+        // The sidecar file we created and partially populated MUST be gone.
+        assertTrue(!recoverer.sidecarFile(p.logicalTopic(), p.logicalPartition()).exists(),
+            "partial sidecar must not survive a gap-detection failure");
+        assertEquals(0L, tracker.nextLogicalOffset("topicB", 0));
+    }
+
+    @Test
+    public void scanDoesNotDeleteFilterSidecarsOnFailure() throws IOException {
+        // The rollback must distinguish "we created it inline" (delete) from "caller passed
+        // it in the filter set" (leave alone). The leader-acquisition path passes the filter,
+        // closes the readiness gate around the call, and the file may pre-date this scan —
+        // it's NOT ours to delete on failure. The gate keeps the partial state invisible until
+        // the recoverer succeeds; the next attempt re-runs preTruncateFilter.
+        LogicalPartition filterPart = new LogicalPartition("topicA", 0);
+        LogicalPartition inlinePart = new LogicalPartition("topicA", 1);
+
+        // Pre-seed the filter-partition sidecar — simulates state from a previous incarnation.
+        try (LogicalSidecarIndex pre = recoverer.openSidecar(filterPart.logicalTopic(), filterPart.logicalPartition())) {
+            for (long i = 0; i < 4; i++) pre.append(500L + i);
+        }
+
+        // Stream: one record for the filter partition (gets appended to the now-truncated
+        // file), one record for an inline partition (creates a new file), then a gap that
+        // forces the scan to throw.
+        List<RecoveryRecord> stream = List.of(
+            new RecoveryRecord("topicA", 0, 0L, 600L),
+            new RecoveryRecord("topicA", 1, 0L, 601L),
+            new RecoveryRecord("topicA", 1, 2L, 602L)   // gap: expected 1, got 2
+        );
+        LogicalOffsetTracker tracker = new LogicalOffsetTracker();
+        Set<LogicalPartition> filter = Set.of(filterPart);
+        assertThrows(IllegalStateException.class,
+            () -> recoverer.recoverFromScan(stream.iterator(), tracker, filter));
+
+        // Filter partition's file MUST still exist (caller's gate keeps it invisible).
+        assertTrue(recoverer.sidecarFile(filterPart.logicalTopic(), filterPart.logicalPartition()).exists(),
+            "filter sidecar must survive scan failure (caller owns lifecycle under the gate)");
+        // Inline-created partition's file MUST be gone.
+        assertTrue(!recoverer.sidecarFile(inlinePart.logicalTopic(), inlinePart.logicalPartition()).exists(),
+            "inline-created sidecar must be deleted on scan failure");
+    }
+
+    private static final class SimulatedScanFailure extends RuntimeException {
+        SimulatedScanFailure(String msg) {
+            super(msg);
         }
     }
 }
