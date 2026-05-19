@@ -630,6 +630,71 @@ class IoUringSelectorTest {
     }
 
     @Test
+    void evictionSiteHasSendGuardSavesChannelEvenWhenStep2BumpRegressed() throws Exception {
+        // EXPIRY-F1-LOCAL (#139): belt-and-suspenders for the F1 invariant that a muted
+        // channel with a pending unsent response must never be reaped on idle expiry.
+        //
+        // The primary protection lives in runActiveChannelReadWriteStep's write step:
+        // every poll where hasSend()==true bumps lastActiveNanos regardless of bytes
+        // flushed. That bump is already covered by
+        // idleExpiryDoesNotReapMutedChannelWithBackpressuredSend.
+        //
+        // EXPIRY-F1-LOCAL adds a second line of defense AT the eviction call site:
+        // maybeExpireOldestIdleChannel double-checks hasSend() before reaping. This
+        // test simulates a hypothetical refactor regression that suppressed the step-2
+        // bump (e.g., moved the write step, conditionalized the bump on bytes-written>0,
+        // introduced an async write path that bypasses runActiveChannelReadWriteStep).
+        // It pokes lastActiveNanos directly via the test-only setter to an old value,
+        // bypassing the write-step bump, then drives a poll across the idle window.
+        // Without the eviction-site guard, the channel is reaped; with it, the guard
+        // refreshes lastActiveNanos and the channel survives.
+        long idle = TimeUnit.MILLISECONDS.toNanos(100);
+        IoUringSelector s = newSelector(idle);
+        EmbeddedChannel netty = acceptNew(s, REMOTE_A);
+        s.poll(0);
+        String id = s.connected().get(0);
+
+        s.mute(id);
+        ByteBuffer body = ByteBuffer.wrap("backpressured-response".getBytes());
+        s.send(new NetworkSend(id, ByteBufferSend.sizePrefixed(body)));
+        netty.unsafe().outboundBuffer().setUserDefinedWritability(1, false);
+        assertFalse(netty.isWritable(), "preconditions: channel is past high water mark");
+
+        // Force lastActiveNanos to a value well past the idle window. This simulates a
+        // step-2-bump regression — the write step "forgot" to refresh lastActive even
+        // though hasSend() is true.
+        long staleNanos = time.nanoseconds() - idle - TimeUnit.MILLISECONDS.toNanos(50);
+        s.setLastActiveNanosForTesting(id, staleNanos);
+        long nowNanos = time.nanoseconds();
+        assertTrue(nowNanos - staleNanos > idle,
+            "preconditions: staleNanos must be past the idle window");
+
+        // Call the eviction scan directly. This bypasses runActiveChannelReadWriteStep
+        // (which would otherwise refresh lastActive via the step-2 hasSend() bump),
+        // isolating the eviction-site guard as the sole protection. Without the guard,
+        // the channel is reaped; with it, the guard refreshes lastActive and returns
+        // false (no eviction).
+        boolean evicted = s.maybeExpireOldestIdleChannelForTesting(nowNanos);
+        assertFalse(evicted,
+            "eviction-site guard must catch hasSend()==true and skip the reap — without " +
+            "this guard a refactor that breaks step-2's bump would silently drop in-flight " +
+            "responses on idle expiry");
+        assertTrue(s.disconnected().isEmpty(),
+            "muted channel with hasSend()==true must not appear in disconnected(). " +
+            "Disconnected was: " + s.disconnected());
+        assertNotNull(s.channel(id), "channel must still be present in channels()");
+
+        // Release backpressure and prove the channel is still functional, not just kept
+        // alive in a half-dead state — the staged send must complete on the next poll.
+        netty.unsafe().outboundBuffer().setUserDefinedWritability(1, true);
+        s.poll(0);
+        assertEquals(1, s.completedSends().size(),
+            "once backpressure clears, the staged send must complete — channel was healthy " +
+            "all along, the eviction-site guard kept it that way");
+        assertEquals(id, s.completedSends().get(0).destinationId());
+    }
+
+    @Test
     void idleScanIsGatedBetweenPollsWhenNoChannelCouldHaveExpired() throws Exception {
         // BUG-N1 regression: without nextIdleScanNanos, every poll ran the full O(n)
         // min-scan over lastActiveNanos even though no entry could possibly have expired

@@ -775,7 +775,23 @@ public final class IoUringSelector implements BrokerSelector {
         if (nowNanos - oldestNanos <= connectionsMaxIdleNanos) {
             return false;
         }
-        KafkaChannel channel = channels.remove(oldestId);
+        KafkaChannel channel = channels.get(oldestId);
+        // EXPIRY-F1-LOCAL: belt-and-suspenders for the muted-with-pending-send invariant.
+        // F1's primary protection is the write step in runActiveChannelReadWriteStep
+        // bumping lastActiveNanos on every hasSend()==true regardless of bytes written.
+        // That bump is the contract — but it lives in a different method, and any future
+        // refactor that conditionalizes the write-step bump (e.g., "only bump when
+        // bytesBeforeUnwritable>0", or moves write into a per-channel async path) silently
+        // breaks F1 with no test-visible signal until a production broker drops an
+        // in-flight response. The local check here makes the invariant explicit at the
+        // eviction site: if we're about to expire a channel that still has a pending
+        // send, refresh its lastActiveNanos and skip the eviction. Worst case this is
+        // dead code — best case it catches a step-2 refactor regression.
+        if (channel != null && channel.hasSend()) {
+            lastActiveNanos.put(oldestId, nowNanos);
+            return false;
+        }
+        channels.remove(oldestId);
         nettyChannels.remove(oldestId);
         lastActiveNanos.remove(oldestId);
         if (channel != null) {
@@ -1381,6 +1397,28 @@ public final class IoUringSelector implements BrokerSelector {
     // test assert the Set is empty after the close path under test runs.
     int explicitlyMutedChannelsSizeForTesting() {
         return explicitlyMutedChannels.size();
+    }
+
+    // Test-visible mutator to force a stale lastActiveNanos value for a single channel.
+    // Used by EXPIRY-F1-LOCAL regression to simulate a hypothetical step-2-bump refactor
+    // regression: with the bump suppressed externally, the eviction-site guard is the
+    // only thing protecting a muted+hasSend channel from being reaped on idle expiry.
+    // Limiting this to a single setter keeps the test surface minimal; production code
+    // never calls this method.
+    void setLastActiveNanosForTesting(String id, long nanos) {
+        lastActiveNanos.put(id, nanos);
+    }
+
+    // Test-visible accessor to invoke the idle-eviction scan in isolation, bypassing
+    // runActiveChannelReadWriteStep. EXPIRY-F1-LOCAL needs this because the production
+    // poll() runs the step-2 bump before the eviction scan — a regression test that
+    // wants to prove the eviction-site hasSend() guard fires must be able to simulate
+    // the case where step-2 didn't bump (the very scenario the guard defends against).
+    // Returns true iff a channel was reaped. Also clears nextIdleScanNanos so the scan
+    // is not gated; the test controls nowNanos directly.
+    boolean maybeExpireOldestIdleChannelForTesting(long nowNanos) {
+        nextIdleScanNanos = 0L;
+        return maybeExpireOldestIdleChannel(nowNanos);
     }
 
     /**
