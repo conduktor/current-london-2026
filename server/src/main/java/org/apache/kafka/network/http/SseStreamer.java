@@ -264,8 +264,9 @@ final class SseStreamer {
         // then drops its connection (TCP FIN) is undetectable: we would loop forever, holding an SSE
         // limiter slot and resubmitting broker fetches indefinitely. Writing a comment line on every empty
         // fetch bounds the leak window to one broker fetch max-wait (~500ms): the next iteration's write
-        // throws IOException on a dead socket and we tear the stream down. Cost is 4 bytes per quiet-topic
-        // poll, which is also the standard SSE keep-alive pattern that prevents NAT/proxy idle timeouts.
+        // throws IOException on a dead socket and we tear the stream down. Cost is 3 bytes per quiet-topic
+        // poll (the {@code ":\n\n"} {@link #HEARTBEAT_COMMENT} constant), which is also the standard SSE
+        // keep-alive pattern that prevents NAT/proxy idle timeouts.
         if (view.records().isEmpty()) {
             try {
                 out.write(HEARTBEAT_COMMENT);

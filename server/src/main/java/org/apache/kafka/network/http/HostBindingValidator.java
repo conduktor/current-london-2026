@@ -59,9 +59,11 @@ public final class HostBindingValidator {
         if (trimmed.isEmpty()) {
             return true;
         }
-        // Strip the brackets some operators put around IPv6 literals — getAllByName accepts both forms but treats
-        // the bracketed version as a hostname lookup, which is the wrong semantic. Bracket-stripping is purely a
-        // normalisation step before the resolver call.
+        // Strip the brackets some operators carry over from RFC 2732 URI literal form (e.g. `[::]`).
+        // {@link InetAddress#getAllByName} already accepts both `[::]` and `::` identically — its RFC 2732
+        // path strips the brackets internally and parses the inner string as an IPv6 literal, with no DNS
+        // lookup. The strip here is a normalisation hygiene step so the trimmed value is a single canonical
+        // form, not a behavioural fix for a JDK quirk.
         if (trimmed.startsWith("[") && trimmed.endsWith("]") && trimmed.length() >= 2) {
             trimmed = trimmed.substring(1, trimmed.length() - 1);
         }
