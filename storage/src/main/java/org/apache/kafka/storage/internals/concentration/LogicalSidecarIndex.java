@@ -187,9 +187,25 @@ public final class LogicalSidecarIndex implements Closeable {
             throw new IllegalArgumentException(
                 "newSize " + newSize + " out of [0, " + entries + "]");
         }
+        // r22 #165: read the new last entry BEFORE the truncate syscall. The entry at index
+        // newSize-1 is unaffected by truncate (only entries at indices >= newSize are removed),
+        // so the read can run in either order — but doing it first means a CRC failure or I/O
+        // error from readEntryAt surfaces BEFORE any state changes, leaving the sidecar in its
+        // pre-truncate state for a clean retry.
+        //
+        // Pre-fix order (truncate, set entries, then readEntryAt) had a latent inconsistency: if
+        // readEntryAt threw, `entries` had already been updated to newSize but `lastBackingOffset`
+        // still held the pre-truncate tail value — which is necessarily HIGHER than what's now at
+        // entries-1, because truncate only removes from the tail. Every subsequent append's
+        // monotonicity check (`backingOffset > lastBackingOffset`) would then reject legitimate
+        // appends in the (newLast, oldLast] range until the next broker restart re-seeds the
+        // field from disk. The window is narrow (truncateTo only runs on recovery rollback per
+        // BLOCKER #170 and on BackingScanRecoverer reset paths), but a single corrupted entry at
+        // the new tail would silently throttle the partition.
+        long newLastBackingOffset = newSize > 0 ? readEntryAt(newSize - 1) : -1L;
         channel.truncate(newSize * ENTRY_SIZE);
         entries = newSize;
-        lastBackingOffset = entries > 0 ? readEntryAt(entries - 1) : -1L;
+        lastBackingOffset = newLastBackingOffset;
     }
 
     @Override

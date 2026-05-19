@@ -366,6 +366,55 @@ public class LogicalSidecarIndexTest {
     }
 
     @Test
+    public void truncateToFailedReadLeavesStateIntactForCleanRetry() throws IOException {
+        // r22 #165: if truncateTo's read of the new last entry throws (CRC mismatch on the
+        // surviving tail, I/O error from the channel), the (entries, lastBackingOffset) pair must
+        // remain in its pre-truncate state so a subsequent retry can re-attempt the operation
+        // without observing a stale, too-high lastBackingOffset that would silently throttle
+        // every later append. Pre-fix the order was (truncate, set entries, read tail), which
+        // committed entries=newSize but kept lastBackingOffset at the OLD tail value — every
+        // append in the (newTail, oldTail] range would then be rejected as non-monotonic until
+        // the next broker restart re-seeded from disk.
+        //
+        // We simulate the failure by corrupting the entry that would become the new tail AFTER a
+        // truncateTo(3): entry index 2. Then call truncateTo(3) and assert it throws, and that
+        // the kernel-visible state (size, nextLogicalOffset, lookups of intact entries) is
+        // unchanged from before the call.
+        File file = new File(tempDir, "trunc-rollback-0.sidecar");
+        try (LogicalSidecarIndex idx = new LogicalSidecarIndex(file, "trunc-rb", 0)) {
+            for (long i = 0; i < 5; i++) idx.append(i * 10);  // entries 0..4, backing 0,10,20,30,40
+        }
+        // Corrupt entry 2 (which would become the new last after truncateTo(3)).
+        byte[] contents = Files.readAllBytes(file.toPath());
+        int bytePos = 2 * ENTRY_SIZE + (OFFSET_BYTES - 1);
+        contents[bytePos] = (byte) (contents[bytePos] ^ 0x04);
+        Files.write(file.toPath(), contents);
+
+        // Reopen — entry 4 (the last) is intact, so the constructor succeeds.
+        LogicalSidecarIndex idx = new LogicalSidecarIndex(file, "trunc-rb", 0);
+        openIndexes.add(idx);
+        assertEquals(5L, idx.size(), "all 5 entries present at reopen");
+
+        // Pre-fix: truncateTo(3) would call channel.truncate(36) then set entries=3 then throw
+        // when readEntryAt(2) hit the corrupted CRC — leaving entries=3 but lastBackingOffset
+        // still=40 (the pre-truncate tail). With the fix the read runs FIRST and throws before
+        // any state change, so the post-throw view must equal the pre-call view.
+        RuntimeException thrown = assertThrows(RuntimeException.class, () -> idx.truncateTo(3));
+        assertEquals("org.apache.kafka.storage.internals.log.CorruptIndexException",
+            thrown.getClass().getName(),
+            "expected CorruptIndexException from the failing readEntryAt: " + thrown);
+
+        // Critical assertion: an append that would have been rejected post-fix (because
+        // lastBackingOffset would still be the stale value 40) must succeed when its backingOffset
+        // is greater than the TRUE current last (40). Pick 41 — strictly greater than 40, which
+        // would still be rejected if lastBackingOffset survived as something larger. The fix
+        // keeps lastBackingOffset==40 (the true pre-call last), so 41 is accepted.
+        idx.append(41L);
+        assertEquals(6L, idx.size(),
+            "append after rolled-back truncate must succeed against the true pre-call last");
+    }
+
+    @Test
     public void crcOnLastEntryIsVerifiedAtConstructionTime() throws IOException {
         // Construction reads the last entry to seed lastBackingOffset (so append() can enforce
         // strict monotonicity across a process restart). That read MUST go through the CRC
