@@ -993,7 +993,15 @@ public final class RuleEngine {
      * grants the bypass to nobody (so every request, including inter-broker,
      * is subject to rule evaluation). When an allow-list IS configured, the
      * principal must appear in it — matched as a verbatim string against the
-     * principal's {@code toString()} representation (e.g. {@code "User:broker"}).
+     * canonical {@code type + ":" + name} form built by hand from
+     * {@link org.apache.kafka.common.security.auth.KafkaPrincipal#getPrincipalType()}
+     * and {@link org.apache.kafka.common.security.auth.KafkaPrincipal#getName()}
+     * at the call site (mirroring how {@link #normaliseTrustedBypassPrincipals}
+     * canonicalises the operator-supplied allow-list at construction time).
+     * The match is intentionally NOT against {@code KafkaPrincipal#toString()}
+     * because a subclass could override that to emit a non-canonical or
+     * attacker-chosen string and bypass an operator allow-list keyed on the
+     * canonical form.
      *
      * <p>Codex P1#1 fix: previous behaviour fell back to listener-only when
      * the allow-list was empty, which silently re-introduced the very gap the
@@ -1026,13 +1034,22 @@ public final class RuleEngine {
         if (now - last >= BUDGET_WARN_INTERVAL_NANOS
             && lastBudgetWarnNanos.compareAndSet(last, now)) {
             long suppressed = suppressedBudgetWarnings.getAndSet(0L);
+            // R23 HIGH (#221): sanitise budget.getMessage() to match the
+            // sibling sites (maybeWarnEvalError, maybeWarnActivationFailure).
+            // The budget message today only embeds JVM class names and integer
+            // constants — all safe — but the asymmetry was a footgun: any
+            // future walker change that adds wire-derived data (a topic name,
+            // a field label, an o.toString()) to the exception message would
+            // land unsanitised in operator logs. Three sites now have the
+            // same posture.
+            String budgetMessage = LogSafe.sanitize(budget.getMessage());
             if (suppressed > 0) {
                 LOG.warn("activation budget exceeded on apiKey {} — failing closed (POLICY_VIOLATION), "
                     + "suppressed {} similar events in the previous window: {}",
-                    apiKey, suppressed, budget.getMessage());
+                    apiKey, suppressed, budgetMessage);
             } else {
                 LOG.warn("activation budget exceeded on apiKey {} — failing closed (POLICY_VIOLATION): {}",
-                    apiKey, budget.getMessage());
+                    apiKey, budgetMessage);
             }
         } else {
             suppressedBudgetWarnings.incrementAndGet();
