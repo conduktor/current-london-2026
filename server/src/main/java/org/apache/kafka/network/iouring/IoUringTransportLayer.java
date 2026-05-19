@@ -482,38 +482,53 @@ final class IoUringTransportLayer implements TransportLayer {
             // KafkaChannel.maybeCompleteSend never advances. The ByteBuf itself is
             // released by writeAndFlush's promise on either path (success or failure),
             // so the only leak we have to defend against here is the counter.
-            io.netty.channel.ChannelFuture future = nettyChannel.writeAndFlush(buf);
-            handedOff = true;
-            future.addListener(f -> {
-                if (!f.isSuccess()) {
-                    // Record the cause so the next Processor write step can throw it
-                    // synchronously and route the channel through FAILED_SEND. Without
-                    // this, a peer RST mid-response leaves the broker thinking the send
-                    // completed normally — completedSends fires, RESPONSE_SENT mute event
-                    // succeeds, and the request handling pipeline silently advances on a
-                    // request the client never saw. Set BEFORE decrementing pendingWriteBytes:
-                    // a reader observing the listener mid-flight must not see
-                    // (pendingWriteBytes == 0 && asyncWriteFailure == null) — that window is
-                    // the exact false-success window where ByteBufferSend.completed() returns
-                    // true and KafkaChannel.maybeCompleteSend() emits a Send the kernel rejected.
-                    asyncWriteFailure = f.cause();
-                }
-                pendingWriteBytes.addAndGet(-safeChunk);
-                // Wake the Processor's poll(). The listener runs on Netty's event loop
-                // thread (a separate thread from the Processor in production), so without
-                // this callback the Processor stays asleep on its wakeup Semaphore until
-                // the poll timeout expires — even though hasPendingWrites() now reads
-                // false and maybeCompleteSend() would return the completed Send on the
-                // very next poll iteration. For a small response that never crosses the
-                // outbound watermark, channelWritabilityChanged is not invoked, so no
-                // other wakeup source exists. Result without this line: every small
-                // request/response incurs an extra ~300 ms (the default poll timeout)
-                // before the broker emits RESPONSE_SENT. The bug is invisible under
-                // EmbeddedChannel because that channel completes writeAndFlush futures
-                // synchronously on the calling thread.
-                writeWakeCallback.run();
-            });
-            pendingWriteBytes.addAndGet(safeChunk);
+            try {
+                io.netty.channel.ChannelFuture future = nettyChannel.writeAndFlush(buf);
+                handedOff = true;
+                future.addListener(f -> {
+                    if (!f.isSuccess()) {
+                        // Record the cause so the next Processor write step can throw it
+                        // synchronously and route the channel through FAILED_SEND. Without
+                        // this, a peer RST mid-response leaves the broker thinking the send
+                        // completed normally — completedSends fires, RESPONSE_SENT mute event
+                        // succeeds, and the request handling pipeline silently advances on a
+                        // request the client never saw. Set BEFORE decrementing pendingWriteBytes:
+                        // a reader observing the listener mid-flight must not see
+                        // (pendingWriteBytes == 0 && asyncWriteFailure == null) — that window is
+                        // the exact false-success window where ByteBufferSend.completed() returns
+                        // true and KafkaChannel.maybeCompleteSend() emits a Send the kernel rejected.
+                        asyncWriteFailure = f.cause();
+                    }
+                    pendingWriteBytes.addAndGet(-safeChunk);
+                    // Wake the Processor's poll(). The listener runs on Netty's event loop
+                    // thread (a separate thread from the Processor in production), so without
+                    // this callback the Processor stays asleep on its wakeup Semaphore until
+                    // the poll timeout expires — even though hasPendingWrites() now reads
+                    // false and maybeCompleteSend() would return the completed Send on the
+                    // very next poll iteration. For a small response that never crosses the
+                    // outbound watermark, channelWritabilityChanged is not invoked, so no
+                    // other wakeup source exists. Result without this line: every small
+                    // request/response incurs an extra ~300 ms (the default poll timeout)
+                    // before the broker emits RESPONSE_SENT. The bug is invisible under
+                    // EmbeddedChannel because that channel completes writeAndFlush futures
+                    // synchronously on the calling thread.
+                    writeWakeCallback.run();
+                });
+                pendingWriteBytes.addAndGet(safeChunk);
+            } catch (RuntimeException e) {
+                // Netty's writeAndFlush / DefaultPromise.addListener can throw unchecked
+                // when the event loop is shut down (RejectedExecutionException) or in other
+                // listener-registration races. The TransportLayer contract is to throw
+                // IOException so the Selector's write step routes the channel through
+                // FAILED_SEND; an escaping RuntimeException bypasses that path and
+                // surfaces as an unhandled error in the Processor's run loop, breaking
+                // graceful shutdown ordering. If writeAndFlush threw before returning a
+                // future, handedOff stays false and the finally below releases buf;
+                // if addListener threw after writeAndFlush returned, Netty owns the buf
+                // and will release it on flush completion (no decrementer installed, but
+                // the inc on line 516 didn't run either — counter stays consistent).
+                throw new IOException("write submission failed", e);
+            }
         } finally {
             if (!handedOff) {
                 buf.release();
