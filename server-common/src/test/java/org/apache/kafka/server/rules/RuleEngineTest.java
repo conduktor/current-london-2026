@@ -27,6 +27,8 @@ import org.apache.kafka.server.rules.extract.ApiMessageActivation;
 
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -37,6 +39,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -861,11 +864,88 @@ public class RuleEngineTest {
     }
 
     @Test
+    public void installSwapStructuralInvariantsPreventTornReads() throws Exception {
+        // R28 Concurrency F1 / Task #233: the runtime test
+        // installSwapIsAtomicForConcurrentReaders below cannot actually
+        // detect a torn-read regression, because the JMM guarantees that
+        // make torn reads impossible are *structural* — they live on the
+        // type declarations, not on the runtime behaviour:
+        //
+        //   1. RuleEngine.active is declared as AtomicReference<RuleSet>.
+        //      A `.set(rs)` is a single volatile write of the reference;
+        //      a `.get()` is a single volatile read. There is no window
+        //      in which a reader could see the swap mid-way through.
+        //
+        //   2. Every field of RuleSet (denyBitset, rulesByApiKey,
+        //      rulesById) is `final`. Per JLS §17.5, final fields are
+        //      safely-published — any thread that observes a reference
+        //      to the RuleSet observes the final fields fully initialised,
+        //      regardless of how the reference reaches it.
+        //
+        // Together these mean that for any pair of pre-built RuleSets A
+        // and B, no reader can ever see "A's reference with B's contents"
+        // or "the new reference with the old contents" — the runtime
+        // test below therefore passes vacuously and would continue to
+        // pass even if both invariants were broken simultaneously (as
+        // long as the test setup happens to pre-publish the RuleSets
+        // safely, which it does by virtue of pool.submit).
+        //
+        // This test pins the invariants at their source — it FAILS the
+        // moment either `active` is downgraded to a non-AtomicReference
+        // or any RuleSet field is non-final.
+
+        // Invariant 1: RuleEngine.active is AtomicReference, not a plain
+        // reference field. A future "let's simplify, AtomicReference is
+        // overkill" refactor must surface here.
+        Field active = RuleEngine.class.getDeclaredField("active");
+        assertEquals(AtomicReference.class, active.getType(),
+            "RuleEngine.active must be AtomicReference<RuleSet> — concurrent "
+                + "install/evaluate relies on its volatile semantics for "
+                + "publication and reference atomicity; a plain reference "
+                + "field would re-open torn-read hazards the engine has no "
+                + "other defense against");
+        assertTrue(Modifier.isFinal(active.getModifiers()),
+            "RuleEngine.active must be final — the AtomicReference itself "
+                + "must not be reassignable, or a writer reassigning the "
+                + "AtomicReference would defeat the publication contract");
+
+        // Invariant 2: every field of RuleSet is final. Without this, a
+        // future field added to RuleSet without the `final` modifier
+        // would silently break JMM safe-publication for that one field,
+        // and torn reads become observable for it specifically.
+        for (Field f : RuleSet.class.getDeclaredFields()) {
+            // Static fields (EMPTY, MAX_API_KEY_ID) don't participate in
+            // per-instance safe-publication; the contract is only on
+            // instance state.
+            if (Modifier.isStatic(f.getModifiers())) continue;
+            assertTrue(Modifier.isFinal(f.getModifiers()),
+                "RuleSet instance field '" + f.getName() + "' must be final — "
+                    + "JMM safe-publication for the RuleSet's contents "
+                    + "depends on every instance field being final so a "
+                    + "concurrent reader that observes the reference also "
+                    + "observes the field's fully-initialised value, "
+                    + "regardless of synchronisation on the reference");
+        }
+    }
+
+    @Test
     public void installSwapIsAtomicForConcurrentReaders() throws Exception {
-        // Spec: concurrent readers always observe one of the fully-published
-        // RuleSets, never a partially-constructed state. We exercise this by
-        // hammering the engine from many threads while a writer flips
-        // between two distinct, internally-consistent rule sets.
+        // Smoke test that complements installSwapStructuralInvariantsPreventTornReads
+        // (Task #233): the structural test above is what actually proves
+        // torn-read impossibility — this runtime test exists to confirm
+        // the engine works correctly under concurrent install/evaluate
+        // load (no NPE, no thrown exception, no obviously-wrong answer)
+        // and serves as a smoke detector for *behavioural* regressions
+        // that the structural invariants would not catch (e.g., a future
+        // multi-step install that reads from one snapshot and writes to
+        // another in-place).
+        //
+        // The (errorCode, denyingRuleId) pair on the decision is checked
+        // as a unit: under the live contract each pair value comes from a
+        // single Rule instance's two final fields, so a torn read that
+        // mixed fields across snapshots (the only behavioural shape this
+        // test could catch) would surface as a (11, "b") or (22, "a")
+        // mismatch rather than just an unexpected errorCode.
         RuleEngine engine = new RuleEngine();
         RuleSet a = new RuleSetBuilder()
             .put(denyRule("a", ApiKeys.METADATA, "true", 11))
@@ -891,7 +971,19 @@ public class RuleEngineTest {
                         RuleDecision d = engine.evaluate(
                             ApiKeys.METADATA, "client", null, false,
                             () -> Collections.emptyMap());
-                        if (!d.denied() || (d.errorCode() != 11 && d.errorCode() != 22)) {
+                        if (!d.denied()) {
+                            failed.set(true);
+                            return;
+                        }
+                        // Pair (errorCode, denyingRuleId) must be coherent —
+                        // either ("a", 11) or ("b", 22). Any other pair is a
+                        // torn-snapshot symptom. Without this paired check, a
+                        // refactor that returned errorCode from one snapshot and
+                        // ruleId from another would still satisfy "errorCode is
+                        // 11 or 22" and the test would pass.
+                        boolean pairA = "a".equals(d.denyingRuleId()) && d.errorCode() == 11;
+                        boolean pairB = "b".equals(d.denyingRuleId()) && d.errorCode() == 22;
+                        if (!(pairA || pairB)) {
                             failed.set(true);
                             return;
                         }
@@ -916,7 +1008,8 @@ public class RuleEngineTest {
         start.countDown();
         pool.shutdown();
         assertTrue(pool.awaitTermination(15, TimeUnit.SECONDS), "pool should finish");
-        assertFalse(failed.get(), "no reader should observe a partially-built RuleSet");
+        assertFalse(failed.get(), "no reader should observe a partially-built RuleSet "
+            + "or a (errorCode, denyingRuleId) pair sourced from two different snapshots");
     }
 
     @Test
