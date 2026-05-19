@@ -126,9 +126,39 @@ public final class Rule {
         return Objects.hash(id, apiKeys, action, whenSource, errorCode);
     }
 
+    /**
+     * R34-C-1 [HIGH]: the {@code whenSource} field is operator-authored and
+     * its bytes — while constrained to a JSON string at codec intake — may
+     * include escaped control codepoints ({@code "\\u001B"}, {@code "\\u0007"},
+     * etc.) that Jackson decodes to actual C0/C1 bytes in the Java String.
+     * The CEL lexer's quoted-string path admits these bytes (only the small
+     * {@code \\n \\t \\r \\\\ \\" \\'} escape set is recognised; every other
+     * byte between quotes passes through verbatim), so the post-compile
+     * {@code whenSource} we store here can carry raw control bytes despite
+     * the JSON envelope being well-formed.
+     *
+     * <p>No production log site currently invokes {@code Rule.toString()}
+     * — but the method is a latent log-injection footgun: a future
+     * {@code LOG.warn("rule fired: {}", rule)} or audit-trail dump would
+     * paste raw CR/LF/ANSI/bidi-isolate bytes straight into broker.log.
+     * Running both the rule id and the {@code whenSource} through
+     * {@link LogSafe#sanitize(String)} here closes that footgun structurally
+     * — the same posture the per-rule eval-error WARN in
+     * {@link RuleEngine#maybeWarnEvalError} already takes for the rule id.
+     * The id is already validated against forbidden codepoints at codec
+     * intake ({@code RuleJsonCodec.validateRuleId}), so re-sanitising it is
+     * defensive — a future codec change that admits a control byte in id
+     * would not silently re-open this site.
+     *
+     * <p>This does NOT touch {@link #whenSource()} — code that needs the
+     * raw source (e.g. {@code RuleJsonCodec.encode}, which round-trips
+     * through Jackson and re-escapes control bytes anyway) gets the
+     * authentic value. Only the human-facing {@code toString()} renders
+     * the sanitised form.
+     */
     @Override
     public String toString() {
-        return "Rule(" + id + ", keys=" + apiKeys + ", action=" + action
-            + ", when=" + whenSource + ", errorCode=" + errorCode + ")";
+        return "Rule(" + LogSafe.sanitize(id) + ", keys=" + apiKeys + ", action=" + action
+            + ", when=" + LogSafe.sanitize(whenSource) + ", errorCode=" + errorCode + ")";
     }
 }

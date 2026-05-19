@@ -120,4 +120,90 @@ public class RuleTest {
         assertEquals(a.hashCode(), b.hashCode());
         assertTrue(!a.equals(c));
     }
+
+    @Test
+    public void toStringSanitisesControlBytesInWhenSource() {
+        // R34-C-1 [HIGH]: Rule.toString() is a latent log-injection footgun.
+        // The CEL lexer's quoted-string path admits raw C0/C1 control bytes
+        // (only the small \n \t \r \\ \" \' escape set is special; every
+        // other byte between quotes passes through verbatim). Jackson at
+        // the JSON layer accepts `` escape sequences and decodes
+        // them to actual char 0x1B — so an operator-published rule whose
+        // `when` clause contains escaped control bytes will land here
+        // with raw control bytes in `whenSource`.
+        //
+        // No production log site currently invokes Rule.toString(), but
+        // any future LOG.warn("rule fired: {}", rule) would dump CR/LF/
+        // ANSI/bidi bytes straight into broker.log. This test pins the
+        // sanitisation contract on toString() so the latent footgun is
+        // structurally closed.
+        //
+        // The CEL source need not match the compiled program in this
+        // test — the constructor stores `whenSource` verbatim and uses
+        // `compiled` independently for evaluation. We exercise toString
+        // shape only.
+
+        // (a) Raw C0 controls (ESC, BEL, NL embedded as raw char) in
+        //     whenSource: toString must not emit them as raw bytes.
+        String evilSource = "x == \"foo[2Kbar\nbaz\"";
+        Rule rule = new Rule("r1",
+            Collections.singletonList(ApiKeys.FETCH),
+            RuleAction.DENY, evilSource, 42, TRUE);
+
+        String rendered = rule.toString();
+        // The toString output must NOT contain raw control bytes — these
+        // are exactly the bytes LogSafe.sanitize escapes/strips. We
+        // assert each forbidden raw byte individually so a partial-fix
+        // (one byte sanitised, another missed) still trips the test.
+        assertEquals(-1, rendered.indexOf(''),
+            "raw ESC (U+001B) must not appear in toString(): " + rendered);
+        assertEquals(-1, rendered.indexOf(''),
+            "raw BEL (U+0007) must not appear in toString(): " + rendered);
+        assertEquals(-1, rendered.indexOf('\n'),
+            "raw LF must not appear in toString() — log-injection vector: "
+                + rendered);
+
+        // (b) Negative control: a clean rule renders normally, including
+        //     identifier punctuation. Pins that sanitisation is targeted
+        //     and not over-broad.
+        Rule clean = new Rule("audit-rule",
+            Collections.singletonList(ApiKeys.FETCH),
+            RuleAction.DENY, "request.topic == \"audit\"", 42, TRUE);
+        String cleanRendered = clean.toString();
+        assertTrue(cleanRendered.contains("audit-rule"),
+            "clean rule id must pass through toString verbatim: "
+                + cleanRendered);
+        assertTrue(cleanRendered.contains("request.topic == \\\"audit\\\"")
+                || cleanRendered.contains("request.topic == \"audit\""),
+            "clean whenSource must pass through (modulo LogSafe quote "
+                + "escape) — got: " + cleanRendered);
+
+        // (c) whenSource() accessor still returns the AUTHENTIC source
+        //     with raw bytes intact — only toString is sanitised. This
+        //     preserves the codec round-trip contract (encode() passes
+        //     whenSource through Jackson, which re-escapes control bytes
+        //     for the wire) and keeps toString as the only render path
+        //     that has to be log-safe.
+        assertEquals(evilSource, rule.whenSource(),
+            "whenSource() must return the unmodified source — only "
+                + "toString() is the sanitised render path");
+    }
+
+    @Test
+    public void toStringSanitisesControlBytesInIdEvenThoughCodecAlreadyRejects() {
+        // R34-C-1 [HIGH] defense-in-depth: the codec's validateRuleId
+        // rejects all forbidden codepoints in rule id at intake, so a
+        // Rule reaching toString with control bytes in its id is a
+        // caller-bug shape (Rule constructor bypassing the codec — only
+        // possible from a test or a future internal pathway). Still
+        // sanitise so that if such a Rule does materialise, the audit
+        // render path stays log-safe rather than re-introducing the
+        // exact log-injection the codec gate is supposed to prevent.
+        Rule rule = new Rule("ruleid",
+            Collections.singletonList(ApiKeys.FETCH),
+            RuleAction.DENY, "true", 42, TRUE);
+        String rendered = rule.toString();
+        assertEquals(-1, rendered.indexOf(''),
+            "raw ESC in rule id must not survive toString: " + rendered);
+    }
 }
