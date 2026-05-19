@@ -938,7 +938,44 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
     private val lastWarnAtNanos = new AtomicLong(0L)
     private val suppressedSinceLastWarn = new AtomicLong(0L)
 
-    def emit(message: String): Unit = {
+    /**
+     * R35 HIGH-1: synchronized to match the sibling
+     * [[PoisonRecordThrottle#emit]] (line ~1034). The body composes a
+     * read-then-conditional-set sequence over three independent atomic
+     * cells ({@code lastWarnedMessage}, {@code lastWarnAtNanos},
+     * {@code suppressedSinceLastWarn}) — each cell is atomic in isolation
+     * but the compound sequence is not. Two threads concurrently observing
+     * {@code previous != msg} would both emit a fresh WARN, both
+     * {@code incrementAndGet()} the cumulative counter, and both
+     * {@code getAndSet(0L)} the suppressed counter (the slower thread sees
+     * 0, losing the count that the faster thread already drained).
+     *
+     * <p>Today the only production caller is {@code scheduleOngoing}'s
+     * single drain thread, and {@code drainStartup} runs before that
+     * scheduler arms — sequential, not concurrent. But the precondition
+     * is undocumented (tracked at task #206) and ALREADY at risk of
+     * silent violation by:
+     * <ul>
+     *   <li>The R23 #218 drain-thread watchdog (planned), which would
+     *       probe {@code drainFailureThrottle} from a separate timer.</li>
+     *   <li>The R29 #260 observability surface, which could expose drift
+     *       gauges that probe {@code cleanupPolicyDriftThrottle} /
+     *       {@code partitionCountDriftThrottle} from a JMX reader thread
+     *       calling {@code maybeWarnIfCleanupPolicyDrifted} lazily.</li>
+     *   <li>Any future refactor that moves drift probes off the drain
+     *       task to reduce per-tick overhead (task #271 explicitly calls
+     *       out the current shared try/catch coupling).</li>
+     * </ul>
+     *
+     * <p>Synchronizing the body — a single mutex contended only on the
+     * rare WARN path — closes the race symmetrically with the sibling
+     * and removes the undocumented-precondition footgun without any
+     * caller change. The atomic cell types are retained as
+     * defense-in-depth (visibility guarantees if a future test reads
+     * them outside the lock) but the compound-update contract is now
+     * carried by the lock.
+     */
+    def emit(message: String): Unit = synchronized {
       val msg = if (message == null) "<null>" else message
       val previous = lastWarnedMessage.get()
       val now = failureWarnNowNanos()

@@ -1837,6 +1837,89 @@ class BrokerGovernanceBootstrapTest {
         "cumulative counter and lastWarn were reset by the first rollup")
   }
 
+  @Test
+  def warnThrottleConcurrentFirstHitEmitsExactlyOnce(): Unit = {
+    // R35 HIGH-1: pin the synchronization contract on WarnThrottle.emit.
+    //
+    // Without synchronization, the body composes a read-then-conditional-set
+    // sequence over three atomic cells (lastWarnedMessage, lastWarnAtNanos,
+    // suppressedSinceLastWarn). Each cell is atomic in isolation, but the
+    // compound sequence is not. Two threads that both observe
+    // `previous == null` on a fresh throttle both take the first branch:
+    // both call warn, both incrementAndGet warnEmissions, both getAndSet
+    // suppressedSinceLastWarn to 0 (the slower thread loses the count that
+    // the faster thread already drained). The cumulative emission counter
+    // overshoots 1 for what should logically be a single fresh-message
+    // emission with N-1 suppressed repeats.
+    //
+    // This test maximises the race window by gathering N threads on a
+    // CyclicBarrier and firing them simultaneously at emit() on a freshly
+    // constructed throttle. Without the fix, the cumulative count is
+    // unbounded in [1, N]; with the fix it is exactly 1, plus
+    // suppressedSinceLastWarn captures N-1 silent repeats.
+    //
+    // The sibling PoisonRecordThrottle.emit (BrokerGovernanceBootstrap.scala
+    // ~L1034) is synchronized — this restores symmetry. The R20 #206 task
+    // documenting the single-threaded precondition is closed by carrying
+    // the contract in the lock rather than in the comment.
+    val rm = mock(classOf[ReplicaManager])
+    val engine = new RuleEngine()
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp)
+    // Freeze the clock at a fixed value so all threads observe identical
+    // `now` and the rollup branch is unreachable — the only path that can
+    // emit is the first-arrival path. With the lock in place, exactly one
+    // thread wins it; without the lock, every thread that races past the
+    // `previous == null` read also wins the emission branch.
+    val frozenNow = 1_000_000_000L
+    boot.failureWarnNowNanos = () => frozenNow
+
+    val threadCount = 32
+    val barrier = new java.util.concurrent.CyclicBarrier(threadCount)
+    val started = new java.util.concurrent.CountDownLatch(threadCount)
+    val errors = new java.util.concurrent.atomic.AtomicReference[Throwable](null)
+    val pool = java.util.concurrent.Executors.newFixedThreadPool(threadCount)
+    try {
+      val futures = (0 until threadCount).map { _ =>
+        pool.submit(new Runnable {
+          override def run(): Unit = {
+            started.countDown()
+            try {
+              barrier.await()
+              boot.maybeWarnSuppressed("contended fresh message")
+            } catch {
+              case t: Throwable => errors.compareAndSet(null, t)
+            }
+          }
+        })
+      }
+      // Wait for all threads to land before the barrier; if any thread is
+      // late to start, the barrier still gates the actual emit() race so
+      // this is just a tighter pre-condition.
+      assertTrue(started.await(30L, java.util.concurrent.TimeUnit.SECONDS),
+        "all threads must reach the barrier within 30s")
+      // Drain — assertions follow once every thread has completed emit().
+      futures.foreach(_.get(30L, java.util.concurrent.TimeUnit.SECONDS))
+    } finally {
+      pool.shutdownNow()
+    }
+
+    assertEquals(null, errors.get(),
+      "no thread may throw from concurrent WarnThrottle.emit()")
+
+    // The contract: under contention on a fresh message, exactly ONE WARN
+    // fires. Without the synchronized fix, this would land anywhere in
+    // [1, threadCount] depending on interleaving. With the fix, the lock
+    // serializes the read-set window, and the second-onwards threads see
+    // `previous == "contended fresh message"`, so they take the rollup
+    // branch — which fails the time-window check (now == lastWarn, so
+    // `now - lastWarn = 0 < FailureWarnIntervalNanos`), and falls into
+    // the final else (suppressedSinceLastWarn.incrementAndGet).
+    assertEquals(1L, boot.warnEmissions.get(),
+      s"concurrent first-hit must emit exactly 1 WARN; observed " +
+        s"${boot.warnEmissions.get()} which would only happen without " +
+        s"the synchronization fix")
+  }
+
   // ── Round-14 HIGH H-1: cleanup.policy runtime drift detector ────────────
 
   @Test
