@@ -227,7 +227,15 @@ public final class KafkaWebSocketEndpoint implements Session.Listener.AutoDemand
     @Override
     public void onWebSocketClose(int statusCode, String reason) {
         if (LOG.isDebugEnabled()) {
-            LOG.debug("WS close on {} status={} reason={}", topic, statusCode, reason);
+            // The close-frame reason is the remote peer's RFC 6455 §5.5.1 payload — up to 123 UTF-8 bytes of
+            // arbitrary client-supplied data. Without sanitisation a peer that sends `reason="\nWARN forged"`
+            // forges a log line on every log aggregator that line-splits; operators routinely enable DEBUG
+            // under incident response so the "DEBUG-gated" mitigation is not sufficient. Mirror the policy
+            // applied after Wave 26 to the topic-name slot: never let an untrusted byte sequence land in a
+            // logger format argument regardless of level. {@code sanitizeShortPreview} substitutes '?' for
+            // C0 controls + DEL and truncates above 32 chars.
+            LOG.debug("WS close on {} status={} reason={}", topic, statusCode,
+                WsSubscribeMessageParser.sanitizeShortPreview(reason));
         }
         tearDown();
     }

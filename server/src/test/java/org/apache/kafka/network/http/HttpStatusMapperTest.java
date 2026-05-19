@@ -123,13 +123,62 @@ class HttpStatusMapperTest {
 
     @Test
     void unmappedErrorDefaultsTo500() {
-        // CORRUPT_MESSAGE has no explicit mapping; fall back to 500
-        assertEquals(500, HttpStatusMapper.toHttpStatus(Errors.CORRUPT_MESSAGE));
+        // NOT_CONTROLLER cannot legitimately surface via produce/fetch (it is a metadata-RPC error), so it
+        // is left unmapped and falls through to 500. Wave 27 moved CORRUPT_MESSAGE → 400 (produce-side
+        // client-fault dominates), so this sentinel changed.
+        assertEquals(500, HttpStatusMapper.toHttpStatus(Errors.NOT_CONTROLLER));
     }
 
     @Test
     void unsupportedVersionMapsTo400() {
         assertEquals(400, HttpStatusMapper.toHttpStatus(Errors.UNSUPPORTED_VERSION));
+    }
+
+    // ----- Wave 27: client-fault produce/fetch errors that previously fell to 500 -----
+
+    @Test
+    void invalidRecordMapsTo400() {
+        // Broker LogValidator rejected the produce batch (bad magic, null key on compacted topic, parse-time
+        // CRC failure). Client-fault — re-submitting the same bytes will fail again. Must NOT be 500/503
+        // because that invites harmful retries.
+        assertEquals(400, HttpStatusMapper.toHttpStatus(Errors.INVALID_RECORD));
+    }
+
+    @Test
+    void unsupportedCompressionTypeMapsTo400() {
+        // Produced batch uses a codec the broker / topic config does not accept. Client must re-encode.
+        assertEquals(400, HttpStatusMapper.toHttpStatus(Errors.UNSUPPORTED_COMPRESSION_TYPE));
+    }
+
+    @Test
+    void corruptMessageMapsTo400() {
+        // Produce-side CRC mismatch (client wrote a bad batch). Same client-fault as INVALID_RECORD. The
+        // fetch-side rationale (broker-side log corruption) is rare enough that 400 is acceptable — the
+        // Errors.name() in the envelope still discriminates for diagnostics.
+        assertEquals(400, HttpStatusMapper.toHttpStatus(Errors.CORRUPT_MESSAGE));
+    }
+
+    @Test
+    void offsetMovedToTieredStorageMapsTo400() {
+        // Tiered-storage clusters: requested offset moved below the local logStartOffset. Same class as
+        // OFFSET_OUT_OF_RANGE — caller needs a different cursor (e.g. _links.first), not a retry.
+        assertEquals(400, HttpStatusMapper.toHttpStatus(Errors.OFFSET_MOVED_TO_TIERED_STORAGE));
+    }
+
+    @Test
+    void positionOutOfRangeMapsTo400() {
+        // Analogous to OFFSET_OUT_OF_RANGE. Same client-fault classification.
+        assertEquals(400, HttpStatusMapper.toHttpStatus(Errors.POSITION_OUT_OF_RANGE));
+    }
+
+    @Test
+    void listenerNotFoundMapsTo503() {
+        // Transient: the broker is up but listener metadata has not yet propagated to this node. Retryable
+        // once metadata refreshes.
+        assertEquals(503, HttpStatusMapper.toHttpStatus(Errors.LISTENER_NOT_FOUND));
+        // And the Retry-After contract holds for 503.
+        assertTrue(HttpStatusMapper.statusCarriesRetryAfter(
+            HttpStatusMapper.toHttpStatus(Errors.LISTENER_NOT_FOUND)));
     }
 
     // ----- carriesRetryAfter -----

@@ -392,4 +392,42 @@ class WsSubscribeMessageParserTest {
         assertTrue(ex.getMessage().contains("credits"),
             () -> "expected message to name the offending field, was: " + ex.getMessage());
     }
+
+    // ----- Wave 27 axis KK: sanitizeShortPreview promoted to package-private + made null-tolerant
+    // so KafkaWebSocketEndpoint can use it on the remote peer's RFC 6455 §5.5.1 close-frame reason.
+
+    @Test
+    void sanitizeShortPreviewReplacesC0AndDelWithQuestionMark() {
+        // Every byte 0x00–0x1F and 0x7F is the log-forging primitive: a remote peer that ships
+        // "\nWARN forged broker line" in its WS close reason would otherwise inject a fake log entry.
+        String input = "ok" + (char) 0x0A + "LF" + (char) 0x0D + "CR" + (char) 0x07 + "BEL" + (char) 0x7F + "DELend";
+        assertEquals("ok?LF?CR?BEL?DELend", WsSubscribeMessageParser.sanitizeShortPreview(input));
+    }
+
+    @Test
+    void sanitizeShortPreviewPassesPrintableUnicodeThrough() {
+        // Non-control Unicode (CJK, emoji, accented Latin) is left alone — operators debugging an
+        // integration should see the bytes the client sent, just without the control-character class.
+        assertEquals("héllo 中", WsSubscribeMessageParser.sanitizeShortPreview("héllo 中"));
+    }
+
+    @Test
+    void sanitizeShortPreviewTruncatesAbove32CharsWithMarker() {
+        String long33 = "a".repeat(33);
+        String out = WsSubscribeMessageParser.sanitizeShortPreview(long33);
+        assertEquals(32 + 3, out.length());
+        assertTrue(out.endsWith("..."));
+    }
+
+    @Test
+    void sanitizeShortPreviewHandlesNullReason() {
+        // Jetty's onWebSocketClose delivers a null reason when the peer closed without a payload.
+        // The helper must not NPE on that path; the literal "null" is fine for the log line.
+        assertEquals("null", WsSubscribeMessageParser.sanitizeShortPreview(null));
+    }
+
+    @Test
+    void sanitizeShortPreviewHandlesEmptyString() {
+        assertEquals("", WsSubscribeMessageParser.sanitizeShortPreview(""));
+    }
 }

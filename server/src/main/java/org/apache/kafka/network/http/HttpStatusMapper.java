@@ -84,6 +84,24 @@ public final class HttpStatusMapper {
         m.put(Errors.UNSUPPORTED_VERSION, BAD_REQUEST);
         m.put(Errors.UNSUPPORTED_FOR_MESSAGE_FORMAT, BAD_REQUEST);
         m.put(Errors.POLICY_VIOLATION, BAD_REQUEST);
+        // Client-fault produce/fetch failures that were previously falling through to 500. Telling a caller
+        // "500 try again" when the truth is "your payload is malformed" causes harmful retries: the original
+        // bytes will be rejected the second time too, and a worse failure mode (retry storms on a runaway
+        // producer) is what shows up in operator dashboards. Map to 400 explicitly.
+        // - INVALID_RECORD: broker LogValidator rejected the produce batch (bad magic, null key on compacted
+        //   topic, parse-time CRC failure).
+        // - UNSUPPORTED_COMPRESSION_TYPE: produced batch uses a codec the broker / topic config does not accept.
+        // - CORRUPT_MESSAGE: produce-side CRC mismatch (client wrote a bad batch). The fetch-side rationale
+        //   is broker-side log corruption (legitimately 500), but the produce path is the common case for an
+        //   externally-facing bridge and the produce semantics dominate the decision. The fetch case is rare
+        //   enough that a 400 here is acceptable (caller can still recover via Errors.name() in the envelope).
+        // - OFFSET_MOVED_TO_TIERED_STORAGE / POSITION_OUT_OF_RANGE: same class as OFFSET_OUT_OF_RANGE — caller
+        //   needs a different cursor, not a retry of the same offset.
+        m.put(Errors.INVALID_RECORD, BAD_REQUEST);
+        m.put(Errors.UNSUPPORTED_COMPRESSION_TYPE, BAD_REQUEST);
+        m.put(Errors.CORRUPT_MESSAGE, BAD_REQUEST);
+        m.put(Errors.OFFSET_MOVED_TO_TIERED_STORAGE, BAD_REQUEST);
+        m.put(Errors.POSITION_OUT_OF_RANGE, BAD_REQUEST);
 
         m.put(Errors.MESSAGE_TOO_LARGE, PAYLOAD_TOO_LARGE);
         m.put(Errors.RECORD_LIST_TOO_LARGE, PAYLOAD_TOO_LARGE);
@@ -95,9 +113,19 @@ public final class HttpStatusMapper {
         m.put(Errors.REPLICA_NOT_AVAILABLE, SERVICE_UNAVAILABLE);
         m.put(Errors.BROKER_NOT_AVAILABLE, SERVICE_UNAVAILABLE);
         m.put(Errors.NOT_ENOUGH_REPLICAS, SERVICE_UNAVAILABLE);
+        // NOT_ENOUGH_REPLICAS_AFTER_APPEND is intentionally mapped to 503 (retryable) despite the durability
+        // ambiguity: the record IS persisted to the leader but not yet replicated to enough ISRs. A 503
+        // invites the client to retry, which may duplicate the produce. The alternative — 500 / 207 / a
+        // new envelope flag — would diverge from the standard wire contract without a clear win, and the
+        // client's idempotence / dedup policy is outside the bridge's surface. Document the trade-off here
+        // so a future contributor doesn't accidentally "fix" this mapping without considering the upgrade
+        // path for a richer envelope shape.
         m.put(Errors.NOT_ENOUGH_REPLICAS_AFTER_APPEND, SERVICE_UNAVAILABLE);
         m.put(Errors.COORDINATOR_NOT_AVAILABLE, SERVICE_UNAVAILABLE);
         m.put(Errors.COORDINATOR_LOAD_IN_PROGRESS, SERVICE_UNAVAILABLE);
+        // LISTENER_NOT_FOUND is transient: the broker is up but the listener metadata has not yet propagated
+        // to this node. A retry against the same coordinator will eventually succeed once metadata refreshes.
+        m.put(Errors.LISTENER_NOT_FOUND, SERVICE_UNAVAILABLE);
 
         return m;
     }

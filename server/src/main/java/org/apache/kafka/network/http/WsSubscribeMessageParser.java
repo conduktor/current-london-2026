@@ -121,7 +121,10 @@ public final class WsSubscribeMessageParser {
      * points pass through unchanged so Unicode field values stay readable for clients debugging their integration.
      * Truncates above 32 chars with a trailing {@code ...} marker.
      */
-    private static String sanitizeShortPreview(String value) {
+    static String sanitizeShortPreview(String value) {
+        if (value == null) {
+            return "null";
+        }
         int max = Math.min(value.length(), 32);
         StringBuilder sb = new StringBuilder(max + 3);
         for (int i = 0; i < max; i++) {
