@@ -19,7 +19,7 @@ package kafka.server
 
 import kafka.cluster.Partition
 import kafka.coordinator.transaction.{InitProducerIdResult, TransactionCoordinator}
-import kafka.log.UnifiedLog
+import kafka.log.{LogManager, UnifiedLog}
 import kafka.network.RequestChannel
 import kafka.server.QuotaFactory.QuotaManagers
 import kafka.server.metadata.{ConfigRepository, KRaftMetadataCache, MockConfigRepository}
@@ -13024,6 +13024,108 @@ class KafkaApisTest extends Logging {
         "not INVALID_TOPIC_EXCEPTION (which would leak the declared-backing set)")
     verify(concentrationKernel, never()).isBackingTopic(backingTopic)
     verify(replicaManager, never()).activeProducerState(any[TopicPartition])
+  }
+
+  @Test
+  def testDescribeLogDirsFiltersBackingTopicByName(): Unit = {
+    // r22 BLOCKER (escalated from Agent 3 cross-tenant audit) — DescribeLogDirs is gated on
+    // cluster-level DESCRIBE, which cannot distinguish per-tenant scope: a principal authorized
+    // to DESCRIBE the cluster otherwise sees every backing topic's name, partition count, log-dir
+    // path, and aggregate disk usage (the SUM of every co-tenant's bytes). That is an
+    // enumeration oracle plus a per-tenant write-rate side channel. The by-name branch must drop
+    // backing partitions BEFORE the partition set reaches ReplicaManager.describeLogDirs.
+    val backingTopic = "backing-r22-185"
+    val plainTopic = "tenant-r22-185"
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+    when(concentrationKernel.isBackingTopic(plainTopic)).thenReturn(false)
+
+    val authorizer: Authorizer = mock(classOf[Authorizer])
+    val clusterDescribe = new Action(AclOperation.DESCRIBE,
+      new ResourcePattern(ResourceType.CLUSTER, Resource.CLUSTER_NAME, PatternType.LITERAL),
+      1, true, true)
+    when(authorizer.authorize(any[RequestContext],
+      ArgumentMatchers.eq(Collections.singletonList(clusterDescribe))))
+      .thenReturn(Seq(AuthorizationResult.ALLOWED).asJava)
+
+    val captor: ArgumentCaptor[Set[TopicPartition]] =
+      ArgumentCaptor.forClass(classOf[Set[TopicPartition]])
+    when(replicaManager.describeLogDirs(captor.capture()))
+      .thenReturn(List.empty[DescribeLogDirsResponseData.DescribeLogDirsResult])
+
+    val data = new DescribeLogDirsRequestData()
+      .setTopics(new DescribeLogDirsRequestData.DescribableLogDirTopicCollection(
+        util.Arrays.asList(
+          new DescribeLogDirsRequestData.DescribableLogDirTopic()
+            .setTopic(backingTopic)
+            .setPartitions(util.Arrays.asList(Int.box(0), Int.box(1))),
+          new DescribeLogDirsRequestData.DescribableLogDirTopic()
+            .setTopic(plainTopic)
+            .setPartitions(util.Arrays.asList(Int.box(0)))
+        ).iterator()))
+    val request = buildRequest(new DescribeLogDirsRequest.Builder(data).build())
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+    kafkaApis = createKafkaApis(authorizer = Some(authorizer))
+    kafkaApis.handleDescribeLogDirsRequest(request)
+
+    val captured = captor.getValue
+    assertFalse(captured.exists(_.topic == backingTopic),
+      s"DescribeLogDirs must NOT forward backing topic '$backingTopic' to ReplicaManager.describeLogDirs — " +
+        "doing so would leak per-broker partition count, log-dir paths, and aggregate cross-tenant " +
+        s"disk usage (the SUM of co-tenant bytes). Captured set was: $captured")
+    assertTrue(captured.contains(new TopicPartition(plainTopic, 0)),
+      s"Plain (non-backing) topic '$plainTopic' must still reach ReplicaManager. Captured set: $captured")
+  }
+
+  @Test
+  def testDescribeLogDirsFiltersBackingTopicAllTopicsBranch(): Unit = {
+    // Mirror of the by-name guard for the isAllTopicPartitions branch — the same filter must
+    // apply to both code paths, otherwise an attacker simply asks "give me ALL log dirs" and
+    // enumerates every backing topic on this broker in a single RPC. This is the same pattern
+    // closed at METADATA(isAllTopics) BLOCKER #157 and DescribeTopicPartitions(all) BLOCKER #164;
+    // DescribeLogDirs(isAllTopicPartitions=true) is the third leg of that triad.
+    val backingTopic = "backing-r22-185-all"
+    val plainTopic = "tenant-r22-185-all"
+    val backingTp = new TopicPartition(backingTopic, 0)
+    val plainTp = new TopicPartition(plainTopic, 0)
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+    when(concentrationKernel.isBackingTopic(plainTopic)).thenReturn(false)
+
+    val backingLog = mock(classOf[UnifiedLog])
+    val plainLog = mock(classOf[UnifiedLog])
+    when(backingLog.topicPartition).thenReturn(backingTp)
+    when(plainLog.topicPartition).thenReturn(plainTp)
+    val logManagerMock = mock(classOf[LogManager])
+    when(logManagerMock.allLogs).thenReturn(Iterable[UnifiedLog](backingLog, plainLog))
+    when(replicaManager.logManager).thenReturn(logManagerMock)
+
+    val authorizer: Authorizer = mock(classOf[Authorizer])
+    val clusterDescribe = new Action(AclOperation.DESCRIBE,
+      new ResourcePattern(ResourceType.CLUSTER, Resource.CLUSTER_NAME, PatternType.LITERAL),
+      1, true, true)
+    when(authorizer.authorize(any[RequestContext],
+      ArgumentMatchers.eq(Collections.singletonList(clusterDescribe))))
+      .thenReturn(Seq(AuthorizationResult.ALLOWED).asJava)
+
+    val captor: ArgumentCaptor[Set[TopicPartition]] =
+      ArgumentCaptor.forClass(classOf[Set[TopicPartition]])
+    when(replicaManager.describeLogDirs(captor.capture()))
+      .thenReturn(List.empty[DescribeLogDirsResponseData.DescribeLogDirsResult])
+
+    // setTopics(null) makes isAllTopicPartitions == true.
+    val data = new DescribeLogDirsRequestData().setTopics(null)
+    val request = buildRequest(new DescribeLogDirsRequest.Builder(data).build())
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+    kafkaApis = createKafkaApis(authorizer = Some(authorizer))
+    kafkaApis.handleDescribeLogDirsRequest(request)
+
+    val captured = captor.getValue
+    assertFalse(captured.contains(backingTp),
+      s"DescribeLogDirs(isAllTopicPartitions=true) MUST NOT enumerate backing topics — this is " +
+        s"the all-topics discovery vector. Captured set: $captured")
+    assertTrue(captured.contains(plainTp),
+      s"Plain topic '$plainTopic' must still appear in all-topics enumeration. Captured set: $captured")
   }
 
   @Test

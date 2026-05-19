@@ -3414,13 +3414,28 @@ class KafkaApis(val requestChannel: RequestChannel,
     val describeLogDirsDirRequest = request.body[DescribeLogDirsRequest]
     val (logDirInfos, error) = {
       if (authHelper.authorize(request.context, DESCRIBE, CLUSTER, CLUSTER_NAME)) {
+        // r22 BLOCKER (#185, Agent 3 cross-tenant escalation): backing topics that concentrate
+        // multiple logical tenants must NEVER surface via DescribeLogDirs. The cluster-level
+        // DESCRIBE auth above gates WHO can call this RPC, but it does not — and cannot —
+        // distinguish per-tenant scope: a principal with DESCRIBE on CLUSTER would otherwise see
+        // every backing topic's name, partition count, log-dir path, and aggregate disk usage
+        // (the SUM of every co-tenant's bytes), giving them an enumeration oracle plus a side
+        // channel for per-tenant write-rate inference. Drop backing partitions on both branches:
+        // the all-topics branch must skip them (silent omission, same as METADATA(isAllTopics)
+        // BLOCKER #157/#164), and the by-name branch must skip them too (rather than echoing
+        // back UNKNOWN, which would itself be an oracle distinguishing "no such partition" from
+        // "concentration backing"). Logical topics are never present in `logManager.allLogs` —
+        // produce traffic to a logical name routes to its declared backing — so there is no
+        // mirror filter required for the logical side.
         val partitions =
           if (describeLogDirsDirRequest.isAllTopicPartitions)
-            replicaManager.logManager.allLogs.map(_.topicPartition).toSet
+            replicaManager.logManager.allLogs.map(_.topicPartition)
+              .filterNot(tp => concentrationKernel.isBackingTopic(tp.topic)).toSet
           else
             describeLogDirsDirRequest.data.topics.asScala.flatMap(
               logDirTopic => logDirTopic.partitions.asScala.map(partitionIndex =>
-                new TopicPartition(logDirTopic.topic, partitionIndex))).toSet
+                new TopicPartition(logDirTopic.topic, partitionIndex)))
+              .filterNot(tp => concentrationKernel.isBackingTopic(tp.topic)).toSet
 
         (replicaManager.describeLogDirs(partitions), Errors.NONE)
       } else {
