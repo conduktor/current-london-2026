@@ -1007,8 +1007,24 @@ class BrokerServer(
       // level override if present, otherwise the broker-default
       // log.cleanup.policy (Kafka default: "delete"), matching how
       // LogManager resolves the policy when opening this log.
-      val govImage = metadataCache.currentImage().topics().getTopic(GovernanceTopic.NAME)
-      val govTopicLevel = if (govImage != null) metadataCache.currentImage().configs()
+      // R35-A3 [MED]: snapshot the metadata image ONCE and use it for every
+      // governance topic read. The metadata cache can swap snapshots between
+      // independent `currentImage()` calls — on cluster cold-start the
+      // controller may publish a new image right as this broker reaches the
+      // gate, and a between-reads swap producing asymmetric `null`/non-null
+      // observations would short-circuit `topicExists=false` on the gate
+      // input even though `getTopic` already returned a non-null entry.
+      // Concrete bad shape: image-1 lacks the topic and the original
+      // double-read computed `govImage=null` → `govTopicLevel=null` →
+      // `topicExists=false`; image-2 has the topic created and the partition
+      // gate's `partitions().size()` would have read the value from image-2,
+      // but the call site fell into the `else 0` branch keyed on
+      // `govImage != null` (the IMAGE-1 read). The two gates would see
+      // disagreeing views of the same topic. Snapshotting once binds the
+      // gates to a coherent metadata observation.
+      val govImage0 = metadataCache.currentImage()
+      val govImage = govImage0.topics().getTopic(GovernanceTopic.NAME)
+      val govTopicLevel = if (govImage != null) govImage0.configs()
         .configMapForResource(new ConfigResource(ConfigResource.Type.TOPIC, GovernanceTopic.NAME))
         .get(TopicConfig.CLEANUP_POLICY_CONFIG) else null
       BrokerServer.requireGovernanceTopicCompactPolicy(
