@@ -677,13 +677,103 @@ class ControllerApis(
     val electLeadersRequest = request.body[ElectLeadersRequest]
     val context = new ControllerRequestContext(request.context.header.data, request.context.principal,
       requestTimeoutMsToDeadlineNs(time, electLeadersRequest.data.timeoutMs))
-    val future = controller.electLeaders(context, electLeadersRequest.data)
-    future.handle[Unit] { (responseData, exception) =>
+    // Outside-in TOPIC scrub (#128 / F6). A direct `bootstrap.controllers`
+    // Admin (KIP-590) reaches this handler without traversing KafkaApis, so
+    // the broker-side scrub at handleElectLeadersRequest does not run.
+    // Two attack shapes:
+    //
+    //  1. Named-topic mode (`topicPartitions != null`): a cluster-wide caller
+    //     could trigger an UNCLEAN leader election on `acme.orders-0`,
+    //     potentially data-losing the tenant. Refuse per-topic, echo the
+    //     topic name — INVALID_TOPIC_EXCEPTION on every requested partition.
+    //
+    //  2. Null-sweep mode (`topicPartitions == null`): the controller
+    //     enumerates EVERY topic in topicsByName and elects leaders on each.
+    //     A forwarded tenant principal must NEVER null-sweep — tenants are
+    //     not cluster admins; their own topics are reachable by naming them.
+    //     For a cluster-wide caller, the elections legitimately cover the
+    //     whole cluster (the admin has ALTER on CLUSTER, same as the broker
+    //     handler's stated rationale) but the response would otherwise
+    //     enumerate every tenant topic name back to the caller. Strip
+    //     tenant-namespaced entries from the response post-hoc as a name
+    //     enumeration defence-in-depth.
+    val data = electLeadersRequest.data
+    val callerTenant = callerTenantFromPrincipal(request.context.principal.getName)
+
+    if (data.topicPartitions() == null && callerTenant.isDefined) {
+      // Tenant principal attempting a cluster-wide sweep. Refuse with a
+      // top-level CLUSTER_AUTHORIZATION_FAILED — the legitimate flow is to
+      // name the topics explicitly. Tenants don't normally reach this RPC
+      // (ELECT_LEADERS is not in TENANT_ALLOWED_APIS on the broker), but a
+      // forwarded envelope could carry the principal to bootstrap.controllers.
+      val errResp = new ElectLeadersResponseData()
+        .setErrorCode(Errors.CLUSTER_AUTHORIZATION_FAILED.code)
+      requestHelper.sendResponseMaybeThrottle(request, throttleMs =>
+        new ElectLeadersResponse(errResp.setThrottleTimeMs(throttleMs)))
+      return CompletableFuture.completedFuture(())
+    }
+
+    val pollutionRejected =
+      new util.ArrayList[ElectLeadersResponseData.ReplicaElectionResult]()
+    if (data.topicPartitions() != null) {
+      val keep = new ElectLeadersRequestData.TopicPartitionsCollection(data.topicPartitions().size)
+      data.topicPartitions().forEach { tp =>
+        foreignTenantTopicRefusal(tp.topic(), callerTenant) match {
+          case Some(message) =>
+            val partitionResults = new util.ArrayList[ElectLeadersResponseData.PartitionResult](tp.partitions().size)
+            tp.partitions().forEach { p =>
+              partitionResults.add(new ElectLeadersResponseData.PartitionResult()
+                .setPartitionId(p)
+                .setErrorCode(INVALID_TOPIC_EXCEPTION.code)
+                .setErrorMessage(message))
+            }
+            pollutionRejected.add(new ElectLeadersResponseData.ReplicaElectionResult()
+              .setTopic(tp.topic())
+              .setPartitionResult(partitionResults))
+          case None =>
+            keep.add(tp.duplicate())
+        }
+      }
+      if (!pollutionRejected.isEmpty) data.setTopicPartitions(keep)
+    }
+
+    val electFuture =
+      if (data.topicPartitions() != null && data.topicPartitions().isEmpty && !pollutionRejected.isEmpty) {
+        // Every requested topic was refused. Do NOT call the controller — an
+        // empty TopicPartitions list would otherwise degrade into a NULL
+        // sweep on some code paths (the request field is nullable). Skip the
+        // round-trip and return only the rejections built above.
+        CompletableFuture.completedFuture(new ElectLeadersResponseData())
+      } else {
+        controller.electLeaders(context, data)
+      }
+    electFuture.handle[Unit] { (responseData, exception) =>
       if (exception != null) {
         requestHelper.sendResponseMaybeThrottle(request, throttleMs => {
           electLeadersRequest.getErrorResponse(throttleMs, exception)
         })
       } else {
+        // Defence-in-depth for the cluster-wide null-sweep case: strip any
+        // tenant-namespaced topic from the response so the caller cannot
+        // enumerate them. `callerTenant.isDefined && null-sweep` was
+        // already short-circuited above; here only the cluster-wide path
+        // can reach with a null sweep, but we filter using the SAME
+        // structural predicate so combined-mode + split-mode agree.
+        if (data.topicPartitions() == null && responseData.replicaElectionResults() != null) {
+          val filtered = new util.ArrayList[ElectLeadersResponseData.ReplicaElectionResult](
+            responseData.replicaElectionResults().size)
+          responseData.replicaElectionResults().forEach { r =>
+            if (!isForeignTenantNamespace(r.topic(), callerTenant)) filtered.add(r)
+          }
+          responseData.setReplicaElectionResults(filtered)
+        }
+        if (!pollutionRejected.isEmpty) {
+          val merged = new util.ArrayList[ElectLeadersResponseData.ReplicaElectionResult](
+            responseData.replicaElectionResults().size + pollutionRejected.size)
+          merged.addAll(responseData.replicaElectionResults())
+          merged.addAll(pollutionRejected)
+          responseData.setReplicaElectionResults(merged)
+        }
         requestHelper.sendResponseMaybeThrottle(request, throttleMs => {
           new ElectLeadersResponse(responseData.setThrottleTimeMs(throttleMs))
         })
@@ -1069,11 +1159,60 @@ class ControllerApis(
     authHelper.authorizeClusterOperation(request, ALTER)
     val context = new ControllerRequestContext(request.context.header.data, request.context.principal,
       requestTimeoutMsToDeadlineNs(time, alterRequest.data.timeoutMs))
-    controller.alterPartitionReassignments(context, alterRequest.data)
-      .thenApply[Unit] { response =>
-        requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
-          new AlterPartitionReassignmentsResponse(response.setThrottleTimeMs(requestThrottleMs)))
+    // Outside-in TOPIC scrub (#127 / F4). A direct `bootstrap.controllers`
+    // Admin (KIP-590) reaches this handler without traversing KafkaApis, so
+    // the broker-side scrub at handleAlterPartitionReassignmentsRequest does
+    // not run. A cluster-wide caller could rewire replicas on a tenant topic
+    // — or, with `Replicas=null`, silently CANCEL the tenant's in-flight
+    // reassignments. Refuse per-topic, echoing the topic name (TOPIC names
+    // are public via Metadata; nothing to hide). Same-tenant carve-out via
+    // `isForeignTenantNamespace`: a forwarded `__tenant_acme.alice` may
+    // still reassign `acme.*` topics.
+    val data = alterRequest.data
+    val callerTenant = callerTenantFromPrincipal(request.context.principal.getName)
+    val pollutionRejected =
+      new util.ArrayList[AlterPartitionReassignmentsResponseData.ReassignableTopicResponse]()
+    val keep = new util.ArrayList[AlterPartitionReassignmentsRequestData.ReassignableTopic](data.topics().size)
+    data.topics().forEach { t =>
+      foreignTenantTopicRefusal(t.name(), callerTenant) match {
+        case Some(message) =>
+          val partResults = new util.ArrayList[AlterPartitionReassignmentsResponseData.ReassignablePartitionResponse](t.partitions().size)
+          t.partitions().forEach { p =>
+            partResults.add(new AlterPartitionReassignmentsResponseData.ReassignablePartitionResponse()
+              .setPartitionIndex(p.partitionIndex())
+              .setErrorCode(INVALID_TOPIC_EXCEPTION.code)
+              .setErrorMessage(message))
+          }
+          pollutionRejected.add(new AlterPartitionReassignmentsResponseData.ReassignableTopicResponse()
+            .setName(t.name())
+            .setPartitions(partResults))
+        case None =>
+          keep.add(t)
       }
+    }
+    if (!pollutionRejected.isEmpty) data.setTopics(keep)
+
+    val reassignFuture =
+      if (data.topics().isEmpty) {
+        // Every topic was refused upstream. Skip the controller round-trip
+        // so no metadata write is attempted; the per-topic rejections built
+        // above still ship in the response below. Same short-circuit as
+        // #117 / #126.
+        CompletableFuture.completedFuture(new AlterPartitionReassignmentsResponseData())
+      } else {
+        controller.alterPartitionReassignments(context, data)
+      }
+    reassignFuture.thenApply[Unit] { response =>
+      if (!pollutionRejected.isEmpty) {
+        val merged = new util.ArrayList[AlterPartitionReassignmentsResponseData.ReassignableTopicResponse](
+          response.responses.size + pollutionRejected.size)
+        merged.addAll(response.responses)
+        merged.addAll(pollutionRejected)
+        response.setResponses(merged)
+      }
+      requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
+        new AlterPartitionReassignmentsResponse(response.setThrottleTimeMs(requestThrottleMs)))
+    }
   }
 
   private[server] def handleAlterUserScramCredentials(request: RequestChannel.Request): CompletableFuture[Unit] = {
@@ -1270,6 +1409,27 @@ class ControllerApis(
     Some(afterPrefix.substring(0, dot))
   }
 
+  // For per-topic outside-in TOPIC scrubs on the controller listener
+  // (AlterPartitionReassignments, ElectLeaders, ...). Returns the standard
+  // refusal message — formatted ONCE to keep #126-style filter loops in
+  // every handler textually identical — when the topic name lies in a
+  // foreign tenant's namespace, or `None` when the topic is acceptable for
+  // this caller.
+  //
+  // Same-tenant carve-out lives in `isForeignTenantNamespace`: a forwarded
+  // tenant principal `__tenant_<id>.<user>` whose `callerTenant` equals the
+  // topic's leading segment passes through untouched. Internal topics,
+  // single-`_` prefixes, and dotless names are NOT in any tenant namespace
+  // and also pass through.
+  private def foreignTenantTopicRefusal(
+      topicName: String,
+      callerTenant: Option[String]): Option[String] = {
+    if (isForeignTenantNamespace(topicName, callerTenant))
+      Some(s"Topic name '$topicName' is reserved (tenant namespace prefix)")
+    else
+      None
+  }
+
   // For AlterConfigs / IncrementalAlterConfigs on the controller listener.
   // Returns `Some((errorCode, errorMessage))` when the resource lies in a
   // foreign tenant's namespace, or `None` when the resource is acceptable for
@@ -1433,8 +1593,126 @@ class ControllerApis(
     authHelper.authorizeClusterOperation(request, DESCRIBE)
     val context = new ControllerRequestContext(request.context.header.data, request.context.principal,
       OptionalLong.empty())
-    controller.listPartitionReassignments(context, listRequest.data)
+    // Outside-in TOPIC scrub + response-side enumeration defence (#129 / F5).
+    // A direct `bootstrap.controllers` Admin (KIP-590) reaches this handler
+    // without traversing KafkaApis, so the broker-side filter in
+    // handleListPartitionReassignmentsRequest does not run.
+    //
+    // Two attack shapes:
+    //
+    //  1. List-all mode (`topics == null`): the controller enumerates every
+    //     in-progress reassignment cluster-wide. A cluster-wide caller would
+    //     see `acme.orders`, `beta.events`, ... — a tenant-topic-presence
+    //     oracle and a partition-count leak. A forwarded tenant principal
+    //     would see other tenants' topics. Filter the response.
+    //
+    //  2. Per-topic mode (`topics != null`): a cluster-wide or cross-tenant
+    //     caller could name a foreign-tenant topic explicitly. Refuse with a
+    //     top-level INVALID_TOPIC_EXCEPTION — the response schema has no per-
+    //     entry error slot, so partial refusal is not expressible. Top-level
+    //     refusal matches F4/AlterPartitionReassignments in spirit (explicit,
+    //     not silent) while preserving atomicity.
+    //
+    // Same-tenant carve-out via `callerTenantFromPrincipal`: a forwarded
+    // `__tenant_acme.alice` may name `orders` (LOGICAL) per-topic; we
+    // translate to `acme.orders` before forwarding and back on the response.
+    val data = listRequest.data
+    val callerTenant = callerTenantFromPrincipal(request.context.principal.getName)
+
+    // Per-topic mode pre-checks. Returns Some(errorMessage) on first refusal,
+    // or None when the request is safe to forward. Translation of logical→
+    // physical names for a tenant caller is performed in-place after the
+    // per-entry refusal scan, so a partial mutation cannot occur.
+    val perTopicRefusal: Option[String] =
+      if (data.topics() == null) None
+      else {
+        var refusal: Option[String] = None
+        val it = data.topics().iterator()
+        while (it.hasNext && refusal.isEmpty) {
+          val name = it.next().name()
+          if (isForeignTenantNamespace(name, callerTenant)) {
+            refusal = Some(s"Topic name '$name' is reserved (tenant namespace prefix)")
+          }
+        }
+        refusal
+      }
+
+    if (perTopicRefusal.isDefined) {
+      val errResp = new ListPartitionReassignmentsResponseData()
+        .setErrorCode(INVALID_TOPIC_EXCEPTION.code)
+        .setErrorMessage(perTopicRefusal.get)
+      requestHelper.sendResponseMaybeThrottle(request, throttleMs =>
+        new ListPartitionReassignmentsResponse(errResp.setThrottleTimeMs(throttleMs)))
+      return CompletableFuture.completedFuture(())
+    }
+
+    // Tenant caller in per-topic mode: rewrite each entry's logical name to
+    // its physical form so the controller (which stores physical names)
+    // returns matches. A double-prefix or invalid logical form throws
+    // InvalidTopicException from TenantNamespace.toPhysical; surface that as
+    // a top-level error rather than silently consuming it.
+    if (data.topics() != null && callerTenant.isDefined) {
+      val tenantId = callerTenant.get
+      var rewriteError: Option[String] = None
+      val it = data.topics().iterator()
+      while (it.hasNext && rewriteError.isEmpty) {
+        val t = it.next()
+        val logical = t.name()
+        if (logical != null && !TenantNamespace.isInternalTopic(logical)) {
+          try t.setName(TenantNamespace.toPhysical(tenantId, logical))
+          catch {
+            case e: org.apache.kafka.common.errors.InvalidTopicException =>
+              rewriteError = Some(e.getMessage)
+          }
+        }
+      }
+      if (rewriteError.isDefined) {
+        val errResp = new ListPartitionReassignmentsResponseData()
+          .setErrorCode(INVALID_TOPIC_EXCEPTION.code)
+          .setErrorMessage(rewriteError.get)
+        requestHelper.sendResponseMaybeThrottle(request, throttleMs =>
+          new ListPartitionReassignmentsResponse(errResp.setThrottleTimeMs(throttleMs)))
+        return CompletableFuture.completedFuture(())
+      }
+    }
+
+    controller.listPartitionReassignments(context, data)
       .thenApply[Unit] { response =>
+        // Response-side filter. Two cases:
+        //
+        //  - Tenant caller: keep only entries in this tenant's `<id>.`
+        //    namespace AND rewrite back to logical names so the client only
+        //    ever sees what it sent (or, in list-all mode, the logical view
+        //    of its own namespace).
+        //
+        //  - Cluster-wide caller in list-all mode: strip any entry whose
+        //    leading segment is structurally a valid tenant id. Per-topic
+        //    cluster-wide requests have already been refused above if they
+        //    named a foreign tenant, so no filtering needed there (every
+        //    entry the controller returns matches a name the cluster admin
+        //    explicitly asked for, and those names are by definition not
+        //    in any tenant namespace).
+        if (response.topics() != null) {
+          callerTenant match {
+            case Some(tenantId) =>
+              val filtered = new util.ArrayList[ListPartitionReassignmentsResponseData.OngoingTopicReassignment](
+                response.topics().size)
+              response.topics().forEach { t =>
+                if (TenantNamespace.belongsTo(tenantId, t.name())) {
+                  filtered.add(t.setName(TenantNamespace.toLogical(tenantId, t.name())))
+                }
+              }
+              response.setTopics(filtered)
+            case None if data.topics() == null =>
+              val filtered = new util.ArrayList[ListPartitionReassignmentsResponseData.OngoingTopicReassignment](
+                response.topics().size)
+              response.topics().forEach { t =>
+                if (!isForeignTenantNamespace(t.name(), None)) filtered.add(t)
+              }
+              response.setTopics(filtered)
+            case None => // cluster-wide, per-topic: nothing to strip
+          }
+        }
         requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
           new ListPartitionReassignmentsResponse(response.setThrottleTimeMs(requestThrottleMs)))
       }

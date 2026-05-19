@@ -3081,6 +3081,617 @@ class ControllerApisTest {
     assertEquals("acme.orders", r.resourceName())
   }
 
+  // ---------------------------------------------------------------------------
+  // F4: AlterPartitionReassignments — outside-in TOPIC scrub on the controller
+  // listener. A direct `bootstrap.controllers` Admin (KIP-590) bypasses the
+  // broker-side scrub in KafkaApis.handleAlterPartitionReassignmentsRequest;
+  // the controller is therefore the SOLE chokepoint on this path. Refuse
+  // foreign-tenant topic entries per-topic; pass cluster topics through.
+  // Same-tenant carve-out via `isForeignTenantNamespace`: a forwarded tenant
+  // principal may reassign topics in its own namespace.
+  // ---------------------------------------------------------------------------
+
+  @Test
+  def testControllerAlterPartitionReassignmentsRefusesForeignTenantTopic(): Unit = {
+    val controller = mock(classOf[Controller])
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.empty())
+
+    val data = new AlterPartitionReassignmentsRequestData()
+    data.topics().add(new AlterPartitionReassignmentsRequestData.ReassignableTopic()
+      .setName("acme.orders")
+      .setPartitions(util.Arrays.asList(
+        new AlterPartitionReassignmentsRequestData.ReassignablePartition()
+          .setPartitionIndex(0)
+          .setReplicas(util.Arrays.asList(java.lang.Integer.valueOf(1), java.lang.Integer.valueOf(2))))))
+    val req = buildTokenRequest(
+      new AlterPartitionReassignmentsRequest.Builder(data).build(),
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    controllerApis.handleAlterPartitionReassignments(req)
+
+    // Controller must NEVER see the foreign-tenant topic. If it did, the
+    // reassignment record would be appended to the metadata log verbatim.
+    verify(controller, never()).alterPartitionReassignments(
+      any(classOf[ControllerRequestContext]),
+      any(classOf[AlterPartitionReassignmentsRequestData]))
+
+    val response = captureSentResponse(req).asInstanceOf[AlterPartitionReassignmentsResponse]
+    val responses = response.data().responses().asScala.toList
+    assertEquals(1, responses.size, "single refused topic expected")
+    assertEquals("acme.orders", responses.head.name())
+    val part = responses.head.partitions().asScala.head
+    assertEquals(0, part.partitionIndex())
+    assertEquals(INVALID_TOPIC_EXCEPTION.code(), part.errorCode(),
+      "cluster-wide caller must be refused on a tenant-prefixed topic")
+    assertNotNull(part.errorMessage())
+    assertTrue(part.errorMessage().contains("acme.orders"),
+      "topic name is public via Metadata; echo it back to the caller")
+  }
+
+  @Test
+  def testControllerAlterPartitionReassignmentsAllowsSameTenantTopicFromTenantCaller(): Unit = {
+    val controller = mock(classOf[Controller])
+    val controllerResponse = new AlterPartitionReassignmentsResponseData()
+    controllerResponse.responses().add(new AlterPartitionReassignmentsResponseData.ReassignableTopicResponse()
+      .setName("acme.orders")
+      .setPartitions(util.Arrays.asList(
+        new AlterPartitionReassignmentsResponseData.ReassignablePartitionResponse()
+          .setPartitionIndex(0)
+          .setErrorCode(NONE.code))))
+    when(controller.alterPartitionReassignments(
+      any(classOf[ControllerRequestContext]),
+      any(classOf[AlterPartitionReassignmentsRequestData])))
+      .thenReturn(CompletableFuture.completedFuture(controllerResponse))
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.empty())
+
+    val data = new AlterPartitionReassignmentsRequestData()
+    data.topics().add(new AlterPartitionReassignmentsRequestData.ReassignableTopic()
+      .setName("acme.orders")
+      .setPartitions(util.Arrays.asList(
+        new AlterPartitionReassignmentsRequestData.ReassignablePartition()
+          .setPartitionIndex(0)
+          .setReplicas(util.Arrays.asList(java.lang.Integer.valueOf(1))))))
+    val req = buildTokenRequest(
+      new AlterPartitionReassignmentsRequest.Builder(data).build(),
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_acme.alice"))
+
+    controllerApis.handleAlterPartitionReassignments(req)
+
+    val forwarded: ArgumentCaptor[AlterPartitionReassignmentsRequestData] =
+      ArgumentCaptor.forClass(classOf[AlterPartitionReassignmentsRequestData])
+    verify(controller).alterPartitionReassignments(
+      any(classOf[ControllerRequestContext]),
+      forwarded.capture())
+    assertEquals(1, forwarded.getValue.topics().size,
+      "tenant principal's own-namespace topic must reach the controller")
+    assertEquals("acme.orders", forwarded.getValue.topics().get(0).name())
+
+    val response = captureSentResponse(req).asInstanceOf[AlterPartitionReassignmentsResponse]
+    val p = response.data().responses().asScala.head.partitions().asScala.head
+    assertEquals(NONE.code(), p.errorCode(),
+      "forwarded tenant principal may reassign topics in its own namespace")
+  }
+
+  @Test
+  def testControllerAlterPartitionReassignmentsMixedBatchSplitsRefusedAndAccepted(): Unit = {
+    val controller = mock(classOf[Controller])
+    val controllerResponse = new AlterPartitionReassignmentsResponseData()
+    controllerResponse.responses().add(new AlterPartitionReassignmentsResponseData.ReassignableTopicResponse()
+      .setName("cluster-metrics")
+      .setPartitions(util.Arrays.asList(
+        new AlterPartitionReassignmentsResponseData.ReassignablePartitionResponse()
+          .setPartitionIndex(0)
+          .setErrorCode(NONE.code))))
+    when(controller.alterPartitionReassignments(
+      any(classOf[ControllerRequestContext]),
+      any(classOf[AlterPartitionReassignmentsRequestData])))
+      .thenReturn(CompletableFuture.completedFuture(controllerResponse))
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.empty())
+
+    val data = new AlterPartitionReassignmentsRequestData()
+    data.topics().add(new AlterPartitionReassignmentsRequestData.ReassignableTopic()
+      .setName("acme.orders")
+      .setPartitions(util.Arrays.asList(
+        new AlterPartitionReassignmentsRequestData.ReassignablePartition()
+          .setPartitionIndex(0)
+          .setReplicas(util.Arrays.asList(java.lang.Integer.valueOf(1))))))
+    data.topics().add(new AlterPartitionReassignmentsRequestData.ReassignableTopic()
+      .setName("cluster-metrics")
+      .setPartitions(util.Arrays.asList(
+        new AlterPartitionReassignmentsRequestData.ReassignablePartition()
+          .setPartitionIndex(0)
+          .setReplicas(util.Arrays.asList(java.lang.Integer.valueOf(1))))))
+    val req = buildTokenRequest(
+      new AlterPartitionReassignmentsRequest.Builder(data).build(),
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    controllerApis.handleAlterPartitionReassignments(req)
+
+    // Only the cluster-scope topic reaches controller.alterPartitionReassignments.
+    val forwarded: ArgumentCaptor[AlterPartitionReassignmentsRequestData] =
+      ArgumentCaptor.forClass(classOf[AlterPartitionReassignmentsRequestData])
+    verify(controller).alterPartitionReassignments(
+      any(classOf[ControllerRequestContext]),
+      forwarded.capture())
+    assertEquals(util.Arrays.asList("cluster-metrics"),
+      forwarded.getValue.topics().asScala.map(_.name()).asJava,
+      "only the cluster-scope topic must reach the controller")
+
+    val response = captureSentResponse(req).asInstanceOf[AlterPartitionReassignmentsResponse]
+    val byName: Map[String, Short] = response.data().responses().asScala
+      .map(t => t.name() -> t.partitions().asScala.head.errorCode()).toMap
+    assertEquals(INVALID_TOPIC_EXCEPTION.code(), byName("acme.orders"),
+      "tenant TOPIC must be refused with INVALID_TOPIC_EXCEPTION")
+    assertEquals(NONE.code(), byName("cluster-metrics"),
+      "legitimate cluster topic must round-trip with NONE")
+  }
+
+  // ---------------------------------------------------------------------------
+  // F6: ElectLeaders — outside-in TOPIC scrub + null-sweep guard on the
+  // controller listener. Two attack shapes:
+  //
+  //   1. Named-topic mode (`topicPartitions != null`): refuse per-topic just
+  //      like AlterPartitionReassignments above.
+  //
+  //   2. Null-sweep mode (`topicPartitions == null`): the controller would
+  //      otherwise enumerate every topic in topicsByName and elect leaders on
+  //      each. A forwarded tenant principal must NEVER null-sweep — refused
+  //      with CLUSTER_AUTHORIZATION_FAILED. A cluster-wide caller's null-sweep
+  //      is forwarded (the admin has ALTER on CLUSTER, same as the broker's
+  //      stated rationale) but the response is filtered post-hoc to strip
+  //      tenant-namespaced topic names — defence-in-depth against using the
+  //      sweep response as a topic-name enumeration oracle.
+  // ---------------------------------------------------------------------------
+
+  @Test
+  def testControllerElectLeadersRefusesForeignTenantTopic(): Unit = {
+    val controller = mock(classOf[Controller])
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.empty())
+
+    val req = buildTokenRequest(
+      new ElectLeadersRequest.Builder(ElectionType.PREFERRED,
+        util.Arrays.asList(new org.apache.kafka.common.TopicPartition("acme.orders", 0)), 30000).build(),
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    controllerApis.handleElectLeaders(req)
+
+    // Controller must NEVER see the foreign-tenant topic.
+    verify(controller, never()).electLeaders(
+      any(classOf[ControllerRequestContext]),
+      any(classOf[ElectLeadersRequestData]))
+
+    val response = captureSentResponse(req).asInstanceOf[ElectLeadersResponse]
+    val results = response.data().replicaElectionResults().asScala.toList
+    assertEquals(1, results.size)
+    assertEquals("acme.orders", results.head.topic())
+    val pr = results.head.partitionResult().asScala.head
+    assertEquals(0, pr.partitionId())
+    assertEquals(INVALID_TOPIC_EXCEPTION.code(), pr.errorCode(),
+      "cluster-wide caller must be refused on a tenant-prefixed topic")
+    assertNotNull(pr.errorMessage())
+    assertTrue(pr.errorMessage().contains("acme.orders"),
+      "topic name is public via Metadata; echo it back to the caller")
+  }
+
+  @Test
+  def testControllerElectLeadersAllowsSameTenantTopicFromTenantCaller(): Unit = {
+    val controller = mock(classOf[Controller])
+    val controllerResponse = new ElectLeadersResponseData()
+    controllerResponse.replicaElectionResults().add(new ElectLeadersResponseData.ReplicaElectionResult()
+      .setTopic("acme.orders")
+      .setPartitionResult(util.Arrays.asList(
+        new ElectLeadersResponseData.PartitionResult().setPartitionId(0).setErrorCode(NONE.code))))
+    when(controller.electLeaders(
+      any(classOf[ControllerRequestContext]),
+      any(classOf[ElectLeadersRequestData])))
+      .thenReturn(CompletableFuture.completedFuture(controllerResponse))
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.empty())
+
+    val req = buildTokenRequest(
+      new ElectLeadersRequest.Builder(ElectionType.PREFERRED,
+        util.Arrays.asList(new org.apache.kafka.common.TopicPartition("acme.orders", 0)), 30000).build(),
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_acme.alice"))
+
+    controllerApis.handleElectLeaders(req)
+
+    val forwarded: ArgumentCaptor[ElectLeadersRequestData] =
+      ArgumentCaptor.forClass(classOf[ElectLeadersRequestData])
+    verify(controller).electLeaders(
+      any(classOf[ControllerRequestContext]),
+      forwarded.capture())
+    val forwardedTopics = forwarded.getValue.topicPartitions().asScala.map(_.topic()).toList
+    assertEquals(List("acme.orders"), forwardedTopics,
+      "tenant principal's own-namespace topic must reach the controller")
+
+    val response = captureSentResponse(req).asInstanceOf[ElectLeadersResponse]
+    val pr = response.data().replicaElectionResults().asScala.head.partitionResult().asScala.head
+    assertEquals(NONE.code(), pr.errorCode(),
+      "forwarded tenant principal may elect leaders for topics in its own namespace")
+  }
+
+  @Test
+  def testControllerElectLeadersMixedBatchSplitsRefusedAndAccepted(): Unit = {
+    val controller = mock(classOf[Controller])
+    val controllerResponse = new ElectLeadersResponseData()
+    controllerResponse.replicaElectionResults().add(new ElectLeadersResponseData.ReplicaElectionResult()
+      .setTopic("cluster-metrics")
+      .setPartitionResult(util.Arrays.asList(
+        new ElectLeadersResponseData.PartitionResult().setPartitionId(0).setErrorCode(NONE.code))))
+    when(controller.electLeaders(
+      any(classOf[ControllerRequestContext]),
+      any(classOf[ElectLeadersRequestData])))
+      .thenReturn(CompletableFuture.completedFuture(controllerResponse))
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.empty())
+
+    val req = buildTokenRequest(
+      new ElectLeadersRequest.Builder(ElectionType.PREFERRED,
+        util.Arrays.asList(
+          new org.apache.kafka.common.TopicPartition("acme.orders", 0),
+          new org.apache.kafka.common.TopicPartition("cluster-metrics", 0)
+        ), 30000).build(),
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    controllerApis.handleElectLeaders(req)
+
+    // Only the cluster-scope topic reaches the controller.
+    val forwarded: ArgumentCaptor[ElectLeadersRequestData] =
+      ArgumentCaptor.forClass(classOf[ElectLeadersRequestData])
+    verify(controller).electLeaders(
+      any(classOf[ControllerRequestContext]),
+      forwarded.capture())
+    assertEquals(List("cluster-metrics"),
+      forwarded.getValue.topicPartitions().asScala.map(_.topic()).toList,
+      "only the cluster-scope topic must reach the controller")
+
+    val response = captureSentResponse(req).asInstanceOf[ElectLeadersResponse]
+    val byName: Map[String, Short] = response.data().replicaElectionResults().asScala
+      .map(t => t.topic() -> t.partitionResult().asScala.head.errorCode()).toMap
+    assertEquals(INVALID_TOPIC_EXCEPTION.code(), byName("acme.orders"),
+      "tenant TOPIC must be refused with INVALID_TOPIC_EXCEPTION")
+    assertEquals(NONE.code(), byName("cluster-metrics"),
+      "legitimate cluster topic must round-trip with NONE")
+  }
+
+  @Test
+  def testControllerElectLeadersRefusesNullSweepFromTenantCaller(): Unit = {
+    // A forwarded tenant principal trying to elect leaders for ALL topics is
+    // a cluster-wide operation a tenant has no business performing. The
+    // controller must short-circuit with CLUSTER_AUTHORIZATION_FAILED — never
+    // even ENUMERATE the topic universe on behalf of a tenant.
+    val controller = mock(classOf[Controller])
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.empty())
+
+    val req = buildTokenRequest(
+      new ElectLeadersRequest.Builder(ElectionType.PREFERRED, null, 30000).build(),
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_acme.alice"))
+
+    controllerApis.handleElectLeaders(req)
+
+    verify(controller, never()).electLeaders(
+      any(classOf[ControllerRequestContext]),
+      any(classOf[ElectLeadersRequestData]))
+
+    val response = captureSentResponse(req).asInstanceOf[ElectLeadersResponse]
+    assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED.code(), response.data().errorCode(),
+      "a tenant principal must never null-sweep the whole cluster")
+  }
+
+  @Test
+  def testControllerElectLeadersNullSweepStripsTenantTopicsForClusterCaller(): Unit = {
+    // Defence-in-depth: the cluster-wide caller's null-sweep is forwarded
+    // (the admin has ALTER on CLUSTER and may legitimately want this) but the
+    // controller would otherwise enumerate every tenant topic name back in
+    // the response — useful as a probe for an admin with no Metadata reach.
+    // The handler must strip tenant-namespaced entries from the response.
+    val controller = mock(classOf[Controller])
+    val controllerResponse = new ElectLeadersResponseData()
+    controllerResponse.replicaElectionResults().add(new ElectLeadersResponseData.ReplicaElectionResult()
+      .setTopic("cluster-metrics")
+      .setPartitionResult(util.Arrays.asList(
+        new ElectLeadersResponseData.PartitionResult().setPartitionId(0).setErrorCode(NONE.code))))
+    controllerResponse.replicaElectionResults().add(new ElectLeadersResponseData.ReplicaElectionResult()
+      .setTopic("acme.orders")
+      .setPartitionResult(util.Arrays.asList(
+        new ElectLeadersResponseData.PartitionResult().setPartitionId(0).setErrorCode(NONE.code))))
+    when(controller.electLeaders(
+      any(classOf[ControllerRequestContext]),
+      any(classOf[ElectLeadersRequestData])))
+      .thenReturn(CompletableFuture.completedFuture(controllerResponse))
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.empty())
+
+    val req = buildTokenRequest(
+      new ElectLeadersRequest.Builder(ElectionType.PREFERRED, null, 30000).build(),
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    controllerApis.handleElectLeaders(req)
+
+    // The forwarded request to the controller stays null-sweep.
+    val forwarded: ArgumentCaptor[ElectLeadersRequestData] =
+      ArgumentCaptor.forClass(classOf[ElectLeadersRequestData])
+    verify(controller).electLeaders(
+      any(classOf[ControllerRequestContext]),
+      forwarded.capture())
+    assertNull(forwarded.getValue.topicPartitions(),
+      "cluster-wide null-sweep is forwarded to the controller as null")
+
+    val response = captureSentResponse(req).asInstanceOf[ElectLeadersResponse]
+    val topics = response.data().replicaElectionResults().asScala.map(_.topic()).toSet
+    assertEquals(Set("cluster-metrics"), topics,
+      "tenant-namespaced topic names must be stripped from the null-sweep response")
+  }
+
+  // ---------------------------------------------------------------------------
+  // F5: ListPartitionReassignments — outside-in TOPIC scrub on the controller
+  // listener PLUS response-side enumeration defence. A direct `bootstrap.
+  // controllers` AdminClient (KIP-590) reaches handleListPartitionReassignments
+  // without traversing KafkaApis, so the broker-side filter in KafkaApis does
+  // not run. Two attack shapes:
+  //
+  //   1. List-all mode (`topics == null`): the controller would otherwise
+  //      enumerate every in-progress reassignment cluster-wide — a tenant-
+  //      topic-presence oracle plus a partition-count leak. The handler must
+  //      strip tenant-namespaced topics from the response (cluster-wide caller)
+  //      or return only own-tenant topics rewritten to their LOGICAL form
+  //      (tenant caller).
+  //
+  //   2. Per-topic mode (`topics != null`): a cluster-wide or cross-tenant
+  //      caller could name a foreign tenant topic explicitly. The response
+  //      schema has no per-entry error slot, so the handler refuses the entire
+  //      request with top-level INVALID_TOPIC_EXCEPTION — matching
+  //      F4/AlterPartitionReassignments in spirit (explicit, not silent).
+  //
+  // Same-tenant carve-out via `callerTenantFromPrincipal`: a forwarded
+  // `__tenant_acme.alice` may name `orders` (LOGICAL) per-topic; the handler
+  // translates to `acme.orders` before forwarding and back on the response.
+  // ---------------------------------------------------------------------------
+
+  @Test
+  def testControllerListPartitionReassignmentsClusterWideListAllStripsTenantNamespaced(): Unit = {
+    // Cluster-wide caller, list-all sweep. The controller would happily return
+    // every in-progress reassignment — including tenant-prefixed topics —
+    // turning the response into a tenant-topic-presence oracle. The handler
+    // must filter out any topic whose leading segment is structurally a valid
+    // tenant id, keeping only genuine cluster topics.
+    val controller = mock(classOf[Controller])
+    val controllerResponse = new ListPartitionReassignmentsResponseData()
+    controllerResponse.topics().add(new ListPartitionReassignmentsResponseData.OngoingTopicReassignment()
+      .setName("cluster-metrics")
+      .setPartitions(util.Arrays.asList(
+        new ListPartitionReassignmentsResponseData.OngoingPartitionReassignment()
+          .setPartitionIndex(0)
+          .setReplicas(util.Arrays.asList(java.lang.Integer.valueOf(1), java.lang.Integer.valueOf(2)))
+          .setAddingReplicas(util.Arrays.asList(java.lang.Integer.valueOf(2)))
+          .setRemovingReplicas(util.Collections.emptyList[java.lang.Integer]))))
+    controllerResponse.topics().add(new ListPartitionReassignmentsResponseData.OngoingTopicReassignment()
+      .setName("acme.orders")
+      .setPartitions(util.Arrays.asList(
+        new ListPartitionReassignmentsResponseData.OngoingPartitionReassignment()
+          .setPartitionIndex(0)
+          .setReplicas(util.Arrays.asList(java.lang.Integer.valueOf(3), java.lang.Integer.valueOf(4)))
+          .setAddingReplicas(util.Arrays.asList(java.lang.Integer.valueOf(4)))
+          .setRemovingReplicas(util.Collections.emptyList[java.lang.Integer]))))
+    controllerResponse.topics().add(new ListPartitionReassignmentsResponseData.OngoingTopicReassignment()
+      .setName("beta.events")
+      .setPartitions(util.Arrays.asList(
+        new ListPartitionReassignmentsResponseData.OngoingPartitionReassignment()
+          .setPartitionIndex(0)
+          .setReplicas(util.Arrays.asList(java.lang.Integer.valueOf(5)))
+          .setAddingReplicas(util.Collections.emptyList[java.lang.Integer])
+          .setRemovingReplicas(util.Collections.emptyList[java.lang.Integer]))))
+    when(controller.listPartitionReassignments(
+      any(classOf[ControllerRequestContext]),
+      any(classOf[ListPartitionReassignmentsRequestData])))
+      .thenReturn(CompletableFuture.completedFuture(controllerResponse))
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.empty())
+
+    // topics() is null on a freshly-constructed RequestData — that's the list-all sweep.
+    val data = new ListPartitionReassignmentsRequestData()
+    assertNull(data.topics(), "list-all mode requires topics == null on the wire")
+    val req = buildTokenRequest(
+      new ListPartitionReassignmentsRequest.Builder(data).build(),
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    controllerApis.handleListPartitionReassignments(req)
+
+    // The forwarded request stays list-all (null topics).
+    val forwarded: ArgumentCaptor[ListPartitionReassignmentsRequestData] =
+      ArgumentCaptor.forClass(classOf[ListPartitionReassignmentsRequestData])
+    verify(controller).listPartitionReassignments(
+      any(classOf[ControllerRequestContext]),
+      forwarded.capture())
+    assertNull(forwarded.getValue.topics(),
+      "cluster-wide list-all sweep is forwarded to the controller as null")
+
+    val response = captureSentResponse(req).asInstanceOf[ListPartitionReassignmentsResponse]
+    assertEquals(NONE.code(), response.data().errorCode())
+    val topicNames = response.data().topics().asScala.map(_.name()).toSet
+    assertEquals(Set("cluster-metrics"), topicNames,
+      "tenant-namespaced topic names must be stripped from the list-all response")
+  }
+
+  @Test
+  def testControllerListPartitionReassignmentsTenantListAllReturnsOnlyOwnNamespaceAsLogical(): Unit = {
+    // Forwarded tenant principal, list-all sweep. The controller returns the
+    // physical names it stores (`acme.orders`, `beta.events`, `cluster-metrics`)
+    // — the handler must keep only entries in this tenant's `<id>.` namespace
+    // AND rewrite them back to their logical form so the tenant only ever sees
+    // the names it would have submitted itself.
+    val controller = mock(classOf[Controller])
+    val controllerResponse = new ListPartitionReassignmentsResponseData()
+    controllerResponse.topics().add(new ListPartitionReassignmentsResponseData.OngoingTopicReassignment()
+      .setName("acme.orders")
+      .setPartitions(util.Arrays.asList(
+        new ListPartitionReassignmentsResponseData.OngoingPartitionReassignment()
+          .setPartitionIndex(0)
+          .setReplicas(util.Arrays.asList(java.lang.Integer.valueOf(1), java.lang.Integer.valueOf(2)))
+          .setAddingReplicas(util.Arrays.asList(java.lang.Integer.valueOf(2)))
+          .setRemovingReplicas(util.Collections.emptyList[java.lang.Integer]))))
+    controllerResponse.topics().add(new ListPartitionReassignmentsResponseData.OngoingTopicReassignment()
+      .setName("beta.events")
+      .setPartitions(util.Arrays.asList(
+        new ListPartitionReassignmentsResponseData.OngoingPartitionReassignment()
+          .setPartitionIndex(0)
+          .setReplicas(util.Arrays.asList(java.lang.Integer.valueOf(3)))
+          .setAddingReplicas(util.Collections.emptyList[java.lang.Integer])
+          .setRemovingReplicas(util.Collections.emptyList[java.lang.Integer]))))
+    controllerResponse.topics().add(new ListPartitionReassignmentsResponseData.OngoingTopicReassignment()
+      .setName("cluster-metrics")
+      .setPartitions(util.Arrays.asList(
+        new ListPartitionReassignmentsResponseData.OngoingPartitionReassignment()
+          .setPartitionIndex(0)
+          .setReplicas(util.Arrays.asList(java.lang.Integer.valueOf(4)))
+          .setAddingReplicas(util.Collections.emptyList[java.lang.Integer])
+          .setRemovingReplicas(util.Collections.emptyList[java.lang.Integer]))))
+    when(controller.listPartitionReassignments(
+      any(classOf[ControllerRequestContext]),
+      any(classOf[ListPartitionReassignmentsRequestData])))
+      .thenReturn(CompletableFuture.completedFuture(controllerResponse))
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.empty())
+
+    val data = new ListPartitionReassignmentsRequestData()
+    val req = buildTokenRequest(
+      new ListPartitionReassignmentsRequest.Builder(data).build(),
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_acme.alice"))
+
+    controllerApis.handleListPartitionReassignments(req)
+
+    val response = captureSentResponse(req).asInstanceOf[ListPartitionReassignmentsResponse]
+    assertEquals(NONE.code(), response.data().errorCode())
+    val topicNames = response.data().topics().asScala.map(_.name()).toSet
+    assertEquals(Set("orders"), topicNames,
+      "tenant caller must see only own-namespace topics, rewritten to LOGICAL names")
+  }
+
+  @Test
+  def testControllerListPartitionReassignmentsClusterWidePerTopicForeignRefused(): Unit = {
+    // Cluster-wide caller naming a mixed batch (one cluster topic + one foreign
+    // tenant topic) per-topic. The response schema has NO per-entry error slot
+    // (only top-level ErrorCode/ErrorMessage on OngoingTopicReassignment is
+    // absent), so partial refusal is not expressible. The handler refuses the
+    // entire request with top-level INVALID_TOPIC_EXCEPTION and the controller
+    // is never called.
+    val controller = mock(classOf[Controller])
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.empty())
+
+    val data = new ListPartitionReassignmentsRequestData()
+    // `topics` is `nullableVersions: "0+", default: null` on the wire, so the
+    // generated POJO returns null unless we materialise the list explicitly.
+    data.setTopics(new util.ArrayList[ListPartitionReassignmentsRequestData.ListPartitionReassignmentsTopics]())
+    data.topics().add(new ListPartitionReassignmentsRequestData.ListPartitionReassignmentsTopics()
+      .setName("cluster-metrics")
+      .setPartitionIndexes(util.Arrays.asList(java.lang.Integer.valueOf(0))))
+    data.topics().add(new ListPartitionReassignmentsRequestData.ListPartitionReassignmentsTopics()
+      .setName("acme.orders")
+      .setPartitionIndexes(util.Arrays.asList(java.lang.Integer.valueOf(0))))
+    val req = buildTokenRequest(
+      new ListPartitionReassignmentsRequest.Builder(data).build(),
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    controllerApis.handleListPartitionReassignments(req)
+
+    // Controller must NEVER see the foreign-tenant topic. Whole request refused.
+    verify(controller, never()).listPartitionReassignments(
+      any(classOf[ControllerRequestContext]),
+      any(classOf[ListPartitionReassignmentsRequestData]))
+
+    val response = captureSentResponse(req).asInstanceOf[ListPartitionReassignmentsResponse]
+    assertEquals(INVALID_TOPIC_EXCEPTION.code(), response.data().errorCode(),
+      "any foreign-tenant entry must refuse the entire request (no per-entry error slot)")
+    assertNotNull(response.data().errorMessage())
+    assertTrue(response.data().errorMessage().contains("acme.orders"),
+      "topic name is public via Metadata; echo it back to the caller")
+    assertTrue(response.data().topics() == null || response.data().topics().isEmpty,
+      "refused request returns no per-topic entries")
+  }
+
+  @Test
+  def testControllerListPartitionReassignmentsTenantPerTopicTranslatesLogicalToPhysical(): Unit = {
+    // Forwarded tenant principal names `orders` per-topic (the LOGICAL form
+    // it would have submitted on the tenant listener). The handler must
+    // translate to `acme.orders` BEFORE forwarding (the controller only
+    // knows physical names) and translate the controller's `acme.orders`
+    // response back to `orders` so the tenant never sees its own prefix.
+    val controller = mock(classOf[Controller])
+    val controllerResponse = new ListPartitionReassignmentsResponseData()
+    controllerResponse.topics().add(new ListPartitionReassignmentsResponseData.OngoingTopicReassignment()
+      .setName("acme.orders")
+      .setPartitions(util.Arrays.asList(
+        new ListPartitionReassignmentsResponseData.OngoingPartitionReassignment()
+          .setPartitionIndex(0)
+          .setReplicas(util.Arrays.asList(java.lang.Integer.valueOf(1), java.lang.Integer.valueOf(2)))
+          .setAddingReplicas(util.Arrays.asList(java.lang.Integer.valueOf(2)))
+          .setRemovingReplicas(util.Collections.emptyList[java.lang.Integer]))))
+    when(controller.listPartitionReassignments(
+      any(classOf[ControllerRequestContext]),
+      any(classOf[ListPartitionReassignmentsRequestData])))
+      .thenReturn(CompletableFuture.completedFuture(controllerResponse))
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.empty())
+
+    val data = new ListPartitionReassignmentsRequestData()
+    data.setTopics(new util.ArrayList[ListPartitionReassignmentsRequestData.ListPartitionReassignmentsTopics]())
+    data.topics().add(new ListPartitionReassignmentsRequestData.ListPartitionReassignmentsTopics()
+      .setName("orders")
+      .setPartitionIndexes(util.Arrays.asList(java.lang.Integer.valueOf(0))))
+    val req = buildTokenRequest(
+      new ListPartitionReassignmentsRequest.Builder(data).build(),
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_acme.alice"))
+
+    controllerApis.handleListPartitionReassignments(req)
+
+    // Forwarded request must carry the PHYSICAL form so the controller's
+    // physical-name store actually matches.
+    val forwarded: ArgumentCaptor[ListPartitionReassignmentsRequestData] =
+      ArgumentCaptor.forClass(classOf[ListPartitionReassignmentsRequestData])
+    verify(controller).listPartitionReassignments(
+      any(classOf[ControllerRequestContext]),
+      forwarded.capture())
+    assertEquals(util.Arrays.asList("acme.orders"),
+      forwarded.getValue.topics().asScala.map(_.name()).asJava,
+      "tenant per-topic logical name must be rewritten to physical before forwarding")
+
+    val response = captureSentResponse(req).asInstanceOf[ListPartitionReassignmentsResponse]
+    assertEquals(NONE.code(), response.data().errorCode())
+    val topicNames = response.data().topics().asScala.map(_.name()).toSet
+    assertEquals(Set("orders"), topicNames,
+      "response must echo the tenant's LOGICAL name, never the physical form")
+  }
+
   @AfterEach
   def tearDown(): Unit = {
     quotasNeverThrottleControllerMutations.shutdown()
