@@ -4495,13 +4495,11 @@ class KafkaApis(val requestChannel: RequestChannel,
               }
             }
         } else {
-          val rejectedResults = rejectedRead.map { td =>
+          val rejectedResults = rejectedRead.map { case (td, err, msg) =>
             new ReadShareGroupStateResponseData.ReadStateResult()
               .setTopicId(td.topicId)
               .setPartitions(td.partitions.asScala.map { p =>
-                ReadShareGroupStateResponse.toErrorResponsePartitionResult(
-                  p.partition, Errors.INVALID_REQUEST,
-                  "Backing topic for concentrated logical topics is not addressable as a share-partition.")
+                ReadShareGroupStateResponse.toErrorResponsePartitionResult(p.partition, err, msg)
               }.asJava)
           }
           if (forwardedRead.isEmpty) {
@@ -4555,13 +4553,11 @@ class KafkaApis(val requestChannel: RequestChannel,
               }
             }
         } else {
-          val rejectedResults = rejectedWrite.map { td =>
+          val rejectedResults = rejectedWrite.map { case (td, err, msg) =>
             new WriteShareGroupStateResponseData.WriteStateResult()
               .setTopicId(td.topicId)
               .setPartitions(td.partitions.asScala.map { p =>
-                WriteShareGroupStateResponse.toErrorResponsePartitionResult(
-                  p.partition, Errors.INVALID_REQUEST,
-                  "Backing topic for concentrated logical topics is not addressable as a share-partition.")
+                WriteShareGroupStateResponse.toErrorResponsePartitionResult(p.partition, err, msg)
               }.asJava)
           }
           if (forwardedWrite.isEmpty) {
@@ -4588,20 +4584,44 @@ class KafkaApis(val requestChannel: RequestChannel,
   }
 
   /**
-   * r19 ADV-A BLOCKER #144 helper. Partition share-state request topics into a rejected set
-   * (those whose TopicId resolves via the metadata cache to a backing-topic name registered
-   * in the concentration kernel) and a forwarded set (everything else). The resolution can
-   * miss in two ways: (a) the UUID is unknown — let the share-coord handle UNKNOWN_TOPIC_ID
-   * downstream; (b) the name resolves but isn't a backing topic — forward normally. Only when
-   * BOTH the resolution succeeds AND the kernel agrees it's a backing topic do we reject.
+   * r19 ADV-A BLOCKER #144 + r21 BLOCKER #171 helper. Partition share-state request topics into
+   * a REJECTED list (with a per-element error code + message) and a FORWARDED list (safe to send
+   * to the share coordinator). The previous implementation used
+   * {@code metadataCache.getTopicName(id).exists(concentrationKernel.isBackingTopic)} which
+   * collapsed THREE distinct outcomes into the forward bucket on a {@code None} resolution:
+   *
+   *   (a) UUID resolves to a backing-topic name — REJECT (the #144 case);
+   *   (b) UUID resolves to a non-backing name — forward (normal flow);
+   *   (c) UUID does NOT resolve (cache stale, controller failover catching up, deleted-name not
+   *       yet evicted across image refresh) — was forwarded ⇒ FAIL-OPEN: a backing UUID landing
+   *       in window (c) would have been persisted in __share_group_state keyed on the BACKING
+   *       topic-id, corrupting acquisition tracking for every logical tenant on that backing.
+   *
+   * Fix: window (c) is now rejected with UNKNOWN_TOPIC_ID — the same response the share coord
+   * would emit downstream for a topic-id that genuinely doesn't exist, but applied here so a
+   * backing UUID can never reach the coordinator log through a stale-cache crack. The
+   * INVALID_REQUEST message for window (a) keeps the original wording to preserve test surface
+   * and to distinguish "this is a backing topic" from "this topic doesn't exist."
    */
   private def partitionShareStateTopicsForBackingTopic[T](
       topics: Seq[T],
-      topicIdOf: T => Uuid): (Seq[T], Seq[T]) = {
-    topics.partition { t =>
+      topicIdOf: T => Uuid): (Seq[(T, Errors, String)], Seq[T]) = {
+    val rejected = Seq.newBuilder[(T, Errors, String)]
+    val forwarded = Seq.newBuilder[T]
+    topics.foreach { t =>
       val id = topicIdOf(t)
-      metadataCache.getTopicName(id).exists(concentrationKernel.isBackingTopic)
+      metadataCache.getTopicName(id) match {
+        case Some(name) if concentrationKernel.isBackingTopic(name) =>
+          rejected += ((t, Errors.INVALID_REQUEST,
+            "Backing topic for concentrated logical topics is not addressable as a share-partition."))
+        case Some(_) =>
+          forwarded += t
+        case None =>
+          rejected += ((t, Errors.UNKNOWN_TOPIC_ID,
+            "Topic id is not present in the broker's metadata image; the broker may be catching up after a metadata update."))
+      }
     }
+    (rejected.result(), forwarded.result())
   }
 
   def handleDeleteShareGroupStateRequest(request: RequestChannel.Request): Unit = {

@@ -13550,6 +13550,89 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testReadShareGroupStateFailsClosedOnUnresolvedTopicId(): Unit = {
+    // r21 BLOCKER #171 — when the broker's metadata image cannot resolve a TopicId (cache stale
+    // mid-failover, image rebuild in progress, deleted-name not yet evicted across the refresh
+    // window), the original guard at partitionShareStateTopicsForBackingTopic used
+    //   metadataCache.getTopicName(id).exists(concentrationKernel.isBackingTopic)
+    // which collapsed a None resolution into the forward bucket, letting a backing-topic UUID
+    // through during that transient window — corrupting __share_group_state.
+    // Fail-closed: an unresolved UUID is rejected with UNKNOWN_TOPIC_ID and the share-coord
+    // never sees the request. This denies a brief UX window for legitimate UNKNOWN_TOPIC_ID
+    // flows in exchange for closing the cross-tenant corruption surface.
+    val mysteryTopicId = Uuid.randomUuid()
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
+    // INTENTIONALLY do NOT add this topic to the metadata cache — simulate the stale-image race.
+
+    val readRequestData = new ReadShareGroupStateRequestData()
+      .setGroupId("group1")
+      .setTopics(List(
+        new ReadShareGroupStateRequestData.ReadStateData()
+          .setTopicId(mysteryTopicId)
+          .setPartitions(List(
+            new ReadShareGroupStateRequestData.PartitionData().setPartition(0).setLeaderEpoch(1),
+            new ReadShareGroupStateRequestData.PartitionData().setPartition(1).setLeaderEpoch(1)
+          ).asJava)
+      ).asJava)
+
+    val requestChannelRequest = buildRequest(new ReadShareGroupStateRequest.Builder(readRequestData, true).build())
+    kafkaApis = createKafkaApis(
+      overrideProperties = Map(ShareGroupConfig.SHARE_GROUP_ENABLE_CONFIG -> "true") ++
+        ShareCoordinatorTestConfig.testConfigMap().asScala
+    )
+    kafkaApis.handle(requestChannelRequest, RequestLocal.noCaching())
+
+    val response = verifyNoThrottling[ReadShareGroupStateResponse](requestChannelRequest)
+    assertEquals(1, response.data.results.size)
+    val topicResult = response.data.results.get(0)
+    assertEquals(mysteryTopicId, topicResult.topicId)
+    assertEquals(2, topicResult.partitions.size)
+    topicResult.partitions.forEach { partResult =>
+      assertEquals(Errors.UNKNOWN_TOPIC_ID.code(), partResult.errorCode(),
+        s"partition ${partResult.partition} must surface UNKNOWN_TOPIC_ID — never silently forwarded")
+    }
+    // The share coordinator must never see an unresolved topic-id — that's the whole point.
+    verify(shareCoordinator, never()).readState(any[RequestContext], any[ReadShareGroupStateRequestData])
+  }
+
+  @Test
+  def testWriteShareGroupStateFailsClosedOnUnresolvedTopicId(): Unit = {
+    // r21 BLOCKER #171 — symmetric with the read path. WriteShareGroupState persists to
+    // __share_group_state, so any backing UUID slipping through is unrecoverable without manual
+    // coordinator-log surgery; failing closed on unresolved IDs is the only safe posture.
+    val mysteryTopicId = Uuid.randomUuid()
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
+    // INTENTIONALLY do NOT add this topic to the metadata cache.
+
+    val writeRequestData = new WriteShareGroupStateRequestData()
+      .setGroupId("group1")
+      .setTopics(List(
+        new WriteShareGroupStateRequestData.WriteStateData()
+          .setTopicId(mysteryTopicId)
+          .setPartitions(List(
+            new WriteShareGroupStateRequestData.PartitionData()
+              .setPartition(0).setLeaderEpoch(1).setStateEpoch(1).setStartOffset(0)
+          ).asJava)
+      ).asJava)
+
+    val requestChannelRequest = buildRequest(new WriteShareGroupStateRequest.Builder(writeRequestData, true).build())
+    kafkaApis = createKafkaApis(
+      overrideProperties = Map(ShareGroupConfig.SHARE_GROUP_ENABLE_CONFIG -> "true") ++
+        ShareCoordinatorTestConfig.testConfigMap().asScala
+    )
+    kafkaApis.handle(requestChannelRequest, RequestLocal.noCaching())
+
+    val response = verifyNoThrottling[WriteShareGroupStateResponse](requestChannelRequest)
+    assertEquals(1, response.data.results.size)
+    val topicResult = response.data.results.get(0)
+    assertEquals(mysteryTopicId, topicResult.topicId)
+    assertEquals(1, topicResult.partitions.size)
+    assertEquals(Errors.UNKNOWN_TOPIC_ID.code(), topicResult.partitions.get(0).errorCode(),
+      "unresolved UUID must NOT be persisted — fail-closed prevents backing-UUID corruption of __share_group_state")
+    verify(shareCoordinator, never()).writeState(any[RequestContext], any[WriteShareGroupStateRequestData])
+  }
+
+  @Test
   def testWriteShareGroupStateSuccess(): Unit = {
     val topicId = Uuid.randomUuid();
     val writeRequestData = new WriteShareGroupStateRequestData()
@@ -13750,6 +13833,14 @@ class KafkaApisTest extends Logging {
       any[ReadShareGroupStateRequestData]
     )).thenReturn(future)
     metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
+    // r21 BLOCKER #171 — the share-state guard now fails-closed on UUIDs that don't resolve
+    // through metadataCache. The helper resets the cache, so we re-register each request's
+    // topic-id under a synthetic non-backing name to keep success-path tests exercisable. The
+    // fail-closed coverage is in testRead/WriteShareGroupStateFailsClosedOnUnresolvedTopicId,
+    // which construct kafkaApis without going through this helper.
+    requestData.topics.asScala.foreach { td =>
+      addTopicToMetadataCache(s"share-state-helper-${td.topicId}", numPartitions = 4, topicId = td.topicId)
+    }
     kafkaApis = createKafkaApis(
       overrideProperties = configOverrides,
       authorizer = Option(authorizer),
@@ -13779,6 +13870,12 @@ class KafkaApisTest extends Logging {
       any[WriteShareGroupStateRequestData]
     )).thenReturn(future)
     metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
+    // r21 BLOCKER #171 — see getReadShareGroupResponse for the same rationale: helper resets
+    // the cache, so re-register each request's topic-id so the success-path tests pass through
+    // the fail-closed unresolved-UUID guard installed in partitionShareStateTopicsForBackingTopic.
+    requestData.topics.asScala.foreach { td =>
+      addTopicToMetadataCache(s"share-state-helper-${td.topicId}", numPartitions = 4, topicId = td.topicId)
+    }
     kafkaApis = createKafkaApis(
       overrideProperties = configOverrides,
       authorizer = Option(authorizer),
