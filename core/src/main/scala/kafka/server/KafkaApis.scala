@@ -156,6 +156,30 @@ class KafkaApis(val requestChannel: RequestChannel,
     false
   }
 
+  // Whether this Fetch is a *trusted* inter-broker follower fetch.
+  //
+  // `FetchRequest.isFromFollower` is purely wire-derived (`replicaId >= 0`);
+  // it is a CLIENT-controlled boolean. Any caller that already holds
+  // `CLUSTER_ACTION` on the cluster (super-users, MirrorMaker service
+  // accounts, replica-audit operators) can flip the broker into "follower
+  // fetch" mode by setting `replicaId=99` from a cluster-wide listener and
+  // by-pass the outside-in pollution guard at line 1349 — `isFromFollower`
+  // is the very predicate that turns the guard OFF. The follower-branch
+  // CLUSTER_ACTION check at line 1423 then waves the spoof through, and the
+  // tenant's physical topic (`acme.orders`) is returned by name.
+  //
+  // A real inter-broker follower always arrives on `config.interBrokerListenerName`.
+  // Pin the trust to that listener: a `replicaId >= 0` fetch on any other
+  // listener is treated as a regular consumer fetch (outside-in guard
+  // applies, READ ACL required, etc.). Legitimate replication is unaffected
+  // because the inter-broker listener is exactly where replicas connect.
+  private def isInterBrokerFollowerFetch(request: RequestChannel.Request,
+                                         fetchRequest: FetchRequest): Boolean = {
+    if (!fetchRequest.isFromFollower) return false
+    val ibl = config.interBrokerListenerName
+    ibl != null && ibl == request.context.listenerName
+  }
+
   // Outside-in guard for coordinator-keyed namespaces (consumer-group ids and
   // transactional ids). The physical wire form is `__tenant_<id>.<logical>`; a
   // privileged caller on a non-tenant listener naming `__tenant_acme.foo`
@@ -1343,10 +1367,16 @@ class KafkaApis(val requestChannel: RequestChannel,
     // check — which a permissive ACL passes. Surface reserved-prefix entries
     // as UNKNOWN_TOPIC_OR_PARTITION (via foreignFetchTips → foreignErroneous
     // below) so the response is indistinguishable from a real miss; this
-    // closes both the data leak and the existence oracle. Follower fetches
-    // are skipped (inter-broker traffic legitimately addresses physical names
-    // and is already gated on CLUSTER_ACTION).
-    val outsideInGuardActive = !tenantScoped && !fetchRequest.isFromFollower && !tenantConfig.allTenants.isEmpty
+    // closes both the data leak and the existence oracle.
+    //
+    // The follower-fetch skip must be pinned to the inter-broker listener
+    // (see `isInterBrokerFollowerFetch`). `FetchRequest.isFromFollower` is
+    // purely wire-derived (replicaId >= 0); a CLUSTER_ACTION holder on a
+    // cluster-wide listener could otherwise spoof it and read tenant
+    // physical topics by name. A legitimate replica always arrives on the
+    // inter-broker listener; any other replicaId>=0 fetch is treated as a
+    // regular consumer fetch and subject to the outside-in guard.
+    val outsideInGuardActive = !tenantScoped && !isInterBrokerFollowerFetch(request, fetchRequest) && !tenantConfig.allTenants.isEmpty
     val fetchData = if (tenantScoped) {
       val rewritten = new util.LinkedHashMap[TopicIdPartition, FetchRequest.PartitionData](rawFetchData.size)
       rawFetchData.forEach { (tip, data) =>

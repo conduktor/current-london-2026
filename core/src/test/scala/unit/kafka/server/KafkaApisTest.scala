@@ -11747,6 +11747,109 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testFetchFollowerSpoofOnClusterWideListenerRefusesTenantPhysicalForm(): Unit = {
+    // Adversarial: `FetchRequest.isFromFollower` is wire-derived (replicaId
+    // >= 0); a caller with CLUSTER_ACTION on a cluster-wide listener can flip
+    // it from -1 to 99 and turn into a "follower". The previous outside-in
+    // predicate (`!fetchRequest.isFromFollower`) used that single boolean to
+    // disable the foreign-fetch guard, and the follower branch's
+    // CLUSTER_ACTION check let the spoofed request through. The fix pins
+    // follower trust to `config.interBrokerListenerName`: replicaId>=0 on any
+    // other listener is treated as a regular consumer fetch and the
+    // outside-in guard buckets `acme.orders` into foreignFetchTips →
+    // UNKNOWN_TOPIC_OR_PARTITION, indistinguishable from a real miss.
+    val attackerListener = new ListenerName("EXTERNAL_SASL")
+    val topicId = Uuid.randomUuid()
+    val physicalTp = new TopicPartition("acme.orders", 0)
+    addTopicToMetadataCache(physicalTp.topic, numPartitions = 1, numBrokers = 1, topicId)
+
+    val emptyFetchData = new util.LinkedHashMap[TopicIdPartition, FetchRequest.PartitionData]()
+    val fetchMetadata = new JFetchMetadata(0, 0)
+    val fetchContext = new FullFetchContext(time, new FetchSessionCacheShard(1000, 100),
+      fetchMetadata, emptyFetchData, true, true)
+    val newContextFetchDataCaptor = ArgumentCaptor.forClass(classOf[util.Map[TopicIdPartition, FetchRequest.PartitionData]])
+    when(fetchManager.newContext(
+      any[Short], any[JFetchMetadata], any[Boolean],
+      newContextFetchDataCaptor.capture(),
+      any[util.List[TopicIdPartition]],
+      any[util.Map[Uuid, String]],
+      any[Option[String]])).thenReturn(fetchContext)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    // Spoofed follower fetch: replicaId=99 (not -1). Default inter-broker
+    // listener is PLAINTEXT; the attacker arrives on EXTERNAL_SASL with
+    // CLUSTER_ACTION-class privileges (no tenant prefix on the principal).
+    val fetchDataBuilder = Map(physicalTp -> new FetchRequest.PartitionData(topicId, 0, 0, 1000,
+      Optional.empty())).asJava
+    val fetchRequest = new FetchRequest.Builder(16, 16, 99, 1, 100, 0, fetchDataBuilder).build()
+    val request = buildRequest(
+      fetchRequest,
+      listenerName = attackerListener,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "cluster-admin"))
+
+    kafkaApis = createKafkaApis(
+      authorizer = None,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleFetchRequest(request)
+
+    assertTrue(newContextFetchDataCaptor.getValue.isEmpty,
+      s"spoofed-follower reserved-form TIPs must not enter fetchManager.newContext; saw ${newContextFetchDataCaptor.getValue.keySet}")
+
+    val response = verifyNoThrottling[FetchResponse](request)
+    val partitionData = response.data.responses.asScala.head.partitions.asScala.head
+    assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION.code, partitionData.errorCode,
+      "spoofed-follower fetch on a non-inter-broker listener must see UNKNOWN_TOPIC_OR_PARTITION, identical to a real miss")
+
+    verify(replicaManager, never()).fetchMessages(any(), any(), any(), any())
+  }
+
+  @Test
+  def testFetchLegitimateFollowerOnInterBrokerListenerSkipsOutsideInGuard(): Unit = {
+    // Complement of the spoof test: a real replica fetch on the inter-broker
+    // listener (PLAINTEXT in test setup, == config.interBrokerListenerName)
+    // must continue to address tenant physical topics by name. Otherwise
+    // replication of tenant partitions would be broken by the fix above.
+    // The TIP must reach fetchManager.newContext untouched.
+    val topicId = Uuid.randomUuid()
+    val physicalTp = new TopicPartition("acme.orders", 0)
+    val tidp = new TopicIdPartition(topicId, physicalTp)
+    addTopicToMetadataCache(physicalTp.topic, numPartitions = 1, numBrokers = 1, topicId)
+
+    val emptyFetchData = new util.LinkedHashMap[TopicIdPartition, FetchRequest.PartitionData]()
+    val fetchMetadata = new JFetchMetadata(0, 0)
+    val fetchContext = new FullFetchContext(time, new FetchSessionCacheShard(1000, 100),
+      fetchMetadata, emptyFetchData, true, true)
+    val newContextFetchDataCaptor = ArgumentCaptor.forClass(classOf[util.Map[TopicIdPartition, FetchRequest.PartitionData]])
+    when(fetchManager.newContext(
+      any[Short], any[JFetchMetadata], any[Boolean],
+      newContextFetchDataCaptor.capture(),
+      any[util.List[TopicIdPartition]],
+      any[util.Map[Uuid, String]],
+      any[Option[String]])).thenReturn(fetchContext)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val fetchDataBuilder = Map(physicalTp -> new FetchRequest.PartitionData(topicId, 0, 0, 1000,
+      Optional.empty())).asJava
+    // replicaId=2 = legitimate follower; listenerName defaults to PLAINTEXT
+    // which is exactly the inter-broker listener in the test broker config.
+    val fetchRequest = new FetchRequest.Builder(16, 16, 2, 1, 100, 0, fetchDataBuilder).build()
+    val request = buildRequest(
+      fetchRequest,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "broker-2"))
+
+    kafkaApis = createKafkaApis(
+      authorizer = None,
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleFetchRequest(request)
+
+    val capturedFetchData = newContextFetchDataCaptor.getValue
+    assertTrue(capturedFetchData.containsKey(tidp),
+      s"legitimate follower fetch on inter-broker listener must reach fetchManager.newContext; saw ${capturedFetchData.keySet}")
+  }
+
+  @Test
   def testFetchV12TenantResponseTopicFieldIsLogical(): Unit = {
     // Pre-id-fetch (v0-12) carries the Topic string on the wire. The broker
     // must rewrite logical -> physical end-to-end (so sessions, replicaManager
