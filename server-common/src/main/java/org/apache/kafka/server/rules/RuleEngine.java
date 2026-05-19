@@ -464,6 +464,46 @@ public final class RuleEngine {
                     + "whitespace (ASCII or Unicode). Internal whitespace is "
                     + "allowed (eg. SSL DNs like `CN=Broker One,OU=...`).");
             }
+            // Round-19 BLOCKER (R19-A #1 / R19-D BLOCKER-1): PROMPT.md
+            // operator contract claims this parser rejects "internal
+            // C0/C1/zero-width/bidi codepoints". Without this check, an
+            // operator typo embedding an invisible codepoint inside an
+            // otherwise-valid component (e.g. `User:broker​` — looks
+            // identical to `User:broker` on screen) parses successfully
+            // but produces an allow-list entry whose canonical form can
+            // never match a runtime peer principal — silent under-grant of
+            // the bypass, with no diagnostic. The leading/trailing
+            // whitespace check above does NOT catch these: zero-width and
+            // bidi codepoints are not classified as whitespace by either
+            // Character.isWhitespace or Character.isSpaceChar; C0 and C1
+            // control chars are reachable in the interior because the
+            // whitespace check only inspects the first and last code
+            // points. Reject any internal occurrence and surface the
+            // failure at broker startup, where it can be fixed.
+            String typeInvisible = firstInvisibleCodePointLabel(type);
+            if (typeInvisible != null) {
+                throw new IllegalArgumentException(
+                    "governance.bypass.principals entry has invisible "
+                    + "codepoint (" + typeInvisible + ") in principal "
+                    + "type: '" + trimmed + "'. Invisible codepoints "
+                    + "(C0/C1 controls, zero-width, bidi overrides) "
+                    + "produce an allow-list entry whose canonical form "
+                    + "can never match a runtime peer principal; reject "
+                    + "at startup rather than under-granting the bypass "
+                    + "silently.");
+            }
+            String nameInvisible = firstInvisibleCodePointLabel(name);
+            if (nameInvisible != null) {
+                throw new IllegalArgumentException(
+                    "governance.bypass.principals entry has invisible "
+                    + "codepoint (" + nameInvisible + ") in principal "
+                    + "name: '" + trimmed + "'. Invisible codepoints "
+                    + "(C0/C1 controls, zero-width, bidi overrides) "
+                    + "produce an allow-list entry whose canonical form "
+                    + "can never match a runtime peer principal; reject "
+                    + "at startup rather than under-granting the bypass "
+                    + "silently.");
+            }
             out.add(principal.toString());
         }
         return Collections.unmodifiableSet(out);
@@ -508,6 +548,60 @@ public final class RuleEngine {
         int first = s.codePointAt(0);
         int last = s.codePointBefore(s.length());
         return isAnyWhitespaceCodePoint(first) || isAnyWhitespaceCodePoint(last);
+    }
+
+    /**
+     * Scan {@code s} for any invisible code point that would survive both
+     * the whitespace check and {@link String#isBlank()} but make the
+     * canonical principal form unreachable at runtime. Returns a short
+     * human-readable label for the first offending code point, or
+     * {@code null} if {@code s} is clean.
+     *
+     * <p>Round-19 BLOCKER. Rejects:
+     * <ul>
+     *   <li>C0 control chars (U+0000–U+001F) and DEL (U+007F). Leading and
+     *       trailing TAB/LF/CR are already caught by
+     *       {@link #hasLeadingOrTrailingWhitespace} above; this also
+     *       catches them <i>internally</i>, plus the rest of the C0
+     *       block which is not classified as whitespace.</li>
+     *   <li>C1 control chars (U+0080–U+009F).</li>
+     *   <li>Zero-width spacing characters: ZWSP (U+200B), ZWNJ (U+200C),
+     *       ZWJ (U+200D), and BOM / ZWNBSP (U+FEFF). These render as
+     *       nothing, so a typo embedding one is visually indistinguishable
+     *       from the intended value.</li>
+     *   <li>Bidi formatting controls: LRE/RLE/PDF/LRO/RLO
+     *       (U+202A–U+202E) and LRI/RLI/FSI/PDI (U+2066–U+2069). A typo
+     *       embedding one of these reorders the visible component on
+     *       screen while the codepoint sits invisibly in the underlying
+     *       string — a silent under-grant vector.</li>
+     * </ul>
+     *
+     * <p>The visible-ASCII space (U+0020) and the SSL-DN-friendly inner
+     * spaces inside e.g. {@code CN=Broker One,...} remain unaffected: they
+     * are not in any of the ranges above.
+     */
+    private static String firstInvisibleCodePointLabel(String s) {
+        int len = s.length();
+        for (int i = 0; i < len; ) {
+            int cp = s.codePointAt(i);
+            if (cp <= 0x001F || cp == 0x007F) {
+                return String.format("C0 control U+%04X", cp);
+            }
+            if (cp >= 0x0080 && cp <= 0x009F) {
+                return String.format("C1 control U+%04X", cp);
+            }
+            if (cp == 0x200B || cp == 0x200C || cp == 0x200D || cp == 0xFEFF) {
+                return String.format("zero-width U+%04X", cp);
+            }
+            if (cp >= 0x202A && cp <= 0x202E) {
+                return String.format("bidi override U+%04X", cp);
+            }
+            if (cp >= 0x2066 && cp <= 0x2069) {
+                return String.format("bidi isolate U+%04X", cp);
+            }
+            i += Character.charCount(cp);
+        }
+        return null;
     }
 
     /**

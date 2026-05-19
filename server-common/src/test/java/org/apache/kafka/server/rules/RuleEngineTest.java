@@ -1349,6 +1349,123 @@ public class RuleEngineTest {
     }
 
     @Test
+    public void parseBypassPrincipalsRejectsInvisibleCodePointsInNameOrType() {
+        // Round-19 BLOCKER (R19-A #1 / R19-D BLOCKER-1): PROMPT.md operator
+        // contract claims parseBypassPrincipals aborts broker startup on
+        // entries containing internal C0/C1/zero-width/bidi codepoints.
+        // Without this rejection, a typo embedding an invisible codepoint
+        // (e.g. zero-width space inside `broker`, indistinguishable on
+        // screen) parses successfully but produces an allow-list entry
+        // whose canonical form can never match a runtime peer principal —
+        // a silent under-grant of the bypass that doesn't surface until
+        // request time, when ALL traffic is being denied. The check must
+        // run at startup so the operator sees the typo loudly.
+        //
+        // Each branch below uses a codepoint from one of the four contract
+        // categories, embedded INTERNALLY in either the type or the name.
+        // Leading/trailing whitespace is already caught by the existing
+        // whitespace check (parseBypassPrincipalsThrowsOnPaddedComponent),
+        // so this test focuses on the interior position.
+
+        // ---- C0 control char (internal TAB inside name) ----
+        IllegalArgumentException c0 = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals("User:bro\tker"));
+        assertTrue(c0.getMessage().contains("C0 control")
+            && c0.getMessage().contains("principal name"),
+            "internal C0 (TAB) in name must abort startup with a C0-control "
+                + "diagnostic; got: " + c0.getMessage());
+
+        // ---- C1 control char (internal NEL U+0085 inside type) ----
+        IllegalArgumentException c1 = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals("User:broker"));
+        assertTrue(c1.getMessage().contains("C1 control")
+            && c1.getMessage().contains("principal type"),
+            "internal C1 (NEL U+0085) in type must abort startup with a "
+                + "C1-control diagnostic; got: " + c1.getMessage());
+
+        // ---- Zero-width space (internal ZWSP U+200B inside name) ----
+        // This is the headline silent-under-grant case: `User:broker​` and
+        // `User:broker` are visually identical, but the first contains a
+        // ZWSP and parses to an unreachable allow-list entry. Operators
+        // copy/paste principal strings out of dashboards, chat threads,
+        // and tickets, all of which can carry zero-width contamination.
+        IllegalArgumentException zwsp = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals("User:bro​ker"));
+        assertTrue(zwsp.getMessage().contains("zero-width")
+            && zwsp.getMessage().contains("U+200B")
+            && zwsp.getMessage().contains("principal name"),
+            "internal ZWSP (U+200B) in name must abort startup with a "
+                + "zero-width diagnostic naming the codepoint; got: "
+                + zwsp.getMessage());
+
+        // ---- BOM / ZWNBSP (U+FEFF inside name) ----
+        IllegalArgumentException bom = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals("User:bro﻿ker"));
+        assertTrue(bom.getMessage().contains("zero-width")
+            && bom.getMessage().contains("U+FEFF"),
+            "internal BOM (U+FEFF) must abort startup with a zero-width "
+                + "diagnostic naming the codepoint; got: " + bom.getMessage());
+
+        // ---- Bidi override (LRE U+202A inside type) ----
+        IllegalArgumentException lre = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals("Us‪er:broker"));
+        assertTrue(lre.getMessage().contains("bidi override")
+            && lre.getMessage().contains("U+202A")
+            && lre.getMessage().contains("principal type"),
+            "internal LRE (U+202A) in type must abort startup with a "
+                + "bidi-override diagnostic naming the codepoint; got: "
+                + lre.getMessage());
+
+        // ---- Bidi isolate (LRI U+2066 inside name) ----
+        IllegalArgumentException lri = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals("User:bro⁦ker"));
+        assertTrue(lri.getMessage().contains("bidi isolate")
+            && lri.getMessage().contains("U+2066"),
+            "internal LRI (U+2066) must abort startup with a bidi-isolate "
+                + "diagnostic naming the codepoint; got: " + lri.getMessage());
+
+        // ---- ZWJ / ZWNJ also rejected (U+200C, U+200D) ----
+        org.junit.jupiter.api.Assertions.assertThrows(
+            IllegalArgumentException.class,
+            () -> RuleEngine.parseBypassPrincipals("User:bro‌ker"),
+            "ZWNJ (U+200C) in name must abort startup");
+        org.junit.jupiter.api.Assertions.assertThrows(
+            IllegalArgumentException.class,
+            () -> RuleEngine.parseBypassPrincipals("User:bro‍ker"),
+            "ZWJ (U+200D) in name must abort startup");
+
+        // ---- DEL (U+007F) also rejected ----
+        IllegalArgumentException del = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals("User:broker"));
+        assertTrue(del.getMessage().contains("C0 control")
+            && del.getMessage().contains("U+007F"),
+            "DEL (U+007F) must be reported as C0 control; got: "
+                + del.getMessage());
+
+        // ---- Sanity: regression guard for the legitimate SSL DN path ----
+        // The SSL-DN test asserts internal ASCII space is OK. Pin the
+        // *negative* shape of the new check: nothing in `CN=Broker One,...`
+        // is in any of the rejected ranges (space is U+0020 — outside C0,
+        // not classified zero-width or bidi). If the implementation ever
+        // accidentally widens to include U+0020, this test would catch
+        // that immediately because the SSL DN test would start failing
+        // with a "C0 control" message — but pin it explicitly here too so
+        // a failure points directly at codepoint-rejection scope.
+        String sslDn = "User:CN=Broker One,OU=Kafka Brokers,O=Example Corp,C=US";
+        java.util.Set<String> okSsl = RuleEngine.parseBypassPrincipals(sslDn);
+        assertEquals(1, okSsl.size(),
+            "internal ASCII space (U+0020) must NOT be rejected by the "
+                + "codepoint check; got: " + okSsl);
+    }
+
+    @Test
     public void reentrantEvaluateFromActivationSupplierIsCaughtAndFailsOpen() {
         // Round-8 audit task #100: the per-request CEL step budget is reset
         // on entry and again in a finally on exit. A re-entrant evaluate()
