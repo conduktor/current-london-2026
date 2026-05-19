@@ -16,6 +16,7 @@
  */
 package org.apache.kafka.network.iouring;
 
+import org.apache.kafka.common.config.internals.BrokerSecurityConfigs;
 import org.apache.kafka.common.memory.MemoryPool;
 import org.apache.kafka.common.memory.SimpleMemoryPool;
 import org.apache.kafka.common.network.ByteBufferSend;
@@ -24,6 +25,9 @@ import org.apache.kafka.common.network.KafkaChannel;
 import org.apache.kafka.common.network.ListenerName;
 import org.apache.kafka.common.network.NetworkReceive;
 import org.apache.kafka.common.network.NetworkSend;
+import org.apache.kafka.common.security.auth.AuthenticationContext;
+import org.apache.kafka.common.security.auth.KafkaPrincipal;
+import org.apache.kafka.common.security.auth.KafkaPrincipalBuilder;
 import org.apache.kafka.common.utils.MockTime;
 
 import org.junit.jupiter.api.AfterEach;
@@ -33,6 +37,7 @@ import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -40,6 +45,7 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.embedded.EmbeddedChannel;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -470,6 +476,119 @@ class IoUringSelectorTest {
         s.poll(0);
         assertTrue(s.disconnected().isEmpty(), "channel that read recently must not be expired");
         assertNotNull(s.channel(id));
+    }
+
+    @Test
+    void idleExpiryDoesNotReapMutedChannelWithBackpressuredSend() throws Exception {
+        // C-18-F1 regression: a muted channel with an in-flight response blocked at Netty's
+        // high water mark (kernel send buffer full or peer's TCP window closed) used to lose
+        // every lastActiveNanos bump — mute gates the read step, and the pre-fix write step
+        // only bumped on `written > 0`. The idle sweep then evicted the channel mid-response,
+        // surfaced EXPIRED in disconnected(), discarded the pending NetworkSend, and tore
+        // the connection down while the peer was still waiting for the reply.
+        //
+        // The fix: bump lastActiveNanos whenever the channel has a pending send, regardless
+        // of bytes flushed this poll. This test exercises the bug by:
+        //   1) muting the channel (no read-step bumps),
+        //   2) staging a NetworkSend (hasSend() = true),
+        //   3) backpressuring the EmbeddedChannel so write() returns 0 every poll,
+        //   4) advancing past the idle window.
+        // With the pre-fix code, the channel is reaped; with the fix, it survives.
+        long idle = TimeUnit.MILLISECONDS.toNanos(100);
+        IoUringSelector s = newSelector(idle);
+        EmbeddedChannel netty = acceptNew(s, REMOTE_A);
+        s.poll(0);
+        String id = s.connected().get(0);
+
+        // Mirror the production Processor mute/send pair: mute first, then enqueue the
+        // response. Order matters — selector.send wires through KafkaChannel.setSend which
+        // requires the channel to exist in channels(), which the accept poll above provides.
+        s.mute(id);
+        ByteBuffer body = ByteBuffer.wrap("backpressured-response".getBytes());
+        s.send(new NetworkSend(id, ByteBufferSend.sizePrefixed(body)));
+
+        // Force IoUringTransportLayer.write to return 0 every poll: setUserDefinedWritability
+        // flips Netty's outbound past the high water mark, so bytesBeforeUnwritable() == 0
+        // and the watermark gate returns 0 without ever allocating a ByteBuf. Same primitive
+        // IoUringTransportLayerTest uses in writeReturnsZeroOncePastHighWaterMarkRegardlessOfChunkSize.
+        netty.unsafe().outboundBuffer().setUserDefinedWritability(1, false);
+        assertFalse(netty.isWritable(), "preconditions: channel is past high water mark");
+
+        // Cross the idle window with multiple polls so the write-step runs repeatedly
+        // against a backpressured channel — each poll's write call returns 0 bytes.
+        for (int i = 0; i < 5; i++) {
+            time.sleep(50);
+            s.poll(0);
+        }
+
+        assertTrue(s.disconnected().isEmpty(),
+            "muted channel with pending send must survive idle expiry while bytes are queued — " +
+            "otherwise the response is silently discarded mid-flight and the peer sees a reset. " +
+            "Disconnected was: " + s.disconnected());
+        assertNotNull(s.channel(id),
+            "channel must still be present in channels() — the F1 idle sweep used to evict it here");
+
+        // Release backpressure and prove the channel is still functional, not just kept
+        // around half-dead: the staged send must complete on the next poll.
+        netty.unsafe().outboundBuffer().setUserDefinedWritability(1, true);
+        s.poll(0);
+        assertEquals(1, s.completedSends().size(),
+            "once backpressure clears, the staged send must complete — channel was healthy all along");
+        assertEquals(id, s.completedSends().get(0).destinationId());
+    }
+
+    /**
+     * KafkaPrincipalBuilder whose constructor throws a {@link LinkageError} — stands in for
+     * the NoClassDefFoundError / ExceptionInInitializerError surface area the production
+     * principal-builder reflection path exposes when a class is misconfigured or its static
+     * init fails. Public + static so {@code Utils.newInstance} can find a public no-arg
+     * constructor via reflection.
+     */
+    public static final class ThrowingErrorPrincipalBuilder implements KafkaPrincipalBuilder {
+        public ThrowingErrorPrincipalBuilder() {
+            throw new LinkageError("simulated principal-builder initializer failure (F10 regression)");
+        }
+        @Override
+        public KafkaPrincipal build(AuthenticationContext context) {
+            throw new IllegalStateException("never reached — constructor throws");
+        }
+    }
+
+    @Test
+    void onAcceptCatchesErrorFromPrincipalBuilderConstructor() {
+        // C-18-F10 regression: the pre-fix onAccept catch was `catch (RuntimeException e)`
+        // which let Errors from reflective principal-builder construction escape into the
+        // Netty event-loop thread. NoClassDefFoundError, ExceptionInInitializerError, and
+        // LinkageError all bypass RuntimeException — when they escape onAccept, the IO
+        // handler dies and the listener silently freezes for every subsequent accept.
+        //
+        // The fix widens the catch to Throwable, runs the same per-channel cleanup
+        // (close authenticator + transport + Netty channel), logs loudly, and only
+        // re-throws VirtualMachineError so JVM crash-fast semantics are preserved.
+        // This test exercises the LinkageError path explicitly via a KafkaPrincipalBuilder
+        // whose constructor throws.
+        Map<String, Object> configs = Map.of(
+            BrokerSecurityConfigs.PRINCIPAL_BUILDER_CLASS_CONFIG, ThrowingErrorPrincipalBuilder.class);
+        selector = new IoUringSelector(LISTENER, MAX_RECEIVE, MemoryPool.NONE,
+                                       IDLE_NANOS_NEVER, time, 0, configs);
+        EmbeddedChannel netty = new EmbeddedChannel();
+        channels.add(netty);
+
+        assertDoesNotThrow(() -> selector.onAccept(netty, REMOTE_A, LOCAL),
+            "onAccept must catch the Error from the build path — letting it escape kills " +
+            "the Netty event-loop thread and freezes the listener for every subsequent accept");
+
+        assertTrue(selector.channels().isEmpty(),
+            "no channel must be published when the principal-builder constructor throws — " +
+            "the partially-built state was rolled back by the catch block");
+        assertFalse(netty.isOpen(),
+            "the catch block must close the Netty channel — otherwise the fd leaks per failed accept");
+
+        // Selector itself is still alive: a poll() does not throw and surfaces nothing.
+        assertDoesNotThrow(() -> selector.poll(0),
+            "selector must remain functional after onAccept's catch block runs");
+        assertTrue(selector.connected().isEmpty());
+        assertTrue(selector.disconnected().isEmpty());
     }
 
     @Test

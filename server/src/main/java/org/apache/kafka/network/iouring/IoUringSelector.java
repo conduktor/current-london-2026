@@ -363,11 +363,26 @@ public final class IoUringSelector implements BrokerSelector {
             metadata.registerClientInformation(ClientInformation.EMPTY);
             final Authenticator authForLambda = authenticator;
             channel = new KafkaChannel(id, transport, () -> authForLambda, maxReceiveSize, memoryPool, metadata);
-        } catch (RuntimeException e) {
-            log.warn("io_uring: failed to build KafkaChannel for {} — releasing transport+authenticator", id, e);
+        } catch (Throwable t) {
+            // C-18-F10: catch Throwable, not just RuntimeException. PrincipalBuilder.build()
+            // and IoUringPlaintextAuthenticator's reflective principal-builder load can throw
+            // Error subclasses (NoClassDefFoundError, ExceptionInInitializerError, LinkageError)
+            // when a misconfigured principal.builder.class fails to load. Catching only
+            // RuntimeException lets those Errors escape the event-loop thread, killing the
+            // Netty IO handler and silently freezing the listener (no further accepts/reads
+            // fire). Mirrors B-17-3 in IoUringSupport.computeProbe and NIO Selector.register's
+            // pattern of treating channel-build failure as a per-channel close, not a
+            // listener-fatal event. VM-fatal Errors (OOMError, StackOverflowError) are still
+            // re-thrown below so JVM termination semantics are preserved.
+            log.warn("io_uring: failed to build KafkaChannel for {} — releasing transport+authenticator", id, t);
             Utils.closeQuietly(authenticator, "authenticator on accept-build failure");
             Utils.closeQuietly(transport, "transport on accept-build failure");
             nettyChannel.close();
+            if (t instanceof VirtualMachineError) {
+                // OOMError, StackOverflowError, InternalError — the JVM is in an unrecoverable
+                // state, propagating preserves crash-fast semantics.
+                throw (VirtualMachineError) t;
+            }
             return;
         }
 
@@ -540,12 +555,13 @@ public final class IoUringSelector implements BrokerSelector {
                 }
             }
 
-            // Write step.
+            // Write step. C-18-F1: pending send counts as activity even if write()==0
+            // (Netty high-water). See idleExpiryDoesNotReapMutedChannelWithBackpressuredSend.
             if (channel.hasSend()) {
+                lastActiveNanos.put(channel.id(), nowNanos);
                 try {
                     long written = channel.write();
                     if (written > 0) {
-                        lastActiveNanos.put(channel.id(), nowNanos);
                         madeProgress = true;
                     }
                     NetworkSend send = channel.maybeCompleteSend();
