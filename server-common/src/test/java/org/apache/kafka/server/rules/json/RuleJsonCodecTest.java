@@ -26,6 +26,7 @@ import org.junit.jupiter.api.Test;
 import java.nio.charset.StandardCharsets;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -390,6 +391,53 @@ public class RuleJsonCodecTest {
         assertTrue(ex.getMessage().contains("malformed JSON envelope"),
             "trailing-token rejection must surface as a malformed-JSON failure: "
                 + ex.getMessage());
+    }
+
+    @Test
+    public void trailingWhitespaceAfterEnvelopeIsTolerated() throws Exception {
+        // R28 #253: FAIL_ON_TRAILING_TOKENS rejects non-whitespace content past
+        // the closing brace (covered by #250's trailingTokensAfterEnvelopeRejected
+        // above) but Jackson's contract for the feature explicitly excludes
+        // whitespace — `\n`, `\r`, `\t`, and space characters after the tree
+        // are not "tokens" and must remain tolerated. Without this test, a
+        // Jackson upgrade or codec refactor that flips that semantics (e.g. by
+        // wiring a stricter parser feature, or by replacing readTree with a
+        // raw token-loop that bails on any trailing byte) would silently
+        // reject every newline-terminated rule producer in production —
+        // which is the canonical shape because line-delimited JSON is the
+        // common operator format. Pin the tolerance contract here.
+        //
+        // Discriminating power: the assertion below would FAIL if any of the
+        // four whitespace flavours were rejected — proving the test
+        // exercises the tolerance rather than only the happy path. The
+        // negative control for the converse property (trailing non-whitespace)
+        // is the sibling #250 test above.
+        String body = "{\"apiKeys\":[\"METADATA\"],"
+            + "\"action\":\"DENY\","
+            + "\"when\":\"true\","
+            + "\"errorCode\":47}";
+        // Cover space, tab, LF, CR, and a mixed combination — every flavour
+        // a hand-edited rule file or POSIX `echo` pipeline would append.
+        String[] trailings = { " ", "\t", "\n", "\r", " \t\r\n  " };
+        for (String t : trailings) {
+            String json = body + t;
+            Rule rule = RuleJsonCodec.decode("rid", json.getBytes(StandardCharsets.UTF_8));
+            assertNotNull(rule, "trailing-whitespace flavour " + escape(t)
+                + " must decode cleanly under FAIL_ON_TRAILING_TOKENS");
+            assertEquals(RuleAction.DENY, rule.action(),
+                "decoded rule body must round-trip the action regardless of "
+                    + "trailing whitespace flavour " + escape(t));
+        }
+    }
+
+    private static String escape(String s) {
+        StringBuilder out = new StringBuilder("[");
+        for (int i = 0; i < s.length(); i++) {
+            int cp = s.codePointAt(i);
+            out.append(String.format("U+%04X ", cp));
+        }
+        out.append(']');
+        return out.toString();
     }
 
     @Test
