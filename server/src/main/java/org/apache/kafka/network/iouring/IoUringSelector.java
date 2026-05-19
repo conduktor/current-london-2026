@@ -404,8 +404,18 @@ public final class IoUringSelector implements BrokerSelector {
         // Stash the netty channel so mute/unmute can flip autoRead without chasing
         // references through the KafkaChannel's selectionKey.
         nettyChannels.put(id, nettyChannel);
-        pendingAccepts.offer(channel);
+        // CONC-1: increment BEFORE publishing into pendingAccepts. Otherwise the Processor
+        // thread can poll() the queue (poll loop at line ~510) and decrementAndGet from N
+        // to N-1 (or 0 to -1) before this event-loop thread runs the increment — the count
+        // recovers to N immediately after, but during the window pendingAcceptCount can
+        // observe negative. Today the only reader is the cap check above, which treats
+        // negative as "below cap" identically to zero, so the bug is latent. Future
+        // observability hooks (metrics, debug-dump assertions, invariant guards) that
+        // expect "count is always the queue depth" would trip. Increment-before-publish
+        // makes the invariant hold continuously: count >= queue.size at every observation
+        // point because the increment lands before the queue slot is visible.
         pendingAcceptCount.incrementAndGet();
+        pendingAccepts.offer(channel);
 
         // B-17-1: re-check closed AFTER publishing. close() drains channels / closingChannels
         // / nettyChannels / pendingAccepts based on the snapshot taken when closed was set
