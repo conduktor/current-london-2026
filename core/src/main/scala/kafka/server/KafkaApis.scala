@@ -3706,6 +3706,17 @@ class KafkaApis(val requestChannel: RequestChannel,
     } else if (!authHelper.authorize(request.context, READ, GROUP, shareGroupHeartbeatRequest.data.groupId)) {
       requestHelper.sendMaybeThrottle(request, shareGroupHeartbeatRequest.getErrorResponse(Errors.GROUP_AUTHORIZATION_FAILED.exception))
       CompletableFuture.completedFuture[Unit](())
+    } else if (shareGroupHeartbeatRequest.data.subscribedTopicNames != null &&
+               shareGroupHeartbeatRequest.data.subscribedTopicNames.asScala.exists(isViewTopic)) {
+      // Symmetric with the SHARE_FETCH / SHARE_ACKNOWLEDGE rejections at lines 3977 and 4068:
+      // share consumers do not currently route through the view rewrite + predicate path, so
+      // admitting a view into the subscription would persist coordinator state for a member
+      // whose assigned partitions can never be served — every subsequent SHARE_FETCH returns
+      // INVALID_TOPIC_EXCEPTION and the group wedges. Reject at heartbeat with the same
+      // error code the fetch path uses so a single retry without the view name clears the
+      // condition. Mirrors the read-only contract across both consumer protocols.
+      requestHelper.sendMaybeThrottle(request, shareGroupHeartbeatRequest.getErrorResponse(Errors.INVALID_TOPIC_EXCEPTION.exception))
+      CompletableFuture.completedFuture[Unit](())
     } else {
       groupCoordinator.shareGroupHeartbeat(
         request.context,

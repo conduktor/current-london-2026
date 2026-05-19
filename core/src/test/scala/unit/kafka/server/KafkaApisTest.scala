@@ -13787,6 +13787,74 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testShareGroupHeartbeatRejectsViewTopicSubscription(): Unit = {
+    // R42 close: heartbeat must reject a subscription that names a view topic *before* the
+    // coordinator persists member/subscription state. Otherwise the group wedges: the heartbeat
+    // returns success and gets an assignment, but every subsequent SHARE_FETCH for that
+    // assignment returns INVALID_TOPIC_EXCEPTION (see handleFetchFromShareFetchRequest at
+    // KafkaApis.scala:3977 and the symmetric SHARE_ACKNOWLEDGE rejection at 4068). The fix
+    // is symmetric — same INVALID_TOPIC_EXCEPTION code so a single retry without the view
+    // clears the condition. groupCoordinator.shareGroupHeartbeat must never be called for
+    // a subscription that contains a view.
+    val viewTopic = "shgh-view"
+    val regularTopic = "shgh-regular"
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, "shgh-backing")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.x == 1")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+
+    val shareGroupHeartbeatRequest = new ShareGroupHeartbeatRequestData()
+      .setGroupId("group")
+      .setSubscribedTopicNames(List(viewTopic, regularTopic).asJava)
+
+    val requestChannelRequest = buildRequest(new ShareGroupHeartbeatRequest.Builder(shareGroupHeartbeatRequest, true).build())
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
+    kafkaApis = createKafkaApis(
+      configRepository = configRepository,
+      overrideProperties = Map(ShareGroupConfig.SHARE_GROUP_ENABLE_CONFIG -> "true"),
+    )
+    kafkaApis.handle(requestChannelRequest, RequestLocal.noCaching)
+
+    val response = verifyNoThrottling[ShareGroupHeartbeatResponse](requestChannelRequest)
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, response.data.errorCode,
+      "subscription containing a view must be rejected upfront so no wedged coordinator state is persisted")
+    verify(groupCoordinator, never()).shareGroupHeartbeat(any(), any())
+  }
+
+  @Test
+  def testShareGroupHeartbeatAdmitsNonViewSubscription(): Unit = {
+    // Sibling guard for testShareGroupHeartbeatRejectsViewTopicSubscription: the view filter
+    // must not regress the regular-topic path. A subscription consisting only of non-view
+    // topics still flows through to the coordinator unchanged.
+    val regularTopic = "shgh-regular-only"
+
+    val shareGroupHeartbeatRequest = new ShareGroupHeartbeatRequestData()
+      .setGroupId("group")
+      .setSubscribedTopicNames(List(regularTopic).asJava)
+
+    val requestChannelRequest = buildRequest(new ShareGroupHeartbeatRequest.Builder(shareGroupHeartbeatRequest, true).build())
+
+    val future = new CompletableFuture[ShareGroupHeartbeatResponseData]()
+    when(groupCoordinator.shareGroupHeartbeat(
+      requestChannelRequest.context,
+      shareGroupHeartbeatRequest
+    )).thenReturn(future)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
+    kafkaApis = createKafkaApis(
+      overrideProperties = Map(ShareGroupConfig.SHARE_GROUP_ENABLE_CONFIG -> "true"),
+    )
+    kafkaApis.handle(requestChannelRequest, RequestLocal.noCaching)
+
+    val expectedResponse = new ShareGroupHeartbeatResponseData()
+    future.complete(expectedResponse)
+    val response = verifyNoThrottling[ShareGroupHeartbeatResponse](requestChannelRequest)
+    assertEquals(expectedResponse, response.data)
+    verify(groupCoordinator).shareGroupHeartbeat(any(), any())
+  }
+
+  @Test
   def testShareGroupHeartbeatRequestFutureFailed(): Unit = {
     val shareGroupHeartbeatRequest = new ShareGroupHeartbeatRequestData().setGroupId("group")
 
