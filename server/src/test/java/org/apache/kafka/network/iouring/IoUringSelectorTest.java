@@ -517,6 +517,60 @@ class IoUringSelectorTest {
     }
 
     @Test
+    void slowTricklePartialFrameKeepsChannelAliveLikeNio() throws Exception {
+        // LASTACTIVE-PARITY (#137 — finding verified invalid via this regression).
+        // Audit FINDING-N1 claimed: "NIO bumps idleExpiryManager BEFORE the read attempt
+        // for every ready selection key; io_uring only bumps after read>0. Effect: a slow-
+        // paced PLAINTEXT client (small partial frames spaced near connections.max.idle.ms)
+        // gets expired by io_uring but kept alive by NIO."
+        //
+        // That conclusion is incorrect. NIO's pollSelectionKeys only iterates keys the
+        // kernel reported as ready, which is exactly the kernel saying "bytes arrived" —
+        // the io_uring analogue is bytes hitting the inbound queue, which translates 1:1
+        // to read()>0 on the next poll. As long as the peer trickles ANY bytes per idle
+        // window, both implementations bump lastActive on every such poll.
+        //
+        // This test pins the behavior: deliver bytes one fragment at a time (2 bytes each,
+        // never forming a complete frame on its own), advance MockTime by ~half the idle
+        // window between fragments, and assert the channel is still alive after the total
+        // elapsed time has crossed the idle window many times over.
+        long idle = TimeUnit.MILLISECONDS.toNanos(100);
+        IoUringSelector s = newSelector(idle);
+        EmbeddedChannel netty = acceptNew(s, REMOTE_A);
+        s.poll(0);
+        String id = s.connected().get(0);
+
+        // First fragment: a 4-byte size header advertising a 1000-byte body. Subsequent
+        // fragments deliver only 2 body bytes each — total body delivered = 38 bytes,
+        // far short of the 1000-byte payload, so NetworkReceive never completes and
+        // completedReceives stays empty. That keeps us on the "partial frame, no complete
+        // receive" path the audit was worried about, where the audit predicted io_uring
+        // would silently expire the channel.
+        ByteBuffer header = ByteBuffer.allocate(4);
+        header.putInt(1000);
+        header.flip();
+        s.onRead(netty, Unpooled.wrappedBuffer(header));
+        s.poll(0); // header drained, lastActive bumped
+
+        // 19 fragments × 50ms each = 950ms more, well past the 100ms idle window.
+        // Each onRead+poll bumps lastActive via read()>0.
+        byte[] twoBodyBytes = new byte[]{0x55, (byte) 0xAA};
+        for (int i = 0; i < 19; i++) {
+            time.sleep(50);
+            s.onRead(netty, Unpooled.wrappedBuffer(twoBodyBytes));
+            s.poll(0);
+            assertTrue(s.disconnected().isEmpty(),
+                "iteration " + i + ": channel must survive trickled partial frames as long as " +
+                "bytes are delivered within the idle window — NIO behaves the same way, " +
+                "this is the parity invariant. Disconnected was: " + s.disconnected());
+        }
+        assertEquals(0, s.completedReceives().size(),
+            "preconditions: this scenario must never complete a receive — otherwise it's " +
+            "exercising a different code path than the audit's slow-trickle case");
+        assertNotNull(s.channel(id), "channel must still be present after the full trickle sequence");
+    }
+
+    @Test
     void idleExpiryDoesNotReapMutedChannelWithBackpressuredSend() throws Exception {
         // C-18-F1 regression: a muted channel with an in-flight response blocked at Netty's
         // high water mark (kernel send buffer full or peer's TCP window closed) used to lose
