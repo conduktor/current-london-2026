@@ -258,7 +258,26 @@ class ControllerApis(
         providedNames.remove(name)
       }
     }
-    request.topicNames.forEach(addProvidedName)
+    // Outside-in pollution guard. A caller reaching ControllerApis directly
+    // via `bootstrap.controllers` bypasses KafkaApis.handleDeleteTopicsRequest
+    // and its name/UUID scrub — they could submit `acme.orders` as a literal
+    // name or a tenant topic UUID, and the controller would delete the topic
+    // out from under tenant acme. Refuse any tenant-namespaced name (or
+    // UUID-resolved name; see below) before forwarding. Principal-aware via
+    // `isForeignTenantNamespace`: the legitimate forwarded tenant flow
+    // (broker rewrote `orders` → `acme.orders`, envelope carries
+    // `__tenant_acme.alice`) passes through untouched.
+    val callerTenant = callerTenantFromPrincipal(context.principal.getName)
+    def refuseIfTenantPolluting(name: String): Boolean = {
+      if (isForeignTenantNamespace(name, callerTenant)) {
+        appendResponse(name, ZERO_UUID, new ApiError(INVALID_TOPIC_EXCEPTION,
+          "Topic name '" + name + "' is reserved (tenant namespace prefix)"))
+        true
+      } else false
+    }
+    request.topicNames.forEach { name =>
+      if (!refuseIfTenantPolluting(name)) addProvidedName(name)
+    }
     request.topics.forEach {
       topic => if (topic.name == null) {
         if (topic.topicId.equals(ZERO_UUID)) {
@@ -270,7 +289,7 @@ class ControllerApis(
         }
       } else {
         if (topic.topicId.equals(ZERO_UUID)) {
-          addProvidedName(topic.name)
+          if (!refuseIfTenantPolluting(topic.name)) addProvidedName(topic.name)
         } else {
           appendResponse(topic.name, topic.topicId, new ApiError(INVALID_REQUEST,
             "You may not specify both topic name and topic id."))
@@ -293,8 +312,23 @@ class ControllerApis(
         if (nameOrError.isError) {
           appendResponse(null, id, nameOrError.error())
         } else {
-          toAuthenticate.add(nameOrError.result())
-          idToName.put(id, nameOrError.result())
+          val resolved = nameOrError.result()
+          // UUID resolution can surface a tenant-namespaced name even when
+          // the caller supplied only the topic id. The bootstrap.controllers
+          // bypass exposes this: a cluster-acting principal that knows or
+          // guesses a tenant topic's UUID could otherwise delete it through
+          // this path. Refuse the resolved name. Principal-aware so the
+          // legitimate forwarded tenant delete (envelope carries
+          // `__tenant_acme.alice`) passes. Note the response surfaces the
+          // ACTUAL `id` (not ZERO_UUID like the named path) so the caller
+          // sees which UUID was rejected.
+          if (isForeignTenantNamespace(resolved, callerTenant)) {
+            appendResponse(resolved, id, new ApiError(INVALID_TOPIC_EXCEPTION,
+              "Topic name '" + resolved + "' is reserved (tenant namespace prefix)"))
+          } else {
+            toAuthenticate.add(resolved)
+            idToName.put(id, resolved)
+          }
         }
       }
       // Get the list of deletable topics (those we can delete) and the list of describable

@@ -2097,6 +2097,188 @@ class ControllerApisTest {
     verify(controller, never()).createTopics(any(), any(), any())
   }
 
+  // ---------------------------------------------------------------------------
+  // bootstrap.controllers TOPIC scrub — DeleteTopics (#121 step 2)
+  //
+  // DeleteTopics has three distinct input paths in the request body:
+  //   1. legacy `topicNames` (List[String])
+  //   2. `topics` with `.name` set and `.topicId == ZERO_UUID`
+  //   3. `topics` with `.topicId` set and `.name == null` — the controller
+  //      resolves the id to a name via `findTopicNames` AFTER the named-input
+  //      scrub runs
+  // Each must refuse a tenant-namespaced name when the caller's principal is
+  // not within that tenant. The UUID path is especially nasty: a cluster-wide
+  // caller that learns or guesses a tenant topic's id could otherwise delete
+  // it through the controller with no tenant context whatsoever.
+  // ---------------------------------------------------------------------------
+
+  @Test
+  def testControllerDeleteTopicsRefusesTenantPrefixedNameOnBootstrapControllers(): Unit = {
+    // Path 1+2: legacy `topicNames` AND `topics[].name`. Cluster-acting
+    // anonymous caller via bootstrap.controllers sends both shapes targeting
+    // `acme.orders` — both must surface INVALID_TOPIC_EXCEPTION and the
+    // controller must never see the deletion.
+    val controller = mock(classOf[Controller])
+    // The controller is still consulted to resolve the (empty) UUID set and
+    // the (empty post-scrub) name set, and the deletion path is invoked
+    // with an empty id set. Stub all three to empty results so the scrub
+    // is the ONLY barrier between the request and any actual deletion.
+    when(controller.findTopicNames(any(classOf[ControllerRequestContext]), any(classOf[java.util.Collection[Uuid]])))
+      .thenReturn(CompletableFuture.completedFuture(java.util.Collections.emptyMap[Uuid, ResultOrError[String]]()))
+    when(controller.findTopicIds(any(classOf[ControllerRequestContext]), any(classOf[java.util.Collection[String]])))
+      .thenReturn(CompletableFuture.completedFuture(java.util.Collections.emptyMap[String, ResultOrError[Uuid]]()))
+    when(controller.deleteTopics(any(classOf[ControllerRequestContext]), any(classOf[java.util.Set[Uuid]])))
+      .thenReturn(CompletableFuture.completedFuture(java.util.Collections.emptyMap[Uuid, org.apache.kafka.common.requests.ApiError]()))
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    val request = new DeleteTopicsRequestData()
+    request.setTopicNames(util.Arrays.asList("acme.orders"))
+    request.topics().add(new DeleteTopicState().setName("acme.payments").setTopicId(ZERO_UUID))
+    val results = controllerApis.deleteTopics(ANONYMOUS_CONTEXT, request,
+      ApiKeys.DELETE_TOPICS.latestVersion().toInt,
+      hasClusterAuth = true,
+      _ => Set.empty,
+      _ => Set.empty).get().asScala.toList
+    val resultsByName = results.map(r => r.name -> r.errorCode).toMap
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, resultsByName("acme.orders"),
+      "controller-direct DeleteTopics must refuse tenant-prefixed name from `topicNames`")
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, resultsByName("acme.payments"),
+      "controller-direct DeleteTopics must refuse tenant-prefixed name from `topics[].name`")
+    // The controller is still called for housekeeping (resolve IDs, then
+    // pass the surviving id set to deleteTopics) but the surviving id set
+    // MUST be empty — no scrubbed name made it through to actual deletion.
+    val idCaptor: ArgumentCaptor[java.util.Set[Uuid]] =
+      ArgumentCaptor.forClass(classOf[java.util.Set[Uuid]])
+    verify(controller).deleteTopics(any(classOf[ControllerRequestContext]), idCaptor.capture())
+    assertEquals(java.util.Collections.emptySet[Uuid](), idCaptor.getValue,
+      "scrub must short-circuit before any id reaches controller.deleteTopics")
+    // A name-only refusal carries ZERO_UUID; we never reveal whatever id the
+    // controller happens to hold for that physical name.
+    val resultsById = results.map(r => r.name -> r.topicId).toMap
+    assertEquals(ZERO_UUID, resultsById("acme.orders"))
+    assertEquals(ZERO_UUID, resultsById("acme.payments"))
+  }
+
+  @Test
+  def testControllerDeleteTopicsRefusesTenantOwnedUuidOnBootstrapControllers(): Unit = {
+    // Path 3 (the gnarly one): caller supplies a UUID with no name and the
+    // controller resolves it via findTopicNames. The resolved name reveals
+    // the topic lives in tenant `acme`'s namespace — the scrub MUST refuse
+    // at that point and the deletion MUST not proceed. Without the
+    // callback-side scrub, this id-only request would call
+    // `controller.deleteTopics(idToName.keySet)` and quietly delete the
+    // tenant's topic.
+    val acmeOrdersId = Uuid.fromString("vZKYST0pSA2HO5x_6hoO2Q")
+    val controller = new MockController.Builder()
+      .newInitialTopic("acme.orders", acmeOrdersId).build()
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    val request = new DeleteTopicsRequestData()
+    request.topics().add(new DeleteTopicState().setName(null).setTopicId(acmeOrdersId))
+    val results = controllerApis.deleteTopics(ANONYMOUS_CONTEXT, request,
+      ApiKeys.DELETE_TOPICS.latestVersion().toInt,
+      hasClusterAuth = true,
+      // hasClusterAuth=true short-circuits the authorize-by-name filter
+      // (`(topicsToAuthenticate.toSet, topicsToAuthenticate.toSet)`) so the
+      // scrub is the ONLY barrier between the resolved name and deletion.
+      _ => Set.empty,
+      _ => Set.empty).get().asScala.toList
+    assertEquals(1, results.size, "id-only delete must surface exactly one response")
+    val result = results.head
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, result.errorCode,
+      "UUID-resolved tenant topic must surface INVALID_TOPIC_EXCEPTION")
+    assertEquals("acme.orders", result.name,
+      "refusal must echo the resolved physical name so the cluster operator can diagnose")
+    assertEquals(acmeOrdersId, result.topicId,
+      "UUID path must surface the original id, not ZERO_UUID (named path is the one that uses ZERO_UUID)")
+    // Verify the topic still exists in MockController — the scrub blocked
+    // the deletion, not just the response synthesis.
+    val survives = controller.findTopicIds(ANONYMOUS_CONTEXT,
+      util.Collections.singleton("acme.orders")).get()
+    assertEquals(acmeOrdersId, survives.get("acme.orders").result(),
+      "MockController must still hold the topic — scrub must block the actual delete, not just the response")
+  }
+
+  @Test
+  def testControllerDeleteTopicsAllowsLegitimateForwardedTenantPrincipal(): Unit = {
+    // Must-not-regress: legitimate tenant DeleteTopics. Tenant client sends
+    // `DeleteTopics("orders")` to its broker listener; KafkaApis rewrites
+    // the name to `acme.orders` and envelopes the request to the controller
+    // with `forwardedPrincipal=__tenant_acme.alice`. The principal-aware
+    // scrub must NOT refuse here — the broker has already validated the
+    // listener/principal binding (#86, #110), so the caller's tenant
+    // identity is canonical from the forwarded principal.
+    val deleteTopicsRequest = new DeleteTopicsRequest.Builder(
+      new DeleteTopicsRequestData().setTopicNames(util.Arrays.asList("acme.orders"))).build()
+    val tenantPrincipal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_acme.alice")
+    val envelopeRequest = kafka.utils.TestUtils.buildEnvelopeRequest(
+      deleteTopicsRequest, envelopePrincipalSerde, requestChannelMetrics, time.nanoseconds(),
+      forwardedPrincipal = tenantPrincipal,
+      outerPrincipal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    val controller = mock(classOf[Controller])
+    val acmeOrdersId = Uuid.fromString("vZKYST0pSA2HO5x_6hoO2Q")
+    when(controller.findTopicNames(any(classOf[ControllerRequestContext]), any(classOf[java.util.Collection[Uuid]])))
+      .thenReturn(CompletableFuture.completedFuture(java.util.Collections.emptyMap[Uuid, ResultOrError[String]]()))
+    when(controller.findTopicIds(any(classOf[ControllerRequestContext]), any(classOf[java.util.Collection[String]])))
+      .thenReturn(CompletableFuture.completedFuture(
+        java.util.Collections.singletonMap("acme.orders", new ResultOrError[Uuid](acmeOrdersId))))
+    when(controller.deleteTopics(any(classOf[ControllerRequestContext]), any(classOf[java.util.Set[Uuid]])))
+      .thenReturn(CompletableFuture.completedFuture(
+        java.util.Collections.singletonMap(acmeOrdersId, org.apache.kafka.common.requests.ApiError.NONE)))
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = tenantConfigBinding("acme", "CONTROLLER"))
+    controllerApis.handle(envelopeRequest, RequestLocal.noCaching())
+
+    // The scrub did NOT refuse: the controller received the delete with
+    // the physical name resolved to its id. Without principal-aware
+    // gating, this assertion would fail and the legitimate tenant flow
+    // would be silently broken at the controller.
+    verify(controller).deleteTopics(any(classOf[ControllerRequestContext]),
+      any(classOf[java.util.Set[Uuid]]))
+  }
+
+  @Test
+  def testControllerDeleteTopicsRefusesCrossTenantPrincipalForeignNamespace(): Unit = {
+    // Cross-tenant pollution by way of a known-tenant principal. The
+    // adversary holds credentials for tenant `evil` (or merely names a
+    // `__tenant_*` principal that the controller treats as a known tenant)
+    // and asks the controller — via envelope — to delete `acme.orders`.
+    // Even though the principal is tenant-namespaced, the topic's prefix
+    // names a DIFFERENT tenant. The scrub must refuse: `callerTenant` is
+    // `Some("evil")` and `isForeignTenantNamespace("acme.orders", Some("evil"))`
+    // is true because tenant `acme` is known AND `Some("evil") != Some("acme")`.
+    val deleteTopicsRequest = new DeleteTopicsRequest.Builder(
+      new DeleteTopicsRequestData().setTopicNames(util.Arrays.asList("acme.orders"))).build()
+    val crossTenantPrincipal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_evil.alice")
+    val envelopeRequest = kafka.utils.TestUtils.buildEnvelopeRequest(
+      deleteTopicsRequest, envelopePrincipalSerde, requestChannelMetrics, time.nanoseconds(),
+      forwardedPrincipal = crossTenantPrincipal,
+      outerPrincipal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    val controller = mock(classOf[Controller])
+    val originals = new java.util.HashMap[String, AnyRef]()
+    originals.put("listener.name.tenant_acme.tenant.id", "acme")
+    originals.put("listener.name.tenant_evil.tenant.id", "evil")
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.from(originals))
+    controllerApis.handle(envelopeRequest, RequestLocal.noCaching())
+
+    // The cross-tenant request must never reach controller.deleteTopics
+    // and must not even probe findTopicIds (the resolution-by-name lookup
+    // would tell evil's principal whether acme.orders exists).
+    verify(controller, never()).deleteTopics(any(), any())
+    verify(controller, never()).findTopicIds(any(), any())
+  }
+
   @AfterEach
   def tearDown(): Unit = {
     quotasNeverThrottleControllerMutations.shutdown()
