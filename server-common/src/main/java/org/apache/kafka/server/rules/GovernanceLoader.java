@@ -115,27 +115,25 @@ public final class GovernanceLoader {
             LOG.warn("dropping __governance record with null key (value present={})", value != null);
             return false;
         }
-        // Round-12 audit (tombstone/compaction sub-agent, MEDIUM-1): reject
-        // operator-published records whose key uses the engine-reserved
-        // "__name__" shape on BOTH the update and tombstone paths. RuleJsonCodec
-        // enforces this on update records inside decode(), but a tombstone
-        // (value == null) is not routed through the codec — the previous code
-        // path went straight to working.remove(key). No __name__-shape rule
-        // exists in the working set today (the codec rejects them at intake),
-        // so the existing behaviour was a no-op rather than a vulnerability;
-        // but if a future engine-internal sentinel ever populates a __name__
-        // rule into the working set, an operator-published tombstone would
-        // silently delete it. Closing the asymmetry here removes that future
-        // surface and keeps the rejection contract symmetric across both
-        // record shapes.
-        if (RuleJsonCodec.isReservedNameShape(key)) {
-            // Round-13 BLOCKER-1: the rule id is wire-derived bytes; pipe
-            // through LogSafe so an attacker cannot inject ANSI escape
-            // sequences or forged log lines via the record key.
-            LOG.warn("dropping __governance record for rule id '{}' — uses the reserved \"__name__\" shape " +
-                "(double-underscore prefix and suffix); these ids are reserved for engine-internal " +
-                "synthetic decisions and may not be authored by operators (record was a {})",
-                LogSafe.sanitize(key), value == null ? "tombstone" : "update");
+        // R23 BLOCKER (#211): apply the FULL operator-authored rule-id contract
+        // (length cap, forbidden codepoints, reserved __name__ shape) BEFORE
+        // dispatching to the tombstone short-circuit. Previously only the
+        // reserved-shape check ran here; an operator-published tombstone whose
+        // key carried NBSP, C0/C1, zero-width, BOM, or bidi-format codepoints
+        // would silently call working.remove(key) without any guard — the
+        // trim-impersonation primitive that round-10/12 closed on the update
+        // path would re-open on the tombstone path. The 256-char cap also
+        // matters: the WARN below logs the sanitised key verbatim, so an
+        // unbounded id is a log-amplification primitive on either record shape.
+        try {
+            RuleJsonCodec.validateRuleId(key);
+        } catch (RuleEnvelopeException e) {
+            // Both `key` and `e.getMessage()` carry attacker-controlled bytes
+            // (validateRuleId re-embeds the bad id in the exception message,
+            // already LogSafe-sanitised, but we re-sanitise defensively).
+            LOG.warn("dropping __governance record for rule id '{}': {} (record was a {})",
+                LogSafe.sanitize(key), LogSafe.sanitize(e.getMessage()),
+                value == null ? "tombstone" : "update");
             return false;
         }
         if (value == null) {

@@ -364,6 +364,78 @@ public final class RuleJsonCodec {
     }
 
     /**
+     * Run the operator-authored rule-id contract checks against {@code id}:
+     * non-null, non-empty, no longer than {@link #MAX_RULE_ID_LEN} chars,
+     * no forbidden codepoints (C0/C1 controls, whitespace, zero-width, BOM,
+     * bidi-format), and not in the engine-reserved {@code __name__} shape.
+     * Throws {@link RuleEnvelopeException} on the first violation.
+     *
+     * <p>Exposed because the same checks must run on BOTH sides of the
+     * {@code __governance} record stream:
+     *
+     * <ul>
+     *   <li>Update records ({@code value != null}) — enforced inside {@link
+     *       #decode}.</li>
+     *   <li>Tombstone records ({@code value == null}) — enforced by
+     *       {@code GovernanceLoader.apply} BEFORE the working-state mutation.
+     *       <b>Round-23 BLOCKER (task #211):</b> without this call, an
+     *       operator-published tombstone whose key is {@code " __activation-
+     *       budget-exceeded__"} (leading NBSP) — or any id carrying ANSI
+     *       escape bytes, zero-width, or bidi-format codepoints — would render
+     *       identically to an engine-internal sentinel in any normalising
+     *       audit viewer AND would silently {@code working.remove(key)}
+     *       without any check. The trim-impersonation and log-injection
+     *       primitives that round-10/11/12 closed on the update path would
+     *       re-open on the tombstone path. The 256-char cap also matters on
+     *       tombstones: the loader's reject branch logs the key verbatim, so
+     *       an unbounded id is a log-amplification primitive on either record
+     *       shape.</li>
+     * </ul>
+     *
+     * <p>Today {@link #decode} still has the same inline checks (preserved
+     * for the detailed Round-10/11/13 rationale comments next to each one);
+     * this method is a thin re-statement of that contract for the
+     * pre-decode caller. The two stay in lockstep because each codepoint
+     * extension or cap change must land in both, and the test fixtures
+     * exercise both surfaces.
+     */
+    public static void validateRuleId(String id) {
+        if (id == null || id.isEmpty()) {
+            throw new RuleEnvelopeException("rule id (record key) must be non-empty");
+        }
+        if (id.length() > MAX_RULE_ID_LEN) {
+            throw new RuleEnvelopeException(
+                "rule id length " + id.length() + " exceeds max of "
+                    + MAX_RULE_ID_LEN + "; rule ids are operator-authored "
+                    + "identifiers (audit handles, ticket numbers, namespaced "
+                    + "names) and have no legitimate use for multi-kilobyte "
+                    + "strings — every DENY emission logs the id verbatim, so "
+                    + "an unbounded id is a log-amplification primitive");
+        }
+        for (int i = 0; i < id.length(); i++) {
+            char c = id.charAt(i);
+            if (isForbiddenIdCodepoint(c)) {
+                throw new RuleEnvelopeException(
+                    "rule id '" + LogSafe.sanitize(id) + "' contains forbidden codepoint U+"
+                        + String.format("%04X", (int) c) + " at index " + i
+                        + "; rule ids may not contain whitespace, zero-width, BOM, "
+                        + "bidi-format controls, or C0/C1 control codepoints "
+                        + "(operator-authored identifiers have no legitimate use for "
+                        + "these, and a Unicode-padded id could be rendered identically "
+                        + "to an engine-internal sentinel in audit consumers that "
+                        + "normalise on display)");
+            }
+        }
+        if (isReservedNameShape(id)) {
+            throw new RuleEnvelopeException(
+                "rule id '" + LogSafe.sanitize(id) + "' uses the reserved \"__name__\" shape "
+                    + "(double-underscore prefix and suffix); these ids are reserved "
+                    + "for engine-internal synthetic decisions and may not be authored "
+                    + "by operators");
+        }
+    }
+
+    /**
      * True when {@code c} is a codepoint forbidden in operator-authored rule
      * ids: ASCII whitespace ({@link Character#isWhitespace}), the broader
      * Unicode Space_Separator class ({@link Character#isSpaceChar} —

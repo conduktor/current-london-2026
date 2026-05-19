@@ -460,6 +460,69 @@ public class GovernanceLoaderTest {
     }
 
     @Test
+    public void tombstoneRejectsForbiddenCodepointInKey() {
+        // R23 BLOCKER (#211): the tombstone path used to dispatch straight to
+        // working.remove(key) after only the reserved-shape check. An
+        // operator-published tombstone with key " __activation-budget-exceeded__"
+        // (leading NBSP) would render identically to the engine sentinel in
+        // any normalising audit viewer AND would silently delete a working-
+        // state entry. validateRuleId on both paths closes the asymmetry.
+        RuleEngine engine = new RuleEngine();
+        GovernanceLoader loader = new GovernanceLoader(engine);
+        // Seed a real operator rule so we can prove a rejected forbidden-
+        // codepoint tombstone made no working-state mutation.
+        assertTrue(loader.apply("operator-rule", envelope("true", ApiKeys.METADATA, 7)));
+
+        // (a) Leading NBSP (U+00A0) — trim-impersonation primitive.
+        assertFalse(loader.apply(" operator-rule", null),
+            "tombstone with leading NBSP must be rejected");
+        // (b) Zero-width space (U+200B) embedded inside id.
+        assertFalse(loader.apply("operator​-rule", null),
+            "tombstone with embedded zero-width space must be rejected");
+        // (c) ESC control (U+001B) — log-injection primitive.
+        assertFalse(loader.apply("operator-rule[2J", null),
+            "tombstone with embedded ESC control must be rejected");
+        // (d) Bidi-format mark (U+200E LRM) — invisible padding hazard.
+        assertFalse(loader.apply("operator-rule‎", null),
+            "tombstone with trailing LRM must be rejected");
+        // (e) Bidi isolate (U+2068 FSI).
+        assertFalse(loader.apply("⁨operator-rule⁩", null),
+            "tombstone with FSI/PDI brackets must be rejected");
+
+        // Working state survived every rejected tombstone.
+        loader.commit();
+        RuleDecision d = engine.evaluate(
+            ApiKeys.METADATA, "client", false, Collections::emptyMap);
+        assertTrue(d.denied(), "operator-rule survived all rejected tombstones");
+        assertEquals("operator-rule", d.denyingRuleId());
+    }
+
+    @Test
+    public void tombstoneRejectsOverLengthKey() {
+        // R23 BLOCKER (#211): the loader's WARN slot logs the sanitised key
+        // verbatim, so an unbounded id is a log-amplification primitive on
+        // either record shape. The 256-char cap must apply to tombstones too.
+        RuleEngine engine = new RuleEngine();
+        GovernanceLoader loader = new GovernanceLoader(engine);
+        assertTrue(loader.apply("operator-rule", envelope("true", ApiKeys.METADATA, 7)));
+
+        // 257-char id — exactly one past MAX_RULE_ID_LEN=256.
+        StringBuilder sb = new StringBuilder(257);
+        for (int i = 0; i < 257; i++) {
+            sb.append('a');
+        }
+        assertFalse(loader.apply(sb.toString(), null),
+            "tombstone with over-length id must be rejected");
+
+        // Operator's rule survived.
+        loader.commit();
+        RuleDecision d = engine.evaluate(
+            ApiKeys.METADATA, "client", false, Collections::emptyMap);
+        assertTrue(d.denied());
+        assertEquals("operator-rule", d.denyingRuleId());
+    }
+
+    @Test
     public void encodeDecodeViaCodecLinesUpWithLoader() {
         // Sanity: the loader and the codec must agree on what a record looks
         // like. We use the codec's own encode() to produce input — if a
