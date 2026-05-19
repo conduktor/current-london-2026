@@ -14436,6 +14436,113 @@ class KafkaApisTest extends Logging {
     verify(groupCoordinator, never()).shareGroupHeartbeat(any[RequestContext], any[ShareGroupHeartbeatRequestData])
   }
 
+  // r22 BLOCKER #228 (sibling of #227): defense-in-depth on the ASSIGNMENT response of
+  // ShareGroupHeartbeat. The r20 #158 fix rejects explicit backing-name subscriptions at the
+  // request boundary, but the coordinator can still derive a backing topicId via (a) regex
+  // resolution (pending #168/#169/#143) or (b) share-group state predating the #158 deployment.
+  // Without the assignment-response filter, the consumer receives the backing UUID, resolves
+  // it on its next ShareFetch, and reads cross-tenant bytes.
+  @Test
+  def testShareGroupHeartbeatFiltersBackingTopicFromAssignment(): Unit = {
+    metadataCache = mock(classOf[KRaftMetadataCache])
+    val groupId = "share-group"
+    val backingTopic = "backing-r22-228"
+    val plainTopic = "plain-r22-228"
+    val backingUuid = Uuid.randomUuid()
+    val plainUuid = Uuid.randomUuid()
+
+    when(metadataCache.getTopicName(backingUuid)).thenReturn(Some(backingTopic))
+    when(metadataCache.getTopicName(plainUuid)).thenReturn(Some(plainTopic))
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+    when(concentrationKernel.isBackingTopic(plainTopic)).thenReturn(false)
+
+    val shareGroupHeartbeatRequest = new ShareGroupHeartbeatRequestData().setGroupId(groupId)
+    val requestChannelRequest = buildRequest(new ShareGroupHeartbeatRequest.Builder(shareGroupHeartbeatRequest, true).build())
+
+    val future = new CompletableFuture[ShareGroupHeartbeatResponseData]()
+    when(groupCoordinator.shareGroupHeartbeat(
+      requestChannelRequest.context,
+      shareGroupHeartbeatRequest
+    )).thenReturn(future)
+    kafkaApis = createKafkaApis(
+      overrideProperties = Map(ShareGroupConfig.SHARE_GROUP_ENABLE_CONFIG -> "true"),
+    )
+    kafkaApis.handle(requestChannelRequest, RequestLocal.noCaching)
+
+    // Coordinator returns an assignment containing BOTH a backing topicId and a plain one.
+    // The bug we're guarding is the broker forwarding the backing topicId unchanged.
+    val coordinatorResponse = new ShareGroupHeartbeatResponseData()
+      .setMemberId("member-228")
+      .setAssignment(new ShareGroupHeartbeatResponseData.Assignment()
+        .setTopicPartitions(List(
+          new ShareGroupHeartbeatResponseData.TopicPartitions()
+            .setTopicId(backingUuid)
+            .setPartitions(List(Integer.valueOf(0), Integer.valueOf(1)).asJava),
+          new ShareGroupHeartbeatResponseData.TopicPartitions()
+            .setTopicId(plainUuid)
+            .setPartitions(List(Integer.valueOf(0)).asJava)
+        ).asJava))
+    future.complete(coordinatorResponse)
+
+    val response = verifyNoThrottling[ShareGroupHeartbeatResponse](requestChannelRequest)
+    val returnedTopicIds = response.data.assignment.topicPartitions.asScala.map(_.topicId).toSet
+    assertFalse(returnedTopicIds.contains(backingUuid),
+      s"ShareGroupHeartbeat leaked backing topicId '$backingUuid' (resolves to backing topic '$backingTopic') to the consumer; returned=$returnedTopicIds")
+    assertTrue(returnedTopicIds.contains(plainUuid),
+      s"ShareGroupHeartbeat over-filtered: dropped legitimate topicId '$plainUuid'; returned=$returnedTopicIds")
+  }
+
+  // r22 BLOCKER #228 — fail-closed on a UUID that doesn't resolve in this broker's metadata
+  // cache. A stale-cache window cannot be used to forward a backing UUID under a None
+  // resolution, matching the share-state #171 precedent (and matching the symmetric #227
+  // policy for ConsumerGroupHeartbeat). A legit assignment dropped this way is re-issued on
+  // the next heartbeat cycle.
+  @Test
+  def testShareGroupHeartbeatDropsUnresolvableTopicIdFromAssignment(): Unit = {
+    metadataCache = mock(classOf[KRaftMetadataCache])
+    val groupId = "share-group"
+    val unresolvableUuid = Uuid.randomUuid()
+    val resolvableUuid = Uuid.randomUuid()
+    val resolvableTopic = "resolvable-r22-228"
+
+    when(metadataCache.getTopicName(unresolvableUuid)).thenReturn(None)
+    when(metadataCache.getTopicName(resolvableUuid)).thenReturn(Some(resolvableTopic))
+    when(concentrationKernel.isBackingTopic(resolvableTopic)).thenReturn(false)
+
+    val shareGroupHeartbeatRequest = new ShareGroupHeartbeatRequestData().setGroupId(groupId)
+    val requestChannelRequest = buildRequest(new ShareGroupHeartbeatRequest.Builder(shareGroupHeartbeatRequest, true).build())
+
+    val future = new CompletableFuture[ShareGroupHeartbeatResponseData]()
+    when(groupCoordinator.shareGroupHeartbeat(
+      requestChannelRequest.context,
+      shareGroupHeartbeatRequest
+    )).thenReturn(future)
+    kafkaApis = createKafkaApis(
+      overrideProperties = Map(ShareGroupConfig.SHARE_GROUP_ENABLE_CONFIG -> "true"),
+    )
+    kafkaApis.handle(requestChannelRequest, RequestLocal.noCaching)
+
+    val coordinatorResponse = new ShareGroupHeartbeatResponseData()
+      .setMemberId("member-228b")
+      .setAssignment(new ShareGroupHeartbeatResponseData.Assignment()
+        .setTopicPartitions(List(
+          new ShareGroupHeartbeatResponseData.TopicPartitions()
+            .setTopicId(unresolvableUuid)
+            .setPartitions(List(Integer.valueOf(0)).asJava),
+          new ShareGroupHeartbeatResponseData.TopicPartitions()
+            .setTopicId(resolvableUuid)
+            .setPartitions(List(Integer.valueOf(0)).asJava)
+        ).asJava))
+    future.complete(coordinatorResponse)
+
+    val response = verifyNoThrottling[ShareGroupHeartbeatResponse](requestChannelRequest)
+    val returnedTopicIds = response.data.assignment.topicPartitions.asScala.map(_.topicId).toSet
+    assertFalse(returnedTopicIds.contains(unresolvableUuid),
+      s"ShareGroupHeartbeat failed open on unresolvable topicId '$unresolvableUuid' — could be used to forward a backing UUID through a stale-cache window; returned=$returnedTopicIds")
+    assertTrue(returnedTopicIds.contains(resolvableUuid),
+      s"ShareGroupHeartbeat over-filtered: dropped resolvable plain topicId '$resolvableUuid'; returned=$returnedTopicIds")
+  }
+
   @Test
   def testShareGroupDescribeSuccess(): Unit = {
     val groupIds = List("share-group-id-0", "share-group-id-1").asJava
