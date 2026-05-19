@@ -506,7 +506,8 @@ public class GovernanceLoaderTest {
         GovernanceLoader loader = new GovernanceLoader(engine);
         assertTrue(loader.apply("operator-rule", envelope("true", ApiKeys.METADATA, 7)));
 
-        // 257-char id — exactly one past MAX_RULE_ID_LEN=256.
+        // 257 ASCII chars = 257 UTF-8 bytes — exactly one past
+        // MAX_RULE_ID_BYTES=256.
         StringBuilder sb = new StringBuilder(257);
         for (int i = 0; i < 257; i++) {
             sb.append('a');

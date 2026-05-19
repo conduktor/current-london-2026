@@ -59,11 +59,11 @@ public final class LogSafe {
     /**
      * Maximum kept length of an attacker-controlled string in a log line.
      * 128 chars is a generous bound for legitimate values: the codec's
-     * {@code MAX_RULE_ID_LEN} is 256 (longer than this, deliberately, so
-     * that a length-only rejection still surfaces the original length
-     * via the truncation annotation), and well-behaved clientIds are
-     * typically &lt; 64 chars. Anything past this cap is by definition
-     * either pathological or attacker-controlled.
+     * {@code MAX_RULE_ID_BYTES} is 256 UTF-8 bytes (longer than this,
+     * deliberately, so that a length-only rejection still surfaces the
+     * original length via the truncation annotation), and well-behaved
+     * clientIds are typically &lt; 64 chars. Anything past this cap is by
+     * definition either pathological or attacker-controlled.
      */
     public static final int MAX_LEN = 128;
 

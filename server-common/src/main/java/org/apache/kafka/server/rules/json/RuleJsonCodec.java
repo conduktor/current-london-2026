@@ -30,6 +30,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.LinkedHashSet;
@@ -104,21 +105,35 @@ public final class RuleJsonCodec {
     static final int MAX_ENVELOPE_BYTES = 65 * 1024;
 
     /**
-     * Maximum rule-id length accepted by {@link #decode(String, byte[])}.
-     * Rule ids are Kafka record keys on the {@code __governance} topic; their
-     * only upper bound at the protocol layer is {@code max.message.bytes}
-     * (default 1 MiB). Round-11 audit (audit-forgery sub-agent, CRITICAL):
-     * an unbounded id is a log-amplification primitive — every DENY emission
-     * in {@code KafkaApis.handle} logs the id verbatim, so a 900&#x202F;KB id
-     * yields a 900&#x202F;KB log line per denied request, gigabytes per
-     * second on a hot api-key.
+     * Maximum rule-id length accepted by {@link #decode(String, byte[])},
+     * measured in <b>UTF-8 bytes</b>. Rule ids are Kafka record keys on the
+     * {@code __governance} topic; their only upper bound at the protocol layer
+     * is {@code max.message.bytes} (default 1 MiB). Round-11 audit (audit-
+     * forgery sub-agent, CRITICAL): an unbounded id is a log-amplification
+     * primitive — every DENY emission in {@code KafkaApis.handle} logs the id
+     * verbatim, so a 900&#x202F;KB id yields a 900&#x202F;KB log line per
+     * denied request, gigabytes per second on a hot api-key.
      *
-     * <p>256 characters is comfortably wider than any legitimate operator
+     * <p><b>R28 adversarial (#235):</b> the cap is measured in UTF-8 bytes,
+     * NOT in {@link String#length()} (UTF-16 code units) or codepoints. The
+     * threat model is log amplification: broker log lines are written as
+     * UTF-8, so the bytes-on-disk cost of an id scales with its UTF-8
+     * encoding, not its Java char count. Under a chars-axis cap, a 256-char
+     * id of CJK BMP codepoints (3 UTF-8 bytes each) would be admitted at
+     * up to 768 bytes — a 3x silent amplification factor — and a 256-char
+     * Latin-1-supplement id would be admitted at up to 512 bytes. Measuring
+     * in bytes pins the threat axis directly: 256 bytes is exactly what a
+     * single emission costs the broker log.
+     *
+     * <p>256 bytes is comfortably wider than any legitimate operator
      * identifier (file-system path components, audit handles, JIRA ticket
-     * shapes) while keeping a single log line cheap. The cap is intake-only:
-     * existing well-formed ids in the wild are not affected.
+     * shapes — all ASCII in practice, so 1 byte per char) while keeping a
+     * single log line cheap. The cap is intake-only: existing well-formed
+     * ASCII ids are not affected; non-ASCII ids longer than ~85 CJK chars or
+     * ~128 Latin-1-supplement chars are deliberately rejected as
+     * indistinguishable from log-amplification probes.
      */
-    static final int MAX_RULE_ID_LEN = 256;
+    static final int MAX_RULE_ID_BYTES = 256;
 
     /**
      * Api-keys on which a DENY rule would brick the cluster — rejected at rule
@@ -199,11 +214,16 @@ public final class RuleJsonCodec {
         // reach the forbidden-codepoint scan and the engine-internal
         // reservation check with an absurd id either. Operator-authored ids
         // (audit handles, ticket-shaped strings, namespaced names) live well
-        // inside 256 chars; nothing legitimate is affected.
-        if (id.length() > MAX_RULE_ID_LEN) {
+        // inside 256 bytes; nothing legitimate is affected.
+        //
+        // R28 adversarial (#235): measure in UTF-8 bytes — the broker log is
+        // UTF-8, so bytes-on-disk is the threat axis, not String.length()
+        // which counts UTF-16 code units. See MAX_RULE_ID_BYTES docstring.
+        int idBytes = id.getBytes(StandardCharsets.UTF_8).length;
+        if (idBytes > MAX_RULE_ID_BYTES) {
             throw new RuleEnvelopeException(
-                "rule id length " + id.length() + " exceeds max of "
-                    + MAX_RULE_ID_LEN + "; rule ids are operator-authored "
+                "rule id length " + idBytes + " UTF-8 bytes exceeds max of "
+                    + MAX_RULE_ID_BYTES + "; rule ids are operator-authored "
                     + "identifiers (audit handles, ticket numbers, namespaced "
                     + "names) and have no legitimate use for multi-kilobyte "
                     + "strings — every DENY emission logs the id verbatim, so "
@@ -383,10 +403,10 @@ public final class RuleJsonCodec {
 
     /**
      * Run the operator-authored rule-id contract checks against {@code id}:
-     * non-null, non-empty, no longer than {@link #MAX_RULE_ID_LEN} chars,
-     * no forbidden codepoints (C0/C1 controls, whitespace, zero-width, BOM,
-     * bidi-format), and not in the engine-reserved {@code __name__} shape.
-     * Throws {@link RuleEnvelopeException} on the first violation.
+     * non-null, non-empty, no longer than {@link #MAX_RULE_ID_BYTES} UTF-8
+     * bytes, no forbidden codepoints (C0/C1 controls, whitespace, zero-width,
+     * BOM, bidi-format), and not in the engine-reserved {@code __name__}
+     * shape. Throws {@link RuleEnvelopeException} on the first violation.
      *
      * <p>Exposed because the same checks must run on BOTH sides of the
      * {@code __governance} record stream:
@@ -421,10 +441,13 @@ public final class RuleJsonCodec {
         if (id == null || id.isEmpty()) {
             throw new RuleEnvelopeException("rule id (record key) must be non-empty");
         }
-        if (id.length() > MAX_RULE_ID_LEN) {
+        // R28 adversarial (#235): UTF-8 bytes, mirroring the decode-path
+        // check at the top of decode(). Both surfaces stay in lockstep.
+        int idBytes = id.getBytes(StandardCharsets.UTF_8).length;
+        if (idBytes > MAX_RULE_ID_BYTES) {
             throw new RuleEnvelopeException(
-                "rule id length " + id.length() + " exceeds max of "
-                    + MAX_RULE_ID_LEN + "; rule ids are operator-authored "
+                "rule id length " + idBytes + " UTF-8 bytes exceeds max of "
+                    + MAX_RULE_ID_BYTES + "; rule ids are operator-authored "
                     + "identifiers (audit handles, ticket numbers, namespaced "
                     + "names) and have no legitimate use for multi-kilobyte "
                     + "strings — every DENY emission logs the id verbatim, so "

@@ -700,7 +700,8 @@ public class RuleJsonCodecTest {
         // Kafka record keys, bounded only by max.message.bytes (default
         // 1 MiB). Every DENY in KafkaApis.handle logs the id verbatim, so
         // a 900 KB id would amplify the broker log by ~900 KB per denial —
-        // gigabytes/s on a hot api-key. Bound at 256.
+        // gigabytes/s on a hot api-key. Bound at 256 UTF-8 bytes (R28 #235:
+        // bytes, not String.length() UTF-16 code units; see CJK test below).
         StringBuilder huge = new StringBuilder();
         for (int i = 0; i < 257; i++) {
             huge.append('x');
@@ -710,13 +711,95 @@ public class RuleJsonCodecTest {
             () -> RuleJsonCodec.decode(id, SAMPLE.getBytes(StandardCharsets.UTF_8)));
         assertTrue(ex.getMessage().contains("exceeds max"),
             "rejection must name the length cap: " + ex.getMessage());
+        assertTrue(ex.getMessage().contains("UTF-8 bytes"),
+            "rejection must name the unit (UTF-8 bytes): " + ex.getMessage());
         // The boundary case — exactly the max — must still be accepted.
+        // 256 ASCII chars = 256 UTF-8 bytes = MAX_RULE_ID_BYTES.
         StringBuilder boundary = new StringBuilder();
         for (int i = 0; i < 256; i++) {
             boundary.append('x');
         }
         Rule ok = RuleJsonCodec.decode(boundary.toString(), SAMPLE.getBytes(StandardCharsets.UTF_8));
         assertEquals(256, ok.id().length());
+    }
+
+    @Test
+    public void overlongIdRejectedByUtf8ByteAxisNotCharAxis() {
+        // R28 adversarial (#235): the rule-id length cap MUST be measured in
+        // UTF-8 bytes (the unit the broker log writes), not in
+        // String.length() UTF-16 code units. A CJK-only id is ~3 UTF-8 bytes
+        // per BMP codepoint; under a chars-axis cap of 256, an id of 256 CJK
+        // chars would be admitted at up to 768 UTF-8 bytes — a 3x silent
+        // log-amplification factor on every DENY emission.
+        //
+        // U+4E2D '中' (CJK Unified Ideograph): 1 UTF-16 code unit, 3 UTF-8
+        // bytes. Build an id whose UTF-8 byte length exceeds 256 but whose
+        // String.length() is well under it — this discriminates the byte
+        // axis from the char axis.
+        //
+        // Negative control: if the check ever regresses to id.length(), this
+        // test fails because 87 < 256.
+        StringBuilder sb = new StringBuilder(87);
+        for (int i = 0; i < 87; i++) {
+            sb.append('中');
+        }
+        String id = sb.toString();
+        // Confirm the discriminator: chars-axis would admit (87 < 256),
+        // bytes-axis must reject (261 > 256).
+        assertEquals(87, id.length(),
+            "test setup: id must be < 256 UTF-16 chars to discriminate the axes");
+        assertEquals(261, id.getBytes(StandardCharsets.UTF_8).length,
+            "test setup: id must be > 256 UTF-8 bytes to be rejected");
+        RuleEnvelopeException ex = assertThrows(RuleEnvelopeException.class,
+            () -> RuleJsonCodec.decode(id, SAMPLE.getBytes(StandardCharsets.UTF_8)));
+        assertTrue(ex.getMessage().contains("UTF-8 bytes"),
+            "rejection must name the unit: " + ex.getMessage());
+        assertTrue(ex.getMessage().contains("261"),
+            "rejection must surface the actual byte count: " + ex.getMessage());
+
+        // Boundary: 85 CJK chars = 255 UTF-8 bytes = one under the cap,
+        // must be accepted. Demonstrates the cap admits non-ASCII ids up to
+        // the byte boundary, just not past it.
+        StringBuilder okSb = new StringBuilder(85);
+        for (int i = 0; i < 85; i++) {
+            okSb.append('中');
+        }
+        String okId = okSb.toString();
+        assertEquals(255, okId.getBytes(StandardCharsets.UTF_8).length,
+            "test setup: boundary id must be 255 UTF-8 bytes");
+        Rule okRule = RuleJsonCodec.decode(okId, SAMPLE.getBytes(StandardCharsets.UTF_8));
+        assertEquals(okId, okRule.id());
+
+        // Exact-boundary 256 bytes: cannot be hit with pure CJK BMP (3 bytes
+        // per char yields 255 or 258, never 256), so use a mixed id: 84 CJK
+        // chars (252 bytes) + 4 ASCII (4 bytes) = 256 bytes total. Must be
+        // accepted at the exact cap.
+        StringBuilder mixedAtCap = new StringBuilder();
+        for (int i = 0; i < 84; i++) {
+            mixedAtCap.append('中');
+        }
+        mixedAtCap.append("abcd");
+        String mixedId = mixedAtCap.toString();
+        assertEquals(256, mixedId.getBytes(StandardCharsets.UTF_8).length,
+            "test setup: mixed id must be exactly 256 UTF-8 bytes");
+        Rule mixedRule = RuleJsonCodec.decode(mixedId, SAMPLE.getBytes(StandardCharsets.UTF_8));
+        assertEquals(mixedId, mixedRule.id());
+
+        // One byte past the cap with a mixed id (84 CJK + 5 ASCII = 257
+        // bytes) — confirms the cap is strictly > MAX_RULE_ID_BYTES, not
+        // off-by-one.
+        StringBuilder mixedOver = new StringBuilder();
+        for (int i = 0; i < 84; i++) {
+            mixedOver.append('中');
+        }
+        mixedOver.append("abcde");
+        String mixedOverId = mixedOver.toString();
+        assertEquals(257, mixedOverId.getBytes(StandardCharsets.UTF_8).length,
+            "test setup: one-past-cap id must be 257 UTF-8 bytes");
+        RuleEnvelopeException ex2 = assertThrows(RuleEnvelopeException.class,
+            () -> RuleJsonCodec.decode(mixedOverId, SAMPLE.getBytes(StandardCharsets.UTF_8)));
+        assertTrue(ex2.getMessage().contains("257"),
+            "rejection must surface byte count 257: " + ex2.getMessage());
     }
 
     @Test
