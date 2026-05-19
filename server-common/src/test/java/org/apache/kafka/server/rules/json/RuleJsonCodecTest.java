@@ -94,9 +94,19 @@ public class RuleJsonCodecTest {
     public void emptyApiKeyListRejected() {
         // A rule with no targets is meaningless and would silently dead-code.
         // Reject at the boundary so the loader replays a clear error.
+        // R28 Codec F1 / Task #232: pin the *specific* diagnostic, not just
+        // RuleEnvelopeException.class. Without that pin, a refactor that
+        // tripped a different rejection branch first (e.g. errorCode parse
+        // or a future apiKeys-not-array check) would silently still throw
+        // RuleEnvelopeException and pass this test — the test would no
+        // longer prove what it claims to ("empty apiKeys is rejected").
         String json = "{\"apiKeys\":[],\"action\":\"DENY\",\"when\":\"true\",\"errorCode\":1}";
-        assertThrows(RuleEnvelopeException.class,
+        RuleEnvelopeException ex = assertThrows(RuleEnvelopeException.class,
             () -> RuleJsonCodec.decode("k", json.getBytes(StandardCharsets.UTF_8)));
+        assertTrue(ex.getMessage().contains("apiKeys"),
+            "diagnostic must name the offending field: " + ex.getMessage());
+        assertTrue(ex.getMessage().contains("at least one"),
+            "diagnostic must describe why empty is rejected: " + ex.getMessage());
     }
 
     @Test
@@ -258,8 +268,16 @@ public class RuleJsonCodecTest {
         // Compile errors must surface as a clean envelope-level rejection,
         // not as a leaked CelCompilationException — the loader catches
         // RuleEnvelopeException specifically to fence off bad records.
-        assertThrows(RuleEnvelopeException.class,
+        // R28 Codec F1 / Task #232: pin that we're actually going through
+        // the CEL-compile catch branch, not (e.g.) a malformed-JSON or
+        // missing-field branch that happens to reject the same payload
+        // for a different reason.
+        RuleEnvelopeException ex = assertThrows(RuleEnvelopeException.class,
             () -> RuleJsonCodec.decode("k", json.getBytes(StandardCharsets.UTF_8)));
+        assertTrue(ex.getMessage().contains("uncompilable CEL"),
+            "diagnostic must identify the compile failure as the cause: " + ex.getMessage());
+        assertTrue(ex.getMessage().contains("'k'"),
+            "diagnostic must name the offending rule id: " + ex.getMessage());
     }
 
     @Test
@@ -295,30 +313,55 @@ public class RuleJsonCodecTest {
 
     @Test
     public void missingActionRejected() {
+        // R28 Codec F1 / Task #232: pin the *specific* diagnostic. Without
+        // this, a refactor reordering field parsing so apiKeys / when /
+        // errorCode were checked first would silently still reject this
+        // payload — for the wrong reason — and the test would no longer
+        // prove that missing 'action' has its own clear diagnostic.
         String json = "{\"apiKeys\":[\"METADATA\"],\"when\":\"true\",\"errorCode\":1}";
-        assertThrows(RuleEnvelopeException.class,
+        RuleEnvelopeException ex = assertThrows(RuleEnvelopeException.class,
             () -> RuleJsonCodec.decode("k", json.getBytes(StandardCharsets.UTF_8)));
+        assertTrue(ex.getMessage().contains("'action'"),
+            "diagnostic must name the missing field: " + ex.getMessage());
+        assertTrue(ex.getMessage().contains("must be a string"),
+            "diagnostic must describe the type requirement: " + ex.getMessage());
     }
 
     @Test
     public void missingWhenRejected() {
+        // R28 Codec F1 / Task #232: same anti-pattern fix as above.
         String json = "{\"apiKeys\":[\"METADATA\"],\"action\":\"DENY\",\"errorCode\":1}";
-        assertThrows(RuleEnvelopeException.class,
+        RuleEnvelopeException ex = assertThrows(RuleEnvelopeException.class,
             () -> RuleJsonCodec.decode("k", json.getBytes(StandardCharsets.UTF_8)));
+        assertTrue(ex.getMessage().contains("'when'"),
+            "diagnostic must name the missing field: " + ex.getMessage());
+        assertTrue(ex.getMessage().contains("must be a string"),
+            "diagnostic must describe the type requirement: " + ex.getMessage());
     }
 
     @Test
     public void missingErrorCodeRejected() {
+        // R28 Codec F1 / Task #232: same anti-pattern fix.
         String json = "{\"apiKeys\":[\"METADATA\"],\"action\":\"DENY\",\"when\":\"true\"}";
-        assertThrows(RuleEnvelopeException.class,
+        RuleEnvelopeException ex = assertThrows(RuleEnvelopeException.class,
             () -> RuleJsonCodec.decode("k", json.getBytes(StandardCharsets.UTF_8)));
+        assertTrue(ex.getMessage().contains("'errorCode'"),
+            "diagnostic must name the missing field: " + ex.getMessage());
+        assertTrue(ex.getMessage().contains("must be an integer"),
+            "diagnostic must describe the type requirement: " + ex.getMessage());
     }
 
     @Test
     public void malformedJsonRejected() {
+        // R28 Codec F1 / Task #232: pin that we reach the malformed-JSON
+        // arm at RuleJsonCodec:623 (which wraps Jackson's exception with
+        // LogSafe.sanitize), not some other arm that happens to throw the
+        // same exception class for the same input.
         String json = "this is not json";
-        assertThrows(RuleEnvelopeException.class,
+        RuleEnvelopeException ex = assertThrows(RuleEnvelopeException.class,
             () -> RuleJsonCodec.decode("k", json.getBytes(StandardCharsets.UTF_8)));
+        assertTrue(ex.getMessage().contains("malformed JSON envelope"),
+            "diagnostic must identify the parse failure as the cause: " + ex.getMessage());
     }
 
     @Test
@@ -330,13 +373,24 @@ public class RuleJsonCodecTest {
         // its canonical-encoded view to the broker's loaded state would
         // see a mismatch. With STRICT_DUPLICATE_DETECTION enabled, the
         // parser raises and we reject at intake.
+        // R28 Codec F1 / Task #232: pin we reach the malformed-JSON catch
+        // (where Jackson's STRICT_DUPLICATE_DETECTION raises), proving the
+        // STRICT_DUPLICATE_DETECTION feature is what drives the rejection.
+        // Without this, disabling STRICT_DUPLICATE_DETECTION on MAPPER
+        // would silently accept duplicates and pick last-wins, and this
+        // test would still pass if some unrelated later branch threw
+        // RuleEnvelopeException (e.g. an apiKeys-shape check).
         String json = "{\"apiKeys\":[\"CREATE_TOPICS\"],"
             + "\"apiKeys\":[\"METADATA\"],"
             + "\"action\":\"DENY\","
             + "\"when\":\"true\","
             + "\"errorCode\":47}";
-        assertThrows(RuleEnvelopeException.class,
+        RuleEnvelopeException ex = assertThrows(RuleEnvelopeException.class,
             () -> RuleJsonCodec.decode("k", json.getBytes(StandardCharsets.UTF_8)));
+        assertTrue(ex.getMessage().contains("malformed JSON envelope"),
+            "diagnostic must identify the parse failure as the cause "
+                + "(STRICT_DUPLICATE_DETECTION raises a Jackson JsonParseException "
+                + "which is caught and wrapped at the malformed-JSON arm): " + ex.getMessage());
     }
 
     @Test
@@ -345,16 +399,39 @@ public class RuleJsonCodecTest {
         // loader level — not by this codec. Calling decode(..., null) is
         // therefore a programmer error and must throw a clean exception
         // rather than NPE.
-        assertThrows(RuleEnvelopeException.class,
+        // R28 Codec F1 / Task #232: pin the diagnostic so a refactor that
+        // accidentally raised NPE (which extends RuntimeException, not
+        // RuleEnvelopeException) — or that started routing null through a
+        // different rejection branch — would surface here.
+        RuleEnvelopeException ex = assertThrows(RuleEnvelopeException.class,
             () -> RuleJsonCodec.decode("k", null));
+        assertTrue(ex.getMessage().contains("rule envelope is null"),
+            "diagnostic must explain why null payload is a codec-level error: " + ex.getMessage());
+        assertTrue(ex.getMessage().contains("tombstone"),
+            "diagnostic must point operators at the tombstone/loader boundary "
+                + "so the codec-vs-loader contract is unambiguous: " + ex.getMessage());
     }
 
     @Test
     public void nullOrEmptyIdRejected() {
-        assertThrows(RuleEnvelopeException.class,
+        // R28 Codec F1 / Task #232: pin the diagnostic for both branches.
+        // Without these, a refactor that started rejecting at the body /
+        // length / shape branches for null/empty id (because id was used
+        // in a later check) would still satisfy assertThrows but no
+        // longer prove the *id* boundary is what catches the violation.
+        RuleEnvelopeException nullEx = assertThrows(RuleEnvelopeException.class,
             () -> RuleJsonCodec.decode(null, SAMPLE.getBytes(StandardCharsets.UTF_8)));
-        assertThrows(RuleEnvelopeException.class,
+        assertTrue(nullEx.getMessage().contains("rule id"),
+            "diagnostic must name the offending field: " + nullEx.getMessage());
+        assertTrue(nullEx.getMessage().contains("non-empty"),
+            "diagnostic must describe why null is rejected: " + nullEx.getMessage());
+
+        RuleEnvelopeException emptyEx = assertThrows(RuleEnvelopeException.class,
             () -> RuleJsonCodec.decode("", SAMPLE.getBytes(StandardCharsets.UTF_8)));
+        assertTrue(emptyEx.getMessage().contains("rule id"),
+            "diagnostic must name the offending field: " + emptyEx.getMessage());
+        assertTrue(emptyEx.getMessage().contains("non-empty"),
+            "diagnostic must describe why empty is rejected: " + emptyEx.getMessage());
     }
 
     @Test
