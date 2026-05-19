@@ -382,22 +382,38 @@ final class IoUringTransportLayer implements TransportLayer {
             }
         }
         if (total > 0) {
-            // Inbound watermark gate (read-side): once the Processor has drained enough
-            // bytes for the queue to fall below the LOW water mark, flip autoRead back on
-            // so the kernel resumes pushing bytes. Only re-enable on an unmuted channel —
-            // an operator mute (RESPONSE_QUEUED throttling) or memory-pool self-mute
-            // (KafkaChannel.read failed to allocate) must keep autoRead off regardless of
-            // queue depth, otherwise the request-pipeline throttle is bypassed. We re-
-            // check the autoRead flag itself so we don't fight a state legitimately set
-            // by addInterestOps/removeInterestOps — only flip when we know we lowered it
-            // due to backpressure.
-            long after = inboundBytes.addAndGet(-total);
-            if (after <= INBOUND_LOW_WATERMARK_BYTES
-                    && !isMute()
-                    && nettyChannel.isOpen()
-                    && !nettyChannel.config().isAutoRead()) {
-                nettyChannel.config().setAutoRead(true);
-            }
+            inboundBytes.addAndGet(-total);
+        }
+        // Inbound watermark gate (read-side): once the queue has fallen below the LOW
+        // water mark, flip autoRead back on so the kernel resumes pushing bytes. Only
+        // re-enable on an unmuted channel — an operator mute (RESPONSE_QUEUED throttling)
+        // or memory-pool self-mute (KafkaChannel.read failed to allocate) must keep
+        // autoRead off regardless of queue depth, otherwise the request-pipeline throttle
+        // is bypassed.
+        //
+        // CRITICAL: this reconciliation MUST run on EVERY read() call, not only when
+        // total > 0. The Processor calls read() on every poll for every registered
+        // channel; if we gated this on total > 0, the following silent-stall race
+        // becomes terminal:
+        //   1. queue near HIGH, autoRead=true. Event-loop offerInbound runs its
+        //      addAndGet(+size) which crosses HIGH, but is preempted before the
+        //      setAutoRead(false) call lands.
+        //   2. Processor.read drains the entire queue. total > 0 path runs, addAndGet(-total)
+        //      gives after=0 — but the gate condition !isAutoRead() is FALSE (autoRead is
+        //      still true because the event loop's flip-off hasn't lapsed yet). Gate skips.
+        //   3. Event loop resumes and runs setAutoRead(false) based on its stale local
+        //      `after` value.
+        //   4. End state: queue=0, autoRead=false, channel unmuted, peer still wants
+        //      to send. The kernel honors TCP backpressure and stops pushing, so no
+        //      further offerInbound runs. read() returns 0 every poll. Nothing recovers
+        //      until idle expiry (~10 min) closes the connection.
+        // Running this gate every read() means the next Processor poll cycle heals the
+        // race within microseconds.
+        if (inboundBytes.get() <= INBOUND_LOW_WATERMARK_BYTES
+                && !isMute()
+                && nettyChannel.isOpen()
+                && !nettyChannel.config().isAutoRead()) {
+            nettyChannel.config().setAutoRead(true);
         }
         if (total == 0 && eofSeen && inbound.isEmpty()) return -1;
         return total;

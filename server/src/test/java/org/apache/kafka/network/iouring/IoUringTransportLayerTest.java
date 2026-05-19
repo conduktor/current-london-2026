@@ -641,6 +641,58 @@ class IoUringTransportLayerTest {
     }
 
     @Test
+    void readReconcilesAutoReadEvenWhenNoBytesAvailable() throws Exception {
+        // Regression for the AUTOREAD-RACE silent stall.
+        //
+        // Adversarial interleaving between the event-loop offerInbound and the Processor read:
+        //
+        //   State: inboundBytes = HIGH-50, autoRead = true, queue has bytes.
+        //   T1 (event loop): offerInbound(buf, size=100)
+        //        - addAndGet(+100) → local `after = HIGH+50`
+        //        - inbound.offer(buf)
+        //        - [PAUSE before the autoRead-off gate]
+        //   T2 (Processor): read(dst)
+        //        - drains the queue completely → total = HIGH+50
+        //        - addAndGet(-(HIGH+50)) → local `after = 0`
+        //        - gate: after <= LOW, !isMute, open, BUT !isAutoRead() is FALSE
+        //          (T1 has not yet flipped it). Gate does nothing.
+        //   T1 (resumes): isAutoRead() still true, local `after` still HIGH+50 ≥ HIGH.
+        //        - setAutoRead(false).
+        //
+        // Final state: queue=0, autoRead=false, not muted, channel open.
+        // Nothing will recover this:
+        //   - offerInbound won't fire (the kernel honored TCP backpressure and stopped pushing).
+        //   - read() doesn't reconcile because the autoRead re-enable lives inside `if (total > 0)`.
+        //   - addInterestOps(OP_READ) won't fire because OP_READ is already in the interest mask.
+        //   - The channel goes silent until idle expiry (~10 min) closes it.
+        //
+        // Fix: in read(), the autoRead reconciliation MUST run on every Processor poll, regardless
+        // of whether bytes were drained this call. The next Processor.poll cycle then heals the
+        // race within microseconds.
+        IoUringTransportLayer l = newLayer();
+
+        // Simulate the post-race state directly. We can't run two threads against an
+        // EmbeddedChannel deterministically (its pipeline is single-threaded), so we drive the
+        // observable end state: autoRead=false, queue empty, inboundBytes=0, not muted.
+        assertTrue(channel.config().isAutoRead(), "fresh channel: autoRead is on");
+        assertFalse(l.isMute(), "fresh channel: not muted");
+        channel.config().setAutoRead(false);
+        assertFalse(channel.config().isAutoRead(),
+            "preconditions: autoRead is off (simulates the stale-after race outcome)");
+
+        // Processor calls read on every poll, even for channels with nothing buffered.
+        ByteBuffer dst = ByteBuffer.allocate(4096);
+        int n = l.read(dst);
+        assertEquals(0, n, "queue is empty: read returns 0 (no bytes, not EOF)");
+
+        assertTrue(channel.config().isAutoRead(),
+            "read() MUST reconcile autoRead with the current queue depth on every call, not only "
+            + "when bytes were drained. Without this, the offerInbound-vs-read race can latch the "
+            + "channel into autoRead=false with an empty queue and a live peer, silently stalling "
+            + "the connection until idle expiry.");
+    }
+
+    @Test
     void writeChunksLargePayloadsToMaxWriteChunkBytes() throws Exception {
         // Regression for v7 BLOCKER 2: write(ByteBuffer) previously allocated a direct
         // ByteBuf of size = src.remaining() in one shot, BEFORE the isWritable()
