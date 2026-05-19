@@ -35,6 +35,12 @@ import java.util.Objects;
  * rather than an unstructured {@code OutOfMemoryError}. The bridge runs inside the broker; a misbehaving HTTP client
  * must not be able to take the binary protocol down with it.
  *
+ * <p>The cap applies to decoded payload bytes, not wire bytes. Jetty has already removed the HTTP/1.1 transport
+ * framing ({@code Transfer-Encoding: chunked} chunk-size lines, chunk extensions, and trailers per RFC 9112 §7) by
+ * the time the servlet calls {@link jakarta.servlet.http.HttpServletRequest#getInputStream}, so the bytes counted here
+ * are pure JSON. Mixed {@code Content-Length}+{@code Transfer-Encoding: chunked}, oversized chunk-size hex, and other
+ * framing-level smuggling vectors are rejected by Jetty's {@code HttpParser} pre-dispatch and never reach this stream.
+ *
  * <p>The cap is INCLUSIVE — exactly {@code limit} bytes read are fine; byte {@code limit + 1} fails. We pre-validate
  * a negative limit at construction so callers can't pass {@code -1} and then be surprised by a runtime exception
  * during the first read.
