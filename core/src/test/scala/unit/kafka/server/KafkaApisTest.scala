@@ -16861,6 +16861,66 @@ class KafkaApisTest extends Logging {
     verify(groupCoordinator, never()).shareGroupHeartbeat(any(), any())
   }
 
+  // ---------------------------------------------------------------------------
+  // ShareGroupHeartbeat subscribedTopicNames outside-in scrub (#133)
+  //
+  // Mirrors the consumer-side #132 fix. The existing groupId guard above only
+  // inspects `groupId`. A cluster-wide caller can still pass an innocuous
+  // groupId and `subscribedTopicNames=["acme.orders"]`; without this guard the
+  // new share-group coordinator would record the subscription against the
+  // tenant's physical topic — leaking topic existence and end offsets through
+  // subsequent heartbeat assignments, and letting a non-tenant principal
+  // disrupt the tenant's share-rebalance protocol. Refuse the whole heartbeat
+  // with TOPIC_AUTHORIZATION_FAILED before the coordinator is touched.
+  // ---------------------------------------------------------------------------
+  @Test
+  def testShareGroupHeartbeatOutsideInRefusesReservedSubscribedTopicName(): Unit = {
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
+    val req = new ShareGroupHeartbeatRequest.Builder(
+      new ShareGroupHeartbeatRequestData()
+        .setGroupId("regular-group")
+        .setSubscribedTopicNames(List("regular-topic", "acme.orders").asJava),
+      true).build()
+    val request = buildRequest(req)
+
+    kafkaApis = createKafkaApis(
+      overrideProperties = Map(ShareGroupConfig.SHARE_GROUP_ENABLE_CONFIG -> "true"),
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleShareGroupHeartbeat(request)
+
+    val response = verifyNoThrottling[ShareGroupHeartbeatResponse](request)
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED.code, response.data.errorCode,
+      "reserved-namespace topic in share subscribedTopicNames must be refused before the coordinator")
+    verify(groupCoordinator, never()).shareGroupHeartbeat(any(), any())
+  }
+
+  @Test
+  def testShareGroupHeartbeatClusterWideListenerForwardsDottedNamesWhenNoTenantsConfigured(): Unit = {
+    // No tenants configured: `acme.orders` is just a dotted topic name. The
+    // outside-in guard must not fire; the request goes through to the share
+    // coordinator as on stock Kafka. Pins the "no-tenants → stock semantics"
+    // contract for the share-heartbeat path.
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
+    val data = new ShareGroupHeartbeatRequestData()
+      .setGroupId("regular-group")
+      .setSubscribedTopicNames(List("acme.orders").asJava)
+    val req = new ShareGroupHeartbeatRequest.Builder(data, true).build()
+    val request = buildRequest(req)
+
+    val future = new CompletableFuture[ShareGroupHeartbeatResponseData]()
+    when(groupCoordinator.shareGroupHeartbeat(request.context, data)).thenReturn(future)
+
+    kafkaApis = createKafkaApis(
+      overrideProperties = Map(ShareGroupConfig.SHARE_GROUP_ENABLE_CONFIG -> "true"))
+    kafkaApis.handleShareGroupHeartbeat(request)
+
+    val coordinatorResponse = new ShareGroupHeartbeatResponseData().setMemberId("m")
+    future.complete(coordinatorResponse)
+    val response = verifyNoThrottling[ShareGroupHeartbeatResponse](request)
+    assertEquals(coordinatorResponse, response.data,
+      "with no tenants configured the dotted topic name is not reserved on share heartbeat")
+  }
+
   @Test
   def testShareGroupDescribeOutsideInRefusesTenantPrincipalNamespace(): Unit = {
     metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)

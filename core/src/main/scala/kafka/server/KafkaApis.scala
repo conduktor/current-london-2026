@@ -5755,6 +5755,38 @@ class KafkaApis(val requestChannel: RequestChannel,
       requestHelper.sendMaybeThrottle(request, shareGroupHeartbeatRequest.getErrorResponse(Errors.GROUP_AUTHORIZATION_FAILED.exception))
       CompletableFuture.completedFuture[Unit](())
     } else {
+      if (shareGroupHeartbeatRequest.data.subscribedTopicNames != null &&
+        !shareGroupHeartbeatRequest.data.subscribedTopicNames.isEmpty) {
+        // #133: mirror the consumer-side guard at handleConsumerGroupHeartbeat.
+        // The `groupId` guard above only inspects the group name. A cluster-wide
+        // caller (no tenant context) naming `groupId="g"` and
+        // `subscribedTopicNames=["acme.orders"]` would otherwise have the share
+        // coordinator record the subscription against tenant `acme`'s PHYSICAL
+        // topic — leaking topic existence and end offsets via subsequent
+        // heartbeat responses, and letting a non-tenant principal disrupt the
+        // tenant's share-rebalance protocol. Refuse before forwarding.
+        // SHARE_GROUP_HEARTBEAT is outside TENANT_ALLOWED_APIS so tenant
+        // principals never reach here; this guard only fires for non-tenant
+        // callers.
+        if (!tenantContextFor(request).effectiveTenant.isPresent &&
+          shareGroupHeartbeatRequest.data.subscribedTopicNames.asScala.exists(isReservedTenantNamespace)) {
+          val responseData = new ShareGroupHeartbeatResponseData()
+            .setErrorCode(Errors.TOPIC_AUTHORIZATION_FAILED.code)
+          requestHelper.sendMaybeThrottle(request, new ShareGroupHeartbeatResponse(responseData))
+          return CompletableFuture.completedFuture[Unit](())
+        }
+        // Clients are not allowed to see topics that are not authorized for Describe.
+        val subscribedTopicSet = shareGroupHeartbeatRequest.data.subscribedTopicNames.asScala.toSet
+        val authorizedTopics = authHelper.filterByAuthorized(request.context, DESCRIBE, TOPIC,
+          subscribedTopicSet)(identity)
+        if (authorizedTopics.size < subscribedTopicSet.size) {
+          val responseData = new ShareGroupHeartbeatResponseData()
+            .setErrorCode(Errors.TOPIC_AUTHORIZATION_FAILED.code)
+          requestHelper.sendMaybeThrottle(request, new ShareGroupHeartbeatResponse(responseData))
+          return CompletableFuture.completedFuture[Unit](())
+        }
+      }
+
       groupCoordinator.shareGroupHeartbeat(
         request.context,
         shareGroupHeartbeatRequest.data,
