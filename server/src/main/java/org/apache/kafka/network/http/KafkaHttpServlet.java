@@ -20,6 +20,8 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
+import org.apache.kafka.common.internals.Topic;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -294,6 +296,15 @@ public final class KafkaHttpServlet extends HttpServlet {
     /**
      * Pull the topic name out of {@code /topics/{topic}/records}. Returns null if the path doesn't match — the caller
      * emits 404 in that case rather than guessing.
+     *
+     * <p>The topic name is also checked against {@link Topic#isValid} before being returned. Two reasons: (1) Jetty's
+     * {@code UriCompliance.DEFAULT} rejects ambiguous {@code %2F} and control bytes like {@code %00} pre-dispatch, but
+     * decoded ASCII control bytes (CR {@code %0D}, LF {@code %0A}, BEL {@code %07}, DEL {@code %7F}, {@code %01}–
+     * {@code %1F}) flow through and would otherwise reach every {@code LOG.warn("…for {}", topic, …)} site in the
+     * bridge as raw text — a log-forging primitive (an attacker submits {@code topic=foo%0AFAKE INFO …} and
+     * splits a single log line into two). (2) The bridge would otherwise silently rely on broker-side topic-name
+     * enforcement; making the rejection explicit here keeps the contract local to the HTTP boundary and means the
+     * client sees a uniform 404 instead of a 400 derived from {@code INVALID_TOPIC_EXCEPTION}.
      */
     static String extractTopic(String pathInfo) {
         if (pathInfo == null || !pathInfo.startsWith(PATH_PREFIX_TOPICS) || !pathInfo.endsWith(PATH_SUFFIX_RECORDS)) {
@@ -301,7 +312,7 @@ public final class KafkaHttpServlet extends HttpServlet {
         }
         String inner = pathInfo.substring(PATH_PREFIX_TOPICS.length(),
             pathInfo.length() - PATH_SUFFIX_RECORDS.length());
-        if (inner.isEmpty() || inner.indexOf('/') >= 0) {
+        if (inner.isEmpty() || inner.indexOf('/') >= 0 || !Topic.isValid(inner)) {
             return null;
         }
         return inner;

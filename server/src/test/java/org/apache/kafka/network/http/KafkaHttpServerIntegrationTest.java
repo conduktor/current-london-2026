@@ -1292,6 +1292,29 @@ class KafkaHttpServerIntegrationTest {
         assertNull(KafkaHttpServer.extractSubscribeTopic("/v1/other/orders/subscribe", "/v1"));
     }
 
+    @Test
+    void extractSubscribeTopicRejectsTopicNamesThatFailKafkaValidation() {
+        // Wave 26 axis Y: decoded ASCII control bytes in a topic name (CR, LF, NUL, DEL, etc.) flow through Jetty's
+        // default UriCompliance unchecked and would otherwise reach every LOG.warn("…for {}", topic, …) site in the
+        // bridge as raw text — a log-forging primitive (attacker submits topic=foo%0AFAKE INFO… and forges a second
+        // log line). Topic.isValid bottlenecks the rejection at the extraction boundary, so no logger ever sees the
+        // poisoned string.
+        // Use explicit char literals for the control-byte cases so the source survives copy/paste, IDE
+        // newline normalisation, and editor reformat — mirror the extractTopic regression below.
+        assertNull(KafkaHttpServer.extractSubscribeTopic("/v1/topics/foo\nFAKE/subscribe", "/v1"),
+            "embedded newline (log-forging primitive) must be rejected at the WS extraction boundary");
+        assertNull(KafkaHttpServer.extractSubscribeTopic("/v1/topics/foo\rFAKE/subscribe", "/v1"));
+        assertNull(KafkaHttpServer.extractSubscribeTopic("/v1/topics/foo" + (char) 0x07 + "FAKE/subscribe", "/v1"));   // BEL
+        assertNull(KafkaHttpServer.extractSubscribeTopic("/v1/topics/foo" + (char) 0x7F + "FAKE/subscribe", "/v1"));   // DEL
+        assertNull(KafkaHttpServer.extractSubscribeTopic("/v1/topics/foo" + (char) 0x00 + "FAKE/subscribe", "/v1"));   // NUL
+        assertNull(KafkaHttpServer.extractSubscribeTopic("/v1/topics/foo bar/subscribe", "/v1"));        // space — outside [A-Za-z0-9._-]
+        assertNull(KafkaHttpServer.extractSubscribeTopic("/v1/topics/./subscribe", "/v1"));              // forbidden literal
+        assertNull(KafkaHttpServer.extractSubscribeTopic("/v1/topics/../subscribe", "/v1"));             // forbidden literal
+        // 250 chars exceeds Kafka's 249-char cap
+        String tooLong = "a".repeat(250);
+        assertNull(KafkaHttpServer.extractSubscribeTopic("/v1/topics/" + tooLong + "/subscribe", "/v1"));
+    }
+
     private String wsUrl(String path) {
         return "ws://127.0.0.1:" + server.boundPort() + path;
     }
@@ -2094,6 +2117,30 @@ class KafkaHttpServerIntegrationTest {
         assertNull(KafkaHttpServlet.extractTopic("/topics//records"));             // empty topic
         assertNull(KafkaHttpServlet.extractTopic("/topics/orders/extra/records")); // slash inside topic
         assertNull(KafkaHttpServlet.extractTopic("/other/orders/records"));        // wrong prefix
+    }
+
+    @Test
+    void extractTopicRejectsTopicNamesThatFailKafkaValidation() {
+        // Wave 26 axis Y: Jetty's UriCompliance.DEFAULT does not reject decoded ASCII control bytes (CR, LF, BEL,
+        // DEL, 0x01–0x1F). Without a bridge-side validation step the percent-decoded topic flows through to every
+        // LOG.warn("…for {}", topic, …) in the bridge as raw text. An attacker that crafts topic=foo%0AFAKE INFO …
+        // splits a real log line into two attacker-controlled lines — a log-forging primitive a SOC log-parser
+        // would mistake for legitimate broker entries. Topic.isValid at the extraction boundary keeps the poisoned
+        // string out of every logger.
+        // Use string concatenation with explicit char literals so the test source survives copy/paste, IDE
+        // newline normalisation, and editor reformat — embedding raw 0x07/0x7F/0x00 bytes in a source file is
+        // fragile (some tools strip them on save).
+        assertNull(KafkaHttpServlet.extractTopic("/topics/foo\nFAKE/records"),
+            "embedded newline (log-forging primitive) must be rejected at the HTTP extraction boundary");
+        assertNull(KafkaHttpServlet.extractTopic("/topics/foo\rFAKE/records"));
+        assertNull(KafkaHttpServlet.extractTopic("/topics/foo" + (char) 0x07 + "FAKE/records"));   // BEL
+        assertNull(KafkaHttpServlet.extractTopic("/topics/foo" + (char) 0x7F + "FAKE/records"));   // DEL
+        assertNull(KafkaHttpServlet.extractTopic("/topics/foo" + (char) 0x00 + "FAKE/records"));   // NUL
+        assertNull(KafkaHttpServlet.extractTopic("/topics/foo bar/records"));        // space — outside [A-Za-z0-9._-]
+        assertNull(KafkaHttpServlet.extractTopic("/topics/./records"));              // forbidden literal
+        assertNull(KafkaHttpServlet.extractTopic("/topics/../records"));             // forbidden literal
+        String tooLong = "a".repeat(250);
+        assertNull(KafkaHttpServlet.extractTopic("/topics/" + tooLong + "/records"));
     }
 
     /** Submitter that yields whatever the test set up, with overrides for failure and deferred completion. */

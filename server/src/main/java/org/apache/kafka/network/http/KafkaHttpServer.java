@@ -18,6 +18,8 @@ package org.apache.kafka.network.http;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 
+import org.apache.kafka.common.internals.Topic;
+
 import org.eclipse.jetty.ee10.servlet.ErrorHandler;
 import org.eclipse.jetty.ee10.servlet.ServletContextHandler;
 import org.eclipse.jetty.ee10.servlet.ServletContextRequest;
@@ -327,6 +329,11 @@ public final class KafkaHttpServer {
      * Returns {@code null} if the shape doesn't match — the caller emits 404 in that case rather than guessing. The
      * Jetty WS filter already path-matched against {@link #WS_PATH_SPEC}, so this is defence-in-depth, not the primary
      * validation.
+     *
+     * <p>The topic name is also checked against {@link Topic#isValid}. See {@link KafkaHttpServlet#extractTopic} for
+     * the full reasoning — same defence: rejecting decoded ASCII control bytes here keeps {@code %0A}-bearing topic
+     * names out of every WS-side {@code LOG.warn("…for {}", topic, …)} site (log-forging primitive) and removes the
+     * bridge's silent dependency on broker-side topic-name validation.
      */
     static String extractSubscribeTopic(String requestPath, String contextPath) {
         if (requestPath == null) {
@@ -342,7 +349,7 @@ public final class KafkaHttpServer {
             return null;
         }
         String topic = inner.substring(prefix.length(), inner.length() - suffix.length());
-        if (topic.isEmpty() || topic.indexOf('/') >= 0) {
+        if (topic.isEmpty() || topic.indexOf('/') >= 0 || !Topic.isValid(topic)) {
             return null;
         }
         return topic;
