@@ -14200,6 +14200,108 @@ class KafkaApisTest extends Logging {
       s"error message must not leak backing-topic name, was: ${taintedGroup.errorMessage}")
   }
 
+  // r22 HIGH #229: sibling-asymmetry with share-group describe. The #211 filter walks
+  // member.assignment + member.targetAssignment but NOT member.subscribedTopicNames; the
+  // SubscribedTopicNames field is on the wire (ConsumerGroupDescribeResponse.json line 67,
+  // "[]string", entityType=topicName), so a backing topic name planted there by any upstream
+  // path (regex resolution #209, classic-bridge #212, persisted-record replay #232) leaked
+  // verbatim before the symmetric fix. Mirror the share-group describe pattern at
+  // handleShareGroupDescribe which has always concatenated subscribedTopicNames into the
+  // topicsToCheck and hasForbiddenTopic streams. Discriminator: empty assignments, backing
+  // only in subscribedTopicNames — pre-fix the response forwards the backing name; post-fix
+  // the group is bucketed to TOPIC_AUTHORIZATION_FAILED.
+  @Test
+  def testConsumerGroupDescribeFiltersBackingFromSubscribedTopicNames(): Unit = {
+    val logicalTopic = "tenant-logical"
+    val backingTopic = "__concentration_backing_0"
+    val errorMessage = "The group has described topic(s) that the client is not authorized to describe."
+
+    metadataCache = mock(classOf[KRaftMetadataCache])
+
+    val groupIds = List("group-id-clean", "group-id-subscribed-to-backing").asJava
+    val consumerGroupDescribeRequestData = new ConsumerGroupDescribeRequestData()
+      .setGroupIds(groupIds)
+    val requestChannelRequest = buildRequest(new ConsumerGroupDescribeRequest.Builder(consumerGroupDescribeRequestData, true).build())
+
+    val authorizer: Authorizer = mock(classOf[Authorizer])
+    val acls = Map(
+      groupIds.get(0) -> AuthorizationResult.ALLOWED,
+      groupIds.get(1) -> AuthorizationResult.ALLOWED,
+      logicalTopic    -> AuthorizationResult.ALLOWED,
+      // Wildcard authz on the backing — the kernel guard must strip it regardless.
+      backingTopic    -> AuthorizationResult.ALLOWED,
+    )
+    when(authorizer.authorize(
+      any[RequestContext],
+      any[util.List[Action]]
+    )).thenAnswer { invocation =>
+      val actions = invocation.getArgument(1, classOf[util.List[Action]])
+      actions.asScala.map { action =>
+        acls.getOrElse(action.resourcePattern.name, AuthorizationResult.DENIED)
+      }.asJava
+    }
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+    when(concentrationKernel.isBackingTopic(logicalTopic)).thenReturn(false)
+
+    val future = new CompletableFuture[util.List[ConsumerGroupDescribeResponseData.DescribedGroup]]()
+    when(groupCoordinator.consumerGroupDescribe(
+      any[RequestContext],
+      any[util.List[String]]
+    )).thenReturn(future)
+    kafkaApis = createKafkaApis(
+      authorizer = Some(authorizer),
+      featureVersions = Seq(GroupVersion.GV_1)
+    )
+    kafkaApis.handle(requestChannelRequest, RequestLocal.noCaching)
+
+    val cleanMember = new ConsumerGroupDescribeResponseData.Member()
+      .setMemberId("clean-member")
+      .setSubscribedTopicNames(List(logicalTopic).asJava)
+      .setAssignment(new ConsumerGroupDescribeResponseData.Assignment()
+        .setTopicPartitions(List(new TopicPartitions().setTopicName(logicalTopic)).asJava))
+      .setTargetAssignment(new ConsumerGroupDescribeResponseData.Assignment()
+        .setTopicPartitions(List(new TopicPartitions().setTopicName(logicalTopic)).asJava))
+
+    // Empty assignments — backing name lives ONLY in subscribedTopicNames. Without the #229
+    // fix, the topicsToCheck/hasForbiddenTopic flatMaps would miss it entirely and the group
+    // would round-trip with the backing name verbatim on the wire.
+    val subscribedToBackingMember = new ConsumerGroupDescribeResponseData.Member()
+      .setMemberId("subscribed-to-backing-member")
+      .setSubscribedTopicNames(List(backingTopic).asJava)
+      .setAssignment(new ConsumerGroupDescribeResponseData.Assignment()
+        .setTopicPartitions(util.Collections.emptyList()))
+      .setTargetAssignment(new ConsumerGroupDescribeResponseData.Assignment()
+        .setTopicPartitions(util.Collections.emptyList()))
+
+    future.complete(List(
+      new DescribedGroup()
+        .setGroupId(groupIds.get(0))
+        .setMembers(List(cleanMember).asJava),
+      new DescribedGroup()
+        .setGroupId(groupIds.get(1))
+        .setMembers(List(subscribedToBackingMember).asJava)
+    ).asJava)
+
+    val response = verifyNoThrottling[ConsumerGroupDescribeResponse](requestChannelRequest)
+    val groups = response.data.groups.asScala.toList
+    assertEquals(2, groups.size)
+
+    // Clean group passes through unchanged.
+    val cleanGroup = groups.find(_.groupId == groupIds.get(0)).get
+    assertEquals(Errors.NONE.code, cleanGroup.errorCode)
+    assertEquals(1, cleanGroup.members.size)
+
+    // Subscribed-to-backing group: collapsed to TOPIC_AUTHORIZATION_FAILED with empty members.
+    // The backing name MUST NOT appear anywhere in the response — not in errorMessage and not
+    // in any surviving member.subscribedTopicNames list (collapse drops members entirely).
+    val taintedGroup = groups.find(_.groupId == groupIds.get(1)).get
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED.code, taintedGroup.errorCode)
+    assertEquals(errorMessage, taintedGroup.errorMessage)
+    assertEquals(0, taintedGroup.members.size)
+    assertFalse(taintedGroup.errorMessage.contains(backingTopic),
+      s"error message must not leak backing-topic name, was: ${taintedGroup.errorMessage}")
+  }
+
   @Test
   def testGetTelemetrySubscriptions(): Unit = {
     val request = buildRequest(new GetTelemetrySubscriptionsRequest.Builder(

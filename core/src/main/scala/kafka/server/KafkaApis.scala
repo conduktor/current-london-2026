@@ -3984,11 +3984,25 @@ class KafkaApis(val requestChannel: RequestChannel,
           // would have entered the coordinator state via a regex resolution (#209), a classic
           // JoinGroup protocol-metadata blob (#212), or any prior commit, and would surface here
           // verbatim without this guard.
+          //
+          // r22 HIGH #229 (sibling-asymmetry with share-group describe at the same handler
+          // pattern below): the topicsToCheck flatMap must ALSO include `member.subscribedTopicNames`
+          // because that field is on the wire (ConsumerGroupDescribeResponse.Member.SubscribedTopicNames
+          // is "[]string", entityType=topicName). Before this fix the filter walked only
+          // assignment + targetAssignment partitions, so a member whose `subscribedTopicNames`
+          // list contained a backing topic — planted by any of the upstream paths above —
+          // had that name echoed verbatim in the wire response, even though every backing
+          // topicId on its assignment got bucket-rejected. The share-group sibling at
+          // handleShareGroupDescribe (below) has always concatenated subscribedTopicNames into
+          // its topicsToCheck stream; this mirror restores the symmetry.
           val topicsToCheck = response.groups.stream()
             .flatMap(group => group.members.stream)
-            .flatMap(member => util.stream.Stream.of(member.assignment, member.targetAssignment))
-            .flatMap(assignment => assignment.topicPartitions.stream)
-            .map(topicPartition => topicPartition.topicName)
+            .flatMap(member => util.stream.Stream.concat(
+              member.subscribedTopicNames.stream,
+              util.stream.Stream.of(member.assignment, member.targetAssignment)
+                .flatMap(assignment => assignment.topicPartitions.stream)
+                .map[String](tp => tp.topicName)
+            ))
             .collect(Collectors.toSet[String])
             .asScala
           val authorizedTopics: Set[String] = if (authorizer.isEmpty) topicsToCheck.toSet
@@ -4002,9 +4016,13 @@ class KafkaApis(val requestChannel: RequestChannel,
             name => authorizedTopics.contains(name) && !concentrationKernel.isBackingTopic(name)
           val updatedGroups = response.groups.stream().map { group =>
             val hasForbiddenTopic = group.members.stream()
-              .flatMap(member => util.stream.Stream.of(member.assignment, member.targetAssignment))
-              .flatMap(assignment => assignment.topicPartitions.stream())
-              .anyMatch(tp => !sieve(tp.topicName))
+              .flatMap(member => util.stream.Stream.concat(
+                member.subscribedTopicNames.stream,
+                util.stream.Stream.of(member.assignment, member.targetAssignment)
+                  .flatMap(assignment => assignment.topicPartitions.stream())
+                  .map[String](tp => tp.topicName)
+              ))
+              .anyMatch(name => !sieve(name))
 
             if (hasForbiddenTopic) {
               new ConsumerGroupDescribeResponseData.DescribedGroup()
