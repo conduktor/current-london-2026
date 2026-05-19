@@ -243,11 +243,12 @@ final class IoUringTransportLayer implements TransportLayer {
         // the destination NetworkReceive buffer, not the bytes still sitting in this
         // queue waiting to be drained).
         //
-        // We always defer the autoRead=false to the channel's own event loop, even though
-        // offerInbound is invoked from the event loop in production. EmbeddedChannel in
-        // tests routes channelRead synchronously on the caller's thread — calling
-        // setAutoRead inline on the test path could deadlock if it tried to re-enter the
-        // pipeline. The event loop is always the right thread to flip Netty config.
+        // setAutoRead is called inline on the caller's thread. offerInbound is contracted
+        // to be invoked from the channel's event loop (the production caller is the Netty
+        // pipeline's channelRead, and EmbeddedChannel in tests routes channelRead
+        // synchronously on the test thread — same single-threaded discipline). The
+        // companion gate in read() reconciles autoRead back on if this flip races with
+        // a concurrent Processor drain (see AUTOREAD-RACE).
         if (after >= INBOUND_HIGH_WATERMARK_BYTES && nettyChannel.config().isAutoRead()) {
             nettyChannel.config().setAutoRead(false);
         }
