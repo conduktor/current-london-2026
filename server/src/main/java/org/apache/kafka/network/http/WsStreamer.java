@@ -193,7 +193,9 @@ public final class WsStreamer {
             // in-flight whenCompleteAsync chain settles (up to fetch.max.wait.ms); without this, every
             // staged FetchedRecord (key+value byte arrays) is pinned for that window. Concurrent
             // poll/offer racing this clear is safe: ConcurrentLinkedQueue.clear is non-blocking, racing
-            // drains see null polls and exit, and handleFetchResult gates its offers on !closed.
+            // drains see null polls and exit, and handleFetchResult's offer loop is fenced by a
+            // post-stage closed-check that mirrors this clear (so an offer that lands after this
+            // clear runs is dropped at the gate, not pinned).
             buffer.clear();
             try {
                 sink.close();
@@ -214,7 +216,8 @@ public final class WsStreamer {
         if (closed.compareAndSet(false, true)) {
             limiterToken.close();
             // Same rationale as close(): drop staged record refs so they aren't pinned for the lifetime
-            // of any in-flight whenCompleteAsync chain.
+            // of any in-flight whenCompleteAsync chain. handleFetchResult's post-stage closed-check
+            // mirrors this clear to fence late-arriving offers.
             buffer.clear();
             try {
                 sink.close(statusCode, reason);
@@ -450,6 +453,19 @@ public final class WsStreamer {
         // happens-before so the buffer and throttle writes are visible to any thread that observes fetchInFlight=false.
         for (FetchResponseFormatter.FetchedRecord r : view.records()) {
             buffer.offer(r);
+        }
+        // Post-stage close gate. The closed-check at the entry of this method (above) guards entry only.
+        // If close() (or closeOnFailure() — same CAS) lands between that entry-check and the offer loop
+        // above, close()'s own buffer.clear() already ran BEFORE our offers, so the records we just staged
+        // sit pinned in the buffer for the lifetime of the WsStreamer reference (Jetty drops the endpoint
+        // shortly after onWebSocketClose, but until then the staged FetchedRecord key+value arrays are
+        // live — the whole point of W45-DDD's eager clear). Mirror close()'s clear here so the two-sided
+        // gating ("entry-check + post-stage clear") closes the window. Resetting fetchInFlight keeps the
+        // book-keeping clean even though no future drain will read it.
+        if (closed.get()) {
+            buffer.clear();
+            fetchInFlight.set(false);
+            return;
         }
         long throttleMs = result.throttleTimeMs();
         if (throttleMs > 0) {
