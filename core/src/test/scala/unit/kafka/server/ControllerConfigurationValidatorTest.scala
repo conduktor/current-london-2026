@@ -18,13 +18,13 @@
 package kafka.server
 
 import kafka.utils.TestUtils
-import org.apache.kafka.common.config.ConfigResource
+import org.apache.kafka.common.config.{ConfigException, ConfigResource}
 import org.apache.kafka.common.config.ConfigResource.Type.{BROKER, BROKER_LOGGER, CLIENT_METRICS, GROUP, TOPIC}
 import org.apache.kafka.common.config.TopicConfig.{REMOTE_LOG_STORAGE_ENABLE_CONFIG, SEGMENT_BYTES_CONFIG, SEGMENT_JITTER_MS_CONFIG, SEGMENT_MS_CONFIG}
 import org.apache.kafka.common.errors.{InvalidConfigurationException, InvalidRequestException, InvalidTopicException}
 import org.apache.kafka.coordinator.group.GroupConfig
 import org.apache.kafka.server.metrics.ClientMetricsConfigs
-import org.junit.jupiter.api.Assertions.{assertEquals, assertThrows}
+import org.junit.jupiter.api.Assertions.{assertEquals, assertThrows, assertTrue}
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.ValueSource
@@ -174,6 +174,53 @@ class ControllerConfigurationValidatorTest {
     assertEquals("Illegal client matching pattern: 10",
       assertThrows(classOf[InvalidConfigurationException], () => validator.validate(
         new ConfigResource(CLIENT_METRICS, "subscription-1"), config, emptyMap())). getMessage)
+  }
+
+  @Test
+  def testBrokerConfigRejectsTenantPrefixedSuperUsersOnController(): Unit = {
+    // Controller-side defence in depth: a writer reaching the controller
+    // listener directly (e.g. a CLUSTER_ACTION holder bypassing the broker
+    // preprocess in ConfigAdminManager) must NOT be able to persist a poison
+    // super.users record into the metadata log. The broker would otherwise
+    // catch it at startup or in DynamicBrokerConfig — too late, the metadata
+    // is already corrupted and every broker restart fails.
+    val config = new util.TreeMap[String, String]()
+    config.put("super.users", "User:Operator;User:__tenant_acme.alice")
+    val ex = assertThrows(classOf[ConfigException], () => validator.validate(
+      new ConfigResource(BROKER, "1"), config, emptyMap()))
+    val msg = ex.getMessage
+    assertTrue(msg.contains("__tenant_acme.alice"), s"expected offender listed in: $msg")
+    assertTrue(msg.contains("reserved tenant prefix"), s"expected explanation in: $msg")
+  }
+
+  @Test
+  def testBrokerConfigAcceptsOperatorSuperUsersOnController(): Unit = {
+    // Non-tenant principals in super.users are the legitimate operator case.
+    val config = new util.TreeMap[String, String]()
+    config.put("super.users", "User:Operator;User:Admin")
+    validator.validate(new ConfigResource(BROKER, "1"), config, emptyMap())
+  }
+
+  @Test
+  def testBrokerConfigSuperUsersValidationAggregatesOffendersOnController(): Unit = {
+    // Mirrors TenantConfig.validateSuperUsersAreNotTenantPrefixed behaviour:
+    // every offending entry is named in the error so an operator can fix the
+    // request in one round-trip instead of discovering them one at a time.
+    val config = new util.TreeMap[String, String]()
+    config.put("super.users", "User:__tenant_acme.alice;User:Operator;User:__tenant_beta.bob")
+    val ex = assertThrows(classOf[ConfigException], () => validator.validate(
+      new ConfigResource(BROKER, "1"), config, emptyMap()))
+    val msg = ex.getMessage
+    assertTrue(msg.contains("__tenant_acme.alice"), s"expected first offender in: $msg")
+    assertTrue(msg.contains("__tenant_beta.bob"), s"expected second offender in: $msg")
+  }
+
+  @Test
+  def testBrokerConfigWithoutSuperUsersPassesOnController(): Unit = {
+    // Unrelated broker configs must not be impeded by the tenant guard.
+    val config = new util.TreeMap[String, String]()
+    config.put("log.retention.ms", "604800000")
+    validator.validate(new ConfigResource(BROKER, "1"), config, emptyMap())
   }
 
   @Test

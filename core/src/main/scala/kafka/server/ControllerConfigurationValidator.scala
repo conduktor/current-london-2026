@@ -26,6 +26,7 @@ import org.apache.kafka.common.errors.{InvalidConfigurationException, InvalidReq
 import org.apache.kafka.common.internals.Topic
 import org.apache.kafka.coordinator.group.GroupConfigManager
 import org.apache.kafka.server.metrics.ClientMetricsConfigs
+import org.apache.kafka.server.tenant.TenantConfig
 import org.apache.kafka.storage.internals.log.LogConfig
 
 import scala.collection.mutable
@@ -119,7 +120,22 @@ class ControllerConfigurationValidator(kafkaConfig: KafkaConfig) extends Configu
         }
         LogConfig.validate(oldConfigs, properties, kafkaConfig.extractLogConfigMap,
           kafkaConfig.remoteLogManagerConfig.isRemoteStorageSystemEnabled())
-      case BROKER => validateBrokerName(resource.name())
+      case BROKER =>
+        validateBrokerName(resource.name())
+        // Defence in depth against tenant-prefixed super.users.
+        // KafkaConfig.validateValues already runs the same check at broker
+        // startup *and* on the broker-side AlterConfigs preprocess
+        // (ConfigAdminManager → DynamicBrokerConfig.validate constructs a new
+        // KafkaConfig, which calls validateValues). However an AlterConfigs
+        // landing directly on the controller listener — or any future caller
+        // that bypasses ConfigAdminManager — skips that gate, and would
+        // otherwise persist a poison `super.users` entry into the metadata
+        // log. The next broker restart then fails to apply its dynamic
+        // configs (ConfigException from validateValues) and a custom
+        // Reconfigurable authorizer would happily ingest the bad value at
+        // runtime. Mirror the startup check here so the controller refuses
+        // to write the record in the first place.
+        TenantConfig.validateSuperUsersAreNotTenantPrefixed(newConfigs)
       case CLIENT_METRICS =>
         val properties = new Properties()
         newConfigs.forEach((key, value) => properties.setProperty(key, value))
