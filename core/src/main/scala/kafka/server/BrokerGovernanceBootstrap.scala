@@ -834,6 +834,20 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
   // emission count regardless of which category fired.
   private[server] val warnEmissions = new AtomicLong(0L)
 
+  // Round-22 HIGH (Agent 1 / Agent 6 #217): the cumulative counter above
+  // proves a WARN *fired*, not what it *said*. The poison-throttle tests
+  // need to pin the format of the emitted line — that the offset, the
+  // sanitized exception message, and the rollup count actually appear in
+  // the WARN — otherwise a regression that silently drops the rollup
+  // ("(same exception class repeated N time(s) in the last 60000ms)")
+  // or stops sanitizing the message would still leave the count
+  // assertions passing. Capture the most-recent emitted message string
+  // per category. Production cost: a single AtomicReference set per
+  // emit on the drain thread; tests read it. Cleared lazily, never
+  // bounded — the field is overwritten on each emit, so memory cost is
+  // O(1) per category and the previous value is GC'd on overwrite.
+  private[server] val lastPoisonWarnMessage = new AtomicReference[String](null)
+
   /**
    * Round-15 HIGH-1 (recent-changes sub-agent): each WARN category has its
    * own dedup ledger so dedupe state does not leak across distinct concerns.
@@ -933,20 +947,25 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
         val suppressed = suppressedSinceLastWarn.getAndSet(0L)
         lastClassName.set(className)
         lastWarnAtNanos.set(now)
-        if (suppressed > 0L && previous != null) {
-          warn(s"skipping poisoned __governance record at offset $offset: $sample " +
-            s"(previous class '$previous' repeated and was suppressed $suppressed " +
-            s"time(s) before this new class)")
-        } else {
-          warn(s"skipping poisoned __governance record at offset $offset: $sample")
-        }
+        val msg =
+          if (suppressed > 0L && previous != null) {
+            s"skipping poisoned __governance record at offset $offset: $sample " +
+              s"(previous class '$previous' repeated and was suppressed $suppressed " +
+              s"time(s) before this new class)"
+          } else {
+            s"skipping poisoned __governance record at offset $offset: $sample"
+          }
+        warn(msg)
+        lastPoisonWarnMessage.set(msg)
         warnEmissions.incrementAndGet()
       } else if (now - lastWarnAtNanos.get() >= FailureWarnIntervalNanos) {
         val rolled = suppressedSinceLastWarn.getAndSet(0L)
         lastWarnAtNanos.set(now)
-        warn(s"skipping poisoned __governance record at offset $offset: $sample " +
+        val msg = s"skipping poisoned __governance record at offset $offset: $sample " +
           s"(same exception class repeated $rolled time(s) in the last " +
-          s"${FailureWarnIntervalNanos / 1_000_000L}ms)")
+          s"${FailureWarnIntervalNanos / 1_000_000L}ms)"
+        warn(msg)
+        lastPoisonWarnMessage.set(msg)
         warnEmissions.incrementAndGet()
       } else {
         suppressedSinceLastWarn.incrementAndGet()

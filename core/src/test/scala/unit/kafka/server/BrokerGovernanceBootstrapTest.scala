@@ -377,6 +377,30 @@ class BrokerGovernanceBootstrapTest {
     assertEquals(1L, boot.warnEmissions.get(),
       "five same-class poison records inside one window must collapse to exactly ONE WARN — " +
         "the log-flood vector against the operator's log pipeline must be neutralised")
+
+    // Round-22 HIGH (Agent 1 / Agent 6 #217): the count assertion above
+    // does NOT prove the WARN actually carried the diagnostic an operator
+    // needs to act on. Pin the emitted message format:
+    //   - includes the "skipping poisoned __governance record at offset N"
+    //     prefix that operators grep for
+    //   - includes the offset of the *triggering* (first) record, NOT
+    //     the offset of a later suppressed record
+    //   - includes the sanitised exception message ("poison-1" — the
+    //     first record's message, since the throttle only fires on the
+    //     first arrival of a fresh class)
+    val warn = boot.lastPoisonWarnMessage.get()
+    assertNotNull(warn, "WARN must have been captured for assertion")
+    assertTrue(warn.startsWith("skipping poisoned __governance record at offset 0:"),
+      "WARN must carry the offset-0 prefix that operators grep for; got: " + warn)
+    assertTrue(warn.contains("poison-1"),
+      "WARN must carry the sanitised exception message of the *triggering* record " +
+        "(the first one); got: " + warn)
+    // The single-window WARN must NOT carry a rollup tail (this fires
+    // before the suppression window has rolled over).
+    assertTrue(!warn.contains("repeated and was suppressed")
+      && !warn.contains("repeated") || !warn.contains("time(s) in the last"),
+      "first WARN of a fresh class with no prior class must not carry a rollup tail; got: "
+        + warn)
   }
 
   @Test
@@ -397,6 +421,13 @@ class BrokerGovernanceBootstrapTest {
     boot.maybeWarnPoisonedRecord(100L, new RuntimeException("first"))
     assertEquals(1L, boot.warnEmissions.get(),
       "first poison of a fresh exception class must WARN")
+    // Round-22 HIGH (#217): pin the format of the first-arrival WARN.
+    val firstWarn = boot.lastPoisonWarnMessage.get()
+    assertNotNull(firstWarn, "first WARN must have been captured")
+    assertTrue(firstWarn.startsWith("skipping poisoned __governance record at offset 100:"),
+      "first WARN must carry the correct offset prefix; got: " + firstWarn)
+    assertTrue(firstWarn.contains("first"),
+      "first WARN must carry the triggering record's sanitised message; got: " + firstWarn)
 
     // Same class, inside the window — suppressed.
     clock.set(10_000L * 1_000_000L)
@@ -407,6 +438,12 @@ class BrokerGovernanceBootstrapTest {
     boot.maybeWarnPoisonedRecord(103L, new RuntimeException("inside-window-3"))
     assertEquals(1L, boot.warnEmissions.get(),
       "same-class poison inside the window must be silently suppressed")
+    // Round-22 HIGH (#217): the captured WARN string must remain the
+    // first one because the throttle is suppressing — if it were
+    // changed, that would mean a suppression WARN leaked through.
+    assertEquals(firstWarn, boot.lastPoisonWarnMessage.get(),
+      "no WARN must have been re-emitted during suppression; lastPoisonWarnMessage " +
+        "must still hold the original first-arrival WARN")
 
     // Crossing the window — rollup fires.
     clock.set(60_001L * 1_000_000L)
@@ -414,6 +451,22 @@ class BrokerGovernanceBootstrapTest {
     assertEquals(2L, boot.warnEmissions.get(),
       "crossing the window with the same class must roll up the suppressed count " +
         "into exactly ONE WARN, not one per suppressed occurrence")
+    // Round-22 HIGH (#217): the rollup WARN must explicitly carry the
+    // suppressed count AND the window-duration tail. Without these,
+    // operators cannot tell the flood magnitude — the whole point of
+    // the rollup. The count is 3 (records 101/102/103 were
+    // suppressed within the window).
+    val rollupWarn = boot.lastPoisonWarnMessage.get()
+    assertNotNull(rollupWarn, "rollup WARN must have been captured")
+    assertTrue(rollupWarn.startsWith("skipping poisoned __governance record at offset 104:"),
+      "rollup WARN must carry the triggering-record offset (104), not a suppressed offset; " +
+        "got: " + rollupWarn)
+    assertTrue(rollupWarn.contains("same exception class repeated 3 time(s)"),
+      "rollup WARN must explicitly carry the suppressed count (=3 for 101/102/103); " +
+        "got: " + rollupWarn)
+    assertTrue(rollupWarn.contains("in the last 60000ms"),
+      "rollup WARN must carry the window-duration tail so operators can correlate " +
+        "with their log-flood timeline; got: " + rollupWarn)
 
     // A brand-new class fires immediately.
     clock.set(60_500L * 1_000_000L)
@@ -422,6 +475,19 @@ class BrokerGovernanceBootstrapTest {
     assertEquals(3L, boot.warnEmissions.get(),
       "a transition to a new exception class must WARN immediately — operators must see " +
         "the failure mode change without waiting for the suppression window")
+    // Round-22 HIGH (#217): when the class transitions and the
+    // previous class had no suppressed records (we just rolled up at
+    // offset 104), the new-class WARN should NOT carry a "previous
+    // class suppressed N time(s)" tail — there's nothing to roll up.
+    val newClassWarn = boot.lastPoisonWarnMessage.get()
+    assertNotNull(newClassWarn, "new-class WARN must have been captured")
+    assertTrue(newClassWarn.startsWith("skipping poisoned __governance record at offset 105:"),
+      "new-class WARN must carry the offset prefix; got: " + newClassWarn)
+    assertTrue(newClassWarn.contains("new-class"),
+      "new-class WARN must carry the new exception's sanitised message; got: " + newClassWarn)
+    assertTrue(!newClassWarn.contains("previous class"),
+      "after a rollup just cleared the suppressed counter, the class-transition WARN " +
+        "must NOT carry a stale 'previous class' tail; got: " + newClassWarn)
   }
 
   @Test
