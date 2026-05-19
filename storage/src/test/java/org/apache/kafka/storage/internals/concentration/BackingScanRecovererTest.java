@@ -23,6 +23,8 @@ import org.junit.jupiter.api.Test;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
@@ -418,6 +420,130 @@ public class BackingScanRecovererTest {
     private static final class SimulatedScanFailure extends RuntimeException {
         SimulatedScanFailure(String msg) {
             super(msg);
+        }
+    }
+
+    // ---------------- r24 BLOCKER #248: parent-dir fsync discriminator tests ----------------
+
+    @Test
+    public void openSidecarOnNewTopicFsyncsSidecarDirAndTopicDir() throws IOException {
+        // Two fsyncs must happen end-to-end on a fresh topic's first openSidecar:
+        //   1. sidecarDir, after ensureTopicDir created topic-dir (so the topic-dir's dirent
+        //      survives a crash before the FS's next metadata writeback).
+        //   2. topic-dir, after the constructor created the .sidecar file (so the sidecar's
+        //      dirent survives that same window).
+        // Both go through the flushDirSeam, so the counting subclass observes both. Removing
+        // either fsync from the production code would drop the count and fail this assertion.
+        CountingRecoverer rec = new CountingRecoverer(sidecarDir);
+        try (LogicalSidecarIndex sidecar = rec.openSidecar("freshTopic", 0)) {
+            sidecar.append(0L);   // sanity: the sidecar is usable
+        }
+        Path expectedSidecarDir = sidecarDir.toPath().toAbsolutePath().normalize();
+        Path expectedTopicDir = new File(sidecarDir, "freshTopic").toPath().toAbsolutePath().normalize();
+        assertEquals(2, rec.flushedPaths.size(),
+            "fresh-topic openSidecar must fsync sidecarDir AND topic-dir; saw " + rec.flushedPaths);
+        assertTrue(rec.flushedPaths.contains(expectedSidecarDir),
+            "must fsync sidecarDir; saw " + rec.flushedPaths);
+        assertTrue(rec.flushedPaths.contains(expectedTopicDir),
+            "must fsync topic-dir; saw " + rec.flushedPaths);
+    }
+
+    @Test
+    public void reopeningExistingSidecarFsyncsNothing() throws IOException {
+        // First open (via the @BeforeEach recoverer) creates the dir + file and fsyncs both.
+        try (LogicalSidecarIndex initial = recoverer.openSidecar("topicA", 0)) {
+            initial.append(0L);
+        }
+        // Subsequent open observes the file already exists → no creation → no fsync. This is
+        // the steady-state fast path: every produce after the first to a given (topic,
+        // partition) must NOT pay an fsync per open. Otherwise the no-fsync-per-append PROMPT
+        // invariant would be silently violated by the kernel reopening on every restart.
+        CountingRecoverer rec = new CountingRecoverer(sidecarDir);
+        try (LogicalSidecarIndex reopen = rec.openSidecar("topicA", 0)) {
+            assertEquals(1L, reopen.size(), "sanity: file content survived");
+        }
+        assertEquals(0, rec.flushedPaths.size(),
+            "re-opening an existing sidecar must not fsync anything; saw " + rec.flushedPaths);
+    }
+
+    @Test
+    public void openSidecarOnNewPartitionInExistingTopicFsyncsOnlyTopicDir() throws IOException {
+        // Topic-dir already exists from a prior partition's open → ensureTopicDir's fast path
+        // (isDirectory true) skips both mkdirs and sidecarDir-fsync. Only the new .sidecar file
+        // creation needs a topic-dir fsync.
+        try (LogicalSidecarIndex p0 = recoverer.openSidecar("topicA", 0)) {
+            p0.append(0L);
+        }
+        CountingRecoverer rec = new CountingRecoverer(sidecarDir);
+        try (LogicalSidecarIndex p1 = rec.openSidecar("topicA", 1)) {
+            p1.append(99L);
+        }
+        Path expectedTopicDir = new File(sidecarDir, "topicA").toPath().toAbsolutePath().normalize();
+        assertEquals(1, rec.flushedPaths.size(),
+            "new-partition-in-existing-topic must fsync exactly topic-dir; saw " + rec.flushedPaths);
+        assertTrue(rec.flushedPaths.contains(expectedTopicDir));
+    }
+
+    @Test
+    public void openSidecarPropagatesFlushDirFailure() {
+        // If the OS reports the fsync failed (e.g., I/O error on the metadata journal), the
+        // produce path MUST see the failure rather than continuing with a possibly-not-durable
+        // dirent. CountingRecoverer makes flushDirSeam throw on first invocation; the production
+        // code surfaces that as IOException to its caller.
+        CountingRecoverer rec = new CountingRecoverer(sidecarDir);
+        rec.failOnFlushDir = new IOException("simulated metadata-fsync failure");
+        IOException thrown = assertThrows(IOException.class, () -> rec.openSidecar("topicA", 0));
+        assertEquals("simulated metadata-fsync failure", thrown.getMessage());
+    }
+
+    @Test
+    public void persistStartOffsetFsyncsSidecarDirOnFreshTopic() throws IOException {
+        // persistStartOffset calls ensureTopicDir which fsyncs sidecarDir on first creation
+        // (one observable seam call). The rename's parent (topic-dir) is fsync'd inside
+        // atomicMoveWithFallback via Utils.flushDir directly — NOT through our seam — so the
+        // counter sees exactly one fsync from this codepath.
+        CountingRecoverer rec = new CountingRecoverer(sidecarDir);
+        rec.persistStartOffset("freshTopic", 0, 42L);
+        Path expectedSidecarDir = sidecarDir.toPath().toAbsolutePath().normalize();
+        assertEquals(1, rec.flushedPaths.size(),
+            "persistStartOffset on fresh topic must fsync sidecarDir; saw " + rec.flushedPaths);
+        assertTrue(rec.flushedPaths.contains(expectedSidecarDir));
+    }
+
+    @Test
+    public void sidecarFileNoLongerCreatesTopicDirAsSideEffect() {
+        // Path-only contract for sidecarFile() (and startOffsetFile()): inspection callers
+        // (partitionsWithoutSidecar's .exists() walk, removeLogicalPartition's cleanup .exists()
+        // check) must NOT accidentally materialise an empty topic-dir as a side effect — pre-
+        // r24 #248, sidecarFile() did exactly that, which both (a) leaked an empty directory
+        // per inspected topic-name and (b) created a dirent in sidecarDir without fsync.
+        File computed = recoverer.sidecarFile("freshTopic", 0);
+        assertEquals("0.sidecar", computed.getName());
+        File topicDir = computed.getParentFile();
+        assertEquals("freshTopic", topicDir.getName());
+        assertTrue(!topicDir.exists(), "sidecarFile() must not create the topic-dir as a side effect");
+    }
+
+    /**
+     * Counts {@link BackingScanRecoverer#flushDirSeam(Path)} invocations and optionally throws
+     * on the next call. The seam pattern lets us assert the production code ACTUALLY fsyncs the
+     * directories it claims to — a no-op {@code ensureTopicDir} would otherwise pass every
+     * other test in this file silently.
+     */
+    private static final class CountingRecoverer extends BackingScanRecoverer {
+        final List<Path> flushedPaths = new ArrayList<>();
+        volatile IOException failOnFlushDir;
+
+        CountingRecoverer(File sidecarDir) {
+            super(sidecarDir);
+        }
+
+        @Override
+        void flushDirSeam(Path path) throws IOException {
+            flushedPaths.add(path);
+            if (failOnFlushDir != null) {
+                throw failOnFlushDir;
+            }
         }
     }
 }

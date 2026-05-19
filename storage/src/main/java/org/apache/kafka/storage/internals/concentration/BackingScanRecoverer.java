@@ -22,6 +22,7 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.Collection;
 import java.util.Collections;
@@ -49,7 +50,9 @@ import java.util.Set;
  * The per-topic subdirectory makes the file naming unambiguous for any legal topic name and
  * sidesteps name-encoding concerns at the cost of a few extra inodes.
  */
-public final class BackingScanRecoverer {
+// Non-final so r24 BLOCKER #248 discriminator test can subclass and count/inject failures via
+// the {@link #flushDirSeam(Path)} package-private seam. No production subclass exists.
+public class BackingScanRecoverer {
 
     private final File sidecarDir;
 
@@ -60,12 +63,17 @@ public final class BackingScanRecoverer {
         }
     }
 
+    /**
+     * Pure path computation: returns the {@code File} where the per-(logicalTopic, partition)
+     * sidecar lives. The parent topic-dir is NOT created as a side effect — that responsibility
+     * belongs to {@link #ensureTopicDir(String)}, which is called from the write paths
+     * ({@link #openSidecar(String, int)} / {@link #persistStartOffset(String, int, long)}) where
+     * the corresponding {@code sidecarDir} fsync is also needed for crash-durability
+     * (r24 BLOCKER #248). Inspection callers ({@code .exists()}, {@code .getParentFile()})
+     * therefore no longer accidentally materialise an empty topic-dir on read.
+     */
     public File sidecarFile(String logicalTopic, int logicalPartition) {
-        File topicDir = new File(sidecarDir, logicalTopic);
-        if (!topicDir.isDirectory() && !topicDir.mkdirs()) {
-            throw new IllegalStateException("could not create topic dir " + topicDir);
-        }
-        return new File(topicDir, logicalPartition + ".sidecar");
+        return new File(new File(sidecarDir, logicalTopic), logicalPartition + ".sidecar");
     }
 
     /**
@@ -81,15 +89,77 @@ public final class BackingScanRecoverer {
      * time: the sidecar grows on every produce, the start-offset file mutates only on DeleteRecords.
      */
     public File startOffsetFile(String logicalTopic, int logicalPartition) {
-        File topicDir = new File(sidecarDir, logicalTopic);
-        if (!topicDir.isDirectory() && !topicDir.mkdirs()) {
-            throw new IllegalStateException("could not create topic dir " + topicDir);
-        }
-        return new File(topicDir, logicalPartition + ".startoffset");
+        return new File(new File(sidecarDir, logicalTopic), logicalPartition + ".startoffset");
     }
 
+    /**
+     * Open (or create) the sidecar for {@code (logicalTopic, logicalPartition)}.
+     *
+     * <p>r24 BLOCKER #248 — first-produce-on-fresh-topic crash-durability. The constructor
+     * opens the file with {@code RandomAccessFile("rw")} which creates it if missing. POSIX
+     * guarantees the file's inode is durable only after {@code fsync} of the file itself; the
+     * file's directory entry inside the topic-dir is durable only after {@code fsync} of the
+     * topic-dir. Without that latter fsync, a power loss between the open and the next OS
+     * metadata writeback can lose the entire .sidecar file. The backing-log record carrying
+     * logical headers survives Kafka's normal replication-fsync chain; the broker on restart
+     * sees no sidecar, treats the next produce as logical offset 0 — silently overwriting the
+     * lost record's identity from the consumer's point of view. The two fsyncs together
+     * ({@code sidecarDir} via {@link #ensureTopicDir}, {@code topicDir} here) close the chain.
+     */
     public LogicalSidecarIndex openSidecar(String logicalTopic, int logicalPartition) throws IOException {
-        return new LogicalSidecarIndex(sidecarFile(logicalTopic, logicalPartition), logicalTopic, logicalPartition);
+        File topicDir = ensureTopicDir(logicalTopic);
+        File file = new File(topicDir, logicalPartition + ".sidecar");
+        boolean wasNew = !file.exists();
+        LogicalSidecarIndex idx = new LogicalSidecarIndex(file, logicalTopic, logicalPartition);
+        if (wasNew) {
+            // POSIX: the .sidecar's dirent lives in topicDir; fsync topicDir to make the dirent
+            // durable. Subsequent openSidecar calls for an existing file skip this — the dirent
+            // was already fsync'd when the file was first created in a prior call (this
+            // lifetime) or a prior broker run.
+            flushDirSeam(topicDir.toPath().toAbsolutePath().normalize());
+        }
+        return idx;
+    }
+
+    /**
+     * Create the per-topic subdir under {@code sidecarDir} if it does not already exist, and
+     * fsync {@code sidecarDir} so the new dirent is durable (r24 BLOCKER #248).
+     *
+     * <p>The fast path is a single {@code isDirectory()} stat — no work, no lock, no fsync.
+     * Only the first call per topic per broker lifetime (or first call after the topic-dir
+     * was externally removed) takes the slow path. Slow path is monitored against concurrent
+     * callers so a race-loser does not return before the race-winner's {@code sidecarDir} fsync
+     * has made the topic-dir's dirent durable — otherwise the loser could create a .sidecar
+     * file whose ancestor path is not yet on disk, defeating the whole chain.
+     *
+     * <p>If neither this call nor a concurrent one can create the dir AND the dir is still not
+     * present after the attempt, an {@link IOException} is thrown so the caller can fail the
+     * produce/persist instead of silently dropping the write.
+     */
+    private File ensureTopicDir(String logicalTopic) throws IOException {
+        File topicDir = new File(sidecarDir, logicalTopic);
+        if (topicDir.isDirectory()) {
+            return topicDir;
+        }
+        synchronized (this) {
+            if (topicDir.isDirectory()) return topicDir;
+            if (!topicDir.mkdirs() && !topicDir.isDirectory()) {
+                throw new IOException("could not create topic dir " + topicDir);
+            }
+            flushDirSeam(sidecarDir.toPath().toAbsolutePath().normalize());
+        }
+        return topicDir;
+    }
+
+    /**
+     * Package-private fsync seam: delegates to {@link Utils#flushDir(Path)}. The r24 BLOCKER
+     * #248 discriminator test overrides this to count invocations and inject failures without
+     * having to mock the filesystem underneath. Tests that pass against a no-op
+     * {@code ensureTopicDir} fsync would not catch a regression; routing every fsync through
+     * one seam makes the invariant testable.
+     */
+    void flushDirSeam(Path path) throws IOException {
+        Utils.flushDir(path);
     }
 
     /**
@@ -118,7 +188,14 @@ public final class BackingScanRecoverer {
         if (startOffset < 0) {
             throw new IllegalArgumentException("startOffset must be non-negative, got " + startOffset);
         }
-        File target = startOffsetFile(logicalTopic, logicalPartition);
+        // r24 BLOCKER #248: ensureTopicDir creates the topic-dir (if missing) AND fsyncs
+        // sidecarDir so the new dirent is durable. atomicMoveWithFallback below already fsyncs
+        // the rename's parent (topic-dir) for the .startoffset file's own dirent — but that
+        // alone is insufficient if topic-dir itself was just-created and sidecarDir has not yet
+        // been fsync'd. The two fsyncs together (sidecarDir here, topic-dir in
+        // atomicMoveWithFallback) close the chain.
+        File topicDir = ensureTopicDir(logicalTopic);
+        File target = new File(topicDir, logicalPartition + ".startoffset");
         File tmp = new File(target.getPath() + ".tmp");
         try (FileChannel ch = FileChannel.open(tmp.toPath(),
                 StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
