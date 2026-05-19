@@ -522,8 +522,8 @@ abstract class CelNode {
             // prefixes (compareTo / equals), so a fat string == in an
             // attacker-iterated comprehension can do millions of char compares
             // without touching the iteration budget. Charge the linear cost
-            // for string-vs-string comparisons; numeric/boolean compare is
-            // O(1) and bounded by AST node count via MAX_NODES.
+            // additively on top of the baseline so the per-character work is
+            // accounted, not just the node itself.
             if (l instanceof String && r instanceof String) {
                 int len = Math.min(((String) l).length(), ((String) r).length());
                 CelLimits.bumpSteps(Math.max(1, len));
@@ -597,6 +597,19 @@ abstract class CelNode {
                     if (len > 1) {
                         CelLimits.bumpSteps(len - 1);
                     }
+                } else if (v instanceof List && item instanceof List) {
+                    // R27-B (Task #182): mirror Compare.eval's list-vs-list
+                    // charge. Without this, `bigList in [bigListCopy1, ...]`
+                    // amortises N element compares per inner valueEquals at
+                    // only one step apiece — symmetric DoS hole with the one
+                    // Compare's bump already closes.
+                    CelLimits.bumpSteps(Math.min(((List<?>) v).size(), ((List<?>) item).size()));
+                } else if (v instanceof Map && item instanceof Map) {
+                    // R27-B (Task #182): mirror Compare.eval's map-vs-map
+                    // charge — AbstractMap.equals walks every entry; for
+                    // ApiMessageActivation-shaped data both sides can be
+                    // deep nested maps.
+                    CelLimits.bumpSteps(Math.min(((Map<?, ?>) v).size(), ((Map<?, ?>) item).size()));
                 }
                 if (valueEquals(v, item)) {
                     return true;

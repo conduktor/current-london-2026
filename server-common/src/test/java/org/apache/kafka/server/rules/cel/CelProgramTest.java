@@ -781,6 +781,68 @@ public class CelProgramTest {
     }
 
     @Test
+    public void listEqualityInsideInListChargesElementCostAgainstBudget() {
+        // R27-B (Task #182): InList previously charged only 1 step per
+        // iteration plus a string-prefix bump — but it did NOT charge for
+        // list-vs-list element walks the way Compare.eval does. So
+        // `needle in [bigListCopy1, bigListCopy2, ...]` could amortise
+        // O(N) AbstractList.equals work per outer step.
+        //
+        // Pin the fix: 200-element needle × 600 candidate lists =
+        // 600 × (1 baseline + 200 element-bumps) = 120_600 > 100_000.
+        //
+        // Every candidate is a 200-element list that matches the needle
+        // on its first 199 elements and differs only at the last index, so
+        // AbstractList.equals walks the full prefix before returning false.
+        // `in` does NOT short-circuit because each comparison is false; the
+        // loop runs the full 600 candidates and trips the budget.
+        java.util.List<Object> needle = new java.util.ArrayList<>();
+        for (int n = 0; n < 200; n++) {
+            needle.add("e-" + n);
+        }
+        java.util.List<Object> xs = new java.util.ArrayList<>();
+        for (int k = 0; k < 600; k++) {
+            java.util.List<Object> copy = new java.util.ArrayList<>(needle);
+            copy.set(copy.size() - 1, "DIFFERS-" + k);
+            xs.add(copy);
+        }
+        Map<String, Object> env = new HashMap<>();
+        env.put("xs", xs);
+        env.put("needle", needle);
+        assertThrows(CelEvaluationException.class,
+            () -> evalBool("needle in xs", env));
+    }
+
+    @Test
+    public void mapEqualityInsideInListChargesEntryCostAgainstBudget() {
+        // R27-B (Task #182), map-side. AbstractMap.equals walks every
+        // entry via Objects.equals; before this charge a needle Map
+        // compared against a list of equal-shaped Maps amortised O(N)
+        // entry compares per outer step. 200-entry needle × 600 candidate
+        // maps = 600 × (1 + 200) = 120_600 > 100_000.
+        //
+        // Each candidate matches needle on the first 199 entries and
+        // differs at one — the walk runs to that mismatch and returns
+        // false, so `in` keeps iterating and the full 600 candidates run.
+        java.util.LinkedHashMap<String, Object> needle = new java.util.LinkedHashMap<>();
+        for (int n = 0; n < 200; n++) {
+            needle.put("k-" + n, "v-" + n);
+        }
+        java.util.List<Object> xs = new java.util.ArrayList<>();
+        for (int k = 0; k < 600; k++) {
+            java.util.LinkedHashMap<String, Object> copy =
+                new java.util.LinkedHashMap<>(needle);
+            copy.put("k-199", "DIFFERS-" + k);
+            xs.add(copy);
+        }
+        Map<String, Object> env = new HashMap<>();
+        env.put("xs", xs);
+        env.put("needle", needle);
+        assertThrows(CelEvaluationException.class,
+            () -> evalBool("needle in xs", env));
+    }
+
+    @Test
     public void unknownMethodIsRejectedAtCompileTime() {
         // Audit LOW-1: a typo like `name.startWith("audit")` (missing 's')
         // must fail at rule load — CelCompilationException — not silently
