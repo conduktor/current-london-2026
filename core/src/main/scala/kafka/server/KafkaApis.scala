@@ -2024,7 +2024,17 @@ class KafkaApis(val requestChannel: RequestChannel,
           TOPIC,
           groupFetchResponse.topics.asScala
         )(_.name)
-        groupFetchResponse.setTopics(authorizedOffsets.asJava)
+        // r22 BLOCKER (Agent 3 Finding #2, read-side complement to #205): backing topics that
+        // concentrate multiple logical tenants must NEVER surface via OffsetFetch. The DESCRIBE-
+        // TOPIC authz above gates per-tenant access to logical topics, but if an admin
+        // misconfigured an ACL granting DESCRIBE on a backing-topic name (or pre-#205 offset rows
+        // were committed and survive), the all-topics branch would otherwise echo those rows back
+        // — leaking the backing's existence plus committed-offset progress across every co-tenant
+        // group. Silent omission here matches METADATA(isAllTopics) #157, DescribeTopicPartitions
+        // #164 and DescribeLogDirs(allTopics) #185.
+        val nonBacking = authorizedOffsets
+          .filterNot(t => concentrationKernel.isBackingTopic(t.name))
+        groupFetchResponse.setTopics(nonBacking.asJava)
       }
     }
   }
@@ -2034,12 +2044,21 @@ class KafkaApis(val requestChannel: RequestChannel,
     groupFetchRequest: OffsetFetchRequestData.OffsetFetchRequestGroup,
     requireStable: Boolean
   ): CompletableFuture[OffsetFetchResponseData.OffsetFetchResponseGroup] = {
+    // r22 BLOCKER (Agent 3 Finding #2, read-side complement to #205): drop backing-topic entries
+    // from the request BEFORE the authz check. Filtering after authz would still split into the
+    // authorized branch (where a misconfigured ACL leaks the backing) and the unauthorized
+    // branch (where TOPIC_AUTHORIZATION_FAILED is an existence oracle distinguishing
+    // "no such topic" from "concentration backing"). Treating backing names as if the client had
+    // asked about a non-existent topic — they simply don't appear in the response — closes both
+    // sides at once.
+    val visibleRequestTopics = groupFetchRequest.topics.asScala
+      .filterNot(t => concentrationKernel.isBackingTopic(t.name))
     // Clients are not allowed to see offsets for topics that are not authorized for Describe.
     val (authorizedTopics, unauthorizedTopics) = authHelper.partitionSeqByAuthorized(
       requestContext,
       DESCRIBE,
       TOPIC,
-      groupFetchRequest.topics.asScala
+      visibleRequestTopics
     )(_.name)
 
     groupCoordinator.fetchOffsets(

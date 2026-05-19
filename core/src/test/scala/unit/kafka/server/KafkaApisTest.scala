@@ -11919,6 +11919,135 @@ class KafkaApisTest extends Logging {
     assertEquals(expectedOffsetFetchResponse, response.data)
   }
 
+  // r22 BLOCKER #151 (Agent 3 Finding #2, read-side complement to #205): OffsetFetch must drop
+  // backing-topic entries from BOTH branches (all-topics and explicit-list). The write-side
+  // OffsetCommit/OffsetDelete guard from #205 stops new commits from landing on a backing name,
+  // but defence-in-depth on the read side closes two residual gaps:
+  //   (a) pre-#205 offset rows that may exist in __consumer_offsets from a prior broker version,
+  //   (b) an admin-misconfigured ACL granting DESCRIBE on a backing-topic name to a tenant — in
+  //       which case the response would otherwise echo that backing's committed offsets back to
+  //       the wrong principal.
+  // Backing topics must surface as if non-existent (silent drop), matching METADATA(isAllTopics)
+  // #157, DescribeTopicPartitions(all) #164 and DescribeLogDirs #185.
+  @Test
+  def testOffsetFetchAllOffsetsFiltersBackingTopics(): Unit = {
+    val backingTopic = "backing-r22-151"
+    val plainTopic = "plain-r22-151"
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+    when(concentrationKernel.isBackingTopic(plainTopic)).thenReturn(false)
+
+    val requestChannelRequest = buildRequest(new OffsetFetchRequest.Builder(
+      "group-1",
+      false,
+      null, // all offsets.
+      false
+    ).build(ApiKeys.OFFSET_FETCH.latestVersion))
+
+    val future = new CompletableFuture[OffsetFetchResponseData.OffsetFetchResponseGroup]()
+    when(groupCoordinator.fetchAllOffsets(
+      requestChannelRequest.context,
+      new OffsetFetchRequestData.OffsetFetchRequestGroup()
+        .setGroupId("group-1")
+        .setTopics(null),
+      false
+    )).thenReturn(future)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleOffsetFetchRequest(requestChannelRequest)
+
+    // Coordinator returns offsets for BOTH topics — the bug we're guarding against is the broker
+    // forwarding them to the client. Without the isBackingTopic filter the response would
+    // contain the backing-topic entry, leaking its existence + committed-offset progress.
+    val coordinatorResponse = new OffsetFetchResponseData.OffsetFetchResponseGroup()
+      .setGroupId("group-1")
+      .setTopics(List(
+        new OffsetFetchResponseData.OffsetFetchResponseTopics()
+          .setName(backingTopic)
+          .setPartitions(List(
+            new OffsetFetchResponseData.OffsetFetchResponsePartitions()
+              .setPartitionIndex(0)
+              .setCommittedOffset(100)
+              .setCommittedLeaderEpoch(1)
+          ).asJava),
+        new OffsetFetchResponseData.OffsetFetchResponseTopics()
+          .setName(plainTopic)
+          .setPartitions(List(
+            new OffsetFetchResponseData.OffsetFetchResponsePartitions()
+              .setPartitionIndex(0)
+              .setCommittedOffset(200)
+              .setCommittedLeaderEpoch(2)
+          ).asJava)
+      ).asJava)
+
+    future.complete(coordinatorResponse)
+
+    val response = verifyNoThrottling[OffsetFetchResponse](requestChannelRequest)
+    val returnedTopicNames = response.data.groups.asScala.flatMap(_.topics.asScala.map(_.name)).toSet
+    assertFalse(returnedTopicNames.contains(backingTopic),
+      s"OffsetFetch(all) leaked backing topic '$backingTopic' to the client; returned=$returnedTopicNames")
+    assertTrue(returnedTopicNames.contains(plainTopic),
+      s"OffsetFetch(all) over-filtered: dropped legitimate '$plainTopic'; returned=$returnedTopicNames")
+  }
+
+  @Test
+  def testOffsetFetchByListFiltersBackingTopicsBeforeCoordinator(): Unit = {
+    val backingTopic = "backing-r22-151"
+    val plainTopic = "plain-r22-151"
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+    when(concentrationKernel.isBackingTopic(plainTopic)).thenReturn(false)
+
+    val requestChannelRequest = buildRequest(new OffsetFetchRequest.Builder(
+      "group-1",
+      false,
+      List(
+        new TopicPartition(backingTopic, 0),
+        new TopicPartition(plainTopic, 0)
+      ).asJava,
+      false
+    ).build(ApiKeys.OFFSET_FETCH.latestVersion))
+
+    // The coordinator must NEVER be asked about the backing topic — we filter pre-authz so the
+    // backing-name path doesn't even reach __consumer_offsets storage. Capture the request the
+    // broker hands to the coordinator and assert the backing topic is absent.
+    val captor: ArgumentCaptor[OffsetFetchRequestData.OffsetFetchRequestGroup] =
+      ArgumentCaptor.forClass(classOf[OffsetFetchRequestData.OffsetFetchRequestGroup])
+    val future = new CompletableFuture[OffsetFetchResponseData.OffsetFetchResponseGroup]()
+    when(groupCoordinator.fetchOffsets(
+      ArgumentMatchers.eq(requestChannelRequest.context),
+      captor.capture(),
+      ArgumentMatchers.eq(false)
+    )).thenReturn(future)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleOffsetFetchRequest(requestChannelRequest)
+
+    val coordinatorRequest = captor.getValue
+    val requestedTopicNames = coordinatorRequest.topics.asScala.map(_.name).toSet
+    assertFalse(requestedTopicNames.contains(backingTopic),
+      s"OffsetFetch leaked backing topic '$backingTopic' down to the group coordinator; " +
+        s"coordinator-requested=$requestedTopicNames")
+    assertTrue(requestedTopicNames.contains(plainTopic),
+      s"OffsetFetch over-filtered: dropped legitimate '$plainTopic' before the coordinator call; " +
+        s"coordinator-requested=$requestedTopicNames")
+
+    val coordinatorResponse = new OffsetFetchResponseData.OffsetFetchResponseGroup()
+      .setGroupId("group-1")
+      .setTopics(List(
+        new OffsetFetchResponseData.OffsetFetchResponseTopics()
+          .setName(plainTopic)
+          .setPartitions(List(
+            new OffsetFetchResponseData.OffsetFetchResponsePartitions()
+              .setPartitionIndex(0)
+              .setCommittedOffset(200)
+              .setCommittedLeaderEpoch(2)
+          ).asJava)
+      ).asJava)
+    future.complete(coordinatorResponse)
+
+    val response = verifyNoThrottling[OffsetFetchResponse](requestChannelRequest)
+    val returnedTopicNames = response.data.groups.asScala.flatMap(_.topics.asScala.map(_.name)).toSet
+    assertFalse(returnedTopicNames.contains(backingTopic),
+      s"OffsetFetch(byList) leaked backing topic '$backingTopic' to the client; returned=$returnedTopicNames")
+  }
+
   @Test
   def testHandleOffsetFetchAuthorization(): Unit = {
     def makeRequest(version: Short): RequestChannel.Request = {
