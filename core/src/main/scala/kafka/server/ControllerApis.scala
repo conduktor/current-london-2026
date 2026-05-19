@@ -1428,6 +1428,40 @@ class ControllerApis(
   // refused.
   private def isForeignTenantNamespace(name: String, callerTenant: Option[String]): Boolean = {
     if (name == null || Topic.isInternal(name)) return false
+    // #188: principal-prefix topic-name shape `__tenant_<id>.<rest>` is a
+    // reserved tenant namespace on the controller side too. Same gap that
+    // #185 closed on `KafkaApis.isReservedTenantNamespace`: the
+    // `startsWith("_")` short-circuit below silently dropped this shape on
+    // the floor, so a cluster-admin on `bootstrap.controllers` could
+    // CreateTopics(`__tenant_acme.evil`) — controller wrote the metadata
+    // record, tenant `acme` saw `evil` via `TenantNamespace.toLogical`,
+    // and every chained controller-side write (CreatePartitions,
+    // AlterReassignments, ElectLeaders, AlterConfigs, ACL handlers) on
+    // the planted name was accepted by the same helper. Structural —
+    // no `allTenants` gate — to match the controller helper's split-mode
+    // posture (#114).
+    if (name.startsWith(TenantNamespace.PRINCIPAL_PREFIX)) {
+      val afterPrefix = name.substring(TenantNamespace.PRINCIPAL_PREFIX.length)
+      val pdot = afterPrefix.indexOf('.')
+      if (pdot <= 0) return false
+      val pid = afterPrefix.substring(0, pdot)
+      try {
+        TenantNamespace.validateTenantId(pid)
+      } catch {
+        case _: IllegalArgumentException => return false
+      }
+      // No `callerTenant.contains` carve-out here — unlike the
+      // physical-prefix branch below where `acme.foo` IS the legitimate
+      // forwarded topic name for tenant `acme` (broker rewrites `foo` →
+      // `acme.foo` before envelope), a `__tenant_<id>.<rest>` topic name
+      // is NEVER legitimate under any caller: the `__tenant_` prefix is
+      // reserved for principals, not for topic names. Even a forwarded
+      // tenant principal `__tenant_acme.alice` writing `__tenant_acme.x`
+      // is pollution — the broker-side scrub (KafkaApis #185) already
+      // refuses such names, so by the time the controller sees one the
+      // request must have arrived via the controller listener directly.
+      return true
+    }
     // Single-`_` prefix exempts `_confluent-*`, Connect connector configs,
     // and other operator-internal conventions. `__*` is covered by the
     // `validateTenantId` rejection below (it refuses `__`-prefixed ids).

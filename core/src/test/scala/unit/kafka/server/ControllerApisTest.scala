@@ -1970,6 +1970,102 @@ class ControllerApisTest {
   }
 
   @Test
+  def testControllerCreateTopicsRefusesTenantPrincipalShapedNameOnBootstrapControllers(): Unit = {
+    // #188 — the `__tenant_<id>.<x>` topic-name shape was the same blindspot
+    // on the controller helper that #185 closed on the broker helper. Without
+    // the new branch in `isForeignTenantNamespace`, an adversary on
+    // bootstrap.controllers could CreateTopics(`__tenant_acme.evil`); the
+    // controller would write the metadata log record and the tenant would see
+    // `evil` via `TenantNamespace.toLogical` (which strips the
+    // `__tenant_acme.` prefix). Same INVALID_TOPIC_EXCEPTION refusal shape as
+    // the physical-prefix counterpart above so probes cannot distinguish
+    // pollution-shape from already-existing-topic.
+    val controller = mock(classOf[Controller])
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    val request = new CreateTopicsRequest.Builder(
+      new CreateTopicsRequestData().setTopics(new CreatableTopicCollection(util.Arrays.asList(
+        new CreatableTopic().setName("__tenant_acme.evil").setNumPartitions(1).setReplicationFactor(1)
+      ).iterator()))).build()
+    val response = handleRequest[CreateTopicsResponse](request, controllerApis)
+    val results = response.data.topics().asScala.map(t => t.name -> t.errorCode).toMap
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, results("__tenant_acme.evil"),
+      "controller-direct CreateTopics must refuse `__tenant_<id>.<x>` topic names — they would otherwise become the substrate for downstream chained-write pollution against tenants")
+    // Scrub must short-circuit before the metadata log gets the record.
+    verify(controller, never()).createTopics(any(), any(), any())
+  }
+
+  @Test
+  def testControllerCreateTopicsRefusesTenantPrincipalShapedNameEvenWithEmptyTenantConfig(): Unit = {
+    // #188 — controller helper is structural (no `allTenants` gate, see
+    // #114). In split-mode KRaft the controller's TenantConfig is empty, but
+    // the principal-prefix branch must STILL refuse — otherwise a cluster
+    // admin reaching a split-mode controller could plant tenant-shaped names
+    // before tenants are even bound. Pairs with the broker-side
+    // `allTenants.isEmpty` gate, which exists for the opposite reason
+    // (stock Kafka with zero tenants stays backwards-compatible on its
+    // broker listener). On the controller, a `__tenant_*` topic name is
+    // never legitimate under any configuration.
+    val controller = mock(classOf[Controller])
+    val emptyOriginals = new java.util.HashMap[String, AnyRef]()  // zero tenants
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.from(emptyOriginals))
+    val request = new CreateTopicsRequest.Builder(
+      new CreateTopicsRequestData().setTopics(new CreatableTopicCollection(util.Arrays.asList(
+        new CreatableTopic().setName("__tenant_acme.evil").setNumPartitions(1).setReplicationFactor(1)
+      ).iterator()))).build()
+    val response = handleRequest[CreateTopicsResponse](request, controllerApis)
+    val results = response.data.topics().asScala.map(t => t.name -> t.errorCode).toMap
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, results("__tenant_acme.evil"),
+      "structural refusal must fire even when no tenants are configured (split-mode)")
+    verify(controller, never()).createTopics(any(), any(), any())
+  }
+
+  @Test
+  def testControllerDeleteTopicsRefusesTenantPrincipalShapedNameOnBootstrapControllers(): Unit = {
+    // #188 second leg — DeleteTopics name-supplied path. Stub the
+    // controller's housekeeping calls to empty so the scrub is the only
+    // barrier between the request and any deletion attempt. The principal-
+    // shape name `__tenant_acme.evil` must reach neither findTopicIds (which
+    // would otherwise be an existence oracle) nor the deletion call.
+    val controller = mock(classOf[Controller])
+    when(controller.findTopicNames(any(classOf[ControllerRequestContext]), any(classOf[java.util.Collection[Uuid]])))
+      .thenReturn(CompletableFuture.completedFuture(java.util.Collections.emptyMap[Uuid, ResultOrError[String]]()))
+    when(controller.findTopicIds(any(classOf[ControllerRequestContext]), any(classOf[java.util.Collection[String]])))
+      .thenReturn(CompletableFuture.completedFuture(java.util.Collections.emptyMap[String, ResultOrError[Uuid]]()))
+    when(controller.deleteTopics(any(classOf[ControllerRequestContext]), any(classOf[java.util.Set[Uuid]])))
+      .thenReturn(CompletableFuture.completedFuture(java.util.Collections.emptyMap[Uuid, org.apache.kafka.common.requests.ApiError]()))
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    val request = new DeleteTopicsRequestData()
+    request.setTopicNames(util.Arrays.asList("__tenant_acme.evil"))
+    request.topics().add(new DeleteTopicState().setName("__tenant_acme.payments").setTopicId(ZERO_UUID))
+    val results = controllerApis.deleteTopics(ANONYMOUS_CONTEXT, request,
+      ApiKeys.DELETE_TOPICS.latestVersion().toInt,
+      hasClusterAuth = true,
+      _ => Set.empty,
+      _ => Set.empty).get().asScala.toList
+    val resultsByName = results.map(r => r.name -> r.errorCode).toMap
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, resultsByName("__tenant_acme.evil"),
+      "controller-direct DeleteTopics must refuse `__tenant_<id>.<x>` from `topicNames`")
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, resultsByName("__tenant_acme.payments"),
+      "controller-direct DeleteTopics must refuse `__tenant_<id>.<x>` from `topics[].name`")
+    // The surviving id set passed to deleteTopics MUST be empty — no
+    // principal-shape name made it through to actual deletion.
+    val idCaptor: ArgumentCaptor[java.util.Set[Uuid]] =
+      ArgumentCaptor.forClass(classOf[java.util.Set[Uuid]])
+    verify(controller).deleteTopics(any(classOf[ControllerRequestContext]), idCaptor.capture())
+    assertEquals(java.util.Collections.emptySet[Uuid](), idCaptor.getValue,
+      "scrub must short-circuit before any id reaches controller.deleteTopics")
+  }
+
+  @Test
   def testControllerCreateTopicsMixesAllowedAndRejectedOnBootstrapControllers(): Unit = {
     // A mixed batch must reach the controller for the non-polluting entries
     // and surface the polluting entries as per-name INVALID_TOPIC_EXCEPTION.
