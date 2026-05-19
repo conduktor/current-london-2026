@@ -32,6 +32,7 @@ import kafka.utils.Logging
 import org.apache.kafka.clients.admin.{AlterConfigOp, EndpointType}
 import org.apache.kafka.common.Uuid.ZERO_UUID
 import org.apache.kafka.common.acl.AclOperation.{ALTER, ALTER_CONFIGS, CLUSTER_ACTION, CREATE, CREATE_TOKENS, DELETE, DESCRIBE, DESCRIBE_CONFIGS}
+import org.apache.kafka.common.acl.{AclBinding, AclBindingFilter}
 import org.apache.kafka.common.config.ConfigResource
 import org.apache.kafka.common.errors.{ApiException, ClusterAuthorizationException, InvalidRequestException, TopicDeletionDisabledException, UnsupportedVersionException}
 import org.apache.kafka.common.internals.FatalExitError
@@ -48,6 +49,7 @@ import org.apache.kafka.common.protocol.{ApiKeys, ApiMessage, Errors}
 import org.apache.kafka.common.quota.{ClientQuotaAlteration, ClientQuotaEntity}
 import org.apache.kafka.common.requests._
 import org.apache.kafka.common.resource.Resource.CLUSTER_NAME
+import org.apache.kafka.common.resource.ResourceType
 import org.apache.kafka.common.resource.ResourceType.{CLUSTER, GROUP, TOPIC, USER}
 import org.apache.kafka.common.utils.Time
 import org.apache.kafka.common.Uuid
@@ -124,9 +126,9 @@ class ControllerApis(
         case ApiKeys.ALLOCATE_PRODUCER_IDS => handleAllocateProducerIdsRequest(request)
         case ApiKeys.CREATE_PARTITIONS => handleCreatePartitions(request)
         case ApiKeys.DESCRIBE_CONFIGS => handleDescribeConfigsRequest(request)
-        case ApiKeys.DESCRIBE_ACLS => aclApis.handleDescribeAcls(request)
-        case ApiKeys.CREATE_ACLS => aclApis.handleCreateAcls(request)
-        case ApiKeys.DELETE_ACLS => aclApis.handleDeleteAcls(request)
+        case ApiKeys.DESCRIBE_ACLS => handleDescribeAclsRequest(request)
+        case ApiKeys.CREATE_ACLS => handleCreateAclsRequest(request)
+        case ApiKeys.DELETE_ACLS => handleDeleteAclsRequest(request)
         case ApiKeys.ELECT_LEADERS => handleElectLeaders(request)
         case ApiKeys.UPDATE_FEATURES => handleUpdateFeatures(request)
         case ApiKeys.DESCRIBE_CLUSTER => handleDescribeCluster(request)
@@ -1464,6 +1466,151 @@ class ControllerApis(
         else Some((GROUP_AUTHORIZATION_FAILED.code, null))
       case _ => None
     }
+  }
+
+  // True iff `principalStr` is in the legacy `User:<name>` form AND the
+  // `<name>` portion lies in a reserved tenant principal namespace. ACL bindings
+  // serialise the principal as `User:foo`; the tenant-encoded form is
+  // `User:__tenant_<id>.<user>`. Mirrors KafkaApis.isReservedUserPrincipalLiteral
+  // so the structural check stays in lock-step across broker and controller.
+  private def isReservedUserPrincipalLiteral(principalStr: String): Boolean = {
+    if (principalStr == null) return false
+    val userPrefix = "User:"
+    if (!principalStr.startsWith(userPrefix)) return false
+    isReservedTenantPrincipalNamespace(principalStr.substring(userPrefix.length))
+  }
+
+  // ACL handler outside-in pollution / leak guard for the controller listener.
+  //
+  // ACL APIs declare `listeners=[broker, controller]` in their schema — so an
+  // AdminClient configured with `bootstrap.controllers` reaches CreateAcls /
+  // DeleteAcls / DescribeAcls directly on a controller node, completely
+  // bypassing KafkaApis.handleCreateAclsRequest / handleDeleteAclsRequest /
+  // handleDescribeAcls and their tenant-namespace scrubs (#88, #98, #115).
+  // Without these guards a cluster-wide admin reaching the controller could:
+  //
+  //  - CreateAcls: write a literal ACL keyed by physical name (e.g.
+  //    `Topic:acme.orders`) or by tenant principal (e.g. `User:__tenant_acme.bob`),
+  //    laundering authority into a tenant's namespace.
+  //  - DeleteAcls: yank every ACL of a tenant via an explicit `Topic:acme.orders`
+  //    or `User:__tenant_acme.alice` filter — or, via a wildcard filter, get a
+  //    free enumeration of tenant ACLs from MatchingAcls.
+  //  - DescribeAcls: enumerate tenant principals / consumer-group ids /
+  //    transactional ids by filter probe, or get a wildcard dump of every
+  //    tenant binding.
+  //
+  // Each scrub below is principal-aware: a forwarded tenant principal whose
+  // `callerTenant` matches the bound prefix passes through (legitimate
+  // tenant flow). Refusal is keyed structurally on `__tenant_*` and
+  // tenant-id-shape topic prefixes — works in split-mode KRaft (#114).
+
+  // Returns Some(ApiError) for a binding that a non-owning caller must not
+  // create. Reuses the structural helpers shared with the topic/group scrubs.
+  private def aclTenantPollutionRefusal(
+      binding: AclBinding,
+      callerTenant: Option[String]): Option[ApiError] = {
+    val resource = binding.pattern
+    val resourceType = resource.resourceType
+    val resourceName = resource.name
+    val principalRefused = isReservedUserPrincipalLiteral(binding.entry.principal) &&
+      !callerOwnsUserPrincipal(binding.entry.principal, callerTenant)
+    val nameRefused = resourceType match {
+      case ResourceType.TOPIC =>
+        isForeignTenantNamespace(resourceName, callerTenant)
+      case ResourceType.GROUP | ResourceType.TRANSACTIONAL_ID | ResourceType.USER =>
+        isReservedTenantPrincipalNamespace(resourceName) &&
+          !callerOwnsPrincipalNamespaceName(resourceName, callerTenant)
+      case _ => false
+    }
+    if (principalRefused || nameRefused) {
+      val what =
+        if (nameRefused) "Resource name '" + resourceName + "'"
+        else "Principal '" + binding.entry.principal + "'"
+      Some(new ApiError(Errors.INVALID_REQUEST,
+        what + " is reserved (tenant namespace prefix)"))
+    } else None
+  }
+
+  // Returns Some(ApiError) for a DeleteAcls filter that EXPLICITLY names a
+  // foreign tenant namespace. Wildcard / null-name filters are left alone here
+  // (cluster admin reach is legitimate) — they are scrubbed via the postFilter
+  // on MatchingAcls below.
+  private def aclTenantFilterRefusal(
+      filter: AclBindingFilter,
+      callerTenant: Option[String]): Option[ApiError] = {
+    val pattern = filter.patternFilter
+    val resourceName = pattern.name
+    val principal = filter.entryFilter.principal
+    val nameRefused = resourceName != null && (pattern.resourceType match {
+      case ResourceType.TOPIC =>
+        isForeignTenantNamespace(resourceName, callerTenant)
+      case ResourceType.GROUP | ResourceType.TRANSACTIONAL_ID | ResourceType.USER =>
+        isReservedTenantPrincipalNamespace(resourceName) &&
+          !callerOwnsPrincipalNamespaceName(resourceName, callerTenant)
+      case _ => false
+    })
+    val principalRefused = principal != null &&
+      isReservedUserPrincipalLiteral(principal) &&
+      !callerOwnsUserPrincipal(principal, callerTenant)
+    if (nameRefused || principalRefused) {
+      val what =
+        if (nameRefused) "Resource filter '" + resourceName + "'"
+        else "Principal filter '" + principal + "'"
+      Some(new ApiError(Errors.INVALID_REQUEST,
+        what + " names a reserved tenant namespace"))
+    } else None
+  }
+
+  // Postfilter on DeleteAcls.MatchingAcls and DescribeAcls.Resources: keep a
+  // binding only if it does not echo a foreign tenant namespace name or
+  // principal. This is the leak guard for wildcard / ResourceType.ANY queries
+  // that we intentionally let through.
+  private def aclTenantBindingAllowed(
+      binding: AclBinding,
+      callerTenant: Option[String]): Boolean = {
+    val pattern = binding.pattern
+    val name = pattern.name
+    val byName = pattern.resourceType match {
+      case ResourceType.TOPIC =>
+        isForeignTenantNamespace(name, callerTenant)
+      case ResourceType.GROUP | ResourceType.TRANSACTIONAL_ID | ResourceType.USER =>
+        isReservedTenantPrincipalNamespace(name) &&
+          !callerOwnsPrincipalNamespaceName(name, callerTenant)
+      case _ => false
+    }
+    val byPrincipal = isReservedUserPrincipalLiteral(binding.entry.principal) &&
+      !callerOwnsUserPrincipal(binding.entry.principal, callerTenant)
+    !(byName || byPrincipal)
+  }
+
+  // Helpers for the same-tenant carve-out. The name `__tenant_<id>.<rest>` is
+  // caller-owned iff the caller's effective tenant is `<id>`.
+  private def callerOwnsPrincipalNamespaceName(name: String,
+                                               callerTenant: Option[String]): Boolean = {
+    callerTenant.exists(t => name.startsWith(TenantNamespace.PRINCIPAL_PREFIX + t + "."))
+  }
+
+  private def callerOwnsUserPrincipal(principalStr: String,
+                                      callerTenant: Option[String]): Boolean = {
+    callerTenant.exists(t =>
+      principalStr.startsWith("User:" + TenantNamespace.PRINCIPAL_PREFIX + t + "."))
+  }
+
+  private[server] def handleCreateAclsRequest(request: RequestChannel.Request): CompletableFuture[Unit] = {
+    val callerTenant = callerTenantFromPrincipal(request.context.principal.getName)
+    aclApis.handleCreateAcls(request, b => aclTenantPollutionRefusal(b, callerTenant))
+  }
+
+  private[server] def handleDeleteAclsRequest(request: RequestChannel.Request): CompletableFuture[Unit] = {
+    val callerTenant = callerTenantFromPrincipal(request.context.principal.getName)
+    aclApis.handleDeleteAcls(request,
+      f => aclTenantFilterRefusal(f, callerTenant),
+      b => aclTenantBindingAllowed(b, callerTenant))
+  }
+
+  private[server] def handleDescribeAclsRequest(request: RequestChannel.Request): CompletableFuture[Unit] = {
+    val callerTenant = callerTenantFromPrincipal(request.context.principal.getName)
+    aclApis.handleDescribeAcls(request, b => aclTenantBindingAllowed(b, callerTenant))
   }
 
   private[server] def handleCreateDelegationTokenRequest(request: RequestChannel.Request): CompletableFuture[Unit] = {

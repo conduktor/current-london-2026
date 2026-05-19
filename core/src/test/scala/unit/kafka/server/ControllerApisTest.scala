@@ -23,7 +23,7 @@ import kafka.server.QuotaFactory.QuotaManagers
 import kafka.server.metadata.KRaftMetadataCache
 import org.apache.kafka.clients.admin.AlterConfigOp
 import org.apache.kafka.common.Uuid.ZERO_UUID
-import org.apache.kafka.common.acl.AclOperation
+import org.apache.kafka.common.acl.{AccessControlEntry, AccessControlEntryFilter, AclBinding, AclBindingFilter, AclOperation, AclPermissionType}
 import org.apache.kafka.common.config.{ConfigResource, TopicConfig}
 import org.apache.kafka.common.errors._
 import org.apache.kafka.common.internals.Topic
@@ -45,7 +45,7 @@ import org.apache.kafka.common.protocol.Errors._
 import org.apache.kafka.common.protocol.{ApiKeys, ApiMessage, Errors}
 import org.apache.kafka.common.quota.{ClientQuotaAlteration, ClientQuotaEntity}
 import org.apache.kafka.common.requests._
-import org.apache.kafka.common.resource.{PatternType, Resource, ResourcePattern, ResourceType}
+import org.apache.kafka.common.resource.{PatternType, Resource, ResourcePattern, ResourcePatternFilter, ResourceType}
 import org.apache.kafka.common.security.auth.{KafkaPrincipal, SecurityProtocol}
 import org.apache.kafka.common.test.MockController
 import org.apache.kafka.common.utils.MockTime
@@ -56,7 +56,7 @@ import org.apache.kafka.image.publisher.ControllerRegistrationsPublisher
 import org.apache.kafka.network.SocketServerConfigs
 import org.apache.kafka.network.metrics.RequestChannelMetrics
 import org.apache.kafka.raft.QuorumConfig
-import org.apache.kafka.server.authorizer.{Action, AuthorizableRequestContext, AuthorizationResult, Authorizer}
+import org.apache.kafka.server.authorizer.{AclCreateResult, AclDeleteResult, Action, AuthorizableRequestContext, AuthorizationResult, Authorizer}
 import org.apache.kafka.server.common.{ApiMessageAndVersion, FinalizedFeatures, KRaftVersion, MetadataVersion, ProducerIdsBlock, RequestLocal}
 import org.apache.kafka.server.config.{KRaftConfigs, ServerConfigs}
 import org.apache.kafka.server.util.FutureUtils
@@ -3690,6 +3690,347 @@ class ControllerApisTest {
     val topicNames = response.data().topics().asScala.map(_.name()).toSet
     assertEquals(Set("orders"), topicNames,
       "response must echo the tenant's LOGICAL name, never the physical form")
+  }
+
+  // ---------------------------------------------------------------------------
+  // bootstrap.controllers ACL scrub (#122)
+  //
+  // CreateAcls / DeleteAcls / DescribeAcls all declare `listeners=[broker,
+  // controller]` so an AdminClient configured with `bootstrap.controllers`
+  // reaches them directly on the controller, bypassing the broker-side scrubs
+  // (#88, #98, #115). Without the controller-side guard a cluster-wide caller
+  // could:
+  //   - CREATE_ACLS: mint a literal ACL keyed by a tenant resource name
+  //     (Topic:acme.orders) or a tenant principal (User:__tenant_acme.bob),
+  //   - DELETE_ACLS: yank every ACL of a tenant via an explicit filter, or
+  //     enumerate tenant ACLs from MatchingAcls in a wildcard filter,
+  //   - DESCRIBE_ACLS: probe tenant ownership / enumerate tenant principals.
+  //
+  // Same-tenant carve-out: a forwarded `__tenant_<id>.<u>` principal IS
+  // allowed to operate on bindings inside its own namespace — the broker has
+  // already validated the listener/principal binding (#86, #110), so the
+  // forwarded principal is canonical.
+  // ---------------------------------------------------------------------------
+
+  private def aclCreation(resourceType: ResourceType,
+                          resourceName: String,
+                          principal: String): CreateAclsRequestData.AclCreation =
+    new CreateAclsRequestData.AclCreation()
+      .setResourceType(resourceType.code)
+      .setResourceName(resourceName)
+      .setResourcePatternType(PatternType.LITERAL.code)
+      .setPrincipal(principal)
+      .setHost("*")
+      .setOperation(AclOperation.READ.code)
+      .setPermissionType(AclPermissionType.ALLOW.code)
+
+  private def aclFilter(resourceType: ResourceType,
+                        resourceNameFilter: String,
+                        principalFilter: String): DeleteAclsRequestData.DeleteAclsFilter =
+    new DeleteAclsRequestData.DeleteAclsFilter()
+      .setResourceTypeFilter(resourceType.code)
+      .setResourceNameFilter(resourceNameFilter)
+      .setPatternTypeFilter(PatternType.LITERAL.code)
+      .setPrincipalFilter(principalFilter)
+      .setHostFilter(null)
+      .setOperation(AclOperation.READ.code)
+      .setPermissionType(AclPermissionType.ALLOW.code)
+
+  private def describeAclsRequest(rt: ResourceType,
+                                  name: String,
+                                  patternType: PatternType,
+                                  principal: String): DescribeAclsRequest = {
+    val patternFilter = new ResourcePatternFilter(rt, name, patternType)
+    val entryFilter = new AccessControlEntryFilter(principal, null,
+      AclOperation.ANY, AclPermissionType.ANY)
+    new DescribeAclsRequest.Builder(new AclBindingFilter(patternFilter, entryFilter)).build()
+  }
+
+  private def aclBinding(rt: ResourceType,
+                         resourceName: String,
+                         patternType: PatternType,
+                         principal: String): AclBinding = {
+    new AclBinding(
+      new ResourcePattern(rt, resourceName, patternType),
+      new AccessControlEntry(principal, "*", AclOperation.READ, AclPermissionType.ALLOW))
+  }
+
+  // The ACL handler short-circuits with SECURITY_DISABLED if no Authorizer is
+  // configured — the scrub never runs. Tests need a real Authorizer instance
+  // that ALLOWS cluster operations (so the scrub is the only gate left) and
+  // exposes stubbable createAcls/deleteAcls/acls hooks.
+  private def authorizerAllowingClusterOps(): Authorizer = {
+    val auth: Authorizer = mock(classOf[Authorizer])
+    when(auth.authorize(any[AuthorizableRequestContext], any[util.List[Action]]()))
+      .thenAnswer(inv => {
+        val actions = inv.getArgument[util.List[Action]](1)
+        val out = new util.ArrayList[AuthorizationResult](actions.size)
+        actions.forEach(_ => out.add(AuthorizationResult.ALLOWED))
+        out
+      })
+    auth
+  }
+
+  // Build a CONTROLLER-listener request whose caller is anonymous. This
+  // models the cluster-acting admin reaching the controller directly via
+  // bootstrap.controllers — the precise threat model the scrub closes
+  // (no broker has rewritten the request, so the wire form is verbatim).
+  private def buildControllerRequest(request: AbstractRequest): RequestChannel.Request = {
+    val buffer = request.serializeWithHeader(new RequestHeader(request.apiKey, request.version, clientID, 0))
+    val header = RequestHeader.parse(buffer)
+    val context = new RequestContext(header, "1", InetAddress.getLocalHost, KafkaPrincipal.ANONYMOUS,
+      ListenerName.normalised("CONTROLLER"),
+      SecurityProtocol.PLAINTEXT, ClientInformation.EMPTY, false)
+    new RequestChannel.Request(processor = 1, context = context, startTimeNanos = 0,
+      MemoryPool.NONE, buffer, requestChannelMetrics)
+  }
+
+  @Test
+  def testControllerCreateAclsRefusesTenantPrefixedTopicOnBootstrapControllers(): Unit = {
+    // Cluster-acting admin via bootstrap.controllers writes a literal ACL
+    // keyed by `Topic:acme.orders`. Without the controller-side scrub the
+    // metadata log would record the binding and tenant acme would later see
+    // bob hold READ on its `orders` topic.
+    val creation = aclCreation(ResourceType.TOPIC, "acme.orders", "User:bob")
+    val req = new CreateAclsRequest.Builder(new CreateAclsRequestData()
+      .setCreations(util.Arrays.asList(creation))).build()
+    val request = buildControllerRequest(req)
+
+    val auth = authorizerAllowingClusterOps()
+    controllerApis = createControllerApis(
+      authorizer = Some(auth),
+      controller = new MockController.Builder().build(),
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    controllerApis.handleCreateAclsRequest(request).get()
+
+    val response = captureSentResponse(request).asInstanceOf[CreateAclsResponse]
+    assertEquals(1, response.results.size)
+    assertEquals(Errors.INVALID_REQUEST.code, response.results.get(0).errorCode,
+      "controller-direct CreateAcls must refuse tenant-namespaced resource name")
+    verify(auth, never()).createAcls(any(), any())
+  }
+
+  @Test
+  def testControllerCreateAclsRefusesTenantPrefixedGroupOnBootstrapControllers(): Unit = {
+    // Same shape, GROUP resource. The group id is always the principal-prefix
+    // form `__tenant_<id>.<group>`, so the scrub must accept literal
+    // `__tenant_acme.app1` as a reserved name and refuse if the caller does
+    // not own it.
+    val creation = aclCreation(ResourceType.GROUP, "__tenant_acme.app1", "User:bob")
+    val req = new CreateAclsRequest.Builder(new CreateAclsRequestData()
+      .setCreations(util.Arrays.asList(creation))).build()
+    val request = buildControllerRequest(req)
+
+    val auth = authorizerAllowingClusterOps()
+    controllerApis = createControllerApis(
+      authorizer = Some(auth),
+      controller = new MockController.Builder().build(),
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    controllerApis.handleCreateAclsRequest(request).get()
+
+    val response = captureSentResponse(request).asInstanceOf[CreateAclsResponse]
+    assertEquals(Errors.INVALID_REQUEST.code, response.results.get(0).errorCode,
+      "controller-direct CreateAcls must refuse `__tenant_acme.*` GROUP name from a cluster caller")
+    verify(auth, never()).createAcls(any(), any())
+  }
+
+  @Test
+  def testControllerCreateAclsRefusesTenantPrefixedPrincipalOnBootstrapControllers(): Unit = {
+    // The principal field of the AclEntry — laundering authority into a
+    // tenant principal's namespace. `User:__tenant_acme.bob` must be refused.
+    val creation = aclCreation(ResourceType.TOPIC, "plain-topic", "User:__tenant_acme.bob")
+    val req = new CreateAclsRequest.Builder(new CreateAclsRequestData()
+      .setCreations(util.Arrays.asList(creation))).build()
+    val request = buildControllerRequest(req)
+
+    val auth = authorizerAllowingClusterOps()
+    controllerApis = createControllerApis(
+      authorizer = Some(auth),
+      controller = new MockController.Builder().build(),
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    controllerApis.handleCreateAclsRequest(request).get()
+
+    val response = captureSentResponse(request).asInstanceOf[CreateAclsResponse]
+    assertEquals(Errors.INVALID_REQUEST.code, response.results.get(0).errorCode,
+      "controller-direct CreateAcls must refuse `User:__tenant_acme.*` from a non-owning caller")
+    verify(auth, never()).createAcls(any(), any())
+  }
+
+  @Test
+  def testControllerCreateAclsMixesAllowedAndRejectedOnBootstrapControllers(): Unit = {
+    // Mixed batch: a tenant-polluting binding sits next to a neutral one.
+    // The scrub must refuse the tenant binding per-entry and forward the
+    // neutral one to the Authorizer; the response must be positional.
+    val creations = util.Arrays.asList(
+      aclCreation(ResourceType.TOPIC, "acme.orders", "User:bob"),  // 0: refuse
+      aclCreation(ResourceType.TOPIC, "plain-a", "User:bob"))      // 1: allow
+    val req = new CreateAclsRequest.Builder(new CreateAclsRequestData()
+      .setCreations(creations)).build()
+    val request = buildControllerRequest(req)
+
+    val auth = authorizerAllowingClusterOps()
+    // Authorizer accepts the one neutral binding it sees and returns NONE.
+    val createdFuture = new CompletableFuture[AclCreateResult]()
+    createdFuture.complete(AclCreateResult.SUCCESS)
+    when(auth.createAcls(any[AuthorizableRequestContext](), any[util.List[AclBinding]]()))
+      .thenAnswer(inv => {
+        val bindings = inv.getArgument[util.List[AclBinding]](1)
+        val out = new util.ArrayList[CompletableFuture[AclCreateResult]](bindings.size)
+        bindings.forEach(_ => out.add(createdFuture))
+        out
+      })
+    controllerApis = createControllerApis(
+      authorizer = Some(auth),
+      controller = new MockController.Builder().build(),
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    controllerApis.handleCreateAclsRequest(request).get()
+
+    val response = captureSentResponse(request).asInstanceOf[CreateAclsResponse]
+    val codes = response.results.asScala.map(_.errorCode).toList
+    assertEquals(List(Errors.INVALID_REQUEST.code, Errors.NONE.code), codes,
+      "tenant entry must be refused at position 0; neutral entry forwarded at position 1")
+
+    // The Authorizer must have seen ONLY the neutral binding.
+    val bindingCaptor: ArgumentCaptor[util.List[AclBinding]] =
+      ArgumentCaptor.forClass(classOf[util.List[AclBinding]])
+    verify(auth).createAcls(any[AuthorizableRequestContext](), bindingCaptor.capture())
+    val passed = bindingCaptor.getValue.asScala.map(_.pattern.name).toList
+    assertEquals(List("plain-a"), passed,
+      "scrub must short-circuit before the polluting binding reaches the Authorizer")
+  }
+
+  @Test
+  def testControllerDeleteAclsRefusesExplicitTenantTopicFilter(): Unit = {
+    // Explicit-name filter `Topic:acme.orders` deletes every ACL of tenant
+    // acme that names this resource. Refuse before the Authorizer is asked.
+    val filter = aclFilter(ResourceType.TOPIC, "acme.orders", null)
+    val req = new DeleteAclsRequest.Builder(new DeleteAclsRequestData()
+      .setFilters(util.Arrays.asList(filter))).build()
+    val request = buildControllerRequest(req)
+
+    val auth = authorizerAllowingClusterOps()
+    controllerApis = createControllerApis(
+      authorizer = Some(auth),
+      controller = new MockController.Builder().build(),
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    controllerApis.handleDeleteAclsRequest(request).get()
+
+    val response = captureSentResponse(request).asInstanceOf[DeleteAclsResponse]
+    assertEquals(1, response.filterResults.size)
+    assertEquals(Errors.INVALID_REQUEST.code, response.filterResults.get(0).errorCode,
+      "controller-direct DeleteAcls must refuse an explicit tenant topic filter")
+    verify(auth, never()).deleteAcls(any(), any())
+  }
+
+  @Test
+  def testControllerDeleteAclsRefusesExplicitTenantPrincipalFilter(): Unit = {
+    val filter = aclFilter(ResourceType.TOPIC, null, "User:__tenant_acme.alice")
+    val req = new DeleteAclsRequest.Builder(new DeleteAclsRequestData()
+      .setFilters(util.Arrays.asList(filter))).build()
+    val request = buildControllerRequest(req)
+
+    val auth = authorizerAllowingClusterOps()
+    controllerApis = createControllerApis(
+      authorizer = Some(auth),
+      controller = new MockController.Builder().build(),
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    controllerApis.handleDeleteAclsRequest(request).get()
+
+    val response = captureSentResponse(request).asInstanceOf[DeleteAclsResponse]
+    assertEquals(Errors.INVALID_REQUEST.code, response.filterResults.get(0).errorCode,
+      "controller-direct DeleteAcls must refuse an explicit tenant principal filter")
+    verify(auth, never()).deleteAcls(any(), any())
+  }
+
+  @Test
+  def testControllerDeleteAclsScrubsMatchingAclsForWildcardFilter(): Unit = {
+    // Wildcard filter is legitimate cluster-admin reach — let it through, but
+    // scrub tenant-named entries out of the MatchingAcls echo so the response
+    // does not enumerate tenant ACLs for a non-owning caller.
+    val filter = aclFilter(ResourceType.TOPIC, null, null)
+    val req = new DeleteAclsRequest.Builder(new DeleteAclsRequestData()
+      .setFilters(util.Arrays.asList(filter))).build()
+    val request = buildControllerRequest(req)
+
+    val auth = authorizerAllowingClusterOps()
+    // Stub the Authorizer to return a mix of tenant and neutral bindings.
+    val deletedFuture = new CompletableFuture[AclDeleteResult]()
+    deletedFuture.complete(new AclDeleteResult(util.Arrays.asList(
+      new AclDeleteResult.AclBindingDeleteResult(
+        aclBinding(ResourceType.TOPIC, "acme.orders", PatternType.LITERAL, "User:bob")),
+      new AclDeleteResult.AclBindingDeleteResult(
+        aclBinding(ResourceType.TOPIC, "plain-topic", PatternType.LITERAL, "User:__tenant_acme.alice")),
+      new AclDeleteResult.AclBindingDeleteResult(
+        aclBinding(ResourceType.TOPIC, "plain-topic", PatternType.LITERAL, "User:bob")))))
+    when(auth.deleteAcls(any[AuthorizableRequestContext](), any[util.List[AclBindingFilter]]()))
+      .thenAnswer(_ => {
+        val out = new util.ArrayList[CompletableFuture[AclDeleteResult]](1)
+        out.add(deletedFuture)
+        out
+      })
+    controllerApis = createControllerApis(
+      authorizer = Some(auth),
+      controller = new MockController.Builder().build(),
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    controllerApis.handleDeleteAclsRequest(request).get()
+
+    val response = captureSentResponse(request).asInstanceOf[DeleteAclsResponse]
+    val matching = response.filterResults.get(0).matchingAcls.asScala.toList
+    assertEquals(1, matching.size,
+      "tenant-named resource and tenant-principal entries must be scrubbed from MatchingAcls")
+    assertEquals("plain-topic", matching.head.resourceName)
+    assertEquals("User:bob", matching.head.principal)
+  }
+
+  @Test
+  def testControllerDescribeAclsRefusesTenantTopicLiteralFilter(): Unit = {
+    // L1 oracle: a LITERAL filter `Topic:acme.orders` from a cluster caller
+    // probes whether tenant `acme` owns that topic. Scrub the MatchingAcls so
+    // the response carries nothing tenant-shaped — `acls()` may still return
+    // bindings but the postFilter drops them all here.
+    val req = describeAclsRequest(ResourceType.TOPIC, "acme.orders", PatternType.LITERAL, null)
+    val request = buildControllerRequest(req)
+
+    val auth = authorizerAllowingClusterOps()
+    when(auth.acls(any[AclBindingFilter]()))
+      .thenReturn(util.Arrays.asList(
+        aclBinding(ResourceType.TOPIC, "acme.orders", PatternType.LITERAL, "User:bob")))
+    controllerApis = createControllerApis(
+      authorizer = Some(auth),
+      controller = new MockController.Builder().build(),
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    controllerApis.handleDescribeAclsRequest(request).get()
+
+    val response = captureSentResponse(request).asInstanceOf[DescribeAclsResponse]
+    assertEquals(0, response.acls.size,
+      "controller-direct DescribeAcls must scrub tenant bindings from the response")
+  }
+
+  @Test
+  def testControllerDescribeAclsScrubsTenantBindingsFromWildcard(): Unit = {
+    // Wildcard query: the response must carry only non-tenant bindings.
+    val req = describeAclsRequest(ResourceType.ANY, null, PatternType.ANY, null)
+    val request = buildControllerRequest(req)
+
+    val auth = authorizerAllowingClusterOps()
+    when(auth.acls(any[AclBindingFilter]()))
+      .thenReturn(util.Arrays.asList(
+        aclBinding(ResourceType.TOPIC, "acme.orders", PatternType.LITERAL, "User:bob"),
+        aclBinding(ResourceType.TOPIC, "plain-topic", PatternType.LITERAL, "User:bob"),
+        aclBinding(ResourceType.GROUP, "__tenant_acme.cg-1", PatternType.LITERAL, "User:bob"),
+        aclBinding(ResourceType.TOPIC, "neutral-2", PatternType.LITERAL, "User:__tenant_acme.alice")))
+    controllerApis = createControllerApis(
+      authorizer = Some(auth),
+      controller = new MockController.Builder().build(),
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    controllerApis.handleDescribeAclsRequest(request).get()
+
+    val response = captureSentResponse(request).asInstanceOf[DescribeAclsResponse]
+    val surviving = response.acls.asScala.flatMap { res =>
+      res.acls.asScala.map(a => (res.resourceType, res.resourceName, a.principal))
+    }.toSet
+    assertEquals(Set((ResourceType.TOPIC.code, "plain-topic", "User:bob")), surviving,
+      "tenant-named TOPIC, tenant-shaped GROUP, and tenant principal echo must all be scrubbed")
   }
 
   @AfterEach

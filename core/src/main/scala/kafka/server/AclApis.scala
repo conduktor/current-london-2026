@@ -21,6 +21,7 @@ import kafka.network.RequestChannel
 import kafka.utils.Logging
 import org.apache.kafka.common.acl.AclOperation._
 import org.apache.kafka.common.acl.AclBinding
+import org.apache.kafka.common.acl.AclBindingFilter
 import org.apache.kafka.common.errors._
 import org.apache.kafka.common.message.CreateAclsResponseData.AclCreationResult
 import org.apache.kafka.common.message.DeleteAclsResponseData.DeleteAclsFilterResult
@@ -85,7 +86,15 @@ class AclApis(authHelper: AuthHelper,
     CompletableFuture.completedFuture[Unit](())
   }
 
-  def handleCreateAcls(request: RequestChannel.Request): CompletableFuture[Unit] = {
+  // preFilter is the tenant-namespace scrub for outside-in pollution. ControllerApis
+  // passes a predicate that returns Some(ApiError) for AclBindings that name a
+  // reserved tenant namespace not owned by the caller (so a cluster-wide caller
+  // on `bootstrap.controllers` cannot mint `Topic:acme.orders` or
+  // `User:__tenant_acme.bob` ACLs literally on the metadata log). The default is
+  // `_ => None` (no scrub) so non-tenant deployments and tests calling AclApis
+  // directly are unchanged.
+  def handleCreateAcls(request: RequestChannel.Request,
+                       preFilter: AclBinding => Option[ApiError] = _ => None): CompletableFuture[Unit] = {
     authHelper.authorizeClusterOperation(request, ALTER)
     val createAclsRequest = request.body[CreateAclsRequest]
 
@@ -106,15 +115,23 @@ class AclApis(authHelper: AuthHelper,
             new InvalidRequestException("Invalid empty resource name")
           else
             null
+          val tenantRefusal = if (throwable == null) preFilter(acl) else None
           if (throwable != null) {
             debug(s"Failed to add acl $acl to $resource", throwable)
             errorResults(acl) = new AclCreateResult(throwable)
+          } else if (tenantRefusal.isDefined) {
+            errorResults(acl) = new AclCreateResult(tenantRefusal.get.exception())
           } else
             validBindings += acl
         }
 
         val future = new CompletableFuture[util.List[AclCreationResult]]()
-        val createResults = auth.createAcls(request.context, validBindings.asJava).asScala.map(_.toCompletableFuture)
+        // Skip the Authorizer call entirely when every binding was rejected by
+        // the preFilter — otherwise we'd waste an empty round-trip and surprise
+        // tests / authorizers that assert no-op semantics on empty input.
+        val createResults: scala.collection.mutable.Buffer[CompletableFuture[AclCreateResult]] =
+          if (validBindings.isEmpty) scala.collection.mutable.Buffer.empty
+          else auth.createAcls(request.context, validBindings.asJava).asScala.map(_.toCompletableFuture)
 
         def sendResponseCallback(): Unit = {
           val aclCreationResults = allBindings.map { acl =>
@@ -130,7 +147,13 @@ class AclApis(authHelper: AuthHelper,
           }
           future.complete(aclCreationResults.asJava)
         }
-        alterAclsPurgatory.tryCompleteElseWatch(config.connectionsMaxIdleMs, createResults, sendResponseCallback)
+        if (createResults.isEmpty) {
+          // Nothing forwarded — complete synchronously to avoid deadlocking the
+          // purgatory on an empty watch set.
+          sendResponseCallback()
+        } else {
+          alterAclsPurgatory.tryCompleteElseWatch(config.connectionsMaxIdleMs, createResults, sendResponseCallback)
+        }
 
         future.thenApply[Unit] { aclCreationResults =>
           requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
@@ -141,7 +164,19 @@ class AclApis(authHelper: AuthHelper,
     }
   }
 
-  def handleDeleteAcls(request: RequestChannel.Request): CompletableFuture[Unit] = {
+  // preFilter rejects whole filters that explicitly name a foreign tenant
+  // namespace (e.g. `Topic:acme.orders` or `User:__tenant_acme.bob`) — refuses
+  // them with the supplied ApiError so a cluster-wide caller cannot delete
+  // tenant ACLs from `bootstrap.controllers`.
+  //
+  // postFilter scrubs the per-filter MatchingAcls echo: a wildcard filter that
+  // we LET THROUGH still surfaces tenant-owned bindings in the response
+  // (resource + principal name) — the postFilter drops them before serialisation
+  // to plug that enumeration leak. Defaults are no-ops so non-tenant deployments
+  // and tests calling AclApis directly are unchanged.
+  def handleDeleteAcls(request: RequestChannel.Request,
+                       preFilter: AclBindingFilter => Option[ApiError] = _ => None,
+                       postFilter: AclBinding => Boolean = _ => true): CompletableFuture[Unit] = {
     authHelper.authorizeClusterOperation(request, ALTER)
     val deleteAclsRequest = request.body[DeleteAclsRequest]
     authorizer match {
@@ -151,17 +186,61 @@ class AclApis(authHelper: AuthHelper,
             new SecurityDisabledException("No Authorizer is configured.")))
         CompletableFuture.completedFuture[Unit](())
       case Some(auth) =>
+        val allFilters = deleteAclsRequest.filters.asScala.toList
+        // Split into rejected (positional) and forwarded.
+        val rejections = mutable.Map[Int, ApiError]()
+        val keptIndexed = new ArrayBuffer[(Int, AclBindingFilter)]
+        allFilters.zipWithIndex.foreach { case (f, idx) =>
+          preFilter(f) match {
+            case Some(err) => rejections(idx) = err
+            case None => keptIndexed += ((idx, f))
+          }
+        }
+        val keptFilters = keptIndexed.map(_._2).asJava
+        // Skip the Authorizer call when every filter was rejected by the
+        // preFilter — same rationale as the empty-bindings short-circuit on
+        // createAcls above.
+        val deleteResults: List[CompletableFuture[AclDeleteResult]] =
+          if (keptFilters.isEmpty) Nil
+          else auth.deleteAcls(request.context, keptFilters).asScala.map(_.toCompletableFuture).toList
 
         val future = new CompletableFuture[util.List[DeleteAclsFilterResult]]()
-        val deleteResults = auth.deleteAcls(request.context, deleteAclsRequest.filters)
-          .asScala.map(_.toCompletableFuture).toList
-
         def sendResponseCallback(): Unit = {
-          val filterResults = deleteResults.map(_.get).map(DeleteAclsResponse.filterResult).asJava
-          future.complete(filterResults)
+          val forwardedResults = deleteResults.map(_.get).map(DeleteAclsResponse.filterResult)
+          // Apply postFilter to each forwarded result's MatchingAcls.
+          forwardedResults.foreach { fr =>
+            if (fr.matchingAcls != null && !fr.matchingAcls.isEmpty) {
+              val scrubbed = new util.ArrayList[DeleteAclsResponseData.DeleteAclsMatchingAcl](fr.matchingAcls.size)
+              fr.matchingAcls.forEach { m =>
+                if (postFilter(DeleteAclsResponse.aclBinding(m))) scrubbed.add(m)
+              }
+              fr.setMatchingAcls(scrubbed)
+            }
+          }
+          // Interleave at original positions.
+          val merged = new util.ArrayList[DeleteAclsFilterResult](allFilters.size)
+          var fwd = 0
+          allFilters.indices.foreach { i =>
+            rejections.get(i) match {
+              case Some(err) =>
+                merged.add(new DeleteAclsFilterResult()
+                  .setErrorCode(err.error.code)
+                  .setErrorMessage(err.message))
+              case None =>
+                merged.add(forwardedResults(fwd))
+                fwd += 1
+            }
+          }
+          future.complete(merged)
         }
 
-        alterAclsPurgatory.tryCompleteElseWatch(config.connectionsMaxIdleMs, deleteResults, sendResponseCallback)
+        if (deleteResults.isEmpty) {
+          // No forwarded filters — complete synchronously so we don't deadlock
+          // the purgatory on an empty watch set.
+          sendResponseCallback()
+        } else {
+          alterAclsPurgatory.tryCompleteElseWatch(config.connectionsMaxIdleMs, deleteResults, sendResponseCallback)
+        }
         future.thenApply[Unit] { filterResults =>
           requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
             new DeleteAclsResponse(
