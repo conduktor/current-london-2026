@@ -12048,6 +12048,58 @@ class KafkaApisTest extends Logging {
       s"OffsetFetch(byList) leaked backing topic '$backingTopic' to the client; returned=$returnedTopicNames")
   }
 
+  // r23 BLOCKER #230 (escalated from MEDIUM): OffsetFetchResponse.groupError on v1 (versions
+  // below TOP_LEVEL_ERROR_AND_NULL_TOPICS_MIN_VERSION = 2) iterates group.topics() and echoes
+  // every requested topic in the response. The #151 fix filters backings before authz and
+  // before the coordinator call, but the exception-path call site passed the ORIGINAL
+  // groupFetchRequest (unfiltered) to groupError, so any time the coordinator future completes
+  // exceptionally (NOT_COORDINATOR / COORDINATOR_LOAD_IN_PROGRESS / COORDINATOR_NOT_AVAILABLE
+  // — common operational errors), backing names land on the wire in the error response.
+  // Discriminator: v1 OffsetFetch listing a backing topic + a plain topic; stub the coordinator
+  // future to complete exceptionally; assert the backing name is absent from the response.
+  @Test
+  def testOffsetFetchV1ExceptionPathDoesNotLeakBackingTopic(): Unit = {
+    val backingTopic = "backing-r23-230"
+    val plainTopic = "plain-r23-230"
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+    when(concentrationKernel.isBackingTopic(plainTopic)).thenReturn(false)
+
+    // Build a v1 request specifically (v1 < TOP_LEVEL_ERROR_AND_NULL_TOPICS_MIN_VERSION = 2 →
+    // groupError walks group.topics() and echoes them per-partition with the error code).
+    val v1 = 1.toShort
+    val requestChannelRequest = buildRequest(new OffsetFetchRequest.Builder(
+      "group-1",
+      false,
+      List(
+        new TopicPartition(backingTopic, 0),
+        new TopicPartition(plainTopic, 0)
+      ).asJava,
+      false
+    ).build(v1))
+
+    val future = new CompletableFuture[OffsetFetchResponseData.OffsetFetchResponseGroup]()
+    when(groupCoordinator.fetchOffsets(
+      ArgumentMatchers.eq(requestChannelRequest.context),
+      any[OffsetFetchRequestData.OffsetFetchRequestGroup],
+      ArgumentMatchers.eq(false)
+    )).thenReturn(future)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleOffsetFetchRequest(requestChannelRequest)
+
+    // Coordinator transition / loss → exceptional completion. This is the path that flows
+    // through OffsetFetchResponse.groupError on v1.
+    future.completeExceptionally(Errors.NOT_COORDINATOR.exception())
+
+    val response = verifyNoThrottling[OffsetFetchResponse](requestChannelRequest)
+    // v1 response shape: top-level groups not used; topics list at v0/v1 envelope. We read both
+    // shapes defensively so the assertion survives even if the response factory shifts.
+    val perGroupNames = response.data.groups.asScala.flatMap(_.topics.asScala.map(_.name)).toSet
+    val topLevelNames = Option(response.data.topics).map(_.asScala.map(_.name).toSet).getOrElse(Set.empty)
+    val returnedTopicNames = perGroupNames ++ topLevelNames
+    assertFalse(returnedTopicNames.contains(backingTopic),
+      s"OffsetFetch v1 exception path leaked backing topic '$backingTopic' to the client; returned=$returnedTopicNames")
+  }
+
   @Test
   def testHandleOffsetFetchAuthorization(): Unit = {
     def makeRequest(version: Short): RequestChannel.Request = {

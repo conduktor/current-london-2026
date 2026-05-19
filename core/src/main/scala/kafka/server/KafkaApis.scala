@@ -2061,6 +2061,21 @@ class KafkaApis(val requestChannel: RequestChannel,
       visibleRequestTopics
     )(_.name)
 
+    // r23 BLOCKER #230 (escalated from MEDIUM after the r23 audit confirmed the v1 exception
+    // path leaks unfiltered request topics): OffsetFetchResponse.groupError(..., version) on
+    // version < TOP_LEVEL_ERROR_AND_NULL_TOPICS_MIN_VERSION (i.e., v1, since v0 was already
+    // dropped) iterates group.topics() and echoes every requested topic name verbatim in the
+    // per-partition error response. Passing the ORIGINAL groupFetchRequest leaks backing names
+    // any time the coordinator future completes exceptionally — and NOT_COORDINATOR /
+    // COORDINATOR_LOAD_IN_PROGRESS / COORDINATOR_NOT_AVAILABLE are common operational errors,
+    // so the leak is reliably reachable. Echo visibleRequestTopics (already filtered above) so
+    // the v1 error response matches the v2+ happy-path post-filter shape and no backing name
+    // crosses the wire on either branch.
+    val filteredRequestGroup = new OffsetFetchRequestData.OffsetFetchRequestGroup()
+      .setGroupId(groupFetchRequest.groupId)
+      .setMemberId(groupFetchRequest.memberId)
+      .setMemberEpoch(groupFetchRequest.memberEpoch)
+      .setTopics(visibleRequestTopics.asJava)
     groupCoordinator.fetchOffsets(
       requestContext,
       new OffsetFetchRequestData.OffsetFetchRequestGroup()
@@ -2072,7 +2087,7 @@ class KafkaApis(val requestChannel: RequestChannel,
     ).handle[OffsetFetchResponseData.OffsetFetchResponseGroup] { (groupFetchResponse, exception) =>
       if (exception != null) {
         OffsetFetchResponse.groupError(
-          groupFetchRequest,
+          filteredRequestGroup,
           Errors.forException(exception),
           requestContext.apiVersion()
         )
