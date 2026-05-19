@@ -1577,6 +1577,13 @@ public final class QuorumController implements Controller {
             setCreateTopicPolicy(createTopicPolicy).
             setFeatureControl(featureControl).
             build();
+        // R44 (Codex Finding): wire the partition-count lookup from RCM into CCM so that
+        // IncrementalAlterConfigs / legacy AlterConfigs that set or change view.backing.topic
+        // on an existing topic refuse mismatched partition counts inside the controller event
+        // loop. The wiring has to happen here (post-RCM-construction) because CCM is built
+        // first and RCM holds the partition registry. The lookup itself is invoked inside the
+        // event loop in CCM.validateAlterConfig, atomic against the timeline state.
+        this.configurationControl.setTopicPartitionCountLookup(this.replicationControl::topicPartitionCount);
         this.scramControlManager = new ScramControlManager.Builder().
             setLogContext(logContext).
             setSnapshotRegistry(snapshotRegistry).

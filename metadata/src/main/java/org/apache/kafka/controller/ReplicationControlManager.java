@@ -803,6 +803,9 @@ public class ReplicationControlManager {
             if (error.isFailure()) return error;
         }
         int numPartitions = newParts.size();
+        ApiError viewBackingError = validateViewBackingPartitionCountAtCreate(
+            topic.name(), creationConfigs, numPartitions);
+        if (viewBackingError.isFailure()) return viewBackingError;
         try {
             context.applyPartitionChangeQuota(numPartitions); // check controller mutation quota
         } catch (ThrottlingQuotaExceededException e) {
@@ -865,6 +868,52 @@ public class ReplicationControlManager {
             setLeaderEpoch(0).
             setPartitionEpoch(0).
             build();
+    }
+
+    /**
+     * R44 (Codex Finding): if this CreateTopics request declares a view (i.e.
+     * {@code view.backing.topic} is set in the per-topic creation configs), refuse it unless
+     * the backing topic already exists in the registry with the same partition count.
+     *
+     * <p>The fetch redirect at {@code KafkaApis.handleFetchRequest} keys
+     * {@code (view, p) → (backing, p)} on partition index alone; a mismatch silently drops
+     * backing partitions whose index is ≥ the view's partition count (data loss for view
+     * consumers) or strands view partitions whose index is ≥ the backing's partition count
+     * (perpetual {@code UNKNOWN_TOPIC_OR_PARTITION}, wedged consumer groups). The CEL-as-
+     * security-boundary model makes this invariant a correctness gate.
+     *
+     * <p>The check is registry-only: users wanting to create both topics in one
+     * CreateTopicsRequest must accept that the view in the same batch will see "backing does
+     * not exist" — the contract is "create backing first, then view". We run before the
+     * mutation-quota check so a doomed request does not burn quota.
+     */
+    private ApiError validateViewBackingPartitionCountAtCreate(
+        String topicName,
+        Map<String, String> creationConfigs,
+        int numPartitions
+    ) {
+        String backing = creationConfigs.get(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG);
+        if (backing == null) return ApiError.NONE;
+        String trimmedBacking = backing.trim();
+        if (trimmedBacking.isEmpty()) return ApiError.NONE;
+        Uuid existingBackingId = topicsByName.get(trimmedBacking);
+        if (existingBackingId == null) {
+            return new ApiError(Errors.INVALID_CONFIG,
+                "View topic '" + topicName + "' references backing topic '" + trimmedBacking +
+                    "', but no such topic exists. Create the backing topic first, then " +
+                    "create the view.");
+        }
+        int backingPartitions = topics.get(existingBackingId).parts.size();
+        if (backingPartitions != numPartitions) {
+            return new ApiError(Errors.INVALID_CONFIG,
+                "View topic '" + topicName + "' was requested with " + numPartitions +
+                    " partition(s) but its backing topic '" + trimmedBacking + "' has " +
+                    backingPartitions + " partition(s). A view must have the same partition " +
+                    "count as its backing — the fetch redirect maps (view, p) → (backing, p) " +
+                    "on partition index alone, so mismatches silently lose data or wedge " +
+                    "consumers.");
+        }
+        return ApiError.NONE;
     }
 
     private ApiError maybeCheckCreateTopicPolicy(Supplier<CreateTopicPolicy.RequestMetadata> supplier) {
@@ -1058,6 +1107,27 @@ public class ReplicationControlManager {
 
     Uuid getTopicId(String name) {
         return topicsByName.get(name);
+    }
+
+    /**
+     * R44 (Codex Finding): the source-sparse view contract requires a 1:1 partition mapping
+     * between a view topic and its backing topic. Fetch routing keys on partition index alone
+     * (KafkaApis.handleFetchRequest treats {@code (view, p)} → {@code (backing, p)}), so a
+     * mismatched count silently drops backing partitions whose index exceeds the view's count
+     * (data loss) or wedges view partitions whose index exceeds the backing's count (perpetual
+     * UNKNOWN_TOPIC_OR_PARTITION). This accessor lets {@link ConfigurationControlManager}
+     * validate the invariant inside the controller event loop on alter paths that would set or
+     * change {@code view.backing.topic}, atomically against the partition registry. Returns
+     * empty if the topic is not yet in the registry — callers in the create path must consult
+     * the in-flight request, not this accessor, for topics being created in the same batch.
+     */
+    public OptionalInt topicPartitionCount(String topicName) {
+        if (topicName == null) return OptionalInt.empty();
+        Uuid id = topicsByName.get(topicName);
+        if (id == null) return OptionalInt.empty();
+        TopicControlInfo info = topics.get(id);
+        if (info == null) return OptionalInt.empty();
+        return OptionalInt.of(info.parts.size());
     }
 
     // VisibleForTesting
@@ -1867,6 +1937,23 @@ public class ReplicationControlManager {
         if (viewPredicate != null && !viewPredicate.isEmpty()) {
             throw new InvalidTopicException("Cannot add partitions to view topic '" + topic.name() +
                     "': view partition count is determined by the backing topic.");
+        }
+        // R44 (Codex Finding): symmetric to the view-self rejection above and to the R39
+        // delete-block. Adding partitions to a topic that backs an active view would break
+        // the 1:1 partition mapping that the fetch redirect relies on: the newly added
+        // backing partitions (indices ≥ current view partition count) would be silently
+        // invisible to view consumers, and depending on operator expectations the divergence
+        // can either look like silent data loss or like a metadata mismatch consumers can't
+        // diagnose. The cleanest contract is: backing partition count is frozen while any
+        // view depends on it. Operators who genuinely need to expand the backing should
+        // either drop the views first, or perform a coordinated atomic expansion of the
+        // dependent views (out of scope for this guard).
+        Set<String> dependentViews = configurationControl.topicsReferencingBackingTopic(topic.name());
+        if (!dependentViews.isEmpty()) {
+            throw new InvalidTopicException("Cannot add partitions to topic '" + topic.name() +
+                    "': it is the backing for view topic(s) " + dependentViews + ". Views require " +
+                    "a 1:1 partition mapping with the backing — drop the dependent view(s) before " +
+                    "expanding the backing, or expand both atomically.");
         }
         if (topic.count() == topicInfo.parts.size()) {
             throw new InvalidPartitionsException("Topic already has " +

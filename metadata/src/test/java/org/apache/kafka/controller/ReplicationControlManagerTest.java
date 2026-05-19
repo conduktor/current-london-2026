@@ -49,6 +49,7 @@ import org.apache.kafka.common.message.CreateTopicsRequestData;
 import org.apache.kafka.common.message.CreateTopicsRequestData.CreatableReplicaAssignment;
 import org.apache.kafka.common.message.CreateTopicsRequestData.CreatableTopic;
 import org.apache.kafka.common.message.CreateTopicsRequestData.CreatableTopicCollection;
+import org.apache.kafka.common.message.CreateTopicsRequestData.CreatableTopicConfig;
 import org.apache.kafka.common.message.CreateTopicsResponseData;
 import org.apache.kafka.common.message.CreateTopicsResponseData.CreatableTopicResult;
 import org.apache.kafka.common.message.ElectLeadersRequestData;
@@ -138,6 +139,7 @@ import static org.apache.kafka.common.protocol.Errors.ELIGIBLE_LEADERS_NOT_AVAIL
 import static org.apache.kafka.common.protocol.Errors.INELIGIBLE_REPLICA;
 import static org.apache.kafka.common.protocol.Errors.INVALID_PARTITIONS;
 import static org.apache.kafka.common.protocol.Errors.INVALID_REPLICATION_FACTOR;
+import static org.apache.kafka.common.protocol.Errors.INVALID_CONFIG;
 import static org.apache.kafka.common.protocol.Errors.INVALID_REPLICA_ASSIGNMENT;
 import static org.apache.kafka.common.protocol.Errors.INVALID_REQUEST;
 import static org.apache.kafka.common.protocol.Errors.INVALID_TOPIC_EXCEPTION;
@@ -1879,6 +1881,113 @@ public class ReplicationControlManagerTest {
             "regular topic partition 2 must have been created");
         assertNotNull(replicationControl.getPartition(regularId, 3),
             "regular topic partition 3 must have been created");
+    }
+
+    /**
+     * R44 (Codex Finding): CreateTopics that declares a view (i.e. sets
+     * {@code view.backing.topic} in the per-topic configs) must be refused when the backing
+     * topic exists but has a different partition count than the requested view. The fetch
+     * redirect at KafkaApis maps {@code (view, p) → (backing, p)} on partition index alone,
+     * so a partition-count mismatch is either silent data loss (backing partitions whose index
+     * exceeds the view's count are invisible to view consumers) or a wedge (view partitions
+     * whose index exceeds the backing's count return UNKNOWN_TOPIC_OR_PARTITION forever).
+     *
+     * Exploit prevented: create backing "orders" with 3 partitions, then attempt to create
+     * "orders_view" with view.backing.topic=orders and numPartitions=1. Without this guard,
+     * the view is accepted; partition 0 of backing is the only thing visible to view
+     * consumers — partitions 1 and 2 are silently dropped from the projection.
+     */
+    private static CreatableTopic r44ViewTopic(String name, int parts, String backing) {
+        CreatableTopic t = new CreatableTopic().setName(name).
+            setNumPartitions(parts).setReplicationFactor((short) 2);
+        t.configs().add(new CreatableTopicConfig().setName(
+            ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG).setValue(backing));
+        return t;
+    }
+
+    @Test
+    public void testR44CreateViewRejectedWhenBackingMismatchedOrMissing() {
+        ReplicationControlTestContext ctx = new ReplicationControlTestContext.Builder().build();
+        ReplicationControlManager replicationControl = ctx.replicationControl;
+        ctx.registerBrokers(0, 1);
+        ctx.unfenceBrokers(0, 1);
+        ControllerRequestContext createCtx = anonymousContextFor(ApiKeys.CREATE_TOPICS);
+
+        // Create a real backing topic with 3 partitions.
+        CreateTopicsRequestData createBacking = new CreateTopicsRequestData();
+        createBacking.topics().add(new CreatableTopic().setName("orders").
+            setNumPartitions(3).setReplicationFactor((short) 2));
+        ctx.replay(replicationControl.createTopics(
+            createCtx, createBacking, new HashSet<>(Arrays.asList("orders"))).records());
+
+        // Case 1: mismatched partition count (view=1, backing=3) — rejected with INVALID_CONFIG
+        // naming both view and backing.
+        CreateTopicsRequestData createMismatch = new CreateTopicsRequestData();
+        createMismatch.topics().add(r44ViewTopic("orders_view", 1, "orders"));
+        ControllerResult<CreateTopicsResponseData> mismatch = replicationControl.createTopics(
+            createCtx, createMismatch, new HashSet<>(Arrays.asList("orders_view")));
+        CreatableTopicResult mismatchRes = mismatch.response().topics().find("orders_view");
+        assertEquals(INVALID_CONFIG.code(), mismatchRes.errorCode());
+        assertTrue(mismatchRes.errorMessage().contains("orders")
+                && mismatchRes.errorMessage().contains("orders_view"),
+            "mismatch rejection must name both topics (got: " + mismatchRes.errorMessage() + ")");
+        ctx.replay(mismatch.records());
+        assertNull(replicationControl.getTopicId("orders_view"));
+
+        // Case 2: nonexistent backing — rejected with INVALID_CONFIG naming the missing backing.
+        CreateTopicsRequestData createOrphan = new CreateTopicsRequestData();
+        createOrphan.topics().add(r44ViewTopic("orphan_view", 2, "missing_backing"));
+        CreatableTopicResult orphanRes = replicationControl.createTopics(
+            createCtx, createOrphan, new HashSet<>(Arrays.asList("orphan_view"))).
+            response().topics().find("orphan_view");
+        assertEquals(INVALID_CONFIG.code(), orphanRes.errorCode());
+        assertTrue(orphanRes.errorMessage().contains("missing_backing"),
+            "orphan rejection must name missing backing (got: " + orphanRes.errorMessage() + ")");
+    }
+
+    /**
+     * R44 (Codex Finding) symmetric to the view-self block and to the R39 delete-block:
+     * CreatePartitions on a topic that is currently the backing for an active view must be
+     * refused. Without this guard, adding partitions to the backing would silently surface
+     * "phantom" backing partitions (index ≥ view.parts.size) that view consumers cannot see,
+     * breaking the 1:1 partition mapping that fetch routing assumes.
+     */
+    @Test
+    public void testR44CreatePartitionsRejectedOnBackingOfActiveView() {
+        ReplicationControlTestContext ctx = new ReplicationControlTestContext.Builder().build();
+        ReplicationControlManager replicationControl = ctx.replicationControl;
+        ctx.registerBrokers(0, 1);
+        ctx.unfenceBrokers(0, 1);
+
+        CreateTopicsRequestData request = new CreateTopicsRequestData();
+        request.topics().add(new CreatableTopic().setName("orders").
+            setNumPartitions(3).setReplicationFactor((short) 2));
+        request.topics().add(new CreatableTopic().setName("orders_view").
+            setNumPartitions(3).setReplicationFactor((short) 2));
+        ctx.replay(replicationControl.createTopics(
+            anonymousContextFor(ApiKeys.CREATE_TOPICS), request,
+            new HashSet<>(Arrays.asList("orders", "orders_view"))).records());
+
+        // Bind orders_view to orders via direct config replay (bypasses validator, mirrors R39).
+        ctx.alterTopicConfig("orders_view",
+            ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, "orders");
+        ctx.alterTopicConfig("orders_view",
+            ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "true");
+
+        List<CreatePartitionsTopic> topics = new ArrayList<>();
+        topics.add(new CreatePartitionsTopic().setName("orders").setCount(5).setAssignments(null));
+        ControllerResult<List<CreatePartitionsTopicResult>> result =
+            replicationControl.createPartitions(
+                anonymousContextFor(ApiKeys.CREATE_PARTITIONS), topics);
+
+        CreatePartitionsTopicResult backingRes = result.response().get(0);
+        assertEquals(INVALID_TOPIC_EXCEPTION.code(), backingRes.errorCode());
+        assertTrue(backingRes.errorMessage().contains("orders_view"),
+            "rejection must name dependent view (got: " + backingRes.errorMessage() + ")");
+
+        ctx.replay(result.records());
+        assertNull(replicationControl.getPartition(replicationControl.getTopicId("orders"), 3),
+            "no new backing partition should have been created");
     }
 
     @Test

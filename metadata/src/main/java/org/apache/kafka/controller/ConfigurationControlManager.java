@@ -54,8 +54,10 @@ import java.util.Map.Entry;
 import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalInt;
 import java.util.Set;
 import java.util.function.Consumer;
+import java.util.function.Function;
 
 import static org.apache.kafka.clients.admin.AlterConfigOp.OpType.APPEND;
 import static org.apache.kafka.common.config.ConfigResource.Type.BROKER;
@@ -81,6 +83,18 @@ public class ConfigurationControlManager {
     private final Map<String, Object> staticConfig;
     private final ConfigResource currentController;
     private final FeatureControlManager featureControl;
+
+    /**
+     * R44 (Codex Finding): partition-count lookup wired post-construction by
+     * {@link QuorumController} after {@link ReplicationControlManager} is built. Used inside
+     * {@link #validateAlterConfig} to refuse alter operations that would leave a topic with
+     * {@code view.backing.topic} set to a topic whose partition count does not match this
+     * topic's. The default no-op lookup means the check is silently skipped if the
+     * controller wiring forgets to call {@link #setTopicPartitionCountLookup} — the create
+     * and CreatePartitions guards in {@link ReplicationControlManager} still hold even in
+     * that degraded mode, but production correctness depends on the wiring being present.
+     */
+    private volatile Function<String, OptionalInt> topicPartitionCountLookup = __ -> OptionalInt.empty();
 
     static class Builder {
         private LogContext logContext = null;
@@ -185,6 +199,19 @@ public class ConfigurationControlManager {
 
     SnapshotRegistry snapshotRegistry() {
         return snapshotRegistry;
+    }
+
+    /**
+     * R44 (Codex Finding): wire the partition-count lookup from {@link ReplicationControlManager}
+     * after the controller's manager graph has been constructed. Idempotent; later calls
+     * overwrite the previous lookup (used in tests). Must be called from inside the controller
+     * event loop or before any alter request is processed; the lookup itself is invoked inside
+     * the event loop in {@link #validateAlterConfig}, so the {@link Function} implementation
+     * must read state that is consistent with the event-loop timeline.
+     */
+    public void setTopicPartitionCountLookup(Function<String, OptionalInt> lookup) {
+        this.topicPartitionCountLookup = Objects.requireNonNull(lookup,
+            "topicPartitionCountLookup must not be null");
     }
 
     /**
@@ -409,6 +436,48 @@ public class ConfigurationControlManager {
             validator.validate(configResource, allConfigs, existingConfigsMap);
             if (!newlyCreatedResource) {
                 existenceChecker.accept(configResource);
+            }
+            // R44 (Codex Finding): for alter operations on an existing topic that leave
+            // view.backing.topic set in the POST-state, require the view topic and its backing
+            // to have the same partition count. The fetch redirect maps (view, p) → (backing, p)
+            // on partition index alone; a mismatch silently drops backing partitions whose
+            // index ≥ view.parts.size (data loss for view consumers) or strands view partitions
+            // whose index ≥ backing.parts.size (perpetual UNKNOWN_TOPIC_OR_PARTITION, wedged
+            // consumer groups). The createTopic path enforces the same invariant inline; this
+            // covers the rebind / turn-existing-topic-into-view paths reachable via
+            // IncrementalAlterConfigs and legacy AlterConfigs. We skip the check when the
+            // resource is newly created — at that point the view topic is not yet in the
+            // partition registry, and the createTopic-side guard is authoritative. We also
+            // skip if the lookup is the default no-op (lookup never returns a present count
+            // for the view itself), which preserves test-context fallthrough where the
+            // ReplicationControlManager is not wired in.
+            if (!newlyCreatedResource && configResource.type() == Type.TOPIC) {
+                String backing = allConfigs.get(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG);
+                if (backing != null) {
+                    String trimmedBacking = backing.trim();
+                    if (!trimmedBacking.isEmpty()) {
+                        OptionalInt viewParts = topicPartitionCountLookup.apply(configResource.name());
+                        if (viewParts.isPresent()) {
+                            OptionalInt backingParts = topicPartitionCountLookup.apply(trimmedBacking);
+                            if (!backingParts.isPresent()) {
+                                throw new ConfigException(
+                                    "Cannot set " + ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG +
+                                    "='" + trimmedBacking + "' on topic '" + configResource.name() +
+                                    "': backing topic '" + trimmedBacking + "' does not exist.");
+                            }
+                            if (viewParts.getAsInt() != backingParts.getAsInt()) {
+                                throw new ConfigException(
+                                    "Cannot set " + ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG +
+                                    "='" + trimmedBacking + "' on topic '" + configResource.name() +
+                                    "': view has " + viewParts.getAsInt() + " partition(s) but " +
+                                    "backing topic '" + trimmedBacking + "' has " +
+                                    backingParts.getAsInt() + " partition(s). A view must have " +
+                                    "the same partition count as its backing — the fetch redirect " +
+                                    "maps (view, p) → (backing, p) on partition index alone.");
+                            }
+                        }
+                    }
+                }
             }
             if (alterConfigPolicy.isPresent()) {
                 alterConfigPolicy.get().validate(new RequestMetadata(configResource, alteredConfigsForAlterConfigPolicyCheck));
