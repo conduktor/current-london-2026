@@ -324,35 +324,40 @@ public class ApiMessageActivationTest {
 
     @Test
     public void recursionDepthIsBoundedAgainstPathologicalNesting() {
-        // Codex deep-audit P1 part 3: the reflection walk recurses into any
-        // object with at least one accessor. Kafka's generated DTOs don't
-        // contain cycles, so this isn't reachable from a well-formed protocol
-        // message — but a hostile request or a future protocol with deep
-        // nesting we never anticipated must not be able to blow the stack or
-        // spin the walker forever. MAX_DEPTH=32 caps the walk.
+        // Codex deep-audit P1 part 3 (round-23 #184 posture flip): the
+        // reflection walk recurses into any object with at least one accessor.
+        // Kafka's generated DTOs don't contain cycles, so this isn't reachable
+        // from a well-formed protocol message — but a hostile request or a
+        // future protocol with deep nesting we never anticipated must not be
+        // able to blow the stack or spin the walker forever. MAX_DEPTH=32 caps
+        // the walk.
         //
-        // A self-referencing test class is the simplest way to demonstrate the
-        // cap: without the depth bound, toMap() would never return.
+        // <p><b>Previously:</b> toMap() returned an empty map on depth
+        // exhaustion (soft truncation, fail-OPEN). That created an attacker
+        // primitive: a DENY rule keyed on a field that sits below depth 32 on
+        // a hostile Message chain silently evaluated against {} and never
+        // matched, evading the rule.
+        //
+        // <p><b>Now (round-17 MED #184 / round-23 fix):</b> toMap throws
+        // {@link ActivationBudgetExceededException} on depth exhaustion,
+        // symmetric with {@link convertIterable} which has thrown on the same
+        // condition since round-15 H1. The engine catches that typed signal
+        // separately from the generic Throwable branch and fails the request
+        // CLOSED (synthetic POLICY_VIOLATION DENY).
+        //
+        // A self-referencing test class is the simplest way to demonstrate
+        // the cap: without the depth bound, toMap() would never return.
         SelfReferencingNode root = new SelfReferencingNode();
-        Map<String, Object> m = ApiMessageActivation.from(root);
-        assertNotNull(m, "depth-bounded walk must terminate and return a non-null map");
-        // Drill down to MAX_DEPTH; somewhere along the way the recursion must
-        // bottom out. We verify by walking until the inner map is empty.
-        int depth = 0;
-        Map<?, ?> current = m;
-        while (!current.isEmpty() && depth < ApiMessageActivation.MAX_DEPTH + 10) {
-            Object next = current.get("child");
-            assertNotNull(next, "child accessor should yield a map until depth bound is hit");
-            assertTrue(next instanceof Map,
-                "child must be a recursively-walked Map (until the depth bound truncates)");
-            current = (Map<?, ?>) next;
-            depth++;
-        }
-        assertTrue(current.isEmpty(),
-            "recursion must bottom out at an empty map by MAX_DEPTH; reached depth=" + depth);
-        assertTrue(depth <= ApiMessageActivation.MAX_DEPTH,
-            "recursion must terminate at or before MAX_DEPTH=" + ApiMessageActivation.MAX_DEPTH +
-                "; observed depth=" + depth);
+        ActivationBudgetExceededException ex = assertThrows(
+            ActivationBudgetExceededException.class,
+            () -> ApiMessageActivation.from(root));
+        assertTrue(
+            ex.getMessage().contains("depth limit of " + ApiMessageActivation.MAX_DEPTH),
+            "expected depth-limit error, got: " + ex.getMessage());
+        assertTrue(
+            ex.getMessage().contains(SelfReferencingNode.class.getName()),
+            "depth-limit error must name the offending walker class for forensics; got: "
+                + ex.getMessage());
     }
 
     /**
@@ -399,23 +404,32 @@ public class ApiMessageActivationTest {
 
     @Test
     public void accessorInvocationBudgetTerminatesPathologicalWideWalk() {
-        // Codex deep-audit P1b fix: the depth cap alone is not enough. A shallow
-        // but extremely wide message — say, a list of many self-referencing
-        // nodes, where each one would recurse MAX_DEPTH levels — can still
-        // perform millions of accessor invocations before the depth cap kicks
-        // in at each branch. The total-invocation budget bounds the aggregate
-        // work and raises ActivationBudgetExceededException long before the
-        // request thread is starved. The engine catches that specific type
-        // ahead of the generic Throwable branch and fails the request CLOSED
-        // (synthetic POLICY_VIOLATION DENY), since budget overflow is
-        // attacker-shaped and the cap is what makes worst-case walk cost
-        // bounded — see ActivationBudgetExceededException javadoc.
+        // Codex deep-audit P1b fix: the depth cap alone is not enough. A
+        // shallow but extremely wide message can still perform millions of
+        // accessor invocations before the depth cap kicks in at each branch.
+        // The total-invocation budget bounds the aggregate work and raises
+        // ActivationBudgetExceededException long before the request thread is
+        // starved. The engine catches that specific type ahead of the generic
+        // Throwable branch and fails the request CLOSED (synthetic
+        // POLICY_VIOLATION DENY), since budget overflow is attacker-shaped
+        // and the cap is what makes worst-case walk cost bounded — see
+        // ActivationBudgetExceededException javadoc.
+        //
+        // <p><b>Round-23 #184 fixture refactor:</b> the previous shape used
+        // 1000 SelfReferencingNode children to inflate accessor invocations
+        // depth-times-width-style. After round-23 promoted toMap's depth-cap
+        // to fail-CLOSED (#184), the very first SelfReferencingNode child
+        // throws on depth limit at ~30 invocations — well below
+        // MAX_ACCESSOR_INVOCATIONS=10_000 — so the assertion that names
+        // "accessor budget" would no longer hold. A wide flat scalar list
+        // is the cleanest fixture: the per-iteration bump inside
+        // convertIterable charges each element (Codex deep-audit P1d), and
+        // 11_000 strings overflow the budget at element 10_001 without ever
+        // descending past depth 1.
         WideNode root = new WideNode();
-        // 1000 children, each recursing MAX_DEPTH levels of self-reference,
-        // is well above MAX_ACCESSOR_INVOCATIONS=10_000. The walk must abort.
-        java.util.List<SelfReferencingNode> kids = new java.util.ArrayList<>();
-        for (int n = 0; n < 1000; n++) {
-            kids.add(new SelfReferencingNode());
+        java.util.List<String> kids = new java.util.ArrayList<>(11_000);
+        for (int n = 0; n < 11_000; n++) {
+            kids.add("k" + n);
         }
         root.children = kids;
         ActivationBudgetExceededException ex = assertThrows(
@@ -427,14 +441,15 @@ public class ApiMessageActivationTest {
 
     /**
      * Fixture used only by {@link #accessorInvocationBudgetTerminatesPathologicalWideWalk}.
-     * Exposes a wide list of {@link SelfReferencingNode}s; combined with the
-     * self-reference, the walk would do MAX_DEPTH * |children| accessor
-     * invocations without the budget.
+     * Exposes a wide list of String elements; the per-element bump inside
+     * {@code convertIterable} charges each scalar against
+     * {@code MAX_ACCESSOR_INVOCATIONS}, so a sufficiently large list overflows
+     * the budget regardless of depth.
      */
     @SuppressWarnings("unused")
     public static final class WideNode implements org.apache.kafka.common.protocol.ApiMessage {
-        public java.util.List<SelfReferencingNode> children = java.util.Collections.emptyList();
-        public java.util.List<SelfReferencingNode> children() {
+        public java.util.List<String> children = java.util.Collections.emptyList();
+        public java.util.List<String> children() {
             return children;
         }
         @Override public short apiKey() {

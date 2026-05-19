@@ -241,21 +241,40 @@ public final class ApiMessageActivation {
     /**
      * Recursive form with depth counter and shared invocation budget.
      * {@code depth} is incremented on each descent into a nested message.
-     * When it reaches {@link #MAX_DEPTH} we return an empty map rather than
-     * recurse further — the rule sees the upper levels intact, the bottom is
-     * truncated. {@code invocations} is a one-element array used as a shared
-     * mutable counter across the whole walk; each {@link Accessor#invoke}
-     * call bumps it, and overflowing {@link #MAX_ACCESSOR_INVOCATIONS}
-     * raises {@link ActivationBudgetExceededException} — a typed signal
-     * {@link RuleEngine#evaluate} catches separately from the generic
-     * {@code Throwable} branch so attacker-shaped wide requests fail closed.
-     * A one-element {@code int[]} is the smallest reliable way to share an
-     * integer counter across recursive calls without boxing or a dedicated
-     * holder class.
+     * When it reaches {@link #MAX_DEPTH} we throw
+     * {@link ActivationBudgetExceededException} so the whole evaluation
+     * fails CLOSED — symmetric with {@link #convertIterable}, which has
+     * thrown on the same condition since round-15 Walker HIGH H1.
+     * {@code invocations} is a one-element array used as a shared mutable
+     * counter across the whole walk; each {@link Accessor#invoke} call
+     * bumps it, and overflowing {@link #MAX_ACCESSOR_INVOCATIONS} also
+     * raises {@link ActivationBudgetExceededException} — the same typed
+     * signal {@link RuleEngine#evaluate} catches separately from the
+     * generic {@code Throwable} branch.
+     *
+     * <p><b>R23 #184 (round-17 MED, promoted round-23):</b> the previous
+     * shape returned {@link Collections#emptyMap()} on depth exhaustion,
+     * a soft-truncation choice that quietly turned every accessor below
+     * the cap into an empty map. For a Message-shaped activation, that is
+     * an attacker primitive: a DENY rule keyed on {@code r.config.value}
+     * (or any field that sits below the depth cap on a deeply-nested
+     * request) silently evaluates against {@code {}} — never matches —
+     * so a hostile client able to construct a Message chain past depth 32
+     * could evade the rule. Real Kafka protocol shapes peak at roughly
+     * 5-6 levels of nesting (request → topics → partitions → configs),
+     * so the only path to depth 32 is an attacker-shaped or
+     * future-protocol input — exactly the population we want fail-closed.
+     * Throwing here aligns the posture with {@code convertIterable},
+     * which round-15 H1 already migrated to fail-closed for the same
+     * reason on the iterable-chain side. A one-element {@code int[]} is
+     * the smallest reliable way to share an integer counter across
+     * recursive calls without boxing or a dedicated holder class.
      */
     private static Map<String, Object> toMap(Object o, int depth, int[] invocations) {
         if (depth >= MAX_DEPTH) {
-            return Collections.emptyMap();
+            throw new ActivationBudgetExceededException(
+                "activation walk exceeded depth limit of " + MAX_DEPTH
+                    + " while walking message of " + o.getClass().getName());
         }
         Map<String, Object> out = new LinkedHashMap<>();
         for (Accessor a : accessorsFor(o.getClass())) {
