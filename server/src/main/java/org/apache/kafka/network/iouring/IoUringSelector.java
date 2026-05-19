@@ -463,6 +463,14 @@ public final class IoUringSelector implements BrokerSelector {
 
     @Override
     public void poll(long timeoutMs) throws IOException {
+        // Mirror NIO Selector.poll (clients/.../Selector.java:445-447): a negative
+        // timeout is a caller bug, not a "wait forever" sentinel. Without this guard,
+        // io_uring silently accepts it and the awaitForWork branch below falls
+        // through to "no wait, return immediately" — turning the bug into a 100% CPU
+        // spin on the Processor thread. NIO throws IllegalArgumentException which
+        // surfaces via the Processor's catch Throwable as a clear stack trace.
+        if (timeoutMs < 0)
+            throw new IllegalArgumentException("timeout should be >= 0");
         if (closed) throw new IOException("selector is closed");
 
         // Reset per-poll outputs BEFORE evicting closingChannels: the eviction populates

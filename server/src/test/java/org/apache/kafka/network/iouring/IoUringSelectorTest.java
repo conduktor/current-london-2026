@@ -107,6 +107,21 @@ class IoUringSelectorTest {
     }
 
     @Test
+    void pollRejectsNegativeTimeoutWithIllegalArgumentException() throws Exception {
+        // PARITY-1: NIO Selector.poll (clients/.../Selector.java:445-447) rejects negative
+        // timeout with IllegalArgumentException("timeout should be >= 0"). io_uring previously
+        // accepted negative values silently — the awaitForWork branch fell through to "no wait,
+        // return immediately", turning a caller bug into a 100% CPU spin on the Processor
+        // thread. Message text MUST match NIO byte-for-byte so operator log search and alert
+        // patterns work uniformly across the two backends.
+        IoUringSelector s = newSelector(IDLE_NANOS_NEVER);
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class, () -> s.poll(-1));
+        assertEquals("timeout should be >= 0", ex.getMessage(),
+            "must match NIO's message byte-for-byte so log searches and alerts work uniformly");
+        assertDoesNotThrow(() -> s.poll(0), "zero timeout remains valid (NIO parity)");
+    }
+
+    @Test
     void pollWithNoChannelsReturnsEmptyOutputs() throws Exception {
         IoUringSelector s = newSelector(IDLE_NANOS_NEVER);
 
