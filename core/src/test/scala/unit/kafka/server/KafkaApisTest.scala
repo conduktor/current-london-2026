@@ -5956,6 +5956,164 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testOffsetDeleteRejectsBackingTopic(): Unit = {
+    // r22 BLOCKER #205 — backing topics for concentrated logical topics are real Kafka
+    // topics, so metadataCache.contains returns true and handleOffsetDeleteRequest would
+    // accept them without this guard. A principal authorized on the backing-topic NAME could
+    // delete consumer-group offsets that legitimate co-tenant clients committed via their
+    // LOGICAL topic, causing wholesale re-consumption / data re-processing across every
+    // co-tenant group sharing that backing partition. The rejection MUST run AFTER auth so
+    // an UNauthorized probe still receives TOPIC_AUTHORIZATION_FAILED and cannot enumerate
+    // the declared-backing set (auth-first / shadow-second precedence, same as #159/#146).
+    val group = "groupId"
+    val backingTopic = "backing-topic-r22-205"
+    val plainTopic = "tenant-topic-r22-205"
+    addTopicToMetadataCache(backingTopic, numPartitions = 8)
+    addTopicToMetadataCache(plainTopic, numPartitions = 2)
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+    when(concentrationKernel.isBackingTopic(plainTopic)).thenReturn(false)
+
+    val topics = new OffsetDeleteRequestTopicCollection()
+    topics.add(new OffsetDeleteRequestTopic()
+      .setName(backingTopic)
+      .setPartitions(Seq(
+        new OffsetDeleteRequestPartition().setPartitionIndex(0),
+        new OffsetDeleteRequestPartition().setPartitionIndex(1)).asJava))
+    topics.add(new OffsetDeleteRequestTopic()
+      .setName(plainTopic)
+      .setPartitions(Seq(
+        new OffsetDeleteRequestPartition().setPartitionIndex(0)).asJava))
+
+    val offsetDeleteRequest = new OffsetDeleteRequest.Builder(
+      new OffsetDeleteRequestData().setGroupId(group).setTopics(topics)
+    ).build()
+    val request = buildRequest(offsetDeleteRequest)
+
+    val requestLocal = RequestLocal.withThreadConfinedCaching
+    val future = new CompletableFuture[OffsetDeleteResponseData]()
+    // The coordinator MUST only see the non-backing topic in its request payload.
+    when(groupCoordinator.deleteOffsets(
+      ArgumentMatchers.eq(request.context),
+      any[OffsetDeleteRequestData],
+      ArgumentMatchers.eq(requestLocal.bufferSupplier)
+    )).thenReturn(future)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleOffsetDeleteRequest(request, requestLocal)
+
+    // Drive the coordinator future to a successful response for the plain topic.
+    future.complete(new OffsetDeleteResponseData()
+      .setTopics(new OffsetDeleteResponseData.OffsetDeleteResponseTopicCollection(List(
+        new OffsetDeleteResponseData.OffsetDeleteResponseTopic()
+          .setName(plainTopic)
+          .setPartitions(new OffsetDeleteResponseData.OffsetDeleteResponsePartitionCollection(List(
+            new OffsetDeleteResponseData.OffsetDeleteResponsePartition()
+              .setPartitionIndex(0)
+              .setErrorCode(Errors.NONE.code)
+          ).asJava.iterator))
+      ).asJava.iterator())))
+
+    val response = verifyNoThrottling[OffsetDeleteResponse](request)
+    val backingResp = response.data.topics.find(backingTopic)
+    assertNotNull(backingResp, "backing topic must still appear in response with rejection error")
+    backingResp.partitions.forEach { p =>
+      assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, p.errorCode,
+        s"Backing topic partition ${p.partitionIndex} must be rejected with INVALID_TOPIC_EXCEPTION")
+    }
+    val plainResp = response.data.topics.find(plainTopic)
+    assertNotNull(plainResp, "non-backing topic must be forwarded to coordinator and present in response")
+    assertEquals(Errors.NONE.code, plainResp.partitions.find(0).errorCode,
+      "non-backing topic offset deletion must succeed independently of backing rejection")
+    // The coordinator MUST NOT have been asked to delete offsets for the backing topic.
+    val captor = ArgumentCaptor.forClass(classOf[OffsetDeleteRequestData])
+    verify(groupCoordinator).deleteOffsets(any(), captor.capture(), any())
+    val forwarded = captor.getValue
+    assertNull(forwarded.topics.find(backingTopic),
+      "Backing topic MUST NOT be forwarded to group coordinator — offset state must never key on backing")
+    assertNotNull(forwarded.topics.find(plainTopic),
+      "Non-backing topic MUST be forwarded to group coordinator")
+  }
+
+  @Test
+  def testOffsetCommitRejectsBackingTopic(): Unit = {
+    // r22 BLOCKER #205 — backing topics for concentrated logical topics are real Kafka
+    // topics, so metadataCache.contains returns true and handleOffsetCommitRequest would
+    // accept them without this guard. A principal authorized on the backing-topic NAME could
+    // commit arbitrary offsets keyed on the backing in __consumer_offsets, corrupting every
+    // co-tenant consumer group sharing that backing partition. Rejection runs AFTER auth so
+    // an UNauthorized probe still receives TOPIC_AUTHORIZATION_FAILED and cannot enumerate
+    // the declared-backing set (auth-first / shadow-second precedence).
+    val backingTopic = "backing-topic-r22-205-commit"
+    val plainTopic = "tenant-topic-r22-205-commit"
+    addTopicToMetadataCache(backingTopic, numPartitions = 8)
+    addTopicToMetadataCache(plainTopic, numPartitions = 2)
+    when(concentrationKernel.isBackingTopic(backingTopic)).thenReturn(true)
+    when(concentrationKernel.isBackingTopic(plainTopic)).thenReturn(false)
+
+    val offsetCommitRequest = new OffsetCommitRequestData()
+      .setGroupId("group")
+      .setMemberId("member")
+      .setTopics(List(
+        new OffsetCommitRequestData.OffsetCommitRequestTopic()
+          .setName(backingTopic)
+          .setPartitions(List(
+            new OffsetCommitRequestData.OffsetCommitRequestPartition()
+              .setPartitionIndex(0)
+              .setCommittedOffset(666),
+            new OffsetCommitRequestData.OffsetCommitRequestPartition()
+              .setPartitionIndex(1)
+              .setCommittedOffset(777)).asJava),
+        new OffsetCommitRequestData.OffsetCommitRequestTopic()
+          .setName(plainTopic)
+          .setPartitions(List(
+            new OffsetCommitRequestData.OffsetCommitRequestPartition()
+              .setPartitionIndex(0)
+              .setCommittedOffset(10)).asJava)).asJava)
+
+    val requestChannelRequest = buildRequest(new OffsetCommitRequest.Builder(offsetCommitRequest).build())
+
+    val future = new CompletableFuture[OffsetCommitResponseData]()
+    when(groupCoordinator.commitOffsets(
+      ArgumentMatchers.eq(requestChannelRequest.context),
+      any[OffsetCommitRequestData],
+      any()
+    )).thenReturn(future)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handle(requestChannelRequest, RequestLocal.noCaching)
+
+    // Coordinator returns success only for the plain topic.
+    future.complete(new OffsetCommitResponseData()
+      .setTopics(List(
+        new OffsetCommitResponseData.OffsetCommitResponseTopic()
+          .setName(plainTopic)
+          .setPartitions(List(
+            new OffsetCommitResponseData.OffsetCommitResponsePartition()
+              .setPartitionIndex(0)
+              .setErrorCode(Errors.NONE.code)).asJava)).asJava))
+
+    val response = verifyNoThrottling[OffsetCommitResponse](requestChannelRequest)
+    val responseTopics = response.data.topics.asScala
+    val backingResp = responseTopics.find(_.name == backingTopic).getOrElse(
+      fail("backing topic must appear in response with rejection error").asInstanceOf[Nothing])
+    backingResp.partitions.asScala.foreach { p =>
+      assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, p.errorCode,
+        s"Backing topic partition ${p.partitionIndex} must be rejected with INVALID_TOPIC_EXCEPTION")
+    }
+    val plainResp = responseTopics.find(_.name == plainTopic).getOrElse(
+      fail("non-backing topic must be forwarded and appear in response").asInstanceOf[Nothing])
+    assertEquals(Errors.NONE.code, plainResp.partitions.asScala.head.errorCode,
+      "non-backing topic offset commit must succeed independently of backing rejection")
+
+    // The coordinator MUST NOT have been asked to commit offsets for the backing topic.
+    val captor = ArgumentCaptor.forClass(classOf[OffsetCommitRequestData])
+    verify(groupCoordinator).commitOffsets(any(), captor.capture(), any())
+    val forwarded = captor.getValue
+    assertFalse(forwarded.topics.asScala.exists(_.name == backingTopic),
+      "Backing topic MUST NOT be forwarded to group coordinator — offset state must never key on backing")
+    assertTrue(forwarded.topics.asScala.exists(_.name == plainTopic),
+      "Non-backing topic MUST be forwarded to group coordinator")
+  }
+
+  @Test
   def testOffsetDeleteTopicsAndPartitionsValidation(): Unit = {
     val group = "groupId"
     addTopicToMetadataCache("foo", numPartitions = 2)

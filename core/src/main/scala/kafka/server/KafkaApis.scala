@@ -411,6 +411,16 @@ class KafkaApis(val requestChannel: RequestChannel,
           // to the response with TOPIC_AUTHORIZATION_FAILED.
           responseBuilder.addPartitions[OffsetCommitRequestData.OffsetCommitRequestPartition](
             topic.name, topic.partitions, _.partitionIndex, Errors.TOPIC_AUTHORIZATION_FAILED)
+        } else if (concentrationKernel.isBackingTopic(topic.name)) {
+          // r22 BLOCKER #205 — backing topics are real Kafka topics (metadataCache.contains
+          // returns true), so without this guard a principal authorized on the backing-topic
+          // NAME could commit arbitrary offsets keyed on the backing in __consumer_offsets,
+          // corrupting every co-tenant consumer group sharing that backing partition. Rejection
+          // runs AFTER auth so an UNauthorized probe still receives TOPIC_AUTHORIZATION_FAILED
+          // and cannot enumerate the declared-backing set (same auth-first precedence as
+          // DescribeConfigs #159 / Alter* #146).
+          responseBuilder.addPartitions[OffsetCommitRequestData.OffsetCommitRequestPartition](
+            topic.name, topic.partitions, _.partitionIndex, Errors.INVALID_TOPIC_EXCEPTION)
         } else if (!metadataCache.contains(topic.name) && !concentrationKernel.isLogicalTopic(topic.name)) {
           // If the topic is unknown (neither in the KRaft cache nor declared as a logical
           // topic) we add the topic and all its partitions to the response with
@@ -3501,6 +3511,16 @@ class KafkaApis(val requestChannel: RequestChannel,
           // to the response with TOPIC_AUTHORIZATION_FAILED.
           responseBuilder.addPartitions[OffsetDeleteRequestData.OffsetDeleteRequestPartition](
             topic.name, topic.partitions, _.partitionIndex, Errors.TOPIC_AUTHORIZATION_FAILED)
+        } else if (concentrationKernel.isBackingTopic(topic.name)) {
+          // r22 BLOCKER #205 — backing topics are real Kafka topics (metadataCache.contains
+          // returns true), so without this guard a principal authorized on the backing-topic
+          // NAME could delete the consumer-group offsets that legitimate co-tenant clients
+          // committed via their LOGICAL topic, causing wholesale re-consumption / data
+          // re-processing across every co-tenant group. Rejection runs AFTER auth so an
+          // UNauthorized probe still receives TOPIC_AUTHORIZATION_FAILED and cannot enumerate
+          // the declared-backing set (same auth-first precedence as #159/#146).
+          responseBuilder.addPartitions[OffsetDeleteRequestData.OffsetDeleteRequestPartition](
+            topic.name, topic.partitions, _.partitionIndex, Errors.INVALID_TOPIC_EXCEPTION)
         } else if (!metadataCache.contains(topic.name)) {
           // If the topic is unknown, we add the topic and all its partitions
           // to the response with UNKNOWN_TOPIC_OR_PARTITION.
