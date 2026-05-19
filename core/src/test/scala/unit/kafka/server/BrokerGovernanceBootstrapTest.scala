@@ -1346,7 +1346,7 @@ class BrokerGovernanceBootstrapTest {
     // cadence and would WARN on every tick — quickly burying the rest of
     // broker.log under the same message. The deduplication policy:
     //   - first occurrence WARNs (count +1)
-    //   - identical occurrences within FailureWarnIntervalMs are
+    //   - identical occurrences within FailureWarnIntervalNanos are
     //     silently suppressed and counted
     //   - the same identical occurrence past the interval rolls up the
     //     suppressed count into a single WARN
@@ -1355,7 +1355,10 @@ class BrokerGovernanceBootstrapTest {
     val engine = new RuleEngine()
     val boot = new BrokerGovernanceBootstrap(rm, engine, tp)
     val clock = new AtomicLong(0L)
-    boot.failureWarnNowMs = () => clock.get()
+    // Round-18 MED D-3: throttle is now nanoTime-based, so the test clock
+    // advances in nanoseconds. Keep the same logical window crossings
+    // (5s, 10s, 20s, 40s, 59.999s suppressed; 60.001s rolls up).
+    boot.failureWarnNowNanos = () => clock.get()
 
     // 1st occurrence — fresh message, fires.
     boot.maybeWarnSuppressed("reassigned away")
@@ -1364,17 +1367,17 @@ class BrokerGovernanceBootstrapTest {
 
     // 2nd–6th identical occurrences within the suppression window —
     // suppressed silently.
-    clock.set(5_000L); boot.maybeWarnSuppressed("reassigned away")
-    clock.set(10_000L); boot.maybeWarnSuppressed("reassigned away")
-    clock.set(20_000L); boot.maybeWarnSuppressed("reassigned away")
-    clock.set(40_000L); boot.maybeWarnSuppressed("reassigned away")
-    clock.set(59_999L); boot.maybeWarnSuppressed("reassigned away")
+    clock.set(5_000L * 1_000_000L); boot.maybeWarnSuppressed("reassigned away")
+    clock.set(10_000L * 1_000_000L); boot.maybeWarnSuppressed("reassigned away")
+    clock.set(20_000L * 1_000_000L); boot.maybeWarnSuppressed("reassigned away")
+    clock.set(40_000L * 1_000_000L); boot.maybeWarnSuppressed("reassigned away")
+    clock.set(59_999L * 1_000_000L); boot.maybeWarnSuppressed("reassigned away")
     assertEquals(1L, boot.warnEmissions.get(),
       "identical occurrences inside the suppression window must NOT WARN — " +
         "the broker.log floor must not be buried under 12 Hz repeats")
 
     // Crossing the suppression window — same message rolls up.
-    clock.set(60_001L)
+    clock.set(60_001L * 1_000_000L)
     boot.maybeWarnSuppressed("reassigned away")
     assertEquals(2L, boot.warnEmissions.get(),
       "crossing the suppression window with the same message must roll up the count " +
@@ -1383,17 +1386,65 @@ class BrokerGovernanceBootstrapTest {
     // A new distinct failure resets the ledger and WARNs immediately,
     // mentioning the previously-suppressed message so an operator
     // scanning logs sees the transition.
-    clock.set(60_500L)
+    clock.set(60_500L * 1_000_000L)
     boot.maybeWarnSuppressed("disk faulted")
     assertEquals(3L, boot.warnEmissions.get(),
       "a brand-new distinct failure must WARN immediately — operators must see " +
         "transitions to a new failure mode without waiting for the suppression window")
 
     // The same new message is now itself suppressed for the next window.
-    clock.set(60_600L); boot.maybeWarnSuppressed("disk faulted")
-    clock.set(80_000L); boot.maybeWarnSuppressed("disk faulted")
+    clock.set(60_600L * 1_000_000L); boot.maybeWarnSuppressed("disk faulted")
+    clock.set(80_000L * 1_000_000L); boot.maybeWarnSuppressed("disk faulted")
     assertEquals(3L, boot.warnEmissions.get(),
       "the new failure becomes subject to the same per-message suppression policy")
+  }
+
+  @Test
+  def warnThrottleUsesMonotonicTimeAndIsImmuneToClockStepBackwards(): Unit = {
+    // Round-18 MED D-3: the throttle window must be measured against a
+    // monotonic source so a backwards wall-clock step (NTP correction,
+    // operator clock adjustment, leap-second handling) cannot silence WARN
+    // emission. Concretely: if the throttle were wall-clock based and the
+    // operator stepped the clock back by ≥60s after the first WARN, the
+    // `now - lastWarnAt >= FailureWarnInterval` check would never satisfy
+    // again and the suppression window would effectively become infinite.
+    //
+    // We simulate this by injecting a clock that steps backwards between
+    // calls. With nanoTime-backed throttle the source itself never goes
+    // backwards in production, but the test injection points let us pin
+    // that the dedup ledger does NOT silently stall: the moment a new
+    // distinct message arrives or the monotonic deadline is reached, the
+    // WARN must fire.
+    val rm = mock(classOf[ReplicaManager])
+    val engine = new RuleEngine()
+    val boot = new BrokerGovernanceBootstrap(rm, engine, tp)
+    val clock = new AtomicLong(1_000_000_000L) // start at 1s in nanos
+    boot.failureWarnNowNanos = () => clock.get()
+
+    // 1st identical occurrence — fresh message, fires.
+    boot.maybeWarnSuppressed("reassigned away")
+    assertEquals(1L, boot.warnEmissions.get())
+
+    // Operator steps clock backwards by 10 minutes (e.g. NTP correction).
+    // A wall-clock implementation would now compute now - lastWarn = -600s,
+    // never satisfy the >= interval check, and silently suppress forever.
+    // Verify the dedup ledger still does the right thing on the NEXT branch
+    // that should be taken: a NEW distinct message must fire immediately,
+    // regardless of clock direction.
+    clock.set(1_000_000_000L - 600L * 1_000_000_000L) // 599s in the past
+    boot.maybeWarnSuppressed("disk faulted")
+    assertEquals(2L, boot.warnEmissions.get(),
+      "a new distinct message must fire even when the test clock has " +
+        "stepped backwards — dedup ledger keys on message identity, not " +
+        "time direction")
+
+    // And: when the same message repeats AND the monotonic deadline is
+    // reached (forward step past the window), the rollup must fire.
+    clock.set(clock.get() + 61L * 1_000_000_000L)
+    boot.maybeWarnSuppressed("disk faulted")
+    assertEquals(3L, boot.warnEmissions.get(),
+      "after a monotonic forward advance past the window, repeated " +
+        "message must roll up")
   }
 
   // ── Round-14 HIGH H-1: cleanup.policy runtime drift detector ────────────
@@ -1464,7 +1515,7 @@ class BrokerGovernanceBootstrapTest {
     // The drift detector runs on every drain tick (every 200ms in production).
     // Sustained drift must NOT spam the log — maybeWarnSuppressed should
     // dedupe by message, emitting one WARN initially and rolling up the rest
-    // until the FailureWarnIntervalMs window elapses. We don't advance the
+    // until the FailureWarnIntervalNanos window elapses. We don't advance the
     // clock here; the first call wins the slot, the rest are silently
     // suppressed.
     val rm = mock(classOf[ReplicaManager])

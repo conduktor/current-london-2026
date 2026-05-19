@@ -640,7 +640,7 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
    * every few seconds, indefinitely. The de-dup ledger below collapses a
    * repeating identical message: the first occurrence WARNs immediately,
    * subsequent identical occurrences are counted silently and rolled up
-   * into a single WARN every [[FailureWarnIntervalMs]]. A new distinct
+   * into a single WARN every [[FailureWarnIntervalNanos]]. A new distinct
    * message resets the ledger and WARNs immediately again — so an
    * operator scanning logs always sees the transition to a NEW failure
    * mode promptly, and a steady-state recurring failure never floods.
@@ -721,7 +721,7 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
    * including topic-level overrides) and routes a WARN through
    * {@link #maybeWarnSuppressed} whenever the effective policy is not
    * exactly {@code {compact}}. The throttled WARN dedupes identical drift
-   * messages within {@link #FailureWarnIntervalMs} while still firing a fresh
+   * messages within {@link #FailureWarnIntervalNanos} while still firing a fresh
    * line if the operator transitions from one bad policy to a different bad
    * policy (the dedup key is the message string). Visible for tests as a
    * private method invoked from the scheduleOngoing task.
@@ -811,9 +811,13 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
     }
   }
 
-  private val FailureWarnIntervalMs: Long = 60_000L
+  private val FailureWarnIntervalNanos: Long = 60_000L * 1_000_000L
   // Visible for tests so the suppression window can be advanced synthetically.
-  private[server] var failureWarnNowMs: () => Long = () => System.currentTimeMillis()
+  // Round-18 MED D-3: monotonic source so a backwards wall-clock step
+  // (NTP correction, operator clock adjustment) cannot silence WARN emission
+  // by stalling `now - lastWarn` below the throttle interval. Mirrors the
+  // Round-15 Recent-changes MED-1 nanoTime pattern (#172).
+  private[server] var failureWarnNowNanos: () => Long = () => System.nanoTime()
   // Visible for tests so they can assert how many WARNs actually fired —
   // capturing SLF4J output across the codebase is heavy and brittle. Shared
   // across all three throttles (drain failures, cleanup-policy drift,
@@ -840,21 +844,21 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
    * {@code drainFailureThrottle}, {@code cleanupPolicyDriftThrottle},
    * {@code partitionCountDriftThrottle}. They share only
    * {@link #warnEmissions} (a cumulative counter that tests assert against)
-   * and {@link #failureWarnNowMs} (the time source that tests inject).
+   * and {@link #failureWarnNowNanos} (the time source that tests inject).
    */
   private class WarnThrottle(prefix: String) {
     private val lastWarnedMessage = new AtomicReference[String](null)
-    private val lastWarnAtMs = new AtomicLong(0L)
+    private val lastWarnAtNanos = new AtomicLong(0L)
     private val suppressedSinceLastWarn = new AtomicLong(0L)
 
     def emit(message: String): Unit = {
       val msg = if (message == null) "<null>" else message
       val previous = lastWarnedMessage.get()
-      val now = failureWarnNowMs()
+      val now = failureWarnNowNanos()
       if (previous == null || previous != msg) {
         val suppressed = suppressedSinceLastWarn.getAndSet(0L)
         lastWarnedMessage.set(msg)
-        lastWarnAtMs.set(now)
+        lastWarnAtNanos.set(now)
         if (suppressed > 0L && previous != null) {
           warn(s"$prefix: $msg (previous '$previous' " +
             s"repeated and was suppressed $suppressed time(s) before this new message)")
@@ -862,11 +866,11 @@ class BrokerGovernanceBootstrap(replicaManager: ReplicaManager,
           warn(s"$prefix: $msg")
         }
         warnEmissions.incrementAndGet()
-      } else if (now - lastWarnAtMs.get() >= FailureWarnIntervalMs) {
+      } else if (now - lastWarnAtNanos.get() >= FailureWarnIntervalNanos) {
         val rolled = suppressedSinceLastWarn.getAndSet(0L)
-        lastWarnAtMs.set(now)
+        lastWarnAtNanos.set(now)
         warn(s"$prefix: $msg (same condition repeated $rolled " +
-          s"time(s) in the last ${FailureWarnIntervalMs}ms)")
+          s"time(s) in the last ${FailureWarnIntervalNanos / 1_000_000L}ms)")
         warnEmissions.incrementAndGet()
       } else {
         suppressedSinceLastWarn.incrementAndGet()
