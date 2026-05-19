@@ -705,29 +705,34 @@ public class ConfigurationControlManagerTest {
     }
 
     /**
-     * R53 negative: altering an existing view (view.backing.topic already set) to point to a
-     * different backing must still succeed. Without this case, a regression that blanket-rejects
-     * any view.backing.topic SET would pass the rejection tests above.
+     * R53 negative (post-R56): altering an existing view's predicate text while keeping the
+     * backing fixed must still succeed. The documented hot-reload capability (tested end-to-end
+     * by ViewTopicIntegrationTest.testPredicateChangeIsHotReloaded) lives on this path: ALTER
+     * view.cel.predicate, broker config publisher fires viewRegistry.invalidate(view), next
+     * fetch recompiles. R56 closes backing-identity rebind specifically, not predicate edits.
      */
     @Test
     public void testR53AllowRebindOnExistingView() {
         ConfigurationControlManager manager = new ConfigurationControlManager.Builder().
             setKafkaConfigSchema(SCHEMA).
             build();
-        // mytopic was created as a view (has view.backing.topic = B_old).
+        // mytopic was created as a view; both backing AND predicate are seeded so the post-state
+        // is still a valid view (all three view.* keys present per LogConfig all-or-none).
         manager.replay(new ConfigRecord().setResourceType(TOPIC.id()).setResourceName("mytopic").
-            setName("view.backing.topic").setValue("B_old"));
+            setName("view.backing.topic").setValue("B"));
+        manager.replay(new ConfigRecord().setResourceType(TOPIC.id()).setResourceName("mytopic").
+            setName("view.cel.predicate").setValue("true"));
 
         ControllerResult<Map<ConfigResource, ApiError>> result = manager.incrementalAlterConfigs(
-            toMap(entry(MYTOPIC, toMap(entry("view.backing.topic", entry(SET, "B_new"))))),
+            toMap(entry(MYTOPIC, toMap(entry("view.cel.predicate", entry(SET, "x > 5"))))),
             false);
 
         assertEquals(ApiError.NONE, result.response().get(MYTOPIC),
-            "view-to-view rebind on an existing view must remain allowed");
+            "predicate-only change on an existing view must remain allowed");
         assertEquals(1, result.records().size());
         ConfigRecord emitted = (ConfigRecord) result.records().get(0).message();
-        assertEquals("view.backing.topic", emitted.name());
-        assertEquals("B_new", emitted.value());
+        assertEquals("view.cel.predicate", emitted.name());
+        assertEquals("x > 5", emitted.value());
     }
 
     /**
@@ -853,5 +858,125 @@ public class ConfigurationControlManagerTest {
         assertEquals(Errors.INVALID_CONFIG, err.error());
         assertTrue(err.message().contains("immutable"),
             "error message must explain the view-ness immutability rule, got: " + err.message());
+    }
+
+    /**
+     * R56 (Codex Finding): live backing-identity change on an existing view is rejected.
+     * Offset commits for a view are stored as (group, V, partition) with NO backing identity,
+     * and the fetch redirect forwards consumers' committed offsets unchanged to whichever
+     * backing the view currently points to. A live B1 → B2 rebind would silently remap every
+     * committed offset onto a physically different log: either skipping B2 records below the
+     * offset or hitting OffsetOutOfRange and triggering auto.offset.reset. Operators must
+     * delete + recreate the view to point at a different backing (DeleteTopics propagates to
+     * the group coordinator which tombstones committed offsets).
+     */
+    @Test
+    public void testR56RejectIncrementalAlterChangingBackingOnExistingView() {
+        ConfigurationControlManager manager = new ConfigurationControlManager.Builder().
+            setKafkaConfigSchema(SCHEMA).
+            build();
+        manager.replay(new ConfigRecord().setResourceType(TOPIC.id()).setResourceName("mytopic").
+            setName("view.backing.topic").setValue("B_old"));
+        manager.replay(new ConfigRecord().setResourceType(TOPIC.id()).setResourceName("mytopic").
+            setName("view.cel.predicate").setValue("true"));
+        manager.replay(new ConfigRecord().setResourceType(TOPIC.id()).setResourceName("mytopic").
+            setName("view.offset.mode").setValue("sparse"));
+
+        ControllerResult<Map<ConfigResource, ApiError>> result = manager.incrementalAlterConfigs(
+            toMap(entry(MYTOPIC, toMap(entry("view.backing.topic", entry(SET, "B_new"))))),
+            false);
+
+        assertEquals(Collections.emptyList(), result.records(),
+            "no records should be emitted when the backing rebind is rejected");
+        ApiError err = result.response().get(MYTOPIC);
+        assertEquals(Errors.INVALID_CONFIG, err.error());
+        assertTrue(err.message().contains("immutable"),
+            "error message must explain the backing-identity immutability rule, got: " + err.message());
+        assertTrue(err.message().contains("B_old") && err.message().contains("B_new"),
+            "error message must name both the old and new backing, got: " + err.message());
+    }
+
+    /**
+     * R56: the same rejection via the legacy AlterConfigs full-replace surface. Legacy
+     * overwrites all configs in one shot, so an operator submitting {view.backing.topic=B_new,
+     * view.cel.predicate=true, view.offset.mode=sparse} for an existing view pointing at B_old
+     * is changing the backing while keeping the view shape — must be rejected the same way.
+     */
+    @Test
+    public void testR56RejectLegacyAlterChangingBackingOnExistingView() {
+        ConfigurationControlManager manager = new ConfigurationControlManager.Builder().
+            setKafkaConfigSchema(SCHEMA).
+            build();
+        manager.replay(new ConfigRecord().setResourceType(TOPIC.id()).setResourceName("mytopic").
+            setName("view.backing.topic").setValue("B_old"));
+        manager.replay(new ConfigRecord().setResourceType(TOPIC.id()).setResourceName("mytopic").
+            setName("view.cel.predicate").setValue("true"));
+        manager.replay(new ConfigRecord().setResourceType(TOPIC.id()).setResourceName("mytopic").
+            setName("view.offset.mode").setValue("sparse"));
+
+        ControllerResult<Map<ConfigResource, ApiError>> result = manager.legacyAlterConfigs(
+            toMap(entry(MYTOPIC, toMap(
+                entry("view.backing.topic", "B_new"),
+                entry("view.cel.predicate", "true"),
+                entry("view.offset.mode", "sparse")))),
+            false);
+
+        assertEquals(Collections.emptyList(), result.records());
+        ApiError err = result.response().get(MYTOPIC);
+        assertEquals(Errors.INVALID_CONFIG, err.error());
+        assertTrue(err.message().contains("immutable"),
+            "error message must explain the backing-identity immutability rule, got: " + err.message());
+    }
+
+    /**
+     * R56 negative: predicate-only change on an existing view (same backing) must still
+     * succeed. This is the documented hot-reload capability tested end-to-end by
+     * ViewTopicIntegrationTest.testPredicateChangeIsHotReloaded. The R56 gate keys on
+     * trimmed-backing-equality only, so identical backings with different predicates pass.
+     */
+    @Test
+    public void testR56AllowPredicateChangeWithSameBacking() {
+        ConfigurationControlManager manager = new ConfigurationControlManager.Builder().
+            setKafkaConfigSchema(SCHEMA).
+            build();
+        manager.replay(new ConfigRecord().setResourceType(TOPIC.id()).setResourceName("mytopic").
+            setName("view.backing.topic").setValue("B"));
+        manager.replay(new ConfigRecord().setResourceType(TOPIC.id()).setResourceName("mytopic").
+            setName("view.cel.predicate").setValue("true"));
+        manager.replay(new ConfigRecord().setResourceType(TOPIC.id()).setResourceName("mytopic").
+            setName("view.offset.mode").setValue("sparse"));
+
+        ControllerResult<Map<ConfigResource, ApiError>> result = manager.incrementalAlterConfigs(
+            toMap(entry(MYTOPIC, toMap(entry("view.cel.predicate", entry(SET, "x > 10"))))),
+            false);
+
+        assertEquals(ApiError.NONE, result.response().get(MYTOPIC),
+            "predicate-only change on existing view must remain allowed (hot-reload contract)");
+    }
+
+    /**
+     * R56 negative: re-asserting the same backing (idempotent SET) must succeed. The check
+     * triggers only on a different trimmed value, so SET view.backing.topic=B when the
+     * existing value is already B is a no-op rebind and must pass. Important because a
+     * tooling-generated full-replace alter may include the unchanged backing verbatim.
+     */
+    @Test
+    public void testR56AllowIdempotentBackingSet() {
+        ConfigurationControlManager manager = new ConfigurationControlManager.Builder().
+            setKafkaConfigSchema(SCHEMA).
+            build();
+        manager.replay(new ConfigRecord().setResourceType(TOPIC.id()).setResourceName("mytopic").
+            setName("view.backing.topic").setValue("B"));
+        manager.replay(new ConfigRecord().setResourceType(TOPIC.id()).setResourceName("mytopic").
+            setName("view.cel.predicate").setValue("true"));
+        manager.replay(new ConfigRecord().setResourceType(TOPIC.id()).setResourceName("mytopic").
+            setName("view.offset.mode").setValue("sparse"));
+
+        ControllerResult<Map<ConfigResource, ApiError>> result = manager.incrementalAlterConfigs(
+            toMap(entry(MYTOPIC, toMap(entry("view.backing.topic", entry(SET, "B"))))),
+            false);
+
+        assertEquals(ApiError.NONE, result.response().get(MYTOPIC),
+            "idempotent backing SET (same value) must not trip the R56 gate");
     }
 }

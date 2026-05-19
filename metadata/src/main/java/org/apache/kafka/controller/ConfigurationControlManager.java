@@ -437,119 +437,8 @@ public class ConfigurationControlManager {
             if (!newlyCreatedResource) {
                 existenceChecker.accept(configResource);
             }
-            // R44 (Codex Finding): for alter operations on an existing topic that leave
-            // view.backing.topic set in the POST-state, require the view topic and its backing
-            // to have the same partition count. The fetch redirect maps (view, p) → (backing, p)
-            // on partition index alone; a mismatch silently drops backing partitions whose
-            // index ≥ view.parts.size (data loss for view consumers) or strands view partitions
-            // whose index ≥ backing.parts.size (perpetual UNKNOWN_TOPIC_OR_PARTITION, wedged
-            // consumer groups). The createTopic path enforces the same invariant inline; this
-            // covers the rebind / turn-existing-topic-into-view paths reachable via
-            // IncrementalAlterConfigs and legacy AlterConfigs. We skip the check when the
-            // resource is newly created — at that point the view topic is not yet in the
-            // partition registry, and the createTopic-side guard is authoritative. We also
-            // skip if the lookup is the default no-op (lookup never returns a present count
-            // for the view itself), which preserves test-context fallthrough where the
-            // ReplicationControlManager is not wired in.
             if (!newlyCreatedResource && configResource.type() == Type.TOPIC) {
-                String backing = allConfigs.get(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG);
-                String existingBacking = existingConfigsMap.get(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG);
-                boolean wasView = existingBacking != null && !existingBacking.trim().isEmpty();
-                boolean willBeView = backing != null && !backing.trim().isEmpty();
-                // R53 (Codex Finding): view-ness is immutable after topic creation. Reject
-                // AlterConfigs that transitions a non-view topic into a view by setting
-                // view.backing.topic. The exploit chain Codex traced: AddPartitionsToTxn(T-0) is
-                // accepted while T is a regular topic (txnMetadata.topicPartitions includes T-0),
-                // an alter then sets view.backing.topic on T (this path), EndTxn issues markers
-                // for T-0, the broker classifies T as a view at marker dispatch time and rejects
-                // with INVALID_TOPIC_EXCEPTION (KafkaApis.handleWriteTxnMarkers), and
-                // TransactionMarkerRequestCompletionHandler has no case for INVALID_TOPIC_EXCEPTION
-                // — it falls into the default branch and throws IllegalStateException. The marker
-                // for T-0 is then never acknowledged or cancelled, leaving the transaction wedged
-                // and any READ_COMMITTED consumer on the backing partition blocked at the LSO.
-                // Separate but reinforcing concern: any data already written to T's log (when T
-                // was a regular topic) becomes orphaned after conversion, because consumer reads
-                // on the view redirect to the backing topic and never observe the pre-conversion
-                // log. We allow create-time view configs (newlyCreatedResource above) and
-                // view-to-view changes (predicate/backing rebind where wasView==true).
-                if (willBeView && !wasView) {
-                    throw new ConfigException(
-                        "Cannot set " + ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG +
-                        " on existing non-view topic '" + configResource.name() + "': " +
-                        "view-ness is immutable after topic creation. Create the topic with " +
-                        "view configs at create time, or alter an existing view's predicate or " +
-                        "backing. Converting a regular topic into a view would wedge any " +
-                        "in-flight transactions (the broker rejects markers on views with " +
-                        "INVALID_TOPIC_EXCEPTION, blocking READ_COMMITTED consumers at the LSO) " +
-                        "and orphan any data already present in the topic's log (consumer reads " +
-                        "redirect to the backing topic).");
-                }
-                // R55 (Codex Finding): view-ness is immutable in BOTH directions. R53 above
-                // rejects regular→view; this branch rejects view→regular. Without it, a
-                // principal holding ALTER_CONFIGS on a view V (but not READ on its backing B)
-                // can strip view-ness via either of two paths:
-                //   (a) legacy AlterConfigs full-replace omitting all view.* keys. Legacy
-                //       overwrites all configs, so omitted keys become implicit DELETEs
-                //       (CCM.legacyAlterConfigResource at lines 633-642). The all-or-none
-                //       invariant in LogConfig.validateViewConfigs permits present=0 as a
-                //       valid "regular topic" post-state, so partial-strip detection at the
-                //       schema layer does not catch full-strip.
-                //   (b) IncrementalAlterConfigs DELETE op on view.backing.topic. The
-                //       per-key DELETE sets newValue=null (CCM.incrementalAlterConfigResource
-                //       at line 355), and the LogConfig all-or-none check would only reject if
-                //       a partial subset remained — so attacker DELETEs the backing key (or
-                //       all three keys) in one shot to land on the valid present=0 state.
-                // Once stripped, broker classification flips: KafkaApis.isViewTopic at
-                // KafkaApis:565 requires all three view configs (via TopicViewConfigs.fromMap),
-                // so a topic with present=0 is no longer a view. Subsequent fetches stop
-                // redirecting to the backing topic (KafkaApis:828 path) and produces stop
-                // hitting the read-only rejection (KafkaApis:434, :540). The principal — who
-                // could not READ B — now controls a writable local log that consumers holding
-                // READ on V still believe is the filtered view feed, opening a path to
-                // attacker-controlled records being served as the view. Reject the conversion
-                // here so the create path remains the only place view-ness is established or
-                // torn down. The auth check at ControllerApis.handleLegacyAlterConfigs only
-                // computes currentBackingDenied when the submitted map contains a view key by
-                // name (legacyTouchesAnyViewConfig at ControllerApis:956), so omission-based
-                // mutations bypass the broker-side READ-on-backing check — this controller
-                // gate is what actually closes the exploit.
-                if (wasView && !willBeView) {
-                    throw new ConfigException(
-                        "Cannot remove " + ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG +
-                        " from existing view topic '" + configResource.name() + "': " +
-                        "view-ness is immutable after topic creation. Delete and recreate " +
-                        "the topic if you need to convert a view into a regular topic. " +
-                        "Stripping view configs would let a principal who cannot READ the " +
-                        "backing topic produce attacker-controlled records to consumers " +
-                        "that still hold READ on the view (the read-only rejection and " +
-                        "fetch-redirect both key on view classification, which collapses " +
-                        "once any of the three view configs is removed).");
-                }
-                if (backing != null) {
-                    String trimmedBacking = backing.trim();
-                    if (!trimmedBacking.isEmpty()) {
-                        OptionalInt viewParts = topicPartitionCountLookup.apply(configResource.name());
-                        if (viewParts.isPresent()) {
-                            OptionalInt backingParts = topicPartitionCountLookup.apply(trimmedBacking);
-                            if (!backingParts.isPresent()) {
-                                throw new ConfigException(
-                                    "Cannot set " + ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG +
-                                    "='" + trimmedBacking + "' on topic '" + configResource.name() +
-                                    "': backing topic '" + trimmedBacking + "' does not exist.");
-                            }
-                            if (viewParts.getAsInt() != backingParts.getAsInt()) {
-                                throw new ConfigException(
-                                    "Cannot set " + ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG +
-                                    "='" + trimmedBacking + "' on topic '" + configResource.name() +
-                                    "': view has " + viewParts.getAsInt() + " partition(s) but " +
-                                    "backing topic '" + trimmedBacking + "' has " +
-                                    backingParts.getAsInt() + " partition(s). A view must have " +
-                                    "the same partition count as its backing — the fetch redirect " +
-                                    "maps (view, p) → (backing, p) on partition index alone.");
-                            }
-                        }
-                    }
-                }
+                validateTopicViewInvariants(configResource, allConfigs, existingConfigsMap);
             }
             if (alterConfigPolicy.isPresent()) {
                 alterConfigPolicy.get().validate(new RequestMetadata(configResource, alteredConfigsForAlterConfigPolicyCheck));
@@ -565,6 +454,106 @@ public class ConfigurationControlManager {
             return apiError;
         }
         return ApiError.NONE;
+    }
+
+    /**
+     * Enforce view-topic invariants on an alter operation against an existing topic. Throws
+     * {@link ConfigException} (caught by the caller and mapped to INVALID_CONFIG) when any
+     * invariant is violated. Skipped for create-time (newlyCreatedResource) and non-TOPIC
+     * resources — the caller is responsible for those gates.
+     *
+     * Closed invariants:
+     * <ul>
+     *   <li><b>R53</b>: regular topic → view conversion. Forbidden because it would wedge any
+     *       in-flight transactions whose markers target the now-view partitions
+     *       (TransactionMarkerRequestCompletionHandler default-throws on INVALID_TOPIC_EXCEPTION)
+     *       and orphan any data already written to the topic's log.</li>
+     *   <li><b>R55</b>: view → regular conversion via legacy AlterConfigs omission or
+     *       IncrementalAlterConfigs DELETE on the view.* keys. Forbidden because it would
+     *       collapse {@code KafkaApis.isViewTopic} classification and let a principal who
+     *       cannot READ the backing produce attacker-controlled records to consumers that
+     *       still hold READ on the (now-regular) topic.</li>
+     *   <li><b>R56</b>: live backing rebind (B1 → B2) on an existing view. Forbidden because
+     *       offset commits for a view carry no backing identity and the fetch redirect
+     *       forwards them unchanged, so the rebind would silently remap every committed
+     *       offset onto a different physical log. Predicate-only changes remain allowed
+     *       (the documented hot-reload contract).</li>
+     *   <li><b>R44</b>: partition-count alignment between view and backing. Required because
+     *       the fetch redirect maps (view, p) → (backing, p) on partition index alone.</li>
+     * </ul>
+     */
+    private void validateTopicViewInvariants(
+        ConfigResource configResource,
+        Map<String, String> allConfigs,
+        Map<String, String> existingConfigsMap
+    ) {
+        String backing = allConfigs.get(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG);
+        String existingBacking = existingConfigsMap.get(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG);
+        boolean wasView = existingBacking != null && !existingBacking.trim().isEmpty();
+        boolean willBeView = backing != null && !backing.trim().isEmpty();
+
+        if (willBeView && !wasView) {
+            throw new ConfigException(
+                "Cannot set " + ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG +
+                " on existing non-view topic '" + configResource.name() + "': " +
+                "view-ness is immutable after topic creation. Create the topic with view " +
+                "configs at create time. Converting a regular topic into a view would wedge " +
+                "any in-flight transactions (the broker rejects markers on views with " +
+                "INVALID_TOPIC_EXCEPTION, blocking READ_COMMITTED consumers at the LSO) and " +
+                "orphan any data already present in the topic's log (consumer reads redirect " +
+                "to the backing topic).");
+        }
+        if (wasView && !willBeView) {
+            throw new ConfigException(
+                "Cannot remove " + ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG +
+                " from existing view topic '" + configResource.name() + "': " +
+                "view-ness is immutable after topic creation. Delete and recreate the topic " +
+                "if you need to convert a view into a regular topic. Stripping view configs " +
+                "would let a principal who cannot READ the backing topic produce " +
+                "attacker-controlled records to consumers that still hold READ on the view.");
+        }
+        if (wasView && willBeView) {
+            String trimmedExisting = existingBacking.trim();
+            String trimmedNew = backing.trim();
+            if (!trimmedExisting.equals(trimmedNew)) {
+                throw new ConfigException(
+                    "Cannot change " + ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG +
+                    " on existing view topic '" + configResource.name() + "' from '" +
+                    trimmedExisting + "' to '" + trimmedNew + "': backing identity is " +
+                    "immutable after topic creation. View-partition offset semantics key on " +
+                    "the current backing (consumers' committed offsets are stored as " +
+                    "(group, view, partition) and the fetch redirect forwards them unchanged " +
+                    "to the backing), so a live rebind would silently remap every committed " +
+                    "offset onto a different physical log. Delete and recreate the view to " +
+                    "point at a different backing; predicate changes on the existing backing " +
+                    "remain allowed.");
+            }
+        }
+        if (backing != null) {
+            String trimmedBacking = backing.trim();
+            if (!trimmedBacking.isEmpty()) {
+                OptionalInt viewParts = topicPartitionCountLookup.apply(configResource.name());
+                if (viewParts.isPresent()) {
+                    OptionalInt backingParts = topicPartitionCountLookup.apply(trimmedBacking);
+                    if (!backingParts.isPresent()) {
+                        throw new ConfigException(
+                            "Cannot set " + ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG +
+                            "='" + trimmedBacking + "' on topic '" + configResource.name() +
+                            "': backing topic '" + trimmedBacking + "' does not exist.");
+                    }
+                    if (viewParts.getAsInt() != backingParts.getAsInt()) {
+                        throw new ConfigException(
+                            "Cannot set " + ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG +
+                            "='" + trimmedBacking + "' on topic '" + configResource.name() +
+                            "': view has " + viewParts.getAsInt() + " partition(s) but " +
+                            "backing topic '" + trimmedBacking + "' has " +
+                            backingParts.getAsInt() + " partition(s). A view must have the " +
+                            "same partition count as its backing — the fetch redirect maps " +
+                            "(view, p) → (backing, p) on partition index alone.");
+                    }
+                }
+            }
+        }
     }
 
     private static final ApiError DISALLOWED_BROKER_MIN_ISR_TRANSITION_ERROR =
