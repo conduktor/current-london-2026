@@ -37,6 +37,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.function.Supplier;
+import java.util.regex.Pattern;
 
 /**
  * Central entry point for broker-side request authorisation by CEL rules.
@@ -569,6 +570,57 @@ public final class RuleEngine {
                     + "principal; reject at startup rather than "
                     + "under-granting the bypass silently.");
             }
+            // R29 #270 [HIGH]: detect the comma-as-separator typo. Every
+            // other Kafka list config (listeners, bootstrap.servers,
+            // advertised.listeners, controller.quorum.voters, …) uses
+            // comma as the separator. PROMPT.md mandates `;` here because
+            // legitimate SSL DN principal names contain commas (e.g.
+            // `User:CN=Broker One,OU=Kafka Brokers,O=Example Corp,C=US`).
+            // An operator typo using `,` instead of `;` produces ONE
+            // segment that parses successfully: split(":", 2) consumes
+            // only the first colon, so `"User:admin,User:broker"` becomes
+            // type=`User`, name=`admin,User:broker`. The whitespace and
+            // invisible-codepoint guards above do not catch commas. The
+            // allow-list becomes non-empty so the BrokerServer empty-set
+            // startup guard passes. At runtime the broker's own peer
+            // principal `User:broker` will NEVER match the literal entry
+            // — silently soft-bricking inter-broker traffic with NO
+            // startup diagnostic.
+            //
+            // Discriminator (must not false-positive on SSL DNs):
+            //   1. Reject any `,` in TYPE. Principal types are short
+            //      identifiers (User/Group/Role/Service Account) and
+            //      never contain commas; commas in `type` only appear
+            //      via a typo of shape `"User,Group:admin"`.
+            //   2. Reject `,<ident>:` shape inside NAME. SSL DN
+            //      attribute separators use `=` (`,OU=`, `,O=`, `,C=`,
+            //      `,EMAILADDRESS=`, …) — never `:` — so legitimate DNs
+            //      with embedded commas are NOT affected. The smoking
+            //      gun for comma-typo is the colon after the identifier
+            //      (`,User:`, `,Group:`, `,Role:`, …).
+            if (type.indexOf(',') >= 0) {
+                throw new IllegalArgumentException(
+                    "governance.bypass.principals entry contains a comma "
+                    + "in the principal type: '" + LogSafe.sanitize(trimmed)
+                    + "'. The separator between entries is `;` (semicolon), "
+                    + "NOT `,` (comma) — note this differs from other Kafka "
+                    + "list configs (listeners, bootstrap.servers, …) "
+                    + "because legitimate SSL DN principal names embed "
+                    + "commas (eg. "
+                    + "`User:CN=Broker One,OU=Kafka Brokers,O=Example Corp,C=US`).");
+            }
+            if (COMMA_SEPARATOR_TYPO.matcher(name).find()) {
+                throw new IllegalArgumentException(
+                    "governance.bypass.principals entry contains "
+                    + "`,<identifier>:` inside the principal name, which is "
+                    + "the shape of a comma-as-separator typo: '"
+                    + LogSafe.sanitize(trimmed)
+                    + "'. The separator between entries is `;` (semicolon), "
+                    + "NOT `,` (comma) — this differs from other Kafka list "
+                    + "configs because legitimate SSL DNs use `=` as the "
+                    + "attribute separator (eg. "
+                    + "`User:CN=Broker One,OU=Kafka Brokers,O=Example Corp,C=US`).");
+            }
             // Round-22 HIGH (Agent 5 H-1): assemble the canonical
             // "type:name" form explicitly rather than calling toString.
             // SecurityUtils.parseKafkaPrincipal currently always returns the
@@ -609,6 +661,19 @@ public final class RuleEngine {
     private static boolean isAnyWhitespaceCodePoint(int c) {
         return Character.isWhitespace(c) || Character.isSpaceChar(c);
     }
+
+    /**
+     * R29 #270 [HIGH]: smoking-gun shape of a comma-as-separator typo in
+     * {@code governance.bypass.principals}: comma, optional whitespace, an
+     * identifier, then colon. Examples: {@code ",User:"}, {@code ", Group:"}.
+     *
+     * <p>SSL DN attribute separators use {@code =} (eg. {@code ,OU=},
+     * {@code ,O=}, {@code ,C=}) — NEVER {@code :} — so legitimate SSL DNs
+     * containing commas do NOT match this pattern. See
+     * {@link #parseBypassPrincipals(String)} for the full rationale.
+     */
+    private static final Pattern COMMA_SEPARATOR_TYPO =
+        Pattern.compile(",\\s*[A-Za-z][A-Za-z0-9_]*:");
 
     /** True if {@code s} is non-empty and every code point is whitespace. */
     private static boolean isAllWhitespace(String s) {

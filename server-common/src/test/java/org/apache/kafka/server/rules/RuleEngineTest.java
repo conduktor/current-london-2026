@@ -1517,6 +1517,142 @@ public class RuleEngineTest {
     }
 
     @Test
+    public void parseBypassPrincipalsRejectsCommaAsSeparatorTypo() {
+        // R29 #270 [HIGH]: governance.bypass.principals uses `;` as the
+        // separator (PROMPT.md), NOT `,` — because legitimate SSL DN
+        // principal names contain commas (eg. CN=Broker One,OU=...,O=...,C=).
+        // But every other Kafka list config (listeners, bootstrap.servers,
+        // advertised.listeners, controller.quorum.voters, ...) is comma-
+        // separated, so an operator typo replacing `;` with `,` is highly
+        // plausible.
+        //
+        // The hazard: `"User:admin,User:broker"` parses successfully as a
+        // SINGLE principal — SecurityUtils.parseKafkaPrincipal does
+        // split(":", 2), so type=`User`, name=`admin,User:broker`. The
+        // existing whitespace and invisible-codepoint guards do not catch
+        // commas. Allow-list becomes non-empty (`{"User:admin,User:broker"}`)
+        // so the BrokerServer empty-set startup guard passes. At runtime
+        // the broker's own peer principal is `User:broker` — it will NEVER
+        // match the literal `User:admin,User:broker` entry, silently
+        // soft-bricking inter-broker traffic with NO startup diagnostic.
+        //
+        // Discriminator (must not false-positive on SSL DN):
+        //   - `,` in TYPE → always rejected. Principal types are short
+        //     identifiers (User/Group/Role/Service Account); commas only
+        //     appear there via a typo of shape `"User,Group:admins"`.
+        //   - `,<ident>:` in NAME → rejected as comma-separator typo.
+        //     SSL DN attribute separators use `=` (`,OU=`, `,O=`, `,C=`,
+        //     `,EMAILADDRESS=`, ...) — never `:` — so legitimate DNs
+        //     containing commas are NOT affected by this check.
+
+        // ---- The headline case: two principals comma-joined ----
+        IllegalArgumentException ex1 = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals("User:admin,User:broker"));
+        assertTrue(ex1.getMessage().toLowerCase().contains("comma"),
+            "comma-separator typo diagnostic must name `comma`; got: "
+                + ex1.getMessage());
+        assertTrue(ex1.getMessage().contains(";"),
+            "diagnostic must name the correct separator `;`; got: "
+                + ex1.getMessage());
+        assertTrue(ex1.getMessage().contains("User:admin,User:broker"),
+            "diagnostic must echo the offending entry so the operator can "
+                + "find it in their config; got: " + ex1.getMessage());
+
+        // ---- Comma + space after (Kafka-idiom-ish formatting) ----
+        IllegalArgumentException ex2 = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals("User:admin, User:broker"));
+        assertTrue(ex2.getMessage().toLowerCase().contains("comma"),
+            "comma-separator typo with whitespace after comma must also be "
+                + "rejected (Kafka list configs often have ', ' formatting); got: "
+                + ex2.getMessage());
+
+        // ---- Different principal types ----
+        IllegalArgumentException ex3 = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals("User:admin,Group:admins"));
+        assertTrue(ex3.getMessage().toLowerCase().contains("comma"),
+            "comma-separator typo with mixed principal types must be rejected; got: "
+                + ex3.getMessage());
+
+        // ---- Three principals comma-joined (no `;` at all) ----
+        IllegalArgumentException ex4 = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals(
+                    "User:admin,User:broker,User:client"));
+        assertTrue(ex4.getMessage().toLowerCase().contains("comma"),
+            "three-principal comma-joined typo must be rejected; got: "
+                + ex4.getMessage());
+
+        // ---- Mixed: some segments correct, one segment uses comma ----
+        // `"User:broker;User:admin,User:client"` → split by `;` yields two
+        // segments. The first is fine; the second has the comma typo. The
+        // parser must abort on the second segment.
+        IllegalArgumentException ex5 = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals(
+                    "User:broker;User:admin,User:client"));
+        assertTrue(ex5.getMessage().toLowerCase().contains("comma"),
+            "mixed-separator config (semicolon-joined entry containing a "
+                + "comma-typo entry) must be rejected on the bad segment; got: "
+                + ex5.getMessage());
+
+        // ---- Comma in TYPE: `"User,Group:admin"` ----
+        // split(":", 2) gives type="User,Group", name="admin". Comma is in
+        // the parsed type — reject with the same diagnostic family.
+        IllegalArgumentException ex6 = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals("User,Group:admin"));
+        assertTrue(ex6.getMessage().toLowerCase().contains("comma"),
+            "comma in principal TYPE must be rejected; got: " + ex6.getMessage());
+
+        // ---- LogSafe regression: typo with embedded CR must not forge a
+        // log line. The diagnostic embeds the offending entry, which the
+        // BrokerServer.startup fatal log line propagates via SLF4J.
+        IllegalArgumentException exLog = org.junit.jupiter.api.Assertions
+            .assertThrows(IllegalArgumentException.class,
+                () -> RuleEngine.parseBypassPrincipals("User:admin,User:broker\rX"));
+        assertFalse(exLog.getMessage().contains("\r"),
+            "comma-typo diagnostic must not embed raw CR (log-injection guard); "
+                + "got: " + exLog.getMessage());
+        assertTrue(exLog.getMessage().contains("\\u000D"),
+            "comma-typo diagnostic must show CR as \\u000D; got: "
+                + exLog.getMessage());
+
+        // ---- Regression guard: legitimate SSL DN with commas is STILL
+        // accepted. This is the critical no-false-positive assertion. If
+        // the implementation widens to "reject any comma in name", this
+        // test fails and we get a clear signal that the discriminator is
+        // too broad.
+        String sslDn = "User:CN=Broker One,OU=Kafka Brokers,O=Example Corp,C=US";
+        java.util.Set<String> okSsl = RuleEngine.parseBypassPrincipals(sslDn);
+        assertEquals(1, okSsl.size(),
+            "SSL DN with commas (X.500 attribute separators followed by `=`) "
+                + "must NOT trip the comma-separator-typo check; got: " + okSsl);
+        assertTrue(okSsl.contains(sslDn),
+            "SSL DN must round-trip to its canonical form; got: " + okSsl);
+
+        // ---- Regression guard: a single ordinary principal (no commas
+        // anywhere) is unaffected.
+        java.util.Set<String> okPlain = RuleEngine.parseBypassPrincipals("User:broker");
+        assertEquals(1, okPlain.size(), "plain principal must parse cleanly");
+        assertTrue(okPlain.contains("User:broker"));
+
+        // ---- Regression guard: name containing a comma but NOT in
+        // `,<ident>:` shape (e.g. trailing comma in the operator's free-
+        // form `name`). This is unusual but not the typo signature — a
+        // name like `"foo,bar"` does not look like a chained principal.
+        // Accept it to keep the discriminator narrow.
+        java.util.Set<String> okFreeForm = RuleEngine.parseBypassPrincipals(
+            "User:foo,bar");
+        assertEquals(1, okFreeForm.size(),
+            "name with trailing comma (no `<ident>:` after) is NOT the typo "
+                + "shape; got: " + okFreeForm);
+        assertTrue(okFreeForm.contains("User:foo,bar"));
+    }
+
+    @Test
     public void parseBypassPrincipalsThrowsOnUnicodeBlankComponent() {
         // Codex round-4 F2: String.trim() only strips ASCII whitespace (chars
         // <= 0x20), so a non-breaking space (U+00A0) inside a component
