@@ -484,6 +484,47 @@ public class ConfigurationControlManager {
                         "and orphan any data already present in the topic's log (consumer reads " +
                         "redirect to the backing topic).");
                 }
+                // R55 (Codex Finding): view-ness is immutable in BOTH directions. R53 above
+                // rejects regular→view; this branch rejects view→regular. Without it, a
+                // principal holding ALTER_CONFIGS on a view V (but not READ on its backing B)
+                // can strip view-ness via either of two paths:
+                //   (a) legacy AlterConfigs full-replace omitting all view.* keys. Legacy
+                //       overwrites all configs, so omitted keys become implicit DELETEs
+                //       (CCM.legacyAlterConfigResource at lines 633-642). The all-or-none
+                //       invariant in LogConfig.validateViewConfigs permits present=0 as a
+                //       valid "regular topic" post-state, so partial-strip detection at the
+                //       schema layer does not catch full-strip.
+                //   (b) IncrementalAlterConfigs DELETE op on view.backing.topic. The
+                //       per-key DELETE sets newValue=null (CCM.incrementalAlterConfigResource
+                //       at line 355), and the LogConfig all-or-none check would only reject if
+                //       a partial subset remained — so attacker DELETEs the backing key (or
+                //       all three keys) in one shot to land on the valid present=0 state.
+                // Once stripped, broker classification flips: KafkaApis.isViewTopic at
+                // KafkaApis:565 requires all three view configs (via TopicViewConfigs.fromMap),
+                // so a topic with present=0 is no longer a view. Subsequent fetches stop
+                // redirecting to the backing topic (KafkaApis:828 path) and produces stop
+                // hitting the read-only rejection (KafkaApis:434, :540). The principal — who
+                // could not READ B — now controls a writable local log that consumers holding
+                // READ on V still believe is the filtered view feed, opening a path to
+                // attacker-controlled records being served as the view. Reject the conversion
+                // here so the create path remains the only place view-ness is established or
+                // torn down. The auth check at ControllerApis.handleLegacyAlterConfigs only
+                // computes currentBackingDenied when the submitted map contains a view key by
+                // name (legacyTouchesAnyViewConfig at ControllerApis:956), so omission-based
+                // mutations bypass the broker-side READ-on-backing check — this controller
+                // gate is what actually closes the exploit.
+                if (wasView && !willBeView) {
+                    throw new ConfigException(
+                        "Cannot remove " + ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG +
+                        " from existing view topic '" + configResource.name() + "': " +
+                        "view-ness is immutable after topic creation. Delete and recreate " +
+                        "the topic if you need to convert a view into a regular topic. " +
+                        "Stripping view configs would let a principal who cannot READ the " +
+                        "backing topic produce attacker-controlled records to consumers " +
+                        "that still hold READ on the view (the read-only rejection and " +
+                        "fetch-redirect both key on view classification, which collapses " +
+                        "once any of the three view configs is removed).");
+                }
                 if (backing != null) {
                     String trimmedBacking = backing.trim();
                     if (!trimmedBacking.isEmpty()) {

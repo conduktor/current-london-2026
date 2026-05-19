@@ -750,4 +750,108 @@ public class ConfigurationControlManagerTest {
         assertEquals(ApiError.NONE, result.response().get(MYTOPIC),
             "create-time view.backing.topic must remain allowed");
     }
+
+    /**
+     * R55 (Codex Finding): view-ness is immutable in BOTH directions. R53 covers regular→view;
+     * R55 covers view→regular. A legacy AlterConfigs full-replace that omits all view.* keys on
+     * an existing view generates implicit-DELETE records for the omitted keys (see
+     * legacyAlterConfigResource at CCM:633-642). The LogConfig all-or-none invariant permits
+     * present=0 as a valid "regular topic" post-state, so the schema layer does not catch the
+     * full-strip. Without R55, KafkaApis.isViewTopic would flip to false: produces would stop
+     * hitting the read-only rejection and fetches would stop redirecting to the backing topic,
+     * letting a principal who could not READ the backing serve attacker-controlled records to
+     * consumers who still hold READ on the view.
+     */
+    @Test
+    public void testR55RejectLegacyAlterStrippingViewKeysByOmission() {
+        ConfigurationControlManager manager = new ConfigurationControlManager.Builder().
+            setKafkaConfigSchema(SCHEMA).
+            build();
+
+        // Seed mytopic as a complete view: all three view.* keys set.
+        manager.replay(new ConfigRecord().setResourceType(TOPIC.id()).setResourceName("mytopic").
+            setName("view.backing.topic").setValue("B"));
+        manager.replay(new ConfigRecord().setResourceType(TOPIC.id()).setResourceName("mytopic").
+            setName("view.cel.predicate").setValue("true"));
+        manager.replay(new ConfigRecord().setResourceType(TOPIC.id()).setResourceName("mytopic").
+            setName("view.offset.mode").setValue("sparse"));
+
+        // Legacy alter with only a non-view key. Full-replace semantics generate implicit
+        // deletes for the omitted view.* keys.
+        ControllerResult<Map<ConfigResource, ApiError>> result = manager.legacyAlterConfigs(
+            toMap(entry(MYTOPIC, toMap(entry("retention.ms", "60000")))),
+            false);
+
+        assertEquals(Collections.emptyList(), result.records(),
+            "no records should be emitted when the view→regular strip is rejected");
+        ApiError err = result.response().get(MYTOPIC);
+        assertEquals(Errors.INVALID_CONFIG, err.error());
+        assertTrue(err.message().contains("immutable"),
+            "error message must explain the view-ness immutability rule, got: " + err.message());
+        assertTrue(err.message().contains("mytopic"),
+            "error message must name the topic being stripped, got: " + err.message());
+    }
+
+    /**
+     * R55: the same threat via the IncrementalAlterConfigs surface. Explicit DELETE on
+     * view.backing.topic alone (predicate + offsetMode would then be partial, but the post-state
+     * check sees backing absent so willBeView=false) — or DELETE on all three keys in one
+     * request — must be rejected. The single-key DELETE case is the cleaner attacker shape: one
+     * operation, one round-trip, no partial-state window.
+     */
+    @Test
+    public void testR55RejectIncrementalDeleteOfViewBacking() {
+        ConfigurationControlManager manager = new ConfigurationControlManager.Builder().
+            setKafkaConfigSchema(SCHEMA).
+            build();
+
+        manager.replay(new ConfigRecord().setResourceType(TOPIC.id()).setResourceName("mytopic").
+            setName("view.backing.topic").setValue("B"));
+        manager.replay(new ConfigRecord().setResourceType(TOPIC.id()).setResourceName("mytopic").
+            setName("view.cel.predicate").setValue("true"));
+        manager.replay(new ConfigRecord().setResourceType(TOPIC.id()).setResourceName("mytopic").
+            setName("view.offset.mode").setValue("sparse"));
+
+        ControllerResult<Map<ConfigResource, ApiError>> result = manager.incrementalAlterConfigs(
+            toMap(entry(MYTOPIC, toMap(entry("view.backing.topic", entry(DELETE, ""))))),
+            false);
+
+        assertEquals(Collections.emptyList(), result.records());
+        ApiError err = result.response().get(MYTOPIC);
+        assertEquals(Errors.INVALID_CONFIG, err.error());
+        assertTrue(err.message().contains("immutable"),
+            "error message must explain the view-ness immutability rule, got: " + err.message());
+    }
+
+    /**
+     * R55: incremental DELETE on all three view keys in one atomic request must also be
+     * rejected. Without this case, a regression that only blocked single-key DELETE would still
+     * let an attacker batch-delete all three in one shot.
+     */
+    @Test
+    public void testR55RejectIncrementalDeleteOfAllThreeViewKeys() {
+        ConfigurationControlManager manager = new ConfigurationControlManager.Builder().
+            setKafkaConfigSchema(SCHEMA).
+            build();
+
+        manager.replay(new ConfigRecord().setResourceType(TOPIC.id()).setResourceName("mytopic").
+            setName("view.backing.topic").setValue("B"));
+        manager.replay(new ConfigRecord().setResourceType(TOPIC.id()).setResourceName("mytopic").
+            setName("view.cel.predicate").setValue("true"));
+        manager.replay(new ConfigRecord().setResourceType(TOPIC.id()).setResourceName("mytopic").
+            setName("view.offset.mode").setValue("sparse"));
+
+        ControllerResult<Map<ConfigResource, ApiError>> result = manager.incrementalAlterConfigs(
+            toMap(entry(MYTOPIC, toMap(
+                entry("view.backing.topic", entry(DELETE, "")),
+                entry("view.cel.predicate", entry(DELETE, "")),
+                entry("view.offset.mode", entry(DELETE, ""))))),
+            false);
+
+        assertEquals(Collections.emptyList(), result.records());
+        ApiError err = result.response().get(MYTOPIC);
+        assertEquals(Errors.INVALID_CONFIG, err.error());
+        assertTrue(err.message().contains("immutable"),
+            "error message must explain the view-ness immutability rule, got: " + err.message());
+    }
 }
