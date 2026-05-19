@@ -347,12 +347,29 @@ public final class IoUringSelector implements BrokerSelector {
         // crossing → no onWritabilityChanged) leaves poll() asleep until timeoutMs while
         // completedSends/RESPONSE_SENT are silently pending.
         IoUringTransportLayer transport = new IoUringTransportLayer(nettyChannel, remote, local, wakeup::release);
-        Authenticator authenticator = new IoUringPlaintextAuthenticator(transport, listenerName, configs);
-        IoUringChannelMetadataRegistry metadata = new IoUringChannelMetadataRegistry();
-        // Mirror NIO Selector.register: seed ClientInformation.EMPTY so the first RequestContext
-        // (built before any ApiVersionsRequest is parsed) never captures null.
-        metadata.registerClientInformation(ClientInformation.EMPTY);
-        KafkaChannel channel = new KafkaChannel(id, transport, () -> authenticator, maxReceiveSize, memoryPool, metadata);
+        // C-17-Lifecycle-C2: if any subsequent constructor throws (the most likely culprit is
+        // PrincipalBuilder.build() inside IoUringPlaintextAuthenticator, or KafkaChannel's
+        // own constructor), we must close every partially-built object — otherwise the
+        // authenticator's per-channel principal-builder resources and the transport's
+        // direct-memory recvByteBufAllocator state are orphaned with no close() path.
+        // Track each side-effect separately so the catch knows exactly what to undo.
+        Authenticator authenticator = null;
+        KafkaChannel channel;
+        try {
+            authenticator = new IoUringPlaintextAuthenticator(transport, listenerName, configs);
+            IoUringChannelMetadataRegistry metadata = new IoUringChannelMetadataRegistry();
+            // Mirror NIO Selector.register: seed ClientInformation.EMPTY so the first RequestContext
+            // (built before any ApiVersionsRequest is parsed) never captures null.
+            metadata.registerClientInformation(ClientInformation.EMPTY);
+            final Authenticator authForLambda = authenticator;
+            channel = new KafkaChannel(id, transport, () -> authForLambda, maxReceiveSize, memoryPool, metadata);
+        } catch (RuntimeException e) {
+            log.warn("io_uring: failed to build KafkaChannel for {} — releasing transport+authenticator", id, e);
+            Utils.closeQuietly(authenticator, "authenticator on accept-build failure");
+            Utils.closeQuietly(transport, "transport on accept-build failure");
+            nettyChannel.close();
+            return;
+        }
 
         nettyChannel.attr(TRANSPORT_ATTR).set(transport);
         nettyChannel.attr(CHANNEL_ID_ATTR).set(id);
@@ -362,6 +379,26 @@ public final class IoUringSelector implements BrokerSelector {
         nettyChannels.put(id, nettyChannel);
         pendingAccepts.offer(channel);
         pendingAcceptCount.incrementAndGet();
+
+        // B-17-1: re-check closed AFTER publishing. close() drains channels / closingChannels
+        // / nettyChannels / pendingAccepts based on the snapshot taken when closed was set
+        // true. If close() ran between our initial closed check at the top and the publish
+        // we just performed, our entries are orphaned — the KafkaChannel sits in pendingAccepts
+        // that nothing will drain, and the netty channel sits in nettyChannels with the same
+        // fate, leaking direct memory + a file descriptor per racing accept. Re-checking and
+        // self-cleaning closes that window: if close() saw our entries it cleaned them up
+        // (our undo here is a no-op); if close() ran fully before our publish, we now own
+        // the cleanup. KafkaChannel.close() is idempotent via Utils.closeAll so the worst
+        // case is double-close, which is safe.
+        if (closed) {
+            log.debug("io_uring: onAccept raced selector close — cleaning up id {}", id);
+            nettyChannels.remove(id);
+            if (pendingAccepts.remove(channel)) {
+                pendingAcceptCount.decrementAndGet();
+            }
+            Utils.closeQuietly(channel, "channel on accept-close race");
+            return;
+        }
         wakeup.release();
     }
 

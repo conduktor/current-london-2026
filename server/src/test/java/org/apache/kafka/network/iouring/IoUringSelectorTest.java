@@ -1152,4 +1152,141 @@ class IoUringSelectorTest {
         assertEquals(org.apache.kafka.common.network.ClientInformation.EMPTY, seeded,
             "io_uring must seed ClientInformation.EMPTY, matching NIO Selector.register");
     }
+
+    @Test
+    void onAcceptRacingSelectorCloseLeavesNoLeakedChannels() throws Exception {
+        // Round-17 B-17-1 regression test. Scenario: an accept from the event loop and a
+        // close() from the Processor thread interleave such that onAccept reads closed=false
+        // at its top, then close() runs to completion (drains channels / closingChannels /
+        // nettyChannels / pendingAccepts), THEN onAccept publishes nettyChannels.put +
+        // pendingAccepts.offer. Without the post-publish re-check fix, those entries sit in
+        // the maps forever — the KafkaChannel never gets closed, leaking the transport's
+        // direct-memory recvByteBufAllocator state and the underlying file descriptor.
+        //
+        // The race is hard to interleave deterministically with two threads, so the test
+        // stresses it: many concurrent onAccept invocations against a selector that closes
+        // mid-flight, repeated 30 times. Even a single leaked accept across all iterations
+        // fails the assertion at the bottom, because every EmbeddedChannel we created must be
+        // closed by the time the dust settles — either by close() draining pendingAccepts, or
+        // by onAccept's own self-cleanup branch. Without the fix the test fails reliably
+        // under -PrunFlaky or repeated runs; with the fix it passes every time.
+        final int iterations = 30;
+        final int acceptsPerIter = 32;
+        final java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newCachedThreadPool();
+        try {
+            for (int iter = 0; iter < iterations; iter++) {
+                IoUringSelector s = new IoUringSelector(
+                    LISTENER, MAX_RECEIVE, MemoryPool.NONE, IDLE_NANOS_NEVER, time);
+                java.util.List<EmbeddedChannel> created =
+                    new java.util.concurrent.CopyOnWriteArrayList<>();
+                java.util.concurrent.CountDownLatch startGate = new java.util.concurrent.CountDownLatch(1);
+                java.util.List<java.util.concurrent.Future<?>> futures = new ArrayList<>();
+                for (int i = 0; i < acceptsPerIter; i++) {
+                    futures.add(pool.submit(() -> {
+                        startGate.await();
+                        EmbeddedChannel ch = new EmbeddedChannel();
+                        created.add(ch);
+                        s.onAccept(ch, REMOTE_A, LOCAL);
+                        return null;
+                    }));
+                }
+                futures.add(pool.submit(() -> {
+                    startGate.await();
+                    // Tiny jitter so close() lands somewhere in the middle of the accept
+                    // burst, maximizing the chance of catching the race window.
+                    java.util.concurrent.locks.LockSupport.parkNanos(1_000L);
+                    s.close();
+                    return null;
+                }));
+                startGate.countDown();
+                for (java.util.concurrent.Future<?> f : futures) {
+                    f.get(10, TimeUnit.SECONDS);
+                }
+                // Every EmbeddedChannel we created must be closed when the race resolves.
+                // close() drains pendingAccepts (which closes the KafkaChannel and transitively
+                // its IoUringTransportLayer, which closes the EmbeddedChannel). onAccept's
+                // self-clean branch does the same. The only way an EmbeddedChannel stays open
+                // is if the publish landed AFTER close()'s drain and self-cleanup did not run.
+                for (int i = 0; i < created.size(); i++) {
+                    EmbeddedChannel ch = created.get(i);
+                    assertFalse(ch.isOpen(),
+                        "iter=" + iter + " accept #" + i + " leaked an open EmbeddedChannel — "
+                            + "B-17-1 race regression (onAccept published after close() drained "
+                            + "without re-checking)");
+                }
+            }
+        } finally {
+            pool.shutdown();
+            assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void onAcceptReleasesPartiallyBuiltStackWhenPrincipalBuilderThrows() throws Exception {
+        // Round-17 C-17-Lifecycle-C2 regression test. If a constructor inside onAccept (in
+        // production: PrincipalBuilder via ChannelBuilders.createPrincipalBuilder, invoked
+        // from IoUringPlaintextAuthenticator's ctor) throws, the transport must be closed,
+        // the authenticator must NOT be left as an orphan, and the selector's
+        // nettyChannels / pendingAccepts must remain untouched — otherwise a misconfigured
+        // principal.builder.class slow-leaks a netty Channel + transport per accept.
+        //
+        // We inject the failure by configuring a custom principal-builder class whose
+        // no-arg constructor throws. ChannelBuilders.createPrincipalBuilder calls
+        // Utils.newInstance, which wraps the throw in a KafkaException — that propagates
+        // out of IoUringPlaintextAuthenticator's ctor as a RuntimeException, hitting our
+        // new catch block.
+        java.util.Map<String, Object> configs = new java.util.HashMap<>();
+        configs.put(
+            org.apache.kafka.common.config.internals.BrokerSecurityConfigs.PRINCIPAL_BUILDER_CLASS_CONFIG,
+            ThrowingPrincipalBuilder.class);
+        IoUringSelector s = new IoUringSelector(
+            LISTENER, MAX_RECEIVE, MemoryPool.NONE, IDLE_NANOS_NEVER, time, 0, configs);
+        try {
+            EmbeddedChannel ch = new EmbeddedChannel();
+            channels.add(ch);
+            // onAccept must not throw — the catch (RuntimeException) inside swallows + logs.
+            // (Throwing would crash the Netty event loop on a single bad accept, killing
+            // every other healthy connection served by the same listener.)
+            s.onAccept(ch, REMOTE_A, LOCAL);
+            // Behavioral invariants of the catch block:
+            //   1. EmbeddedChannel was closed (transport.close() → nettyChannel.close()).
+            //   2. No entry leaked into nettyChannels (assertable via nettyChannelFor on any
+            //      attr-set id, but we didn't get that far — the id attr was never set
+            //      because the publish path didn't run).
+            //   3. pendingAccepts is empty (assertable via a poll surfacing no connected).
+            assertFalse(ch.isOpen(),
+                "EmbeddedChannel must be closed when principal-builder constructor throws "
+                    + "— otherwise the transport + Netty channel leak forever");
+            assertNull(ch.attr(IoUringSelector.CHANNEL_ID_ATTR).get(),
+                "CHANNEL_ID_ATTR must NOT be set when accept-build fails — the publish branch "
+                    + "must not run after the catch");
+            s.poll(0);
+            assertTrue(s.connected().isEmpty(),
+                "no channel must surface in connected() when accept-build failed");
+            assertTrue(s.channels().isEmpty(),
+                "channels() must remain empty when accept-build failed");
+        } finally {
+            s.close();
+        }
+    }
+
+    /**
+     * Test-only principal builder whose constructor throws. ChannelBuilders.createPrincipalBuilder
+     * instantiates this via Utils.newInstance; the exception propagates up as KafkaException
+     * (a RuntimeException sub-class) into IoUringPlaintextAuthenticator's ctor, which is the
+     * exact production failure mode of a misconfigured principal.builder.class. Must be
+     * public+top-level visible to reflection.
+     */
+    public static final class ThrowingPrincipalBuilder
+            implements org.apache.kafka.common.security.auth.KafkaPrincipalBuilder {
+        public ThrowingPrincipalBuilder() {
+            throw new IllegalStateException("synthetic principal-builder failure for C-17-Lifecycle-C2 test");
+        }
+
+        @Override
+        public org.apache.kafka.common.security.auth.KafkaPrincipal build(
+                org.apache.kafka.common.security.auth.AuthenticationContext context) {
+            throw new UnsupportedOperationException();
+        }
+    }
 }
