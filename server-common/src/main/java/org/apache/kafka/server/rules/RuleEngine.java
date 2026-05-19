@@ -26,6 +26,8 @@ import org.apache.kafka.server.rules.extract.ActivationBudgetExceededException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.security.auth.x500.X500Principal;
+
 import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -752,6 +754,69 @@ public final class RuleEngine {
                     + "attribute separator (eg. "
                     + "`User:CN=Broker One,OU=Kafka Brokers,O=Example Corp,C=US`).");
             }
+            // R32 #282 [HIGH]: DN normalisation gap. The natural operator
+            // workflow for discovering an SSL broker's principal is
+            //   $ openssl x509 -in broker.pem -noout -subject
+            //   subject=CN = broker-1, OU = kafka, O = corp, C = US
+            // (RFC 2253 form with spaces around `=` and after `,`). But
+            // DefaultKafkaPrincipalBuilder.build() funnels the runtime peer
+            // through X500Principal.getName() (the default RFC 2253 form),
+            // which always returns the no-space canonical form
+            //   CN=broker-1,OU=kafka,O=corp,C=US
+            // and always upper-cases known RDN keywords. R30 #280
+            // deliberately allowed internal ASCII U+0020 inside `name` so
+            // legitimate DNs like `CN=Broker One,...` work — that allowance
+            // means the openssl-padded paste sails through every existing
+            // R29-R32 guard and parses cleanly. Stored verbatim, it never
+            // matches the runtime peer's canonical form ⇒ silent
+            // fail-CLOSED soft-brick of the inter-broker bypass, same
+            // impact class as the codepoint/confusable findings.
+            //
+            // Fix: when `name` looks DN-shaped (contains `=`), round-trip
+            // it through X500Principal.getName(). The JDK constructor
+            //   - parses both openssl-padded AND canonical forms cleanly
+            //   - rejects non-DN strings with `IllegalArgumentException`
+            //     (eg. unknown RDN keywords like `User=broker` throw)
+            //   - upper-cases keywords on output (matches what
+            //     DefaultKafkaPrincipalBuilder produces at runtime)
+            //   - returns the RFC 2253 canonical form (no spaces,
+            //     deterministic across JDK versions)
+            // If the constructor throws, the operator did not give us a
+            // DN — leave `name` verbatim (no change vs prior behaviour).
+            // If the canonical form differs from the input, emit a
+            // one-time INFO line so the operator sees the rewrite at
+            // startup and can audit it.
+            //
+            // Idempotency: an already-canonical DN round-trips to itself
+            // (no log, no rewrite). The gate `name.indexOf('=') >= 0`
+            // avoids touching non-DN names like `User:broker` or
+            // SASL-mapped `User:svc-account`.
+            //
+            // Why not RFC2253-CANONICAL form? `getName(CANONICAL)`
+            // lower-cases everything (`cn=broker-1,...`), which does NOT
+            // match what DefaultKafkaPrincipalBuilder emits. The
+            // no-argument `getName()` (= RFC 2253 default) is the right
+            // target.
+            if (name.indexOf('=') >= 0) {
+                String canonical = canonicaliseDnIfPossible(name);
+                if (canonical != null && !canonical.equals(name)) {
+                    LOG.info(
+                        "governance.bypass.principals entry '{}' was "
+                        + "rewritten to its X500 canonical form '{}:{}' "
+                        + "to match the runtime peer principal that "
+                        + "DefaultKafkaPrincipalBuilder produces via "
+                        + "X500Principal.getName(). The original DN was "
+                        + "valid but in a non-canonical shape (typically "
+                        + "from `openssl x509 -noout -subject` output, "
+                        + "which space-pads `=` and `,`). The bypass set "
+                        + "now stores the canonical form so the runtime "
+                        + "match succeeds.",
+                        LogSafe.sanitize(trimmed),
+                        LogSafe.sanitize(type),
+                        LogSafe.sanitize(canonical));
+                    name = canonical;
+                }
+            }
             // Round-22 HIGH (Agent 5 H-1): assemble the canonical
             // "type:name" form explicitly rather than calling toString.
             // SecurityUtils.parseKafkaPrincipal currently always returns the
@@ -770,6 +835,37 @@ public final class RuleEngine {
             out.add(type + ":" + name);
         }
         return Collections.unmodifiableSet(out);
+    }
+
+    /**
+     * R32 #282 [HIGH]: round-trip a candidate DN through
+     * {@link X500Principal} and return the canonical RFC 2253 form
+     * (no spaces, upper-cased keywords) if the JDK accepts it as a
+     * valid DN, or {@code null} if the JDK rejects it.
+     *
+     * <p>This matches what {@code DefaultKafkaPrincipalBuilder.build()}
+     * does for SSL peers at runtime — it calls {@code X500Principal
+     * .getName()} on the cert subject. The bypass set must store the
+     * same canonical form for the runtime {@code Set.contains} lookup
+     * to succeed.
+     *
+     * <p>Returning {@code null} on failure (rather than throwing) lets
+     * the caller fall back to the verbatim input — non-DN names like
+     * {@code "broker"}, {@code "svc-account-1"}, or
+     * {@code "User:foo@example.com"} legitimately don't parse as DNs
+     * and must be left alone.
+     *
+     * <p>The default {@code getName()} (= RFC 2253) is the right
+     * target, not {@code getName(CANONICAL)} — CANONICAL lower-cases
+     * everything and does not match what
+     * {@code DefaultKafkaPrincipalBuilder} produces at runtime.
+     */
+    private static String canonicaliseDnIfPossible(String name) {
+        try {
+            return new X500Principal(name).getName();
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
     }
 
     /**

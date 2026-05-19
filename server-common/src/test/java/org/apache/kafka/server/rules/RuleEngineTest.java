@@ -2501,6 +2501,118 @@ public class RuleEngineTest {
     }
 
     @Test
+    public void parseBypassPrincipalsCanonicalisesOpensslPaddedDn() {
+        // R32 #282 [HIGH]: the natural operator workflow for discovering
+        // an SSL broker's principal is
+        //   $ openssl x509 -in broker.pem -noout -subject
+        //   subject=CN = broker-1, OU = kafka, O = corp, C = US
+        // (space-padded RFC 2253). DefaultKafkaPrincipalBuilder produces
+        // the canonical no-space form via X500Principal.getName(). Without
+        // canonicalisation in the parser, the operator's openssl paste
+        // sails through every R29-R32 guard, gets stored verbatim, and
+        // never matches the runtime peer — silent fail-CLOSED soft-brick
+        // of inter-broker bypass.
+        java.util.Set<String> bypass = RuleEngine.parseBypassPrincipals(
+            "User:CN = broker-1, OU = kafka, O = corp, C = US");
+        org.junit.jupiter.api.Assertions.assertEquals(1, bypass.size());
+        // Stored form must be the X500 canonical no-space form, matching
+        // what DefaultKafkaPrincipalBuilder.build() produces at runtime.
+        assertTrue(bypass.contains(
+            "User:CN=broker-1,OU=kafka,O=corp,C=US"),
+            "openssl-padded DN must be rewritten to X500 canonical "
+                + "(no spaces around `=` or after `,`); got: " + bypass);
+    }
+
+    @Test
+    public void parseBypassPrincipalsLeavesCanonicalDnUnchanged() {
+        // R32 #282 [HIGH]: an already-canonical DN must round-trip to
+        // itself. This pins idempotency — re-running the parser on its
+        // own output is a no-op — and ensures we don't emit a spurious
+        // INFO rewrite log for operators who already pasted the right
+        // form.
+        String canonical = "User:CN=broker-1,OU=kafka,O=corp,C=US";
+        java.util.Set<String> bypass = RuleEngine.parseBypassPrincipals(canonical);
+        org.junit.jupiter.api.Assertions.assertEquals(1, bypass.size());
+        assertTrue(bypass.contains(canonical),
+            "canonical DN must round-trip unchanged; got: " + bypass);
+    }
+
+    @Test
+    public void parseBypassPrincipalsLeavesNonDnNameUnchanged() {
+        // R32 #282 [HIGH]: a non-DN name (SASL user, custom mapper output)
+        // must pass through verbatim. The DN gate is `name.indexOf('=') >= 0`,
+        // so names without `=` never reach the X500Principal round-trip.
+        // This pins the gate and ensures we don't accidentally rewrite
+        // SASL/Kerberos/custom-builder names.
+        java.util.Set<String> bypass = RuleEngine.parseBypassPrincipals(
+            "User:broker;User:svc-account-1;User:ANONYMOUS;User:my-saas-user@example.com");
+        org.junit.jupiter.api.Assertions.assertEquals(4, bypass.size());
+        assertTrue(bypass.contains("User:broker"));
+        assertTrue(bypass.contains("User:svc-account-1"));
+        assertTrue(bypass.contains("User:ANONYMOUS"));
+        assertTrue(bypass.contains("User:my-saas-user@example.com"));
+    }
+
+    @Test
+    public void parseBypassPrincipalsLeavesNonDnNameWithEqualsUnchanged() {
+        // R32 #282 [HIGH]: a name that contains `=` but is NOT a DN must
+        // pass through verbatim — X500Principal throws on unknown RDN
+        // keywords, and the helper returns null on that path, so the
+        // verbatim input is preserved. This pins the failure-fallback
+        // behaviour: we never silently rewrite a name when the JDK
+        // refuses to parse it as a DN. Real-world example: an operator
+        // who configures a custom SslPrincipalMapper to emit
+        // `key=value`-style identifiers like `tenant=acme,svc=ingest`
+        // where `tenant`/`svc` are NOT standard RDN keywords.
+        String nonDnWithEquals = "User:tenant=acme,svc=ingest";
+        java.util.Set<String> bypass = RuleEngine.parseBypassPrincipals(nonDnWithEquals);
+        org.junit.jupiter.api.Assertions.assertEquals(1, bypass.size());
+        assertTrue(bypass.contains(nonDnWithEquals),
+            "non-DN name with `=` must round-trip unchanged when "
+                + "X500Principal rejects the form; got: " + bypass);
+    }
+
+    @Test
+    public void parseBypassPrincipalsCanonicalisesMixedFormDn() {
+        // R32 #282 [HIGH]: an operator who hand-edits a DN may produce
+        // a partial-padded form (eg. spaces around some `=` but not
+        // others). All such variants must canonicalise to the same
+        // runtime-matching form. This pins that the canonicalisation
+        // covers the realistic edit-distance of a human typo, not just
+        // the literal openssl output.
+        String mixed = "User:CN=Broker One, OU = Kafka Brokers,O=Example Corp,C=US";
+        String canonical = "User:CN=Broker One,OU=Kafka Brokers,O=Example Corp,C=US";
+        java.util.Set<String> bypass = RuleEngine.parseBypassPrincipals(mixed);
+        org.junit.jupiter.api.Assertions.assertEquals(1, bypass.size());
+        assertTrue(bypass.contains(canonical),
+            "mixed-form DN must be canonicalised; got: " + bypass);
+    }
+
+    @Test
+    public void parseBypassPrincipalsCanonicalisesLowercaseDnKeywords() {
+        // R32 #282 [HIGH]: X500Principal upper-cases known RDN keywords
+        // (cn → CN, ou → OU, o → O, c → C) on output but PRESERVES the
+        // case of attribute VALUES (the data after `=`). An operator who
+        // pastes `User:cn=broker,ou=kafka` (lowercase keywords) would
+        // otherwise never match the runtime peer — DefaultKafkaPrincipal-
+        // Builder funnels through X500Principal.getName() so its keywords
+        // are upper-cased to CN/OU/O/C. Canonicalisation fixes only the
+        // keyword case, not the value case — pinning both arms here so
+        // a future refactor that uses getName(CANONICAL) (which would
+        // lower-case everything) is caught loud.
+        java.util.Set<String> bypass = RuleEngine.parseBypassPrincipals(
+            "User:cn=broker,ou=kafka,o=corp,c=us");
+        org.junit.jupiter.api.Assertions.assertEquals(1, bypass.size());
+        // Keywords upper-cased (CN/OU/O/C); value `us` preserved verbatim
+        // (X500Principal does NOT touch attribute values).
+        assertTrue(bypass.contains("User:CN=broker,OU=kafka,O=corp,C=us"),
+            "lowercase RDN keywords must be upper-cased to match the "
+                + "runtime peer's X500Principal.getName() output; "
+                + "attribute values (eg. `us`) must be preserved; got: "
+                + bypass);
+    }
+
+    @Test
     public void parseBypassPrincipalsCaseMismatchAbortsWholeList() {
         // R32 #287 [HIGH] — list-semantics pin: a case-variant typo in the
         // middle of an otherwise-valid list must abort the WHOLE list (not
