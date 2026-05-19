@@ -4044,7 +4044,26 @@ class KafkaApis(val requestChannel: RequestChannel,
       val responseBuilder = new TxnOffsetCommitResponse.Builder()
       val authorizedTopicCommittedOffsets = new mutable.ArrayBuffer[TxnOffsetCommitRequestData.TxnOffsetCommitRequestTopic]()
       txnOffsetCommitRequest.data.topics.forEach { topic =>
-        if (!authorizedTopics.contains(topic.name)) {
+        if (!tenantCtx.effectiveTenant.isPresent && isReservedTenantNamespace(topic.name)) {
+          // Outside-in pollution scrub for cluster-wide callers — symmetric to
+          // handleOffsetCommitRequest. A non-tenant principal naming
+          // `__tenant_<id>.foo` (or `<id>.foo`) on the TRANSACTIONAL path
+          // would otherwise:
+          //   (a) probe tenant topic existence via NONE vs
+          //       UNKNOWN_TOPIC_OR_PARTITION two lines down (admins hold
+          //       wildcard `Topic:*` READ so authorizedTopics.contains is true),
+          //   (b) land `__consumer_offsets` tombstones AND
+          //       `__transaction_state` markers keyed on a tenant namespace,
+          //       under the admin's own txnId — a storage pollution + a
+          //       cleanup-amplifier sink the admin would not have on a
+          //       non-prefixed topic name.
+          // Refuse with TOPIC_AUTHORIZATION_FAILED, same wire shape a regular
+          // ACL deny produces. Same-tenant callers do not reach this branch:
+          // toPhysical above has already rewritten their `foo` to `<id>.foo`
+          // and effectiveTenant is present.
+          responseBuilder.addPartitions[TxnOffsetCommitRequestData.TxnOffsetCommitRequestPartition](
+            topic.name, topic.partitions, _.partitionIndex, Errors.TOPIC_AUTHORIZATION_FAILED)
+        } else if (!authorizedTopics.contains(topic.name)) {
           // If the topic is not authorized, we add the topic and all its partitions
           // to the response with TOPIC_AUTHORIZATION_FAILED.
           responseBuilder.addPartitions[TxnOffsetCommitRequestData.TxnOffsetCommitRequestPartition](
@@ -5435,7 +5454,21 @@ class KafkaApis(val requestChannel: RequestChannel,
       val responseBuilder = new OffsetDeleteResponse.Builder
       val authorizedTopicPartitions = new OffsetDeleteRequestData.OffsetDeleteRequestTopicCollection()
       offsetDeleteRequest.data.topics.forEach { topic =>
-        if (!authorizedTopics.contains(topic.name)) {
+        if (isReservedTenantNamespace(topic.name)) {
+          // Outside-in pollution scrub mirroring handleOffsetCommitRequest.
+          // OFFSET_DELETE is outside TENANT_ALLOWED_APIS, so the only caller
+          // reaching here is a non-tenant (cluster-wide) principal — listing
+          // `__tenant_<id>.foo` in `topics[]` would otherwise:
+          //   (a) probe topic existence via NONE vs UNKNOWN_TOPIC_OR_PARTITION
+          //       below, even though the admin holds wildcard `Topic:*` READ,
+          //   (b) land a `__consumer_offsets` tombstone keyed
+          //       `<admin-group, __tenant_<id>.foo, partition>` on success —
+          //       cluster-admin-authored storage pollution in tenant namespace.
+          // Refuse with TOPIC_AUTHORIZATION_FAILED — the same wire shape a
+          // regular ACL deny produces — before any metadataCache lookup.
+          responseBuilder.addPartitions[OffsetDeleteRequestData.OffsetDeleteRequestPartition](
+            topic.name, topic.partitions, _.partitionIndex, Errors.TOPIC_AUTHORIZATION_FAILED)
+        } else if (!authorizedTopics.contains(topic.name)) {
           // If the topic is not authorized, we add the topic and all its partitions
           // to the response with TOPIC_AUTHORIZATION_FAILED.
           responseBuilder.addPartitions[OffsetDeleteRequestData.OffsetDeleteRequestPartition](

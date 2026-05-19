@@ -18002,6 +18002,127 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testOffsetDeleteClusterWideListenerRefusesReservedNamespaceTopicsWithoutOracle(): Unit = {
+    // #174: handleOffsetDeleteRequest only refused the tenant-PRINCIPAL-shape
+    // groupId outside-in. The TOPICS list was passed straight to authz +
+    // metadataCache. A cluster admin on bootstrap.servers (wildcard
+    // `Topic:*` READ) could list `acme.orders` (physical-prefix shape) in
+    // topics[], pass authz, hit metadataCache.contains, and get either
+    // NONE (topic exists in the tenant's namespace) or
+    // UNKNOWN_TOPIC_OR_PARTITION (topic does not) — a binary existence
+    // oracle. Worse, on the success path the coordinator lands a
+    // `__consumer_offsets` tombstone keyed `<adminGroup, acme.orders,
+    // partition>` — cluster-admin-authored storage pollution in tenant
+    // namespace.
+    //
+    // The fix synthesises TOPIC_AUTHORIZATION_FAILED for any reserved-form
+    // entry BEFORE the authz + metadataCache step, identical wire shape
+    // regardless of whether the underlying tenant topic exists. This test
+    // exercises both the existing and the non-existing case in the same
+    // request, with the SAME admin group (so the groupId outside-in guard
+    // does not fire), and asserts byte-equal error codes plus zero
+    // coordinator invocation. Mirrors the OffsetCommit cluster-wide test
+    // (#147) on the OffsetDelete path.
+    addTopicToMetadataCache("acme.orders", numPartitions = 1)
+    // intentionally do NOT add "acme.ghost" to metadataCache
+
+    val req = new OffsetDeleteRequest.Builder(new OffsetDeleteRequestData()
+      .setGroupId("admin-cleanup-group")
+      .setTopics(new OffsetDeleteRequestTopicCollection(List(
+        new OffsetDeleteRequestTopic().setName("acme.orders")
+          .setPartitions(List(
+            new OffsetDeleteRequestPartition().setPartitionIndex(0)).asJava),
+        new OffsetDeleteRequestTopic().setName("acme.ghost")
+          .setPartitions(List(
+            new OffsetDeleteRequestPartition().setPartitionIndex(0)).asJava)
+      ).iterator.asJava))).build()
+    val request = buildRequest(req,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "cluster-admin")) // default listener — NOT tenant-bound
+
+    // The handler unconditionally forwards to deleteOffsets even when every
+    // topic was refused (no early empty-list short-circuit in this path).
+    // Stub the mock so the forwarded call returns a completed future with
+    // zero results — the topics filtered by the outside-in scrub never
+    // appear in the forwarded payload.
+    when(groupCoordinator.deleteOffsets(any[RequestContext](), any[OffsetDeleteRequestData](), any()))
+      .thenReturn(CompletableFuture.completedFuture(new OffsetDeleteResponseData()))
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleOffsetDeleteRequest(request, RequestLocal.noCaching)
+
+    val response = verifyNoThrottling[OffsetDeleteResponse](request)
+    val byName = response.data.topics.asScala.map(t => t.name -> t).toMap
+    assertEquals(2, byName.size, "both reserved-namespace topics must echo back in the rejection response")
+    val ordersError = byName("acme.orders").partitions.asScala.head.errorCode
+    val ghostError = byName("acme.ghost").partitions.asScala.head.errorCode
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED.code, ordersError,
+      "existing tenant topic must surface as TOPIC_AUTHORIZATION_FAILED to a cluster-wide caller, not NONE")
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED.code, ghostError,
+      "non-existent reserved-form name must surface as TOPIC_AUTHORIZATION_FAILED, not UNKNOWN_TOPIC_OR_PARTITION")
+    assertEquals(ordersError, ghostError,
+      "existence oracle: cluster-wide caller must NOT be able to distinguish a real tenant topic from a hypothetical one via OffsetDelete response codes")
+    // Coordinator may still be called (no empty-list short-circuit) but with
+    // an empty topics list — the reserved-form names must never reach it.
+    val coordCaptor = ArgumentCaptor.forClass(classOf[OffsetDeleteRequestData])
+    verify(groupCoordinator).deleteOffsets(any[RequestContext](), coordCaptor.capture(), any())
+    assertEquals(0, coordCaptor.getValue.topics.size,
+      "no reserved-form topic may reach the coordinator — the scrub must filter every entry")
+  }
+
+  @Test
+  def testTxnOffsetCommitClusterWideListenerRefusesReservedNamespaceTopicsWithoutOracle(): Unit = {
+    // #183: handleTxnOffsetCommitRequest was missing the outside-in topic
+    // scrub that handleOffsetCommitRequest gained in #147. A cluster admin
+    // on bootstrap.servers running their own transaction could list
+    // `acme.orders` (physical-prefix shape) in topics[] and, since the
+    // admin has wildcard `Topic:*` READ, reach metadataCache.contains →
+    // NONE for existing tenant topics, UNKNOWN_TOPIC_OR_PARTITION for
+    // non-existing ones. Worse, on the success path BOTH
+    // __consumer_offsets AND __transaction_state would receive records
+    // keyed on a tenant namespace under the admin's own txnId — storage
+    // pollution + cleanup-amplifier sink.
+    //
+    // Same wire shape regardless of whether the underlying tenant topic
+    // exists. Exercises both cases in one request and asserts byte-equal
+    // codes plus zero coordinator invocation (TxnOffsetCommit's empty-list
+    // short-circuit short-circuits when authorizedTopicCommittedOffsets is
+    // empty, so commitTransactionalOffsets is never called).
+    addTopicToMetadataCache("acme.orders", numPartitions = 1)
+    // intentionally do NOT add "acme.ghost" to metadataCache
+
+    val partitionOffsetCommitData = new TxnOffsetCommitRequest.CommittedOffset(15L, "", Optional.empty())
+    val offsetCommitRequest = new TxnOffsetCommitRequest.Builder(
+      "admin-txn",
+      "admin-group",
+      42L,
+      0.toShort,
+      Map(
+        new TopicPartition("acme.orders", 0) -> partitionOffsetCommitData,
+        new TopicPartition("acme.ghost", 0) -> partitionOffsetCommitData
+      ).asJava,
+      false
+    ).build(ApiKeys.TXN_OFFSET_COMMIT.latestVersion)
+    val request = buildRequest(offsetCommitRequest,
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "cluster-admin")) // default listener — NOT tenant-bound
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleTxnOffsetCommitRequest(request, RequestLocal.withThreadConfinedCaching)
+
+    val response = verifyNoThrottling[TxnOffsetCommitResponse](request)
+    val errors = response.errors()
+    val ordersError = errors.get(new TopicPartition("acme.orders", 0))
+    val ghostError = errors.get(new TopicPartition("acme.ghost", 0))
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED, ordersError,
+      "existing tenant topic must surface as TOPIC_AUTHORIZATION_FAILED to a cluster-wide caller, not NONE")
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED, ghostError,
+      "non-existent reserved-form name must surface as TOPIC_AUTHORIZATION_FAILED, not UNKNOWN_TOPIC_OR_PARTITION")
+    assertEquals(ordersError, ghostError,
+      "existence oracle: cluster-wide caller must NOT be able to distinguish a real tenant topic from a hypothetical one via TxnOffsetCommit response codes")
+    verify(groupCoordinator, never()).commitTransactionalOffsets(
+      any[RequestContext](), any[TxnOffsetCommitRequestData](), any())
+  }
+
+  @Test
   def testConsumerGroupHeartbeatOutsideInRefusesTenantPrincipalNamespace(): Unit = {
     metadataCache = mock(classOf[KRaftMetadataCache])
     val req = new ConsumerGroupHeartbeatRequest.Builder(
