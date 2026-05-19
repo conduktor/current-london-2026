@@ -352,15 +352,25 @@ public class GovernanceRuleClusterIntegrationTest {
     /**
      * Find the first {@link IllegalStateException} in the cause chain whose
      * message looks like the compaction gate's diagnostic. We match on
-     * 'cleanup.policy' rather than equality so the predicate is robust to
-     * the gate's long remediation message (audit/round IDs etc.) but still
-     * discriminates against unrelated ISEs that might surface during a
-     * failed startup.
+     * {@code "effective cleanup.policy"} — a phrase unique to the
+     * compaction gate's preamble (BrokerServer.scala
+     * {@code requireGovernanceTopicCompactPolicy}: "Topic … has effective
+     * cleanup.policy='…'") and ABSENT from the partition-gate diagnostic.
+     *
+     * <p>R29 #259: the previous predicate, just {@code "cleanup.policy"},
+     * would also match the partition-gate diagnostic which contains
+     * {@code "--config cleanup.policy=compact"} in its remediation text.
+     * The current predicate ensures the two gates cannot collide on the
+     * same helper. {@link #findPartitionGateIllegalStateException} mirrors
+     * this contract with a partition-gate-unique phrase. The match is
+     * robust to wording tweaks in the long remediation message (audit IDs
+     * etc.) while still discriminating against unrelated ISEs that might
+     * surface during a failed startup.
      */
     private static IllegalStateException findGateIllegalStateException(Throwable t) {
         for (Throwable c = t; c != null; c = c.getCause()) {
             if (c instanceof IllegalStateException && c.getMessage() != null
-                && c.getMessage().contains("cleanup.policy")) {
+                && c.getMessage().contains("effective cleanup.policy")) {
                 return (IllegalStateException) c;
             }
             if (c.getCause() == c) break; // self-referential guard
