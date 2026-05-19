@@ -235,7 +235,7 @@ final class SseStreamer {
         for (FetchResponseFormatter.FetchedRecord record : view.records()) {
             try {
                 writeRecordEvent(record);
-            } catch (IOException e) {
+            } catch (IOException | RuntimeException e) {
                 LOG.debug("SSE client disconnected for {}/{}: {}", topic, partition, e.toString());
                 clientStillThere = false;
                 break;
@@ -258,7 +258,7 @@ final class SseStreamer {
             try {
                 out.write(HEARTBEAT_COMMENT);
                 out.flush();
-            } catch (IOException e) {
+            } catch (IOException | RuntimeException e) {
                 LOG.debug("SSE client disconnected on heartbeat for {}/{}: {}", topic, partition, e.toString());
                 closeStream();
                 return;
@@ -334,8 +334,11 @@ final class SseStreamer {
             out.write(mapper.writeValueAsBytes(payload));
             out.write(CRLF);
             out.flush();
-        } catch (IOException ignored) {
-            // Client's gone; nothing we can do.
+        } catch (IOException | RuntimeException ignored) {
+            // Client's gone; nothing we can do. Jetty's HttpOutput can also raise IllegalStateException /
+            // WritePendingException when the stream is mid-flight or already closed — treat those as
+            // disconnects so the caller (handleSchedulingFailure) still reaches closeStream() and the
+            // SseStreamLimiter slot is released.
         }
     }
 

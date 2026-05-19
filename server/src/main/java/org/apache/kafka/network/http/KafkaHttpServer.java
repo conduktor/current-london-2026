@@ -23,7 +23,11 @@ import org.eclipse.jetty.ee10.servlet.ServletContextHandler;
 import org.eclipse.jetty.ee10.servlet.ServletContextRequest;
 import org.eclipse.jetty.ee10.servlet.ServletHolder;
 import org.eclipse.jetty.ee10.websocket.server.config.JettyWebSocketServletContainerInitializer;
+import org.eclipse.jetty.http.HttpFields;
 import org.eclipse.jetty.http.HttpHeader;
+import org.eclipse.jetty.http.HttpHeaderValue;
+import org.eclipse.jetty.http.HttpMethod;
+import org.eclipse.jetty.server.Handler;
 import org.eclipse.jetty.server.HttpConfiguration;
 import org.eclipse.jetty.server.HttpConnectionFactory;
 import org.eclipse.jetty.server.Request;
@@ -247,7 +251,14 @@ public final class KafkaHttpServer {
         // emit Jetty's stock HTML error page — including the "Powered by Jetty <version>" footer — which violates
         // PROMPT.md "every error response includes errorCode and errorMessage fields" and leaks the server fingerprint.
         jetty.setErrorHandler(new CoreJsonErrorHandler(mapper));
-        jetty.setHandler(context);
+        // Pre-dispatch CONNECT guard. Jetty 12.0.25's HttpConnection.HttpStreamOverHTTP1.headerComplete()
+        // hardcodes "method == CONNECT" as always persistent (overriding even Connection: close from the
+        // client). Without an explicit guard, a CONNECT request to the bridge falls through to the 404
+        // Server-level handler but leaves the TCP socket open for the full ServerConnector idle timeout
+        // (30s default). An attacker firing N CONNECTs pins N file descriptors. Intercept CONNECT before
+        // dispatch, emit the bridge's 405 envelope, and force-close the connection.
+        Handler.Wrapper connectGuard = new ConnectMethodGuard(mapper, context);
+        jetty.setHandler(connectGuard);
         jetty.start();
 
         this.server = jetty;
@@ -362,6 +373,52 @@ public final class KafkaHttpServer {
             byte[] payload = mapper.writeValueAsBytes(ErrorEnvelope.forMessage(mapper, code, message));
             resp.setContentLength(payload.length);
             resp.getOutputStream().write(payload);
+        }
+    }
+
+    /**
+     * Pre-dispatch guard for HTTP CONNECT. Jetty 12.0.25's {@code HttpStreamOverHTTP1.headerComplete()}
+     * unconditionally marks the connection persistent when the request method is CONNECT — overriding even
+     * {@code Connection: close} from the client. The bridge does not implement any tunnel, so a CONNECT
+     * request falls through to the 404 path, but the TCP socket is then held alive for the
+     * {@code ServerConnector} idle timeout (30s default). An attacker firing CONNECT to the bridge can pin
+     * file descriptors at attack-stream rate × 30s.
+     *
+     * <p>This wrapper intercepts CONNECT before any handler dispatch, emits the bridge's canonical
+     * {@code {errorCode, errorMessage}} envelope with status 405, and adds {@code Connection: close} so
+     * the underlying HTTP stream closes the socket immediately after the response is flushed. Verified
+     * against Jetty 12.0.25 by raw-socket probe: with the guard installed the response carries
+     * {@code Connection: close} and the server FIN closes the socket inside one request lifetime.
+     */
+    static final class ConnectMethodGuard extends Handler.Wrapper {
+
+        private final ObjectMapper mapper;
+
+        ConnectMethodGuard(ObjectMapper mapper, Handler next) {
+            super(next);
+            this.mapper = mapper;
+        }
+
+        @Override
+        public boolean handle(Request request, Response response, Callback callback) throws Exception {
+            if (HttpMethod.CONNECT.is(request.getMethod())) {
+                response.setStatus(HttpStatusMapper.METHOD_NOT_ALLOWED);
+                HttpFields.Mutable headers = response.getHeaders();
+                headers.put(HttpHeader.CONTENT_TYPE, ContentTypeNegotiator.APPLICATION_JSON);
+                // RFC 9110: a 405 response MUST generate an Allow header listing the methods that are allowed.
+                headers.put(HttpHeader.ALLOW, "GET, HEAD, OPTIONS, POST");
+                // Force-close the connection. The Jetty HTTP/1 generator special-cases CONNECT as always
+                // persistent unless the response explicitly carries Connection: close; setting it here is the
+                // only knob that actually causes the socket to be closed after the response is written.
+                headers.put(HttpHeader.CONNECTION, HttpHeaderValue.CLOSE.asString());
+                byte[] payload = mapper.writeValueAsBytes(
+                    ErrorEnvelope.forMessage(mapper, HttpStatusMapper.METHOD_NOT_ALLOWED,
+                        "method not allowed"));
+                headers.put(HttpHeader.CONTENT_LENGTH, Integer.toString(payload.length));
+                response.write(true, ByteBuffer.wrap(payload), callback);
+                return true;
+            }
+            return super.handle(request, response, callback);
         }
     }
 

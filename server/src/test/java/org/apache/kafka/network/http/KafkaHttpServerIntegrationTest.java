@@ -1422,6 +1422,71 @@ class KafkaHttpServerIntegrationTest {
     }
 
     @Test
+    void connectMethodReturns405AndForcesConnectionClose() throws Exception {
+        // Jetty 12.0.25's HttpConnection.HttpStreamOverHTTP1.headerComplete() hardcodes "method == CONNECT"
+        // as always persistent, OVERRIDING Connection: close from the client. A CONNECT request to the bridge
+        // would otherwise fall through to a 404 with no Connection: close, leaving the TCP socket open for the
+        // full ServerConnector idle timeout (30s default). An attacker firing CONNECT can pin file descriptors
+        // at attack-stream rate × 30s — a connection-exhaustion DoS surface.
+        //
+        // The bridge plugs this with a pre-dispatch ConnectMethodGuard wrapper that:
+        //   1. Returns 405 + the canonical {errorCode, errorMessage} envelope
+        //   2. Sets Allow: GET, HEAD, OPTIONS, POST (matches curated set from doOptions / writeMethodNotAllowed)
+        //   3. Explicitly sets Connection: close so Jetty's HTTP/1 generator closes the socket
+        //
+        // Drive the wire directly: Jetty's HttpClient API does not expose a way to send arbitrary methods
+        // with an authority-form request-target, and CONNECT to a real ServerSocket from HttpClient would
+        // be rewritten as a tunnel attempt.
+        try (Socket s = new Socket("127.0.0.1", server.boundPort())) {
+            s.setSoTimeout(5000);
+            OutputStream out = s.getOutputStream();
+            String req = "CONNECT example.com:443 HTTP/1.1\r\n"
+                + "Host: example.com:443\r\n"
+                + "Connection: close\r\n"
+                + "\r\n";
+            out.write(req.getBytes(StandardCharsets.US_ASCII));
+            out.flush();
+
+            String raw = readAllAscii(s.getInputStream());
+            int headerEnd = raw.indexOf("\r\n\r\n");
+            assertTrue(headerEnd >= 0,
+                "CONNECT response must terminate its headers, got: " + raw);
+            String headers = raw.substring(0, headerEnd);
+            String body = raw.substring(headerEnd + 4);
+
+            // Status must be 405 (method not allowed) — formerly 404 (no path match) leaking the leak.
+            assertTrue(raw.startsWith("HTTP/1.1 405"),
+                "CONNECT must produce a 405 response, got status line: " + raw.split("\r\n", 2)[0]);
+            // Connection: close on the response — this is what makes Jetty actually close the socket.
+            // Without this header, HttpStreamOverHTTP1's CONNECT-is-persistent override keeps the socket open.
+            assertTrue(headers.toLowerCase(java.util.Locale.ROOT).contains("connection: close"),
+                "CONNECT 405 response must carry Connection: close to close the leak-prone CONNECT socket, "
+                    + "got headers: " + headers);
+            // Allow header curated set, matches doOptions / writeMethodNotAllowed.
+            assertTrue(headers.contains("Allow: GET, HEAD, OPTIONS, POST"),
+                "CONNECT 405 must advertise the curated Allow set, got headers: " + headers);
+            // Body is the bridge's canonical envelope.
+            String json = stripChunkPrefix(body);
+            JsonNode envelope = asJson(json.getBytes(StandardCharsets.UTF_8));
+            assertEquals(405, envelope.get("errorCode").asInt(),
+                "CONNECT 405 envelope errorCode must be 405, got: " + json);
+            assertEquals("method not allowed", envelope.get("errorMessage").asText(),
+                "CONNECT 405 envelope errorMessage must be 'method not allowed', got: " + json);
+            // No Jetty version leak via Server header on the CONNECT path (Wave 16 contract).
+            assertFalse(headers.toLowerCase(java.util.Locale.ROOT).contains("server: jetty"),
+                "CONNECT 405 must not leak Jetty version, got headers: " + headers);
+
+            // After the response is flushed, the server must FIN the socket. Probe by issuing a follow-up
+            // read with a short timeout — a closed socket returns -1 immediately; an open one would time out.
+            s.setSoTimeout(2000);
+            int next = s.getInputStream().read();
+            assertEquals(-1, next,
+                "Server must close the TCP socket after CONNECT response. A 0+ byte read means Jetty kept "
+                    + "the connection alive — the persistent-for-CONNECT leak is unsealed.");
+        }
+    }
+
+    @Test
     void optionsAllowHeaderDoesNotAdvertiseTrace() throws Exception {
         // The default HttpServlet.doOptions reflects every doXxx method into the Allow header. Even with doTrace
         // overridden to 405, the reflective discovery still listed it. Override doOptions to curate the set
