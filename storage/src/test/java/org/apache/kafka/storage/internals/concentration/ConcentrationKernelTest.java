@@ -547,6 +547,70 @@ public class ConcentrationKernelTest {
         kernel = null;
     }
 
+    @Test
+    public void commitProduceBatchFencesBackingWhenTruncateFails() throws Exception {
+        // BLOCKER #170: if the sidecar tail truncate ALSO fails after the partial-append catch,
+        // the in-memory tracker has been rolled back but the sidecar file still holds the
+        // half-written tail. Reusing those slots on the next produce would map fresh logical
+        // offsets onto stale backing offsets — silent cross-tenant data corruption. The fix is
+        // to close the backing-readiness gate so subsequent produces fail-fast with
+        // NOT_LEADER_OR_FOLLOWER and the rehydrate path rebuilds the sidecar from the backing
+        // log before we accept new commits.
+        //
+        // Forcing a deterministic truncate failure inside the catch block: open the cached
+        // sidecar by performing one successful commit, then reach in and close its FileChannel
+        // (NOT the LogicalSidecarIndex itself — that would flip the `closed` flag and trip
+        // ensureOpen() BEFORE the try block, so we'd never exercise the catch). With
+        // closed==false the kernel's commitProduceBatch enters the try, append() fails on
+        // ClosedChannelException, and the inner truncateTo() fails the same way — exactly the
+        // path the fence is meant to cover.
+        kernel.declare(descriptor("orders", 4, "shared", 1));
+        kernel.commitProduce(kernel.reserveProduce("orders", 0), 100L);
+
+        TopicPartition backing = new TopicPartition("shared", 0);
+        assertTrue(kernel.isBackingReady(backing), "precondition: gate is open before fault");
+        assertEquals(0L, kernel.currentGeneration(backing), "precondition: never-observed backing has gen 0");
+
+        // Reflectively close the cached sidecar's underlying FileChannel without flipping
+        // LogicalSidecarIndex.closed. This is a test-only seam — production code never does
+        // this; it's the smallest fault that exercises both append-fail and truncate-fail.
+        java.lang.reflect.Field sidecarsField = ConcentrationKernel.class.getDeclaredField("sidecars");
+        sidecarsField.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        java.util.Map<LogicalPartition, LogicalSidecarIndex> sidecars =
+            (java.util.Map<LogicalPartition, LogicalSidecarIndex>) sidecarsField.get(kernel);
+        LogicalSidecarIndex cached = sidecars.get(new LogicalPartition("orders", 0));
+        assertNotNull(cached, "sidecar should be cached after first commit");
+        java.lang.reflect.Field channelField = LogicalSidecarIndex.class.getDeclaredField("channel");
+        channelField.setAccessible(true);
+        java.nio.channels.FileChannel channel = (java.nio.channels.FileChannel) channelField.get(cached);
+        channel.close();
+
+        Reservation[] batch = kernel.reserveProduceBatch("orders", 0, 2);
+        // Both sidecar.append AND sidecar.truncateTo will throw ClosedChannelException — the
+        // commitProduceBatch surfaces an IOException, which carries the truncate failure
+        // suppressed on it.
+        Exception thrown = assertThrows(Exception.class,
+            () -> kernel.commitProduceBatch(batch, 200L));
+        assertTrue(thrown instanceof java.io.IOException
+                || thrown.getCause() instanceof java.io.IOException
+                || thrown.getSuppressed().length > 0,
+            "expected an IOException surface with a suppressed truncate failure, got " + thrown);
+
+        // The fence path must have run: gate is closed and generation bumped exactly once.
+        assertFalse(kernel.isBackingReady(backing),
+            "BLOCKER #170: truncate-failed rollback must close the backing gate");
+        assertEquals(1L, kernel.currentGeneration(backing),
+            "fence must bump the generation exactly once so the recoverer can re-open the gate");
+
+        // Tracker was rolled back too — the next reserve sees the same logical offset that the
+        // failed batch consumed (no gap). Note: we can't actually commitProduce on this
+        // partition until the rehydrate path reopens the gate — that's the whole point of the
+        // fence. But the in-memory reservation slot is free.
+        assertEquals(1L, kernel.nextLogicalOffset("orders", 0),
+            "failed batch must not have advanced the high-water");
+    }
+
     // ---- Idempotent retry cache (v1 fix for PROMPT scenario 6) ----
 
     // All existing idempotent tests use a fixed test epoch (LEADER_EPOCH = 5) on both record and

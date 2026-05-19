@@ -618,12 +618,37 @@ public final class ConcentrationKernel implements AutoCloseable {
                 sidecar.append(firstBackingOffset + i);
             }
         } catch (IOException | RuntimeException e) {
+            boolean truncateFailed = false;
             try {
                 sidecar.truncateTo(sidecarSizeBefore);
             } catch (IOException | RuntimeException truncateFailure) {
+                truncateFailed = true;
                 e.addSuppressed(truncateFailure);
             }
             tracker.rollbackBatch(batch);
+            if (truncateFailed) {
+                // BLOCKER #170: truncate-after-partial-append failed, so the sidecar still has
+                // stale tail entries at the positional indices we just gave back to the tracker.
+                // The tracker rollback already returned those logical offsets to the free pool;
+                // the next reserve→commit on this partition would write FRESH backing offsets at
+                // the SAME positional indices on disk, but the file already has stale entries
+                // there from the partial append. The result is silent cross-tenant data leakage:
+                // fetch resolves logical offset L to a backing offset that was meant for a
+                // different (now-aborted) batch. Close the gate so subsequent produces fail with
+                // NOT_LEADER_OR_FOLLOWER and the broker's rehydrate path rebuilds the sidecar
+                // from the backing log. registry.get is Optional<> because a logical topic could
+                // in principle have been withdrawn concurrently — in that race the gate work is
+                // moot (no future commit can be routed here), but we still log the suppressed
+                // truncate failure on the rethrown exception.
+                registry.get(batch[0].logicalTopic()).ifPresent(d -> {
+                    TopicPartition backing = new TopicPartition(d.backingTopic(),
+                        LogicalPartitionMapper.backingPartitionFor(d, batch[0].logicalPartition()));
+                    log.error("Sidecar truncate failed during commitProduceBatch rollback for "
+                        + "logical={}-{}; fencing backing partition {} to force rehydrate",
+                        batch[0].logicalTopic(), batch[0].logicalPartition(), backing, e);
+                    markBackingUnready(backing);
+                });
+            }
             throw e;
         }
         tracker.commitBatch(batch);
