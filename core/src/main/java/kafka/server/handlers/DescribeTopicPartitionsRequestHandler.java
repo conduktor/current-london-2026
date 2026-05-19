@@ -109,7 +109,16 @@ public class DescribeTopicPartitionsRequestHandler {
         if (fetchAllTopics) {
             CollectionConverters.asJavaCollection(metadataCache.getAllTopics()).forEach(topicName -> {
                 if (topicName.compareTo(cursorTopicName) >= 0) {
-                    topics.add(topicName);
+                    // Backing topics MUST NEVER be addressable through client-facing metadata
+                    // paths — they are an internal storage implementation detail of the
+                    // concentration kernel. Without this filter, DescribeTopicPartitions(all)
+                    // would expose backing topic names and UUIDs to every authorized caller,
+                    // re-opening the ID-based admin attack surface the recent DeleteTopics-by-id
+                    // concentration guards closed. Mirrors the filter on the METADATA path
+                    // (KafkaApis.scala isAllTopics branch).
+                    if (concentrationKernel == null || !concentrationKernel.isBackingTopic(topicName)) {
+                        topics.add(topicName);
+                    }
                 }
             });
             // Logical topics live entirely in broker config — the KRaft metadata cache knows nothing

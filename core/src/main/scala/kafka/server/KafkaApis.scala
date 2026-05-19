@@ -1747,7 +1747,16 @@ class KafkaApis(val requestChannel: RequestChannel,
       // METADATA(isAllTopics) response. Logical topics live outside the metadata cache so we
       // overlay them explicitly here — without this, tools like Kafka UI never see them and
       // operators have no way to discover concentrated topics on a broker.
-      metadataCache.getAllTopics() ++ concentrationKernel.allLogicalTopicNames().asScala
+      //
+      // Backing topics MUST NEVER be addressable through client-facing metadata paths — they are
+      // an internal storage implementation detail of the concentration kernel. The KRaft metadata
+      // cache holds them because the controller materialises them as real topics, but exposing
+      // their names here would let any client discover backing-topic names + UUIDs and then
+      // round-trip them through ID-based admin paths (DeleteTopics-by-id, OffsetForLeaderEpoch,
+      // etc.) — the exact attack surface the recent DeleteTopics-by-id concentration guards
+      // closed. Strip them here, mirroring the precedent at ListOffsets above (line 1521).
+      metadataCache.getAllTopics().filterNot(concentrationKernel.isBackingTopic) ++
+        concentrationKernel.allLogicalTopicNames().asScala
     else if (useTopicId)
       knownTopicNames
     else
