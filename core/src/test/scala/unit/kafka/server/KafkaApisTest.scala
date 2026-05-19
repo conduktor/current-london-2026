@@ -10727,6 +10727,105 @@ class KafkaApisTest extends Logging {
     })
   }
 
+  @Test
+  def testReadShareGroupStateRefusesTenantPrefixedGroupIdFromClusterWideCaller(): Unit = {
+    // #148 regression. A non-tenant principal holding CLUSTER_ACTION on the
+    // share-coordinator listener (a service account, a super-user, a sidecar)
+    // would otherwise be able to address `__tenant_<id>.<group>` directly and
+    // read the tenant's share-partition state — bypassing every tenant-facing
+    // rewrite that hides the physical key from the wire-facing surface. The
+    // scrub at handleReadShareGroupStateRequest refuses the request structurally
+    // (no allTenants lookup, no principal-tenant parsing) so the guarantee
+    // holds even on a controller that has never seen the binding.
+    val topicId = Uuid.randomUuid()
+    val readRequestData = new ReadShareGroupStateRequestData()
+      .setGroupId("__tenant_acme.G")
+      .setTopics(List(
+        new ReadShareGroupStateRequestData.ReadStateData()
+          .setTopicId(topicId)
+          .setPartitions(List(
+            new ReadShareGroupStateRequestData.PartitionData()
+              .setPartition(0)
+              .setLeaderEpoch(1)
+          ).asJava)
+      ).asJava)
+
+    val requestChannelRequest = buildRequest(
+      new ReadShareGroupStateRequest.Builder(readRequestData, true).build())
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
+    kafkaApis = createKafkaApis(
+      overrideProperties = Map(ShareGroupConfig.SHARE_GROUP_ENABLE_CONFIG -> "true")
+        ++ ShareCoordinatorTestConfig.testConfigMap().asScala
+    )
+    kafkaApis.handle(requestChannelRequest, RequestLocal.noCaching())
+
+    val response = verifyNoThrottling[ReadShareGroupStateResponse](requestChannelRequest)
+    assertNotNull(response.data)
+    assertEquals(1, response.data.results.size)
+    response.data.results.forEach { result =>
+      assertEquals(topicId, result.topicId)
+      assertEquals(1, result.partitions.size)
+      assertEquals(Errors.GROUP_AUTHORIZATION_FAILED.code, result.partitions.get(0).errorCode,
+        "Cluster-wide caller addressing `__tenant_*` groupId must be refused with GROUP_AUTHORIZATION_FAILED")
+    }
+    verify(shareCoordinator, never()).readState(any[RequestContext], any[ReadShareGroupStateRequestData])
+  }
+
+  @Test
+  def testWriteShareGroupStateRefusesTenantPrefixedGroupIdFromClusterWideCaller(): Unit = {
+    // #148 regression — write side. Letting a cluster-wide caller WRITE to
+    // `__tenant_<id>.<group>` is strictly worse than the read case: it plants
+    // share-partition state into the tenant's namespace BEFORE the tenant's
+    // first heartbeat — corrupt offsets, replay state batches, delivery counts
+    // chosen by an outsider. The structural scrub closes that vector by
+    // refusing the request before the share coordinator's writeState is
+    // invoked, so no record is ever produced into the share-state topic under
+    // a tenant key.
+    val topicId = Uuid.randomUuid()
+    val writeRequestData = new WriteShareGroupStateRequestData()
+      .setGroupId("__tenant_acme.G")
+      .setTopics(List(
+        new WriteShareGroupStateRequestData.WriteStateData()
+          .setTopicId(topicId)
+          .setPartitions(List(
+            new WriteShareGroupStateRequestData.PartitionData()
+              .setPartition(0)
+              .setLeaderEpoch(1)
+              .setStateEpoch(2)
+              .setStartOffset(10)
+              .setStateBatches(List(
+                new WriteShareGroupStateRequestData.StateBatch()
+                  .setFirstOffset(11)
+                  .setLastOffset(15)
+                  .setDeliveryCount(1)
+                  .setDeliveryState(0)
+              ).asJava)
+          ).asJava)
+      ).asJava)
+
+    val requestChannelRequest = buildRequest(
+      new WriteShareGroupStateRequest.Builder(writeRequestData, true).build())
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
+    kafkaApis = createKafkaApis(
+      overrideProperties = Map(ShareGroupConfig.SHARE_GROUP_ENABLE_CONFIG -> "true")
+        ++ ShareCoordinatorTestConfig.testConfigMap().asScala
+    )
+    kafkaApis.handle(requestChannelRequest, RequestLocal.noCaching())
+
+    val response = verifyNoThrottling[WriteShareGroupStateResponse](requestChannelRequest)
+    assertNotNull(response.data)
+    assertEquals(1, response.data.results.size)
+    response.data.results.forEach { result =>
+      assertEquals(topicId, result.topicId)
+      assertEquals(1, result.partitions.size)
+      assertEquals(Errors.GROUP_AUTHORIZATION_FAILED.code, result.partitions.get(0).errorCode,
+        "Cluster-wide caller WRITING to `__tenant_*` groupId must be refused before writeState is invoked")
+    }
+    verify(shareCoordinator, never()).writeState(any[RequestContext], any[WriteShareGroupStateRequestData])
+  }
+
   def getShareGroupDescribeResponse(groupIds: util.List[String], configOverrides: Map[String, String] = Map.empty,
                                     verifyNoErr: Boolean = true, authorizer: Authorizer = null,
                                     describedGroups: util.List[ShareGroupDescribeResponseData.DescribedGroup]): ShareGroupDescribeResponse = {
@@ -15730,6 +15829,65 @@ class KafkaApisTest extends Logging {
         t.partitions.asScala.head.errorCode,
         s"every topic in the rejection response must carry INVALID_TOPIC_EXCEPTION, got ${t.name}")
     }
+    verify(groupCoordinator, never()).commitOffsets(
+      any[RequestContext](),
+      any[OffsetCommitRequestData](),
+      any[org.apache.kafka.common.utils.BufferSupplier]())
+  }
+
+  @Test
+  def testOffsetCommitClusterWideListenerRefusesReservedNamespaceTopicsWithoutOracle(): Unit = {
+    // Round-6 Agent G finding (#147): handleOffsetCommitRequest only refuses
+    // reserved-physical-form topics when the caller is a tenant principal.
+    // For a cluster-wide caller (no `__tenant_` in identity) the wire topic
+    // names previously fell straight through to `metadataCache.contains`,
+    // producing NONE for existing tenant topics and UNKNOWN_TOPIC_OR_PARTITION
+    // for non-existent ones — a binary topic-existence oracle revealing
+    // whether the tenant has materialised a given topic. The fix adds an
+    // outside-in scrub that synthesises TOPIC_AUTHORIZATION_FAILED for any
+    // reserved-form topic name from a non-tenant caller, identical wire
+    // shape regardless of whether the underlying tenant topic exists.
+    //
+    // This test exercises BOTH the existing and the non-existing case in the
+    // same request and asserts the error codes are byte-equal — the oracle
+    // is closed at the handler boundary, never reaching the metadataCache
+    // probe, never reaching the coordinator.
+    addTopicToMetadataCache("acme.orders", numPartitions = 1)
+    // intentionally do NOT add "acme.ghost" to metadataCache
+
+    val data = new OffsetCommitRequestData()
+      .setGroupId("admin-probe-group")
+      .setMemberId("member-x")
+      .setTopics(List(
+        new OffsetCommitRequestData.OffsetCommitRequestTopic()
+          .setName("acme.orders")
+          .setPartitions(List(
+            new OffsetCommitRequestData.OffsetCommitRequestPartition()
+              .setPartitionIndex(0)
+              .setCommittedOffset(1)).asJava),
+        new OffsetCommitRequestData.OffsetCommitRequestTopic()
+          .setName("acme.ghost")
+          .setPartitions(List(
+            new OffsetCommitRequestData.OffsetCommitRequestPartition()
+              .setPartitionIndex(0)
+              .setCommittedOffset(1)).asJava)).asJava)
+    val request = buildRequest(new OffsetCommitRequest.Builder(data).build(),
+      principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "cluster-admin")) // default listener — NOT TENANT_LISTENER
+
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleOffsetCommitRequest(request, RequestLocal.noCaching)
+
+    val response = verifyNoThrottling[OffsetCommitResponse](request)
+    val byName = response.data.topics.asScala.map(t => t.name -> t).toMap
+    assertEquals(2, byName.size, "both reserved-namespace topics must echo back in the rejection response")
+    val ordersError = byName("acme.orders").partitions.asScala.head.errorCode
+    val ghostError = byName("acme.ghost").partitions.asScala.head.errorCode
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED.code, ordersError,
+      "existing tenant topic must surface as TOPIC_AUTHORIZATION_FAILED to a cluster-wide caller, not NONE")
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED.code, ghostError,
+      "non-existent reserved-form name must surface as TOPIC_AUTHORIZATION_FAILED, not UNKNOWN_TOPIC_OR_PARTITION")
+    assertEquals(ordersError, ghostError,
+      "existence oracle: cluster-wide caller must NOT be able to distinguish a real tenant topic from a hypothetical one via OffsetCommit response codes")
     verify(groupCoordinator, never()).commitOffsets(
       any[RequestContext](),
       any[OffsetCommitRequestData](),

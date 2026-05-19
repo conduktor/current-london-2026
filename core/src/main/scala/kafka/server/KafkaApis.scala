@@ -957,7 +957,25 @@ class KafkaApis(val requestChannel: RequestChannel,
           val responseBuilder = new OffsetCommitResponse.Builder()
           val authorizedTopicsRequest = new mutable.ArrayBuffer[OffsetCommitRequestData.OffsetCommitRequestTopic]()
           offsetCommitRequest.data.topics.forEach { topic =>
-            if (!authorizedTopics.contains(topic.name)) {
+            if (!tenantCtx.effectiveTenant.isPresent && isReservedTenantNamespace(topic.name)) {
+              // Outside-in pollution scrub for cluster-wide callers. A non-tenant
+              // principal naming a reserved tenant-prefix-shaped topic (e.g.
+              // `acme.orders`) is refused with TOPIC_AUTHORIZATION_FAILED — the
+              // same wire shape a regular ACL deny produces — so that:
+              //   (a) the topic-existence oracle at `metadataCache.contains` two
+              //       lines down cannot fire (NONE-vs-UNKNOWN_TOPIC_OR_PARTITION
+              //       would otherwise reveal whether a tenant has materialised
+              //       `acme.orders` even to callers with wildcard `Topic:*`),
+              //   (b) `__consumer_offsets` cannot be polluted with cluster-admin-
+              //       authored commits keyed on tenant namespaces — even though
+              //       the COMMIT itself targets the admin's own group, landing
+              //       records keyed `<group, acme.X, partition>` is a storage
+              //       sink + a delete-records-on-coordinator-cleanup amplifier.
+              // The same-tenant case is handled above (effectiveTenant.isPresent
+              // branch already in-rewrites and refuses reserved-physical-form).
+              responseBuilder.addPartitions[OffsetCommitRequestData.OffsetCommitRequestPartition](
+                topic.name, topic.partitions, _.partitionIndex, Errors.TOPIC_AUTHORIZATION_FAILED)
+            } else if (!authorizedTopics.contains(topic.name)) {
               // If the topic is not authorized, we add the topic and all its partitions
               // to the response with TOPIC_AUTHORIZATION_FAILED.
               responseBuilder.addPartitions[OffsetCommitRequestData.OffsetCommitRequestPartition](
@@ -6371,6 +6389,23 @@ class KafkaApis(val requestChannel: RequestChannel,
 
     authHelper.authorizeClusterOperation(request, CLUSTER_ACTION)
 
+    // Outside-in scrub for the share-coordinator state plane. A non-tenant
+    // principal holding CLUSTER_ACTION (a service account or super-user on a
+    // non-tenant listener) must not be able to read share-group state keyed
+    // on `__tenant_<id>.<group>` — that's the broker's stored form for tenant
+    // share groups, populated only via the tenant-facing ShareGroupHeartbeat /
+    // ShareFetch path (which already rewrites groupId by the time it reaches
+    // the coordinator). Tenant principals themselves cannot reach this
+    // handler (they never carry CLUSTER_ACTION), so the structural check
+    // suffices — no same-tenant carve-out needed. Mirrors the principal-
+    // namespace scrub on ShareFetch (L5975) and on the share-coordinator's
+    // client-facing siblings closed by #64.
+    if (isReservedTenantPrincipalNamespace(readShareGroupStateRequest.data.groupId)) {
+      requestHelper.sendMaybeThrottle(request,
+        readShareGroupStateRequest.getErrorResponse(Errors.GROUP_AUTHORIZATION_FAILED.exception))
+      return CompletableFuture.completedFuture[Unit](())
+    }
+
     shareCoordinator match {
       case None => requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
         readShareGroupStateRequest.getErrorResponse(requestThrottleMs,
@@ -6391,6 +6426,18 @@ class KafkaApis(val requestChannel: RequestChannel,
     val writeShareRequest = request.body[WriteShareGroupStateRequest]
 
     authHelper.authorizeClusterOperation(request, CLUSTER_ACTION)
+
+    // Same scrub as Read: a cluster-action caller naming `__tenant_<id>.<g>`
+    // here would PLANT share-partition state into the tenant's namespace
+    // before the tenant's first heartbeat — corrupt offsets, replay state
+    // batches, deliver junk records under a tenant group. The principal-
+    // prefix check on the wire `groupId` is the right boundary because the
+    // share coordinator stores by that key directly.
+    if (isReservedTenantPrincipalNamespace(writeShareRequest.data.groupId)) {
+      requestHelper.sendMaybeThrottle(request,
+        writeShareRequest.getErrorResponse(Errors.GROUP_AUTHORIZATION_FAILED.exception))
+      return CompletableFuture.completedFuture[Unit](())
+    }
 
     shareCoordinator match {
       case None => requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
