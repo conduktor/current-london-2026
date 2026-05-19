@@ -183,7 +183,17 @@ class KafkaApis(val requestChannel: RequestChannel,
    */
   private def maybeForwardCreateTopicsRejectingLogicalShadow(request: RequestChannel.Request): Unit = {
     val createTopicsRequest = request.body[CreateTopicsRequest]
-    val declared = concentrationKernel.allDeclaredLogicalTopicNames()
+    val declaredLogical: Set[String] = concentrationKernel.allDeclaredLogicalTopicNames().asScala.toSet
+    // r27-D BLOCKER #280: also short-circuit on declared BACKING names. Without this a client
+    // with TOPIC:CREATE on a backing name can probe the declared-backing set (enumeration
+    // oracle via TOPIC_ALREADY_EXISTS) or, under a delete-then-recreate race, forge a backing
+    // topic with attacker-chosen cleanup.policy=compact (breaks every co-tenant's produce via
+    // assertBackingTopicNotCompacted) or numPartitions that disagrees with the descriptor
+    // (silent cross-tenant offset-mapping corruption). The verdict shape mirrors the logical
+    // case; we keep the messages separate so an operator can tell from a packet capture which
+    // namespace was probed.
+    val declaredBacking: Set[String] = concentrationKernel.allDeclaredBackingTopicNames().asScala.toSet
+    val declared: Set[String] = declaredLogical ++ declaredBacking
     if (declared.isEmpty) {
       forwardToController(request)
       return
@@ -218,15 +228,18 @@ class KafkaApis(val requestChannel: RequestChannel,
       }
     }
 
-    val shadowErrorMsg = "Topic name collides with a declared logical topic on this broker; " +
+    val logicalShadowErrorMsg = "Topic name collides with a declared logical topic on this broker; " +
       "refusing to create a physical topic that would shadow it."
+    val backingShadowErrorMsg = "Topic name collides with a declared concentration backing topic " +
+      "on this broker; refusing to create a physical topic that would corrupt the substrate."
 
     def appendShadowEntries(response: CreateTopicsResponseData): Unit = {
       removedAuthorized.foreach { name =>
+        val msg = if (declaredBacking.contains(name)) backingShadowErrorMsg else logicalShadowErrorMsg
         response.topics().add(new CreateTopicsResponseData.CreatableTopicResult()
           .setName(name)
           .setErrorCode(Errors.TOPIC_ALREADY_EXISTS.code)
-          .setErrorMessage(shadowErrorMsg))
+          .setErrorMessage(msg))
       }
       removedUnauthorized.foreach { name =>
         response.topics().add(new CreateTopicsResponseData.CreatableTopicResult()

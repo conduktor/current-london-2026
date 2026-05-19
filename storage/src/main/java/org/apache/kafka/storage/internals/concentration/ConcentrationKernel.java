@@ -296,6 +296,27 @@ public final class ConcentrationKernel implements AutoCloseable {
     }
 
     /**
+     * r27-D BLOCKER #280 — Snapshot of every declared backing-topic name. Used by CreateTopics
+     * interceptors (broker-side {@code KafkaApis.maybeForwardCreateTopicsRejectingLogicalShadow}
+     * and controller-side {@code ControllerApis.createTopics}) so a client with TOPIC:CREATE on
+     * a backing name cannot probe the declared-backing set (TOPIC_ALREADY_EXISTS enumeration
+     * oracle) nor — under a delete-then-recreate race — forge a backing topic with attacker-
+     * chosen {@code cleanup.policy=compact} or with {@code numPartitions} that disagrees with
+     * the descriptor's {@code numBackingPartitions} (silent cross-tenant offset corruption).
+     *
+     * <p>Keep separate from {@link #isBackingTopic} which is the per-name version used by the
+     * data plane; the bulk accessor is for the CreateTopics admission filter that needs to
+     * decide N names in a single RPC.
+     */
+    public Set<String> allDeclaredBackingTopicNames() {
+        Set<String> out = new HashSet<>();
+        for (LogicalTopicDescriptor d : registry.all()) {
+            out.add(d.backingTopic());
+        }
+        return Set.copyOf(out);
+    }
+
+    /**
      * Recompute the shadow set against the current physical-topic name set published by the KRaft
      * metadata image. Called by {@link kafka.server.metadata.BrokerMetadataPublisher} after every
      * image apply.

@@ -886,6 +886,100 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testCreateTopicsRejectsDeclaredBackingShadowWithoutForwarding(): Unit = {
+    // r27-D BLOCKER #280 broker-side discriminator. Mirror of the all-logical-shadow
+    // test above, but every requested name collides with a declared BACKING topic.
+    // The interceptor must synthesize TOPIC_ALREADY_EXISTS per name with the
+    // backing-specific error message and short-circuit — no forward to the controller.
+    // The MESSAGE distinguishes logical-shadow vs backing-shadow (operators can tell
+    // from a packet capture which namespace was probed); the CODE is identical so
+    // client behaviour is unchanged.
+    when(concentrationKernel.allDeclaredLogicalTopicNames())
+      .thenReturn(Collections.emptySet[String])
+    when(concentrationKernel.allDeclaredBackingTopicNames())
+      .thenReturn(Set("sharedA", "sharedB").asJava)
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
+
+    val requestData = new CreateTopicsRequestData()
+    requestData.topics().add(new CreatableTopic().setName("sharedA").setNumPartitions(1).setReplicationFactor(1.toShort))
+    requestData.topics().add(new CreatableTopic().setName("sharedB").setNumPartitions(1).setReplicationFactor(1.toShort))
+    val request = buildRequest(new CreateTopicsRequest.Builder(requestData).build())
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handle(request, RequestLocal.withThreadConfinedCaching)
+
+    verify(forwardingManager, never).forwardRequest(
+      any[RequestChannel.Request](),
+      any[Option[AbstractResponse] => Unit]()
+    )
+    verify(forwardingManager, never).forwardRequest(
+      any[RequestChannel.Request](),
+      any[AbstractRequest](),
+      any[Option[AbstractResponse] => Unit]()
+    )
+
+    val response = verifyNoThrottling[CreateTopicsResponse](request)
+    val results = response.data.topics().iterator().asScala.toList
+    assertEquals(2, results.size)
+    val backingMsg = "Topic name collides with a declared concentration backing topic " +
+      "on this broker; refusing to create a physical topic that would corrupt the substrate."
+    results.foreach { r =>
+      assertEquals(Errors.TOPIC_ALREADY_EXISTS.code, r.errorCode(),
+        s"backing-shadow on ${r.name} must short-circuit to TOPIC_ALREADY_EXISTS")
+      assertEquals(backingMsg, r.errorMessage(),
+        s"backing-shadow error message on ${r.name} must use the backing-specific phrasing " +
+        s"(not the logical phrasing) so operators can distinguish in a packet capture")
+    }
+  }
+
+  @Test
+  def testCreateTopicsBackingShadowDefersToAuthorizationFailureWithoutForwarding(): Unit = {
+    // r27-D BLOCKER #280 broker-side auth-precedence discriminator. Symmetric to
+    // testCreateTopicsShadowReturnsAuthFailedForUnauthorizedNames but for the backing
+    // namespace. An unauthorized backing-name request must surface as
+    // TOPIC_AUTHORIZATION_FAILED — not TOPIC_ALREADY_EXISTS — otherwise the shadow
+    // path leaks the declared-backing set to a principal with no CREATE permission.
+    when(concentrationKernel.allDeclaredLogicalTopicNames())
+      .thenReturn(Collections.emptySet[String])
+    when(concentrationKernel.allDeclaredBackingTopicNames())
+      .thenReturn(Set("sharedA", "sharedB").asJava)
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
+
+    val authorizer: Authorizer = mock(classOf[Authorizer])
+    when(authorizer.authorize(any[RequestContext], any[util.List[Action]]))
+      .thenAnswer { invocation =>
+        invocation.getArgument(1).asInstanceOf[util.List[Action]].asScala
+          .map(_ => AuthorizationResult.DENIED).asJava
+      }
+
+    val requestData = new CreateTopicsRequestData()
+    requestData.topics().add(new CreatableTopic().setName("sharedA").setNumPartitions(1).setReplicationFactor(1.toShort))
+    requestData.topics().add(new CreatableTopic().setName("sharedB").setNumPartitions(1).setReplicationFactor(1.toShort))
+    val request = buildRequest(new CreateTopicsRequest.Builder(requestData).build())
+
+    kafkaApis = createKafkaApis(authorizer = Some(authorizer))
+    kafkaApis.handle(request, RequestLocal.withThreadConfinedCaching)
+
+    verify(forwardingManager, never).forwardRequest(
+      any[RequestChannel.Request](),
+      any[Option[AbstractResponse] => Unit]()
+    )
+    verify(forwardingManager, never).forwardRequest(
+      any[RequestChannel.Request](),
+      any[AbstractRequest](),
+      any[Option[AbstractResponse] => Unit]()
+    )
+
+    val response = verifyNoThrottling[CreateTopicsResponse](request)
+    val byName = response.data.topics().iterator().asScala.map(t => t.name() -> t.errorCode()).toMap
+    assertEquals(2, byName.size)
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED.code, byName("sharedA"),
+      "unauthorized backing-shadow name must surface as AUTH_FAILED (not ALREADY_EXISTS) " +
+      "to avoid leaking the declared-backing set")
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED.code, byName("sharedB"))
+  }
+
+  @Test
   def testCreateTopicsForwardsRemainderAndInjectsShadowRejections(): Unit = {
     // Mixed request: one logical-shadowing topic and one normal topic. The interceptor must
     // mutate the request body (drop the shadow), forward the remainder via the 3-arg overload,

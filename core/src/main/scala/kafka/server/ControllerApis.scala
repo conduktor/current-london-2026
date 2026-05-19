@@ -519,15 +519,25 @@ class ControllerApis(
     } else {
       getCreatableTopics.apply(allowedTopicNames)
     }
-    // Names that pass authorization but collide with a logical declaration configured on this
-    // controller — synthesize TOPIC_ALREADY_EXISTS so the physical topic is never created and
-    // can't shadow the logical mapping on any broker that holds the declaration. Unauthorized
-    // colliding names take the AUTHORIZATION_FAILED path below (precedence: auth wins, matches
-    // the broker-side interceptor in KafkaApis.maybeForwardCreateTopicsRejectingLogicalShadow).
-    val shadowedNames: Set[String] = if (declaredLogicalTopicNames.isEmpty) {
+    // Names that pass authorization but collide with a logical OR backing declaration configured
+    // on this controller — synthesize TOPIC_ALREADY_EXISTS so the physical topic is never created
+    // and can't shadow the logical mapping (logical case) nor corrupt the substrate (backing
+    // case). Unauthorized colliding names take the AUTHORIZATION_FAILED path below (precedence:
+    // auth wins, matches the broker-side interceptor in
+    // KafkaApis.maybeForwardCreateTopicsRejectingLogicalShadow).
+    //
+    // r27-D BLOCKER #280: backing names MUST be included. Otherwise an authorized client can
+    // probe-enumerate the declared-backing set (TOPIC_ALREADY_EXISTS oracle) or, in the
+    // delete-then-recreate race window, forge a backing topic with attacker-chosen
+    // cleanup.policy=compact (breaks every co-tenant via assertBackingTopicNotCompacted) or
+    // numPartitions that disagrees with descriptor.numBackingPartitions (silent cross-tenant
+    // offset-mapping corruption).
+    val shadowedNames: Set[String] = if (declaredLogicalTopicNames.isEmpty && declaredBackingTopicNames.isEmpty) {
       Set.empty
     } else {
-      authorizedTopicNames.iterator.filter(declaredLogicalTopicNames.contains).toSet
+      authorizedTopicNames.iterator
+        .filter(n => declaredLogicalTopicNames.contains(n) || declaredBackingTopicNames.contains(n))
+        .toSet
     }
     // Per-topic verdict override for shadowed names. Default is TOPIC_ALREADY_EXISTS; flipped
     // to THROTTLING_QUOTA_EXCEEDED below if applyPartitionChangeQuota throws (r17 BLOCKER fix —
@@ -594,18 +604,32 @@ class ControllerApis(
             setErrorCode(TOPIC_AUTHORIZATION_FAILED.code).
             setErrorMessage("Authorization failed."))
         } else if (shadowedNames.contains(name)) {
+          // r27-D BLOCKER #280: distinguish logical vs backing in the error message so an
+          // operator can tell from a packet capture which namespace was probed. The error
+          // CODE is identical (TOPIC_ALREADY_EXISTS) so client behaviour is unchanged.
+          val isBackingShadow = declaredBackingTopicNames.contains(name)
           if (shadowQuotaExceeded) {
+            val msg = if (isBackingShadow)
+              "Controller mutation quota exceeded while charging shadow-rejection of a name " +
+                "that collides with a declared concentration backing topic on this controller."
+            else
+              "Controller mutation quota exceeded while charging shadow-rejection of a name " +
+                "that collides with a declared logical topic on this controller."
             response.topics().add(new CreatableTopicResult().
               setName(name).
               setErrorCode(THROTTLING_QUOTA_EXCEEDED.code).
-              setErrorMessage("Controller mutation quota exceeded while charging shadow-rejection " +
-                "of a name that collides with a declared logical topic on this controller."))
+              setErrorMessage(msg))
           } else {
+            val msg = if (isBackingShadow)
+              "Topic name collides with a declared concentration backing topic on this " +
+                "controller; refusing to create a physical topic that would corrupt the substrate."
+            else
+              "Topic name collides with a declared logical topic on this " +
+                "controller; refusing to create a physical topic that would shadow it."
             response.topics().add(new CreatableTopicResult().
               setName(name).
               setErrorCode(TOPIC_ALREADY_EXISTS.code).
-              setErrorMessage("Topic name collides with a declared logical topic on this " +
-                "controller; refusing to create a physical topic that would shadow it."))
+              setErrorMessage(msg))
           }
         }
       }

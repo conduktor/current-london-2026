@@ -810,6 +810,95 @@ class ControllerApisTest {
   }
 
   /**
+   * r27-D BLOCKER #280 discriminator — backing-shadow rejection on the controller side.
+   *
+   * Symmetric to {@link #testCreateTopicsRejectsDeclaredLogicalShadow}. With config
+   * {@code orders:100:shared:4} the declared backing name is {@code "shared"}. A client
+   * with TOPIC:CREATE on {@code "shared"} (or CLUSTER:CREATE) must be denied with
+   * {@code TOPIC_ALREADY_EXISTS} and the backing-specific error message — both to close
+   * the enumeration oracle on the declared-backing set and to slam the delete-then-
+   * recreate race window that would otherwise let the attacker forge a backing topic
+   * with {@code cleanup.policy=compact} or with {@code numPartitions != 4}. The error
+   * MESSAGE differs from the logical case (operator can tell from a packet capture
+   * which namespace was probed); the error CODE is identical so client behaviour is
+   * unchanged.
+   *
+   * The {@code "orders"} request in the same RPC is the negative-control: it must
+   * succeed (it's only the LOGICAL name; the kernel never creates a physical "orders"
+   * because that's the synthesized name), guarding against an accidental rule-swap
+   * regression where backing shadowing fires on logical names too.
+   */
+  @Test
+  def testCreateTopicsRejectsDeclaredBackingShadow(): Unit = {
+    val controller = new MockController.Builder().build()
+    val props = new Properties()
+    props.put(ServerConfigs.CONCENTRATION_LOGICAL_TOPICS_CONFIG, "orders:100:shared:4")
+    controllerApis = createControllerApis(None, controller, props)
+    val request = new CreateTopicsRequestData().setTopics(new CreatableTopicCollection(
+      util.Arrays.asList(
+        new CreatableTopic().setName("shared").setNumPartitions(1).setReplicationFactor(3),
+        new CreatableTopic().setName("safe").setNumPartitions(1).setReplicationFactor(3),
+      ).iterator()))
+    val expectedResponse = Set(
+      new CreatableTopicResult().setName("shared").
+        setErrorCode(TOPIC_ALREADY_EXISTS.code()).
+        setErrorMessage("Topic name collides with a declared concentration backing topic " +
+          "on this controller; refusing to create a physical topic that would corrupt the substrate."),
+      new CreatableTopicResult().setName("safe").
+        setErrorCode(NONE.code()).
+        setTopicId(new Uuid(0L, 1L)).
+        setNumPartitions(1).
+        setReplicationFactor(3).
+        setTopicConfigErrorCode(NONE.code()))
+    assertEquals(expectedResponse, controllerApis.createTopics(ANONYMOUS_CONTEXT, request,
+      hasClusterAuth = true,
+      _ => Set("shared", "safe"),
+      _ => Set("shared", "safe")).get().topics().asScala.toSet)
+  }
+
+  /**
+   * r27-D BLOCKER #280 auth-precedence discriminator for backing shadow.
+   *
+   * Symmetric to {@link #testCreateTopicsShadowDefersToAuthorizationFailure}. An
+   * unauthorized backing-name request must surface as TOPIC_AUTHORIZATION_FAILED, not
+   * TOPIC_ALREADY_EXISTS — otherwise the shadow verdict leaks the declared-backing set
+   * to a principal with no TOPIC:CREATE. This mirrors the logical-shadow precedence
+   * rule and pins the symmetric ACL bypass closed.
+   */
+  @Test
+  def testCreateTopicsBackingShadowDefersToAuthorizationFailure(): Unit = {
+    val controller = new MockController.Builder().build()
+    val props = new Properties()
+    props.put(ServerConfigs.CONCENTRATION_LOGICAL_TOPICS_CONFIG,
+      "ordersA:100:sharedA:4,ordersB:50:sharedB:4")
+    controllerApis = createControllerApis(None, controller, props)
+    val request = new CreateTopicsRequestData().setTopics(new CreatableTopicCollection(
+      util.Arrays.asList(
+        new CreatableTopic().setName("sharedA").setNumPartitions(1).setReplicationFactor(3),
+        new CreatableTopic().setName("sharedB").setNumPartitions(1).setReplicationFactor(3),
+        new CreatableTopic().setName("neither").setNumPartitions(1).setReplicationFactor(3),
+      ).iterator()))
+    val expectedResponse = Set(
+      new CreatableTopicResult().setName("sharedA").
+        setErrorCode(TOPIC_ALREADY_EXISTS.code()).
+        setErrorMessage("Topic name collides with a declared concentration backing topic " +
+          "on this controller; refusing to create a physical topic that would corrupt the substrate."),
+      new CreatableTopicResult().setName("sharedB").
+        setErrorCode(TOPIC_AUTHORIZATION_FAILED.code()).
+        setErrorMessage("Authorization failed."),
+      new CreatableTopicResult().setName("neither").
+        setErrorCode(NONE.code()).
+        setTopicId(new Uuid(0L, 1L)).
+        setNumPartitions(1).
+        setReplicationFactor(3).
+        setTopicConfigErrorCode(NONE.code()))
+    assertEquals(expectedResponse, controllerApis.createTopics(ANONYMOUS_CONTEXT, request,
+      hasClusterAuth = false,
+      _ => Set("sharedA", "neither"),
+      _ => Set("sharedA", "neither")).get().topics().asScala.toSet)
+  }
+
+  /**
    * r15 BLOCKER N3 — auth precedence on the controller side.
    *
    * When a name is BOTH unauthorized AND a logical-shadow collider, the controller must
