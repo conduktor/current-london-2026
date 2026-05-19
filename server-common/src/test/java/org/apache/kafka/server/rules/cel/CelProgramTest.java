@@ -911,6 +911,53 @@ public class CelProgramTest {
     }
 
     @Test
+    public void booleanOperatorChainInsideComprehensionTripsBudget() {
+        // R26-B F2 (Task #143): without per-node step charges on And/Or/Not/
+        // Negate/Compare/Arith, a comprehension whose predicate is a chain
+        // of logical operators amortises K free node-evals across one
+        // iteration step. MAX_NODES=1024 bounds K per rule, but the per-
+        // request budget (MAX_EVAL_STEPS=100_000) is shared across
+        // MAX_RULES_PER_API_KEY=128 rules — so without this charge, a
+        // single attacker request could burn ~131k free node-evals through
+        // dense boolean trees and never trip the budget. This test pins
+        // the fix: K logical operators × N iterations now charges N*K
+        // steps, and at N*K > MAX_EVAL_STEPS the budget trips.
+        //
+        // Shape: 30 conjuncts of `x == x` inside an `all(...)` over a
+        // 2000-element list of Long. Per iteration the predicate evaluates
+        // 30 Compare nodes + 29 And nodes = 59 charged bumps (post-fix).
+        // 2000 × 59 = 118_000 > 100_000 → trips. Pre-fix, both Compare
+        // (numeric path) and And charged ZERO, so only 2000 comprehension
+        // iter steps were charged — well under the budget and the
+        // predicate would have returned true.
+        //
+        // x == x is deliberate: always-true so all(...) runs the full
+        // iteration sequence (no short-circuit on a false element). Long
+        // operands keep Compare on the numeric path so the only charge
+        // that fires is the new baseline bumpStep — the pre-fix code path
+        // does not charge for Long-vs-Long compare.
+        java.util.List<Object> iters = new java.util.ArrayList<>();
+        for (int n = 0; n < 2000; n++) {
+            iters.add(Long.valueOf(n));
+        }
+        Map<String, Object> env = new HashMap<>();
+        env.put("xs", iters);
+        // Build 30-conjunct chain. Left-leaning parse → tree depth ~30,
+        // safely under MAX_PARSE_DEPTH=64. Node count ~60 per predicate +
+        // comprehension overhead, safely under MAX_NODES=1024.
+        StringBuilder pred = new StringBuilder("x == x");
+        for (int k = 1; k < 30; k++) {
+            pred.append(" && x == x");
+        }
+        String expr = "xs.all(x, " + pred + ")";
+        assertThrows(CelEvaluationException.class,
+            () -> evalBool(expr, env),
+            "30-conjunct chain × 2000 iters must trip MAX_EVAL_STEPS after "
+                + "R26-B F2 per-node charges; without the fix the budget "
+                + "would not trip because numeric Compare and And were free");
+    }
+
+    @Test
     public void integerOverflowSurfacesAsCelException() {
         // Round-10 audit: silent overflow flipped predicate truth values.
         // Math.addExact / multiplyExact / negateExact surface overflow

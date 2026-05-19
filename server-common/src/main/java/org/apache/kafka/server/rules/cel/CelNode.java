@@ -389,6 +389,14 @@ abstract class CelNode {
 
         @Override
         Object eval(Function<String, Object> a) {
+            // R26-B F2 (Task #143): charge 1 step per logical-operator node
+            // eval. Without this, a chained boolean expression up to the
+            // MAX_NODES=1024 cap (e.g. `!(!(!(...)))` or `a && b && c && ...`
+            // 1024-deep) walks the AST for zero budget cost. Cross 128 rules
+            // sharing one MAX_EVAL_STEPS=100_000 ceiling per request and a
+            // single attacker request burns 131k free node-evals — bypassing
+            // the budget the engine relies on to cap per-request CPU.
+            CelLimits.bumpStep();
             Object v = inner.eval(a);
             if (v == null) {
                 return true;
@@ -409,6 +417,10 @@ abstract class CelNode {
 
         @Override
         Object eval(Function<String, Object> a) {
+            // R26-B F2 (Task #143): see Not.eval comment — charge baseline
+            // step so the AST-traversal cost is bounded by MAX_EVAL_STEPS,
+            // not just by MAX_NODES per individual rule.
+            CelLimits.bumpStep();
             Object v = inner.eval(a);
             // Round-10 audit: negate of Long.MIN_VALUE silently wraps to
             // MIN_VALUE again, which is the soundness footgun the spec
@@ -440,6 +452,13 @@ abstract class CelNode {
 
         @Override
         Object eval(Function<String, Object> a) {
+            // R26-B F2 (Task #143): see Not.eval comment — without this, an
+            // `a && b && c && ...` chain up to MAX_NODES walks the AST free.
+            // Charged BEFORE evaluating left so short-circuit (l == false)
+            // still pays for the node itself: the attacker shouldn't get
+            // free AST traversal just because their conjunction happens to
+            // short-circuit.
+            CelLimits.bumpStep();
             Object l = left.eval(a);
             if (!truthy(l)) {
                 return false;
@@ -459,6 +478,9 @@ abstract class CelNode {
 
         @Override
         Object eval(Function<String, Object> a) {
+            // R26-B F2 (Task #143): see And.eval comment — symmetric short-
+            // circuit (l == true skips right) but still charge baseline 1.
+            CelLimits.bumpStep();
             Object l = left.eval(a);
             if (truthy(l)) {
                 return true;
@@ -484,6 +506,16 @@ abstract class CelNode {
 
         @Override
         Object eval(Function<String, Object> a) {
+            // R26-B F2 (Task #143): baseline 1-step charge so even purely
+            // numeric/boolean compares (which the original "bounded by
+            // MAX_NODES" comment below relied on) are accounted against
+            // MAX_EVAL_STEPS. MAX_NODES bounds per-rule node count to 1024,
+            // but the budget is shared across MAX_RULES_PER_API_KEY=128
+            // rules per request — 1024×128=131k free node-evals/request
+            // without this baseline. The string/list/map charges below are
+            // ADDITIVE on top of this baseline (still proportional to data
+            // size, just plus 1).
+            CelLimits.bumpStep();
             Object l = left.eval(a);
             Object r = right.eval(a);
             // Audit HIGH-2: String comparisons walk both strings on equal
@@ -591,6 +623,14 @@ abstract class CelNode {
 
         @Override
         Object eval(Function<String, Object> a) {
+            // R26-B F2 (Task #143): see Compare.eval baseline-charge comment.
+            // Same reasoning applies to Arith: the long-form per-char concat
+            // charge below is additive on this 1-step baseline, and purely
+            // numeric arithmetic (which the historical "bounded by MAX_NODES"
+            // comment further down justified as free) now pays 1 step too —
+            // necessary because MAX_NODES bounds nodes-per-rule, not nodes-
+            // per-request across the shared MAX_EVAL_STEPS budget.
+            CelLimits.bumpStep();
             Object l = left.eval(a);
             Object r = right.eval(a);
             if (op == Op.ADD && l instanceof String && r instanceof String) {
