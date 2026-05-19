@@ -135,8 +135,10 @@ public final class KafkaHttpServlet extends HttpServlet {
         // Strict Content-Type before the body is read. The bridge accepts application/json only; everything else
         // (text/plain, application/x-www-form-urlencoded, multipart/form-data, absent header) is rejected here with
         // 415 Unsupported Media Type. The check defends against the cross-origin form-POST CSRF primitive: a browser
-        // form with enctype="text/plain" submits cross-origin WITHOUT a CORS preflight (RFC 9110 §15.3 "simple
-        // request"); without this guard an attacker page can craft a form body whose serialised text starts with a
+        // form with enctype="text/plain" submits cross-origin WITHOUT a CORS preflight (the WHATWG Fetch Standard
+        // classifies text/plain, application/x-www-form-urlencoded, and multipart/form-data as CORS-safelisted
+        // request bodies, exempting them from preflight); without this guard an attacker page can craft a form
+        // body whose serialised text starts with a
         // valid JSON object that the bridge would accept (Jackson silently ignores trailing data after the first
         // JSON value — see WsSubscribeMessageParser axis-RR notes), producing records anonymously. Strict
         // Content-Type closes that primitive independently of the fronting reverse proxy's per-origin defences.
@@ -516,8 +518,9 @@ public final class KafkaHttpServlet extends HttpServlet {
      * Jetty's HTTP/1.1 keep-alive will otherwise drain the remaining declared bytes per Content-Length and parse any
      * pipelined bytes as the next request — which gives a fronting proxy that pools upstream connections a
      * request-smuggling primitive (the attacker chooses Content-Length small enough that Jetty drains rather than
-     * closes). RFC 7230 §6.6 covers this case: when a server cannot fully read the request body it MUST signal
-     * connection close. Mirror the {@link #writePayloadTooLarge} contract for the same defect class.
+     * closes). RFC 9112 §9.3 (Persistence) requires that a server which is unwilling to read the rest of the
+     * request body close the connection; Connection: close is the on-the-wire signal that lets the client and
+     * any intermediary stop pipelining. Mirror the {@link #writePayloadTooLarge} contract for the same defect class.
      */
     private void writeBadRequestAndClose(HttpServletResponse resp, String message) throws IOException {
         resp.setHeader("Connection", "close");
@@ -528,8 +531,8 @@ public final class KafkaHttpServlet extends HttpServlet {
         // The body is mid-read when the cap fires, so the remaining declared bytes are still on the wire. Without
         // Connection: close Jetty drains those bytes per Content-Length and then parses any pipelined bytes as the
         // next request — which gives a fronting proxy that pools upstream connections a request-smuggling primitive
-        // (the attacker chooses Content-Length small enough that Jetty drains rather than closes). RFC 7230 §6.6
-        // covers this case: when a server cannot fully read the request body it MUST signal connection close.
+        // (the attacker chooses Content-Length small enough that Jetty drains rather than closes). RFC 9112 §9.3
+        // (Persistence) requires that a server unwilling to read the rest of the request body close the connection.
         resp.setHeader("Connection", "close");
         writeEnvelope(resp, HttpStatusMapper.PAYLOAD_TOO_LARGE,
             "request body exceeds the configured limit of " + limit + " bytes");
