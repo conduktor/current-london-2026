@@ -905,9 +905,24 @@ class ControllerApis(
     val responses = new util.ArrayList[CreatePartitionsTopicResult]()
     val duplicateTopicNames = new util.HashSet[String]()
     val topicNames = new util.HashSet[String]()
+    // Outside-in pollution guard (#121 step 3). A caller reaching
+    // ControllerApis directly via `bootstrap.controllers` bypasses the
+    // KafkaApis.handleCreatePartitionsRequest scrub. They could submit
+    // `acme.orders` and add partitions to a tenant's topic — the broker
+    // never sees the request, so its `effectiveTenant.isPresent` gate is
+    // irrelevant here. Refuse pre-loop. Principal-aware via
+    // `isForeignTenantNamespace`: the legitimate forwarded tenant flow
+    // (broker rewrote `orders` → `acme.orders`, envelope carries
+    // `__tenant_acme.alice`) passes through untouched.
+    val callerTenant = callerTenantFromPrincipal(context.principal.getName)
     request.topics().forEach {
       topic =>
-        if (!topicNames.add(topic.name())) {
+        if (isForeignTenantNamespace(topic.name(), callerTenant)) {
+          responses.add(new CreatePartitionsTopicResult().
+            setName(topic.name()).
+            setErrorCode(INVALID_TOPIC_EXCEPTION.code).
+            setErrorMessage("Topic name '" + topic.name() + "' is reserved (tenant namespace prefix)"))
+        } else if (!topicNames.add(topic.name())) {
           duplicateTopicNames.add(topic.name())
         }
     }

@@ -2279,6 +2279,171 @@ class ControllerApisTest {
     verify(controller, never()).findTopicIds(any(), any())
   }
 
+  // ---------------------------------------------------------------------------
+  // CreatePartitions outside-in scrub on bootstrap.controllers (#121 step 3).
+  // Adding partitions to `acme.orders` from a cluster-wide caller would silently
+  // grow a tenant topic; tenant clients never see the request and the topic's
+  // partition count would jump out from under them. The scrub mirrors
+  // CreateTopics/DeleteTopics: principal-aware, so the legitimate forwarded
+  // tenant flow (broker rewrote `orders` → `acme.orders`, envelope carries
+  // `__tenant_acme.alice`) passes through, but any other caller (anonymous
+  // cluster-wide, cross-tenant principal) is refused per-topic.
+  // ---------------------------------------------------------------------------
+
+  @Test
+  def testControllerCreatePartitionsRefusesTenantPrefixedNameOnBootstrapControllers(): Unit = {
+    // Cluster-acting anonymous caller via bootstrap.controllers asks to grow
+    // `acme.orders`. The scrub must refuse and the controller must never see
+    // the mutation. We stub controller.createPartitions to empty so the scrub
+    // is the only barrier between the request and the actual mutation.
+    val controller = mock(classOf[Controller])
+    when(controller.createPartitions(
+      any(classOf[ControllerRequestContext]),
+      any(classOf[util.List[CreatePartitionsTopic]]),
+      ArgumentMatchers.eq(false)))
+      .thenReturn(CompletableFuture.completedFuture(java.util.Collections.emptyList[CreatePartitionsTopicResult]()))
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    val request = new CreatePartitionsRequestData()
+    request.topics().add(new CreatePartitionsTopic().setName("acme.orders").setAssignments(null).setCount(10))
+    val results = controllerApis.createPartitions(ANONYMOUS_CONTEXT, request,
+      _ => Set("acme.orders")).get().asScala.toList
+    assertEquals(1, results.size, "single refusal expected")
+    val r = results.head
+    assertEquals("acme.orders", r.name)
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, r.errorCode,
+      "controller-direct CreatePartitions must refuse tenant-prefixed name")
+    // The surviving topic list reaching controller.createPartitions MUST be
+    // empty — no name made it past the scrub.
+    val topicsCaptor: ArgumentCaptor[util.List[CreatePartitionsTopic]] =
+      ArgumentCaptor.forClass(classOf[util.List[CreatePartitionsTopic]])
+    verify(controller).createPartitions(
+      any(classOf[ControllerRequestContext]),
+      topicsCaptor.capture(),
+      ArgumentMatchers.eq(false))
+    assertEquals(java.util.Collections.emptyList[CreatePartitionsTopic](), topicsCaptor.getValue,
+      "scrub must short-circuit before any topic reaches controller.createPartitions")
+  }
+
+  @Test
+  def testControllerCreatePartitionsMixesAllowedAndRejected(): Unit = {
+    // A cluster-wide caller submits a batch with one legitimate cluster topic
+    // (`cluster-metrics`) and one tenant-prefixed name (`acme.orders`). The
+    // scrub must refuse `acme.orders` per-entry but pass `cluster-metrics`
+    // through to controller.createPartitions. This proves the scrub is
+    // per-entry, not request-aborting, matching CreateTopics/DeleteTopics
+    // batch semantics.
+    val controller = mock(classOf[Controller])
+    val allowedResult = new CreatePartitionsTopicResult().setName("cluster-metrics").setErrorCode(NONE.code)
+    when(controller.createPartitions(
+      any(classOf[ControllerRequestContext]),
+      any(classOf[util.List[CreatePartitionsTopic]]),
+      ArgumentMatchers.eq(false)))
+      .thenReturn(CompletableFuture.completedFuture(java.util.Collections.singletonList(allowedResult)))
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    val request = new CreatePartitionsRequestData()
+    request.topics().add(new CreatePartitionsTopic().setName("cluster-metrics").setAssignments(null).setCount(5))
+    request.topics().add(new CreatePartitionsTopic().setName("acme.orders").setAssignments(null).setCount(10))
+    val results = controllerApis.createPartitions(ANONYMOUS_CONTEXT, request,
+      _ => Set("cluster-metrics", "acme.orders")).get().asScala.toList
+    val byName = results.map(r => r.name -> r.errorCode).toMap
+    assertEquals(Errors.INVALID_TOPIC_EXCEPTION.code, byName("acme.orders"),
+      "tenant-prefixed name must be refused")
+    assertEquals(NONE.code, byName("cluster-metrics"),
+      "legitimate cluster-scope topic must pass through unchanged")
+    // Controller saw only the legitimate one.
+    val topicsCaptor: ArgumentCaptor[util.List[CreatePartitionsTopic]] =
+      ArgumentCaptor.forClass(classOf[util.List[CreatePartitionsTopic]])
+    verify(controller).createPartitions(
+      any(classOf[ControllerRequestContext]),
+      topicsCaptor.capture(),
+      ArgumentMatchers.eq(false))
+    assertEquals(1, topicsCaptor.getValue.size,
+      "exactly one topic must reach controller.createPartitions")
+    assertEquals("cluster-metrics", topicsCaptor.getValue.get(0).name)
+  }
+
+  @Test
+  def testControllerCreatePartitionsExemptsInternalTopicForClusterCaller(): Unit = {
+    // Must-not-regress: a cluster-wide admin growing partitions on a Kafka-
+    // internal topic (`__consumer_offsets`, `__transaction_state`,
+    // `__share_group_state`) — names that pass `Topic.isInternal` — must not
+    // be refused by the tenant-namespace scrub. Internal topics are shared
+    // by all tenants on the broker; they belong to no tenant. Same exemption
+    // the broker-side guards already apply.
+    //
+    // (Note: CREATE_PARTITIONS is NOT in TENANT_ALLOWED_APIS, so a tenant
+    // principal cannot reach this handler at all — the legitimate-tenant
+    // regression case is moot. This test instead pins the internal-topic
+    // exemption, which IS the only must-not-regress for the scrub on the
+    // controller listener today.)
+    val controller = mock(classOf[Controller])
+    when(controller.createPartitions(
+      any(classOf[ControllerRequestContext]),
+      any(classOf[util.List[CreatePartitionsTopic]]),
+      ArgumentMatchers.eq(false)))
+      .thenReturn(CompletableFuture.completedFuture(java.util.Collections.singletonList(
+        new CreatePartitionsTopicResult().setName(Topic.GROUP_METADATA_TOPIC_NAME).setErrorCode(NONE.code))))
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    val request = new CreatePartitionsRequestData()
+    request.topics().add(new CreatePartitionsTopic()
+      .setName(Topic.GROUP_METADATA_TOPIC_NAME).setAssignments(null).setCount(60))
+    val results = controllerApis.createPartitions(ANONYMOUS_CONTEXT, request,
+      _ => Set(Topic.GROUP_METADATA_TOPIC_NAME)).get().asScala.toList
+    assertEquals(1, results.size)
+    assertEquals(NONE.code, results.head.errorCode,
+      "internal topic must be exempt from tenant-namespace scrub")
+    // Internal topic reached controller.createPartitions intact.
+    val topicsCaptor: ArgumentCaptor[util.List[CreatePartitionsTopic]] =
+      ArgumentCaptor.forClass(classOf[util.List[CreatePartitionsTopic]])
+    verify(controller).createPartitions(
+      any(classOf[ControllerRequestContext]),
+      topicsCaptor.capture(),
+      ArgumentMatchers.eq(false))
+    assertEquals(1, topicsCaptor.getValue.size)
+    assertEquals(Topic.GROUP_METADATA_TOPIC_NAME, topicsCaptor.getValue.get(0).name)
+  }
+
+  @Test
+  def testControllerCreatePartitionsRefusesCrossTenantPrincipalForeignNamespace(): Unit = {
+    // Cross-tenant pollution via a known-tenant principal. The adversary
+    // holds credentials for tenant `evil` and envelopes a CreatePartitions
+    // targeting `acme.orders`. The scrub must refuse: `callerTenant` is
+    // `Some("evil")` and `isForeignTenantNamespace("acme.orders", Some("evil"))`
+    // returns true because tenant `acme` is known AND
+    // `Some("evil") != Some("acme")`.
+    val crossRequestData = new CreatePartitionsRequestData()
+    crossRequestData.topics().add(
+      new CreatePartitionsTopic().setName("acme.orders").setAssignments(null).setCount(10))
+    val createPartitionsRequest = new CreatePartitionsRequest.Builder(crossRequestData).build()
+    val crossTenantPrincipal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_evil.alice")
+    val envelopeRequest = kafka.utils.TestUtils.buildEnvelopeRequest(
+      createPartitionsRequest, envelopePrincipalSerde, requestChannelMetrics, time.nanoseconds(),
+      forwardedPrincipal = crossTenantPrincipal,
+      outerPrincipal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    val controller = mock(classOf[Controller])
+    val originals = new java.util.HashMap[String, AnyRef]()
+    originals.put("listener.name.tenant_acme.tenant.id", "acme")
+    originals.put("listener.name.tenant_evil.tenant.id", "evil")
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.from(originals))
+    controllerApis.handle(envelopeRequest, RequestLocal.noCaching())
+
+    // Cross-tenant request must never reach controller.createPartitions.
+    verify(controller, never()).createPartitions(any(), any(), ArgumentMatchers.anyBoolean())
+  }
+
   @AfterEach
   def tearDown(): Unit = {
     quotasNeverThrottleControllerMutations.shutdown()
