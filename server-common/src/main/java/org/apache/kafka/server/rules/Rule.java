@@ -21,6 +21,7 @@ import org.apache.kafka.server.rules.cel.CelProgram;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Objects;
 
@@ -49,9 +50,28 @@ public final class Rule {
         if (apiKeys.isEmpty()) {
             throw new IllegalArgumentException("rule must target at least one apiKey");
         }
+        // R28 adversarial (#246): reject duplicates. The codec
+        // (RuleJsonCodec.parseApiKeys) dedupes operator input via
+        // LinkedHashSet — but the Rule constructor is also called from tests
+        // and would otherwise admit a list like [METADATA, METADATA], which
+        // (i) charges the per-API-key cap (RuleSetBuilder.put) by 2,
+        // (ii) duplicates the rule in byKey[METADATA] (RuleSetBuilder.build),
+        // and (iii) double-evaluates the rule per request (RuleEngine.evaluate)
+        // — silently double-charging the CEL step budget when the rule does
+        // not fire on the first hit. The codec already dedupes before
+        // construction, so a duplicate-bearing list reaching this constructor
+        // is a caller bug; surface it rather than swallow it.
+        EnumSet<ApiKeys> seen = EnumSet.noneOf(ApiKeys.class);
         for (ApiKeys k : apiKeys) {
             if (k == null) {
                 throw new NullPointerException("apiKeys contains null");
+            }
+            if (!seen.add(k)) {
+                throw new IllegalArgumentException(
+                    "apiKeys contains duplicate '" + k.name() + "'; the codec "
+                        + "dedupes operator input — a duplicate reaching this "
+                        + "constructor is a caller bug that would double-charge "
+                        + "the per-API-key rule cap and per-request CEL budget");
             }
         }
         this.apiKeys = Collections.unmodifiableList(new ArrayList<>(apiKeys));

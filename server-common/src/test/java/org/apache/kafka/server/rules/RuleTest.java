@@ -76,6 +76,42 @@ public class RuleTest {
     }
 
     @Test
+    public void rejectsDuplicateApiKeys() {
+        // R28 adversarial (#246): the codec dedupes operator input via
+        // LinkedHashSet, but the Rule constructor is also called from tests
+        // and would otherwise admit [METADATA, METADATA]. A duplicate-bearing
+        // list would (i) charge the per-API-key cap by 2, (ii) duplicate the
+        // rule in the per-key evaluation list, and (iii) double-charge the
+        // per-request CEL step budget when the rule does not fire on the
+        // first hit. Surface the caller bug rather than swallow it.
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+            () -> new Rule("r1",
+                Arrays.asList(ApiKeys.METADATA, ApiKeys.METADATA),
+                RuleAction.DENY, "true", 42, TRUE));
+        assertTrue(ex.getMessage().contains("duplicate"),
+            "diagnostic must name the contract violation: " + ex.getMessage());
+        assertTrue(ex.getMessage().contains("METADATA"),
+            "diagnostic must name the offending apiKey: " + ex.getMessage());
+
+        // Non-adjacent duplicate ("ABC...A...") is caught just as well, since
+        // EnumSet.add returns false on the second occurrence regardless of
+        // position. Pins that the dedup check is not a lookback-of-1 hack.
+        IllegalArgumentException ex2 = assertThrows(IllegalArgumentException.class,
+            () -> new Rule("r2",
+                Arrays.asList(ApiKeys.METADATA, ApiKeys.FETCH, ApiKeys.METADATA),
+                RuleAction.DENY, "true", 42, TRUE));
+        assertTrue(ex2.getMessage().contains("METADATA"),
+            "non-adjacent duplicate must still surface the apiKey name: "
+                + ex2.getMessage());
+
+        // Negative control: a list with no duplicates must still be accepted.
+        Rule ok = new Rule("r3",
+            Arrays.asList(ApiKeys.METADATA, ApiKeys.FETCH, ApiKeys.PRODUCE),
+            RuleAction.DENY, "true", 42, TRUE);
+        assertEquals(3, ok.apiKeys().size());
+    }
+
+    @Test
     public void equalsAndHashCodeByContent() {
         Rule a = new Rule("r1", Collections.singletonList(ApiKeys.FETCH), RuleAction.DENY, "true", 42, TRUE);
         Rule b = new Rule("r1", Collections.singletonList(ApiKeys.FETCH), RuleAction.DENY, "true", 42, TRUE);
