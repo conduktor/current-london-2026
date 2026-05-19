@@ -34,7 +34,7 @@ import org.apache.kafka.common.requests.DescribeConfigsResponse.ConfigSource
 import org.apache.kafka.common.resource.Resource.CLUSTER_NAME
 import org.apache.kafka.common.resource.ResourceType.{CLUSTER, GROUP, TOPIC}
 import org.apache.kafka.coordinator.group.GroupConfig
-import org.apache.kafka.server.config.ServerTopicConfigSynonyms
+import org.apache.kafka.server.config.{ServerConfigs, ServerTopicConfigSynonyms}
 import org.apache.kafka.storage.internals.log.LogConfig
 
 import scala.collection.mutable.ListBuffer
@@ -279,7 +279,13 @@ class ConfigHelper(
                                      (name: String, value: Any): DescribeConfigsResponseData.DescribeConfigsResourceResult = {
     val allNames = brokerSynonyms(name)
     val configEntryType = KafkaConfig.configType(name)
-    val isSensitive = KafkaConfig.maybeSensitive(configEntryType)
+    // r22 BLOCKER #202: concentration.logical.topics encodes the full logical->backing topology
+    // (logical-name:partitions:backing-name:partitions tuples). A principal with DESCRIBE_CONFIGS
+    // on CLUSTER would otherwise see every backing-topic name and the co-tenancy map. Force the
+    // value to redacted/sensitive on DescribeConfigs(BROKER); the key remains listed for shape
+    // consistency so attackers cannot probe feature activation via key presence.
+    val isConcentrationTopology = name == ServerConfigs.CONCENTRATION_LOGICAL_TOPICS_CONFIG
+    val isSensitive = isConcentrationTopology || KafkaConfig.maybeSensitive(configEntryType)
     val valueAsString = if (isSensitive)
       null
     else value match {

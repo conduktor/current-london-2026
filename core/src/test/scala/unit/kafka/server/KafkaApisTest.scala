@@ -405,6 +405,75 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testDescribeConfigsBrokerRedactsConcentrationTopology(): Unit = {
+    // r22 BLOCKER #202 — DescribeConfigs(BROKER) MUST NOT expose concentration.logical.topics
+    // value. The config string encodes the full logical->backing topology
+    // (logical-name:partitions:backing-name:partitions tuples). A principal with
+    // DESCRIBE_CONFIGS on CLUSTER would otherwise read every backing-topic name and the
+    // entire co-tenancy map. The key must still appear in the response (shape consistency
+    // across brokers prevents key-presence probing of feature activation), but the value
+    // must be null and isSensitive must be true.
+    val authorizer: Authorizer = mock(classOf[Authorizer])
+
+    val operation = AclOperation.DESCRIBE_CONFIGS
+    val resourceType = ResourceType.CLUSTER
+    val requestHeader = new RequestHeader(ApiKeys.DESCRIBE_CONFIGS, ApiKeys.DESCRIBE_CONFIGS.latestVersion,
+      clientId, 0)
+
+    val expectedActions = Seq(
+      new Action(operation, new ResourcePattern(resourceType, Resource.CLUSTER_NAME, PatternType.LITERAL),
+        1, true, true)
+    )
+    when(authorizer.authorize(any[RequestContext], ArgumentMatchers.eq(expectedActions.asJava)))
+      .thenReturn(Seq(AuthorizationResult.ALLOWED).asJava)
+
+    val topologyValue = "tenantA-events:4:__concentration-bk-1:32,tenantB-events:4:__concentration-bk-2:32"
+    val topicConfigOverride = mutable.Map.empty[String, String]
+    topicConfigOverride.put(ServerConfigs.CONCENTRATION_LOGICAL_TOPICS_CONFIG, topologyValue)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
+
+    val describeConfigsRequest = new DescribeConfigsRequest.Builder(new DescribeConfigsRequestData()
+      .setIncludeSynonyms(true)
+      .setResources(List(new DescribeConfigsRequestData.DescribeConfigsResource()
+        .setResourceName(brokerId.toString)
+        .setResourceType(ConfigResource.Type.BROKER.id)).asJava))
+      .build(requestHeader.apiVersion)
+    val request = buildRequest(describeConfigsRequest, requestHeader = Option(requestHeader))
+
+    kafkaApis = createKafkaApis(authorizer = Some(authorizer), overrideProperties = topicConfigOverride)
+    kafkaApis.handleDescribeConfigsRequest(request)
+
+    val response = verifyNoThrottling[DescribeConfigsResponse](request)
+    val results = response.data.results
+    assertEquals(1, results.size)
+    val result = results.get(0)
+    assertEquals(ConfigResource.Type.BROKER.id, result.resourceType)
+    val concentrationEntries = result.configs.asScala
+      .filter(_.name == ServerConfigs.CONCENTRATION_LOGICAL_TOPICS_CONFIG)
+    assertEquals(1, concentrationEntries.size,
+      "concentration.logical.topics key must remain in the BROKER response (shape consistency)")
+    val entry = concentrationEntries.head
+    assertNull(entry.value,
+      s"concentration.logical.topics value MUST be redacted to null in DescribeConfigs(BROKER); got '${entry.value}'")
+    assertTrue(entry.isSensitive,
+      "concentration.logical.topics MUST be marked isSensitive=true so admin clients/log scrubbers redact it")
+    // Synonyms (e.g. STATIC_BROKER_CONFIG) must also be redacted — configSynonyms branches on
+    // the same isSensitive flag, so a leak in a synonym entry would defeat the primary redaction.
+    entry.synonyms.asScala.foreach { syn =>
+      assertNull(syn.value,
+        s"Synonym ${syn.name} for concentration.logical.topics MUST also be redacted; got '${syn.value}'")
+    }
+    // Defence-in-depth: the raw topology string MUST NOT appear anywhere in the serialized
+    // response — guards against future re-introduction via a parallel code path.
+    val serialized = response.data.toString
+    assertFalse(serialized.contains("__concentration-bk-"),
+      s"Backing topic name leaked through DescribeConfigs(BROKER): $serialized")
+    assertFalse(serialized.contains("tenantA-events:4"),
+      s"Topology tuple leaked through DescribeConfigs(BROKER): $serialized")
+  }
+
+  @Test
   def testElectLeadersForwarding(): Unit = {
     val requestBuilder = new ElectLeadersRequest.Builder(ElectionType.PREFERRED, null, 30000)
     testKraftForwarding(ApiKeys.ELECT_LEADERS, requestBuilder)
