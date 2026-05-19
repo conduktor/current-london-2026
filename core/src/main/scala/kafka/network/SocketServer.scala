@@ -540,19 +540,25 @@ private[kafka] abstract class Acceptor(val socketServer: SocketServer,
   private val recvBufferSize = config.socketReceiveBufferBytes
   private val listenBacklogSize = config.socketListenBacklogSize
 
-  private val nioSelector = NSelector.open()
-
-  // Resolve the effective I/O backend ONCE, eagerly, before any socket-opening side effect
-  // — the 3-arg overload applies the port=0 downgrade contract:
+  // Resolve the effective I/O backend ONCE, eagerly, before any socket-opening or selector-
+  // allocating side effect — the 3-arg overload applies the port=0 downgrade contract:
   //   - auto + port=0 → silent NIO downgrade (returns false).
   //   - explicit io_uring + port=0 → hard-fail (throws IllegalStateException right here).
-  // Eager evaluation matters because the wildcard NIO pre-open below would otherwise leak a
-  // file descriptor on the hard-fail path: it runs from the var-initializer block, and a
-  // throw from a later usesIoUring lookup would propagate out of the constructor *after*
-  // serverChannel was bound, with no `closeAll` ever running (the Acceptor thread never
-  // starts on a failed construct).
+  // Eager evaluation also gates the nioSelector / wildcard pre-open below: a throw from the
+  // resolver must propagate out of the constructor *before* either an epoll FD or a server
+  // socket has been allocated, since no `closeAll` runs on a failed construct (the Acceptor
+  // thread never starts on hard-fail).
   private val effectiveUsesIoUring: Boolean =
     config.usesIoUring(endPoint.listenerName, endPoint.securityProtocol, endPoint.port)
+
+  // For NIO listeners, this is the selector the Acceptor thread blocks on for OP_ACCEPT
+  // readiness and for shutdown wakeup. For io_uring listeners, the accept loop is owned by
+  // the per-Processor IoUringServerListener (Netty event loop), so the Acceptor thread is
+  // never started (see start()) and a NIO selector would be pure overhead — an epoll FD
+  // visible in every RSS / `lsof` snapshot that nothing ever selects on. Hold it null on
+  // the io_uring path; wakeup() and closeAll() each guard against the null.
+  private val nioSelector: NSelector =
+    if (effectiveUsesIoUring) null else NSelector.open()
 
   // If the port is configured as 0, we are using a wildcard port, so we need to open the socket
   // before we can find out what port we have. If it is set to a nonzero value, defer opening
@@ -620,16 +626,27 @@ private[kafka] abstract class Acceptor(val socketServer: SocketServer,
       // io_uring listeners bind via the per-Processor IoUringServerListener (SO_REUSEPORT),
       // so the Acceptor must NOT open a NIO ServerSocketChannel on the same address — doing
       // so would either fail with EADDRINUSE (if the Processor bound first) or steal accepts
-      // away from the io_uring path. The Acceptor thread still starts, but its run loop
-      // skips the NIO accept work for io_uring listeners.
-      if (serverChannel == null && !usesIoUring) {
+      // away from the io_uring path.
+      if (serverChannel == null && !effectiveUsesIoUring) {
         serverChannel = openServerSocket(endPoint.host, endPoint.port, listenBacklogSize)
         debug(s"Opened endpoint ${endPoint.host}:${endPoint.port}")
       }
       debug(s"Starting processors for listener ${endPoint.listenerName}")
       processors.foreach(_.start())
-      debug(s"Starting acceptor thread for listener ${endPoint.listenerName}")
-      thread.start()
+      // The Acceptor thread is the NIO accept-and-dispatch loop. On the io_uring path the
+      // per-Processor IoUringServerListener owns the accept loop in Netty's event loop, so
+      // starting this thread would just park it in nioSelector.select(500) doing nothing —
+      // one wasted KafkaThread + an epoll FD + ~2 wakeups/sec/listener visible in every
+      // thread dump and RSS snapshot. Skip it. close() compensates by invoking closeAll()
+      // explicitly for io_uring listeners, since the thread's finally { closeAll() } never
+      // runs in that case.
+      if (!effectiveUsesIoUring) {
+        debug(s"Starting acceptor thread for listener ${endPoint.listenerName}")
+        thread.start()
+      } else {
+        debug(s"Skipping acceptor thread for io_uring listener ${endPoint.listenerName} " +
+          "(accept loop owned by IoUringServerListener)")
+      }
       startedFuture.complete(null)
       started.set(true)
     } catch {
@@ -667,8 +684,12 @@ private[kafka] abstract class Acceptor(val socketServer: SocketServer,
 
   def close(): Unit = {
     beginShutdown()
-    thread.join()
-    if (!started.get) {
+    thread.join() // no-op when the Acceptor thread was never started (io_uring path)
+    // The thread's `finally { closeAll() }` only fires when the thread actually ran. On
+    // the io_uring path we never started it (see start()); on the NIO path, a failed
+    // start() likewise leaves the thread unstarted. In both cases, invoke closeAll()
+    // explicitly so serverChannel (NIO) and throttledSockets are released.
+    if (!started.get || effectiveUsesIoUring) {
       closeAll()
     }
     synchronized {
@@ -677,25 +698,23 @@ private[kafka] abstract class Acceptor(val socketServer: SocketServer,
   }
 
   /**
-   * Accept loop that checks for new connection attempts. For io_uring listeners the per-
-   * Processor IoUringServerListener owns the accept loop via Netty, so the Acceptor thread
-   * has nothing to dispatch — it just blocks on the nioSelector with a timeout so wakeup()
-   * during shutdown still returns promptly.
+   * Accept loop that checks for new connection attempts. NIO listeners only — for io_uring
+   * listeners the per-Processor IoUringServerListener owns the accept loop via Netty's event
+   * loop, and Acceptor.start() never starts this thread (see start() and close()). The
+   * defensive ISE below catches a future regression where the io_uring path accidentally
+   * gets a started Acceptor thread, rather than idle-spinning silently on a null nioSelector.
    */
   override def run(): Unit = {
-    val ioUring = usesIoUring
-    if (!ioUring) {
-      serverChannel.register(nioSelector, SelectionKey.OP_ACCEPT)
+    if (effectiveUsesIoUring) {
+      throw new IllegalStateException(
+        s"Acceptor thread must not run for io_uring listener ${endPoint.listenerName}; " +
+        "accept loop is owned by IoUringServerListener")
     }
+    serverChannel.register(nioSelector, SelectionKey.OP_ACCEPT)
     try {
       while (shouldRun.get()) {
         try {
-          if (ioUring) {
-            nioSelector.select(500)
-            nioSelector.selectedKeys().clear()
-          } else {
-            acceptNewConnections()
-          }
+          acceptNewConnections()
           closeThrottledConnections()
         }
         catch {
@@ -722,7 +741,9 @@ private[kafka] abstract class Acceptor(val socketServer: SocketServer,
 
   private def closeAll(): Unit = {
     debug("Closing server socket, selector, and any throttled sockets.")
-    // The serverChannel will be null if Acceptor's thread is not started
+    // serverChannel is null on the io_uring path and on a NIO path that never reached start()
+    // or that resolved with port != 0 and was never lazy-opened. nioSelector is null on the
+    // io_uring path. closeQuietly tolerates null.
     Utils.closeQuietly(serverChannel, "Acceptor serverChannel")
     Utils.closeQuietly(nioSelector, "Acceptor nioSelector")
     throttledSockets.foreach(throttledSocket => closeSocket(throttledSocket.socket))
@@ -847,9 +868,12 @@ private[kafka] abstract class Acceptor(val socketServer: SocketServer,
   }
 
   /**
-   * Wakeup the thread for selection.
+   * Wakeup the Acceptor thread blocked on nioSelector.select(). No-op on the io_uring path,
+   * where nioSelector is null and no Acceptor thread is running — beginShutdown still calls
+   * this method unconditionally because the io_uring branch is implicit, not an explicit
+   * shouldRun check on the caller side.
    */
-  def wakeup(): Unit = nioSelector.wakeup()
+  def wakeup(): Unit = if (nioSelector != null) nioSelector.wakeup()
 
   def addProcessors(toCreate: Int): Unit = synchronized {
     val listenerName = endPoint.listenerName
