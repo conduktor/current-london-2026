@@ -337,7 +337,18 @@ final class IoUringTransportLayer implements TransportLayer {
 
     @Override
     public boolean isMute() {
-        return (selectionKey.interestOps() & SelectionKey.OP_READ) == 0;
+        // Mirror NIO PlaintextTransportLayer.isMute (clients/src/main/java/org/apache/kafka/
+        // common/network/PlaintextTransportLayer.java:203-204): the key.isValid() short-circuit
+        // is what makes isMute() return false after close() ran cancel() on the key. Without
+        // this, the cached interestOps still reads "OP_READ cleared" if the transport happened
+        // to be muted at close time, so isMute() reports true on a dead channel — NIO reports
+        // false. Any caller treating isMute() as "channel is healthy and currently throttled"
+        // would diverge: a future KafkaChannel introspection path that reads isMute() post-
+        // close would observe the wrong value on io_uring vs NIO. Current production callers
+        // (NetworkSend metric tagging, channel selector iteration) all gate on the channel
+        // being live before reading isMute(), so this is currently latent — but the parity
+        // landmine is one line away from being defused, so defuse it.
+        return selectionKey.isValid() && (selectionKey.interestOps() & SelectionKey.OP_READ) == 0;
     }
 
     @Override

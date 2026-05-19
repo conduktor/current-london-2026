@@ -140,6 +140,25 @@ class IoUringTransportLayerTest {
     }
 
     @Test
+    void isMuteReturnsFalseAfterCloseEvenIfMutedAtCloseTime() {
+        // ERR-2 (NIO parity): NIO PlaintextTransportLayer.isMute (clients/src/main/java/
+        // org/apache/kafka/common/network/PlaintextTransportLayer.java:203-204) short-circuits
+        // on key.isValid() so a channel whose key was cancelled by close() reports
+        // isMute()==false. Without the same short-circuit in the io_uring path, a channel
+        // that was muted right before close() would still report isMute()==true forever
+        // (interestOps is a cached field that close()'s key.cancel() doesn't touch). Any
+        // future introspection caller (metrics, channel-iteration debug, parity-sensitive
+        // helpers) reading isMute() post-close would see io_uring lie where NIO doesn't.
+        IoUringTransportLayer l = newLayer();
+        l.removeInterestOps(SelectionKey.OP_READ);
+        assertTrue(l.isMute(), "preconditions: channel is muted at close time");
+
+        l.close();
+
+        assertFalse(l.isMute(), "closed channel must not report itself muted (NIO parity)");
+    }
+
+    @Test
     void removingOpReadFlipsNettyAutoReadOffForKernelBackpressure() {
         // KafkaChannel.mute() (called internally when MemoryPool.tryAllocate returns null)
         // calls transport.removeInterestOps(OP_READ). On NIO that takes the SocketChannel out
