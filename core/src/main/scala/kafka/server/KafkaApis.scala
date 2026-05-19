@@ -52,6 +52,7 @@ import org.apache.kafka.common.replica.ClientMetadata.DefaultClientMetadata
 import org.apache.kafka.common.requests.FindCoordinatorRequest.CoordinatorType
 import org.apache.kafka.common.requests.ProduceResponse.PartitionResponse
 import org.apache.kafka.common.requests._
+import org.apache.kafka.common.resource.PatternType
 import org.apache.kafka.common.resource.Resource.CLUSTER_NAME
 import org.apache.kafka.common.resource.ResourceType._
 import org.apache.kafka.common.resource.{Resource, ResourceType}
@@ -256,6 +257,84 @@ class KafkaApis(val requestChannel: RequestChannel,
     val afterPrefix = name.substring(org.apache.kafka.server.tenant.TenantNamespace.PRINCIPAL_PREFIX.length)
     val dot = afterPrefix.indexOf('.')
     dot > 0
+  }
+
+  // ACL pattern-aware variants of the two reserved-namespace helpers. #157:
+  // `StandardAuthorizer.checkSection` resolves an `AclBinding` against a
+  // physical resource name by literal `startsWith` for `PatternType.PREFIXED`
+  // and by equality for `LITERAL` (see `StandardAuthorizerData.checkSection`).
+  // The plain helpers above only catch the LITERAL case: a PREFIXED ACL with
+  // a dotless tenant-id-shape name like `Topic:PREFIXED:acme` passes through
+  // both `isReservedTenantNamespace("acme")` (no dot) and the L2 scrub on
+  // DescribeAcls/DeleteAcls — and silently grants the planted authority over
+  // every tenant-acme topic. Same shape for `Group:PREFIXED:__tenant_acme` on
+  // the principal-prefix namespace.
+  //
+  // The pattern-aware predicate is "does ANY string matching this (name,
+  // pattern) pair fall inside the tenant namespace?" For PREFIXED the answer
+  // is yes iff the name is a prefix of a known tenant-namespace anchor OR is
+  // already in the namespace. For MATCH and ANY the predicate widens to the
+  // union of LITERAL and PREFIXED checks (MATCH bindings match both literal
+  // and prefix variants of the resource name). UNKNOWN is treated as a no-op
+  // — the request will fail downstream on the pattern type anyway.
+  //
+  // Empty `name` with PREFIXED is the most virulent shape (matches every
+  // resource). Refuse it on any non-empty tenant configuration; on an empty
+  // tenant set the predicate is a no-op for backward compatibility with
+  // stock single-tenant Kafka.
+  private def isReservedTenantTopicAclName(name: String, patternType: PatternType): Boolean = {
+    if (name == null) return false
+    patternType match {
+      case PatternType.LITERAL => isReservedTenantNamespace(name)
+      case PatternType.PREFIXED => isReservedTenantTopicAclPrefix(name)
+      case PatternType.MATCH | PatternType.ANY =>
+        isReservedTenantNamespace(name) || isReservedTenantTopicAclPrefix(name)
+      case _ => false
+    }
+  }
+
+  private def isReservedTenantTopicAclPrefix(name: String): Boolean = {
+    // PREFIXED on TOPIC: only refuse when at least one tenant id is bound on
+    // this node — the LITERAL helper makes the same choice (its short-circuit
+    // on empty `allTenants` is what keeps stock Kafka working). The structural
+    // pre-binding posture (#102/#114) is supplied by the principal-prefix
+    // helper instead, since tenant TOPICS live under `<id>.` and are knowable
+    // only from the tenant id table.
+    if (tenantConfig.allTenants.isEmpty) return false
+    val tenants = tenantConfig.allTenants.iterator()
+    while (tenants.hasNext) {
+      val t = tenants.next()
+      val anchor = t + "."
+      // `anchor.startsWith(name)` — e.g. name="ac" with tenant "acme" matches
+      // the anchor; planting `Topic:PREFIXED:ac` would grant on every
+      // `acme.*` physical topic.
+      // `name.startsWith(anchor)` — e.g. name="acme.orders" with PREFIXED
+      // already names physical state inside the tenant namespace.
+      if (anchor.startsWith(name) || name.startsWith(anchor)) return true
+    }
+    false
+  }
+
+  private def isReservedTenantPrincipalAclName(name: String, patternType: PatternType): Boolean = {
+    if (name == null) return false
+    patternType match {
+      case PatternType.LITERAL => isReservedTenantPrincipalNamespace(name)
+      case PatternType.PREFIXED => isReservedTenantPrincipalAclPrefix(name)
+      case PatternType.MATCH | PatternType.ANY =>
+        isReservedTenantPrincipalNamespace(name) || isReservedTenantPrincipalAclPrefix(name)
+      case _ => false
+    }
+  }
+
+  private def isReservedTenantPrincipalAclPrefix(name: String): Boolean = {
+    // STRUCTURAL — does not consult `allTenants` (mirrors
+    // `isReservedTenantPrincipalNamespace`'s pre-binding posture). A PREFIXED
+    // ACL whose name `p` is either a prefix of `__tenant_` (so it could grow
+    // into the namespace when extended) OR already starts with `__tenant_`
+    // (already in the namespace) matches some reserved name and must be
+    // refused. Empty `p` is caught by `prefix.startsWith("")`.
+    val prefix = org.apache.kafka.server.tenant.TenantNamespace.PRINCIPAL_PREFIX
+    prefix.startsWith(name) || name.startsWith(prefix)
   }
 
   // Return the PHYSICAL TopicIdPartition the tenant is allowed to fetch, or
@@ -4057,24 +4136,27 @@ class KafkaApis(val requestChannel: RequestChannel,
     val entryFilter = filter.entryFilter
     val filterName = patternFilter.name
     val filterRT = patternFilter.resourceType
+    val filterPT = patternFilter.patternType
     val filterPrincipal = entryFilter.principal
 
     // L1: a non-null name on a tenant-scoped resource type that lands in a
     // reserved tenant namespace is refused outright. ResourceType.ANY with a
     // tenant-looking name is also refused (the caller is asking the server
     // to test the name against every resource type — which is itself an
-    // oracle).
+    // oracle). #157: the pattern-aware helpers also refuse PREFIXED and MATCH
+    // patterns whose name is a prefix of a tenant namespace anchor — those
+    // would otherwise enumerate planted bypass ACLs that LITERAL guards miss.
     val topicFilterNamesForeignTenant =
       filterName != null &&
         (filterRT == ResourceType.TOPIC || filterRT == ResourceType.ANY) &&
-        isReservedTenantNamespace(filterName)
+        isReservedTenantTopicAclName(filterName, filterPT)
     val principalScopedFilterNamesForeignTenant =
       filterName != null &&
         (filterRT == ResourceType.GROUP ||
           filterRT == ResourceType.TRANSACTIONAL_ID ||
           filterRT == ResourceType.USER ||
           filterRT == ResourceType.ANY) &&
-        isReservedTenantPrincipalNamespace(filterName)
+        isReservedTenantPrincipalAclName(filterName, filterPT)
     val entryFilterTargetsForeignTenantPrincipal =
       isReservedUserPrincipalLiteral(filterPrincipal)
 
@@ -4091,17 +4173,20 @@ class KafkaApis(val requestChannel: RequestChannel,
     }
 
     // L2: defense-in-depth scrub of any tenant-owned binding from the
-    // serialized response. Reuses the same reserved-namespace helpers so the
-    // L1 filter check and L2 binding check stay in lock-step.
+    // serialized response. Reuses the pattern-aware helpers so a PREFIXED
+    // binding planted with a dotless name (`Topic:PREFIXED:acme`) is dropped
+    // from the wildcard enumeration too — keeping the L1 filter check and L2
+    // binding check in lock-step (#157).
     def isForeignTenantBinding(b: AclBinding): Boolean = {
       val pattern = b.pattern
       val name = pattern.name
       val rt = pattern.resourceType
+      val pt = pattern.patternType
       val byPatternName =
-        (rt == ResourceType.TOPIC && isReservedTenantNamespace(name)) ||
+        (rt == ResourceType.TOPIC && isReservedTenantTopicAclName(name, pt)) ||
           ((rt == ResourceType.GROUP ||
             rt == ResourceType.TRANSACTIONAL_ID ||
-            rt == ResourceType.USER) && isReservedTenantPrincipalNamespace(name))
+            rt == ResourceType.USER) && isReservedTenantPrincipalAclName(name, pt))
       val byPrincipal = isReservedUserPrincipalLiteral(b.entry.principal)
       byPatternName || byPrincipal
     }
@@ -4535,11 +4620,25 @@ class KafkaApis(val requestChannel: RequestChannel,
       var i = 0
       while (i < creations.size) {
         val c = creations.get(i)
+        val pt = PatternType.fromCode(c.resourcePatternType)
+        // #157 — pattern-aware refusal. The structural check now extends to
+        // PREFIXED ACLs whose name is a prefix of a tenant namespace anchor
+        // (`Topic:PREFIXED:acme` for bound tenant `acme`, `Group:PREFIXED:__tenant_acme`
+        // for any tenant). Also extended from TOPIC-only to the full set of
+        // tenant-scoped resource types (GROUP / TRANSACTIONAL_ID / USER),
+        // mirroring the controller-side refusal so broker and controller stay
+        // in lock-step under bootstrap.controllers re-routing.
         val topicRefuse = c.resourceType == ResourceType.TOPIC.code &&
-          isReservedTenantNamespace(c.resourceName)
+          isReservedTenantTopicAclName(c.resourceName, pt)
+        val principalNsRefuse =
+          (c.resourceType == ResourceType.GROUP.code ||
+            c.resourceType == ResourceType.TRANSACTIONAL_ID.code ||
+            c.resourceType == ResourceType.USER.code) &&
+            isReservedTenantPrincipalAclName(c.resourceName, pt)
         val principalRefuse = isReservedUserPrincipalLiteral(c.principal)
-        if (topicRefuse || principalRefuse) {
-          val what = if (topicRefuse) "Resource name '" + c.resourceName + "'"
+        if (topicRefuse || principalNsRefuse || principalRefuse) {
+          val what =
+            if (topicRefuse || principalNsRefuse) "Resource name '" + c.resourceName + "'"
             else "Principal '" + c.principal + "'"
           rejections.put(i, new CreateAclsResponseData.AclCreationResult()
             .setErrorCode(Errors.INVALID_REQUEST.code)
@@ -4619,12 +4718,24 @@ class KafkaApis(val requestChannel: RequestChannel,
       var i = 0
       while (i < filters.size) {
         val f = filters.get(i)
+        val ft = PatternType.fromCode(f.patternTypeFilter)
+        // #157 — pattern-aware refusal mirrors the CreateAcls path. Also widens
+        // from TOPIC-only to the principal-prefix resource types so a wildcard
+        // `Group:PREFIXED:__tenant_acme` explicit filter is refused upfront.
         val topicRefuse = f.resourceTypeFilter == ResourceType.TOPIC.code &&
-          f.resourceNameFilter != null && isReservedTenantNamespace(f.resourceNameFilter)
+          f.resourceNameFilter != null &&
+          isReservedTenantTopicAclName(f.resourceNameFilter, ft)
+        val principalNsRefuse =
+          (f.resourceTypeFilter == ResourceType.GROUP.code ||
+            f.resourceTypeFilter == ResourceType.TRANSACTIONAL_ID.code ||
+            f.resourceTypeFilter == ResourceType.USER.code) &&
+            f.resourceNameFilter != null &&
+            isReservedTenantPrincipalAclName(f.resourceNameFilter, ft)
         val principalRefuse = f.principalFilter != null &&
           isReservedUserPrincipalLiteral(f.principalFilter)
-        if (topicRefuse || principalRefuse) {
-          val what = if (topicRefuse) "Resource filter '" + f.resourceNameFilter + "'"
+        if (topicRefuse || principalNsRefuse || principalRefuse) {
+          val what =
+            if (topicRefuse || principalNsRefuse) "Resource filter '" + f.resourceNameFilter + "'"
             else "Principal filter '" + f.principalFilter + "'"
           rejections.put(i, new DeleteAclsResponseData.DeleteAclsFilterResult()
             .setErrorCode(Errors.INVALID_REQUEST.code)
@@ -4644,10 +4755,17 @@ class KafkaApis(val requestChannel: RequestChannel,
       if (fr.matchingAcls == null || fr.matchingAcls.isEmpty) return
       val out = new util.ArrayList[DeleteAclsResponseData.DeleteAclsMatchingAcl](fr.matchingAcls.size)
       fr.matchingAcls.forEach { m =>
-        val tenantOwned =
-          (m.resourceType == ResourceType.TOPIC.code && isReservedTenantNamespace(m.resourceName)) ||
-            isReservedUserPrincipalLiteral(m.principal)
-        if (!tenantOwned) out.add(m)
+        val mpt = PatternType.fromCode(m.patternType)
+        val topicTenant =
+          m.resourceType == ResourceType.TOPIC.code &&
+            isReservedTenantTopicAclName(m.resourceName, mpt)
+        val principalNsTenant =
+          (m.resourceType == ResourceType.GROUP.code ||
+            m.resourceType == ResourceType.TRANSACTIONAL_ID.code ||
+            m.resourceType == ResourceType.USER.code) &&
+            isReservedTenantPrincipalAclName(m.resourceName, mpt)
+        val principalTenant = isReservedUserPrincipalLiteral(m.principal)
+        if (!(topicTenant || principalNsTenant || principalTenant)) out.add(m)
       }
       fr.setMatchingAcls(out)
     }

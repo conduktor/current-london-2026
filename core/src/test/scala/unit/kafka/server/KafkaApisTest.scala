@@ -13786,10 +13786,16 @@ class KafkaApisTest extends Logging {
   private def aclCreation(resourceType: ResourceType,
                           resourceName: String,
                           principal: String): CreateAclsRequestData.AclCreation =
+    aclCreation(resourceType, resourceName, PatternType.LITERAL, principal)
+
+  private def aclCreation(resourceType: ResourceType,
+                          resourceName: String,
+                          patternType: PatternType,
+                          principal: String): CreateAclsRequestData.AclCreation =
     new CreateAclsRequestData.AclCreation()
       .setResourceType(resourceType.code)
       .setResourceName(resourceName)
-      .setResourcePatternType(PatternType.LITERAL.code)
+      .setResourcePatternType(patternType.code)
       .setPrincipal(principal)
       .setHost("*")
       .setOperation(AclOperation.READ.code)
@@ -13905,13 +13911,149 @@ class KafkaApisTest extends Logging {
       any[Option[AbstractResponse] => Unit]())
   }
 
+  // ------------------------------------------------------------------
+  // #157 — ACL PatternType.PREFIXED bypass of tenant-namespace guard.
+  // The LITERAL-only check used the literal `<tenantId>.` anchor; a PREFIXED
+  // binding whose name is the bare tenant id (`acme`), a strict prefix of it
+  // (`ac`, `""`), or the principal-prefix sentinel (`__tenant_`,
+  // `__tenant_acme`) was passed through, then matched in StandardAuthorizer
+  // by literal startsWith, granting on every tenant resource.
+  // ------------------------------------------------------------------
+
+  @Test
+  def testCreateAclsClusterWideListenerRefusesPrefixedDotlessTenantIdTopic(): Unit = {
+    // `Topic:PREFIXED:acme` matches every literal topic name starting with
+    // `acme` — including the entire `acme.*` tenant namespace.
+    val creation = aclCreation(ResourceType.TOPIC, "acme", PatternType.PREFIXED, "User:bob")
+    val req = new CreateAclsRequest.Builder(new CreateAclsRequestData()
+      .setCreations(util.Arrays.asList(creation))).build()
+    val request = buildRequest(req)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleCreateAclsRequest(request)
+
+    val response = verifyNoThrottling[CreateAclsResponse](request)
+    assertEquals(1, response.data.results.size)
+    assertEquals(Errors.INVALID_REQUEST.code, response.data.results.get(0).errorCode,
+      "PREFIXED:`<tenantId>` (no trailing dot) must be refused — it grants on every tenant topic")
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[AbstractRequest](), any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
+  def testCreateAclsClusterWideListenerRefusesPrefixedShortPrefixOfTenantIdTopic(): Unit = {
+    // `Topic:PREFIXED:ac` extends to `acme.*` (and to non-tenant names like
+    // `acoustic`). The presence of even one match in the tenant namespace
+    // requires refusal.
+    val creation = aclCreation(ResourceType.TOPIC, "ac", PatternType.PREFIXED, "User:bob")
+    val req = new CreateAclsRequest.Builder(new CreateAclsRequestData()
+      .setCreations(util.Arrays.asList(creation))).build()
+    val request = buildRequest(req)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleCreateAclsRequest(request)
+
+    val response = verifyNoThrottling[CreateAclsResponse](request)
+    assertEquals(Errors.INVALID_REQUEST.code, response.data.results.get(0).errorCode,
+      "PREFIXED:`<proper prefix of tenantId>` must be refused")
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[AbstractRequest](), any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
+  def testCreateAclsClusterWideListenerRefusesPrefixedEmptyNameTopicWhenTenantsBound(): Unit = {
+    // The empty prefix is the universal match — `Topic:PREFIXED:""` grants on
+    // every topic name. With at least one tenant bound, that includes the
+    // tenant namespace and must be refused.
+    val creation = aclCreation(ResourceType.TOPIC, "", PatternType.PREFIXED, "User:bob")
+    val req = new CreateAclsRequest.Builder(new CreateAclsRequestData()
+      .setCreations(util.Arrays.asList(creation))).build()
+    val request = buildRequest(req)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleCreateAclsRequest(request)
+
+    val response = verifyNoThrottling[CreateAclsResponse](request)
+    assertEquals(Errors.INVALID_REQUEST.code, response.data.results.get(0).errorCode,
+      "PREFIXED:`\"\"` must be refused when at least one tenant is bound")
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[AbstractRequest](), any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
+  def testCreateAclsClusterWideListenerAllowsPrefixedNonTenantTopic(): Unit = {
+    // `Topic:PREFIXED:public` does not overlap any bound tenant's anchor
+    // (`acme.`). It is a legitimate cluster-admin binding and must be forwarded.
+    val creation = aclCreation(ResourceType.TOPIC, "public", PatternType.PREFIXED, "User:bob")
+    val req = new CreateAclsRequest.Builder(new CreateAclsRequestData()
+      .setCreations(util.Arrays.asList(creation))).build()
+    val request = buildRequest(req)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleCreateAclsRequest(request)
+
+    verify(forwardingManager, times(1)).forwardRequest(
+      ArgumentMatchers.eq(request),
+      any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
+  def testCreateAclsClusterWideListenerRefusesPrefixedPrincipalNamespaceSentinel(): Unit = {
+    // `Group:PREFIXED:__tenant_` (or any prefix of `__tenant_`) matches every
+    // tenant principal-namespaced group id. Refusal is STRUCTURAL — independent
+    // of which tenants are currently bound.
+    val creation = aclCreation(ResourceType.GROUP, "__tenant_", PatternType.PREFIXED, "User:bob")
+    val req = new CreateAclsRequest.Builder(new CreateAclsRequestData()
+      .setCreations(util.Arrays.asList(creation))).build()
+    val request = buildRequest(req)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleCreateAclsRequest(request)
+
+    val response = verifyNoThrottling[CreateAclsResponse](request)
+    assertEquals(Errors.INVALID_REQUEST.code, response.data.results.get(0).errorCode,
+      "PREFIXED:`__tenant_` must be refused on principal-namespaced resource types")
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[AbstractRequest](), any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
+  def testCreateAclsClusterWideListenerRefusesPrefixedPrincipalNamespaceAnchorWithoutTrailingDot(): Unit = {
+    // `Group:PREFIXED:__tenant_acme` (no trailing `.`) matches every group id
+    // starting with `__tenant_acme` — including `__tenant_acme.cg-1`. This is
+    // exactly the bypass vector that the LITERAL-only check missed.
+    val creation = aclCreation(ResourceType.GROUP, "__tenant_acme", PatternType.PREFIXED, "User:bob")
+    val req = new CreateAclsRequest.Builder(new CreateAclsRequestData()
+      .setCreations(util.Arrays.asList(creation))).build()
+    val request = buildRequest(req)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleCreateAclsRequest(request)
+
+    val response = verifyNoThrottling[CreateAclsResponse](request)
+    assertEquals(Errors.INVALID_REQUEST.code, response.data.results.get(0).errorCode,
+      "PREFIXED:`__tenant_<id>` (no trailing dot) must be refused")
+  }
+
   private def aclFilter(resourceType: ResourceType,
                         resourceNameFilter: String,
+                        principalFilter: String): DeleteAclsRequestData.DeleteAclsFilter =
+    aclFilter(resourceType, resourceNameFilter, PatternType.LITERAL, principalFilter)
+
+  private def aclFilter(resourceType: ResourceType,
+                        resourceNameFilter: String,
+                        patternTypeFilter: PatternType,
                         principalFilter: String): DeleteAclsRequestData.DeleteAclsFilter =
     new DeleteAclsRequestData.DeleteAclsFilter()
       .setResourceTypeFilter(resourceType.code)
       .setResourceNameFilter(resourceNameFilter)
-      .setPatternTypeFilter(PatternType.LITERAL.code)
+      .setPatternTypeFilter(patternTypeFilter.code)
       .setPrincipalFilter(principalFilter)
       .setHostFilter(null)
       .setOperation(AclOperation.READ.code)
@@ -14057,6 +14199,104 @@ class KafkaApisTest extends Logging {
       "non-tenant matching ACL must not be scrubbed")
   }
 
+  @Test
+  def testDeleteAclsClusterWideListenerRefusesPrefixedDotlessTenantIdFilter(): Unit = {
+    // L1: `Topic:PREFIXED:acme` filter would delete every tenant binding. The
+    // pattern-aware guard refuses it before forwarding (#157).
+    val filter = aclFilter(ResourceType.TOPIC, "acme", PatternType.PREFIXED, null)
+    val req = new DeleteAclsRequest.Builder(new DeleteAclsRequestData()
+      .setFilters(util.Arrays.asList(filter))).build()
+    val request = buildRequest(req)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDeleteAclsRequest(request)
+
+    val response = verifyNoThrottling[DeleteAclsResponse](request)
+    assertEquals(Errors.INVALID_REQUEST.code, response.data.filterResults.get(0).errorCode)
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[AbstractRequest](), any[Option[AbstractResponse] => Unit]())
+    verify(forwardingManager, never()).forwardRequest(any[RequestChannel.Request](),
+      any[Option[AbstractResponse] => Unit]())
+  }
+
+  @Test
+  def testDeleteAclsClusterWideListenerRefusesPrefixedPrincipalNamespaceFilter(): Unit = {
+    // L1: `Group:PREFIXED:__tenant_acme` would yank every tenant group's ACLs.
+    val filter = aclFilter(ResourceType.GROUP, "__tenant_acme", PatternType.PREFIXED, null)
+    val req = new DeleteAclsRequest.Builder(new DeleteAclsRequestData()
+      .setFilters(util.Arrays.asList(filter))).build()
+    val request = buildRequest(req)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDeleteAclsRequest(request)
+
+    val response = verifyNoThrottling[DeleteAclsResponse](request)
+    assertEquals(Errors.INVALID_REQUEST.code, response.data.filterResults.get(0).errorCode)
+  }
+
+  @Test
+  def testDeleteAclsClusterWideListenerScrubsPrefixedTenantMatchingAcls(): Unit = {
+    // L2: wildcard filter is forwarded, but the controller's MatchingAcls
+    // response carries an entry `Topic:PREFIXED:acme` (the bypass shape that
+    // pre-#157 fall-through could have planted). The pattern-aware scrub
+    // removes it from the response so the caller can't enumerate the
+    // tenant-namespaced PREFIXED bindings even if the metadata log holds them.
+    val filter = aclFilter(ResourceType.TOPIC, null, null)
+    val req = new DeleteAclsRequest.Builder(new DeleteAclsRequestData()
+      .setFilters(util.Arrays.asList(filter))).build()
+    val request = buildRequest(req)
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDeleteAclsRequest(request)
+
+    val callbackCaptor: ArgumentCaptor[Option[AbstractResponse] => Unit] =
+      ArgumentCaptor.forClass(classOf[Option[AbstractResponse] => Unit])
+    verify(forwardingManager).forwardRequest(
+      ArgumentMatchers.eq(request), callbackCaptor.capture())
+
+    val controllerMatchingAcls = util.Arrays.asList(
+      new DeleteAclsResponseData.DeleteAclsMatchingAcl()
+        .setResourceType(ResourceType.TOPIC.code)
+        .setResourceName("acme")
+        .setPatternType(PatternType.PREFIXED.code)
+        .setPrincipal("User:bob")
+        .setHost("*")
+        .setOperation(AclOperation.READ.code)
+        .setPermissionType(AclPermissionType.ALLOW.code),
+      new DeleteAclsResponseData.DeleteAclsMatchingAcl()
+        .setResourceType(ResourceType.GROUP.code)
+        .setResourceName("__tenant_acme")
+        .setPatternType(PatternType.PREFIXED.code)
+        .setPrincipal("User:bob")
+        .setHost("*")
+        .setOperation(AclOperation.READ.code)
+        .setPermissionType(AclPermissionType.ALLOW.code),
+      new DeleteAclsResponseData.DeleteAclsMatchingAcl()
+        .setResourceType(ResourceType.TOPIC.code)
+        .setResourceName("plain-topic")
+        .setPatternType(PatternType.LITERAL.code)
+        .setPrincipal("User:bob")
+        .setHost("*")
+        .setOperation(AclOperation.READ.code)
+        .setPermissionType(AclPermissionType.ALLOW.code))
+    val filterResult = new DeleteAclsResponseData.DeleteAclsFilterResult()
+      .setErrorCode(Errors.NONE.code)
+      .setMatchingAcls(controllerMatchingAcls)
+    callbackCaptor.getValue.apply(Some(new DeleteAclsResponse(
+      new DeleteAclsResponseData().setFilterResults(util.Arrays.asList(filterResult)),
+      req.version)))
+
+    val response = verifyNoThrottling[DeleteAclsResponse](request)
+    val matching = response.data.filterResults.get(0).matchingAcls.asScala.toList
+    assertEquals(1, matching.size,
+      "PREFIXED matching entries that hit the tenant namespace must be scrubbed")
+    assertEquals("plain-topic", matching.head.resourceName)
+    assertEquals(PatternType.LITERAL.code, matching.head.patternType)
+  }
+
   // ------------------------------------------------------------------
   // DescribeAcls — tenant existence-oracle + namespace-enumeration leak
   // (KafkaApis.handleDescribeAcls L1 filter validation + L2 response scrub).
@@ -14124,6 +14364,47 @@ class KafkaApisTest extends Logging {
     // L1: PREFIXED filter naming `Topic:acme.` dumps every binding under
     // acme's topic namespace. Refuse outright.
     val req = describeAclsRequest(ResourceType.TOPIC, "acme.", PatternType.PREFIXED, null)
+    val request = buildRequest(req)
+    val auth = authorizerAllowingClusterDescribe()
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(
+      authorizer = Some(auth),
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDescribeAcls(request)
+
+    val response = verifyNoThrottling[DescribeAclsResponse](request)
+    assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED.code, response.data.errorCode)
+    verify(auth, never()).acls(any[AclBindingFilter]())
+  }
+
+  @Test
+  def testDescribeAclsClusterWideListenerRefusesPrefixedDotlessTenantIdTopicFilter(): Unit = {
+    // #157: `Topic:PREFIXED:acme` (no trailing dot) is the bypass shape that
+    // the LITERAL-anchor check missed — StandardAuthorizer's literal startsWith
+    // matches every `acme.*` binding. L1 must refuse this filter outright.
+    val req = describeAclsRequest(ResourceType.TOPIC, "acme", PatternType.PREFIXED, null)
+    val request = buildRequest(req)
+    val auth = authorizerAllowingClusterDescribe()
+
+    metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.LATEST_PRODUCTION)
+    kafkaApis = createKafkaApis(
+      authorizer = Some(auth),
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleDescribeAcls(request)
+
+    val response = verifyNoThrottling[DescribeAclsResponse](request)
+    assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED.code, response.data.errorCode,
+      "PREFIXED:`<tenantId>` (no trailing dot) must be refused at L1")
+    verify(auth, never()).acls(any[AclBindingFilter]())
+  }
+
+  @Test
+  def testDescribeAclsClusterWideListenerRefusesPrefixedPrincipalNamespaceSentinelGroupFilter(): Unit = {
+    // #157: `Group:PREFIXED:__tenant_acme` would echo back every tenant group
+    // binding via the wildcard match. Refuse at L1 to prevent the enumeration.
+    val req = describeAclsRequest(ResourceType.GROUP, "__tenant_acme",
+      PatternType.PREFIXED, null)
     val request = buildRequest(req)
     val auth = authorizerAllowingClusterDescribe()
 

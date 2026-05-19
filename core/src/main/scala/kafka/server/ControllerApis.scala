@@ -48,6 +48,7 @@ import org.apache.kafka.common.protocol.Errors._
 import org.apache.kafka.common.protocol.{ApiKeys, ApiMessage, Errors}
 import org.apache.kafka.common.quota.{ClientQuotaAlteration, ClientQuotaEntity}
 import org.apache.kafka.common.requests._
+import org.apache.kafka.common.resource.PatternType
 import org.apache.kafka.common.resource.Resource.CLUSTER_NAME
 import org.apache.kafka.common.resource.ResourceType
 import org.apache.kafka.common.resource.ResourceType.{CLUSTER, GROUP, TOPIC, USER}
@@ -1569,6 +1570,120 @@ class ControllerApis(
   // tenant flow). Refusal is keyed structurally on `__tenant_*` and
   // tenant-id-shape topic prefixes — works in split-mode KRaft (#114).
 
+  // Pattern-aware foreign-tenant predicate for TOPIC ACL resource names.
+  //
+  // LITERAL: matches the exact name only — defer to isForeignTenantNamespace.
+  //
+  // PREFIXED: matches every name starting with `name`. StandardAuthorizerData
+  // does a literal startsWith, so a binding `Topic:PREFIXED:acme` grants on
+  // every `acme.*` topic and `Topic:PREFIXED:ac` grants on every `acme.*` AND
+  // `acoustic*` AND `actor*`. The structural test is: can this pattern reach
+  // a topic in a foreign tenant namespace?
+  //   - empty name PREFIXED: matches every topic; refuse.
+  //   - starts with `_`: extension keeps the leading `_`, which excludes the
+  //     name from any tenant namespace (operator-internal carveout in
+  //     isForeignTenantNamespace). Allow.
+  //   - contains `.`: the first dot-segment is fixed by the pattern. If that
+  //     segment is a valid tenant id AND not callerTenant → REFUSE. Otherwise
+  //     allow (same as LITERAL semantics for the dot-bearing prefix).
+  //   - no `.`: any extension can introduce a dot and the resulting first
+  //     segment `<name><extension>` is a valid tenant id for SOME extension
+  //     (charset only forbids dots and a few separators). Foreign-tenant
+  //     extensions always exist, so REFUSE — even if `<name>` itself happens
+  //     to equal callerTenant (extensions like `acmef` still reach foreign
+  //     tenants).
+  //
+  // MATCH / ANY: a binding-matching query reaches both LITERAL and PREFIXED
+  // resources, so refuse if either predicate refuses.
+  private def isForeignTenantTopicAclName(
+      name: String,
+      patternType: PatternType,
+      callerTenant: Option[String]): Boolean = {
+    if (name == null) return false
+    patternType match {
+      case PatternType.LITERAL =>
+        isForeignTenantNamespace(name, callerTenant)
+      case PatternType.PREFIXED =>
+        isForeignTenantTopicPrefix(name, callerTenant)
+      case PatternType.MATCH | PatternType.ANY =>
+        isForeignTenantNamespace(name, callerTenant) ||
+          isForeignTenantTopicPrefix(name, callerTenant)
+      case _ => false
+    }
+  }
+
+  private def isForeignTenantTopicPrefix(name: String, callerTenant: Option[String]): Boolean = {
+    if (name.isEmpty) return true
+    if (name.startsWith("_")) return false
+    val dot = name.indexOf('.')
+    if (dot < 0) return true
+    val firstSeg = name.substring(0, dot)
+    try {
+      TenantNamespace.validateTenantId(firstSeg)
+    } catch {
+      case _: IllegalArgumentException => return false
+    }
+    !callerTenant.contains(firstSeg)
+  }
+
+  // Pattern-aware foreign-tenant predicate for principal-namespace ACL resource
+  // names (GROUP / TRANSACTIONAL_ID / USER).
+  //
+  // LITERAL: defer to isReservedTenantPrincipalNamespace + carve-out.
+  //
+  // PREFIXED: refuse when the pattern could match `__tenant_<other>.<user>`
+  // for some foreign tenant. Structurally this is:
+  //   - name is a prefix of `__tenant_` (so any extension can reach a foreign
+  //     tenant principal), OR
+  //   - name already starts with `__tenant_` AND the pattern leaves the
+  //     tenant-id portion under-constrained (no trailing `.` matching the
+  //     caller's id).
+  //
+  // Carve-out: PREFIXED:`__tenant_<caller>.<...>` is strictly inside caller's
+  // namespace and is allowed. Other shapes that could grow into the caller's
+  // namespace (e.g. PREFIXED:`__tenant_<caller>`) STILL match foreign tenants
+  // via single-char extensions (`__tenant_<caller>x.<user>`), so we refuse to
+  // be safe — denying a caller from creating an over-broad ACL on their own
+  // namespace via PREFIXED is acceptable; LITERAL still gives them precise
+  // reach.
+  //
+  // MATCH / ANY: union of LITERAL and PREFIXED.
+  private def isForeignTenantPrincipalAclName(
+      name: String,
+      patternType: PatternType,
+      callerTenant: Option[String]): Boolean = {
+    if (name == null) return false
+    patternType match {
+      case PatternType.LITERAL =>
+        isReservedTenantPrincipalNamespace(name) &&
+          !callerOwnsPrincipalNamespaceName(name, callerTenant)
+      case PatternType.PREFIXED =>
+        isForeignTenantPrincipalPrefix(name, callerTenant)
+      case PatternType.MATCH | PatternType.ANY =>
+        (isReservedTenantPrincipalNamespace(name) &&
+          !callerOwnsPrincipalNamespaceName(name, callerTenant)) ||
+          isForeignTenantPrincipalPrefix(name, callerTenant)
+      case _ => false
+    }
+  }
+
+  private def isForeignTenantPrincipalPrefix(name: String, callerTenant: Option[String]): Boolean = {
+    val prefix = TenantNamespace.PRINCIPAL_PREFIX
+    if (prefix.startsWith(name)) {
+      // name ∈ {"", "_", "__", ..., "__tenant_"} — matches every tenant
+      // principal regardless of callerTenant. Even a tenant caller can't
+      // create a sweep this broad.
+      return true
+    }
+    if (!name.startsWith(prefix)) return false
+    // name extends into the tenant-principal namespace. Carve-out: strictly
+    // inside callerTenant's namespace is allowed.
+    callerTenant match {
+      case Some(t) if name.startsWith(prefix + t + ".") => false
+      case _ => true
+    }
+  }
+
   // Returns Some(ApiError) for a binding that a non-owning caller must not
   // create. Reuses the structural helpers shared with the topic/group scrubs.
   private def aclTenantPollutionRefusal(
@@ -1577,14 +1692,14 @@ class ControllerApis(
     val resource = binding.pattern
     val resourceType = resource.resourceType
     val resourceName = resource.name
+    val patternType = resource.patternType
     val principalRefused = isReservedUserPrincipalLiteral(binding.entry.principal) &&
       !callerOwnsUserPrincipal(binding.entry.principal, callerTenant)
     val nameRefused = resourceType match {
       case ResourceType.TOPIC =>
-        isForeignTenantNamespace(resourceName, callerTenant)
+        isForeignTenantTopicAclName(resourceName, patternType, callerTenant)
       case ResourceType.GROUP | ResourceType.TRANSACTIONAL_ID | ResourceType.USER =>
-        isReservedTenantPrincipalNamespace(resourceName) &&
-          !callerOwnsPrincipalNamespaceName(resourceName, callerTenant)
+        isForeignTenantPrincipalAclName(resourceName, patternType, callerTenant)
       case _ => false
     }
     if (principalRefused || nameRefused) {
@@ -1605,13 +1720,13 @@ class ControllerApis(
       callerTenant: Option[String]): Option[ApiError] = {
     val pattern = filter.patternFilter
     val resourceName = pattern.name
+    val patternType = pattern.patternType
     val principal = filter.entryFilter.principal
     val nameRefused = resourceName != null && (pattern.resourceType match {
       case ResourceType.TOPIC =>
-        isForeignTenantNamespace(resourceName, callerTenant)
+        isForeignTenantTopicAclName(resourceName, patternType, callerTenant)
       case ResourceType.GROUP | ResourceType.TRANSACTIONAL_ID | ResourceType.USER =>
-        isReservedTenantPrincipalNamespace(resourceName) &&
-          !callerOwnsPrincipalNamespaceName(resourceName, callerTenant)
+        isForeignTenantPrincipalAclName(resourceName, patternType, callerTenant)
       case _ => false
     })
     val principalRefused = principal != null &&
@@ -1635,12 +1750,12 @@ class ControllerApis(
       callerTenant: Option[String]): Boolean = {
     val pattern = binding.pattern
     val name = pattern.name
+    val patternType = pattern.patternType
     val byName = pattern.resourceType match {
       case ResourceType.TOPIC =>
-        isForeignTenantNamespace(name, callerTenant)
+        isForeignTenantTopicAclName(name, patternType, callerTenant)
       case ResourceType.GROUP | ResourceType.TRANSACTIONAL_ID | ResourceType.USER =>
-        isReservedTenantPrincipalNamespace(name) &&
-          !callerOwnsPrincipalNamespaceName(name, callerTenant)
+        isForeignTenantPrincipalAclName(name, patternType, callerTenant)
       case _ => false
     }
     val byPrincipal = isReservedUserPrincipalLiteral(binding.entry.principal) &&

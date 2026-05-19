@@ -4001,10 +4001,16 @@ class ControllerApisTest {
   private def aclCreation(resourceType: ResourceType,
                           resourceName: String,
                           principal: String): CreateAclsRequestData.AclCreation =
+    aclCreation(resourceType, resourceName, PatternType.LITERAL, principal)
+
+  private def aclCreation(resourceType: ResourceType,
+                          resourceName: String,
+                          patternType: PatternType,
+                          principal: String): CreateAclsRequestData.AclCreation =
     new CreateAclsRequestData.AclCreation()
       .setResourceType(resourceType.code)
       .setResourceName(resourceName)
-      .setResourcePatternType(PatternType.LITERAL.code)
+      .setResourcePatternType(patternType.code)
       .setPrincipal(principal)
       .setHost("*")
       .setOperation(AclOperation.READ.code)
@@ -4013,10 +4019,16 @@ class ControllerApisTest {
   private def aclFilter(resourceType: ResourceType,
                         resourceNameFilter: String,
                         principalFilter: String): DeleteAclsRequestData.DeleteAclsFilter =
+    aclFilter(resourceType, resourceNameFilter, PatternType.LITERAL, principalFilter)
+
+  private def aclFilter(resourceType: ResourceType,
+                        resourceNameFilter: String,
+                        patternType: PatternType,
+                        principalFilter: String): DeleteAclsRequestData.DeleteAclsFilter =
     new DeleteAclsRequestData.DeleteAclsFilter()
       .setResourceTypeFilter(resourceType.code)
       .setResourceNameFilter(resourceNameFilter)
-      .setPatternTypeFilter(PatternType.LITERAL.code)
+      .setPatternTypeFilter(patternType.code)
       .setPrincipalFilter(principalFilter)
       .setHostFilter(null)
       .setOperation(AclOperation.READ.code)
@@ -4317,6 +4329,222 @@ class ControllerApisTest {
     }.toSet
     assertEquals(Set((ResourceType.TOPIC.code, "plain-topic", "User:bob")), surviving,
       "tenant-named TOPIC, tenant-shaped GROUP, and tenant principal echo must all be scrubbed")
+  }
+
+  // ---------------------------------------------------------------------------
+  // #157 PREFIXED bypass — ControllerApis path mirror.
+  //
+  // StandardAuthorizer literal-startsWith semantics: a PREFIXED binding
+  // `Topic:PREFIXED:acme` matches every literal topic name beginning with
+  // "acme", which includes the entire tenant `acme.*` namespace. The legacy
+  // LITERAL-only structural guard on the controller listener never inspected
+  // PREFIXED, so any cluster-acting admin reaching bootstrap.controllers could
+  // plant a binding that covers a tenant namespace under names like
+  // `Topic:PREFIXED:acme`, `Topic:PREFIXED:ac`, `Topic:PREFIXED:""`, or
+  // `Group:PREFIXED:__tenant_*`. The new dispatcher must refuse all of these
+  // structurally — `tenantConfig.allTenants` is empty in split-mode KRaft
+  // controller, so the refusal cannot rely on a known-tenant list.
+  // ---------------------------------------------------------------------------
+
+  @Test
+  def testControllerCreateAclsRefusesPrefixedDotlessTenantIdTopicOnBootstrapControllers(): Unit = {
+    // `Topic:PREFIXED:acme` — dotless first segment that, on extension to
+    // `acme.<topic>`, would belong to tenant acme. Refuse structurally.
+    val creation = aclCreation(ResourceType.TOPIC, "acme", PatternType.PREFIXED, "User:bob")
+    val req = new CreateAclsRequest.Builder(new CreateAclsRequestData()
+      .setCreations(util.Arrays.asList(creation))).build()
+    val request = buildControllerRequest(req)
+
+    val auth = authorizerAllowingClusterOps()
+    controllerApis = createControllerApis(
+      authorizer = Some(auth),
+      controller = new MockController.Builder().build(),
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    controllerApis.handleCreateAclsRequest(request).get()
+
+    val response = captureSentResponse(request).asInstanceOf[CreateAclsResponse]
+    assertEquals(Errors.INVALID_REQUEST.code, response.results.get(0).errorCode,
+      "controller-direct CreateAcls must refuse PREFIXED:acme — startsWith-matches the entire acme.* namespace")
+    verify(auth, never()).createAcls(any(), any())
+  }
+
+  @Test
+  def testControllerCreateAclsRefusesPrefixedShortPrefixOfTenantIdTopicOnBootstrapControllers(): Unit = {
+    // `Topic:PREFIXED:ac` — strict prefix of `acme`. StandardAuthorizer
+    // startsWith would still match `acme.*`, so the structural refusal must
+    // treat any dotless first segment as polluting (it could extend into any
+    // tenant id).
+    val creation = aclCreation(ResourceType.TOPIC, "ac", PatternType.PREFIXED, "User:bob")
+    val req = new CreateAclsRequest.Builder(new CreateAclsRequestData()
+      .setCreations(util.Arrays.asList(creation))).build()
+    val request = buildControllerRequest(req)
+
+    val auth = authorizerAllowingClusterOps()
+    controllerApis = createControllerApis(
+      authorizer = Some(auth),
+      controller = new MockController.Builder().build(),
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    controllerApis.handleCreateAclsRequest(request).get()
+
+    val response = captureSentResponse(request).asInstanceOf[CreateAclsResponse]
+    assertEquals(Errors.INVALID_REQUEST.code, response.results.get(0).errorCode,
+      "controller-direct CreateAcls must refuse PREFIXED:ac — extends to acme.* and any other tenant id beginning with `ac`")
+    verify(auth, never()).createAcls(any(), any())
+  }
+
+  @Test
+  def testControllerCreateAclsRefusesPrefixedEmptyNameTopicOnBootstrapControllers(): Unit = {
+    // `Topic:PREFIXED:""` — universal startsWith match. Refuse on the
+    // controller listener too: the broker-side guard would refuse it, and the
+    // controller-direct path must not leave a hole.
+    val creation = aclCreation(ResourceType.TOPIC, "", PatternType.PREFIXED, "User:bob")
+    val req = new CreateAclsRequest.Builder(new CreateAclsRequestData()
+      .setCreations(util.Arrays.asList(creation))).build()
+    val request = buildControllerRequest(req)
+
+    val auth = authorizerAllowingClusterOps()
+    controllerApis = createControllerApis(
+      authorizer = Some(auth),
+      controller = new MockController.Builder().build(),
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    controllerApis.handleCreateAclsRequest(request).get()
+
+    val response = captureSentResponse(request).asInstanceOf[CreateAclsResponse]
+    assertEquals(Errors.INVALID_REQUEST.code, response.results.get(0).errorCode,
+      "controller-direct CreateAcls must refuse PREFIXED:\"\" — empty prefix matches every literal name")
+    verify(auth, never()).createAcls(any(), any())
+  }
+
+  @Test
+  def testControllerCreateAclsAllowsPrefixedUnderscoreTopicOnBootstrapControllers(): Unit = {
+    // Positive control: `Topic:PREFIXED:_` is the Connect / `_confluent-*`
+    // operator carveout. The structural guard must not refuse the entire `_`
+    // namespace just because PREFIXED is now policed.
+    val creation = aclCreation(ResourceType.TOPIC, "_", PatternType.PREFIXED, "User:bob")
+    val req = new CreateAclsRequest.Builder(new CreateAclsRequestData()
+      .setCreations(util.Arrays.asList(creation))).build()
+    val request = buildControllerRequest(req)
+
+    val auth = authorizerAllowingClusterOps()
+    val createdFuture = new CompletableFuture[AclCreateResult]()
+    createdFuture.complete(AclCreateResult.SUCCESS)
+    when(auth.createAcls(any[AuthorizableRequestContext](), any[util.List[AclBinding]]()))
+      .thenAnswer(inv => {
+        val bindings = inv.getArgument[util.List[AclBinding]](1)
+        val out = new util.ArrayList[CompletableFuture[AclCreateResult]](bindings.size)
+        bindings.forEach(_ => out.add(createdFuture))
+        out
+      })
+    controllerApis = createControllerApis(
+      authorizer = Some(auth),
+      controller = new MockController.Builder().build(),
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    controllerApis.handleCreateAclsRequest(request).get()
+
+    val response = captureSentResponse(request).asInstanceOf[CreateAclsResponse]
+    assertEquals(Errors.NONE.code, response.results.get(0).errorCode,
+      "PREFIXED:_ is the operator carveout and must remain forwarded to the Authorizer")
+    verify(auth).createAcls(any(), any())
+  }
+
+  @Test
+  def testControllerCreateAclsRefusesPrefixedPrincipalNamespaceSentinelOnBootstrapControllers(): Unit = {
+    // `Group:PREFIXED:__tenant_` — the sentinel prefix itself, which under
+    // startsWith matches every tenant-encoded group id. Refuse structurally.
+    val creation = aclCreation(ResourceType.GROUP, "__tenant_", PatternType.PREFIXED, "User:bob")
+    val req = new CreateAclsRequest.Builder(new CreateAclsRequestData()
+      .setCreations(util.Arrays.asList(creation))).build()
+    val request = buildControllerRequest(req)
+
+    val auth = authorizerAllowingClusterOps()
+    controllerApis = createControllerApis(
+      authorizer = Some(auth),
+      controller = new MockController.Builder().build(),
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    controllerApis.handleCreateAclsRequest(request).get()
+
+    val response = captureSentResponse(request).asInstanceOf[CreateAclsResponse]
+    assertEquals(Errors.INVALID_REQUEST.code, response.results.get(0).errorCode,
+      "controller-direct CreateAcls must refuse PREFIXED:__tenant_ — startsWith-matches every tenant group id")
+    verify(auth, never()).createAcls(any(), any())
+  }
+
+  @Test
+  def testControllerCreateAclsRefusesPrefixedPrincipalAnchorWithoutTrailingDotOnBootstrapControllers(): Unit = {
+    // `Group:PREFIXED:__tenant_acme` (no trailing dot) extends to
+    // `__tenant_acmex.<user>` and friends — foreign tenant ids that begin with
+    // the bound tenant's id. Refuse structurally so the dot-anchor invariant
+    // is not bypassed by omitting the dot.
+    val creation = aclCreation(ResourceType.GROUP, "__tenant_acme", PatternType.PREFIXED, "User:bob")
+    val req = new CreateAclsRequest.Builder(new CreateAclsRequestData()
+      .setCreations(util.Arrays.asList(creation))).build()
+    val request = buildControllerRequest(req)
+
+    val auth = authorizerAllowingClusterOps()
+    controllerApis = createControllerApis(
+      authorizer = Some(auth),
+      controller = new MockController.Builder().build(),
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    controllerApis.handleCreateAclsRequest(request).get()
+
+    val response = captureSentResponse(request).asInstanceOf[CreateAclsResponse]
+    assertEquals(Errors.INVALID_REQUEST.code, response.results.get(0).errorCode,
+      "controller-direct CreateAcls must refuse PREFIXED:__tenant_acme — anchor without trailing dot reaches foreign tenants")
+    verify(auth, never()).createAcls(any(), any())
+  }
+
+  @Test
+  def testControllerDeleteAclsRefusesPrefixedDotlessTenantIdFilterOnBootstrapControllers(): Unit = {
+    // DeleteAcls L1 dispatch must refuse PREFIXED:acme too — otherwise a
+    // cluster-acting caller could enumerate every tenant binding under acme.
+    val filter = aclFilter(ResourceType.TOPIC, "acme", PatternType.PREFIXED, null)
+    val req = new DeleteAclsRequest.Builder(new DeleteAclsRequestData()
+      .setFilters(util.Arrays.asList(filter))).build()
+    val request = buildControllerRequest(req)
+
+    val auth = authorizerAllowingClusterOps()
+    controllerApis = createControllerApis(
+      authorizer = Some(auth),
+      controller = new MockController.Builder().build(),
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    controllerApis.handleDeleteAclsRequest(request).get()
+
+    val response = captureSentResponse(request).asInstanceOf[DeleteAclsResponse]
+    assertEquals(Errors.INVALID_REQUEST.code, response.filterResults.get(0).errorCode,
+      "controller-direct DeleteAcls must refuse PREFIXED:acme — startsWith-matches the entire acme.* namespace")
+    verify(auth, never()).deleteAcls(any(), any())
+  }
+
+  @Test
+  def testControllerDescribeAclsScrubsPrefixedTenantBindingsFromWildcard(): Unit = {
+    // DescribeAcls on the controller listener post-filters bindings via the
+    // pattern-aware `aclTenantBindingAllowed` callback. A PREFIXED binding
+    // planted with a dotless `Topic:PREFIXED:acme` name (the #157 bypass shape)
+    // would otherwise be echoed verbatim to the cluster-direct caller because
+    // its literal name does not lexically equal `acme.`. The new
+    // pattern-aware helpers must refuse that binding too.
+    val req = describeAclsRequest(ResourceType.ANY, null, PatternType.ANY, null)
+    val request = buildControllerRequest(req)
+
+    val auth = authorizerAllowingClusterOps()
+    when(auth.acls(any[AclBindingFilter]()))
+      .thenReturn(util.Arrays.asList(
+        aclBinding(ResourceType.TOPIC, "acme", PatternType.PREFIXED, "User:bob"),
+        aclBinding(ResourceType.GROUP, "__tenant_", PatternType.PREFIXED, "User:bob"),
+        aclBinding(ResourceType.GROUP, "__tenant_acme", PatternType.PREFIXED, "User:bob"),
+        aclBinding(ResourceType.TOPIC, "plain-topic", PatternType.LITERAL, "User:bob")))
+    controllerApis = createControllerApis(
+      authorizer = Some(auth),
+      controller = new MockController.Builder().build(),
+      tenantConfig = tenantConfigBinding("acme", "TENANT_ACME"))
+    controllerApis.handleDescribeAclsRequest(request).get()
+
+    val response = captureSentResponse(request).asInstanceOf[DescribeAclsResponse]
+    val surviving = response.acls.asScala.flatMap { res =>
+      res.acls.asScala.map(a => (res.resourceType, res.resourceName, a.principal))
+    }.toSet
+    assertEquals(Set((ResourceType.TOPIC.code, "plain-topic", "User:bob")), surviving,
+      "PREFIXED bypass bindings (Topic:PREFIXED:acme, Group:PREFIXED:__tenant_, Group:PREFIXED:__tenant_acme) must be scrubbed")
   }
 
   @Test
