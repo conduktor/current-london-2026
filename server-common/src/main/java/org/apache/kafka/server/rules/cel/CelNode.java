@@ -822,6 +822,22 @@ abstract class CelNode {
         if (l instanceof Map && r instanceof Map) {
             return mapEqualsDeep((Map<?, ?>) l, (Map<?, ?>) r);
         }
+        // R29 #256: String/String fell through to Objects.equals, which
+        // calls String.equals — walking up to min(|l|,|r|) chars without
+        // charging the step budget. Compare.eval and InList.eval charge
+        // per-char for TOP-LEVEL String/String pairs, but any String
+        // compare reached via listEqualsDeep / mapEqualsDeep (nested-list
+        // or nested-map equality) hit this fallthrough. Charge the linear
+        // cost here so leaf-level string compares converge to the same
+        // O(total-char-work) accounting that the deep helpers give for
+        // List/Map shapes. The bump happens BEFORE .equals() so input
+        // shaped to hit a reference-equality fast-path cannot defeat
+        // the charge.
+        if (l instanceof String && r instanceof String) {
+            int len = Math.min(((String) l).length(), ((String) r).length());
+            CelLimits.bumpSteps(Math.max(1, len));
+            return l.equals(r);
+        }
         return Objects.equals(l, r);
     }
 

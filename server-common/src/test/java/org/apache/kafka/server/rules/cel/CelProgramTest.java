@@ -1201,6 +1201,52 @@ public class CelProgramTest {
     }
 
     @Test
+    public void nestedStringEqualityRecursivelyChargesPerCharAgainstBudget() {
+        // R29 sweep #3 finding (Task #256): valueEquals dispatched
+        // List/Map/Number explicitly, but fell through to Objects.equals
+        // for everything else — including String/String. Compare.eval and
+        // InList.eval only charge per-char on TOP-LEVEL String/String pairs;
+        // a List of long strings hides each pair-wise compare from the
+        // budget once execution enters listEqualsDeep. AbstractList.equals
+        // and the Objects.equals fallback together walked the full
+        // min(|s|,|t|) chars without charging a single step.
+        //
+        // Attack: `[fatStr1, fatStr2, …] == [fatStr1', fatStr2', …]` where
+        // each pair is deep-equal so listEqualsDeep walks every element.
+        // Pre-fix accounting for 20 elements × 6000 chars each:
+        //   1 (Compare baseline) + 20 (listEqualsDeep size bump) = 21 steps,
+        //   far under MAX_EVAL_STEPS=100_000 → rule returns true.
+        // Post-fix valueEquals charges Math.max(1, min(|s|,|t|)) per
+        // String/String pair: 1 + 20 + 20*6000 = 120_021 > 100_000 → trips
+        // the budget on iteration ~17 before completing the walk.
+        //
+        // The strings are constructed with `new String(...)` so reference
+        // equality fails — Objects.equals must call .equals(), walking the
+        // chars. After the fix, valueEquals charges those chars upfront
+        // regardless of reference equality, so an attacker cannot defeat
+        // the charge by interning.
+        StringBuilder sb = new StringBuilder();
+        for (int n = 0; n < 6000; n++) {
+            sb.append('a');
+        }
+        String fat = sb.toString();
+        java.util.List<Object> left = new java.util.ArrayList<>();
+        java.util.List<Object> right = new java.util.ArrayList<>();
+        for (int n = 0; n < 20; n++) {
+            // Distinct String instances per element on both sides — defeat
+            // String interning so the equality check actually walks chars
+            // in the pre-fix Objects.equals path.
+            left.add(new String(fat));
+            right.add(new String(fat));
+        }
+        Map<String, Object> env = new HashMap<>();
+        env.put("xs", left);
+        env.put("ys", right);
+        assertThrows(CelEvaluationException.class,
+            () -> evalBool("xs == ys", env));
+    }
+
+    @Test
     public void listLiteralConstructionChargesPerElementAgainstBudget() {
         // Round-10 audit: ListLiteral.eval charged zero per element. A
         // literal allocated inside a comprehension paid for its
