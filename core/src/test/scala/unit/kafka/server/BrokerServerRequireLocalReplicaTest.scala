@@ -166,30 +166,91 @@ class BrokerServerRequireLocalReplicaTest {
   // ---------------------------------------------------------------------
   // Hostile Unicode whitespace — Java String.trim() only strips codepoints
   // <= U+0020. Anything above survives trimming and fails the exact match,
-  // which is the SAFE outcome. R40-F-2: pin the contract the javadoc claims.
+  // which is the SAFE outcome. R40-F-2 + R41-D wave pin the contract the
+  // javadoc claims.
+  //
+  // All codepoints are written as `\uXXXX` escapes (R41-D-1) so a future
+  // editor / git filter / source-NFC normalisation cannot silently mutate
+  // the literal to ASCII space without the test still claiming to test what
+  // it claimed before.
+  //
+  // Locale.ROOT case-folding is checked manually: none of the codepoints
+  // below map to ASCII under `toLowerCase(Locale.ROOT)`, so the lowercase
+  // step cannot accidentally strip the hostile codepoint either.
   // ---------------------------------------------------------------------
 
   @Test
   def nbspPrefixedFalseKeepsGateEngaged(): Unit = {
     // U+00A0 NO-BREAK SPACE — not stripped by String.trim().
-    assertTrue(BrokerServer.parseRequireLocalReplica(" false"))
+    assertTrue(BrokerServer.parseRequireLocalReplica("\u00A0false"))
   }
 
   @Test
   def nnbspPrefixedFalseKeepsGateEngaged(): Unit = {
     // U+202F NARROW NO-BREAK SPACE — not stripped by String.trim().
-    assertTrue(BrokerServer.parseRequireLocalReplica(" false"))
+    assertTrue(BrokerServer.parseRequireLocalReplica("\u202Ffalse"))
   }
 
   @Test
   def zwspPrefixedFalseKeepsGateEngaged(): Unit = {
     // U+200B ZERO-WIDTH SPACE — invisible, not stripped by String.trim().
-    assertTrue(BrokerServer.parseRequireLocalReplica("​false"))
+    assertTrue(BrokerServer.parseRequireLocalReplica("\u200Bfalse"))
   }
 
   @Test
   def ideographicSpacePrefixedFalseKeepsGateEngaged(): Unit = {
     // U+3000 IDEOGRAPHIC SPACE — not stripped by String.trim().
-    assertTrue(BrokerServer.parseRequireLocalReplica("　false"))
+    assertTrue(BrokerServer.parseRequireLocalReplica("\u3000false"))
+  }
+
+  @Test
+  def softHyphenPrefixedFalseKeepsGateEngaged(): Unit = {
+    // U+00AD SOFT HYPHEN — highest-realism paste hazard from Word /
+    // Confluence / sloppy property files. Not stripped by String.trim().
+    // R41-D-2.
+    assertTrue(BrokerServer.parseRequireLocalReplica("\u00ADfalse"))
+  }
+
+  @Test
+  def bomPrefixedFalseKeepsGateEngaged(): Unit = {
+    // U+FEFF BYTE-ORDER MARK / ZERO WIDTH NO-BREAK SPACE — common paste
+    // hazard from files saved as UTF-8-with-BOM. Not stripped by
+    // String.trim(). Note: a future `replaceAll("\\s+", ...)` upstream using
+    // `Pattern.UNICODE_CHARACTER_CLASS` WOULD match U+FEFF and silently flip
+    // this to fail-OPEN — exactly the regression this test pins. R41-D-2.
+    assertTrue(BrokerServer.parseRequireLocalReplica("\uFEFFfalse"))
+  }
+
+  @Test
+  def stringTrimInvariantHoldsForHostileCodepoints(): Unit = {
+    // Orthogonal invariant test (R41-D-3): the SAFE behaviour above hinges
+    // on the JDK contract that `String.trim()` only strips codepoints
+    // <= U+0020. If that ever changes (JDK behaviour change, or upstream
+    // someone replaces `.trim` with `.strip()` / `replaceAll("\\s+", ...)`)
+    // every test above silently becomes vacuous (would pass for the wrong
+    // reason: trim DOES strip, then "false" matches, then assertTrue still
+    // says true on a different code path). This test pins the invariant
+    // directly so a regression there breaks loudly.
+    val hostileCodepoints = Seq(
+      0x00A0, // NBSP
+      0x202F, // NNBSP
+      0x200B, // ZWSP
+      0x3000, // IDEOGRAPHIC SPACE
+      0x00AD, // SOFT HYPHEN
+      0xFEFF, // BOM / ZWNBSP
+      0x2007, // FIGURE SPACE
+      0x2028, // LINE SEPARATOR
+      0x2029, // PARAGRAPH SEPARATOR
+      0x2060, // WORD JOINER
+      0x1680, // OGHAM SPACE MARK
+      0x180E  // MONGOLIAN VOWEL SEPARATOR
+    )
+    for (cp <- hostileCodepoints) {
+      val s = new String(Character.toChars(cp)) + "false"
+      assertEquals(
+        s, s.trim,
+        f"U+$cp%04X must survive String.trim — parser fail-closed contract depends on this"
+      )
+    }
   }
 }

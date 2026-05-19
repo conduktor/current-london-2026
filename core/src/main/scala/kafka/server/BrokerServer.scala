@@ -259,9 +259,13 @@ object BrokerServer {
    *       (consumed here) — with no rolling-restart story for moving the gate.
    *       (Note: {@link DynamicBrokerConfig#verifyReconfigurableConfigs}
    *       enforces {@code configNames ∩ nonDynamicProps == ∅} and would
-   *       fail-fast at construction time if the key were placed in
-   *       {@code nonDynamicProps} while a listener wired it, but that catches
-   *       only one of the two ways the maintainer might wire it wrong.)</li>
+   *       throw {@code IllegalArgumentException} when the listener is
+   *       registered (via {@code addReconfigurable}/{@code addBrokerReconfigurable}
+   *       during broker startup, not at {@code DynamicBrokerConfig}
+   *       construction) if the key were placed in {@code nonDynamicProps}
+   *       while a listener wired it. That catches only one of the two ways
+   *       the maintainer might wire it wrong — the listener-versus-dynamic-set
+   *       case passes through.)</li>
    *   <li>An admit-time ConfigException on a malformed value (which
    *       ConfigDef.BOOLEAN would raise for, say, {@code "off"}) would
    *       reject the ENTIRE incremental alteration batch, including
