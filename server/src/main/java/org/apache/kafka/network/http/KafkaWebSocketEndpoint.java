@@ -209,10 +209,13 @@ public final class KafkaWebSocketEndpoint implements Session.Listener.AutoDemand
      * granted or the endpoint has already torn down.
      *
      * <p>The pattern matches {@link WsStreamer#scheduleDrainAfter(long)}: the same JDK static delayer
-     * fires the timer, then dispatches to the Jetty thread pool. A {@code RejectedExecutionException}
-     * at dispatch time (broker shutting down) completes the dependent future exceptionally and is
-     * logged at DEBUG — without the terminal exception handler the failure would be silently dropped
-     * and the deadline would simply never enforce.
+     * fires the timer, then dispatches to the Jetty thread pool. The {@code .exceptionally} handler
+     * catches an uncaught throw from inside {@link #onSubscribeDeadlineFired()} (the action is already
+     * fully defensive, so this is a future-proofing safety net, not a routine path). A
+     * {@code RejectedExecutionException} raised when the delayer eventually submits to a stopped
+     * {@code httpExecutor} surfaces inside the JDK delayer thread, not through the dependent future —
+     * the deadline simply never enforces in that race, and the Jetty idle timeout remains the
+     * defence-in-depth signal.
      */
     private void scheduleSubscribeDeadline() {
         try {
@@ -220,7 +223,7 @@ public final class KafkaWebSocketEndpoint implements Session.Listener.AutoDemand
                 CompletableFuture.delayedExecutor(
                     PRE_SUBSCRIBE_IDLE_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS, httpExecutor))
                 .exceptionally(t -> {
-                    LOG.debug("WS subscribe-deadline dispatch failed on {}: {}", topic,
+                    LOG.debug("WS subscribe-deadline handler threw on {}: {}", topic,
                         t == null ? "null" : t.toString());
                     return null;
                 });
