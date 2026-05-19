@@ -1069,11 +1069,70 @@ class ControllerApis(
     authHelper.authorizeClusterOperation(request, ALTER)
     val context = new ControllerRequestContext(request.context.header.data, request.context.principal,
       requestTimeoutMsToDeadlineNs(time, alterRequest.data.timeoutMs))
-    controller.alterPartitionReassignments(context, alterRequest.data)
-      .thenApply[Unit] { response =>
-        requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
-          new AlterPartitionReassignmentsResponse(response.setThrottleTimeMs(requestThrottleMs)))
+
+    // r19 ADV-A HIGH #145: AlterPartitionReassignments only requires CLUSTER ALTER and forwards
+    // the topic name straight to ReplicationControlManager — no concentration-aware filter. A
+    // CLUSTER ALTER operator could move the backing topic's replicas (transparently relocating
+    // every co-tenant logical topic on that backing — stealth re-tenanting / cross-tenant data
+    // locality breach) or attempt to move a declared logical topic (which has no physical
+    // partitions in KRaft metadata, leaking the declared-logical set as an UNKNOWN_TOPIC oracle
+    // observable to any CLUSTER ALTER principal). Synthesize per-partition INVALID_REQUEST for
+    // shadowed names and forward only unshadowed entries. Cluster auth has already cleared, so
+    // disclosing the operator-remediation message is bounded to principals already privileged
+    // for the operation — same precedence used by DeleteTopics/CreatePartitions on declared
+    // names. The controller is short-circuited (never called) if every entry is shadowed.
+    val shadowedNames = declaredLogicalTopicNames ++ declaredBackingTopicNames
+    val (shadowedTopics, unshadowedTopics) =
+      alterRequest.data.topics.asScala.toSeq.partition(t => shadowedNames.contains(t.name))
+
+    val shadowedResponses = shadowedTopics.map { topic =>
+      val message = if (declaredLogicalTopicNames.contains(topic.name)) {
+        s"Topic '${topic.name}' is a declared logical topic in concentration.logical.topics " +
+          "on this controller. Logical topics have no physical partitions in KRaft metadata; " +
+          "partition reassignment does not apply. Remove the declaration from the controller's " +
+          "broker config and restart, then any physical topic of the same name can be " +
+          "reassigned via the normal path."
+      } else {
+        s"Topic '${topic.name}' is the backing topic for one or more declared logical topics " +
+          "in concentration.logical.topics on this controller. Reassigning the backing's " +
+          "replicas would transparently relocate every co-tenant logical topic on this " +
+          "backing partition and is rejected to prevent stealth cross-tenant data movement. " +
+          "Remove the declaration(s) and restart to reassign the backing."
       }
+      val partitionResponses = new util.ArrayList[AlterPartitionReassignmentsResponseData.ReassignablePartitionResponse]()
+      topic.partitions.forEach { p =>
+        partitionResponses.add(new AlterPartitionReassignmentsResponseData.ReassignablePartitionResponse()
+          .setPartitionIndex(p.partitionIndex)
+          .setErrorCode(INVALID_REQUEST.code)
+          .setErrorMessage(message))
+      }
+      new AlterPartitionReassignmentsResponseData.ReassignableTopicResponse()
+        .setName(topic.name)
+        .setPartitions(partitionResponses)
+    }
+
+    if (unshadowedTopics.isEmpty) {
+      // Every requested topic was shadowed: short-circuit the controller round-trip.
+      val response = new AlterPartitionReassignmentsResponseData()
+        .setErrorCode(NONE.code)
+        .setErrorMessage(null)
+      shadowedResponses.foreach(response.responses.add)
+      requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
+        new AlterPartitionReassignmentsResponse(response.setThrottleTimeMs(requestThrottleMs)))
+      CompletableFuture.completedFuture[Unit](())
+    } else {
+      val forwardedData = new AlterPartitionReassignmentsRequestData()
+        .setTimeoutMs(alterRequest.data.timeoutMs)
+      unshadowedTopics.foreach(forwardedData.topics.add)
+      controller.alterPartitionReassignments(context, forwardedData)
+        .thenApply[Unit] { response =>
+          // Append shadow rejections to whatever the controller returned. Topic order matches
+          // existing partition-handler convention (controller-handled first, then synthesized).
+          shadowedResponses.foreach(response.responses.add)
+          requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
+            new AlterPartitionReassignmentsResponse(response.setThrottleTimeMs(requestThrottleMs)))
+        }
+    }
   }
 
   private def handleAlterUserScramCredentials(request: RequestChannel.Request): CompletableFuture[Unit] = {
@@ -1205,8 +1264,42 @@ class ControllerApis(
     authHelper.authorizeClusterOperation(request, DESCRIBE)
     val context = new ControllerRequestContext(request.context.header.data, request.context.principal,
       OptionalLong.empty())
-    controller.listPartitionReassignments(context, listRequest.data)
+
+    // r19 ADV-A HIGH #145 (list side): never disclose ongoing reassignments for declared
+    // logical or backing topics. Logical names have no physical partitions in KRaft metadata
+    // and would be silently skipped by the controller — but filter explicitly so the
+    // declared-logical set isn't probed as an enumeration oracle by CLUSTER DESCRIBE
+    // principals via response-shape side-channels. Backing names normally cannot have a new
+    // reassignment initiated (AlterPartitionReassignments rejects them above), but any pre-
+    // existing reassignment must not surface here — observing "backing-X is being moved" is
+    // itself the stealth-re-tenanting signal the AlterPartitionReassignments guard prevents.
+    val shadowedNames = declaredLogicalTopicNames ++ declaredBackingTopicNames
+    val forwardedData = if (listRequest.data.topics == null) {
+      // List-all: forward as-is; we filter the response below.
+      listRequest.data
+    } else {
+      // Explicit topic list: strip shadowed names before they reach the controller.
+      val filtered = new ListPartitionReassignmentsRequestData()
+        .setTimeoutMs(listRequest.data.timeoutMs)
+      val filteredTopics = new util.ArrayList[ListPartitionReassignmentsRequestData.ListPartitionReassignmentsTopics]()
+      listRequest.data.topics.forEach { t =>
+        if (!shadowedNames.contains(t.name)) filteredTopics.add(t)
+      }
+      filtered.setTopics(filteredTopics)
+    }
+
+    controller.listPartitionReassignments(context, forwardedData)
       .thenApply[Unit] { response =>
+        if (shadowedNames.nonEmpty) {
+          // Defense-in-depth: even if no backing reassignment can be initiated through this
+          // controller anymore, a list-all response prepared from a topicList==null request
+          // would still surface any pre-existing or out-of-band reassignment on a declared
+          // name. Strip them.
+          val iterator = response.topics.iterator()
+          while (iterator.hasNext) {
+            if (shadowedNames.contains(iterator.next().name)) iterator.remove()
+          }
+        }
         requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
           new ListPartitionReassignmentsResponse(response.setThrottleTimeMs(requestThrottleMs)))
       }

@@ -1660,6 +1660,457 @@ class ControllerApisTest {
       anyBoolean)
   }
 
+  // ---------------------------------------------------------------------------------------------
+  // r19 ADV-A HIGH #146 — AlterConfigs / IncrementalAlterConfigs concentration guard.
+  //
+  // Without this guard, an operator holding ALTER_CONFIGS on a TOPIC resource named after a
+  // declared backing topic could mutate retention.bytes / cleanup.policy / segment.bytes /
+  // min.insync.replicas on the substrate, disrupting EVERY logical tenant sharing that backing.
+  // For declared-logical names, AlterConfigs has no defined semantics in v1 (task #105 tracks
+  // wiring descriptor changes through the kernel) — silently routing to the underlying
+  // controller either lands the change on a phantom physical topic or returns
+  // UNKNOWN_TOPIC_OR_PARTITION. Both are wrong: must be explicitly rejected with a clear
+  // operator remediation message.
+  //
+  // The controller is the canonical mutation point (broker-side preprocess is "nothing to do"
+  // for TOPIC and forwards directly to the controller), so one guard at handleLegacyAlterConfigs
+  // / handleIncrementalAlterConfigs covers both legacy and incremental, both controller- and
+  // broker-originated paths. Auth-first / shadow-second precedence preserved per #128/#137/#139.
+  // ---------------------------------------------------------------------------------------------
+
+  @Test
+  def testLegacyAlterConfigsRejectsDeclaredLogicalTopic(): Unit = {
+    val controller = mock(classOf[Controller])
+    val props = new Properties()
+    props.put(ServerConfigs.CONCENTRATION_LOGICAL_TOPICS_CONFIG, "orders:100:shared:4")
+    controllerApis = createControllerApis(None, controller, props)
+    // controller stub returns NONE for any name that DOES reach it.
+    when(controller.legacyAlterConfigs(any(), any(), anyBoolean()))
+      .thenReturn(CompletableFuture.completedFuture(Collections.emptyMap[ConfigResource, ApiError]()))
+
+    val requestData = new AlterConfigsRequestData().setResources(
+      new OldAlterConfigsResourceCollection(util.Arrays.asList(
+        new OldAlterConfigsResource().
+          setResourceName("orders").
+          setResourceType(ConfigResource.Type.TOPIC.id()).
+          setConfigs(new OldAlterableConfigCollection(util.Arrays.asList(new OldAlterableConfig().
+            setName(TopicConfig.RETENTION_BYTES_CONFIG).
+            setValue("1000000")).iterator())),
+        new OldAlterConfigsResource().
+          setResourceName("safe").
+          setResourceType(ConfigResource.Type.TOPIC.id()).
+          setConfigs(new OldAlterableConfigCollection(util.Arrays.asList(new OldAlterableConfig().
+            setName(TopicConfig.RETENTION_BYTES_CONFIG).
+            setValue("1000000")).iterator()))
+      ).iterator()))
+    val request = buildRequest(new AlterConfigsRequest(requestData, 0))
+    controllerApis.handleLegacyAlterConfigs(request)
+
+    val capturedResponse: ArgumentCaptor[AbstractResponse] =
+      ArgumentCaptor.forClass(classOf[AbstractResponse])
+    verify(requestChannel).sendResponse(
+      ArgumentMatchers.eq(request), capturedResponse.capture(), ArgumentMatchers.eq(None))
+    val response = capturedResponse.getValue.asInstanceOf[AlterConfigsResponse]
+    val byName = response.data().responses().asScala.map(r => r.resourceName() -> r).toMap
+    assertEquals(INVALID_TOPIC_EXCEPTION.code(), byName("orders").errorCode(),
+      "AlterConfigs on a declared logical topic must be rejected with INVALID_TOPIC_EXCEPTION")
+    assertTrue(Option(byName("orders").errorMessage()).exists(_.contains("logical topic")),
+      s"error message must explain the rejection: ${byName("orders").errorMessage()}")
+    // The rejected resource must NOT reach the underlying controller; the controller may still
+    // be invoked for the non-shadowed "safe" name.
+    verify(controller, never()).legacyAlterConfigs(
+      any(),
+      ArgumentMatchers.argThat[util.Map[ConfigResource, util.Map[String, String]]](map =>
+        map.keySet().asScala.exists(_.name() == "orders")),
+      anyBoolean())
+  }
+
+  @Test
+  def testLegacyAlterConfigsRejectsDeclaredBackingTopic(): Unit = {
+    val controller = mock(classOf[Controller])
+    val props = new Properties()
+    props.put(ServerConfigs.CONCENTRATION_LOGICAL_TOPICS_CONFIG, "orders:100:shared:4")
+    controllerApis = createControllerApis(None, controller, props)
+    when(controller.legacyAlterConfigs(any(), any(), anyBoolean()))
+      .thenReturn(CompletableFuture.completedFuture(Collections.emptyMap[ConfigResource, ApiError]()))
+
+    val requestData = new AlterConfigsRequestData().setResources(
+      new OldAlterConfigsResourceCollection(util.Arrays.asList(
+        new OldAlterConfigsResource().
+          setResourceName("shared").
+          setResourceType(ConfigResource.Type.TOPIC.id()).
+          setConfigs(new OldAlterableConfigCollection(util.Arrays.asList(new OldAlterableConfig().
+            setName(TopicConfig.RETENTION_BYTES_CONFIG).
+            setValue("1000000")).iterator()))
+      ).iterator()))
+    val request = buildRequest(new AlterConfigsRequest(requestData, 0))
+    controllerApis.handleLegacyAlterConfigs(request)
+
+    val capturedResponse: ArgumentCaptor[AbstractResponse] =
+      ArgumentCaptor.forClass(classOf[AbstractResponse])
+    verify(requestChannel).sendResponse(
+      ArgumentMatchers.eq(request), capturedResponse.capture(), ArgumentMatchers.eq(None))
+    val response = capturedResponse.getValue.asInstanceOf[AlterConfigsResponse]
+    val byName = response.data().responses().asScala.map(r => r.resourceName() -> r).toMap
+    assertEquals(INVALID_TOPIC_EXCEPTION.code(), byName("shared").errorCode(),
+      "AlterConfigs on a backing topic of a declared logical must be rejected with INVALID_TOPIC_EXCEPTION")
+    assertTrue(Option(byName("shared").errorMessage()).exists(_.contains("backing topic")),
+      s"error message must explain the rejection: ${byName("shared").errorMessage()}")
+    verify(controller, never()).legacyAlterConfigs(
+      any(),
+      ArgumentMatchers.argThat[util.Map[ConfigResource, util.Map[String, String]]](map =>
+        map.keySet().asScala.exists(_.name() == "shared")),
+      anyBoolean())
+  }
+
+  @Test
+  def testIncrementalAlterConfigsRejectsDeclaredLogicalTopic(): Unit = {
+    val controller = mock(classOf[Controller])
+    val props = new Properties()
+    props.put(ServerConfigs.CONCENTRATION_LOGICAL_TOPICS_CONFIG, "orders:100:shared:4")
+    controllerApis = createControllerApis(None, controller, props)
+    when(controller.incrementalAlterConfigs(any(), any(), anyBoolean()))
+      .thenReturn(CompletableFuture.completedFuture(Collections.emptyMap[ConfigResource, ApiError]()))
+
+    val requestData = new IncrementalAlterConfigsRequestData().setResources(
+      new AlterConfigsResourceCollection(util.Arrays.asList(
+        new AlterConfigsResource().
+          setResourceName("orders").
+          setResourceType(ConfigResource.Type.TOPIC.id()).
+          setConfigs(new AlterableConfigCollection(util.Arrays.asList(new AlterableConfig().
+            setName(TopicConfig.CLEANUP_POLICY_CONFIG).
+            setValue("compact").
+            setConfigOperation(AlterConfigOp.OpType.SET.id())).iterator())),
+        new AlterConfigsResource().
+          setResourceName("safe").
+          setResourceType(ConfigResource.Type.TOPIC.id()).
+          setConfigs(new AlterableConfigCollection(util.Arrays.asList(new AlterableConfig().
+            setName(TopicConfig.RETENTION_BYTES_CONFIG).
+            setValue("1000000").
+            setConfigOperation(AlterConfigOp.OpType.SET.id())).iterator()))
+      ).iterator()))
+    val request = buildRequest(new IncrementalAlterConfigsRequest.Builder(requestData).build(0))
+    controllerApis.handleIncrementalAlterConfigs(request)
+
+    val capturedResponse: ArgumentCaptor[AbstractResponse] =
+      ArgumentCaptor.forClass(classOf[AbstractResponse])
+    verify(requestChannel).sendResponse(
+      ArgumentMatchers.eq(request), capturedResponse.capture(), ArgumentMatchers.eq(None))
+    val response = capturedResponse.getValue.asInstanceOf[IncrementalAlterConfigsResponse]
+    val byName = response.data().responses().asScala.map(r => r.resourceName() -> r).toMap
+    assertEquals(INVALID_TOPIC_EXCEPTION.code(), byName("orders").errorCode(),
+      "IncrementalAlterConfigs on a declared logical topic must be rejected with INVALID_TOPIC_EXCEPTION")
+    assertTrue(Option(byName("orders").errorMessage()).exists(_.contains("logical topic")),
+      s"error message must explain the rejection: ${byName("orders").errorMessage()}")
+    verify(controller, never()).incrementalAlterConfigs(
+      any(),
+      ArgumentMatchers.argThat[util.Map[ConfigResource, util.Map[String, util.Map.Entry[AlterConfigOp.OpType, String]]]](map =>
+        map.keySet().asScala.exists(_.name() == "orders")),
+      anyBoolean())
+  }
+
+  @Test
+  def testIncrementalAlterConfigsRejectsDeclaredBackingTopic(): Unit = {
+    val controller = mock(classOf[Controller])
+    val props = new Properties()
+    props.put(ServerConfigs.CONCENTRATION_LOGICAL_TOPICS_CONFIG, "orders:100:shared:4")
+    controllerApis = createControllerApis(None, controller, props)
+    when(controller.incrementalAlterConfigs(any(), any(), anyBoolean()))
+      .thenReturn(CompletableFuture.completedFuture(Collections.emptyMap[ConfigResource, ApiError]()))
+
+    val requestData = new IncrementalAlterConfigsRequestData().setResources(
+      new AlterConfigsResourceCollection(util.Arrays.asList(
+        new AlterConfigsResource().
+          setResourceName("shared").
+          setResourceType(ConfigResource.Type.TOPIC.id()).
+          setConfigs(new AlterableConfigCollection(util.Arrays.asList(new AlterableConfig().
+            setName(TopicConfig.RETENTION_BYTES_CONFIG).
+            setValue("1").
+            setConfigOperation(AlterConfigOp.OpType.SET.id())).iterator()))
+      ).iterator()))
+    val request = buildRequest(new IncrementalAlterConfigsRequest.Builder(requestData).build(0))
+    controllerApis.handleIncrementalAlterConfigs(request)
+
+    val capturedResponse: ArgumentCaptor[AbstractResponse] =
+      ArgumentCaptor.forClass(classOf[AbstractResponse])
+    verify(requestChannel).sendResponse(
+      ArgumentMatchers.eq(request), capturedResponse.capture(), ArgumentMatchers.eq(None))
+    val response = capturedResponse.getValue.asInstanceOf[IncrementalAlterConfigsResponse]
+    val byName = response.data().responses().asScala.map(r => r.resourceName() -> r).toMap
+    assertEquals(INVALID_TOPIC_EXCEPTION.code(), byName("shared").errorCode(),
+      "IncrementalAlterConfigs on a backing topic of a declared logical must be rejected with INVALID_TOPIC_EXCEPTION")
+    assertTrue(Option(byName("shared").errorMessage()).exists(_.contains("backing topic")),
+      s"error message must explain the rejection: ${byName("shared").errorMessage()}")
+    verify(controller, never()).incrementalAlterConfigs(
+      any(),
+      ArgumentMatchers.argThat[util.Map[ConfigResource, util.Map[String, util.Map.Entry[AlterConfigOp.OpType, String]]]](map =>
+        map.keySet().asScala.exists(_.name() == "shared")),
+      anyBoolean())
+  }
+
+  /**
+   * r19 ADV-A HIGH #146 — auth-first / shadow-second precedence for AlterConfigs.
+   *
+   * When a TOPIC name is BOTH unauthorized (no ALTER_CONFIGS) AND a declared-logical/backing
+   * collider, the controller must return TOPIC_AUTHORIZATION_FAILED — NOT the operator
+   * remediation message. Otherwise the declared-logical / declared-backing sets are enumerable
+   * by any principal who can probe arbitrary names without ALTER_CONFIGS. Mirrors the precedence
+   * pinned for CreateTopics / DeleteTopics / CreatePartitions (#128/#137/#139).
+   */
+  @Test
+  def testAlterConfigsShadowDefersToAuthorizationFailure(): Unit = {
+    val controller = mock(classOf[Controller])
+    val props = new Properties()
+    props.put(ServerConfigs.CONCENTRATION_LOGICAL_TOPICS_CONFIG, "orders:100:shared:4")
+    when(controller.incrementalAlterConfigs(any(), any(), anyBoolean()))
+      .thenReturn(CompletableFuture.completedFuture(Collections.emptyMap[ConfigResource, ApiError]()))
+    // Deny-all authorizer: every authorize() call returns DENIED.
+    controllerApis = createControllerApis(Some(createDenyAllAuthorizer()), controller, props)
+
+    val requestData = new IncrementalAlterConfigsRequestData().setResources(
+      new AlterConfigsResourceCollection(util.Arrays.asList(
+        new AlterConfigsResource().
+          setResourceName("orders").
+          setResourceType(ConfigResource.Type.TOPIC.id()).
+          setConfigs(new AlterableConfigCollection(util.Arrays.asList(new AlterableConfig().
+            setName(TopicConfig.RETENTION_BYTES_CONFIG).
+            setValue("1").
+            setConfigOperation(AlterConfigOp.OpType.SET.id())).iterator())),
+        new AlterConfigsResource().
+          setResourceName("shared").
+          setResourceType(ConfigResource.Type.TOPIC.id()).
+          setConfigs(new AlterableConfigCollection(util.Arrays.asList(new AlterableConfig().
+            setName(TopicConfig.RETENTION_BYTES_CONFIG).
+            setValue("1").
+            setConfigOperation(AlterConfigOp.OpType.SET.id())).iterator()))
+      ).iterator()))
+    val request = buildRequest(new IncrementalAlterConfigsRequest.Builder(requestData).build(0))
+    controllerApis.handleIncrementalAlterConfigs(request)
+
+    val capturedResponse: ArgumentCaptor[AbstractResponse] =
+      ArgumentCaptor.forClass(classOf[AbstractResponse])
+    verify(requestChannel).sendResponse(
+      ArgumentMatchers.eq(request), capturedResponse.capture(), ArgumentMatchers.eq(None))
+    val response = capturedResponse.getValue.asInstanceOf[IncrementalAlterConfigsResponse]
+    val byName = response.data().responses().asScala.map(r => r.resourceName() -> r.errorCode()).toMap
+    assertEquals(TOPIC_AUTHORIZATION_FAILED.code(), byName("orders"),
+      "unauthorized declared-logical name must return TOPIC_AUTHORIZATION_FAILED, " +
+        "not the operator remediation message (which would leak the declared set)")
+    assertEquals(TOPIC_AUTHORIZATION_FAILED.code(), byName("shared"),
+      "unauthorized backing name must also return TOPIC_AUTHORIZATION_FAILED")
+    verify(controller, never()).incrementalAlterConfigs(any(), any(), anyBoolean())
+  }
+
+  /**
+   * r19 ADV-A HIGH #145 — AlterPartitionReassignments on a backing topic name must be
+   * rejected. Without this guard, a CLUSTER ALTER operator could move the backing topic's
+   * replicas, which transparently moves data for every co-tenant logical topic on that
+   * backing — a stealth re-tenanting attack or accidental cross-tenant data-locality
+   * breach. Per-partition INVALID_REQUEST mirrors the precedence used by DeleteTopics /
+   * CreatePartitions on declared names; cluster auth has already cleared, so disclosure
+   * of the operator-remediation message is bounded to privileged principals.
+   */
+  @Test
+  def testAlterPartitionReassignmentsRejectsBackingTopic(): Unit = {
+    val controller = mock(classOf[Controller])
+    val props = new Properties()
+    props.put(ServerConfigs.CONCENTRATION_LOGICAL_TOPICS_CONFIG, "orders:100:shared:4")
+    controllerApis = createControllerApis(None, controller, props)
+
+    val backingPartitions = new util.ArrayList[AlterPartitionReassignmentsRequestData.ReassignablePartition]()
+    backingPartitions.add(new AlterPartitionReassignmentsRequestData.ReassignablePartition()
+      .setPartitionIndex(0).setReplicas(java.util.Arrays.asList(1, 2, 3)))
+    backingPartitions.add(new AlterPartitionReassignmentsRequestData.ReassignablePartition()
+      .setPartitionIndex(1).setReplicas(java.util.Arrays.asList(2, 3, 4)))
+    val safePartitions = new util.ArrayList[AlterPartitionReassignmentsRequestData.ReassignablePartition]()
+    safePartitions.add(new AlterPartitionReassignmentsRequestData.ReassignablePartition()
+      .setPartitionIndex(0).setReplicas(java.util.Arrays.asList(1, 2, 3)))
+    val data = new AlterPartitionReassignmentsRequestData().setTimeoutMs(30000)
+    data.topics.add(new AlterPartitionReassignmentsRequestData.ReassignableTopic()
+      .setName("shared").setPartitions(backingPartitions))
+    data.topics.add(new AlterPartitionReassignmentsRequestData.ReassignableTopic()
+      .setName("safe").setPartitions(safePartitions))
+
+    val controllerResponse = new AlterPartitionReassignmentsResponseData().setErrorMessage(null)
+    val safeTopicResp = new AlterPartitionReassignmentsResponseData.ReassignableTopicResponse().setName("safe")
+    safeTopicResp.partitions.add(new AlterPartitionReassignmentsResponseData.ReassignablePartitionResponse()
+      .setPartitionIndex(0).setErrorCode(NONE.code))
+    controllerResponse.responses.add(safeTopicResp)
+    when(controller.alterPartitionReassignments(any[ControllerRequestContext],
+      ArgumentMatchers.argThat[AlterPartitionReassignmentsRequestData](req =>
+        req.topics.asScala.forall(_.name == "safe"))))
+      .thenReturn(CompletableFuture.completedFuture(controllerResponse))
+
+    val response = handleRequest[AlterPartitionReassignmentsResponse](
+      new AlterPartitionReassignmentsRequest.Builder(data).build(), controllerApis)
+    val topicResponses = response.data.responses.asScala.map(t => t.name -> t).toMap
+
+    val sharedResp = topicResponses("shared")
+    assertEquals(2, sharedResp.partitions.size)
+    sharedResp.partitions.asScala.foreach { p =>
+      assertEquals(INVALID_REQUEST.code, p.errorCode,
+        s"AlterPartitionReassignments on backing partition ${p.partitionIndex} must be rejected")
+      assertTrue(p.errorMessage != null && p.errorMessage.contains("backing topic"),
+        s"error message must identify the backing-topic rejection: ${p.errorMessage}")
+    }
+
+    val safeResp = topicResponses("safe")
+    assertEquals(1, safeResp.partitions.size)
+    assertEquals(NONE.code, safeResp.partitions.get(0).errorCode,
+      "non-shadowed topic must still pass through to the controller")
+
+    // The shadow rejection must NOT reach the underlying controller for the backing name.
+    verify(controller, never()).alterPartitionReassignments(
+      any[ControllerRequestContext],
+      ArgumentMatchers.argThat[AlterPartitionReassignmentsRequestData](req =>
+        req.topics.asScala.exists(_.name == "shared")))
+  }
+
+  /**
+   * r19 ADV-A HIGH #145 (logical side) — AlterPartitionReassignments on a declared logical
+   * topic name must also be rejected. Logical topics have no physical partitions in KRaft
+   * metadata; passing them through would surface UNKNOWN_TOPIC_OR_PARTITION as an
+   * enumeration oracle observable to any CLUSTER ALTER principal. Reject explicitly with
+   * INVALID_REQUEST and a remediation message.
+   */
+  @Test
+  def testAlterPartitionReassignmentsRejectsLogicalTopic(): Unit = {
+    val controller = mock(classOf[Controller])
+    val props = new Properties()
+    props.put(ServerConfigs.CONCENTRATION_LOGICAL_TOPICS_CONFIG, "orders:100:shared:4")
+    controllerApis = createControllerApis(None, controller, props)
+
+    val logicalPartitions = new util.ArrayList[AlterPartitionReassignmentsRequestData.ReassignablePartition]()
+    logicalPartitions.add(new AlterPartitionReassignmentsRequestData.ReassignablePartition()
+      .setPartitionIndex(7).setReplicas(java.util.Arrays.asList(1, 2, 3)))
+    val data = new AlterPartitionReassignmentsRequestData().setTimeoutMs(30000)
+    data.topics.add(new AlterPartitionReassignmentsRequestData.ReassignableTopic()
+      .setName("orders").setPartitions(logicalPartitions))
+
+    val response = handleRequest[AlterPartitionReassignmentsResponse](
+      new AlterPartitionReassignmentsRequest.Builder(data).build(), controllerApis)
+    val ordersResp = response.data.responses.asScala.find(_.name == "orders").get
+    assertEquals(1, ordersResp.partitions.size)
+    val partResp = ordersResp.partitions.get(0)
+    assertEquals(INVALID_REQUEST.code, partResp.errorCode,
+      "AlterPartitionReassignments on a declared logical topic must be rejected with INVALID_REQUEST")
+    assertTrue(partResp.errorMessage != null && partResp.errorMessage.contains("declared logical topic"),
+      s"error message must identify the logical-topic rejection: ${partResp.errorMessage}")
+
+    // The controller is short-circuited because every requested topic was shadowed.
+    verify(controller, never()).alterPartitionReassignments(
+      any[ControllerRequestContext], any[AlterPartitionReassignmentsRequestData])
+  }
+
+  /**
+   * r19 ADV-A HIGH #145 — legitimate (non-concentration) reassignments must still pass
+   * through unchanged. Proves no regression on the unconcentrated control path.
+   */
+  @Test
+  def testAlterPartitionReassignmentsAllowsRegularTopic(): Unit = {
+    val controller = mock(classOf[Controller])
+    val props = new Properties()
+    props.put(ServerConfigs.CONCENTRATION_LOGICAL_TOPICS_CONFIG, "orders:100:shared:4")
+    controllerApis = createControllerApis(None, controller, props)
+
+    val partitions = new util.ArrayList[AlterPartitionReassignmentsRequestData.ReassignablePartition]()
+    partitions.add(new AlterPartitionReassignmentsRequestData.ReassignablePartition()
+      .setPartitionIndex(0).setReplicas(java.util.Arrays.asList(1, 2, 3)))
+    val data = new AlterPartitionReassignmentsRequestData().setTimeoutMs(30000)
+    data.topics.add(new AlterPartitionReassignmentsRequestData.ReassignableTopic()
+      .setName("regular").setPartitions(partitions))
+
+    val controllerResponse = new AlterPartitionReassignmentsResponseData().setErrorMessage(null)
+    val regularResp = new AlterPartitionReassignmentsResponseData.ReassignableTopicResponse().setName("regular")
+    regularResp.partitions.add(new AlterPartitionReassignmentsResponseData.ReassignablePartitionResponse()
+      .setPartitionIndex(0).setErrorCode(NONE.code))
+    controllerResponse.responses.add(regularResp)
+    when(controller.alterPartitionReassignments(any[ControllerRequestContext],
+      any[AlterPartitionReassignmentsRequestData]))
+      .thenReturn(CompletableFuture.completedFuture(controllerResponse))
+
+    val response = handleRequest[AlterPartitionReassignmentsResponse](
+      new AlterPartitionReassignmentsRequest.Builder(data).build(), controllerApis)
+    val resp = response.data.responses.asScala.find(_.name == "regular").get
+    assertEquals(NONE.code, resp.partitions.get(0).errorCode,
+      "non-shadowed topic must reach the controller and return its result unchanged")
+  }
+
+  /**
+   * r19 ADV-A HIGH #145 (list side, explicit) — ListPartitionReassignments must not surface
+   * declared logical or backing topics when listed by name. The controller would silently
+   * skip logical names (no metadata) but stripping them before forwarding closes a
+   * response-shape enumeration oracle, and stripping backing names prevents observing the
+   * stealth-re-tenanting signal a backing reassignment in flight would otherwise expose.
+   */
+  @Test
+  def testListPartitionReassignmentsFiltersDeclaredTopicsByName(): Unit = {
+    val controller = mock(classOf[Controller])
+    val props = new Properties()
+    props.put(ServerConfigs.CONCENTRATION_LOGICAL_TOPICS_CONFIG, "orders:100:shared:4")
+    controllerApis = createControllerApis(None, controller, props)
+
+    val data = new ListPartitionReassignmentsRequestData().setTimeoutMs(30000)
+    val topics = new util.ArrayList[ListPartitionReassignmentsRequestData.ListPartitionReassignmentsTopics]()
+    topics.add(new ListPartitionReassignmentsRequestData.ListPartitionReassignmentsTopics()
+      .setName("orders").setPartitionIndexes(java.util.Arrays.asList(Integer.valueOf(0))))
+    topics.add(new ListPartitionReassignmentsRequestData.ListPartitionReassignmentsTopics()
+      .setName("shared").setPartitionIndexes(java.util.Arrays.asList(Integer.valueOf(0))))
+    topics.add(new ListPartitionReassignmentsRequestData.ListPartitionReassignmentsTopics()
+      .setName("regular").setPartitionIndexes(java.util.Arrays.asList(Integer.valueOf(0))))
+    data.setTopics(topics)
+
+    val controllerResponse = new ListPartitionReassignmentsResponseData().setErrorMessage(null)
+    when(controller.listPartitionReassignments(any[ControllerRequestContext],
+      ArgumentMatchers.argThat[ListPartitionReassignmentsRequestData](req =>
+        req.topics != null && req.topics.size == 1 && req.topics.get(0).name == "regular")))
+      .thenReturn(CompletableFuture.completedFuture(controllerResponse))
+
+    handleRequest[ListPartitionReassignmentsResponse](
+      new ListPartitionReassignmentsRequest.Builder(data).build(), controllerApis)
+
+    // The controller must NEVER see the declared topic names on the request side.
+    verify(controller, never()).listPartitionReassignments(
+      any[ControllerRequestContext],
+      ArgumentMatchers.argThat[ListPartitionReassignmentsRequestData](req =>
+        req.topics != null && req.topics.asScala.exists(t => t.name == "orders" || t.name == "shared")))
+  }
+
+  /**
+   * r19 ADV-A HIGH #145 (list side, all) — when ListPartitionReassignments is called with
+   * a null topic list (list-all), any declared logical or backing topic surfacing in the
+   * controller's response must be stripped before the client sees it. Defense-in-depth in
+   * case a backing reassignment was initiated out-of-band or pre-declaration.
+   */
+  @Test
+  def testListPartitionReassignmentsFiltersDeclaredTopicsFromListAllResponse(): Unit = {
+    val controller = mock(classOf[Controller])
+    val props = new Properties()
+    props.put(ServerConfigs.CONCENTRATION_LOGICAL_TOPICS_CONFIG, "orders:100:shared:4")
+    controllerApis = createControllerApis(None, controller, props)
+
+    val data = new ListPartitionReassignmentsRequestData().setTimeoutMs(30000)
+    // topics == null means "list all"
+    data.setTopics(null)
+
+    val controllerResponse = new ListPartitionReassignmentsResponseData().setErrorMessage(null)
+    controllerResponse.topics.add(new ListPartitionReassignmentsResponseData.OngoingTopicReassignment()
+      .setName("regular"))
+    controllerResponse.topics.add(new ListPartitionReassignmentsResponseData.OngoingTopicReassignment()
+      .setName("shared"))
+    controllerResponse.topics.add(new ListPartitionReassignmentsResponseData.OngoingTopicReassignment()
+      .setName("orders"))
+    when(controller.listPartitionReassignments(any[ControllerRequestContext],
+      any[ListPartitionReassignmentsRequestData]))
+      .thenReturn(CompletableFuture.completedFuture(controllerResponse))
+
+    val response = handleRequest[ListPartitionReassignmentsResponse](
+      new ListPartitionReassignmentsRequest.Builder(data).build(), controllerApis)
+    val names = response.data.topics.asScala.map(_.name).toSet
+    assertEquals(Set("regular"), names,
+      "declared logical and backing topics must be stripped from the list-all response")
+  }
+
   @ParameterizedTest(name = "testCreatePartitionsMutationQuota with throttle: {0}")
   @ValueSource(booleans = Array(true, false))
   def testCreatePartitionsMutationQuota(throttle: Boolean): Unit = {
