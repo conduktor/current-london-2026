@@ -542,7 +542,22 @@ public final class RuleEngine {
                     + "principal; reject at startup rather than "
                     + "under-granting the bypass silently.");
             }
-            out.add(principal.toString());
+            // Round-22 HIGH (Agent 5 H-1): assemble the canonical
+            // "type:name" form explicitly rather than calling toString.
+            // SecurityUtils.parseKafkaPrincipal currently always returns the
+            // base KafkaPrincipal class, whose toString() is documented as
+            // `principalType + ":" + name`. But the runtime match site in
+            // KafkaApis already builds the canonical form by hand
+            // (`p.getPrincipalType + ":" + p.getName`, see KafkaApis L246-247)
+            // precisely because custom KafkaPrincipal subclasses sometimes
+            // override toString to append role/group/auth metadata. Closing
+            // the asymmetry here means that if parseKafkaPrincipal is ever
+            // refactored to return a subclass — or someone wires a
+            // KafkaPrincipalBuilder-derived principal into this method — the
+            // allow-list entries stay canonical and continue to match the
+            // KafkaApis bypass check. Cost: two field reads, no allocation
+            // change (StringBuilder concat already used by toString).
+            out.add(type + ":" + name);
         }
         return Collections.unmodifiableSet(out);
     }

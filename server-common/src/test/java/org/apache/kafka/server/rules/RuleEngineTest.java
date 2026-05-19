@@ -1180,6 +1180,47 @@ public class RuleEngineTest {
     }
 
     @Test
+    public void parseBypassPrincipalsCanonicalFormMatchesKafkaApisRuntimeBuild() {
+        // Round-22 HIGH (Agent 5 H-1): the runtime bypass check in
+        // KafkaApis builds the principal-string by hand
+        // (`p.getPrincipalType + ":" + p.getName`, see KafkaApis L246-247)
+        // — NOT by calling `principal.toString()`. The reason is that
+        // custom KafkaPrincipal subclasses (wired via a
+        // KafkaPrincipalBuilder) sometimes override toString to append
+        // role/group/auth metadata, and using toString would produce a
+        // runtime string that never matches a canonical allow-list entry.
+        // Pin that the allow-list-build side uses the same hand-built
+        // form, so a future refactor of parseKafkaPrincipal (or the
+        // wiring of a subclass) cannot silently break the bypass.
+        //
+        // The pin is asserted positionally: every entry returned must
+        // equal `type + ":" + name` for the canonical KafkaPrincipal we
+        // would have constructed from the input.
+        String[] inputs = {
+            "User:broker",
+            "User:CN=Broker One,OU=Kafka Brokers,O=Example Corp,C=US",
+            "Role:cluster-admin"
+        };
+        for (String in : inputs) {
+            java.util.Set<String> out = RuleEngine.parseBypassPrincipals(in);
+            assertEquals(1, out.size(), "single entry must parse to single canonical form: " + in);
+            String got = out.iterator().next();
+            // Build the same canonical form KafkaApis would build at
+            // request time. If parseBypassPrincipals ever reverted to
+            // `principal.toString()` and someone wired a subclass that
+            // augments toString, this assertion would break with a clear
+            // diff between the two forms.
+            org.apache.kafka.common.security.auth.KafkaPrincipal p =
+                org.apache.kafka.common.utils.SecurityUtils.parseKafkaPrincipal(in);
+            String runtimeBuild = p.getPrincipalType() + ":" + p.getName();
+            assertEquals(runtimeBuild, got,
+                "parseBypassPrincipals must emit `type + \":\" + name` so it matches "
+                    + "the KafkaApis runtime bypass check, not principal.toString() "
+                    + "(which custom subclasses may override). input=" + in);
+        }
+    }
+
+    @Test
     public void parseBypassPrincipalsThrowsOnEntryWithoutSeparator() {
         // SecurityUtils.parseKafkaPrincipal requires "type:name" and throws
         // when no ':' separator is present. We propagate that behaviour so
