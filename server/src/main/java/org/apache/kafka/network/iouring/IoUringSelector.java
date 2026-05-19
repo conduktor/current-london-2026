@@ -1031,9 +1031,7 @@ public final class IoUringSelector implements BrokerSelector {
         // calls transport.removeInterestOps(OP_READ), which our IoUringTransportLayer
         // override translates into Netty autoRead=false, so kernel-level backpressure
         // happens atomically with the state transition.
-        KafkaChannel channel = channels.get(id);
-        if (channel == null) channel = closingChannels.get(id);
-        if (channel == null) return;
+        KafkaChannel channel = openOrClosingChannelOrFail(id);
         KafkaChannelMuteBridge.mute(channel);
         // Track operator-driven mutes separately from self-mutes due to memory pressure.
         // The recovery loop at the top of poll() uses this set to decide which channels
@@ -1043,9 +1041,7 @@ public final class IoUringSelector implements BrokerSelector {
 
     @Override
     public void unmute(String id) {
-        KafkaChannel channel = channels.get(id);
-        if (channel == null) channel = closingChannels.get(id);
-        if (channel == null) return;
+        KafkaChannel channel = openOrClosingChannelOrFail(id);
         if (KafkaChannelMuteBridge.maybeUnmute(channel)) {
             // Drop from the operator-muted set only on successful unmute. NIO does the
             // same (Selector.unmute lines 762-763): if maybeUnmute returns false (e.g.
@@ -1277,5 +1273,28 @@ public final class IoUringSelector implements BrokerSelector {
     // assertion on the gate value moving forward.
     long nextIdleScanNanosForTesting() {
         return nextIdleScanNanos;
+    }
+
+    /**
+     * Mirror NIO {@code Selector.openOrClosingChannelOrFail} (clients/.../Selector.java:985-992).
+     * NIO's mute/unmute/send all route id lookups through this helper so that a request on a
+     * channel that has been evicted (e.g. by {@code closeExcessConnections} from the Acceptor
+     * under broker-max pressure, racing the Processor's per-poll mute/unmute pair) surfaces
+     * as {@link IllegalStateException} — caught by the Processor's per-step exception handler
+     * ({@code SocketServer.scala} processCompletedReceives line 1239 and processCompletedSends
+     * line 1266, both wrap {@code case e: Throwable => processChannelException(...)}). Without
+     * this throw, io_uring silently dropped the mute/unmute event, diverging from NIO's
+     * observability invariant: the same race on the two backends produced two different
+     * Processor logs (NIO logged a channel-state exception, io_uring logged nothing).
+     */
+    private KafkaChannel openOrClosingChannelOrFail(String id) {
+        KafkaChannel channel = channels.get(id);
+        if (channel == null) channel = closingChannels.get(id);
+        if (channel == null) {
+            throw new IllegalStateException(
+                "Attempt to retrieve channel for which there is no connection. Connection id "
+                    + id + " existing connections " + channels.keySet());
+        }
+        return channel;
     }
 }

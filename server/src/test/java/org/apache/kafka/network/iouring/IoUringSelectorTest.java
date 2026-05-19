@@ -349,6 +349,28 @@ class IoUringSelectorTest {
     }
 
     @Test
+    void muteAndUnmuteThrowIseForUnknownId() throws Exception {
+        // BUG-N2 / NIO parity: NIO's Selector.mute/unmute route id lookups through
+        // openOrClosingChannelOrFail (clients/.../Selector.java:985-992), which throws
+        // IllegalStateException when the channel is gone. io_uring previously silently
+        // no-op'd, which diverged from NIO's observability contract — a stale id (e.g.
+        // a channel evicted by closeExcessConnections under broker-max pressure, racing
+        // a Processor mute/unmute pair) surfaced as a missing log line on one backend
+        // and a processChannelException entry on the other. SocketServer.scala wraps
+        // both mute (processCompletedReceives line 1239) and unmute (processCompletedSends
+        // line 1266) in catch Throwable, so the throw is safely routed.
+        IoUringSelector s = newSelector(IDLE_NANOS_NEVER);
+        IllegalStateException muteIse = assertThrows(IllegalStateException.class,
+            () -> s.mute("does-not-exist"));
+        assertTrue(muteIse.getMessage().contains("does-not-exist"),
+            "ISE message must include the offending id for diagnostics — got: " + muteIse.getMessage());
+        IllegalStateException unmuteIse = assertThrows(IllegalStateException.class,
+            () -> s.unmute("does-not-exist"));
+        assertTrue(unmuteIse.getMessage().contains("does-not-exist"),
+            "ISE message must include the offending id for diagnostics — got: " + unmuteIse.getMessage());
+    }
+
+    @Test
     void muteAllAndUnmuteAllAffectEveryChannel() throws Exception {
         IoUringSelector s = newSelector(IDLE_NANOS_NEVER);
         EmbeddedChannel a = acceptNew(s, REMOTE_A);
