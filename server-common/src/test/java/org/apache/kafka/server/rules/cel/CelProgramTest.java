@@ -125,6 +125,36 @@ public class CelProgramTest {
     }
 
     @Test
+    public void methodCallNullReceiverPropagatesEvenWhenArgIsNonString() {
+        // Round-17 MED: MethodCall.stringArg used to evaluate the argument
+        // BEFORE checking the receiver type, so a CEL expression of the
+        // shape `request.missing.startsWith(request.someNumeric)` threw
+        // CelEvaluationException ("expected string argument, got Long")
+        // and the rule fail-OPENed — instead of null-propagating to false
+        // the way RegexMatch and Field do. Pin the tri-state behaviour:
+        // a non-String receiver returns false WITHOUT ever evaluating the
+        // argument (so an arg that would throw must NOT surface).
+        Map<String, Object> env = new HashMap<>();
+        env.put("count", 42L);
+        // `missing` is absent → null receiver via Field null-propagation.
+        // The arg `count` is a Long; if the arg were evaluated first under
+        // stringArg, it would throw. Tri-state contract: returns false.
+        assertFalse(evalBool("missing.startsWith(count)", env));
+        assertFalse(evalBool("missing.endsWith(count)", env));
+        assertFalse(evalBool("missing.contains(count)", env));
+        // Same axis for a non-String receiver that IS in env.
+        env.put("notAString", 99L);
+        assertFalse(evalBool("notAString.startsWith(count)", env));
+        // Sanity: a String receiver with a non-String arg still fail-OPENs
+        // by throwing (engine catches CelEvaluationException). This pins
+        // that the Round-17 fix only changed the null-receiver behaviour.
+        env.put("name", "foo");
+        assertThrows(CelEvaluationException.class,
+            () -> evalBool("name.startsWith(count)", env),
+            "non-String arg with String receiver still surfaces type mismatch");
+    }
+
+    @Test
     public void stringMatchesRegex() {
         Map<String, Object> env = new HashMap<>();
         env.put("name", "audit-1");

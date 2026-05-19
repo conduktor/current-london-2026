@@ -144,13 +144,27 @@ abstract class CelNode {
         @Override
         Object eval(Function<String, Object> a) {
             Object r = receiver.eval(a);
+            // Round-17 MED: tri-state consistency with RegexMatch (line 247)
+            // and Field (null-propagation in Field.eval). A non-String
+            // receiver — most commonly a missing-field lookup that
+            // null-propagates through dot access — must short-circuit to
+            // false BEFORE we evaluate the argument. The previous code
+            // ran stringArg(args.get(0), a) unconditionally, which throws
+            // CelEvaluationException if the arg evaluates to a non-String;
+            // that turns `request.missing.startsWith(request.someNumeric)`
+            // into a fail-OPEN throw instead of a null-propagating false.
+            // Match RegexMatch's stance: receiver check first, no argument
+            // evaluation if the receiver cannot satisfy the method.
+            if (!(r instanceof String)) {
+                return false;
+            }
             String arg0 = args.isEmpty() ? null : stringArg(args.get(0), a);
             // Audit HIGH-2: charge proportional work to the step budget so a
             // single fat string-op cannot escape the per-request budget — and,
             // crucially, so that the same op inside an attacker-iterated
             // comprehension trips the budget at the actual char-work limit
             // rather than only at the comprehension iteration count.
-            if (r instanceof String && arg0 != null) {
+            if (arg0 != null) {
                 int rl = ((String) r).length();
                 int al = arg0.length();
                 switch (method) {
@@ -173,11 +187,11 @@ abstract class CelNode {
             }
             switch (method) {
                 case "startsWith":
-                    return r instanceof String && arg0 != null && ((String) r).startsWith(arg0);
+                    return arg0 != null && ((String) r).startsWith(arg0);
                 case "endsWith":
-                    return r instanceof String && arg0 != null && ((String) r).endsWith(arg0);
+                    return arg0 != null && ((String) r).endsWith(arg0);
                 case "contains":
-                    return r instanceof String && arg0 != null && ((String) r).contains(arg0);
+                    return arg0 != null && ((String) r).contains(arg0);
                 default:
                     // Defense in depth: CelCompiler.parseDotSuffix rejects
                     // unknown method names AND wrong-arity calls at compile
