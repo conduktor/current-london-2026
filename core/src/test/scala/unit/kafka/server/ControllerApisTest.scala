@@ -2887,6 +2887,152 @@ class ControllerApisTest {
   }
 
   // ---------------------------------------------------------------------------
+  // #136 — AlterClientQuotas guard must cover EVERY entity-entry type, not
+  // just USER. A ClientQuotaEntity is a composite (USER, CLIENT_ID, IP and any
+  // future entity-type the message schema may carry); the original #117 fix
+  // only inspected the USER entry, leaving a non-USER entry-value free to
+  // carry the reserved `__tenant_*` prefix into the metadata write. Even if
+  // CLIENT_ID/IP are not used by the broker to key runtime sensors, persisting
+  // any record in the reserved namespace from a non-tenant caller violates the
+  // structural contract (the entry would also be invisible in
+  // DescribeClientQuotas response for cluster-wide callers due to #116,
+  // creating silent metadata pollution).
+  // ---------------------------------------------------------------------------
+
+  private def quotaEntityForClientId(clientId: String): ClientQuotaEntity = {
+    val entries = new util.HashMap[String, String]()
+    entries.put(ClientQuotaEntity.CLIENT_ID, clientId)
+    new ClientQuotaEntity(entries)
+  }
+
+  private def quotaEntityForUserAndClientId(user: String, clientId: String): ClientQuotaEntity = {
+    val entries = new util.HashMap[String, String]()
+    entries.put(ClientQuotaEntity.USER, user)
+    entries.put(ClientQuotaEntity.CLIENT_ID, clientId)
+    new ClientQuotaEntity(entries)
+  }
+
+  @Test
+  def testControllerAlterClientQuotasRefusesTenantPrefixedClientIdFromClusterWideCaller(): Unit = {
+    val controller = mock(classOf[Controller])
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.empty())
+
+    // CLIENT_ID-only entity carrying the tenant-prefix shape. A cluster-wide
+    // admin must NOT be able to plant this record — even though CLIENT_ID is
+    // not the runtime sensor key, persisting any record in the reserved
+    // namespace from a non-tenant caller is forbidden by the contract.
+    val tenantEntity = quotaEntityForClientId("__tenant_acme.alice")
+    val ops = util.Collections.singletonList(
+      new ClientQuotaAlteration.Op("producer_byte_rate", 0.0))
+    val entries = util.Collections.singletonList(new ClientQuotaAlteration(tenantEntity, ops))
+    val req = buildAlterClientQuotasRequest(entries,
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    controllerApis.handleAlterClientQuotas(req)
+
+    verify(controller, never()).alterClientQuotas(
+      any(classOf[ControllerRequestContext]), any(), anyBoolean())
+    val response = captureSentResponse(req).asInstanceOf[AlterClientQuotasResponse]
+    val entry = response.data().entries().asScala.head
+    assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED.code(), entry.errorCode(),
+      "cluster-wide caller must be refused for a tenant-prefixed CLIENT_ID entity (#136)")
+    assertTrue(entry.errorMessage() == null || entry.errorMessage().isEmpty,
+      "errorMessage must not echo the physical CLIENT_ID back to the caller")
+  }
+
+  @Test
+  def testControllerAlterClientQuotasRefusesCompositeWhereOnlyClientIdIsForeignTenant(): Unit = {
+    val controller = mock(classOf[Controller])
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.empty())
+
+    // USER value is a regular cluster user (would pass the USER-only check);
+    // CLIENT_ID is tenant-shaped. The composite must still be refused — a
+    // partial-accept would persist the tenant-shaped half via the composite
+    // key (USER, CLIENT_ID), an invisible-to-everyone metadata record.
+    val mixedEntity = quotaEntityForUserAndClientId(
+      user = "regular-cluster-user",
+      clientId = "__tenant_acme.alice")
+    val ops = util.Collections.singletonList(
+      new ClientQuotaAlteration.Op("producer_byte_rate", 0.0))
+    val entries = util.Collections.singletonList(new ClientQuotaAlteration(mixedEntity, ops))
+    val req = buildAlterClientQuotasRequest(entries,
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "admin"))
+
+    controllerApis.handleAlterClientQuotas(req)
+
+    verify(controller, never()).alterClientQuotas(
+      any(classOf[ControllerRequestContext]), any(), anyBoolean())
+    val response = captureSentResponse(req).asInstanceOf[AlterClientQuotasResponse]
+    val entry = response.data().entries().asScala.head
+    assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED.code(), entry.errorCode(),
+      "ANY tenant-shaped entry-value in a composite entity must refuse the whole alteration (#136)")
+  }
+
+  @Test
+  def testControllerAlterClientQuotasAllowsSameTenantClientIdFromTenantCaller(): Unit = {
+    val controller = mock(classOf[Controller])
+    val tenantEntity = quotaEntityForClientId("__tenant_acme.app-1")
+    when(controller.alterClientQuotas(
+      any(classOf[ControllerRequestContext]), any(), anyBoolean()))
+      .thenReturn(CompletableFuture.completedFuture(
+        java.util.Collections.singletonMap(tenantEntity, ApiError.NONE)))
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.empty())
+
+    // Same-tenant carve-out: a forwarded `__tenant_acme.X` may tune quotas
+    // for CLIENT_ID entries inside its own namespace.
+    val ops = util.Collections.singletonList(
+      new ClientQuotaAlteration.Op("producer_byte_rate", 1024.0 * 1024))
+    val entries = util.Collections.singletonList(new ClientQuotaAlteration(tenantEntity, ops))
+    val req = buildAlterClientQuotasRequest(entries,
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_acme.alice"))
+
+    controllerApis.handleAlterClientQuotas(req)
+
+    verify(controller).alterClientQuotas(
+      any(classOf[ControllerRequestContext]), any(), anyBoolean())
+    val response = captureSentResponse(req).asInstanceOf[AlterClientQuotasResponse]
+    val entry = response.data().entries().asScala.head
+    assertEquals(Errors.NONE.code(), entry.errorCode(),
+      "tenant caller must be allowed to tune CLIENT_ID quotas inside its own namespace")
+  }
+
+  @Test
+  def testControllerAlterClientQuotasRefusesCrossTenantClientIdFromTenantCaller(): Unit = {
+    val controller = mock(classOf[Controller])
+    controllerApis = createControllerApis(
+      authorizer = None,
+      controller = controller,
+      tenantConfig = org.apache.kafka.server.tenant.TenantConfig.empty())
+
+    // Cross-tenant CLIENT_ID attempt: caller is `__tenant_acme.*`, value is
+    // `__tenant_evil.*`. Must be refused even from a tenant principal.
+    val crossEntity = quotaEntityForClientId("__tenant_evil.app-1")
+    val ops = util.Collections.singletonList(
+      new ClientQuotaAlteration.Op("producer_byte_rate", 0.0))
+    val entries = util.Collections.singletonList(new ClientQuotaAlteration(crossEntity, ops))
+    val req = buildAlterClientQuotasRequest(entries,
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "__tenant_acme.attacker"))
+
+    controllerApis.handleAlterClientQuotas(req)
+
+    verify(controller, never()).alterClientQuotas(
+      any(classOf[ControllerRequestContext]), any(), anyBoolean())
+    val response = captureSentResponse(req).asInstanceOf[AlterClientQuotasResponse]
+    val entry = response.data().entries().asScala.head
+    assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED.code(), entry.errorCode(),
+      "tenant caller must NOT plant CLIENT_ID quotas in a foreign tenant's namespace (#136)")
+  }
+
+  // ---------------------------------------------------------------------------
   // #126 / F1 — handleIncrementalAlterConfigs + handleLegacyAlterConfigs on
   // ControllerApis pre-scrub TOPIC and GROUP resource names. A privileged
   // caller hitting the controller listener via `bootstrap.controllers`

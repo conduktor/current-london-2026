@@ -895,22 +895,33 @@ class ControllerApis(
     val context = new ControllerRequestContext(request.context.header.data, request.context.principal,
       OptionalLong.empty())
 
-    // Outside-in defence for the USER quota entity. A cluster-wide caller
-    // hitting the broker listener or, via KIP-590 `bootstrap.controllers`,
-    // the controller listener directly, can otherwise persist a quota record
-    // keyed on `__tenant_<id>.<user>`. The broker enforces quotas by the
-    // runtime principal name, so such a record DOS's (or, with high values,
-    // silently elevates) a tenant principal's traffic with no tenant-side
-    // visibility. The metadata layer (ClientQuotaControlManager) writes the
-    // quota record unconditionally — controller is SOLE line of defence.
+    // Outside-in defence for ALL quota-entity entries. A cluster-wide caller
+    // hitting the broker listener or, via KIP-590 `bootstrap.controllers`, the
+    // controller listener directly, can otherwise persist a quota record keyed
+    // on a tenant-shaped principal name. For the USER entity-type the impact is
+    // immediate: the broker enforces USER quotas by the runtime principal name,
+    // so such a record DOS's (or, with high values, silently elevates) a tenant
+    // principal's traffic with no tenant-side visibility.
     //
-    // Same-tenant exemption: a forwarded tenant principal `__tenant_acme.X`
-    // is allowed to set/modify quotas keyed on a user in its own namespace
-    // (`__tenant_acme.<user>`); cross-tenant or cluster-wide callers are
-    // refused. Mirrors the delegation-token pattern at
-    // handleCreateDelegationTokenRequest.
+    // CLIENT_ID and IP do NOT key the broker's runtime sensors by the principal
+    // name, so the DoS vector via those entry types is more limited — but the
+    // structural contract still applies: NO record may be persisted in the
+    // reserved `__tenant_*` namespace by a non-tenant caller. Reasons:
+    //   - DescribeClientQuotas response already filters tenant-keyed entries
+    //     for cluster-wide callers (#116). A planted CLIENT_ID record would
+    //     therefore be invisible to BOTH the cluster admin and the actual
+    //     tenant — silent pollution of the metadata layer that may show up
+    //     in JMX, log lines, or future quota-introspection tooling.
+    //   - The defence-in-depth principle: the reserved namespace is the only
+    //     property a tenant can rely on. Letting any non-USER entry drift
+    //     would invite future regressions where new entity types (e.g. a
+    //     KIP-eligible `GROUP` quota) are added and inherit the gap.
+    //
+    // Same-tenant exemption: a forwarded tenant principal `__tenant_acme.X` is
+    // allowed to set/modify quotas naming a value in its own namespace
+    // (`__tenant_acme.*`); cross-tenant or cluster-wide callers are refused.
     val callerTenant = callerTenantFromPrincipal(request.context.principal.getName)
-    def isForeignTenantUser(name: String): Boolean = {
+    def isForeignTenantQuotaValue(name: String): Boolean = {
       if (name == null) return false
       if (!isReservedTenantPrincipalNamespace(name)) return false
       callerTenant match {
@@ -922,9 +933,15 @@ class ControllerApis(
     val allowed = new util.ArrayList[ClientQuotaAlteration](quotaRequest.entries.size)
     quotaRequest.entries.forEach { alteration =>
       val entity = alteration.entity()
-      val userName = entity.entries().get(ClientQuotaEntity.USER)
-      if (isForeignTenantUser(userName)) {
-        // Empty error message — leaking the physical user name back to the
+      // Inspect every entry value (USER, CLIENT_ID, IP, and any future
+      // entity-type the message schema may carry). A single foreign-tenant
+      // shape anywhere in the composite key suffices to refuse the entire
+      // alteration — a partial-accept would persist half of the entity's
+      // pollution.
+      val hasForeign = entity.entries().values().stream()
+        .anyMatch(name => isForeignTenantQuotaValue(name))
+      if (hasForeign) {
+        // Empty error message — leaking the physical value back to the
         // caller would amount to a presence oracle for that tenant principal.
         refused.put(entity, new ApiError(Errors.CLUSTER_AUTHORIZATION_FAILED, ""))
       } else {
