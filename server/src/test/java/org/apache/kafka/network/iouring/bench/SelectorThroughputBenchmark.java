@@ -208,12 +208,34 @@ public final class SelectorThroughputBenchmark {
         }
     }
 
-    /** Echo loop for the io_uring backend: every completedReceive triggers a send of the same bytes. */
+    /**
+     * Echo loop for the io_uring backend. Mirrors the real broker's Processor
+     * read/send/unmute lifecycle exactly: enqueue a response on every
+     * {@code completedReceive}, then unmute on every {@code completedSend} once
+     * the write is actually flushed.
+     *
+     * <p>The two halves cannot be collapsed into one. {@code selector.send()}
+     * funnels through {@link org.apache.kafka.common.network.KafkaChannel#setSend}
+     * which transitions the channel {@code NOT_MUTED -> MUTED_AND_RESPONSE_PENDING}.
+     * Calling {@link IoUringSelector#unmute} on a channel still in
+     * {@code MUTED_AND_RESPONSE_PENDING} returns silently false — the state
+     * machine only allows unmute from {@code MUTED_AND_RESPONSE_SENT}, which is
+     * the post-write-completion state Netty's write listener publishes. At low
+     * scale the write completes synchronously inside the same poll() so unmute
+     * right after send() happens to win the race; once the kernel send buffer
+     * fills (~100+ sustained connections) the write goes async and an early
+     * unmute is a no-op, parking the channel in MUTED_AND_RESPONSE_SENT
+     * forever. The real Processor handles this via
+     * {@code SocketServer.handleCompletedSends} which iterates
+     * {@code selector.completedSends()} and unmutes by destinationId — this
+     * loop mirrors that contract.
+     */
     private static void ioUringEchoLoop(IoUringSelector selector, AtomicBoolean stop) {
         try {
             long iter = 0;
             long lastLog = System.nanoTime();
             long totalRecv = 0;
+            long totalSent = 0;
             long totalAccepts = 0;
             while (!stop.get()) {
                 selector.poll(50);
@@ -226,21 +248,19 @@ public final class SelectorThroughputBenchmark {
                     copy.put(payload);
                     copy.flip();
                     selector.send(new NetworkSend(id, ByteBufferSend.sizePrefixed(copy)));
-                    // KafkaChannel.setSend() implicitly mutes the channel (state machine:
-                    // NOT_MUTED -> MUTED_AND_RESPONSE_PENDING). The real Processor mirrors
-                    // this with unmute() in handleCompletedSends() once the response is
-                    // flushed, otherwise IoUringSelector's read step at runActiveChannelRead
-                    // skips the channel via the `!channel.isMuted()` gate and the bench
-                    // wedges after the first round-trip on every connection. Without this
-                    // unmute the harness silently stalls at ~100 connections.
-                    selector.unmute(id);
                     thisPollRecv++;
                 }
+                int thisPollSent = 0;
+                for (NetworkSend sent : selector.completedSends()) {
+                    selector.unmute(sent.destinationId());
+                    thisPollSent++;
+                }
                 totalRecv += thisPollRecv;
+                totalSent += thisPollSent;
                 iter++;
                 if (System.nanoTime() - lastLog > 1_000_000_000L) {
-                    System.err.printf("[iouring-echo] iter=%d totalAccepts=%d totalRecv=%d disconnected=%d%n",
-                        iter, totalAccepts, totalRecv, selector.disconnected().size());
+                    System.err.printf("[iouring-echo] iter=%d totalAccepts=%d totalRecv=%d totalSent=%d disconnected=%d%n",
+                        iter, totalAccepts, totalRecv, totalSent, selector.disconnected().size());
                     lastLog = System.nanoTime();
                 }
                 selector.clearCompletedReceives();
