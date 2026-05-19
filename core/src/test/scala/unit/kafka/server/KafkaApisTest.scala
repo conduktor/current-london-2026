@@ -288,6 +288,143 @@ class KafkaApisTest extends Logging {
     assertEquals(propValue, describeConfigsResponseData.value)
   }
 
+  /**
+   * Round 25: `DescribeConfigs` on a view must not disclose the backing topic name (or the
+   * predicate) to a requester that does not hold `READ` on the resolved backing. The fetch path
+   * already enforces the invariant "the consumer never learns the backing topic name"
+   * (KafkaApis.scala:1408 — UNKNOWN_TOPIC_OR_PARTITION is keyed at the view). DescribeConfigs
+   * must honor the same invariant; otherwise a principal with `DESCRIBE_CONFIGS` on the view but
+   * no `READ` on the backing can enumerate backing identity and the security-relevant predicate
+   * without crossing the READ gate that the round-23/24 create/alter checks enforce at view
+   * creation. The non-backing-revealing key `view.offset.mode` is left intact.
+   */
+  @Test
+  def testDescribeConfigsOnViewRedactsBackingForRequesterWithoutReadOnBacking(): Unit = {
+    val viewTopic = "alice_view"
+    val backingTopic = "tenant_a_raw"
+    val authorizer: Authorizer = mock(classOf[Authorizer])
+    when(authorizer.authorize(any[RequestContext], any[util.List[Action]]))
+      .thenAnswer { invocation =>
+        val actions = invocation.getArgument[util.List[Action]](1).asScala
+        val results = actions.map { action =>
+          val op = action.operation()
+          val resourceName = action.resourcePattern().name()
+          // DESCRIBE_CONFIGS on the view is fine; READ on the backing is what we are gating.
+          if (op == AclOperation.DESCRIBE_CONFIGS && resourceName == viewTopic) AuthorizationResult.ALLOWED
+          else AuthorizationResult.DENIED
+        }
+        new util.ArrayList[AuthorizationResult](results.asJava)
+      }
+
+    val configRepository: ConfigRepository = mock(classOf[ConfigRepository])
+    val topicConfigs = new Properties()
+    topicConfigs.put(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, backingTopic)
+    topicConfigs.put(ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.color == 'red'")
+    topicConfigs.put(ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+    when(configRepository.topicConfig(viewTopic)).thenReturn(topicConfigs)
+
+    metadataCache = mock(classOf[KRaftMetadataCache])
+    when(metadataCache.contains(viewTopic)).thenReturn(true)
+
+    val requestHeader = new RequestHeader(ApiKeys.DESCRIBE_CONFIGS, ApiKeys.DESCRIBE_CONFIGS.latestVersion,
+      clientId, 0)
+    val describeConfigsRequest = new DescribeConfigsRequest.Builder(new DescribeConfigsRequestData()
+      .setIncludeSynonyms(true)
+      .setResources(List(new DescribeConfigsRequestData.DescribeConfigsResource()
+        .setResourceName(viewTopic)
+        .setResourceType(ConfigResource.Type.TOPIC.id)).asJava))
+      .build(requestHeader.apiVersion)
+    val request = buildRequest(describeConfigsRequest, requestHeader = Option(requestHeader))
+
+    kafkaApis = createKafkaApis(authorizer = Some(authorizer), configRepository = configRepository)
+    kafkaApis.handleDescribeConfigsRequest(request)
+
+    val response = verifyNoThrottling[DescribeConfigsResponse](request)
+    val result = response.data.results.get(0)
+    assertEquals(Errors.NONE.code, result.errorCode)
+    val configs = result.configs.asScala.map(c => (c.name, c)).toMap
+
+    val backingEntry = configs(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG)
+    assertNull(backingEntry.value,
+      "view.backing.topic must be redacted when requester lacks READ on the backing")
+    assertTrue(backingEntry.isSensitive,
+      "view.backing.topic must be marked sensitive when redacted")
+    backingEntry.synonyms.forEach(syn => assertNull(syn.value,
+      s"synonym ${syn.name} of view.backing.topic must be redacted"))
+
+    val predicateEntry = configs(ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG)
+    assertNull(predicateEntry.value,
+      "view.cel.predicate must be redacted when requester lacks READ on the backing")
+    assertTrue(predicateEntry.isSensitive,
+      "view.cel.predicate must be marked sensitive when redacted")
+    predicateEntry.synonyms.forEach(syn => assertNull(syn.value,
+      s"synonym ${syn.name} of view.cel.predicate must be redacted"))
+
+    val offsetModeEntry = configs(ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG)
+    assertEquals(ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE, offsetModeEntry.value,
+      "view.offset.mode does not reveal the backing and must NOT be redacted")
+    assertFalse(offsetModeEntry.isSensitive,
+      "view.offset.mode must not be marked sensitive after the view-config redaction pass")
+  }
+
+  /**
+   * Mirror of [[testDescribeConfigsOnViewRedactsBackingForRequesterWithoutReadOnBacking]]: when
+   * the requester DOES hold READ on the backing topic, the view-backing redaction must NOT fire
+   * — the legitimate operator workflow (audit a view's backing/predicate) is preserved.
+   */
+  @Test
+  def testDescribeConfigsOnViewExposesBackingForRequesterWithReadOnBacking(): Unit = {
+    val viewTopic = "alice_view"
+    val backingTopic = "tenant_a_raw"
+    val predicate = "body.color == 'red'"
+    val authorizer: Authorizer = mock(classOf[Authorizer])
+    when(authorizer.authorize(any[RequestContext], any[util.List[Action]]))
+      .thenAnswer { invocation =>
+        val actions = invocation.getArgument[util.List[Action]](1).asScala
+        val results = actions.map { action =>
+          val op = action.operation()
+          val resourceName = action.resourcePattern().name()
+          if (op == AclOperation.DESCRIBE_CONFIGS && resourceName == viewTopic) AuthorizationResult.ALLOWED
+          else if (op == AclOperation.READ && resourceName == backingTopic) AuthorizationResult.ALLOWED
+          else AuthorizationResult.DENIED
+        }
+        new util.ArrayList[AuthorizationResult](results.asJava)
+      }
+
+    val configRepository: ConfigRepository = mock(classOf[ConfigRepository])
+    val topicConfigs = new Properties()
+    topicConfigs.put(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, backingTopic)
+    topicConfigs.put(ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, predicate)
+    topicConfigs.put(ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+    when(configRepository.topicConfig(viewTopic)).thenReturn(topicConfigs)
+
+    metadataCache = mock(classOf[KRaftMetadataCache])
+    when(metadataCache.contains(viewTopic)).thenReturn(true)
+
+    val requestHeader = new RequestHeader(ApiKeys.DESCRIBE_CONFIGS, ApiKeys.DESCRIBE_CONFIGS.latestVersion,
+      clientId, 0)
+    val describeConfigsRequest = new DescribeConfigsRequest.Builder(new DescribeConfigsRequestData()
+      .setIncludeSynonyms(true)
+      .setResources(List(new DescribeConfigsRequestData.DescribeConfigsResource()
+        .setResourceName(viewTopic)
+        .setResourceType(ConfigResource.Type.TOPIC.id)).asJava))
+      .build(requestHeader.apiVersion)
+    val request = buildRequest(describeConfigsRequest, requestHeader = Option(requestHeader))
+
+    kafkaApis = createKafkaApis(authorizer = Some(authorizer), configRepository = configRepository)
+    kafkaApis.handleDescribeConfigsRequest(request)
+
+    val response = verifyNoThrottling[DescribeConfigsResponse](request)
+    val result = response.data.results.get(0)
+    assertEquals(Errors.NONE.code, result.errorCode)
+    val configs = result.configs.asScala.map(c => (c.name, c)).toMap
+
+    assertEquals(backingTopic, configs(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG).value,
+      "backing must be visible when requester holds READ on it")
+    assertEquals(predicate, configs(ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG).value,
+      "predicate must be visible when requester holds READ on the backing")
+  }
+
   @Test
   def testElectLeadersForwarding(): Unit = {
     val requestBuilder = new ElectLeadersRequest.Builder(ElectionType.PREFERRED, null, 30000)

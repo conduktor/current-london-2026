@@ -22,7 +22,7 @@ import kafka.network.RequestChannel
 import java.util.{Collections, Properties}
 import kafka.server.metadata.ConfigRepository
 import kafka.utils.{Log4jController, Logging}
-import org.apache.kafka.common.acl.AclOperation.DESCRIBE_CONFIGS
+import org.apache.kafka.common.acl.AclOperation.{DESCRIBE_CONFIGS, READ}
 import org.apache.kafka.common.config.{AbstractConfig, ConfigDef, ConfigResource}
 import org.apache.kafka.common.errors.{ApiException, InvalidRequestException}
 import org.apache.kafka.common.internals.Topic
@@ -35,6 +35,7 @@ import org.apache.kafka.common.resource.Resource.CLUSTER_NAME
 import org.apache.kafka.common.resource.ResourceType.{CLUSTER, GROUP, TOPIC}
 import org.apache.kafka.coordinator.group.GroupConfig
 import org.apache.kafka.server.config.ServerTopicConfigSynonyms
+import org.apache.kafka.server.views.ViewTopicConfig
 import org.apache.kafka.storage.internals.log.LogConfig
 
 import scala.collection.mutable.ListBuffer
@@ -78,7 +79,45 @@ class ConfigHelper(metadataCache: MetadataCache, config: KafkaConfig, configRepo
         .setResourceName(resource.resourceName)
         .setResourceType(resource.resourceType)
     }
-    new DescribeConfigsResponseData().setResults((authorizedConfigs ++ unauthorizedConfigs).asJava)
+    // For view topics, the fetch path enforces "the consumer never learns the backing topic name"
+    // (KafkaApis.scala:1408 — UNKNOWN_TOPIC_OR_PARTITION is keyed at the view, not the backing).
+    // DescribeConfigs must honor the same invariant: a principal with DESCRIBE_CONFIGS on the view
+    // but no READ on the backing topic could otherwise enumerate the backing identity (and the
+    // security-relevant predicate per ViewTopicConfig.java:44) without crossing the READ gate that
+    // the round-23/24 create/alter checks now enforce at view creation. Redact the two
+    // backing-revealing keys when the requester lacks READ on the resolved backing.
+    val redactedAuthorizedConfigs = authorizedConfigs.map { result =>
+      if (result.resourceType == ConfigResource.Type.TOPIC.id && result.errorCode == Errors.NONE.code) {
+        redactViewBackingForUnauthorizedRequester(result, request, authHelper)
+      } else result
+    }
+    new DescribeConfigsResponseData().setResults((redactedAuthorizedConfigs ++ unauthorizedConfigs).asJava)
+  }
+
+  private def redactViewBackingForUnauthorizedRequester(
+    result: DescribeConfigsResponseData.DescribeConfigsResult,
+    request: RequestChannel.Request,
+    authHelper: AuthHelper
+  ): DescribeConfigsResponseData.DescribeConfigsResult = {
+    // Read the backing topic from the (already-built) response entry rather than re-loading from
+    // configRepository: the entry was built from the same snapshot and the value is what would be
+    // disclosed if we did nothing.
+    val backingEntryOpt = result.configs.asScala.find(_.name == ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG)
+    val backingName = backingEntryOpt.flatMap(e => Option(e.value)).filter(_.nonEmpty)
+    backingName match {
+      case Some(backing) if !authHelper.authorize(request.context, READ, TOPIC, backing) =>
+        result.configs.asScala.foreach { entry =>
+          val name = entry.name
+          if (name == ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG ||
+              name == ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG) {
+            entry.setValue(null)
+            entry.setIsSensitive(true)
+            entry.synonyms.forEach(_.setValue(null))
+          }
+        }
+        result
+      case _ => result
+    }
   }
 
   def describeConfigs(resourceToConfigNames: List[DescribeConfigsResource],
