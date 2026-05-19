@@ -18055,6 +18055,67 @@ class KafkaApisTest extends Logging {
       "with no tenants configured the dotted topic name is not reserved")
   }
 
+  // ---------------------------------------------------------------------------
+  // ConsumerGroupHeartbeat (KIP-848) subscribedTopicRegex outside-in scrub (#151)
+  //
+  // Sibling of #132 above. The regex field is resolved server-side at
+  // `GroupMetadataManager.refreshRegularExpressions` against the FULL broker
+  // topic universe, which on a multi-tenant broker includes every tenant's
+  // physical names. A cluster-wide caller submitting `.*` would subscribe its
+  // group to every tenant's topics — leaking existence + partition counts
+  // through `member.assignment.topicPartitions`. Worse, the regex is persisted
+  // to `__consumer_offsets` verbatim, so on coordinator failover or after a new
+  // tenant binding is added later, the same pattern silently picks up the new
+  // tenant's topics. Server-side regex containment is undecidable, so we take
+  // the conservative line: on a broker with ANY tenant binding, refuse a
+  // non-empty `subscribedTopicRegex` from any non-tenant caller outright.
+  // ---------------------------------------------------------------------------
+  @Test
+  def testConsumerGroupHeartbeatRefusesSubscribedTopicRegexFromNonTenantCallerWhenTenantsBound(): Unit = {
+    metadataCache = mock(classOf[KRaftMetadataCache])
+    val req = new ConsumerGroupHeartbeatRequest.Builder(
+      new ConsumerGroupHeartbeatRequestData()
+        .setGroupId("regular-group")
+        .setSubscribedTopicRegex(".*")
+    ).build()
+    val request = buildRequest(req)
+
+    kafkaApis = createKafkaApis(
+      featureVersions = Seq(GroupVersion.GV_1),
+      tenantConfig = tenantConfigBinding("acme", TENANT_LISTENER))
+    kafkaApis.handleConsumerGroupHeartbeat(request)
+
+    val response = verifyNoThrottling[ConsumerGroupHeartbeatResponse](request)
+    assertEquals(Errors.TOPIC_AUTHORIZATION_FAILED.code, response.data.errorCode,
+      "subscribedTopicRegex from non-tenant caller on a multi-tenant broker must be refused before the coordinator")
+    verify(groupCoordinator, never()).consumerGroupHeartbeat(any(), any())
+  }
+
+  @Test
+  def testConsumerGroupHeartbeatAllowsSubscribedTopicRegexWhenNoTenantBindings(): Unit = {
+    // With no tenants configured the regex pattern poses no cross-tenant leak;
+    // standard Kafka regex-subscribe semantics must be preserved so this fork
+    // remains a drop-in for single-tenant deployments.
+    metadataCache = mock(classOf[KRaftMetadataCache])
+    val data = new ConsumerGroupHeartbeatRequestData()
+      .setGroupId("regular-group")
+      .setSubscribedTopicRegex("orders-.*")
+    val req = new ConsumerGroupHeartbeatRequest.Builder(data).build()
+    val request = buildRequest(req)
+
+    val future = new CompletableFuture[ConsumerGroupHeartbeatResponseData]()
+    when(groupCoordinator.consumerGroupHeartbeat(request.context, data)).thenReturn(future)
+
+    kafkaApis = createKafkaApis(featureVersions = Seq(GroupVersion.GV_1))
+    kafkaApis.handleConsumerGroupHeartbeat(request)
+
+    val coordinatorResponse = new ConsumerGroupHeartbeatResponseData().setMemberId("m")
+    future.complete(coordinatorResponse)
+    val response = verifyNoThrottling[ConsumerGroupHeartbeatResponse](request)
+    assertEquals(coordinatorResponse, response.data,
+      "with no tenants configured the regex subscription must be forwarded to the coordinator unchanged")
+  }
+
   @Test
   def testDescribeTopicPartitionsAllTopicsSilentlyDropsTenantPhysicalTopics(): Unit = {
     // fetchAllTopics path: the handler iterates metadataCache.getAllTopics()

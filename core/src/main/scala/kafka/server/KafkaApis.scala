@@ -5739,6 +5739,45 @@ class KafkaApis(val requestChannel: RequestChannel,
         }
       }
 
+      // #151 — outside-in regex subscription pollution, sibling of #132. The
+      // KIP-848 v1+ `subscribedTopicRegex` field is resolved server-side at
+      // `GroupMetadataManager.refreshRegularExpressions` against the FULL
+      // broker topic universe (`MetadataImage.topics().topicsByName().keySet()`),
+      // which on a multi-tenant broker contains every tenant's PHYSICAL names
+      // (`acme.orders`, `beta.invoices`, …). A non-tenant cluster-wide caller
+      // submitting `.*` (or any pattern shaped to match `<id>.<rest>`) would
+      // therefore have the coordinator subscribe its group to every tenant's
+      // topics — leaking existence + partition counts in
+      // `member.assignment.topicPartitions`, and disrupting tenants' rebalance
+      // protocol because they share the GroupMetadataManager.
+      //
+      // Worse, the regex string is persisted to `__consumer_offsets` verbatim
+      // (`ConsumerGroupMemberMetadataValue.SubscribedTopicRegex`). On
+      // coordinator failover or after a new tenant is later bound to the
+      // broker, the same regex is replayed against the THEN-current topic
+      // universe and silently starts matching new tenant topics — a latent
+      // cross-tenant leak surviving restarts and tenant lifecycle.
+      //
+      // CONSUMER_GROUP_HEARTBEAT is outside `TENANT_ALLOWED_APIS` so tenant
+      // principals are dispatch-refused upstream; this guard only ever fires
+      // for non-tenant callers. Server-side regex containment is undecidable
+      // in general, so per-pattern collision tests against bound tenant ids
+      // produce false negatives for pre-binding tenants (#102/#114) and for
+      // patterns using anchors / unicode classes. We take the conservative
+      // line: on a broker with ANY tenant binding, refuse `subscribedTopicRegex`
+      // from non-tenant callers outright. Clients that need regex subscription
+      // on a multi-tenant broker can enumerate topics client-side and submit
+      // an explicit `subscribedTopicNames` list, which IS scrubbed above.
+      if (consumerGroupHeartbeatRequest.data.subscribedTopicRegex != null &&
+        !consumerGroupHeartbeatRequest.data.subscribedTopicRegex.isEmpty &&
+        !tenantContextFor(request).effectiveTenant.isPresent &&
+        !tenantConfig.allTenants.isEmpty) {
+        val responseData = new ConsumerGroupHeartbeatResponseData()
+          .setErrorCode(Errors.TOPIC_AUTHORIZATION_FAILED.code)
+        requestHelper.sendMaybeThrottle(request, new ConsumerGroupHeartbeatResponse(responseData))
+        return CompletableFuture.completedFuture[Unit](())
+      }
+
       groupCoordinator.consumerGroupHeartbeat(
         request.context,
         consumerGroupHeartbeatRequest.data
