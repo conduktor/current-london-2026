@@ -279,7 +279,15 @@ final class Evaluator {
         if (l == null || r == null) return null;
         if (l instanceof Number && r instanceof Number) {
             Integer cmp = compareNumeric((Number) l, (Number) r);
-            return cmp == null ? null : matches(cmp, target, inclusive);
+            // compareNumeric returns null ONLY from compareLongDouble's NaN/Inf or unsafe-Long
+            // branches — both are computation failures on present operands, not absence. SKIP,
+            // not null: `(body.unsafe_long <= 9007199254740992.0) != true` would otherwise admit
+            // through the same null-vs-non-null FALSE → NEQ-confident-TRUE shape closed by R34
+            // for unary/arith/resolvePath. The R5 fix (commit 2ecadee733) tri-stated EQUALITY
+            // null safely (equalsValuesOrNull null propagates through NEQ as null, not via
+            // line-221 FALSE), but ORDERED comparison's null was only safe for direct boolean
+            // use; wrapping it in NEQ re-opens the bypass.
+            return cmp == null ? SKIP : matches(cmp, target, inclusive);
         }
         if (l instanceof String && r instanceof String) {
             int cmp = Integer.signum(((String) l).compareTo((String) r));
@@ -307,7 +315,13 @@ final class Evaluator {
     }
 
     /** Compare a Long against a Double under the IEEE-safe-integer guard. {@code longOnRight=true}
-     *  swaps the comparison so the result is relative to the original left-hand operand. */
+     *  swaps the comparison so the result is relative to the original left-hand operand.
+     *
+     *  <p>Returns {@code null} on a computation failure (NaN/Inf operand, or Long out of IEEE-safe
+     *  range). The caller {@link #compare} turns the {@code null} from this helper into
+     *  {@code SKIP} so an outer {@code (body.x < 5.0) != true} cannot flip a null result via
+     *  equalsValuesOrNull's null-vs-non-null FALSE branch into a confident TRUE — the same R3/R4
+     *  unary, R33b arith, and R34 unary/resolvePath bypass shape applied to compare-result. */
     private static Integer compareLongDouble(long longSide, double doubleSide, boolean longOnRight) {
         if (Double.isNaN(doubleSide) || Double.isInfinite(doubleSide)) {
             return null;

@@ -1047,6 +1047,27 @@ class CompiledPredicateTest {
     }
 
     @Test
+    void orderedComparisonAcrossUnsafeLongDoesNotPassNegatedPredicate() {
+        // R35 (Claude-only follow-on to R34): compareLongDouble's IEEE-safe-integer guard at
+        // Evaluator.java:316 returns null when the Long operand is outside |L| <= 2^53. That null
+        // propagates through compareNumeric (line 282) into compare's return, then into
+        // applyBinaryOp's `<` / `<=` / `>` / `>=` result. If the comparison is wrapped in NEQ,
+        // equalsValuesOrNull's `null vs non-null → FALSE` branch (line 221) lets NEQ negate it
+        // into a confident TRUE — same shape as R33b + R34, applied to compare-result rather
+        // than directly to arith or resolvePath. The existing test
+        // `skipsRecordWhenOrderedComparisonAcrossLongDoubleLosesPrecision` only checks the
+        // un-negated form (`body.account_id <= 9007199254740992.0`); it does not catch the
+        // NEQ-of-compare-result bypass.
+        CompiledPredicate p = compiler.compile(
+                "(body.account_id <= 9007199254740992.0) != true");
+        // 9007199254740993 = 2^53 + 1 is the smallest Long that cannot survive promotion to
+        // double without precision loss.
+        Optional<Boolean> r = p.evaluate(jsonRecord("{\"account_id\":9007199254740993}"));
+        assertTrue(r.isEmpty(),
+                () -> "ordered compare with unsafe Long must yield SKIP through NEQ, got " + r);
+    }
+
+    @Test
     void illegalAccessorOnScalarRootsDoesNotPassNegatedPredicate() {
         // R34 BLOCKER C: resolvePath returned null when a scalar root carried an accessor
         // (`offset.foo`, `partition.foo`, `timestamp.foo`, `key.foo`, `headers` with !=1
