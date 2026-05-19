@@ -209,26 +209,33 @@ public final class SelectorThroughputBenchmark {
     }
 
     /**
-     * Echo loop for the io_uring backend. Mirrors the real broker's Processor
-     * read/send/unmute lifecycle exactly: enqueue a response on every
-     * {@code completedReceive}, then unmute on every {@code completedSend} once
-     * the write is actually flushed.
+     * Echo loop for the io_uring backend. Mirrors the real broker's
+     * {@code Processor} request lifecycle: on every {@code completedReceive}
+     * mute the channel, enqueue the response via {@code selector.send}, then
+     * on every {@code completedSend} unmute the channel so the next request
+     * can be read.
      *
-     * <p>The two halves cannot be collapsed into one. {@code selector.send()}
-     * funnels through {@link org.apache.kafka.common.network.KafkaChannel#setSend}
-     * which transitions the channel {@code NOT_MUTED -> MUTED_AND_RESPONSE_PENDING}.
-     * Calling {@link IoUringSelector#unmute} on a channel still in
-     * {@code MUTED_AND_RESPONSE_PENDING} returns silently false — the state
-     * machine only allows unmute from {@code MUTED_AND_RESPONSE_SENT}, which is
-     * the post-write-completion state Netty's write listener publishes. At low
-     * scale the write completes synchronously inside the same poll() so unmute
-     * right after send() happens to win the race; once the kernel send buffer
-     * fills (~100+ sustained connections) the write goes async and an early
-     * unmute is a no-op, parking the channel in MUTED_AND_RESPONSE_SENT
-     * forever. The real Processor handles this via
-     * {@code SocketServer.handleCompletedSends} which iterates
-     * {@code selector.completedSends()} and unmutes by destinationId — this
-     * loop mirrors that contract.
+     * <p>The mute/unmute discipline is load-bearing, not cosmetic. Without
+     * the mute, a single channel can produce a second {@code completedReceive}
+     * (its peer ships another frame) before the prior {@code selector.send}'s
+     * write actually completes — Netty's {@code writeAndFlush} is async once
+     * the kernel send buffer is full (~100+ sustained connections). The
+     * follow-up {@code selector.send} on that channel then trips
+     * {@link org.apache.kafka.common.network.KafkaChannel#setSend}'s
+     * "Attempt to begin a send while still in progress" guard, which the
+     * io_uring selector treats as a Processor invariant violation:
+     * {@code IoUringSelector.send} (catch at line ~1112) routes the channel
+     * to {@code failedSends}, removes it from {@code channels} /
+     * {@code nettyChannels}, closes it, then rethrows. The bench worker on
+     * that connection then blocks forever on its next {@code in.readInt()}
+     * (the peer's accept FD is gone but the read still waits), throughput
+     * collapses, and the symptom is "warmup ran for 55k frames, then
+     * {@code completedReceives} permanently empty for the entire measure
+     * window". Muting on receive ensures at most one outstanding send per
+     * channel; unmuting on {@code completedSend} reopens reads after the
+     * write actually drains — exactly what
+     * {@code SocketServer.processCompletedReceives} +
+     * {@code SocketServer.handleCompletedSends} do in core/.
      */
     private static void ioUringEchoLoop(IoUringSelector selector, AtomicBoolean stop) {
         try {
@@ -243,6 +250,7 @@ public final class SelectorThroughputBenchmark {
                 int thisPollRecv = 0;
                 for (NetworkReceive recv : selector.completedReceives()) {
                     String id = recv.source();
+                    selector.mute(id);
                     ByteBuffer payload = recv.payload();
                     ByteBuffer copy = ByteBuffer.allocate(payload.remaining());
                     copy.put(payload);
