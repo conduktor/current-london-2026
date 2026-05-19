@@ -552,6 +552,61 @@ public class ConcentrationKernelTest {
     }
 
     @Test
+    public void commitProduceReleasesTrackerLockWhenSidecarOpenFails() throws IOException {
+        // BLOCKER #226 (Agent-2 HIGH#1): sidecarFor() runs AFTER the per-partition tracker lock
+        // has been acquired by reserveProduce() and BEFORE the inner try/catch around
+        // sidecar.append(). Any IOException / CorruptIndexException leaking out of sidecarFor()
+        // used to bypass tracker.rollback(), pinning the ReentrantLock forever and dead-locking
+        // every subsequent produce on this logical partition. This test pre-seeds a corrupt
+        // sidecar file (length not a multiple of ENTRY_SIZE) so the LogicalSidecarIndex
+        // constructor throws CorruptIndexException, then asserts that a follow-up reserve on the
+        // same partition completes — proving the lock was released along the catch path.
+        kernel.declare(descriptor("orders", 4, "shared", 1));
+        File partitionDir = new File(sidecarDir, "orders");
+        assertTrue(partitionDir.exists() || partitionDir.mkdirs());
+        File sidecarFile = new File(partitionDir, "0.sidecar");
+        // 7 bytes — not a multiple of 12 (8 backing-offset + 4 CRC) — triggers
+        // CorruptIndexException inside LogicalSidecarIndex's constructor when sidecarFor() opens it.
+        try (java.io.FileOutputStream out = new java.io.FileOutputStream(sidecarFile)) {
+            out.write(new byte[7]);
+        }
+        Reservation r = kernel.reserveProduce("orders", 0);
+        assertThrows(org.apache.kafka.storage.internals.log.CorruptIndexException.class,
+            () -> kernel.commitProduce(r, 100L));
+        // The throw must have released the partition lock. assertTimeoutPreemptively bounds the
+        // assertion so a regression deadlocks JUnit, not the whole suite.
+        org.junit.jupiter.api.Assertions.assertTimeoutPreemptively(
+            java.time.Duration.ofSeconds(2),
+            () -> {
+                Reservation r2 = kernel.reserveProduce("orders", 0);
+                kernel.rollbackProduce(r2);
+            },
+            "tracker lock was NOT released after sidecarFor() threw — BLOCKER #226 regression");
+    }
+
+    @Test
+    public void commitProduceBatchReleasesTrackerLockWhenSidecarOpenFails() throws IOException {
+        // Batch sibling of BLOCKER #226. Same lock-leak window, same fix shape.
+        kernel.declare(descriptor("orders", 4, "shared", 1));
+        File partitionDir = new File(sidecarDir, "orders");
+        assertTrue(partitionDir.exists() || partitionDir.mkdirs());
+        File sidecarFile = new File(partitionDir, "0.sidecar");
+        try (java.io.FileOutputStream out = new java.io.FileOutputStream(sidecarFile)) {
+            out.write(new byte[7]);
+        }
+        Reservation[] batch = kernel.reserveProduceBatch("orders", 0, 3);
+        assertThrows(org.apache.kafka.storage.internals.log.CorruptIndexException.class,
+            () -> kernel.commitProduceBatch(batch, 1000L));
+        org.junit.jupiter.api.Assertions.assertTimeoutPreemptively(
+            java.time.Duration.ofSeconds(2),
+            () -> {
+                Reservation[] retry = kernel.reserveProduceBatch("orders", 0, 1);
+                kernel.rollbackProduceBatch(retry);
+            },
+            "tracker lock was NOT released after sidecarFor() threw — BLOCKER #226 regression (batch path)");
+    }
+
+    @Test
     public void commitProduceBatchFencesBackingWhenTruncateFails() throws Exception {
         // BLOCKER #170: if the sidecar tail truncate ALSO fails after the partial-append catch,
         // the in-memory tracker has been rolled back but the sidecar file still holds the

@@ -511,7 +511,21 @@ public final class ConcentrationKernel implements AutoCloseable {
         ensureOpen();
         Objects.requireNonNull(reservation, "reservation");
         checkBackingGenerationOrRollback(reservation);
-        LogicalSidecarIndex sidecar = sidecarFor(reservation.logicalTopic(), reservation.logicalPartition());
+        // BLOCKER #224: from this point the per-partition tracker lock is held until commit() or
+        // rollback() resolves the reservation. sidecarFor() can throw IOException (file open
+        // failure) or CorruptIndexException / IllegalStateException (sidecar constructor or
+        // kernel-closed race). Without an outer rollback the lock leaks for the lifetime of the
+        // broker and every subsequent reserve/commit on this logical partition deadlocks. The
+        // second checkBackingGenerationOrRollback self-rolls-back on a gate mismatch, so
+        // BackingGenerationChangedException is intentionally NOT wrapped here — letting it
+        // double-rollback would unbalance the tracker lock state.
+        LogicalSidecarIndex sidecar;
+        try {
+            sidecar = sidecarFor(reservation.logicalTopic(), reservation.logicalPartition());
+        } catch (IOException | RuntimeException e) {
+            tracker.rollback(reservation);
+            throw e;
+        }
         // BLOCKER #207: re-check generation AFTER acquiring the sidecar handle. The first check
         // races with markBackingUnready — between the first check and sidecarFor(), a concurrent
         // gate-close can bump the generation AND evict the cached sidecar; sidecarFor() then
@@ -624,7 +638,19 @@ public final class ConcentrationKernel implements AutoCloseable {
             throw new IllegalArgumentException("commitProduceBatch requires a non-empty batch");
         }
         checkBackingGenerationOrRollbackBatch(batch);
-        LogicalSidecarIndex sidecar = sidecarFor(batch[0].logicalTopic(), batch[0].logicalPartition());
+        // BLOCKER #224 (batch sibling): same lock-leak window as commitProduce. The per-partition
+        // tracker lock is held; sidecarFor() can throw IOException / CorruptIndexException /
+        // IllegalStateException and bypass every rollback path below. Wrap so any throw rolls
+        // back the batch and releases the lock. The second gen-check self-rolls-back on a fence
+        // and must NOT be wrapped here (its BackingGenerationChangedException is already a
+        // post-rollback signal).
+        LogicalSidecarIndex sidecar;
+        try {
+            sidecar = sidecarFor(batch[0].logicalTopic(), batch[0].logicalPartition());
+        } catch (IOException | RuntimeException e) {
+            tracker.rollbackBatch(batch);
+            throw e;
+        }
         // BLOCKER #207: re-check generation AFTER acquiring the sidecar handle — see the matching
         // comment on commitProduce. Without this second check, a markBackingUnready landing between
         // checkBackingGenerationOrRollbackBatch and sidecarFor() can leave us writing a partial
