@@ -20,28 +20,66 @@ import org.apache.kafka.common.config.ConfigDef.Validator;
 import org.apache.kafka.common.config.ConfigException;
 
 /**
- * R33 #292 [HIGH]: ConfigDef-level admission test for
+ * R33 #292 / R34-A-1 [HIGH]: ConfigDef-level admission test for
  * {@code governance.bypass.principals}.
  *
- * <p>Without this validator the ConfigDef declares the bypass list as a
- * bare {@code STRING}, which silently accepts any operator-supplied value
- * at admin-API write time. A malformed value (missing {@code :} separator,
- * blank type or name, comma-confusable separator typo, invisible-glyph
- * smuggle, etc.) is then persisted to KRaft metadata and survives until
- * the next broker restart — at which point {@code BrokerGovernanceBootstrap}
- * calls {@link RuleEngine#parseBypassPrincipals(String)} and the broker
- * refuses to start. The admin who typed the bad value months earlier sees
- * a successful ack and never associates the eventual restart failure with
- * their change.
+ * <h2>What this validator actually closes (narrow)</h2>
  *
- * <p>Running the same parser at admin-API admission time closes that
- * delayed time-bomb: the malformed value is rejected loudly, on the wire,
- * before it ever lands in the metadata log. The validator delegates to
- * {@link RuleEngine#parseBypassPrincipals(String)} so the admission rule
- * is exactly the startup rule — no second source of truth for what counts
- * as a valid bypass principal. Any future hardening of the parser
- * (R30/R31/R32/R33 codepoint/confusable closures) is picked up by the
- * validator automatically.
+ * <p>Fires at {@code ServerConfigs.CONFIG_DEF.parse(...)} time — which is
+ * invoked during {@code KafkaConfig} construction at broker startup. A
+ * malformed value in {@code server.properties} therefore fails fast at
+ * config-parse time with config-name attribution and LogSafe sanitisation,
+ * instead of falling through to {@link RuleEngine#parseBypassPrincipals(String)}
+ * later in {@code BrokerGovernanceBootstrap}. Two narrow benefits:
+ * <ul>
+ *   <li>Earlier, louder failure with the config name embedded in the
+ *       diagnostic (operators see which config is at fault before any
+ *       broker subsystem starts).</li>
+ *   <li>Defense-in-depth so the static-config-parse rejection rule and the
+ *       bootstrap rejection rule cannot drift — both delegate to the same
+ *       {@link RuleEngine#parseBypassPrincipals(String)} parser.</li>
+ * </ul>
+ *
+ * <h2>What this validator does NOT close (the real time-bomb)</h2>
+ *
+ * <p><strong>This validator is unreachable on the admin-API path.</strong>
+ * The original R33 #292 commit narrative — that running the parser at
+ * admin-API admission time would catch malformed values before they reach
+ * KRaft — was incorrect. The actual control flow:
+ *
+ * <ul>
+ *   <li><b>{@code kafka-configs --bootstrap-server} (broker-routed).</b>
+ *       {@code DynamicBrokerConfig.validateConfigs} (
+ *       {@code core/.../DynamicBrokerConfig.scala:142}) intersects the
+ *       incoming property set with
+ *       {@code DynamicConfig.Broker.nonDynamicProps} and throws
+ *       {@code ConfigException("Cannot update these configs dynamically: ...")}
+ *       <em>before</em> {@code validateConfigTypes} (line 145) ever invokes
+ *       {@code DynamicConfig.Broker.validate}, which is the only path that
+ *       would have triggered this validator on an admin RPC. Reason:
+ *       {@code governance.bypass.principals} is not in
+ *       {@code DynamicBrokerConfig.AllDynamicConfigs}.</li>
+ *   <li><b>{@code kafka-configs --bootstrap-controller} (KIP-919,
+ *       controller-direct).</b> Admin RPC lands at
+ *       {@code ControllerConfigurationValidator.validate} (
+ *       {@code core/.../ControllerConfigurationValidator.scala:122}), which
+ *       for {@code BROKER} resources validates <em>only the resource name</em>
+ *       (broker id). New values pass through unchecked. The bad value lands
+ *       in the metadata log; the broker refuses to start at next restart
+ *       (BrokerGovernanceBootstrap), by which time the typing admin has lost
+ *       context. This is the real time-bomb. Tracked as task R34-B-1.</li>
+ * </ul>
+ *
+ * <p>Closing the time-bomb properly requires either (a) making
+ * {@code governance.bypass.principals} dynamic — which in turn requires
+ * wiring a {@code BrokerReconfigurable} listener so the in-memory bypass
+ * set hot-swaps (R34-A-2), or (b) extending
+ * {@code ControllerConfigurationValidator} to value-validate BROKER configs
+ * against {@code ServerConfigs.CONFIG_DEF} (R34-B-1). This validator stays
+ * because both of those follow-ups also rely on it — but its current reach
+ * is the static-config-parse path only.
+ *
+ * <h2>Empty / {@code null} acceptance rationale</h2>
  *
  * <p>Empty input is accepted here because the empty-set rejection is a
  * broker-startup contract enforced in {@link RuleEngine#RuleEngine(java.util.Set)}

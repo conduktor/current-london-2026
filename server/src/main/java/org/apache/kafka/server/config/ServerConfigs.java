@@ -182,13 +182,22 @@ public class ServerConfigs {
             .define(AUTHORIZER_CLASS_NAME_CONFIG, STRING, AUTHORIZER_CLASS_NAME_DEFAULT, new ConfigDef.NonNullValidator(), LOW, AUTHORIZER_CLASS_NAME_DOC)
             .define(EARLY_START_LISTENERS_CONFIG, STRING, null,  HIGH, EARLY_START_LISTENERS_DOC)
             /************ Governance (CEL rule engine) Configuration ************/
-            // R33 #292 [HIGH]: BypassPrincipalsValidator runs the same
-            // RuleEngine.parseBypassPrincipals parser at admin-API admission
-            // time that BrokerGovernanceBootstrap runs at broker startup —
-            // closes the delayed time-bomb where a malformed dynamic-config
-            // write silently lands in KRaft metadata and only surfaces as a
-            // broker-refuses-to-start at the next restart, long after the
-            // admin who typed the bad value has lost the context.
+            // R33 #292 / R34-A-1 [HIGH]: BypassPrincipalsValidator runs the
+            // same RuleEngine.parseBypassPrincipals parser at static-config
+            // parse time (during KafkaConfig construction) that
+            // BrokerGovernanceBootstrap runs at broker startup. Narrow
+            // benefit: earlier, louder failure on a bad value in
+            // server.properties with config-name attribution and LogSafe
+            // sanitisation. It does NOT close the admin-API time-bomb on its
+            // own: governance.bypass.principals is not in
+            // DynamicBrokerConfig.AllDynamicConfigs, so the broker-routed
+            // admin path is pre-rejected by the nonDynamicProps gate
+            // (DynamicBrokerConfig.scala:142) before any value validation
+            // runs; and the controller-direct path (KIP-919) skips value
+            // validation for BROKER resources entirely
+            // (ControllerConfigurationValidator.scala:122). See the validator
+            // javadoc for the full control-flow analysis and R34-A-2 /
+            // R34-B-1 for the follow-ups that actually close the gap.
             .define(GOVERNANCE_BYPASS_PRINCIPALS_CONFIG, STRING, GOVERNANCE_BYPASS_PRINCIPALS_DEFAULT, new BypassPrincipalsValidator(), MEDIUM, GOVERNANCE_BYPASS_PRINCIPALS_DOC)
             /************ Rack Configuration ******************/
             .define(BROKER_RACK_CONFIG, STRING, null, MEDIUM, BROKER_RACK_DOC)

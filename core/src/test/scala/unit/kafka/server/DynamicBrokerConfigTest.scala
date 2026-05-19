@@ -243,6 +243,57 @@ class DynamicBrokerConfigTest {
   }
 
   @Test
+  def governanceBypassPrincipalsIsNonDynamicAndRejectsBeforeValidator(): Unit = {
+    // R34-A-1 [BLOCKER] pin: `governance.bypass.principals` is deliberately
+    // non-dynamic. This pins the current architectural reality that:
+    //   (1) BypassPrincipalsValidator at ServerConfigs.CONFIG_DEF is
+    //       UNREACHABLE on the broker-routed admin-API IncrementalAlterConfigs
+    //       path, because
+    //   (2) DynamicBrokerConfig.validateConfigs throws "Cannot update these
+    //       configs dynamically" via the nonDynamicProps gate BEFORE
+    //       DynamicConfig.Broker.validate (which would invoke the validator)
+    //       ever runs.
+    //
+    // If a future change makes the config dynamic by adding it to
+    // AllDynamicConfigs, this test fails — and forces the author to confront
+    // R34-A-2 (no BrokerReconfigurable listener wired → split-brain) and
+    // R34-A-3 (DN-canonicalisation LOG.info in parseBypassPrincipals becomes
+    // an admin-API log-amplification primitive). The test is a forcing
+    // function, not a security control.
+    val origProps = TestUtils.createBrokerConfig(0, port = 8181)
+    val config = KafkaConfig(origProps)
+    config.dynamicConfig.initialize(None)
+
+    // First assertion: the config is in the nonDynamicProps set. This is the
+    // direct architectural pin — the property comes from
+    // (KafkaConfig.configNames -- DynamicConfig.Broker.brokerConfigs.names).
+    assertTrue(
+      DynamicConfig.Broker.nonDynamicProps.contains(ServerConfigs.GOVERNANCE_BYPASS_PRINCIPALS_CONFIG),
+      s"governance.bypass.principals must remain non-dynamic until R34-A-2 (BrokerReconfigurable listener) lands — see BypassPrincipalsValidator javadoc"
+    )
+
+    // Second assertion: a well-formed-but-not-default value is still
+    // rejected at admit time. Proves the rejection comes from the gate,
+    // not from the BypassPrincipalsValidator (a malformed value would
+    // also be rejected, but for the wrong reason — we want this test to
+    // pass for the right reason).
+    val props = new Properties
+    props.put(ServerConfigs.GOVERNANCE_BYPASS_PRINCIPALS_CONFIG, "User:broker;User:kafka-controller")
+    val ex = assertThrows(
+      classOf[ConfigException],
+      () => config.dynamicConfig.validate(props, perBrokerConfig = true)
+    )
+    assertTrue(
+      ex.getMessage.contains("Cannot update these configs dynamically"),
+      s"expected nonDynamicProps gate rejection; got: ${ex.getMessage}"
+    )
+    assertTrue(
+      ex.getMessage.contains(ServerConfigs.GOVERNANCE_BYPASS_PRINCIPALS_CONFIG),
+      s"expected diagnostic to name the offending config; got: ${ex.getMessage}"
+    )
+  }
+
+  @Test
   def testConfigUpdateWithSomeInvalidConfigs(): Unit = {
     val origProps = TestUtils.createBrokerConfig(0, port = 8181)
     origProps.put(SslConfigs.SSL_KEYSTORE_TYPE_CONFIG, "JKS")
