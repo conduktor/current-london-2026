@@ -25,7 +25,10 @@ import org.apache.kafka.common.record.RecordBatch;
 import org.apache.kafka.common.utils.BufferSupplier;
 
 import java.nio.ByteBuffer;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
@@ -51,6 +54,42 @@ import java.util.Set;
 public final class ViewFilter {
 
     private ViewFilter() {
+    }
+
+    /**
+     * Result of {@link #applyAndCollect(CompiledPredicate, MemoryRecords, int, ViewMetrics, BufferSupplier)}.
+     * Carries the post-filter records AND a side-channel describing which transaction-marker
+     * batches were scrubbed (per producerId, sorted by baseOffset). The side-channel exists so
+     * the downstream abortedTransactions filter in {@code KafkaApis} can still detect
+     * transaction terminators after their producer-id has been stripped from the wire records:
+     * a scrubbed marker is invisible to {@code batch.producerId()} downstream, so without this
+     * side-channel a same-pid hidden-tx + visible-tx pair would falsely keep the hidden tx's
+     * AbortedTransaction entry alive (the visible tx's surviving data would appear "in range"
+     * because the scrubbed marker no longer acts as a per-producer boundary).
+     */
+    public static final class FilterResult {
+        private final MemoryRecords records;
+        private final Map<Long, Set<Long>> scrubbedMarkerOffsetsByProducerId;
+
+        public FilterResult(MemoryRecords records,
+                            Map<Long, Set<Long>> scrubbedMarkerOffsetsByProducerId) {
+            this.records = records;
+            this.scrubbedMarkerOffsetsByProducerId = scrubbedMarkerOffsetsByProducerId;
+        }
+
+        public MemoryRecords records() {
+            return records;
+        }
+
+        /**
+         * For each backing producerId whose transaction marker was scrubbed in this filter
+         * pass, the set of baseOffsets at which markers were dropped. Empty map if no markers
+         * were scrubbed (predicate fully permissive, no transactional records, or no
+         * fully-hidden transactions). Returned map is unmodifiable.
+         */
+        public Map<Long, Set<Long>> scrubbedMarkerOffsetsByProducerId() {
+            return scrubbedMarkerOffsetsByProducerId;
+        }
     }
 
     /**
@@ -96,6 +135,21 @@ public final class ViewFilter {
     public static MemoryRecords apply(CompiledPredicate predicate, MemoryRecords input,
                                        int partition, ViewMetrics metrics,
                                        BufferSupplier decompressionBuffers) {
+        return applyAndCollect(predicate, input, partition, metrics, decompressionBuffers).records();
+    }
+
+    /**
+     * Structured variant of {@link #apply(CompiledPredicate, MemoryRecords, int, ViewMetrics, BufferSupplier)}
+     * that also exposes the per-producer baseOffsets where transaction markers were scrubbed.
+     * The fetch handler ({@code KafkaApis.applyViewFilter}) consumes the side-channel and
+     * threads it through {@code filterAbortedTransactionsByVisibleProducers}, which uses each
+     * scrubbed offset as a synthetic terminator when scanning per-producer batches — exactly
+     * what an intact marker would have provided. Unit tests can ignore the side-channel and
+     * use the simpler {@link #apply} overloads.
+     */
+    public static FilterResult applyAndCollect(CompiledPredicate predicate, MemoryRecords input,
+                                                int partition, ViewMetrics metrics,
+                                                BufferSupplier decompressionBuffers) {
         if (predicate == null) {
             throw new IllegalArgumentException("predicate must not be null");
         }
@@ -151,26 +205,33 @@ public final class ViewFilter {
         //       only baseOffset and lastOffset survive on the empty batch ("Preserves source
         //       offsets"); everything else is leakage.
         //
-        // Control batches (transaction markers) are scrubbed when their producerId has NO
-        // surviving non-control data anywhere in the filtered output. That is the case Codex
-        // (R58) called out: a producer writes only records that the predicate filters out,
-        // commits or aborts the transaction, and the marker still reaches the view consumer —
-        // exposing the backing producer's id, epoch, transaction outcome, coordinator epoch,
-        // and source offset boundary for a transaction the predicate completely hid.
-        // (KafkaApis.filterAbortedTransactionsByVisibleProducers strips the matching
-        // abortedTransactions entry in this case, so the marker is also functionally a no-op
-        // for the consumer's READ_COMMITTED state machine — pure leakage.)
+        // Control batches (transaction markers) are scrubbed when the transaction they
+        // terminate had NO surviving non-control data in the filtered output. That is the case
+        // Codex (R58) called out: a producer writes only records that the predicate filters
+        // out, commits or aborts the transaction, and the marker still reaches the view
+        // consumer — exposing the backing producer's id, epoch, transaction outcome,
+        // coordinator epoch, and source offset boundary for a transaction the predicate
+        // completely hid. (KafkaApis.filterAbortedTransactionsByVisibleProducers strips the
+        // matching abortedTransactions entry in this case, so the marker is also functionally
+        // a no-op for the consumer's READ_COMMITTED state machine — pure leakage.)
         //
-        // We use a PER-PRODUCER-ID rule, not per-transaction-range: a marker is kept iff some
-        // surviving non-control data in the same fetch shares its producerId. The narrower
-        // per-transaction-range rule (keep only when the same OPEN transaction had survivors)
-        // would scrub the boundary marker of a hidden transaction whose producer also had a
-        // visible transaction later — but the downstream
-        // KafkaApis.filterAbortedTransactionsByVisibleProducers walks markers to bound the
-        // search range for each abortedTransactions entry, and a scrubbed marker no longer
-        // carries its producerId so it can no longer act as a boundary. Per-pid retention
-        // keeps the marker's pid intact in that case, leaving the boundary visible. The
-        // canonical multi-tenancy model (one producer per tenant) is fully covered by per-pid.
+        // We use a PER-(PRODUCER-ID, TRANSACTION-RANGE) rule: a marker is kept iff at least
+        // one surviving non-control batch with the same producerId appeared BETWEEN that
+        // producer's previous marker (or the start of the fetch) and this marker. A simpler
+        // per-producer-id rule (R58) would over-keep: if the same pid produces TX1 fully
+        // hidden then TX2 fully visible in the same fetch, TX1's marker survives because
+        // pid has surviving data SOMEWHERE — broadcasting TX1's COMMIT/ABORT outcome and
+        // coordinator epoch even though no record of TX1 reaches the consumer. The narrower
+        // rule scrubs TX1's marker correctly. (Codex R61 BLOCKER.)
+        //
+        // The downstream KafkaApis.filterAbortedTransactionsByVisibleProducers walks per-pid
+        // batches and uses control batches as transaction terminators, so scrubbing a marker
+        // erases its boundary information from the wire. To preserve abortedTransactions
+        // filtering correctness, applyAndCollect returns the set of scrubbed marker offsets
+        // keyed by original producerId; the fetch handler threads this side-channel into the
+        // abortedTransactions filter, which treats each scrubbed offset as a synthetic
+        // terminator. End-to-end behaviour matches the R55 per-tx-range entry filter without
+        // the wire leak.
         //
         // Scrubbed markers become header-only batches: baseOffset/lastOffset survive so LSO
         // advances, NO_PRODUCER_ID + NO_PRODUCER_EPOCH + NO_SEQUENCE + isTransactional=false +
@@ -184,46 +245,101 @@ public final class ViewFilter {
         // are copied via batch.writeTo unchanged. We skip the rebuild entirely (single pass,
         // in-place setPartitionLeaderEpoch only) when no scrub is required, which is the common
         // case under permissive predicates with no fully-hidden producers.
-        filtered = scrubBackingMetadata(filtered);
-        metrics.recordBytes(inputSize, filtered.sizeInBytes());
-        return filtered;
+        ScrubResult scrub = scrubBackingMetadata(filtered);
+        metrics.recordBytes(inputSize, scrub.records.sizeInBytes());
+        return new FilterResult(scrub.records, scrub.scrubbedMarkerOffsetsByProducerId);
+    }
+
+    /** Carries the scrub-pass output: rebuilt records plus the per-producer offsets at which
+     *  fully-hidden transaction markers were dropped. The offsets map keys are producerIds
+     *  (the ORIGINAL backing producerId of the scrubbed marker — the wire form no longer
+     *  carries it), values are the baseOffsets of scrubbed markers; downstream walks them
+     *  as synthetic transaction terminators. */
+    private static final class ScrubResult {
+        final MemoryRecords records;
+        final Map<Long, Set<Long>> scrubbedMarkerOffsetsByProducerId;
+
+        ScrubResult(MemoryRecords records, Map<Long, Set<Long>> scrubbedMarkerOffsetsByProducerId) {
+            this.records = records;
+            this.scrubbedMarkerOffsetsByProducerId = scrubbedMarkerOffsetsByProducerId;
+        }
     }
 
     /**
      * Walks the post-filter batches to perform the three scrubs described in the apply-method
      * comment block (partition_leader_epoch on every retained batch, empty-data-batch identity
-     * fields, and fully-hidden control-batch identity + marker payload). Returns the resulting
-     * {@link MemoryRecords} — either the input (rebuild skipped) or a fresh rebuild.
+     * fields, and fully-hidden control-batch identity + marker payload using per-tx-range
+     * scope). Returns the rebuilt {@link MemoryRecords} alongside the per-producer baseOffsets
+     * at which transaction markers were scrubbed, so the caller can preserve abortedTx
+     * boundary information that the wire-level scrub erases.
      */
-    private static MemoryRecords scrubBackingMetadata(MemoryRecords filtered) {
-        Set<Long> survivingDataPids = null;
+    private static ScrubResult scrubBackingMetadata(MemoryRecords filtered) {
+        ScanPass scan = scanForScrubTargets(filtered);
+        if (!scan.hasEmptyDataBatch && scan.scrubbedMarkerOffsetsByPid.isEmpty()) {
+            return new ScrubResult(filtered, Collections.emptyMap());
+        }
+        MemoryRecords rebuilt = rebuildWithScrub(filtered, scan.scrubbedMarkerOffsetsByPid);
+        return new ScrubResult(rebuilt, freezeSideChannel(scan.scrubbedMarkerOffsetsByPid));
+    }
+
+    /** Output of pass 1 of {@link #scrubBackingMetadata}: which markers need scrubbing and
+     *  whether any empty data batch needs identity stripping. */
+    private static final class ScanPass {
+        final Map<Long, Set<Long>> scrubbedMarkerOffsetsByPid;
+        final boolean hasEmptyDataBatch;
+
+        ScanPass(Map<Long, Set<Long>> scrubbedMarkerOffsetsByPid, boolean hasEmptyDataBatch) {
+            this.scrubbedMarkerOffsetsByPid = scrubbedMarkerOffsetsByPid;
+            this.hasEmptyDataBatch = hasEmptyDataBatch;
+        }
+    }
+
+    /**
+     * Walk in log order: strip partition_leader_epoch on every V2+ batch, track per-pid
+     * "has surviving non-control data since this pid's previous marker", and collect the
+     * baseOffsets of markers whose preceding tx-range had no surviving data.
+     */
+    private static ScanPass scanForScrubTargets(MemoryRecords filtered) {
+        Map<Long, Boolean> survivingSinceLastMarker = new HashMap<>();
+        Map<Long, Set<Long>> scrubbedMarkerOffsetsByPid = new HashMap<>();
         boolean hasEmptyDataBatch = false;
-        boolean hasAnyControlBatch = false;
         for (MutableRecordBatch batch : filtered.batches()) {
             if (batch.magic() < RecordBatch.MAGIC_VALUE_V2) {
                 continue;
             }
             batch.setPartitionLeaderEpoch(RecordBatch.NO_PARTITION_LEADER_EPOCH);
             if (batch.isControlBatch()) {
-                hasAnyControlBatch = true;
+                processControlBatchForScan(batch, survivingSinceLastMarker, scrubbedMarkerOffsetsByPid);
             } else if (isEmptyDataBatch(batch)) {
                 hasEmptyDataBatch = true;
             } else if (hasSurvivingRecords(batch)) {
-                if (survivingDataPids == null) {
-                    survivingDataPids = new HashSet<>();
-                }
-                survivingDataPids.add(batch.producerId());
+                survivingSinceLastMarker.put(batch.producerId(), Boolean.TRUE);
             }
         }
-        final Set<Long> survivingPids = survivingDataPids == null ? Set.of() : survivingDataPids;
-        boolean hasFullyHiddenControlBatch = hasAnyControlBatch
-                && hasFullyHiddenControlBatch(filtered, survivingPids);
-        if (!hasEmptyDataBatch && !hasFullyHiddenControlBatch) {
-            return filtered;
+        return new ScanPass(scrubbedMarkerOffsetsByPid, hasEmptyDataBatch);
+    }
+
+    /** Per-(producerId, tx-range) decision for one control batch: scrub iff no surviving data
+     *  since this pid's previous marker. Resets the per-pid tracker either way (the next tx
+     *  for this pid starts fresh). */
+    private static void processControlBatchForScan(MutableRecordBatch batch,
+                                                   Map<Long, Boolean> survivingSinceLastMarker,
+                                                   Map<Long, Set<Long>> scrubbedMarkerOffsetsByPid) {
+        long pid = batch.producerId();
+        if (!Boolean.TRUE.equals(survivingSinceLastMarker.get(pid))) {
+            scrubbedMarkerOffsetsByPid.computeIfAbsent(pid, k -> new HashSet<>()).add(batch.baseOffset());
         }
+        survivingSinceLastMarker.put(pid, Boolean.FALSE);
+    }
+
+    /** Pass 2 of scrubBackingMetadata: rebuild bytes, scrubbing empty data batches and the
+     *  markers identified by pass 1. Non-empty data and partially-visible markers are
+     *  copied through unchanged. */
+    private static MemoryRecords rebuildWithScrub(MemoryRecords filtered,
+                                                   Map<Long, Set<Long>> scrubbedMarkerOffsetsByPid) {
         ByteBuffer rebuilt = ByteBuffer.allocate(filtered.sizeInBytes());
         for (MutableRecordBatch batch : filtered.batches()) {
-            if (shouldScrubAsEmpty(batch, survivingPids)) {
+            if (shouldScrubAsEmpty(batch, scrubbedMarkerOffsetsByPid)) {
                 DefaultRecordBatch.writeEmptyHeader(
                         rebuilt,
                         RecordBatch.CURRENT_MAGIC_VALUE,
@@ -246,30 +362,37 @@ public final class ViewFilter {
         return MemoryRecords.readableRecords(rebuilt);
     }
 
+    /** Wrap the per-pid scrubbed-marker offsets map (and its nested sets) in unmodifiable
+     *  views before exposing through {@link FilterResult#scrubbedMarkerOffsetsByProducerId()}. */
+    private static Map<Long, Set<Long>> freezeSideChannel(Map<Long, Set<Long>> scrubbedMarkerOffsetsByPid) {
+        if (scrubbedMarkerOffsetsByPid.isEmpty()) {
+            return Collections.emptyMap();
+        }
+        Map<Long, Set<Long>> tmp = new HashMap<>(scrubbedMarkerOffsetsByPid.size());
+        for (Map.Entry<Long, Set<Long>> e : scrubbedMarkerOffsetsByPid.entrySet()) {
+            tmp.put(e.getKey(), Collections.unmodifiableSet(e.getValue()));
+        }
+        return Collections.unmodifiableMap(tmp);
+    }
+
     private static boolean hasSurvivingRecords(MutableRecordBatch batch) {
         Integer count = batch.countOrNull();
         return count != null && count > 0;
     }
 
-    private static boolean hasFullyHiddenControlBatch(MemoryRecords filtered, Set<Long> survivingPids) {
-        for (MutableRecordBatch batch : filtered.batches()) {
-            if (batch.magic() >= RecordBatch.MAGIC_VALUE_V2
-                    && batch.isControlBatch()
-                    && !survivingPids.contains(batch.producerId())) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private static boolean shouldScrubAsEmpty(MutableRecordBatch batch, Set<Long> survivingPids) {
+    private static boolean shouldScrubAsEmpty(MutableRecordBatch batch,
+                                              Map<Long, Set<Long>> scrubbedMarkerOffsetsByPid) {
         if (batch.magic() < RecordBatch.MAGIC_VALUE_V2) {
             return false;
         }
         if (isEmptyDataBatch(batch)) {
             return true;
         }
-        return batch.isControlBatch() && !survivingPids.contains(batch.producerId());
+        if (!batch.isControlBatch()) {
+            return false;
+        }
+        Set<Long> offsets = scrubbedMarkerOffsetsByPid.get(batch.producerId());
+        return offsets != null && offsets.contains(batch.baseOffset());
     }
 
     private static boolean isEmptyDataBatch(MutableRecordBatch batch) {

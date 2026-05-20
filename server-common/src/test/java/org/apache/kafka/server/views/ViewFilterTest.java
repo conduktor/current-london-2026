@@ -693,6 +693,109 @@ class ViewFilterTest {
     }
 
     @Test
+    void samePidHiddenTxBeforeVisibleTxScrubsTheHiddenMarker() {
+        // R61 BLOCKER closure. R58 used a producer-id-wide rule: a marker survived iff its pid
+        // had any surviving non-control data ANYWHERE in the fetch. That over-keeps when the
+        // SAME pid produces TX1 fully hidden then TX2 fully visible — TX1's marker survives
+        // because pid has surviving data SOMEWHERE (from TX2), leaking TX1's COMMIT/ABORT
+        // outcome, coordinator epoch, and offset boundary. The fix narrows the rule to
+        // per-(pid, tx-range): a marker is kept iff at least one surviving non-control batch
+        // with the same pid appeared BETWEEN this pid's previous marker (or fetch start) and
+        // the current marker. TX1's marker is scrubbed; TX2's marker survives.
+        //
+        // The fetch handler also needs the scrubbed offsets back, because the abortedTx
+        // filter (KafkaApis.filterAbortedTransactionsByVisibleProducers) walks per-pid
+        // batches and uses control batches as transaction terminators — a scrubbed marker
+        // is invisible to that walk. applyAndCollect returns the per-pid scrubbed offsets;
+        // this test verifies both the wire scrub AND the side-channel.
+        CompiledPredicate p = compiler.compile("body.color == 'red'");
+        long pid = 80L;
+        short epoch = 0;
+        ByteBuffer buffer = ByteBuffer.allocate(4096);
+
+        // TX1: data fully hidden (only "blue"), then ABORT marker.
+        MemoryRecordsBuilder tx1Data = new MemoryRecordsBuilder(
+                buffer,
+                RecordBatch.CURRENT_MAGIC_VALUE,
+                Compression.NONE,
+                TimestampType.CREATE_TIME,
+                100L, 0L,
+                pid, epoch, 0,
+                true, false, 0,
+                buffer.capacity());
+        tx1Data.append(0L, null, "{\"color\":\"blue\"}".getBytes(StandardCharsets.UTF_8));
+        tx1Data.close();
+        MemoryRecords.writeEndTransactionalMarker(buffer, 101L, 0L, 0,
+                pid, epoch,
+                new EndTransactionMarker(ControlRecordType.ABORT, 0));
+
+        // TX2: data partially visible (red + blue), then COMMIT marker. Same pid, same epoch.
+        MemoryRecordsBuilder tx2Data = new MemoryRecordsBuilder(
+                buffer,
+                RecordBatch.CURRENT_MAGIC_VALUE,
+                Compression.NONE,
+                TimestampType.CREATE_TIME,
+                102L, 0L,
+                pid, epoch, 1,
+                true, false, 0,
+                buffer.capacity());
+        tx2Data.append(0L, null, "{\"color\":\"red\"}".getBytes(StandardCharsets.UTF_8));
+        tx2Data.append(0L, null, "{\"color\":\"blue\"}".getBytes(StandardCharsets.UTF_8));
+        tx2Data.close();
+        MemoryRecords.writeEndTransactionalMarker(buffer, 104L, 0L, 0,
+                pid, epoch,
+                new EndTransactionMarker(ControlRecordType.COMMIT, 0));
+
+        buffer.flip();
+        MemoryRecords input = MemoryRecords.readableRecords(buffer);
+
+        ViewFilter.FilterResult result = ViewFilter.applyAndCollect(
+                p, input, 0, ViewMetrics.NOOP, BufferSupplier.NO_CACHING);
+
+        // (1) Wire-level assertions: TX1 marker (offset 101) scrubbed; TX2 marker (offset 104) intact.
+        boolean hiddenMarkerScrubbed = false;
+        boolean visibleMarkerIntact = false;
+        for (MutableRecordBatch batch : result.records().batches()) {
+            if (batch.baseOffset() == 101L) {
+                assertFalse(batch.isControlBatch(),
+                        "TX1 marker (offset 101) must be scrubbed to a non-control header — same-pid TX1 hidden");
+                assertEquals(RecordBatch.NO_PRODUCER_ID, batch.producerId(),
+                        "TX1 marker must not leak producer_id even though TX2 of the same pid is visible");
+                assertEquals(RecordBatch.NO_PRODUCER_EPOCH, batch.producerEpoch(),
+                        "TX1 marker must not leak producer_epoch");
+                assertFalse(batch.isTransactional(),
+                        "TX1 marker must clear isTransactional");
+                assertFalse(batch.iterator().hasNext(),
+                        "TX1 marker must produce a header-only batch — no coordinator-epoch, no COMMIT/ABORT byte");
+                hiddenMarkerScrubbed = true;
+            } else if (batch.baseOffset() == 104L) {
+                assertTrue(batch.isControlBatch(),
+                        "TX2 marker (offset 104) must remain a control batch — TX2 has surviving data");
+                assertEquals(pid, batch.producerId(),
+                        "TX2 marker producer_id must round-trip — READ_COMMITTED matches it to TX2's data");
+                assertEquals(epoch, batch.producerEpoch(),
+                        "TX2 marker producer_epoch must round-trip");
+                assertTrue(batch.isTransactional(),
+                        "TX2 marker isTransactional must round-trip");
+                visibleMarkerIntact = true;
+            }
+        }
+        assertTrue(hiddenMarkerScrubbed,
+                "expected the TX1 ABORT marker at offset 101 to be scrubbed to a header-only batch");
+        assertTrue(visibleMarkerIntact,
+                "expected the TX2 COMMIT marker at offset 104 to remain a control batch");
+
+        // (2) Side-channel assertions: scrubbed marker offset is reported so KafkaApis can
+        //     keep its abortedTx filter accurate after the wire scrub erases producer_id.
+        assertNotNull(result.scrubbedMarkerOffsetsByProducerId(),
+                "side-channel map must be non-null (empty allowed) so callers can iterate without null guards");
+        assertTrue(result.scrubbedMarkerOffsetsByProducerId().containsKey(pid),
+                "side-channel must record the scrubbed pid so KafkaApis can rebuild transaction boundaries");
+        assertEquals(java.util.Set.of(101L), result.scrubbedMarkerOffsetsByProducerId().get(pid),
+                "side-channel must report exactly the offset(s) of scrubbed markers for this pid (101 for TX1; 104 stayed intact)");
+    }
+
+    @Test
     void filteredBatchesAlwaysCarryNoPartitionLeaderEpochRegardlessOfSource() {
         // The view partition keeps its own (lower) leader-epoch ledger. If the filter forwards the
         // backing topic's partition_leader_epoch through filtered records, the consumer's

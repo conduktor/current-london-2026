@@ -909,16 +909,16 @@ class KafkaApis(val requestChannel: RequestChannel,
           java.util.OptionalInt.empty(),
           data.isReassignmentFetch))
       }
-      val filtered: Either[Errors, MemoryRecords] = data.records match {
+      val filtered: Either[Errors, ViewFilter.FilterResult] = data.records match {
         case mr: MemoryRecords =>
-          Right(ViewFilter.apply(spec.predicate(), mr, viewTpId.partition, viewMetrics, bufferSupplier))
+          Right(ViewFilter.applyAndCollect(spec.predicate(), mr, viewTpId.partition, viewMetrics, bufferSupplier))
         case fr: FileRecords =>
           // Slurp the on-disk slice into a heap buffer and reuse the MemoryRecords filter. The
           // buffer comes from the per-callback supplier so subsequent view partitions in the same
           // fetch can reuse it. Empty slices are short-circuited because ByteBuffer.allocate(0) +
           // readInto on a closed/empty FileRecords would still hit the channel.
           val size = fr.sizeInBytes()
-          if (size == 0) Right(MemoryRecords.EMPTY)
+          if (size == 0) Right(new ViewFilter.FilterResult(MemoryRecords.EMPTY, java.util.Collections.emptyMap()))
           else {
             val buffer = bufferSupplier.get(size)
             try {
@@ -929,7 +929,7 @@ class KafkaApis(val requestChannel: RequestChannel,
               buffer.limit(size)
               fr.readInto(buffer, 0)
               val materialized = MemoryRecords.readableRecords(buffer)
-              Right(ViewFilter.apply(spec.predicate(), materialized, viewTpId.partition, viewMetrics, bufferSupplier))
+              Right(ViewFilter.applyAndCollect(spec.predicate(), materialized, viewTpId.partition, viewMetrics, bufferSupplier))
             } catch {
               case e: java.io.IOException =>
                 error(s"View fetch for ${viewTpId.topic} failed to materialize FileRecords for filtering; " +
@@ -973,7 +973,8 @@ class KafkaApis(val requestChannel: RequestChannel,
       // replicas are not threaded into applyViewFilter.
       val safePreferredReadReplica = java.util.OptionalInt.empty()
       filtered match {
-        case Right(records) =>
+        case Right(result) =>
+          val records = result.records
           // Drop abortedTransactions entries whose producer_id no longer appears in any
           // surviving (non-empty, non-control) data batch. Two reasons:
           //  (1) Leak closure: the round-4 empty-batch scrub (commit 2dcc1780be) clears
@@ -991,8 +992,18 @@ class KafkaApis(val requestChannel: RequestChannel,
           //      these entries to skip the still-aborted records — without them, surviving
           //      aborted records would be surfaced as committed. Empty-batch producer-ids
           //      are scrubbed to NO_PRODUCER_ID, so the filter naturally drops them.
+          //
+          //  (3) R61 same-pid leak closure: when ViewFilter scrubs a fully-hidden transaction
+          //      marker (per-(pid, tx-range) rule), the marker's producer-id is gone from the
+          //      wire, so the per-pid walk below would miss its boundary. The scrubbed marker
+          //      offsets are threaded back in via `result.scrubbedMarkerOffsetsByProducerId`
+          //      and merged into the per-producer batch list as synthetic control batches —
+          //      exactly what the intact marker would have contributed. Without this, a
+          //      hidden TX1 + visible TX2 on the same pid would falsely keep TX1's
+          //      AbortedTransaction entry because TX2's surviving data would appear to be in
+          //      TX1's range.
           val filteredAbortedTransactions = filterAbortedTransactionsByVisibleProducers(
-            records, data.abortedTransactions)
+            records, data.abortedTransactions, result.scrubbedMarkerOffsetsByProducerId)
           (viewTpId, new FetchPartitionData(
             data.error,
             data.highWatermark,
@@ -1047,7 +1058,8 @@ class KafkaApis(val requestChannel: RequestChannel,
     // the upper bound when scoping the transaction range.
     def filterAbortedTransactionsByVisibleProducers(
         records: MemoryRecords,
-        original: Optional[java.util.List[FetchResponseData.AbortedTransaction]]
+        original: Optional[java.util.List[FetchResponseData.AbortedTransaction]],
+        scrubbedMarkerOffsetsByProducerId: java.util.Map[java.lang.Long, java.util.Set[java.lang.Long]]
     ): Optional[java.util.List[FetchResponseData.AbortedTransaction]] = {
       if (!original.isPresent || original.get.isEmpty) {
         return original
@@ -1061,6 +1073,23 @@ class KafkaApis(val requestChannel: RequestChannel,
           val list = perProducer.getOrElseUpdate(batch.producerId(),
             new scala.collection.mutable.ArrayBuffer[BatchInfo]())
           list += new BatchInfo(batch.baseOffset(), batch.isControlBatch, batch.countOrNull())
+        }
+      }
+      // Merge scrubbed marker offsets as synthetic control batches keyed by the ORIGINAL backing
+      // producerId. ViewFilter erases producerId/epoch/transactional/control flags from the wire
+      // when it scrubs a fully-hidden transaction marker (per-(pid, tx-range) rule, R61), so
+      // these offsets are invisible to `batch.producerId()` above. Re-injecting them as
+      // synthetic control batches preserves the transaction-terminator boundary that the
+      // hasSurvivingDataInRange walk depends on — without this merge, a same-pid hidden TX1 +
+      // visible TX2 would falsely keep TX1's AbortedTransaction entry (TX2's surviving data
+      // would appear "in range" because TX1's marker no longer terminates the walk).
+      if (scrubbedMarkerOffsetsByProducerId != null && !scrubbedMarkerOffsetsByProducerId.isEmpty) {
+        scrubbedMarkerOffsetsByProducerId.forEach { (pid, offsets) =>
+          val list = perProducer.getOrElseUpdate(pid.longValue(),
+            new scala.collection.mutable.ArrayBuffer[BatchInfo]())
+          offsets.forEach { offset =>
+            list += new BatchInfo(offset.longValue(), true, java.lang.Integer.valueOf(0))
+          }
         }
       }
       perProducer.values.foreach(_.sortInPlaceBy(_.baseOffset))
