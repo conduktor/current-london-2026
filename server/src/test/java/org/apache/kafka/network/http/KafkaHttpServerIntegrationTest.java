@@ -1912,6 +1912,43 @@ class KafkaHttpServerIntegrationTest {
         assertEquals("method not allowed", envelope.get("errorMessage").asText());
     }
 
+    @Test
+    void oversizedRequestHeaderIsRejectedAtTheHttpConfigCap() throws Exception {
+        // KafkaHttpServer pins HttpConfiguration.requestHeaderSize to 8 KiB so the resource bound does not silently
+        // shift with whichever default a future Jetty 12.x ships. Without that pin, a Jetty bump that raises the
+        // default would let a peer pin substantially more memory in the header phase before the body-rate watchdog
+        // can fire (setMinRequestDataRate only kicks in once body reads start). Drive the wire directly because the
+        // HttpClient API will not knowingly send a request whose headers exceed the server's cap.
+        try (Socket s = new Socket("127.0.0.1", server.boundPort())) {
+            s.setSoTimeout(5000);
+            OutputStream out = s.getOutputStream();
+            // Build a single header whose value exceeds 8 KiB. The cap is on the cumulative header block, so a
+            // value sized comfortably past it (10 KiB) ensures the parser trips the cap regardless of the small
+            // request-line + Host + Content-Length overhead also counted against the budget.
+            int padLength = 10 * 1024;
+            StringBuilder pad = new StringBuilder(padLength);
+            for (int i = 0; i < padLength; i++) {
+                pad.append('a');
+            }
+            String req = "GET /v1/topics/orders/records HTTP/1.1\r\n"
+                + "Host: 127.0.0.1\r\n"
+                + "X-Oversize-Probe: " + pad + "\r\n"
+                + "Connection: close\r\n"
+                + "Content-Length: 0\r\n"
+                + "\r\n";
+            out.write(req.getBytes(StandardCharsets.US_ASCII));
+            out.flush();
+
+            String raw = readAllAscii(s.getInputStream());
+            // Jetty surfaces a header-cap overflow as 431 Request Header Fields Too Large (RFC 6585). Assert the
+            // 4xx family rather than the exact code so a future Jetty release that narrows the response (e.g. to
+            // a plain 400) still passes — the contract is "reject before dispatch", not "exactly 431".
+            assertTrue(raw.startsWith("HTTP/1.1 4"),
+                "oversized header must produce a 4xx response, got status line: "
+                    + raw.split("\r\n", 2)[0]);
+        }
+    }
+
     // ----- async correctness -----
 
     @Test

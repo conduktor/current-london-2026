@@ -206,6 +206,13 @@ public final class KafkaHttpServer {
         // drip attacker can pin a handler for at most maxRequestBodyBytes / 64 seconds before the connection
         // is closed. Body-phase only — does not affect SSE/WS long-poll which use the connector idle timeout.
         httpConfig.setMinRequestDataRate(64L);
+        // Pin the request header byte budget instead of relying on Jetty's default (8 KiB today). The cap bounds
+        // the worst-case memory a peer can pin by sending a giant header block before the first body byte — the
+        // header-phase analogue of setMinRequestDataRate above (which only fires once body reads start). 8 KiB is
+        // the same value Jetty 12.0.25 ships; pinning it here documents the contract so the resource bound does
+        // not silently shift with whichever default a future Jetty 12.x ships — same doctrine the connector idle
+        // timeout below applies.
+        httpConfig.setRequestHeaderSize(8192);
         ServerConnector connector = new ServerConnector(jetty, new HttpConnectionFactory(httpConfig));
         connector.setHost(host);
         connector.setPort(port);
