@@ -28,7 +28,7 @@ import org.apache.kafka.common.header.Header
 import org.apache.kafka.common.network.ListenerName
 import org.apache.kafka.common.message.ApiMessageType
 import org.apache.kafka.common.protocol.{ApiKeys, Errors}
-import org.apache.kafka.common.record.{MemoryRecords, SimpleRecord}
+import org.apache.kafka.common.record.{ControlRecordType, EndTransactionMarker, MemoryRecords, SimpleRecord}
 import org.apache.kafka.common.requests.{AbstractRequest, AbstractResponse, FetchResponse, ProduceRequest, ProduceResponse}
 import org.apache.kafka.common.security.auth.{KafkaPrincipal, SecurityProtocol}
 import org.apache.kafka.common.utils.MockTime
@@ -273,6 +273,68 @@ class KafkaApiRequestSubmitterTest {
     assertNull(record.value(),
       "null Kafka record values must surface as Java null so ValueSerializer can emit {type:NULL}; " +
         "Array.emptyByteArray would collapse to {type:STRING,data:''} and lose the tombstone signal")
+  }
+
+  @Test
+  def translateFetchSkipsControlBatchMarkers(): Unit = {
+    // Transaction commit/abort markers live in control batches (RecordBatch.isControlBatch == true). Standard Kafka
+    // consumers filter them at the record-iterator layer; the bridge MUST do the same, otherwise producer-internal
+    // coordination state (producer id, epoch, marker payload) leaks to HTTP/SSE/WS consumers as if they were
+    // user records.
+    val submitter = newSubmitter()
+    val commitMarker = MemoryRecords.withEndTransactionMarker(
+      1000L, 99.toShort, new EndTransactionMarker(ControlRecordType.COMMIT, 0))
+
+    val partitionData = new FetchPartitionData()
+      .setPartitionIndex(0)
+      .setHighWatermark(1L)
+      .setLogStartOffset(0L)
+      .setRecords(commitMarker)
+    val topicResp = new FetchableTopicResponse().setTopicId(topicId)
+      .setPartitions(util.List.of(partitionData))
+    val response = new FetchResponse(new FetchResponseData().setResponses(util.List.of(topicResp)))
+
+    val cmd = new FetchRequestParser.FetchCommand(topic, 0, 0L, OptionalInt.empty())
+    val result = submitter.translateFetch(response, cmd)
+
+    assertEquals(Errors.NONE, result.partition().error())
+    assertEquals(0, result.partition().records().size(),
+      "control-batch commit markers must not surface as records to HTTP/SSE/WS consumers")
+  }
+
+  @Test
+  def translateFetchSurfacesDataRecordsButSkipsCoLocatedControlBatch(): Unit = {
+    // A FetchResponse can carry data batches concatenated with control-batch markers in the same byte stream
+    // (canonical layout when a transactional producer ends a txn against the same partition). The control batch
+    // must be filtered without dropping the surrounding data records.
+    val submitter = newSubmitter()
+    val dataRecords = MemoryRecords.withRecords(Compression.NONE,
+      new SimpleRecord(1700_000_000L, "k".getBytes, "v".getBytes))
+    val abortMarker = MemoryRecords.withEndTransactionMarker(
+      1L, 1700_000_001L, org.apache.kafka.common.record.RecordBatch.NO_PARTITION_LEADER_EPOCH,
+      1000L, 99.toShort, new EndTransactionMarker(ControlRecordType.ABORT, 0))
+
+    val merged = java.nio.ByteBuffer.allocate(dataRecords.sizeInBytes() + abortMarker.sizeInBytes())
+    merged.put(dataRecords.buffer())
+    merged.put(abortMarker.buffer())
+    merged.flip()
+
+    val partitionData = new FetchPartitionData()
+      .setPartitionIndex(0)
+      .setHighWatermark(2L)
+      .setLogStartOffset(0L)
+      .setRecords(MemoryRecords.readableRecords(merged))
+    val topicResp = new FetchableTopicResponse().setTopicId(topicId)
+      .setPartitions(util.List.of(partitionData))
+    val response = new FetchResponse(new FetchResponseData().setResponses(util.List.of(topicResp)))
+
+    val cmd = new FetchRequestParser.FetchCommand(topic, 0, 0L, OptionalInt.empty())
+    val result = submitter.translateFetch(response, cmd)
+
+    assertEquals(Errors.NONE, result.partition().error())
+    assertEquals(1, result.partition().records().size(),
+      "data records must survive when a control-batch marker is co-located in the same fetch")
+    assertEquals("v", new String(result.partition().records().get(0).value(), StandardCharsets.UTF_8))
   }
 
   @Test

@@ -301,19 +301,27 @@ class KafkaApiRequestSubmitter(
     baseRecords match {
       case null => out
       case r: Records =>
-        r.records().forEach { record =>
-          val offset = record.offset()
-          val timestamp = record.timestamp()
-          val key: Array[Byte] = if (record.hasKey) bytesOf(record.key()) else null
-          // Preserve null-value semantics for compacted-topic tombstones and HTTP-produced {"type":"NULL"} records.
-          // Returning Array.emptyByteArray here would let ValueSerializer.encode emit {"type":"STRING","data":""} —
-          // an incorrect downgrade that loses the tombstone signal. Match the key handling on the line above.
-          val value: Array[Byte] = if (record.hasValue) bytesOf(record.value()) else null
-          val contentType: String = record.headers().toSeq.find(_.key() == "content-type") match {
-            case Some(h) if h.value() != null => new String(h.value(), StandardCharsets.UTF_8)
-            case _ => null
+        // Iterate per-batch so we can skip transaction commit/abort markers (isControlBatch). Records.records()
+        // would flatten ALL batches including control batches; emitting those to HTTP/SSE/WS consumers leaks
+        // producer-internal coordination state (producer id, marker payload) as if it were a user record. Standard
+        // Kafka consumers filter at the record-iterator level — the bridge must do the same.
+        r.batches().forEach { batch =>
+          if (!batch.isControlBatch) {
+            batch.forEach { record =>
+              val offset = record.offset()
+              val timestamp = record.timestamp()
+              val key: Array[Byte] = if (record.hasKey) bytesOf(record.key()) else null
+              // Preserve null-value semantics for compacted-topic tombstones and HTTP-produced {"type":"NULL"} records.
+              // Returning Array.emptyByteArray here would let ValueSerializer.encode emit {"type":"STRING","data":""} —
+              // an incorrect downgrade that loses the tombstone signal. Match the key handling on the line above.
+              val value: Array[Byte] = if (record.hasValue) bytesOf(record.value()) else null
+              val contentType: String = record.headers().toSeq.find(_.key() == "content-type") match {
+                case Some(h) if h.value() != null => new String(h.value(), StandardCharsets.UTF_8)
+                case _ => null
+              }
+              out.add(new FetchedRecord(offset, key, value, contentType, timestamp))
+            }
           }
-          out.add(new FetchedRecord(offset, key, value, contentType, timestamp))
         }
         out
       case other =>
