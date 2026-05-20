@@ -181,6 +181,16 @@ class HttpStatusMapperTest {
             HttpStatusMapper.toHttpStatus(Errors.LISTENER_NOT_FOUND)));
     }
 
+    @Test
+    void kafkaStorageErrorMapsTo503() {
+        // Broker-side log-dir-offline signal extends RetriableException — operators should not see "internal
+        // server bug" (500) when the truth is "this broker's disk is degraded; retry or move the partition."
+        // 503 + Retry-After matches the LEADER_NOT_AVAILABLE / NOT_LEADER_OR_FOLLOWER family.
+        assertEquals(503, HttpStatusMapper.toHttpStatus(Errors.KAFKA_STORAGE_ERROR));
+        assertTrue(HttpStatusMapper.statusCarriesRetryAfter(
+            HttpStatusMapper.toHttpStatus(Errors.KAFKA_STORAGE_ERROR)));
+    }
+
     // ----- carriesRetryAfter -----
 
     @Test

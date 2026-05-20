@@ -17,6 +17,7 @@
 package org.apache.kafka.network.http;
 
 import com.fasterxml.jackson.core.StreamReadConstraints;
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 /**
@@ -113,6 +114,15 @@ public final class BridgeJsonMappers {
     public static ObjectMapper hardened() {
         ObjectMapper mapper = new ObjectMapper();
         mapper.getFactory().setStreamReadConstraints(CONSTRAINTS);
+        // Fail when a JSON object contains duplicate keys at the same nesting level (e.g.
+        // {"type":"STRING","type":"BINARY"}). Jackson's default is to silently keep the LAST value, which
+        // is a documented parser-confusion vector: an intermediate (firewall, audit log, content-aware
+        // proxy) that records the FIRST value disagrees with the bridge about what was actually accepted,
+        // and a multi-tenant attacker can exploit that disagreement to hide a payload. The bridge parses
+        // attacker-controlled envelopes (value type/data, ProduceRequest body, WebSocket text frames) into
+        // trees via readTree, which is exactly the path this feature guards. Honest clients never send
+        // duplicate keys; rejecting the request with a 400 is the correct safe-by-default behaviour.
+        mapper.enable(DeserializationFeature.FAIL_ON_READING_DUP_TREE_KEY);
         return mapper;
     }
 }

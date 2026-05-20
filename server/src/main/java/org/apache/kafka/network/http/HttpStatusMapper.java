@@ -133,6 +133,11 @@ public final class HttpStatusMapper {
         // LISTENER_NOT_FOUND is transient: the broker is up but the listener metadata has not yet propagated
         // to this node. A retry against the same coordinator will eventually succeed once metadata refreshes.
         m.put(Errors.LISTENER_NOT_FOUND, SERVICE_UNAVAILABLE);
+        // KAFKA_STORAGE_ERROR is the broker-side log-dir-offline signal (extends RetriableException). Both
+        // produce and fetch can raise it when ReplicaManager sees a failed log directory on the partition.
+        // Falling through to 500 told operators "internal server bug" when the truth is "broker disk health
+        // degraded — try again or move the partition." 503 + Retry-After is the correct shape.
+        m.put(Errors.KAFKA_STORAGE_ERROR, SERVICE_UNAVAILABLE);
 
         return m;
     }

@@ -17,6 +17,7 @@
 package org.apache.kafka.network.http;
 
 import com.fasterxml.jackson.core.exc.StreamConstraintsException;
+import com.fasterxml.jackson.databind.JsonMappingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
@@ -141,21 +142,35 @@ class BridgeJsonMappersTest {
 
     @Test
     void rejectsTokenCountExceedingCap() {
-        // A document packed with tokens (duplicate-key pathological shape) must fail before the parser allocates
-        // per-token binding objects across the cap. ~150K duplicate entries crosses the 200K-token floor (each
-        // {"a":1,} contributes FIELD_NAME + VALUE_NUMBER_INT).
-        long entries = BridgeJsonMappers.MAX_TOKEN_COUNT;
-        StringBuilder json = new StringBuilder((int) entries * 8);
-        json.append('{');
+        // A document packed with tokens must fail before the parser allocates per-token binding objects
+        // across the cap. An array of single-digit integers crosses the 200K-token floor with the smallest
+        // possible per-token byte cost (one VALUE_NUMBER_INT + one structural comma per entry) and stays
+        // well under MAX_DOCUMENT_LENGTH so the token cap — not the document cap — is the proximate cause.
+        // An object shape would trip FAIL_ON_READING_DUP_TREE_KEY first under any repeated key; unique keys
+        // explode the byte budget past 1 MiB before reaching the token count.
+        long entries = BridgeJsonMappers.MAX_TOKEN_COUNT + 1;
+        StringBuilder json = new StringBuilder((int) entries * 2 + 2);
+        json.append('[');
         for (long i = 0; i < entries; i++) {
             if (i > 0) {
                 json.append(',');
             }
-            json.append("\"a\":1");
+            json.append('1');
         }
-        json.append('}');
+        json.append(']');
         ObjectMapper mapper = BridgeJsonMappers.hardened();
         assertThrows(StreamConstraintsException.class, () -> mapper.readTree(json.toString()));
+    }
+
+    @Test
+    void rejectsDuplicateKeysAtSameNestingLevel() {
+        // Parser-confusion defence: an envelope like {"type":"STRING","type":"BINARY"} would otherwise be
+        // accepted with Jackson silently keeping "BINARY". The bridge would then store one value type while
+        // an upstream firewall / audit log that recorded the first key sees a different one. The hardened
+        // mapper must reject the parse entirely.
+        ObjectMapper mapper = BridgeJsonMappers.hardened();
+        assertThrows(JsonMappingException.class,
+            () -> mapper.readTree("{\"type\":\"STRING\",\"type\":\"BINARY\"}"));
     }
 
     @Test

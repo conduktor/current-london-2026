@@ -374,6 +374,30 @@ public final class WsStreamer {
         if (!fetchInFlight.compareAndSet(false, true)) {
             return;
         }
+        // Post-CAS re-check. The buffer / throttle reads at the entry of this method ran BEFORE the CAS,
+        // so the volatile-CAS-success happens-before fence (which orders reads AFTER the CAS) does NOT
+        // make them safe: a concurrent handleFetchResult that staged records and then cleared
+        // fetchInFlight in the window between our entry read and our CAS would have us launch a duplicate
+        // fetch at the unchanged currentOffset (currentOffset only advances during delivery in
+        // drainBufferWhileCredited, not when records are staged). The window is narrow — it requires our
+        // thread to be context-switched between the entry read and the CAS while handleFetchResult
+        // completes — but real, and an over-delivered offset is the operator-visible defect we promise
+        // not to ship. Cheap defence: re-validate post-CAS and re-arm via scheduleDrain instead.
+        if (!buffer.isEmpty()) {
+            fetchInFlight.set(false);
+            scheduleDrain();
+            return;
+        }
+        long throttleDeadlineNanos = throttleUntilNanos.get();
+        if (throttleDeadlineNanos != 0L) {
+            long remainingNanos = throttleDeadlineNanos - System.nanoTime();
+            if (remainingNanos > 0) {
+                fetchInFlight.set(false);
+                long remainingMs = Math.max(1L, TimeUnit.NANOSECONDS.toMillis(remainingNanos));
+                scheduleDrainAfter(remainingMs);
+                return;
+            }
+        }
         FetchRequestParser.FetchCommand command =
             new FetchRequestParser.FetchCommand(topic, partition, currentOffset, maxBytes);
         try {
