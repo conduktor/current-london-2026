@@ -796,6 +796,99 @@ class ViewFilterTest {
     }
 
     @Test
+    void nonTransactionalSamePidBatchDoesNotKeepFullyHiddenTransactionMarkerAlive() {
+        // R62 BLOCKER closure. R61 set survivingSinceLastMarker for ANY non-control batch with
+        // count > 0, not just transactional ones. If the backing log contains a visible
+        // non-transactional/idempotent batch with producer id P, then a transactional batch with
+        // the same P whose records the predicate fully hides, then COMMIT/ABORT — R61 kept the
+        // marker because P already had "surviving data" from the non-tx batch. That marker
+        // terminates a TRANSACTION, not a producer, so non-transactional data must NOT count.
+        // The leak exposed producerId/producerEpoch/COMMIT-or-ABORT/coordinator_epoch for a
+        // transaction with zero visible transactional data.
+        //
+        // Fix: scanForScrubTargets now requires batch.isTransactional() to mark the tracker.
+        // Non-transactional batches are inert to marker scrub decisions.
+        CompiledPredicate p = compiler.compile("body.color == 'red'");
+        long pid = 90L;
+        short epoch = 0;
+        ByteBuffer buffer = ByteBuffer.allocate(4096);
+
+        // Non-transactional/idempotent batch (same pid). One visible record so the batch
+        // survives the predicate — this is the bait that R61's bug latched onto.
+        MemoryRecordsBuilder nonTx = new MemoryRecordsBuilder(
+                buffer,
+                RecordBatch.CURRENT_MAGIC_VALUE,
+                Compression.NONE,
+                TimestampType.CREATE_TIME,
+                200L, 0L,
+                pid, epoch, 0,
+                false,               // isTransactional = false (idempotent only)
+                false, 0,
+                buffer.capacity());
+        nonTx.append(0L, null, "{\"color\":\"red\"}".getBytes(StandardCharsets.UTF_8));
+        nonTx.close();
+
+        // Transactional batch with the same pid. All records hidden by the predicate.
+        MemoryRecordsBuilder txData = new MemoryRecordsBuilder(
+                buffer,
+                RecordBatch.CURRENT_MAGIC_VALUE,
+                Compression.NONE,
+                TimestampType.CREATE_TIME,
+                201L, 0L,
+                pid, epoch, 0,
+                true,                // isTransactional = true
+                false, 0,
+                buffer.capacity());
+        txData.append(0L, null, "{\"color\":\"blue\"}".getBytes(StandardCharsets.UTF_8));
+        txData.close();
+
+        // COMMIT marker for the hidden transaction.
+        MemoryRecords.writeEndTransactionalMarker(buffer, 202L, 0L, 0,
+                pid, epoch,
+                new EndTransactionMarker(ControlRecordType.COMMIT, 0));
+
+        buffer.flip();
+        MemoryRecords input = MemoryRecords.readableRecords(buffer);
+
+        ViewFilter.FilterResult result = ViewFilter.applyAndCollect(
+                p, input, 0, ViewMetrics.NOOP, BufferSupplier.NO_CACHING);
+
+        boolean markerScrubbed = false;
+        boolean nonTxBatchSurvived = false;
+        for (MutableRecordBatch batch : result.records().batches()) {
+            if (batch.baseOffset() == 200L) {
+                assertFalse(batch.isControlBatch(),
+                        "non-transactional surviving batch must remain a data batch");
+                assertEquals(pid, batch.producerId(),
+                        "non-transactional surviving batch carries its own pid — that is fine");
+                nonTxBatchSurvived = true;
+            } else if (batch.baseOffset() == 202L) {
+                assertFalse(batch.isControlBatch(),
+                        "COMMIT marker (offset 202) must be scrubbed to a non-control header — "
+                                + "the prior non-transactional same-pid batch must NOT keep it alive");
+                assertEquals(RecordBatch.NO_PRODUCER_ID, batch.producerId(),
+                        "marker must not leak producer_id");
+                assertEquals(RecordBatch.NO_PRODUCER_EPOCH, batch.producerEpoch(),
+                        "marker must not leak producer_epoch");
+                assertFalse(batch.isTransactional(),
+                        "marker must clear isTransactional");
+                assertFalse(batch.iterator().hasNext(),
+                        "marker must produce a header-only batch — no COMMIT/ABORT byte, no coordinator_epoch");
+                markerScrubbed = true;
+            }
+        }
+        assertTrue(nonTxBatchSurvived,
+                "non-transactional batch should round-trip through the filter");
+        assertTrue(markerScrubbed,
+                "expected the fully-hidden transaction's COMMIT marker to be scrubbed even though "
+                        + "a same-pid non-transactional batch is visible");
+
+        assertEquals(java.util.Set.of(202L), result.scrubbedMarkerOffsetsByProducerId().get(pid),
+                "side-channel must report the scrubbed marker offset so KafkaApis "
+                        + "can still find the transaction terminator");
+    }
+
+    @Test
     void filteredBatchesAlwaysCarryNoPartitionLeaderEpochRegardlessOfSource() {
         // The view partition keeps its own (lower) leader-epoch ledger. If the filter forwards the
         // backing topic's partition_leader_epoch through filtered records, the consumer's

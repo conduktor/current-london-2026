@@ -312,7 +312,7 @@ public final class ViewFilter {
                 processControlBatchForScan(batch, survivingSinceLastMarker, scrubbedMarkerOffsetsByPid);
             } else if (isEmptyDataBatch(batch)) {
                 hasEmptyDataBatch = true;
-            } else if (hasSurvivingRecords(batch)) {
+            } else if (hasSurvivingRecords(batch) && batch.isTransactional()) {
                 survivingSinceLastMarker.put(batch.producerId(), Boolean.TRUE);
             }
         }
