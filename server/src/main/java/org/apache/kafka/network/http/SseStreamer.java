@@ -415,11 +415,17 @@ final class SseStreamer {
      * client-disconnect). Without this, Jetty's connector force-close on shutdown delivers the same wire signal as
      * a network drop, conflating two different operational conditions across every SSE consumer.
      *
-     * <p>Dispatched through {@code httpExecutor} so the write is serialised on the same strand that processes the
-     * scheduled fetch loop — concurrent writeRecordEvent / heartbeat writes from the in-flight long-poll cannot
-     * collide with this shutdown frame. The broker stop thread returns immediately; the Graceful.shutdown window
-     * (Jetty stopTimeout = http.bridge.shutdown.grace.ms) is what lets the queued shutdown writes actually drain
-     * before connectors are force-closed.
+     * <p>Dispatched through {@code httpExecutor} (Jetty {@code QueuedThreadPool} — multi-threaded; see
+     * {@code KafkaHttpServer.java} line 238) so the broker {@code stop()} thread returns immediately without
+     * blocking on any per-stream write. This is <em>not</em> a per-stream strand: the shutdown runnable may run on
+     * a different worker thread than an in-flight {@link #handleFetchResult}, so two writers can land on the same
+     * {@link ServletOutputStream} concurrently. Jetty's {@code HttpOutput} rejects the racing writer with
+     * {@code IllegalStateException} (CLOSING/CLOSED state); {@link #tryWriteShutdownFrame} catches both
+     * {@code IOException} and {@code RuntimeException} — under that race the SHUTDOWN frame is silently dropped
+     * and the client falls back to the raw FIN. The wire contract is therefore "best-effort" as the class header
+     * states, not "strictly serialised". The Graceful.shutdown window (Jetty {@code stopTimeout} =
+     * {@code http.bridge.shutdown.grace.ms}) is what lets the queued shutdown writes drain before connectors are
+     * force-closed when no in-flight write is racing.
      *
      * <p>If the executor refuses the dispatch (already terminated) or the stream is already in the closed state,
      * the call is a no-op — both are correct for shutdown semantics.
