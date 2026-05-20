@@ -948,6 +948,51 @@ class ViewFilterTest {
         assertTrue(sawBatch, "expected at least one filtered batch in the output");
     }
 
+    @Test
+    void legacyV1BatchAllRecordsHiddenIsDroppedWithoutThrowing() {
+        // R63: backing topics on upgraded clusters can still hold pre-3.0 segments with v0/v1
+        // batches. ViewFilter previously returned RETAIN_EMPTY for every batch; MemoryRecords.filterTo
+        // throws IllegalStateException("Empty batches are only supported for magic v2 and above")
+        // when retainedRecords is empty and batch.magic() < V2 (MemoryRecords.java:197-199), making
+        // a view fetch over a legacy all-hidden range fail instead of advancing. With DELETE_EMPTY
+        // for legacy batches the batch is dropped silently; the consumer advances via the response's
+        // high-watermark / lastStableOffset.
+        CompiledPredicate p = compiler.compile("body.color == 'red'");
+        MemoryRecords input = MemoryRecords.withRecords(RecordBatch.MAGIC_VALUE_V1, Compression.NONE,
+                rec("{\"color\":\"blue\"}"),
+                rec("{\"color\":\"green\"}"));
+
+        MemoryRecords output = ViewFilter.apply(p, input, 0);
+
+        assertEquals(List.of(), offsetsOf(output), "no records survive the legacy v1 filter");
+        // No header emitted for legacy batches (DELETE_EMPTY drops them).
+        assertFalse(output.batches().iterator().hasNext(),
+                "legacy v0/v1 all-hidden batch must be dropped silently (no v2 placeholder)");
+    }
+
+    @Test
+    void legacyV1BatchMatchingRecordsUpConvertToV2() {
+        // R63 follow-on: legacy batches that contain at least one matching record must still
+        // surface those records to the consumer. MemoryRecords.filterTo's
+        // buildRetainedRecordsInto path rebuilds matching records into a CURRENT_MAGIC_VALUE (v2)
+        // batch via writeOriginalBatch=false (MemoryRecords.java:229), so source offsets are
+        // preserved and the consumer sees v2-encoded records.
+        CompiledPredicate p = compiler.compile("body.color == 'red'");
+        MemoryRecords input = MemoryRecords.withRecords(RecordBatch.MAGIC_VALUE_V1, Compression.NONE,
+                rec("{\"color\":\"red\"}"),
+                rec("{\"color\":\"blue\"}"),
+                rec("{\"color\":\"red\"}"));
+
+        MemoryRecords output = ViewFilter.apply(p, input, 0);
+
+        assertEquals(List.of(0L, 2L), offsetsOf(output),
+                "matching legacy v1 records preserved at their source offsets");
+        for (MutableRecordBatch batch : output.batches()) {
+            assertEquals(RecordBatch.CURRENT_MAGIC_VALUE, batch.magic(),
+                    "legacy batch with surviving records up-converts to CURRENT_MAGIC_VALUE");
+        }
+    }
+
     private static SimpleRecord rec(String json) {
         byte[] body = json == null ? null : json.getBytes(StandardCharsets.UTF_8);
         return new SimpleRecord(0L, null, body);

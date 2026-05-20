@@ -407,8 +407,9 @@ public final class ViewFilter {
      * Adapter that bridges {@link CompiledPredicate#evaluate} into Kafka's
      * {@link MemoryRecords.RecordFilter}. {@code currentTime} and {@code deleteRetentionMs} are
      * passed as {@code 0L}: the view filter never participates in delete-horizon logic because
-     * it always returns {@link MemoryRecords.RecordFilter.BatchRetention#RETAIN_EMPTY}, which
-     * bypasses the tombstone-horizon path inside {@link MemoryRecords#filterTo}.
+     * it returns {@link MemoryRecords.RecordFilter.BatchRetention#RETAIN_EMPTY} (v2+ batches) or
+     * {@link MemoryRecords.RecordFilter.BatchRetention#DELETE_EMPTY} (legacy v0/v1 batches),
+     * both of which bypass the tombstone-horizon path inside {@link MemoryRecords#filterTo}.
      */
     private static final class RecordFilterImpl extends MemoryRecords.RecordFilter {
         private final CompiledPredicate predicate;
@@ -424,11 +425,23 @@ public final class ViewFilter {
 
         @Override
         protected BatchRetentionResult checkBatchRetention(RecordBatch batch) {
-            // RETAIN_EMPTY for every batch — data and control. For data batches, an empty header
+            // For v2+ batches: RETAIN_EMPTY for both data and control. An empty data header
             // carries the source (baseOffset, lastOffset) so the consumer advances even through a
-            // fully-filtered span. For control batches we *also* retain the marker record inside
-            // via shouldRetainRecord — see the comment there for why an empty control header
-            // breaks READ_COMMITTED isolation.
+            // fully-filtered span; control batches also retain the marker record inside via
+            // shouldRetainRecord (see that method's comment for why a stripped control header
+            // breaks READ_COMMITTED isolation).
+            //
+            // For legacy v0/v1 batches: DELETE_EMPTY. MemoryRecords.filterTo would throw
+            // IllegalStateException("Empty batches are only supported for magic v2 and above") on
+            // RETAIN_EMPTY when retainedRecords ends up empty (MemoryRecords.java:197-199). v0/v1
+            // batches carry no transactional state (NO_PRODUCER_ID/NO_PRODUCER_EPOCH) and no
+            // control records, so dropping an all-filtered legacy batch loses no producer state
+            // machine; the consumer advances via the response's high-watermark / lastStableOffset
+            // even without a placeholder. Matching legacy records still up-convert to a v2 batch
+            // through buildRetainedRecordsInto (CURRENT_MAGIC_VALUE).
+            if (batch.magic() < RecordBatch.MAGIC_VALUE_V2) {
+                return new BatchRetentionResult(BatchRetention.DELETE_EMPTY, false);
+            }
             return new BatchRetentionResult(BatchRetention.RETAIN_EMPTY, false);
         }
 
