@@ -618,6 +618,10 @@ class KafkaHttpServerIntegrationTest {
         // event-by-event without an upstream proxy_buffering tweak. Regression-locks SseStreamer.start.
         assertEquals("no", response.getHeaders().get("X-Accel-Buffering"),
             "expected SSE response to carry X-Accel-Buffering: no, got: " + response.getHeaders().get("X-Accel-Buffering"));
+        // Cache-Control: no-cache pairs with X-Accel-Buffering to keep SSE event-by-event end-to-end: intermediate
+        // caches (CDNs, browser caches) must not coalesce or replay the open-ended stream. Regression-locks SseStreamer.start.
+        assertEquals("no-cache", response.getHeaders().get("Cache-Control"),
+            "expected SSE response to carry Cache-Control: no-cache, got: " + response.getHeaders().get("Cache-Control"));
 
         try (InputStream body = listener.getInputStream();
              BufferedReader reader = new BufferedReader(new InputStreamReader(body, StandardCharsets.UTF_8))) {

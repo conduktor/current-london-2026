@@ -179,6 +179,11 @@ class KafkaApiRequestSubmitterTest {
     assertEquals(42L, partitionData.fetchOffset)
     assertEquals(2048, partitionData.maxBytes)
     assertEquals(topicId, partitionData.topicId, "resolved topic id must be threaded into the request")
+    // currentLeaderEpoch must remain empty: the bridge runs in-process per broker without fetching cluster metadata,
+    // so it cannot supply a leader epoch. See HTTP_BRIDGE.md "Leader-aware routing across the broker fleet" — a fetch
+    // routed to a non-leader surfaces NOT_LEADER_OR_FOLLOWER and clients must redirect or retry against another broker.
+    assertFalse(partitionData.currentLeaderEpoch.isPresent,
+      "bridge must not carry leader epoch — see HTTP_BRIDGE.md leader-aware routing limitation")
   }
 
   @Test
