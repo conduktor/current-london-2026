@@ -22,12 +22,16 @@ import org.apache.kafka.common.record.MemoryRecords;
 import org.apache.kafka.common.record.MutableRecordBatch;
 import org.apache.kafka.common.record.Record;
 import org.apache.kafka.common.record.RecordBatch;
+import org.apache.kafka.common.record.TimestampType;
 import org.apache.kafka.common.utils.BufferSupplier;
 
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -41,9 +45,17 @@ import java.util.Set;
  * — they are retained as header-only batches. This matters because Kafka consumers track the
  * last fetched offset; if a backing-topic batch covering offsets {@code [100..200]} produces
  * no matching records, the consumer must still see {@code lastOffset = 200} or it will
- * re-fetch the same range indefinitely. {@link MemoryRecords.RecordFilter.BatchRetention#RETAIN_EMPTY}
- * writes an empty batch header that carries {@code baseOffset} and {@code lastOffset} from the
- * source batch, satisfying the sparse-offset acceptance criterion from PROMPT.md.
+ * re-fetch the same range indefinitely. For v2 source batches,
+ * {@link MemoryRecords.RecordFilter.BatchRetention#RETAIN_EMPTY} writes an empty batch header
+ * that carries {@code baseOffset} and {@code lastOffset} from the source batch. For legacy v0/v1
+ * source batches — which cannot use {@code RETAIN_EMPTY} because
+ * {@link MemoryRecords#filterTo} rejects empty headers below magic v2 — we instead emit
+ * {@link MemoryRecords.RecordFilter.BatchRetention#DELETE_EMPTY} during filtering and synthesize
+ * a v2 header-only placeholder for every fully-hidden legacy batch in a post-pass, splicing it
+ * into the output stream in offset order. Both paths satisfy the sparse-offset acceptance
+ * criterion from PROMPT.md (consumer's {@code nextFetchOffset} advances past the hidden span
+ * via the placeholder's {@code lastOffset}; the high-watermark on the response is consulted
+ * only for lag computation, never for position advancement, so a placeholder is required).
  *
  * Control batches (transaction markers) are also retained as empty so EOS semantics on the
  * backing topic propagate transparently to the view consumer.
@@ -171,10 +183,8 @@ public final class ViewFilter {
         // still earns its keep on decompression staging inside filterTo and on the FileRecords
         // slurp buffer in the caller (KafkaApis.applyViewFilter).
         ByteBuffer destination = ByteBuffer.allocate(Math.max(inputSize, 1));
-        MemoryRecords.FilterResult result = input.filterTo(
-                new RecordFilterImpl(predicate, partition, metrics),
-                destination,
-                decompressionBuffers);
+        RecordFilterImpl filter = new RecordFilterImpl(predicate, partition, metrics);
+        MemoryRecords.FilterResult result = input.filterTo(filter, destination, decompressionBuffers);
         ByteBuffer out = result.outputBuffer();
         out.flip();
         MemoryRecords filtered = MemoryRecords.readableRecords(out);
@@ -246,8 +256,23 @@ public final class ViewFilter {
         // in-place setPartitionLeaderEpoch only) when no scrub is required, which is the common
         // case under permissive predicates with no fully-hidden producers.
         ScrubResult scrub = scrubBackingMetadata(filtered);
-        metrics.recordBytes(inputSize, scrub.records.sizeInBytes());
-        return new FilterResult(scrub.records, scrub.scrubbedMarkerOffsetsByProducerId);
+        // PROMPT.md acceptance #7: a fully-filtered source batch must produce a header-only
+        // placeholder spanning its offset range so the consumer's nextFetchOffset advances past
+        // the hidden span. v2 batches get this via RETAIN_EMPTY inside filterTo. Legacy v0/v1
+        // batches don't — filterTo throws on empty headers below magic v2 — so RecordFilterImpl
+        // collected their (baseOffset, lastOffset, timestampType) during the scan, and we splice
+        // a synthetic v2 header-only placeholder into the output here, in offset order. Without
+        // this pass, a fetch slice consisting entirely of legacy all-hidden batches stalls the
+        // consumer: CompletedFetch leaves nextFetchOffset == fetchOffset when batches.hasNext()
+        // is false on the first call, FetchCollector advances position only when
+        // nextFetchOffset > position.offset, and SubscriptionState consumes the response's
+        // highWatermark only for lag — never to advance position. Same shape and identity-strip
+        // as the scrubBackingMetadata empty-data path: NO_PRODUCER_ID, NO_PRODUCER_EPOCH,
+        // NO_SEQUENCE, NO_PARTITION_LEADER_EPOCH, isTransactional=false, isControlRecord=false.
+        MemoryRecords withLegacyPlaceholders = mergeLegacyAllHiddenPlaceholders(
+                scrub.records, filter.legacyAllHiddenSpans());
+        metrics.recordBytes(inputSize, withLegacyPlaceholders.sizeInBytes());
+        return new FilterResult(withLegacyPlaceholders, scrub.scrubbedMarkerOffsetsByProducerId);
     }
 
     /** Carries the scrub-pass output: rebuilt records plus the per-producer offsets at which
@@ -292,6 +317,84 @@ public final class ViewFilter {
             this.scrubbedMarkerOffsetsByPid = scrubbedMarkerOffsetsByPid;
             this.hasEmptyDataBatch = hasEmptyDataBatch;
         }
+    }
+
+    /** Offset range of a legacy v0/v1 source batch whose records were all hidden by the
+     *  predicate. {@link #mergeLegacyAllHiddenPlaceholders} converts each into a v2 header-only
+     *  placeholder. */
+    private static final class LegacySpan {
+        final long baseOffset;
+        final long lastOffset;
+        final TimestampType timestampType;
+
+        LegacySpan(long baseOffset, long lastOffset, TimestampType timestampType) {
+            this.baseOffset = baseOffset;
+            this.lastOffset = lastOffset;
+            this.timestampType = timestampType;
+        }
+    }
+
+    /**
+     * Splice synthetic v2 header-only placeholders for legacy all-hidden source batches into
+     * the filtered output, in offset order. No-op when the input had no legacy batches that
+     * were fully filtered (the common case on modern clusters).
+     *
+     * <p>The legacy spans list is in source-traversal order, which is offset order: filterTo
+     * walks batches sequentially and RecordFilterImpl finalises each batch's tracker before
+     * moving to the next. The filtered output's batch iterator is also in offset order. The
+     * merge is a standard sorted-stream interleave on {@code baseOffset}.</p>
+     *
+     * <p>The placeholder uses v0 source's {@code NO_TIMESTAMP_TYPE} coerced to
+     * {@link TimestampType#CREATE_TIME} because v2 wire-form readers (consumer-side and
+     * broker-side validators) reject {@code NO_TIMESTAMP_TYPE} on v2 batches; the timestamp
+     * itself stays {@link RecordBatch#NO_TIMESTAMP} so no clock data leaks from the source.</p>
+     */
+    private static MemoryRecords mergeLegacyAllHiddenPlaceholders(MemoryRecords filtered,
+                                                                  List<LegacySpan> legacySpans) {
+        if (legacySpans.isEmpty()) {
+            return filtered;
+        }
+        int extra = legacySpans.size() * DefaultRecordBatch.RECORD_BATCH_OVERHEAD;
+        ByteBuffer merged = ByteBuffer.allocate(filtered.sizeInBytes() + extra);
+        Iterator<MutableRecordBatch> outputBatches = filtered.batches().iterator();
+        MutableRecordBatch nextOutputBatch = outputBatches.hasNext() ? outputBatches.next() : null;
+        int spanIdx = 0;
+        while (nextOutputBatch != null || spanIdx < legacySpans.size()) {
+            boolean writeSpan;
+            if (nextOutputBatch == null) {
+                writeSpan = true;
+            } else if (spanIdx >= legacySpans.size()) {
+                writeSpan = false;
+            } else {
+                writeSpan = legacySpans.get(spanIdx).baseOffset < nextOutputBatch.baseOffset();
+            }
+            if (writeSpan) {
+                LegacySpan span = legacySpans.get(spanIdx++);
+                TimestampType placeholderTimestampType =
+                        span.timestampType == TimestampType.NO_TIMESTAMP_TYPE
+                                ? TimestampType.CREATE_TIME
+                                : span.timestampType;
+                DefaultRecordBatch.writeEmptyHeader(
+                        merged,
+                        RecordBatch.CURRENT_MAGIC_VALUE,
+                        RecordBatch.NO_PRODUCER_ID,
+                        RecordBatch.NO_PRODUCER_EPOCH,
+                        RecordBatch.NO_SEQUENCE,
+                        span.baseOffset,
+                        span.lastOffset,
+                        RecordBatch.NO_PARTITION_LEADER_EPOCH,
+                        placeholderTimestampType,
+                        RecordBatch.NO_TIMESTAMP,
+                        false,
+                        false
+                );
+            } else {
+                nextOutputBatch.writeTo(merged);
+                nextOutputBatch = outputBatches.hasNext() ? outputBatches.next() : null;
+            }
+        }
+        merged.flip();
+        return MemoryRecords.readableRecords(merged);
     }
 
     /**
@@ -415,6 +518,13 @@ public final class ViewFilter {
         private final CompiledPredicate predicate;
         private final int partition;
         private final ViewMetrics metrics;
+        // Tracks legacy v0/v1 source batches whose records all failed the predicate. filterTo
+        // can't emit an empty header for those (RETAIN_EMPTY throws below magic v2), so
+        // RecordFilterImpl drops them via DELETE_EMPTY and we hand the spans to
+        // mergeLegacyAllHiddenPlaceholders for v2 placeholder synthesis after filterTo returns.
+        private final List<LegacySpan> legacyAllHiddenSpans = new ArrayList<>();
+        private RecordBatch trackingLegacyBatch;
+        private int trackingLegacyRetainedCount;
 
         RecordFilterImpl(CompiledPredicate predicate, int partition, ViewMetrics metrics) {
             super(0L, 0L);
@@ -423,8 +533,35 @@ public final class ViewFilter {
             this.metrics = metrics;
         }
 
+        /** Finalise the legacy batch we're currently tracking, if any. Called at the start of
+         *  every new batch (filterTo's per-batch boundary) and at the end of filterTo via
+         *  {@link #legacyAllHiddenSpans()}. */
+        private void finaliseLegacyTracking() {
+            if (trackingLegacyBatch != null && trackingLegacyRetainedCount == 0) {
+                legacyAllHiddenSpans.add(new LegacySpan(
+                        trackingLegacyBatch.baseOffset(),
+                        trackingLegacyBatch.lastOffset(),
+                        trackingLegacyBatch.timestampType()));
+            }
+            trackingLegacyBatch = null;
+            trackingLegacyRetainedCount = 0;
+        }
+
+        /** Snapshot of legacy all-hidden source spans observed during filterTo. Must be called
+         *  AFTER filterTo returns — the call finalises the last in-flight batch (filterTo does
+         *  not invoke checkBatchRetention again after the last batch's records are scanned). */
+        List<LegacySpan> legacyAllHiddenSpans() {
+            finaliseLegacyTracking();
+            return legacyAllHiddenSpans;
+        }
+
         @Override
         protected BatchRetentionResult checkBatchRetention(RecordBatch batch) {
+            // Per-batch boundary in filterTo — finalise the previous legacy batch (if any) before
+            // starting the new one. A legacy batch with zero retained records becomes a
+            // LegacySpan; a legacy batch with at least one retained record is up-converted to v2
+            // by buildRetainedRecordsInto and needs no placeholder.
+            finaliseLegacyTracking();
             // For v2+ batches: RETAIN_EMPTY for both data and control. An empty data header
             // carries the source (baseOffset, lastOffset) so the consumer advances even through a
             // fully-filtered span; control batches also retain the marker record inside via
@@ -433,13 +570,19 @@ public final class ViewFilter {
             //
             // For legacy v0/v1 batches: DELETE_EMPTY. MemoryRecords.filterTo would throw
             // IllegalStateException("Empty batches are only supported for magic v2 and above") on
-            // RETAIN_EMPTY when retainedRecords ends up empty (MemoryRecords.java:197-199). v0/v1
-            // batches carry no transactional state (NO_PRODUCER_ID/NO_PRODUCER_EPOCH) and no
-            // control records, so dropping an all-filtered legacy batch loses no producer state
-            // machine; the consumer advances via the response's high-watermark / lastStableOffset
-            // even without a placeholder. Matching legacy records still up-convert to a v2 batch
-            // through buildRetainedRecordsInto (CURRENT_MAGIC_VALUE).
+            // RETAIN_EMPTY when retainedRecords ends up empty (MemoryRecords.java:197-199). The
+            // consumer does NOT advance on an empty response — CompletedFetch leaves
+            // nextFetchOffset == fetchOffset when batches.hasNext() is false on first call,
+            // FetchCollector advances position only when nextFetchOffset > position.offset, and
+            // the response's high-watermark is consumed only for lag computation
+            // (SubscriptionState), never for position advancement. To keep PROMPT.md acceptance
+            // #7 intact we therefore track the source span here and synthesise a v2 header-only
+            // placeholder for it after filterTo returns (see
+            // {@link ViewFilter#mergeLegacyAllHiddenPlaceholders}). Matching legacy records still
+            // up-convert to a v2 batch through buildRetainedRecordsInto (CURRENT_MAGIC_VALUE).
             if (batch.magic() < RecordBatch.MAGIC_VALUE_V2) {
+                trackingLegacyBatch = batch;
+                trackingLegacyRetainedCount = 0;
                 return new BatchRetentionResult(BatchRetention.DELETE_EMPTY, false);
             }
             return new BatchRetentionResult(BatchRetention.RETAIN_EMPTY, false);
@@ -461,14 +604,20 @@ public final class ViewFilter {
             RecordContext ctx = contextFor(batch, record, partition);
             Optional<Boolean> verdict = predicate.evaluate(ctx);
             metrics.recordEvaluation();
+            boolean keep;
             if (verdict.isEmpty()) {
                 // Predicate skipped this record (cost-cap, malformed JSON, non-boolean, etc.).
                 // Surfaces under PredicateSkipRate so operators see anomalies before consumers
                 // notice silently-dropped records.
                 metrics.recordSkip();
-                return false;
+                keep = false;
+            } else {
+                keep = verdict.get();
             }
-            return verdict.get();
+            if (keep && trackingLegacyBatch != null) {
+                trackingLegacyRetainedCount++;
+            }
+            return keep;
         }
     }
 

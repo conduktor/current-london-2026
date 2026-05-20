@@ -949,25 +949,127 @@ class ViewFilterTest {
     }
 
     @Test
-    void legacyV1BatchAllRecordsHiddenIsDroppedWithoutThrowing() {
-        // R63: backing topics on upgraded clusters can still hold pre-3.0 segments with v0/v1
-        // batches. ViewFilter previously returned RETAIN_EMPTY for every batch; MemoryRecords.filterTo
-        // throws IllegalStateException("Empty batches are only supported for magic v2 and above")
-        // when retainedRecords is empty and batch.magic() < V2 (MemoryRecords.java:197-199), making
-        // a view fetch over a legacy all-hidden range fail instead of advancing. With DELETE_EMPTY
-        // for legacy batches the batch is dropped silently; the consumer advances via the response's
-        // high-watermark / lastStableOffset.
+    void legacyV1BatchAllRecordsHiddenEmitsV2HeaderOnlyPlaceholder() {
+        // R63 + R64a: backing topics on upgraded clusters can still hold pre-3.0 segments with
+        // v0/v1 batches. MemoryRecords.filterTo throws IllegalStateException("Empty batches are
+        // only supported for magic v2 and above") when retainedRecords is empty and
+        // batch.magic() < V2 (MemoryRecords.java:197-199), so RecordFilterImpl returns
+        // DELETE_EMPTY for legacy batches to avoid the throw. R63 alone left the consumer
+        // stalled: a fetch slice consisting entirely of legacy all-hidden batches advanced
+        // nothing — CompletedFetch keeps nextFetchOffset == fetchOffset when batches.hasNext()
+        // is false on first call (CompletedFetch.java:190), FetchCollector advances position
+        // only when nextFetchOffset > position.offset (FetchCollector.java:179), and the
+        // response's high-watermark is consumed only for lag computation (SubscriptionState),
+        // never for position. R64a synthesises a v2 header-only placeholder covering the legacy
+        // source batch's (baseOffset, lastOffset) range so the consumer's nextFetchOffset
+        // advances past the hidden span — PROMPT.md acceptance #7.
+        // Use gzip-compressed v1 so the two records form a SINGLE multi-record batch with
+        // baseOffset=0, lastOffset=1 (uncompressed v1 yields one batch per record).
         CompiledPredicate p = compiler.compile("body.color == 'red'");
-        MemoryRecords input = MemoryRecords.withRecords(RecordBatch.MAGIC_VALUE_V1, Compression.NONE,
+        MemoryRecords input = MemoryRecords.withRecords(RecordBatch.MAGIC_VALUE_V1,
+                Compression.gzip().build(),
                 rec("{\"color\":\"blue\"}"),
                 rec("{\"color\":\"green\"}"));
 
         MemoryRecords output = ViewFilter.apply(p, input, 0);
 
         assertEquals(List.of(), offsetsOf(output), "no records survive the legacy v1 filter");
-        // No header emitted for legacy batches (DELETE_EMPTY drops them).
-        assertFalse(output.batches().iterator().hasNext(),
-                "legacy v0/v1 all-hidden batch must be dropped silently (no v2 placeholder)");
+        Iterator<MutableRecordBatch> batches = output.batches().iterator();
+        assertTrue(batches.hasNext(), "legacy all-hidden batch must produce a v2 placeholder so consumer advances");
+        MutableRecordBatch placeholder = batches.next();
+        assertEquals(RecordBatch.CURRENT_MAGIC_VALUE, placeholder.magic(),
+                "placeholder synthesised for legacy all-hidden batch is v2");
+        assertEquals(0L, placeholder.baseOffset(), "placeholder preserves source baseOffset");
+        assertEquals(1L, placeholder.lastOffset(), "placeholder preserves source lastOffset");
+        assertEquals(RecordBatch.NO_PRODUCER_ID, placeholder.producerId(),
+                "placeholder must not leak producer id");
+        assertEquals(RecordBatch.NO_PRODUCER_EPOCH, placeholder.producerEpoch(),
+                "placeholder must not leak producer epoch");
+        assertEquals(RecordBatch.NO_SEQUENCE, placeholder.baseSequence(),
+                "placeholder must not leak base sequence");
+        assertEquals(RecordBatch.NO_PARTITION_LEADER_EPOCH, placeholder.partitionLeaderEpoch(),
+                "placeholder must not carry backing partition leader epoch");
+        assertFalse(placeholder.isTransactional(), "placeholder must not be transactional");
+        assertFalse(placeholder.isControlBatch(), "placeholder must not be a control batch");
+        assertFalse(batches.hasNext(), "exactly one placeholder per legacy all-hidden batch");
+    }
+
+    @Test
+    void legacyV1MixedWithV2EmitsPlaceholderInOffsetOrder() {
+        // R64a: when a fetch response interleaves a legacy v0/v1 all-hidden batch with a v2
+        // batch, mergeLegacyAllHiddenPlaceholders must splice the synthesised placeholder into
+        // the output stream so batch order matches source offset order. Out-of-order batches
+        // would break the consumer's monotonic nextFetchOffset advance assumption.
+        CompiledPredicate p = compiler.compile("body.color == 'red'");
+        // First batch: compressed legacy v1, two records, both hidden — offsets [0,1].
+        MemoryRecords legacyAllHidden = MemoryRecords.withRecords(RecordBatch.MAGIC_VALUE_V1, 0L,
+                Compression.gzip().build(),
+                rec("{\"color\":\"blue\"}"),
+                rec("{\"color\":\"green\"}"));
+        // Second batch: v2, one matching record — offset [2].
+        MemoryRecords v2Match = MemoryRecords.withRecords(2L, Compression.NONE,
+                rec("{\"color\":\"red\"}"));
+        ByteBuffer concat = ByteBuffer.allocate(legacyAllHidden.sizeInBytes() + v2Match.sizeInBytes());
+        concat.put(legacyAllHidden.buffer().duplicate());
+        concat.put(v2Match.buffer().duplicate());
+        concat.flip();
+        MemoryRecords input = MemoryRecords.readableRecords(concat);
+
+        MemoryRecords output = ViewFilter.apply(p, input, 0);
+
+        assertEquals(List.of(2L), offsetsOf(output),
+                "only the matching v2 record survives");
+        Iterator<MutableRecordBatch> batches = output.batches().iterator();
+        assertTrue(batches.hasNext(), "first output batch should be the legacy placeholder");
+        MutableRecordBatch first = batches.next();
+        assertEquals(0L, first.baseOffset(),
+                "legacy placeholder must come first (baseOffset 0 < 2)");
+        assertEquals(1L, first.lastOffset(),
+                "legacy placeholder covers source legacy batch offset range");
+        Integer firstCount = first.countOrNull();
+        assertEquals(0, firstCount == null ? 0 : firstCount.intValue(),
+                "legacy placeholder is header-only");
+        assertTrue(batches.hasNext(), "second output batch should be the v2 match");
+        MutableRecordBatch second = batches.next();
+        assertEquals(2L, second.baseOffset(),
+                "v2 match batch keeps source offset");
+        assertFalse(batches.hasNext(), "exactly two output batches");
+    }
+
+    @Test
+    void legacyV1AllHiddenAcrossMultipleBatchesEachGetsPlaceholder() {
+        // R64a: two adjacent legacy all-hidden compressed batches each yield a separate v2
+        // placeholder so the consumer steps cleanly through each source offset range.
+        CompiledPredicate p = compiler.compile("body.color == 'red'");
+        MemoryRecords first = MemoryRecords.withRecords(RecordBatch.MAGIC_VALUE_V1, 0L,
+                Compression.gzip().build(),
+                rec("{\"color\":\"blue\"}"),
+                rec("{\"color\":\"green\"}"));
+        MemoryRecords second = MemoryRecords.withRecords(RecordBatch.MAGIC_VALUE_V1, 2L,
+                Compression.gzip().build(),
+                rec("{\"color\":\"yellow\"}"),
+                rec("{\"color\":\"purple\"}"));
+        ByteBuffer concat = ByteBuffer.allocate(first.sizeInBytes() + second.sizeInBytes());
+        concat.put(first.buffer().duplicate());
+        concat.put(second.buffer().duplicate());
+        concat.flip();
+        MemoryRecords input = MemoryRecords.readableRecords(concat);
+
+        MemoryRecords output = ViewFilter.apply(p, input, 0);
+
+        assertEquals(List.of(), offsetsOf(output));
+        Iterator<MutableRecordBatch> it = output.batches().iterator();
+        assertTrue(it.hasNext());
+        MutableRecordBatch ph1 = it.next();
+        assertEquals(0L, ph1.baseOffset());
+        assertEquals(1L, ph1.lastOffset());
+        assertEquals(RecordBatch.CURRENT_MAGIC_VALUE, ph1.magic());
+        assertTrue(it.hasNext());
+        MutableRecordBatch ph2 = it.next();
+        assertEquals(2L, ph2.baseOffset());
+        assertEquals(3L, ph2.lastOffset());
+        assertEquals(RecordBatch.CURRENT_MAGIC_VALUE, ph2.magic());
+        assertFalse(it.hasNext());
     }
 
     @Test
