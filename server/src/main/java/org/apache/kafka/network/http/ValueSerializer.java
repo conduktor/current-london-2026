@@ -71,6 +71,15 @@ public final class ValueSerializer {
     /**
      * Encode raw record bytes for inclusion in an HTTP JSON response.
      *
+     * <p>Wire-side amplification — the BINARY branch base64-encodes the raw bytes, which inflates the payload by
+     * exactly 4/3 (rounded up to the next multiple of 4 with `=` padding) before Jackson then renders the resulting
+     * text node as a quoted JSON string. The intermediate {@link JsonNode} tree allocated during response assembly
+     * holds both the decoded buffer and the base64 string simultaneously, so the transient heap footprint for a
+     * binary fetch response is roughly {@code 2.6 × max_bytes} (raw bytes + base64-encoded string + JsonNode
+     * wrappers). Operators sizing {@code max_bytes} against broker heap budget should account for that ratio rather
+     * than the on-disk byte count. The JSON branch is even larger transient-wise because the parsed tree replaces
+     * the raw bytes; the STRING / NULL branches do not amplify.
+     *
      * @param bytes raw record value bytes, possibly null
      * @param contentType optional content-type header value attached to the record
      * @return the envelope to embed in the JSON response
