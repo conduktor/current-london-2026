@@ -17,6 +17,7 @@
 package org.apache.kafka.storage.internals.log;
 
 import org.apache.kafka.common.config.ConfigException;
+import org.apache.kafka.common.config.TopicConfig;
 import org.apache.kafka.common.errors.InvalidConfigurationException;
 import org.apache.kafka.server.views.ViewTopicConfig;
 
@@ -149,6 +150,18 @@ class ViewLogConfigTest {
         Properties props = viewProps();
         props.put(ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "   ");
         assertThrows(InvalidConfigurationException.class, () -> LogConfig.validate(props));
+    }
+
+    @Test
+    void rejectsViewWithRemoteStorageEnabled() {
+        // A view's local log is a placeholder that is never written to; tiered storage would
+        // attach RLM lifecycle/metadata to a permanently-empty log.
+        Properties props = viewProps();
+        props.put(TopicConfig.REMOTE_LOG_STORAGE_ENABLE_CONFIG, "true");
+        InvalidConfigurationException ex = assertThrows(InvalidConfigurationException.class,
+                () -> LogConfig.validate(props));
+        assertTrue(ex.getMessage().contains(TopicConfig.REMOTE_LOG_STORAGE_ENABLE_CONFIG),
+                () -> "exception should name the offending config, got: " + ex.getMessage());
     }
 
     @Test

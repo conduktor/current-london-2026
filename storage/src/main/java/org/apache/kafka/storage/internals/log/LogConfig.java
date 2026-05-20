@@ -596,6 +596,19 @@ public class LogConfig extends AbstractConfig {
                     + ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG + ": " + badPredicate.getMessage(),
                     badPredicate);
         }
+
+        rejectIncompatibleViewSubsystems(props, backing);
+    }
+
+    // A view's local log is a placeholder that is never written to (Produce is rejected, Fetch
+    // is redirected to the backing topic), so subsystems that move or copy log segments have
+    // nothing to act on. Reject them at the validation front door rather than across log-dirs,
+    // cleaner, and RLM.
+    private static void rejectIncompatibleViewSubsystems(Map<?, ?> props, String backing) {
+        if (Boolean.TRUE.equals(props.get(TopicConfig.REMOTE_LOG_STORAGE_ENABLE_CONFIG))) {
+            throw new InvalidConfigurationException(TopicConfig.REMOTE_LOG_STORAGE_ENABLE_CONFIG
+                    + " cannot be true on a topic view (backing topic: " + backing + ").");
+        }
     }
 
     private static String stringOrNull(Object o) {
