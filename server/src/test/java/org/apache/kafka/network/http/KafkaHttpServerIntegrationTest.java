@@ -613,6 +613,11 @@ class KafkaHttpServerIntegrationTest {
         // Jetty appends charset on text/* responses — accept either bare or charset-suffixed.
         assertTrue(response.getHeaders().get("Content-Type").startsWith("text/event-stream"),
             "expected text/event-stream content-type, got: " + response.getHeaders().get("Content-Type"));
+        // Reverse-proxy buffering opt-out: nginx-family proxies buffer responses by default and turn SSE into a
+        // fixed-size lump. The bridge sets X-Accel-Buffering: no on the SSE response so the stream reaches the client
+        // event-by-event without an upstream proxy_buffering tweak. Regression-locks SseStreamer.start.
+        assertEquals("no", response.getHeaders().get("X-Accel-Buffering"),
+            "expected SSE response to carry X-Accel-Buffering: no, got: " + response.getHeaders().get("X-Accel-Buffering"));
 
         try (InputStream body = listener.getInputStream();
              BufferedReader reader = new BufferedReader(new InputStreamReader(body, StandardCharsets.UTF_8))) {

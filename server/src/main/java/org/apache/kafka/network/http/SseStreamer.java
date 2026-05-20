@@ -132,6 +132,13 @@ final class SseStreamer {
             resp.setContentType(ContentTypeNegotiator.TEXT_EVENT_STREAM);
             resp.setCharacterEncoding("UTF-8");
             resp.setHeader("Cache-Control", "no-cache");
+            // nginx (and a few derivatives like OpenResty / Tengine) default to buffering proxied responses, which
+            // turns SSE into a fixed-size lump arriving at the upstream's flush threshold rather than a live stream.
+            // The reverse-proxy hint `X-Accel-Buffering: no` is the standard cross-vendor opt-out — nginx honours it,
+            // other proxies that don't recognise it just pass it through harmlessly. Operators still need to disable
+            // proxy_buffering server-side for upstream caches that buffer regardless of headers (Apache mod_proxy with
+            // SetEnv proxy-sendcl, certain CDN tiers); the header just removes the most common foot-gun by default.
+            resp.setHeader("X-Accel-Buffering", "no");
             // No Content-Length: this is a streaming response. Disable any servlet-container buffering so the first
             // event reaches the client immediately rather than waiting for a flush threshold.
             resp.setBufferSize(0);
