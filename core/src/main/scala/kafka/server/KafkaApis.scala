@@ -911,7 +911,24 @@ class KafkaApis(val requestChannel: RequestChannel,
       }
       val filtered: Either[Errors, ViewFilter.FilterResult] = data.records match {
         case mr: MemoryRecords =>
-          Right(ViewFilter.applyAndCollect(spec.predicate(), mr, viewTpId.partition, viewMetrics, bufferSupplier))
+          // MemoryRecords.filterTo iterates batches() and per-batch streamingIterator(); both can
+          // throw CorruptRecordException (RetriableException → ApiException → KafkaException →
+          // RuntimeException, unchecked) from batch-header size/CRC checks (DefaultRecordBatch
+          // line 152/156) or legacy size bounds (AbstractLegacyRecordBatch line 300/302). A raw
+          // throw would propagate up through the per-partition .map at the fetch callback and
+          // take out the entire mixed-tp FetchResponse — the non-view partitions in the same
+          // request would lose their results. Pin the failure to this partition with
+          // CORRUPT_MESSAGE so the rest of the response survives. Catch KafkaException broadly
+          // (it covers Corrupt/InvalidRecord/UnsupportedVersion and other parser-class failures)
+          // but leave Error/InterruptedException/Throwable to propagate normally.
+          try Right(ViewFilter.applyAndCollect(spec.predicate(), mr, viewTpId.partition, viewMetrics, bufferSupplier))
+          catch {
+            case e: org.apache.kafka.common.KafkaException =>
+              error(s"View fetch for ${viewTpId.topic} hit a corrupt source batch while filtering " +
+                s"MemoryRecords; returning CORRUPT_MESSAGE for this partition only so the rest of " +
+                s"the mixed-tp FetchResponse survives.", e)
+              Left(Errors.CORRUPT_MESSAGE)
+          }
         case fr: FileRecords =>
           // Slurp the on-disk slice into a heap buffer and reuse the MemoryRecords filter. The
           // buffer comes from the per-callback supplier so subsequent view partitions in the same
@@ -935,6 +952,13 @@ class KafkaApis(val requestChannel: RequestChannel,
                 error(s"View fetch for ${viewTpId.topic} failed to materialize FileRecords for filtering; " +
                   s"returning KAFKA_STORAGE_ERROR.", e)
                 Left(Errors.KAFKA_STORAGE_ERROR)
+              case e: org.apache.kafka.common.KafkaException =>
+                // Symmetric with the MemoryRecords branch: a corrupt on-disk batch must not take
+                // out other partitions sharing the same Fetch.
+                error(s"View fetch for ${viewTpId.topic} hit a corrupt source batch while filtering " +
+                  s"FileRecords; returning CORRUPT_MESSAGE for this partition only so the rest of " +
+                  s"the mixed-tp FetchResponse survives.", e)
+                Left(Errors.CORRUPT_MESSAGE)
             } finally {
               // Safe to release: filterTo has finished iterating the materialized records (the
               // filtered output lives in ViewFilter's destination buffer, not in `buffer`).

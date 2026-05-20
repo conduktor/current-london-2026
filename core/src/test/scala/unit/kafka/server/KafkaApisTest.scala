@@ -5899,6 +5899,107 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testCorruptBackingBatchOnViewPartitionDoesNotPoisonMixedFetch(): Unit = {
+    // R69 regression. The view filter iterates the backing's MemoryRecords via filterTo, which
+    // walks ByteBufferLogInputStream.nextBatchSize and DefaultRecordBatch.ensureValid. Both can
+    // throw CorruptRecordException — a RuntimeException — on a bad header (size below overhead,
+    // bogus magic, or CRC mismatch). Before R69 the MemoryRecords branch of applyViewFilter had
+    // no try/catch, so the throw escaped through KafkaApis.processFetchResponse's per-partition
+    // .map and aborted the whole Fetch callback: the regular partition co-fetched in the same
+    // request lost its result too. After R69 the view partition must surface CORRUPT_MESSAGE
+    // and the regular partition must still deliver its records.
+    val viewTopic = "view-corrupt"
+    val backingTopic = "backing-corrupt"
+    val regularTopic = "regular-alongside"
+    val viewTopicId = Uuid.randomUuid()
+    val backingTopicId = Uuid.randomUuid()
+    val regularTopicId = Uuid.randomUuid()
+
+    val configRepository = new MockConfigRepository()
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG, backingTopic)
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_CEL_PREDICATE_CONFIG, "body.keep == true")
+    configRepository.setTopicConfig(viewTopic, ViewTopicConfig.VIEW_OFFSET_MODE_CONFIG, ViewTopicConfig.VIEW_OFFSET_MODE_SOURCE_SPARSE)
+
+    addTopicToMetadataCache(viewTopic, numPartitions = 1, topicId = viewTopicId)
+    addTopicToMetadataCache(backingTopic, numPartitions = 1, topicId = backingTopicId)
+    addTopicToMetadataCache(regularTopic, numPartitions = 1, topicId = regularTopicId)
+
+    val viewTpId = new TopicIdPartition(viewTopicId, new TopicPartition(viewTopic, 0))
+    val backingTpId = new TopicIdPartition(backingTopicId, new TopicPartition(backingTopic, 0))
+    val regularTpId = new TopicIdPartition(regularTopicId, new TopicPartition(regularTopic, 0))
+
+    // Hand-craft a wire-corrupt batch: 8-byte offset + 4-byte size whose declared size is below
+    // LegacyRecord.RECORD_OVERHEAD_V0. ByteBufferLogInputStream.nextBatchSize will throw
+    // CorruptRecordException at the very first iteration of MemoryRecords.filterTo's batches()
+    // loop. We don't need a valid CRC — the size check fires earlier.
+    val corruptBuffer = ByteBuffer.allocate(64)
+    corruptBuffer.putLong(0L) // base offset
+    corruptBuffer.putInt(4) // declared batch size, intentionally below RECORD_OVERHEAD_V0 (=14)
+    corruptBuffer.position(0)
+    val corruptRecords = MemoryRecords.readableRecords(corruptBuffer)
+    val regularRecords = MemoryRecords.withRecords(0L, Compression.NONE,
+      new SimpleRecord("regular-survives".getBytes(StandardCharsets.UTF_8)))
+
+    when(replicaManager.fetchMessages(
+      any[FetchParams],
+      any[Seq[(TopicIdPartition, FetchRequest.PartitionData)]],
+      any[ReplicaQuota],
+      any[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]()
+    )).thenAnswer(invocation => {
+      val callback = invocation.getArgument(3).asInstanceOf[Seq[(TopicIdPartition, FetchPartitionData)] => Unit]
+      callback(Seq(
+        backingTpId -> new FetchPartitionData(Errors.NONE, 1L, 0L, corruptRecords,
+          Optional.empty(), OptionalLong.empty(), Optional.empty(), OptionalInt.empty(), false),
+        regularTpId -> new FetchPartitionData(Errors.NONE, 1L, 0L, regularRecords,
+          Optional.empty(), OptionalLong.empty(), Optional.empty(), OptionalInt.empty(), false)))
+    })
+
+    val fetchData = new util.LinkedHashMap[TopicIdPartition, FetchRequest.PartitionData]()
+    fetchData.put(viewTpId, new FetchRequest.PartitionData(viewTopicId, 0, 0, 1000, Optional.empty()))
+    fetchData.put(regularTpId, new FetchRequest.PartitionData(regularTopicId, 0, 0, 1000, Optional.empty()))
+    val fetchDataBuilder = new util.LinkedHashMap[TopicPartition, FetchRequest.PartitionData]()
+    fetchDataBuilder.put(viewTpId.topicPartition, new FetchRequest.PartitionData(viewTopicId, 0, 0, 1000, Optional.empty()))
+    fetchDataBuilder.put(regularTpId.topicPartition, new FetchRequest.PartitionData(regularTopicId, 0, 0, 1000, Optional.empty()))
+    val fetchMetadata = new JFetchMetadata(0, 0)
+    val fetchContext = new FullFetchContext(time, new FetchSessionCacheShard(1000, 100),
+      fetchMetadata, fetchData, true, false)
+    when(fetchManager.newContext(any[Short], any[JFetchMetadata], any[Boolean],
+      any[util.Map[TopicIdPartition, FetchRequest.PartitionData]],
+      any[util.List[TopicIdPartition]],
+      any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val fetchRequest = new FetchRequest.Builder(ApiKeys.FETCH.latestVersion, ApiKeys.FETCH.latestVersion,
+      -1, -1, 100, 0, fetchDataBuilder).build()
+    val request = buildRequest(fetchRequest)
+    stubBackingPartitionsLocal()
+    kafkaApis = createKafkaApis(configRepository = configRepository)
+    kafkaApis.handleFetchRequest(request)
+
+    val response = verifyNoThrottling[FetchResponse](request)
+    val responseData = response.responseData(metadataCache.topicIdsToNames(), ApiKeys.FETCH.latestVersion)
+
+    val viewData = responseData.get(viewTpId.topicPartition)
+    assertEquals(Errors.CORRUPT_MESSAGE.code, viewData.errorCode,
+      "view partition with a corrupt backing batch must surface CORRUPT_MESSAGE, not propagate " +
+        "the RuntimeException up through the fetch callback")
+    assertEquals(MemoryRecords.EMPTY, FetchResponse.recordsOrFail(viewData),
+      "no records may reach the consumer when the predicate could not be evaluated against the batch")
+
+    val regularData = responseData.get(regularTpId.topicPartition)
+    assertEquals(Errors.NONE.code, regularData.errorCode,
+      "co-fetched regular partition must NOT be poisoned by the view partition's corrupt batch — " +
+        "mixed-tp Fetch independence is part of Kafka's Fetch contract")
+    val regularRecord = FetchResponse.recordsOrFail(regularData).records.iterator.next
+    val payload = new Array[Byte](regularRecord.value.remaining)
+    regularRecord.value.duplicate.get(payload)
+    assertEquals("regular-survives", new String(payload, StandardCharsets.UTF_8),
+      "regular topic records must be delivered intact even when a sibling view partition's " +
+        "backing log is corrupt")
+  }
+
+  @Test
   def testFetchAtV12CollisionBetweenViewAndBackingIsRejected(): Unit = {
     // Regression for Codex Blocker C: Fetch v12 has no topic-id field in the wire format, so the
     // FetchContext surfaces entries with Uuid.ZERO_UUID. The view-redirect path resolves the
