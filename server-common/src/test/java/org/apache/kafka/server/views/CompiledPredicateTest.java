@@ -1075,10 +1075,10 @@ class CompiledPredicateTest {
         // so these paths reach the evaluator unchanged. Null then flowed through NEQ-via-null
         // to admit every record. After R34: each returns SKIP. The probes:
         for (String pred : new String[]{
-                "offset.foo != 0",
-                "partition.foo != 0",
-                "timestamp.foo != 0",
-                "key.foo != 'x'"
+            "offset.foo != 0",
+            "partition.foo != 0",
+            "timestamp.foo != 0",
+            "key.foo != 'x'"
         }) {
             CompiledPredicate p = compiler.compile(pred);
             Optional<Boolean> r = p.evaluate(jsonRecord("{}"));
@@ -1142,10 +1142,10 @@ class CompiledPredicateTest {
         // NEQ negates FALSE → confident TRUE → admit. Round 10 of the same pattern, this time
         // at the LT/LTE/GT/GTE operator boundary instead of EQ/NEQ which R36 closed.
         for (String pred : new String[]{
-                "(body.absent < 5) != true",
-                "(body.absent <= 5) != true",
-                "(body.absent > 5) != true",
-                "(body.absent >= 5) != true",
+            "(body.absent < 5) != true",
+            "(body.absent <= 5) != true",
+            "(body.absent > 5) != true",
+            "(body.absent >= 5) != true",
         }) {
             CompiledPredicate p = compiler.compile(pred);
             Optional<Boolean> r = p.evaluate(jsonRecord("{}"));

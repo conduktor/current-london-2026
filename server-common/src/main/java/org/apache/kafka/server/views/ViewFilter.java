@@ -25,7 +25,9 @@ import org.apache.kafka.common.record.RecordBatch;
 import org.apache.kafka.common.utils.BufferSupplier;
 
 import java.nio.ByteBuffer;
+import java.util.HashSet;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * Applies a {@link CompiledPredicate} to a batch of records, emitting only the records that
@@ -149,55 +151,125 @@ public final class ViewFilter {
         //       only baseOffset and lastOffset survive on the empty batch ("Preserves source
         //       offsets"); everything else is leakage.
         //
-        // Control batches (transaction markers) are NOT scrubbed: READ_COMMITTED isolation needs
-        // intact producer_id / epoch / sequence on COMMIT/ABORT markers so consumers can match
-        // them back to the producing transaction. The data batch's `shouldRetainRecord` retains
-        // the control record itself, so countOrNull() > 0 for control batches in steady state —
-        // we still guard with isControlBatch() to be defensive against a hypothetical empty
-        // control batch reaching this loop.
+        // Control batches (transaction markers) are scrubbed when their producerId has NO
+        // surviving non-control data anywhere in the filtered output. That is the case Codex
+        // (R58) called out: a producer writes only records that the predicate filters out,
+        // commits or aborts the transaction, and the marker still reaches the view consumer —
+        // exposing the backing producer's id, epoch, transaction outcome, coordinator epoch,
+        // and source offset boundary for a transaction the predicate completely hid.
+        // (KafkaApis.filterAbortedTransactionsByVisibleProducers strips the matching
+        // abortedTransactions entry in this case, so the marker is also functionally a no-op
+        // for the consumer's READ_COMMITTED state machine — pure leakage.)
+        //
+        // We use a PER-PRODUCER-ID rule, not per-transaction-range: a marker is kept iff some
+        // surviving non-control data in the same fetch shares its producerId. The narrower
+        // per-transaction-range rule (keep only when the same OPEN transaction had survivors)
+        // would scrub the boundary marker of a hidden transaction whose producer also had a
+        // visible transaction later — but the downstream
+        // KafkaApis.filterAbortedTransactionsByVisibleProducers walks markers to bound the
+        // search range for each abortedTransactions entry, and a scrubbed marker no longer
+        // carries its producerId so it can no longer act as a boundary. Per-pid retention
+        // keeps the marker's pid intact in that case, leaving the boundary visible. The
+        // canonical multi-tenancy model (one producer per tenant) is fully covered by per-pid.
+        //
+        // Scrubbed markers become header-only batches: baseOffset/lastOffset survive so LSO
+        // advances, NO_PRODUCER_ID + NO_PRODUCER_EPOCH + NO_SEQUENCE + isTransactional=false +
+        // isControlRecord=false are written explicitly, and the marker record body is dropped
+        // (no coordinator-epoch leakage, no ControlRecordType.COMMIT|ABORT leakage).
         //
         // The rewrite uses DefaultRecordBatch.writeEmptyHeader (public) into a fresh buffer of
-        // the SAME size as the post-filter output — empty data batches are exactly
-        // RECORD_BATCH_OVERHEAD bytes whether scrubbed or not, and non-empty / control batches
+        // the SAME size as the post-filter output — scrubbed batches are exactly
+        // RECORD_BATCH_OVERHEAD bytes whether the source was an empty data batch or a
+        // fully-hidden control batch, and non-empty data / partially-visible control batches
         // are copied via batch.writeTo unchanged. We skip the rebuild entirely (single pass,
-        // in-place setPartitionLeaderEpoch only) when no empty data batch exists, which is the
-        // common case under permissive predicates.
-        boolean hasEmptyDataBatch = false;
-        for (MutableRecordBatch batch : filtered.batches()) {
-            if (batch.magic() >= RecordBatch.MAGIC_VALUE_V2) {
-                batch.setPartitionLeaderEpoch(RecordBatch.NO_PARTITION_LEADER_EPOCH);
-                if (isEmptyDataBatch(batch)) {
-                    hasEmptyDataBatch = true;
-                }
-            }
-        }
-        if (hasEmptyDataBatch) {
-            ByteBuffer rebuilt = ByteBuffer.allocate(filtered.sizeInBytes());
-            for (MutableRecordBatch batch : filtered.batches()) {
-                if (batch.magic() >= RecordBatch.MAGIC_VALUE_V2 && isEmptyDataBatch(batch)) {
-                    DefaultRecordBatch.writeEmptyHeader(
-                            rebuilt,
-                            RecordBatch.CURRENT_MAGIC_VALUE,
-                            RecordBatch.NO_PRODUCER_ID,
-                            RecordBatch.NO_PRODUCER_EPOCH,
-                            RecordBatch.NO_SEQUENCE,
-                            batch.baseOffset(),
-                            batch.lastOffset(),
-                            RecordBatch.NO_PARTITION_LEADER_EPOCH,
-                            batch.timestampType(),
-                            RecordBatch.NO_TIMESTAMP,
-                            false,  // isTransactional — cleared
-                            false   // isControlRecord — this is a data batch
-                    );
-                } else {
-                    batch.writeTo(rebuilt);
-                }
-            }
-            rebuilt.flip();
-            filtered = MemoryRecords.readableRecords(rebuilt);
-        }
+        // in-place setPartitionLeaderEpoch only) when no scrub is required, which is the common
+        // case under permissive predicates with no fully-hidden producers.
+        filtered = scrubBackingMetadata(filtered);
         metrics.recordBytes(inputSize, filtered.sizeInBytes());
         return filtered;
+    }
+
+    /**
+     * Walks the post-filter batches to perform the three scrubs described in the apply-method
+     * comment block (partition_leader_epoch on every retained batch, empty-data-batch identity
+     * fields, and fully-hidden control-batch identity + marker payload). Returns the resulting
+     * {@link MemoryRecords} — either the input (rebuild skipped) or a fresh rebuild.
+     */
+    private static MemoryRecords scrubBackingMetadata(MemoryRecords filtered) {
+        Set<Long> survivingDataPids = null;
+        boolean hasEmptyDataBatch = false;
+        boolean hasAnyControlBatch = false;
+        for (MutableRecordBatch batch : filtered.batches()) {
+            if (batch.magic() < RecordBatch.MAGIC_VALUE_V2) {
+                continue;
+            }
+            batch.setPartitionLeaderEpoch(RecordBatch.NO_PARTITION_LEADER_EPOCH);
+            if (batch.isControlBatch()) {
+                hasAnyControlBatch = true;
+            } else if (isEmptyDataBatch(batch)) {
+                hasEmptyDataBatch = true;
+            } else if (hasSurvivingRecords(batch)) {
+                if (survivingDataPids == null) {
+                    survivingDataPids = new HashSet<>();
+                }
+                survivingDataPids.add(batch.producerId());
+            }
+        }
+        final Set<Long> survivingPids = survivingDataPids == null ? Set.of() : survivingDataPids;
+        boolean hasFullyHiddenControlBatch = hasAnyControlBatch
+                && hasFullyHiddenControlBatch(filtered, survivingPids);
+        if (!hasEmptyDataBatch && !hasFullyHiddenControlBatch) {
+            return filtered;
+        }
+        ByteBuffer rebuilt = ByteBuffer.allocate(filtered.sizeInBytes());
+        for (MutableRecordBatch batch : filtered.batches()) {
+            if (shouldScrubAsEmpty(batch, survivingPids)) {
+                DefaultRecordBatch.writeEmptyHeader(
+                        rebuilt,
+                        RecordBatch.CURRENT_MAGIC_VALUE,
+                        RecordBatch.NO_PRODUCER_ID,
+                        RecordBatch.NO_PRODUCER_EPOCH,
+                        RecordBatch.NO_SEQUENCE,
+                        batch.baseOffset(),
+                        batch.lastOffset(),
+                        RecordBatch.NO_PARTITION_LEADER_EPOCH,
+                        batch.timestampType(),
+                        RecordBatch.NO_TIMESTAMP,
+                        false,  // isTransactional — cleared
+                        false   // isControlRecord — cleared (header-only offset placeholder)
+                );
+            } else {
+                batch.writeTo(rebuilt);
+            }
+        }
+        rebuilt.flip();
+        return MemoryRecords.readableRecords(rebuilt);
+    }
+
+    private static boolean hasSurvivingRecords(MutableRecordBatch batch) {
+        Integer count = batch.countOrNull();
+        return count != null && count > 0;
+    }
+
+    private static boolean hasFullyHiddenControlBatch(MemoryRecords filtered, Set<Long> survivingPids) {
+        for (MutableRecordBatch batch : filtered.batches()) {
+            if (batch.magic() >= RecordBatch.MAGIC_VALUE_V2
+                    && batch.isControlBatch()
+                    && !survivingPids.contains(batch.producerId())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean shouldScrubAsEmpty(MutableRecordBatch batch, Set<Long> survivingPids) {
+        if (batch.magic() < RecordBatch.MAGIC_VALUE_V2) {
+            return false;
+        }
+        if (isEmptyDataBatch(batch)) {
+            return true;
+        }
+        return batch.isControlBatch() && !survivingPids.contains(batch.producerId());
     }
 
     private static boolean isEmptyDataBatch(MutableRecordBatch batch) {

@@ -480,13 +480,14 @@ class ViewFilterTest {
     }
 
     @Test
-    void controlBatchProducerMetadataSurvivesScrubBecauseReadCommittedNeedsIt() {
-        // Companion to fullyFilteredDataBatchesScrubProducerAndTimestampMetadata: the scrub MUST
-        // skip control batches. READ_COMMITTED consumers match COMMIT/ABORT markers to the
-        // producing transaction via producer_id + producer_epoch on the control batch. Scrubbing
-        // those fields silently corrupts aborted-producers tracking and leaks aborted records.
-        // The data-batch-only scrub above is the right policy; this test pins that control
-        // batches are NOT collateral damage.
+    void controlBatchProducerMetadataSurvivesScrubWhenPartiallyVisibleBecauseReadCommittedNeedsIt() {
+        // Companion to fullyFilteredDataBatchesScrubProducerAndTimestampMetadata: when the
+        // transaction is PARTIALLY visible — at least one non-control data record from the same
+        // producerId survives the predicate — the COMMIT/ABORT marker must propagate unchanged.
+        // READ_COMMITTED consumers match markers to the producing transaction via producer_id +
+        // producer_epoch on the control batch. Scrubbing those fields here silently corrupts
+        // aborted-producers tracking and leaks aborted records. The fully-hidden case is handled
+        // by the companion test fullyHiddenAbortMarkerIsScrubbedToEmptyHeader.
         CompiledPredicate p = compiler.compile("body.color == 'red'");
         MemoryRecords output = ViewFilter.apply(p, withDataAndControlMarker(ControlRecordType.ABORT), 0);
 
@@ -495,14 +496,200 @@ class ViewFilterTest {
             if (batch.isControlBatch()) {
                 sawControl = true;
                 assertEquals(73L, batch.producerId(),
-                        "control-batch producer_id must NOT be scrubbed — READ_COMMITTED depends on it");
+                        "control-batch producer_id must NOT be scrubbed when same-pid data is visible — READ_COMMITTED depends on it");
                 assertEquals((short) 0, batch.producerEpoch(),
-                        "control-batch producer_epoch must NOT be scrubbed — READ_COMMITTED depends on it");
+                        "control-batch producer_epoch must NOT be scrubbed when same-pid data is visible — READ_COMMITTED depends on it");
                 assertTrue(batch.isTransactional(),
-                        "control-batch transactional flag must NOT be scrubbed — it identifies the marker");
+                        "control-batch transactional flag must NOT be scrubbed when same-pid data is visible — it identifies the marker");
             }
         }
         assertTrue(sawControl, "expected the control batch to propagate through the filter");
+    }
+
+    @Test
+    void fullyHiddenAbortMarkerIsScrubbedToEmptyHeader() {
+        fullyHiddenMarkerScrubAssertions(ControlRecordType.ABORT);
+    }
+
+    @Test
+    void fullyHiddenCommitMarkerIsScrubbedToEmptyHeader() {
+        fullyHiddenMarkerScrubAssertions(ControlRecordType.COMMIT);
+    }
+
+    @Test
+    void multiPidFetchScrubsOnlyMarkersOfFullyHiddenProducers() {
+        // Two producers (pid=50 / pid=60) in the same fetch. Predicate filters everything for
+        // pid=50, leaves at least one record for pid=60. The pid=50 marker (fully hidden) MUST
+        // be scrubbed; the pid=60 marker (partially visible) MUST stay intact because the view
+        // consumer needs producer_id + producer_epoch on it to terminate READ_COMMITTED aborted-
+        // producer-range tracking against the surviving records.
+        CompiledPredicate p = compiler.compile("body.color == 'red'");
+        ByteBuffer buffer = ByteBuffer.allocate(4096);
+
+        // pid=50 — fully hidden by the predicate.
+        long hiddenPid = 50L;
+        short hiddenEpoch = 1;
+        MemoryRecordsBuilder hiddenBuilder = new MemoryRecordsBuilder(
+                buffer,
+                RecordBatch.CURRENT_MAGIC_VALUE,
+                Compression.NONE,
+                TimestampType.CREATE_TIME,
+                0L, 0L,
+                hiddenPid, hiddenEpoch, 0,
+                true, false, 0,
+                buffer.capacity());
+        hiddenBuilder.append(0L, null, "{\"color\":\"blue\"}".getBytes(StandardCharsets.UTF_8));
+        hiddenBuilder.close();
+        MemoryRecords.writeEndTransactionalMarker(buffer, 1L, 0L, 0,
+                hiddenPid, hiddenEpoch,
+                new EndTransactionMarker(ControlRecordType.ABORT, 0));
+
+        // pid=60 — partially visible (red + blue).
+        long visiblePid = 60L;
+        short visibleEpoch = 2;
+        MemoryRecordsBuilder visibleBuilder = new MemoryRecordsBuilder(
+                buffer,
+                RecordBatch.CURRENT_MAGIC_VALUE,
+                Compression.NONE,
+                TimestampType.CREATE_TIME,
+                2L, 0L,
+                visiblePid, visibleEpoch, 0,
+                true, false, 0,
+                buffer.capacity());
+        visibleBuilder.append(0L, null, "{\"color\":\"red\"}".getBytes(StandardCharsets.UTF_8));
+        visibleBuilder.append(0L, null, "{\"color\":\"blue\"}".getBytes(StandardCharsets.UTF_8));
+        visibleBuilder.close();
+        MemoryRecords.writeEndTransactionalMarker(buffer, 4L, 0L, 0,
+                visiblePid, visibleEpoch,
+                new EndTransactionMarker(ControlRecordType.ABORT, 0));
+
+        buffer.flip();
+        MemoryRecords input = MemoryRecords.readableRecords(buffer);
+
+        MemoryRecords output = ViewFilter.apply(p, input, 0);
+
+        boolean hiddenMarkerScrubbed = false;     // pid=50's ABORT marker at offset 1
+        boolean visibleMarkerIntact = false;      // pid=60's ABORT marker at offset 4
+        for (MutableRecordBatch batch : output.batches()) {
+            if (batch.baseOffset() == 1L) {
+                assertFalse(batch.isControlBatch(),
+                        "pid=50 ABORT marker (offset 1) must be scrubbed to a non-control header — producer fully hidden");
+                assertEquals(RecordBatch.NO_PRODUCER_ID, batch.producerId(),
+                        "pid=50 marker must not leak producer_id");
+                assertFalse(batch.isTransactional(),
+                        "pid=50 marker must clear isTransactional");
+                assertFalse(batch.iterator().hasNext(),
+                        "pid=50 marker must produce a header-only batch with no records");
+                hiddenMarkerScrubbed = true;
+            } else if (batch.baseOffset() == 4L) {
+                assertTrue(batch.isControlBatch(),
+                        "pid=60 ABORT marker (offset 4) must remain a control batch — pid has surviving data");
+                assertEquals(visiblePid, batch.producerId(),
+                        "pid=60 marker producer_id must round-trip — surviving same-pid data depends on it");
+                assertEquals(visibleEpoch, batch.producerEpoch(),
+                        "pid=60 marker producer_epoch must round-trip");
+                assertTrue(batch.isTransactional(),
+                        "pid=60 marker transactional flag must round-trip");
+                visibleMarkerIntact = true;
+            }
+        }
+        assertTrue(hiddenMarkerScrubbed,
+                "expected pid=50 ABORT marker at offset 1 to be scrubbed to a header-only batch");
+        assertTrue(visibleMarkerIntact,
+                "expected pid=60 ABORT marker at offset 4 to remain a control batch with intact producer metadata");
+    }
+
+    private void fullyHiddenMarkerScrubAssertions(ControlRecordType controlType) {
+        // When ALL non-control data records in a transaction fail the predicate, the COMMIT/ABORT
+        // marker is a pure metadata leak: it broadcasts the backing producer's id + epoch +
+        // transaction outcome (COMMIT/ABORT) + coordinator epoch to view consumers who have no
+        // other reference to that transaction. KafkaApis.filterAbortedTransactionsByVisibleProducers
+        // strips the matching abortedTransactions entry in the same fully-hidden case, so the
+        // marker is also functionally a no-op for READ_COMMITTED tracking. The filter must scrub
+        // the control batch to a header-only empty placeholder (offset advance only), the same
+        // way it scrubs a fully-filtered data batch.
+        //
+        // PROMPT.md line 29 (lessons-already-known): "COMMIT/ABORT control batches contain no
+        // user data, so they have nothing to predicate against — but they must still be emitted
+        // as empty batches or READ_COMMITTED isolation silently breaks". Our scrub honours that:
+        // the offset placeholder remains so LSO advances; the producer-identity payload is gone.
+        CompiledPredicate p = compiler.compile("body.color == 'red'");
+        long backingProducerId = 99L;
+        short backingProducerEpoch = 3;
+        int partitionLeaderEpoch = 0;
+        int baseSequence = 0;
+        ByteBuffer buffer = ByteBuffer.allocate(2048);
+        MemoryRecordsBuilder builder = new MemoryRecordsBuilder(
+                buffer,
+                RecordBatch.CURRENT_MAGIC_VALUE,
+                Compression.NONE,
+                TimestampType.CREATE_TIME,
+                0L,                            // baseOffset
+                0L,                            // logAppendTime
+                backingProducerId,
+                backingProducerEpoch,
+                baseSequence,
+                true,                          // isTransactional
+                false,                         // isControlBatch
+                partitionLeaderEpoch,
+                buffer.capacity());
+        builder.append(0L, null, "{\"color\":\"blue\"}".getBytes(StandardCharsets.UTF_8));
+        builder.append(0L, null, "{\"color\":\"green\"}".getBytes(StandardCharsets.UTF_8));
+        builder.close();
+        MemoryRecords.writeEndTransactionalMarker(buffer, 2L, 0L, partitionLeaderEpoch,
+                backingProducerId, backingProducerEpoch,
+                new EndTransactionMarker(controlType, 0));
+        buffer.flip();
+        MemoryRecords input = MemoryRecords.readableRecords(buffer);
+
+        MemoryRecords output = ViewFilter.apply(p, input, 0);
+
+        assertEquals(List.of(), offsetsOf(output), "no user records survive — predicate filtered all");
+        int totalBatches = 0;
+        int controlBatchCount = 0;
+        int dataBatchCount = 0;
+        boolean dataOffsetsObserved = false;
+        boolean controlOffsetsObserved = false;
+        for (MutableRecordBatch batch : output.batches()) {
+            totalBatches++;
+            assertFalse(batch.isControlBatch(),
+                    "control batch for fully-hidden transaction must be scrubbed to a non-control header (type="
+                            + controlType + ")");
+            assertEquals(RecordBatch.NO_PRODUCER_ID, batch.producerId(),
+                    "fully-hidden " + controlType + " marker must not leak producer_id");
+            assertEquals(RecordBatch.NO_PRODUCER_EPOCH, batch.producerEpoch(),
+                    "fully-hidden " + controlType + " marker must not leak producer_epoch");
+            assertEquals(RecordBatch.NO_SEQUENCE, batch.baseSequence(),
+                    "fully-hidden " + controlType + " marker must not leak base_sequence");
+            assertFalse(batch.isTransactional(),
+                    "fully-hidden " + controlType + " marker must clear isTransactional");
+            assertEquals(RecordBatch.NO_TIMESTAMP, batch.maxTimestamp(),
+                    "fully-hidden " + controlType + " marker must clear max_timestamp");
+            assertFalse(batch.iterator().hasNext(),
+                    "fully-hidden " + controlType + " marker must produce a header-only batch with no records "
+                            + "(no marker payload, no coordinator-epoch leakage)");
+            assertTrue(((org.apache.kafka.common.record.DefaultRecordBatch) batch).isValid(),
+                    "scrubbed batch must carry a valid CRC (type=" + controlType + ")");
+            if (batch.baseOffset() == 0L && batch.lastOffset() == 1L) {
+                dataBatchCount++;
+                dataOffsetsObserved = true;
+            } else if (batch.baseOffset() == 2L && batch.lastOffset() == 2L) {
+                controlBatchCount++;
+                controlOffsetsObserved = true;
+            }
+        }
+        assertEquals(2, totalBatches,
+                "expected two header-only batches (scrubbed data + scrubbed marker, type=" + controlType + ")");
+        assertEquals(1, dataBatchCount,
+                "expected one header-only batch carrying the data span [0..1] for offset advance (type="
+                        + controlType + ")");
+        assertEquals(1, controlBatchCount,
+                "expected one header-only batch carrying the marker's offset 2 for LSO advance (type="
+                        + controlType + ")");
+        assertTrue(dataOffsetsObserved,
+                "data batch offsets must survive scrub so consumer advances past [0..1] (type=" + controlType + ")");
+        assertTrue(controlOffsetsObserved,
+                "marker offset 2 must survive scrub so LSO advances past the marker (type=" + controlType + ")");
     }
 
     @Test
