@@ -339,10 +339,20 @@ final class SseStreamer {
             return;
         }
         try {
-            // Same shape as scheduleNextFetch: the delayedExecutor dispatches via httpExecutor when the
-            // timer fires; if that dispatch is rejected the dependent future is what carries the
-            // failure, not the calling thread. Terminal handler closes the stream so a throttled SSE
-            // session cannot leak its limiter slot on shutdown.
+            // Delivery mechanism: the JDK static delayer fires the timer, then dispatches scheduleNextFetch
+            // via httpExecutor. The .exceptionally handler catches an uncaught throw from inside
+            // scheduleNextFetch itself — the action is already defensive (closed-checked), so this is a
+            // future-proofing safety net, not a routine path.
+            // What it does NOT catch: a RejectedExecutionException raised when the delayer eventually
+            // submits to a stopped or saturated httpExecutor surfaces inside the JDK delayer's ASYNC_POOL
+            // worker (DelayedExecutor.TaskSubmitter.run has no try/catch around the inner execute), NOT
+            // through the dependent future — so the throttle-resume fetch simply never runs in that race.
+            // SSE has no IDLE_TIMEOUT (async.setTimeout(0L) per the streaming contract), so the residual
+            // exposure is reclaimed by the shutdown-registry walk in closeForShutdown that closes every
+            // active streamer on broker stop. Symmetric site documented in WsStreamer#scheduleDrainAfter,
+            // where Jetty's IDLE_TIMEOUT (5 min) is the analogous fallback. Under default Jetty QTP
+            // (unbounded queue) httpExecutor.execute never rejects from saturation — only a stopping
+            // pool refuses, and that path is exactly what closeForShutdown is for.
             CompletableFuture.runAsync(this::scheduleNextFetch,
                 CompletableFuture.delayedExecutor(delayMs, TimeUnit.MILLISECONDS, httpExecutor))
                 .exceptionally(t -> {
@@ -371,8 +381,11 @@ final class SseStreamer {
         out.write(Long.toString(record.offset()).getBytes(java.nio.charset.StandardCharsets.UTF_8));
         out.write(LF);
         out.write(DATA_PREFIX);
-        // Records produced over HTTP never contain raw newlines unescaped, since the body is JSON. writeValueAsBytes
-        // produces a single line of JSON; the closing \n\n then terminates the SSE event.
+        // SSE framing requires the data field on a single line — embedded LF/CR would split the event
+        // and let a record forge or truncate the next frame. Safety is supplied by Jackson, not by the
+        // bridge: writeValueAsBytes escapes any LF/CR inside string literals as \n / \r regardless of
+        // which Kafka producer wrote the record (this bridge, a binary client, MirrorMaker, an attacker
+        // with PRODUCE rights). The closing \n\n then terminates the SSE event.
         out.write(mapper.writeValueAsBytes(body));
         out.write(CRLF);
         out.flush();
@@ -416,7 +429,7 @@ final class SseStreamer {
      * a network drop, conflating two different operational conditions across every SSE consumer.
      *
      * <p>Dispatched through {@code httpExecutor} (Jetty {@code QueuedThreadPool} — multi-threaded; see
-     * {@code KafkaHttpServer.java} line 238) so the broker {@code stop()} thread returns immediately without
+     * {@code KafkaHttpServer.java} line 245) so the broker {@code stop()} thread returns immediately without
      * blocking on any per-stream write. This is <em>not</em> a per-stream strand: the shutdown runnable may run on
      * a different worker thread than an in-flight {@link #handleFetchResult}, so two writers can land on the same
      * {@link ServletOutputStream} concurrently. Jetty's {@code HttpOutput} rejects the racing writer with

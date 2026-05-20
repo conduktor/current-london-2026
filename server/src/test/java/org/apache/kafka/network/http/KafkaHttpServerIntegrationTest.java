@@ -2555,6 +2555,144 @@ class KafkaHttpServerIntegrationTest {
     }
 
     @Test
+    void sseGetRacingShutdownIsRejectedWith503() throws Exception {
+        // Wave 74 axis CCC: the SSE admission gate must observe the same shutdown-race doctrine the WS
+        // upgrade path established at wsUpgradeRacingShutdownIsRejectedWith503. stop() latches a
+        // `shuttingDown` flag BEFORE walking activeSseStreams to emit `event: error` SHUTDOWN frames.
+        // Without a pre-tryAcquire guard, an SSE GET whose servlet entry runs AFTER the snapshot but
+        // BEFORE the connector force-close registers a new streamer that misses the SHUTDOWN walk and
+        // observes raw FIN/RST on the imminent socket close. Mirror the WS test shape: open a live
+        // long-poll to keep the grace window open, pre-open a probe TCP socket, kick stop() on a
+        // background thread, then drive the GET through the probe and assert 503 + Retry-After: 1 +
+        // Connection: close + envelope. Pins the SSE-side contract symmetric to WS.
+        tearDown();
+        ControllableSubmitter localSubmitter = new ControllableSubmitter();
+        KafkaHttpServer gracefulServer = new KafkaHttpServer("127.0.0.1", 0,
+            new KafkaHttpBridge(mapper, localSubmitter), localSubmitter, mapper,
+            DEFAULT_TEST_MAX_BODY_BYTES, DEFAULT_TEST_MAX_SSE_STREAMS, DEFAULT_TEST_MAX_WS_SUBSCRIPTIONS,
+            3000L);
+        try {
+            gracefulServer.start();
+            int port = gracefulServer.boundPort();
+            HttpClient localClient = new HttpClient();
+            localClient.start();
+            try {
+                // Keep the grace-drain window open by parking a live SSE long-poll. Without a drainee,
+                // Server.stop() would unblock immediately on empty activeSseStreams and the connector
+                // would tear down before the probe got its bytes onto the wire.
+                localSubmitter.fetchAlwaysEmpty = true;
+                InputStreamResponseListener liveListener = new InputStreamResponseListener();
+                String liveUrl = "http://127.0.0.1:" + port
+                    + "/v1/topics/orders/records?partition=0&from=earliest";
+                localClient.newRequest(liveUrl)
+                    .method(HttpMethod.GET)
+                    .headers(h -> h.put("Accept", "text/event-stream"))
+                    .send(liveListener);
+                Response liveResponse = liveListener.get(5, TimeUnit.SECONDS);
+                assertEquals(200, liveResponse.getStatus(),
+                    "live SSE stream must open before the race window — otherwise grace drains immediately");
+
+                // Open the race-probe TCP connection BEFORE stop(): the connector still services accepts
+                // here, so only the application-layer guard can reject the request.
+                try (Socket probe = new Socket("127.0.0.1", port)) {
+                    probe.setSoTimeout(5000);
+
+                    CompletableFuture<Throwable> stopFuture = CompletableFuture.supplyAsync(() -> {
+                        try {
+                            gracefulServer.stop();
+                            return null;
+                        } catch (Throwable t) {
+                            return t;
+                        }
+                    });
+
+                    // Wait briefly for stop() to enter its synchronized block and latch shuttingDown.
+                    // Same justification as the WS test — 100 ms dwarfs the scheduler latency.
+                    Thread.sleep(100);
+
+                    String req =
+                        "GET /v1/topics/orders/records?partition=0&from=earliest HTTP/1.1\r\n"
+                            + "Host: 127.0.0.1:" + port + "\r\n"
+                            + "Accept: text/event-stream\r\n"
+                            + "Connection: close\r\n"
+                            + "\r\n";
+                    OutputStream out = probe.getOutputStream();
+                    out.write(req.getBytes(StandardCharsets.US_ASCII));
+                    out.flush();
+
+                    String raw = readAllAscii(probe.getInputStream());
+                    assertTrue(raw.startsWith("HTTP/1.1 503"),
+                        "SSE GET race-probe must be rejected with 503 once stop() has latched the flag; "
+                            + "got status line: " + raw.split("\r\n", 2)[0]);
+                    assertTrue(raw.toLowerCase(java.util.Locale.ROOT).contains("retry-after: 1"),
+                        "503 must carry Retry-After: 1 — symmetric to the WS shutdown doctrine, got: " + raw);
+                    assertTrue(raw.toLowerCase(java.util.Locale.ROOT).contains("connection: close"),
+                        "503 shutdown response must carry Connection: close so the socket is treated as "
+                            + "terminal during the remaining grace window, got: " + raw);
+                    int headerEnd = raw.indexOf("\r\n\r\n");
+                    assertTrue(headerEnd > 0, "503 response must terminate its headers, got: " + raw);
+                    String body = stripChunkPrefix(raw.substring(headerEnd + 4));
+                    JsonNode envelope = mapper.readTree(body);
+                    assertEquals(503, envelope.get("errorCode").asInt(),
+                        "503 body must match the bridge's {errorCode, errorMessage} contract, got: " + body);
+                    assertTrue(envelope.get("errorMessage").asText()
+                            .toLowerCase(java.util.Locale.ROOT).contains("shutting down"),
+                        "errorMessage must name the shutdown cause, got: " + envelope.get("errorMessage"));
+
+                    Throwable stopFailure = stopFuture.get(10, TimeUnit.SECONDS);
+                    assertNull(stopFailure, "background stop() must complete cleanly, got: " + stopFailure);
+                }
+
+                // Live stream is torn down by stop()'s SHUTDOWN walk; drain remaining bytes so the client
+                // releases its connection cleanly. We deliberately do not assert on the live stream's
+                // body — that contract is owned by gracefulShutdownLetsInFlightSseStreamSettleBeforeForceClose.
+                try (InputStream body = liveListener.getInputStream()) {
+                    byte[] buf = new byte[4096];
+                    while (body.read(buf) > 0) {
+                        // drain
+                    }
+                } catch (Exception ignored) {
+                    // Connection closed mid-read is expected during shutdown.
+                }
+            } finally {
+                localClient.stop();
+            }
+        } finally {
+            try {
+                gracefulServer.stop();
+            } catch (Exception ignored) {
+                // already stopped
+            }
+            startServer(DEFAULT_TEST_MAX_BODY_BYTES, DEFAULT_TEST_MAX_SSE_STREAMS, DEFAULT_TEST_MAX_WS_SUBSCRIPTIONS);
+        }
+    }
+
+    @Test
+    void jsonHeadRequestDoesNotInvokeBrokerSubmitter() throws Exception {
+        // Wave 74 axis EEE: HEAD on the JSON branch (no Accept: text/event-stream) must not run through
+        // bridge.fetch. Jetty's default HttpServlet.doHead wraps the response in a body-counting
+        // NoBodyResponse and delegates to doGet; without the explicit JSON-branch HEAD short-circuit, a
+        // burst of HEADs would each cost a full broker fetch whose body is then silently discarded —
+        // breaking the "HEAD is cheap" intent of RFC 9110 §9.3.2 and giving an unauthenticated probe an
+        // amplification vector against the broker. Mirror sseHeadRequestDoesNotAcquireLimiterSlot, but
+        // assert against submitter.fetchCommandLog (the limiter slot is SSE-only — the JSON branch has
+        // no admission gate, so the broker invocation count IS the leak indicator).
+        for (int i = 0; i < 5; i++) {
+            ContentResponse head = client.newRequest(url("/v1/topics/orders/records"))
+                .method(HttpMethod.HEAD)
+                .timeout(5, TimeUnit.SECONDS)
+                .send();
+            assertEquals(200, head.getStatus(), "HEAD on JSON endpoint must return 200");
+            assertTrue(head.getMediaType().startsWith("application/json"),
+                "HEAD must mirror the Content-Type GET would set, got: " + head.getMediaType());
+            assertEquals(0, head.getContent().length, "HEAD response must have empty body");
+        }
+        assertTrue(submitter.fetchCommandLog.isEmpty(),
+            "HEAD on JSON endpoint must NOT invoke the broker submitter — got " + submitter.fetchCommandLog.size()
+                + " fetches, indicating HEAD requests cost the broker as much as GETs");
+    }
+
+    @Test
     void zeroGraceStopsImmediatelyForLegacyTestHarness() throws Exception {
         // Counterpart to gracefulShutdownLetsInFlightSseStreamSettleBeforeForceClose: confirm that the
         // 8-arg legacy constructor still produces a server that tears down without waiting, so the

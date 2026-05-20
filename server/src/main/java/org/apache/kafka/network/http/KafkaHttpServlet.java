@@ -32,6 +32,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
+import java.util.function.BooleanSupplier;
 
 import jakarta.servlet.AsyncContext;
 import jakarta.servlet.http.HttpServlet;
@@ -72,10 +73,17 @@ public final class KafkaHttpServlet extends HttpServlet {
     // can walk the live streams and emit a terminal `event: error` SHUTDOWN frame before the connector
     // force-close. Symmetric to the activeWsSessions plumbing on the WebSocket side.
     private final Set<SseStreamer> activeSseStreams;
+    // Race-guard gate: KafkaHttpServer.stop() latches a `shuttingDown` flag BEFORE taking the SSE snapshot.
+    // The SSE admission path consults this supplier both before and after tryAcquire so an SSE GET that
+    // arrives between the latch and the snapshot is refused with 503 + Retry-After:1 instead of slipping
+    // into activeSseStreams after the walk and observing raw FIN/RST from Server.stop()'s connector close.
+    // Symmetric to the createWsEndpoint pre/post tryAcquire checks in KafkaHttpServer.
+    private final BooleanSupplier shuttingDownGate;
 
     public KafkaHttpServlet(KafkaHttpBridge bridge, RequestSubmitter submitter, ObjectMapper mapper,
                             int maxRequestBodyBytes, SseStreamLimiter sseLimiter, Executor httpExecutor,
-                            HttpBridgeMetrics metrics, Set<SseStreamer> activeSseStreams) {
+                            HttpBridgeMetrics metrics, Set<SseStreamer> activeSseStreams,
+                            BooleanSupplier shuttingDownGate) {
         this.bridge = Objects.requireNonNull(bridge, "bridge must not be null");
         this.submitter = Objects.requireNonNull(submitter, "submitter must not be null");
         this.mapper = Objects.requireNonNull(mapper, "mapper must not be null");
@@ -87,6 +95,7 @@ public final class KafkaHttpServlet extends HttpServlet {
         this.httpExecutor = Objects.requireNonNull(httpExecutor, "httpExecutor must not be null");
         this.metrics = Objects.requireNonNull(metrics, "metrics must not be null");
         this.activeSseStreams = Objects.requireNonNull(activeSseStreams, "activeSseStreams must not be null");
+        this.shuttingDownGate = Objects.requireNonNull(shuttingDownGate, "shuttingDownGate must not be null");
     }
 
     @Override
@@ -253,69 +262,26 @@ public final class KafkaHttpServlet extends HttpServlet {
 
         // SSE branches before startAsync: we parse the same fetch command up-front so a malformed query string falls
         // out as a one-shot 400, not a half-opened event-stream that then immediately errors. After this point the
-        // streamer owns the AsyncContext and the response lifetime.
+        // streamer owns the AsyncContext and the response lifetime. Extracted into handleSseFetch so doGet's NPath
+        // stays under the checkstyle ceiling — the HEAD short-circuit and shutdown-race guards on both branches
+        // would otherwise push the combined branch count past 500.
         if (ContentTypeNegotiator.TEXT_EVENT_STREAM.equals(contentType)) {
-            // Parse the query string BEFORE the HEAD short-circuit so a malformed `?partition=foo` on a HEAD
-            // request returns the same 400 it would on the equivalent GET (RFC 9110 §9.3.2: "the response to
-            // a HEAD request is identical to that of an equivalent GET"). The parse step is pure and cheap; it
-            // is safe to run before deciding whether to acquire a limiter slot.
-            FetchRequestParser.FetchCommand command;
-            try {
-                command = FetchRequestParser.parse(topic, params);
-            } catch (ProduceRequestParser.BadRequestException e) {
-                writeBadRequest(resp, e.getMessage());
-                metrics.recordRequest(HttpBridgeMetrics.Operation.FETCH, elapsedMs(startNanos), HttpStatusMapper.BAD_REQUEST);
-                return;
-            }
-            // HEAD short-circuit. Jetty's default HttpServlet.doHead wraps the response in a body-counting
-            // NoBodyResponse and delegates to doGet; for the SSE branch that would acquire a limiter slot,
-            // start an AsyncContext, and run the streamer against the wrapper — its writes never throw
-            // IOException, so the slot would be held until the underlying socket finally closes. A bursty
-            // HEAD probe could therefore exhaust the SSE cap. Emit only the headers (no body) and return
-            // before any slot or async work. The query has already been validated above.
-            if ("HEAD".equalsIgnoreCase(req.getMethod())) {
-                resp.setStatus(HttpStatusMapper.OK);
-                resp.setContentType(ContentTypeNegotiator.TEXT_EVENT_STREAM);
-                resp.setCharacterEncoding("UTF-8");
-                resp.setHeader("Cache-Control", "no-cache");
-                return;
-            }
-            // Acquire the concurrent-stream slot BEFORE startAsync — if the cap is reached we want to emit a
-            // one-shot 429 with a Retry-After hint, not a half-opened event-stream that immediately closes. The
-            // limiter is the admission gate; without it a runaway client can exhaust the Jetty thread pool.
-            SseStreamLimiter.Token token = sseLimiter.tryAcquire();
-            if (token == null) {
-                writeTooManyStreams(resp);
-                metrics.recordSseCapRejection();
-                metrics.recordRequest(HttpBridgeMetrics.Operation.FETCH, elapsedMs(startNanos), HttpStatusMapper.TOO_MANY_REQUESTS);
-                return;
-            }
-            AsyncContext async;
-            try {
-                async = req.startAsync();
-            } catch (RuntimeException e) {
-                // Mirror the in-band-500 invariant the class javadoc states ("The servlet never throws to
-                // the container"). The branch is extracted so doGet's NPath stays under the checkstyle
-                // ceiling — the behaviour is exactly what the inline block would do.
-                handleSseStartAsyncFailure(resp, token, command.topic(), e, startNanos);
-                return;
-            }
-            // No per-request status recording for the SSE branch — the stream itself can run for hours and there is
-            // no single "response status" to record at the end. Instead record the accept event in
-            // SseStreamsOpened; paired with the ActiveSseStreams gauge and RejectedAtSseCap meter this gives
-            // operators the full open-rate / point-in-time / reject-rate picture without contaminating
-            // RequestLatencyMs with stream-lifetime samples. The meter is incremented from inside start() only
-            // after the priming comment write succeeds — otherwise a connection that died before producing any
-            // events would inflate the open counter relative to the gauge.
-            try {
-                SseStreamer.start(async, submitter, mapper, command, token, httpExecutor, activeSseStreams,
-                    metrics::recordSseStreamOpened);
-            } catch (RuntimeException e) {
-                handleSseStartupFailure(async, token, command.topic(), e, startNanos);
-            }
+            handleSseFetch(req, resp, topic, params, startNanos);
             return;
         }
 
+        // HEAD short-circuit for the JSON branch. Same DoS-amplification concern as the SSE branch above:
+        // Jetty's default HttpServlet.doHead wraps the response in NoBodyResponse and delegates to doGet.
+        // Running through bridge.fetch would dispatch a full async broker fetch whose body is then silently
+        // discarded by the wrapper — bursty HEAD probes would cost the broker the same as full GETs,
+        // breaking the "HEAD is cheap" intent of RFC 9110 §9.3.2. Emit only the headers (no body) and
+        // return before any async or broker work. The topic was validated above at extractTopic; query
+        // params are not parsed for the JSON branch GET either, so HEAD matches GET's pre-async shape.
+        if ("HEAD".equalsIgnoreCase(req.getMethod())) {
+            resp.setStatus(HttpStatusMapper.OK);
+            resp.setContentType(contentType);
+            return;
+        }
         AsyncContext async = req.startAsync();
         // Same rationale as doPost: KafkaHttpBridge.withTimeout owns the request-timeout contract (504/REQUEST_TIMED_OUT
         // via HttpStatusMapper). Disable Jetty's default 30s AsyncContext timeout so the two don't race and so a
@@ -528,6 +494,98 @@ public final class KafkaHttpServlet extends HttpServlet {
         }
     }
 
+    /**
+     * SSE fetch admission and startup. Extracted from {@link #doGet} so that method stays under the
+     * project's NPath-complexity ceiling — the body sequence (parse → HEAD → pre-tryAcquire shutdown
+     * check → tryAcquire → post-tryAcquire shutdown check → startAsync → SseStreamer.start) and its
+     * five distinct error envelopes (400, 200-HEAD, 503-pre, 429, 503-post, 500-startAsync,
+     * 500-startup) would otherwise push doGet past the 500-branch limit when combined with the JSON
+     * branch's HEAD short-circuit and bridge.fetch path. The behaviour is exactly what the inline
+     * block previously did; no semantic change.
+     */
+    private void handleSseFetch(HttpServletRequest req, HttpServletResponse resp, String topic,
+                                QueryParams params, long startNanos) throws IOException {
+        // Parse the query string BEFORE the HEAD short-circuit so a malformed `?partition=foo` on a HEAD
+        // request returns the same 400 it would on the equivalent GET (RFC 9110 §9.3.2: "the response to
+        // a HEAD request is identical to that of an equivalent GET"). The parse step is pure and cheap; it
+        // is safe to run before deciding whether to acquire a limiter slot.
+        FetchRequestParser.FetchCommand command;
+        try {
+            command = FetchRequestParser.parse(topic, params);
+        } catch (ProduceRequestParser.BadRequestException e) {
+            writeBadRequest(resp, e.getMessage());
+            metrics.recordRequest(HttpBridgeMetrics.Operation.FETCH, elapsedMs(startNanos), HttpStatusMapper.BAD_REQUEST);
+            return;
+        }
+        // HEAD short-circuit. Jetty's default HttpServlet.doHead wraps the response in a body-counting
+        // NoBodyResponse and delegates to doGet; for the SSE branch that would acquire a limiter slot,
+        // start an AsyncContext, and run the streamer against the wrapper — its writes never throw
+        // IOException, so the slot would be held until the underlying socket finally closes. A bursty
+        // HEAD probe could therefore exhaust the SSE cap. Emit only the headers (no body) and return
+        // before any slot or async work. The query has already been validated above.
+        if ("HEAD".equalsIgnoreCase(req.getMethod())) {
+            resp.setStatus(HttpStatusMapper.OK);
+            resp.setContentType(ContentTypeNegotiator.TEXT_EVENT_STREAM);
+            resp.setCharacterEncoding("UTF-8");
+            resp.setHeader("Cache-Control", "no-cache");
+            return;
+        }
+        // Shutdown-race guard: stop() latches `shuttingDown` BEFORE taking the SSE snapshot and walking
+        // activeSseStreams to emit terminal `event: error` SHUTDOWN frames. Letting a new SSE session
+        // register here would either (a) miss the snapshot and observe raw FIN/RST on the imminent
+        // connector force-close, or (b) leak a limiter slot if it races registration. A pre-tryAcquire
+        // check turns the race into a clean 503 + Retry-After. Symmetric to createWsEndpoint in
+        // KafkaHttpServer — the WS upgrade path consults the same flag at the same point.
+        if (shuttingDownGate.getAsBoolean()) {
+            writeShuttingDown(resp);
+            metrics.recordRequest(HttpBridgeMetrics.Operation.FETCH, elapsedMs(startNanos), HttpStatusMapper.SERVICE_UNAVAILABLE);
+            return;
+        }
+        // Acquire the concurrent-stream slot BEFORE startAsync — if the cap is reached we want to emit a
+        // one-shot 429 with a Retry-After hint, not a half-opened event-stream that immediately closes. The
+        // limiter is the admission gate; without it a runaway client can exhaust the Jetty thread pool.
+        SseStreamLimiter.Token token = sseLimiter.tryAcquire();
+        if (token == null) {
+            writeTooManyStreams(resp);
+            metrics.recordSseCapRejection();
+            metrics.recordRequest(HttpBridgeMetrics.Operation.FETCH, elapsedMs(startNanos), HttpStatusMapper.TOO_MANY_REQUESTS);
+            return;
+        }
+        // Defence-in-depth: re-check after acquiring the limiter slot. The flag could have been set
+        // between the check above and tryAcquire (Jetty I/O thread vs broker stop thread). Without
+        // this, a session that won the race past the first check would still register in
+        // activeSseStreams after stop()'s snapshot and observe raw FIN/RST. Release the slot we
+        // just took so the cap accounting stays accurate.
+        if (shuttingDownGate.getAsBoolean()) {
+            token.close();
+            writeShuttingDown(resp);
+            metrics.recordRequest(HttpBridgeMetrics.Operation.FETCH, elapsedMs(startNanos), HttpStatusMapper.SERVICE_UNAVAILABLE);
+            return;
+        }
+        AsyncContext async;
+        try {
+            async = req.startAsync();
+        } catch (RuntimeException e) {
+            // Mirror the in-band-500 invariant the class javadoc states ("The servlet never throws to
+            // the container").
+            handleSseStartAsyncFailure(resp, token, command.topic(), e, startNanos);
+            return;
+        }
+        // No per-request status recording for the SSE branch — the stream itself can run for hours and there is
+        // no single "response status" to record at the end. Instead record the accept event in
+        // SseStreamsOpened; paired with the ActiveSseStreams gauge and RejectedAtSseCap meter this gives
+        // operators the full open-rate / point-in-time / reject-rate picture without contaminating
+        // RequestLatencyMs with stream-lifetime samples. The meter is incremented from inside start() only
+        // after the priming comment write succeeds — otherwise a connection that died before producing any
+        // events would inflate the open counter relative to the gauge.
+        try {
+            SseStreamer.start(async, submitter, mapper, command, token, httpExecutor, activeSseStreams,
+                metrics::recordSseStreamOpened);
+        } catch (RuntimeException e) {
+            handleSseStartupFailure(async, token, command.topic(), e, startNanos);
+        }
+    }
+
     private static long elapsedMs(long startNanos) {
         return Math.max(0L, (System.nanoTime() - startNanos) / 1_000_000L);
     }
@@ -580,6 +638,18 @@ public final class KafkaHttpServlet extends HttpServlet {
         resp.setHeader(HEADER_RETRY_AFTER, "5");
         writeEnvelope(resp, HttpStatusMapper.TOO_MANY_REQUESTS,
             "too many concurrent SSE streams; try again later");
+    }
+
+    private void writeShuttingDown(HttpServletResponse resp) throws IOException {
+        // Mirrors the WS shutdown-rejection contract in KafkaHttpServer.createWsEndpoint: 503 +
+        // Retry-After: 1 + Connection: close. The Connection: close prevents a client that pipelined
+        // a follow-up request behind this one from landing on a socket the server is about to close.
+        // Retry-After: 1 matches the broker stop sequence shape — by the time the client retries, the
+        // listener has either fully gone or come back on a different broker via the bootstrap address.
+        resp.setHeader("Connection", "close");
+        resp.setHeader(HEADER_RETRY_AFTER, "1");
+        writeEnvelope(resp, HttpStatusMapper.SERVICE_UNAVAILABLE,
+            "broker is shutting down; try again shortly");
     }
 
     private void writeUnsupportedMediaType(HttpServletResponse resp) throws IOException {

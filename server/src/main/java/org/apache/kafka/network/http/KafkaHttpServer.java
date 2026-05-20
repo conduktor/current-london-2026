@@ -245,7 +245,7 @@ public final class KafkaHttpServer {
         java.util.concurrent.Executor httpExecutor = jetty.getThreadPool();
         ServletHolder holder = new ServletHolder(
             new KafkaHttpServlet(bridge, submitter, mapper, maxRequestBodyBytes, sseLimiter, httpExecutor, metrics,
-                activeSseStreams));
+                activeSseStreams, () -> shuttingDown));
         holder.setAsyncSupported(true);
         context.addServlet(holder, SERVLET_PATTERN);
 
