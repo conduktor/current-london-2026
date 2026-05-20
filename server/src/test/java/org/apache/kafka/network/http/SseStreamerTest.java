@@ -25,6 +25,7 @@ import org.mockito.Mockito;
 import java.io.IOException;
 import java.util.OptionalInt;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -93,7 +94,8 @@ class SseStreamerTest {
         FetchRequestParser.FetchCommand command =
             new FetchRequestParser.FetchCommand("t", 0, 0L, OptionalInt.empty(), false);
 
-        SseStreamer.start(async, submitter, MAPPER, command, token, Runnable::run, primedCount::incrementAndGet);
+        SseStreamer.start(async, submitter, MAPPER, command, token, Runnable::run,
+            ConcurrentHashMap.newKeySet(), primedCount::incrementAndGet);
 
         assertEquals(1, primedCount.get(),
             "priming write must have completed before the failure path runs — otherwise this test would be "
@@ -209,7 +211,8 @@ class SseStreamerTest {
             throw injected;
         };
 
-        SseStreamer.start(async, submitter, MAPPER, command, token, Runnable::run, onPrimed);
+        SseStreamer.start(async, submitter, MAPPER, command, token, Runnable::run,
+            ConcurrentHashMap.newKeySet(), onPrimed);
 
         assertTrue(out.primingWritten(),
             "priming bytes must have been written — the test exercises the post-priming throw path, not the "

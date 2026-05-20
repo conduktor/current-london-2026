@@ -29,6 +29,7 @@ import java.io.IOException;
 import java.nio.channels.ClosedChannelException;
 import java.util.Locale;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 
@@ -67,10 +68,14 @@ public final class KafkaHttpServlet extends HttpServlet {
     private final SseStreamLimiter sseLimiter;
     private final Executor httpExecutor;
     private final HttpBridgeMetrics metrics;
+    // KafkaHttpServer's shutdown registry: every SseStreamer.start registers itself so KafkaHttpServer.stop()
+    // can walk the live streams and emit a terminal `event: error` SHUTDOWN frame before the connector
+    // force-close. Symmetric to the activeWsSessions plumbing on the WebSocket side.
+    private final Set<SseStreamer> activeSseStreams;
 
     public KafkaHttpServlet(KafkaHttpBridge bridge, RequestSubmitter submitter, ObjectMapper mapper,
                             int maxRequestBodyBytes, SseStreamLimiter sseLimiter, Executor httpExecutor,
-                            HttpBridgeMetrics metrics) {
+                            HttpBridgeMetrics metrics, Set<SseStreamer> activeSseStreams) {
         this.bridge = Objects.requireNonNull(bridge, "bridge must not be null");
         this.submitter = Objects.requireNonNull(submitter, "submitter must not be null");
         this.mapper = Objects.requireNonNull(mapper, "mapper must not be null");
@@ -81,6 +86,7 @@ public final class KafkaHttpServlet extends HttpServlet {
         this.sseLimiter = Objects.requireNonNull(sseLimiter, "sseLimiter must not be null");
         this.httpExecutor = Objects.requireNonNull(httpExecutor, "httpExecutor must not be null");
         this.metrics = Objects.requireNonNull(metrics, "metrics must not be null");
+        this.activeSseStreams = Objects.requireNonNull(activeSseStreams, "activeSseStreams must not be null");
     }
 
     @Override
@@ -302,7 +308,8 @@ public final class KafkaHttpServlet extends HttpServlet {
             // after the priming comment write succeeds — otherwise a connection that died before producing any
             // events would inflate the open counter relative to the gauge.
             try {
-                SseStreamer.start(async, submitter, mapper, command, token, httpExecutor, metrics::recordSseStreamOpened);
+                SseStreamer.start(async, submitter, mapper, command, token, httpExecutor, activeSseStreams,
+                    metrics::recordSseStreamOpened);
             } catch (RuntimeException e) {
                 handleSseStartupFailure(async, token, command.topic(), e, startNanos);
             }

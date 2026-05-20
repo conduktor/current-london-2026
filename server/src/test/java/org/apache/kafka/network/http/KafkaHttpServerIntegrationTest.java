@@ -2104,12 +2104,17 @@ class KafkaHttpServerIntegrationTest {
         // every open connector socket, so SSE/WS clients see a TCP reset mid-stream instead of a clean FIN.
         // With shutdownGraceMs > 0 Jetty's Server.doStop calls Graceful.shutdown on the connectors and
         // ServletContextHandler — connectors stop accepting new connections, in-flight requests get up to
-        // shutdownGraceMs to drain, and only then are sockets closed. We pin this by:
-        //   1. starting a server configured with a 1500ms grace,
-        //   2. opening a real SSE stream that long-polls forever,
-        //   3. calling stop() on the test thread and timing how long it takes,
-        //   4. confirming the close happened within the grace window (so the connector did get to close
-        //      cleanly) but did NOT return instantly (so the grace path was actually exercised).
+        // shutdownGraceMs to drain, and only then are sockets closed.
+        //
+        // <p>W71 changes the mechanism for SSE: the streamer registry walk in stop() now proactively
+        // settles every live SSE long-poll with a terminal SHUTDOWN frame and completes the AsyncContext
+        // BEFORE Server.stop() invokes Graceful.shutdown. The Graceful future for SSE therefore resolves
+        // instantly — grace no longer elapses for the SSE case. Pre-W71 this test relied on grace to be
+        // the load-bearing mechanism; the >=1000ms floor was the witness. That witness is invalidated by
+        // design now (proactive close is strictly better — clients see a meaningful frame, not just a
+        // FIN), so the floor is dropped. The ceiling remains so a regression in the SSE walk that
+        // accidentally pinned grace (e.g. failing to complete the AsyncContext) would still fail the
+        // test, and Jetty's own test suite covers Graceful.shutdown behaviour at the framework level.
         tearDown();
         ControllableSubmitter localSubmitter = new ControllableSubmitter();
         KafkaHttpServer gracefulServer = new KafkaHttpServer("127.0.0.1", 0,
@@ -2157,13 +2162,12 @@ class KafkaHttpServerIntegrationTest {
                     long start = System.nanoTime();
                     gracefulServer.stop();
                     long elapsedMs = (System.nanoTime() - start) / 1_000_000L;
-                    // The Graceful.shutdown future for a still-pending async request only completes when
-                    // the grace timeout itself elapses, so stop() must block at least ~1.5s. Allow a small
-                    // floor (1000ms) to absorb timing jitter on slow CI hardware. The ceiling (4000ms)
-                    // catches the legacy zero-grace bug — that took <200ms in practice. An unconditional
-                    // 30s servlet timeout would also bust this ceiling.
-                    assertTrue(elapsedMs >= 1000L,
-                        "graceful stop should have waited at least ~1s for in-flight SSE stream; got " + elapsedMs + "ms");
+                    // The W71 proactive shutdown walk completes the AsyncContext before Graceful.shutdown
+                    // runs, so the Graceful future resolves immediately. We do not assert a lower bound —
+                    // a regression that re-introduces grace as the load-bearing mechanism for SSE would be
+                    // a step backwards, not a step forwards. The ceiling (4000ms) still catches a
+                    // pathological case: a stop() that hangs past the grace window means the walk failed
+                    // to complete one of the AsyncContexts and Jetty fell back to force-close at timeout.
                     assertTrue(elapsedMs <= 4000L,
                         "graceful stop should not exceed ~4x the configured 1500ms grace; got " + elapsedMs + "ms");
                 }
@@ -2249,6 +2253,119 @@ class KafkaHttpServerIntegrationTest {
                 }
             } finally {
                 wsClient.stop();
+            }
+        } finally {
+            try {
+                gracefulServer.stop();
+            } catch (Exception ignored) {
+                // already stopped
+            }
+            startServer(DEFAULT_TEST_MAX_BODY_BYTES, DEFAULT_TEST_MAX_SSE_STREAMS, DEFAULT_TEST_MAX_WS_SUBSCRIPTIONS);
+        }
+    }
+
+    @Test
+    void gracefulShutdownDeliversSseShutdownEventToLiveStreams() throws Exception {
+        // Wave 71 axis EEE: symmetric to the WS 1001 contract pinned above. Until this wave the SSE side of
+        // the bridge had no terminal frame at all on planned shutdown — Server.stop() force-closed every open
+        // long-poll mid-stream with a raw TCP FIN/RST, which a browser EventSource and any HTTP client cannot
+        // distinguish from a network outage. Operators saw the planned restart as a wave of connection errors
+        // across every SSE consumer dashboard. The fix registers each live SseStreamer in a shared set; stop()
+        // walks a snapshot and dispatches a final {@code event: error} frame with code {@code SHUTDOWN} on
+        // each, alongside a long {@code retry:} directive to suppress the default 3-second EventSource
+        // reconnect storm against a half-stopped listener. This test pins the on-wire contract: the bytes a
+        // client reads on a clean shutdown are the SHUTDOWN frame, NOT a transport-level error.
+        tearDown();
+        ControllableSubmitter localSubmitter = new ControllableSubmitter();
+        KafkaHttpServer gracefulServer = new KafkaHttpServer("127.0.0.1", 0,
+            new KafkaHttpBridge(mapper, localSubmitter), localSubmitter, mapper,
+            DEFAULT_TEST_MAX_BODY_BYTES, DEFAULT_TEST_MAX_SSE_STREAMS, DEFAULT_TEST_MAX_WS_SUBSCRIPTIONS,
+            1500L);
+        try {
+            gracefulServer.start();
+            HttpClient localClient = new HttpClient();
+            localClient.start();
+            try {
+                // First fetch yields one record; subsequent fetches never complete. That parks the streamer
+                // in its long-poll loop across the entire shutdown window — the case where the absence of
+                // a terminal frame would otherwise look identical to a network drop on the wire.
+                ConcurrentLinkedQueue<RequestSubmitter.FetchResult> queue = new ConcurrentLinkedQueue<>();
+                queue.add(new RequestSubmitter.FetchResult(
+                    new FetchResponseFormatter.PartitionFetch(
+                        0, Errors.NONE, null, 0, 0, 1,
+                        List.of(new FetchResponseFormatter.FetchedRecord(
+                            0, null, "x".getBytes(StandardCharsets.UTF_8), null, 1L))),
+                    0L));
+                localSubmitter.fetchResultQueue = queue;
+
+                InputStreamResponseListener listener = new InputStreamResponseListener();
+                String streamUrl = "http://127.0.0.1:" + gracefulServer.boundPort()
+                    + "/v1/topics/orders/records?partition=0&from=earliest";
+                localClient.newRequest(streamUrl)
+                    .method(HttpMethod.GET)
+                    .headers(h -> h.put("Accept", "text/event-stream"))
+                    .send(listener);
+                Response response = listener.get(5, TimeUnit.SECONDS);
+                assertEquals(200, response.getStatus());
+
+                try (InputStream body = listener.getInputStream();
+                     BufferedReader reader = new BufferedReader(new InputStreamReader(body, StandardCharsets.UTF_8))) {
+                    // Read past the priming/first-record line so the streamer is firmly registered before
+                    // stop() runs — same race avoidance as the WS test above.
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        if (line.startsWith("data: ")) {
+                            break;
+                        }
+                    }
+                    // Trigger shutdown on a background thread so we can keep reading bytes off the wire. The
+                    // SHUTDOWN frame is dispatched via httpExecutor before Server.stop() blocks on
+                    // Graceful.shutdown; with shutdownGraceMs > 0 the queued write drains inside the window.
+                    CompletableFuture.runAsync(() -> {
+                        try {
+                            gracefulServer.stop();
+                        } catch (Exception ignored) {
+                            // failure surfaces via the assertions below — the test cares about what the
+                            // client sees on the wire, not the stop() return value.
+                        }
+                    });
+                    // Walk the remaining stream until we either see the SHUTDOWN frame or the stream ends.
+                    // A graceful shutdown must produce the frame; a regression where the registry is bypassed
+                    // would yield EOF without ever surfacing the data line.
+                    boolean sawRetry = false;
+                    boolean sawErrorEvent = false;
+                    String shutdownData = null;
+                    long deadlineNs = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                    while (System.nanoTime() < deadlineNs && (line = reader.readLine()) != null) {
+                        if (line.startsWith("retry: ")) {
+                            sawRetry = true;
+                        } else if (line.equals("event: error")) {
+                            sawErrorEvent = true;
+                        } else if (sawErrorEvent && line.startsWith("data: ")) {
+                            shutdownData = line.substring(6);
+                            break;
+                        }
+                    }
+                    assertTrue(sawRetry,
+                        "shutdown frame must carry a retry: directive — without it the EventSource default "
+                            + "3s reconnect storms a half-stopped listener");
+                    assertTrue(sawErrorEvent,
+                        "shutdown must emit `event: error` so the client's onerror handler fires instead "
+                            + "of silently completing the stream");
+                    assertNotNull(shutdownData,
+                        "shutdown must carry a data line with the {errorCode, errorMessage} envelope; "
+                            + "without it the client cannot disambiguate SHUTDOWN from any other terminal error");
+                    JsonNode envelope = asJson(shutdownData.getBytes(StandardCharsets.UTF_8));
+                    assertEquals("SHUTDOWN", envelope.get("errorCode").asText(),
+                        "shutdown frame errorCode must be SHUTDOWN — distinct from INTERNAL and from any "
+                            + "broker-side error code so dashboards can isolate planned restart events");
+                    assertTrue(envelope.get("errorMessage").asText().toLowerCase(java.util.Locale.ROOT)
+                            .contains("shutting down"),
+                        "shutdown frame errorMessage should describe the cause, got: "
+                            + envelope.get("errorMessage").asText());
+                }
+            } finally {
+                localClient.stop();
             }
         } finally {
             try {

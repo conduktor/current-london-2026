@@ -16,6 +16,7 @@
  */
 package org.apache.kafka.network.http;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.exc.StreamConstraintsException;
 import com.fasterxml.jackson.databind.JsonMappingException;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -59,17 +60,22 @@ class BridgeJsonMappersTest {
     }
 
     @Test
-    void acceptsStringExactlyAtCap() {
-        int cap = BridgeJsonMappers.MAX_STRING_LENGTH;
-        StringBuilder json = new StringBuilder(cap + 16);
+    void acceptsStringJustBelowCap() {
+        // The string boundary is asserted indirectly: rejectsStringExceedingCap pins the throw at MAX+1,
+        // and this case pins the accept at a value that comfortably clears any envelope overhead. We don't
+        // build a literal MAX-length string here because the JSON envelope ({"x":"..."}) adds 8 bytes that
+        // would tip the document past MAX_DOCUMENT_LENGTH once FAIL_ON_TRAILING_TOKENS forces the parser to
+        // read through EOF — and we want this test to fail on the string cap, not on the document cap.
+        int strLen = BridgeJsonMappers.MAX_STRING_LENGTH - 32;
+        StringBuilder json = new StringBuilder(strLen + 16);
         json.append("{\"x\":\"");
-        for (int i = 0; i < cap; i++) {
+        for (int i = 0; i < strLen; i++) {
             json.append('a');
         }
         json.append("\"}");
         ObjectMapper mapper = BridgeJsonMappers.hardened();
         JsonNode tree = parse(mapper, json.toString());
-        assertEquals(cap, tree.get("x").asText().length());
+        assertEquals(strLen, tree.get("x").asText().length());
     }
 
     @Test
@@ -160,6 +166,20 @@ class BridgeJsonMappersTest {
         json.append(']');
         ObjectMapper mapper = BridgeJsonMappers.hardened();
         assertThrows(StreamConstraintsException.class, () -> mapper.readTree(json.toString()));
+    }
+
+    @Test
+    void rejectsTrailingTokensAfterRootValue() {
+        // Smuggling defence: a content-aware proxy that pre-parses the prefix sees a valid {"a":1}; a strict
+        // downstream parser would otherwise accept the same bytes and silently drop the tail. The hardened
+        // mapper must reject the parse so the bridge and the upstream defence layer agree on what the body is.
+        ObjectMapper mapper = BridgeJsonMappers.hardened();
+        // Jackson surfaces the post-root garbage via _verifyNoTrailingTokens, which calls nextToken and
+        // throws JsonParseException — a sibling of JsonMappingException under JsonProcessingException, not
+        // a subtype. Asserting the common superclass keeps the test robust against a future Jackson
+        // refactor that reclassifies trailing-content under a different concrete type.
+        assertThrows(JsonProcessingException.class,
+            () -> mapper.readTree("{\"a\":1}garbage"));
     }
 
     @Test

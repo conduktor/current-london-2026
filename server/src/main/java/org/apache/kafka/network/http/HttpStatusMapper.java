@@ -138,6 +138,14 @@ public final class HttpStatusMapper {
         // Falling through to 500 told operators "internal server bug" when the truth is "broker disk health
         // degraded — try again or move the partition." 503 + Retry-After is the correct shape.
         m.put(Errors.KAFKA_STORAGE_ERROR, SERVICE_UNAVAILABLE);
+        // INCONSISTENT_TOPIC_ID surfaces on fetch when the broker's metadata cache reports a different topic id
+        // than the one the request resolved for the topic name — typically a topic recreation churning under
+        // the caller (delete-then-create with the same name). The Errors.INCONSISTENT_TOPIC_ID class extends
+        // RetriableException so a transient retry against the same coordinator after the metadata catches up
+        // will resolve, exactly like LEADER_NOT_AVAILABLE / LISTENER_NOT_FOUND. Without this mapping the
+        // bridge surfaces 500, which leads the operator dashboard to flag an internal server bug when the
+        // truth is "metadata is in flux; retry once."
+        m.put(Errors.INCONSISTENT_TOPIC_ID, SERVICE_UNAVAILABLE);
 
         return m;
     }

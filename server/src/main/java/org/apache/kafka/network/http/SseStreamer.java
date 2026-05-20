@@ -27,8 +27,10 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.util.Objects;
 import java.util.OptionalInt;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -65,6 +67,23 @@ final class SseStreamer {
     private static final byte[] DATA_PREFIX = "data: ".getBytes(java.nio.charset.StandardCharsets.UTF_8);
     private static final byte[] ID_PREFIX = "id: ".getBytes(java.nio.charset.StandardCharsets.UTF_8);
     private static final byte[] EVENT_ERROR = "event: error\n".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    // 24 hours in milliseconds. EventSource clients default to a 3-second auto-reconnect interval; for
+    // permanent errors (UNKNOWN_TOPIC_OR_PARTITION, TOPIC_AUTHORIZATION_FAILED, OFFSET_OUT_OF_RANGE — anything
+    // that will fail identically on the next attempt against the same URL+offset) the default produces a
+    // reconnect storm that pins broker request-handler threads and inflates the rejected-at-cap counter for
+    // no benefit to the client. WHATWG HTML §9.2.6 lets us extend the interval by emitting a `retry: <ms>\n`
+    // directive on the wire; the browser persists the new interval across reconnects on the same EventSource.
+    // 24 h functionally converts "auto-reconnect" into "tomorrow, if at all" without forbidding the operator
+    // from reconnecting explicitly. Bridge-side transient errors (code = INTERNAL) skip this directive so the
+    // default 3 s interval still applies, since those CAN recover on retry.
+    private static final byte[] RETRY_LONG_DIRECTIVE =
+        "retry: 86400000\n".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    private static final byte[] EVENT_SHUTDOWN_DATA =
+        "{\"errorCode\":\"SHUTDOWN\",\"errorMessage\":\"broker is shutting down\"}"
+            .getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    // INTERNAL is the bridge-side transient error signal — see tryWriteErrorFrame() and handleSchedulingFailure().
+    // Every other error code that closes the stream is permanent for the URL+offset the client is dereferencing.
+    private static final String INTERNAL_ERROR_CODE = "INTERNAL";
     private static final byte[] CONNECTED_COMMENT =
         ": connected\n\n".getBytes(java.nio.charset.StandardCharsets.UTF_8);
     // SSE comment line: clients ignore it, but the write itself is our liveness probe — see handleFetchResult.
@@ -82,6 +101,12 @@ final class SseStreamer {
     private final OptionalInt maxBytes;
     private final SseStreamLimiter.Token limiterToken;
     private final Executor httpExecutor;
+    // The same registry KafkaHttpServer walks during stop() to deliver an `event: error` SHUTDOWN frame
+    // before the connector force-closes the socket. The streamer adds itself after the priming write +
+    // onPrimed callback succeed (so a stream that never reached the client is not visible to shutdown),
+    // and removes itself in closeStream() so a graceful client-disconnect cannot make the registry the
+    // memory leak it was meant to prevent. Symmetric to KafkaWebSocketEndpoint's activeWsSessions usage.
+    private final Set<SseStreamer> activeSseStreams;
     // From the URL's ?from=earliest hint. Only consulted while currentOffset == 0L (the initial offset
     // the parser hands us for from=earliest). Once any record is delivered and currentOffset advances,
     // the flag is naturally moot. Without this propagation the bridge would drop the flag in
@@ -95,7 +120,7 @@ final class SseStreamer {
     private SseStreamer(AsyncContext async, RequestSubmitter submitter, ObjectMapper mapper,
                         String topic, int partition, long startOffset, OptionalInt maxBytes,
                         boolean fromEarliest, SseStreamLimiter.Token limiterToken,
-                        Executor httpExecutor) throws IOException {
+                        Executor httpExecutor, Set<SseStreamer> activeSseStreams) throws IOException {
         this.async = Objects.requireNonNull(async);
         this.resp = (HttpServletResponse) async.getResponse();
         this.out = resp.getOutputStream();
@@ -108,6 +133,7 @@ final class SseStreamer {
         this.fromEarliest = fromEarliest;
         this.limiterToken = Objects.requireNonNull(limiterToken);
         this.httpExecutor = Objects.requireNonNull(httpExecutor);
+        this.activeSseStreams = Objects.requireNonNull(activeSseStreams, "activeSseStreams must not be null");
     }
 
     /**
@@ -121,9 +147,10 @@ final class SseStreamer {
      */
     static void start(AsyncContext async, RequestSubmitter submitter, ObjectMapper mapper,
                       FetchRequestParser.FetchCommand command, SseStreamLimiter.Token limiterToken,
-                      Executor httpExecutor, Runnable onPrimed) {
+                      Executor httpExecutor, Set<SseStreamer> activeSseStreams, Runnable onPrimed) {
         Objects.requireNonNull(limiterToken, "limiterToken must not be null — caller must acquire before start()");
         Objects.requireNonNull(httpExecutor, "httpExecutor must not be null");
+        Objects.requireNonNull(activeSseStreams, "activeSseStreams must not be null");
         Objects.requireNonNull(onPrimed, "onPrimed must not be null");
         SseStreamer streamer;
         try {
@@ -147,7 +174,8 @@ final class SseStreamer {
             async.setTimeout(0L); // no servlet-side timeout — the broker's fetch max-wait is the only pacing
 
             streamer = new SseStreamer(async, submitter, mapper, command.topic(), command.partition(),
-                command.offset(), command.maxBytes(), command.fromEarliest(), limiterToken, httpExecutor);
+                command.offset(), command.maxBytes(), command.fromEarliest(), limiterToken, httpExecutor,
+                activeSseStreams);
             // Write the framing comment so connection-buffering proxies flush the headers before any record arrives.
             streamer.out.write(CONNECTED_COMMENT);
             streamer.out.flush();
@@ -172,6 +200,12 @@ final class SseStreamer {
         // (scheduleNextFetch is skipped), so the limiter slot and AsyncContext would leak. Route any throw through
         // the streamer's own closeStream() so the cleanup is identical to a transport failure: token released,
         // AsyncContext completed, the slot freed for the next request.
+        //
+        // Register into the shutdown registry BEFORE running onPrimed so a panic from the metric callback still
+        // leaves the streamer findable by KafkaHttpServer.stop() during shutdown; closeStream() removes the entry
+        // unconditionally, so this never leaks. Streams that failed at the priming write above are intentionally
+        // never registered — they produced no bytes the client saw and need no shutdown notification.
+        activeSseStreams.add(streamer);
         try {
             onPrimed.run();
         } catch (RuntimeException e) {
@@ -349,6 +383,18 @@ final class SseStreamer {
             ObjectNode payload = mapper.createObjectNode();
             payload.put("errorCode", code);
             payload.put("errorMessage", message == null ? "" : message);
+            // EventSource clients auto-reconnect 3 s after a stream closes. For permanent errors against the same
+            // URL+offset (UNKNOWN_TOPIC_OR_PARTITION, TOPIC_AUTHORIZATION_FAILED, OFFSET_OUT_OF_RANGE, etc.) this
+            // produces a reconnect storm: 20 reconnects/min × N clients pin broker request-handler threads on a
+            // request that will fail identically every time. The WHATWG `retry:` directive raises the interval
+            // for this EventSource (browsers persist the value across reconnects on the same source) so the storm
+            // collapses to one retry per day — still recoverable by an operator who fixes the topic / ACL / cursor
+            // and reconnects with a fresh EventSource. INTERNAL is the bridge-side transient signal (handler-thread
+            // starvation, executor reject, broker-callback exception) — leaving its retry at the default 3 s lets
+            // a healthy bridge recover without operator intervention.
+            if (!INTERNAL_ERROR_CODE.equals(code)) {
+                out.write(RETRY_LONG_DIRECTIVE);
+            }
             out.write(EVENT_ERROR);
             out.write(DATA_PREFIX);
             out.write(mapper.writeValueAsBytes(payload));
@@ -362,10 +408,84 @@ final class SseStreamer {
         }
     }
 
+    /**
+     * Best-effort terminal signal for KafkaHttpServer.stop(). Mirrors {@link KafkaWebSocketEndpoint#closeForShutdown}
+     * for the SSE side: emit a final {@code event: error} frame with code {@code SHUTDOWN} so monitoring dashboards
+     * and client retry-loops can distinguish a planned broker restart from a transport failure (raw TCP RST /
+     * client-disconnect). Without this, Jetty's connector force-close on shutdown delivers the same wire signal as
+     * a network drop, conflating two different operational conditions across every SSE consumer.
+     *
+     * <p>Dispatched through {@code httpExecutor} so the write is serialised on the same strand that processes the
+     * scheduled fetch loop — concurrent writeRecordEvent / heartbeat writes from the in-flight long-poll cannot
+     * collide with this shutdown frame. The broker stop thread returns immediately; the Graceful.shutdown window
+     * (Jetty stopTimeout = http.bridge.shutdown.grace.ms) is what lets the queued shutdown writes actually drain
+     * before connectors are force-closed.
+     *
+     * <p>If the executor refuses the dispatch (already terminated) or the stream is already in the closed state,
+     * the call is a no-op — both are correct for shutdown semantics.
+     */
+    void closeForShutdown() {
+        if (closed.get()) {
+            return;
+        }
+        try {
+            httpExecutor.execute(() -> {
+                if (!closed.compareAndSet(false, true)) {
+                    return;
+                }
+                tryWriteShutdownFrame();
+                unregister();
+                limiterToken.close();
+                try {
+                    async.complete();
+                } catch (RuntimeException e) {
+                    LOG.debug("SSE AsyncContext.complete() failed during shutdown: {}", e.toString());
+                }
+            });
+        } catch (RejectedExecutionException ree) {
+            // httpExecutor is gone (already stopped) — best we can do is mark closed so any concurrent
+            // path bails, and release the slot. The client will observe a raw close; we tried.
+            LOG.debug("SSE shutdown dispatch rejected: {}", ree.toString());
+            if (closed.compareAndSet(false, true)) {
+                unregister();
+                limiterToken.close();
+                try {
+                    async.complete();
+                } catch (RuntimeException e) {
+                    LOG.debug("SSE AsyncContext.complete() failed during shutdown fallback: {}", e.toString());
+                }
+            }
+        }
+    }
+
+    private void tryWriteShutdownFrame() {
+        try {
+            // Retry directive is REQUIRED here even though the client got a clean SHUTDOWN code: the EventSource
+            // default 3 s reconnect would hit a broker that is mid-shutdown and produce a reconnect storm against
+            // the next broker / the same loopback bind during the restart window. 24 h converts the storm into
+            // "no auto-reconnect" for the duration of any sane operator restart, and a deliberate client-side
+            // reconnect is still trivial.
+            out.write(RETRY_LONG_DIRECTIVE);
+            out.write(EVENT_ERROR);
+            out.write(DATA_PREFIX);
+            out.write(EVENT_SHUTDOWN_DATA);
+            out.write(CRLF);
+            out.flush();
+        } catch (IOException | RuntimeException ignored) {
+            // Client may have already disconnected before stop() ran; best-effort write either way.
+        }
+    }
+
+    private void unregister() {
+        // Idempotent — Set.remove returns false if we were never registered (e.g. priming failed before add).
+        activeSseStreams.remove(this);
+    }
+
     private void closeStream() {
         if (closed.compareAndSet(false, true)) {
             // Release the SSE slot before completing the AsyncContext. Token.close() is idempotent, so even if a
             // future refactor pushes closeStream() through two paths the limiter count remains accurate.
+            unregister();
             limiterToken.close();
             try {
                 async.complete();

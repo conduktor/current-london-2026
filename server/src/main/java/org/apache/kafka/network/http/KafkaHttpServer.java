@@ -106,6 +106,14 @@ public final class KafkaHttpServer {
     // transport failures on every WS client and monitoring dashboard. ConcurrentHashMap-backed set so concurrent
     // add/remove on Jetty I/O threads cannot race the snapshot taken on the broker stop thread.
     private final Set<KafkaWebSocketEndpoint> activeWsSessions = ConcurrentHashMap.newKeySet();
+    // Live SSE streams. Symmetric to activeWsSessions: each {@link SseStreamer} adds itself once the priming
+    // write+flush has committed the response, and removes itself in closeStream(). {@link #stop()} walks a
+    // snapshot and dispatches a terminal {@code event: error} SHUTDOWN frame on each before Server.stop()
+    // begins, so SSE clients can distinguish a planned broker restart from a transport failure (which would
+    // otherwise look identical: raw TCP FIN/RST with no terminal frame). Without this registry, the SSE side
+    // of the bridge had no symmetric counterpart to the WS 1001 contract and operators saw conflated signals
+    // across SSE consumer dashboards on every restart.
+    private final Set<SseStreamer> activeSseStreams = ConcurrentHashMap.newKeySet();
     // Latched by stop() BEFORE it snapshots activeWsSessions, so any WS upgrade that races stop() between
     // the snapshot and Server.stop() is rejected with 503 instead of slipping in and missing the 1001
     // close-frame walk. Without this guard, the Wave 29 1001-on-shutdown contract has a narrow window:
@@ -229,7 +237,8 @@ public final class KafkaHttpServer {
         // submitter future. Without this, a slow HTTP client can pin a broker handler thread on a socket write.
         java.util.concurrent.Executor httpExecutor = jetty.getThreadPool();
         ServletHolder holder = new ServletHolder(
-            new KafkaHttpServlet(bridge, submitter, mapper, maxRequestBodyBytes, sseLimiter, httpExecutor, metrics));
+            new KafkaHttpServlet(bridge, submitter, mapper, maxRequestBodyBytes, sseLimiter, httpExecutor, metrics,
+                activeSseStreams));
         holder.setAsyncSupported(true);
         context.addServlet(holder, SERVLET_PATTERN);
 
@@ -309,6 +318,22 @@ public final class KafkaHttpServer {
                         endpoint.closeForShutdown();
                     } catch (RuntimeException e) {
                         LOG.debug("WS shutdown close failed: {}", e.toString());
+                    }
+                }
+                // Symmetric SSE walk: dispatch a terminal `event: error` SHUTDOWN frame on every live
+                // streamer BEFORE Server.stop() begins so SSE clients can distinguish a planned broker
+                // restart from a transport failure. Without this, both signals look identical on the
+                // wire (TCP FIN/RST with no terminal frame), and operator dashboards conflate planned
+                // restarts with stream errors on every bridge upgrade or restart. The SHUTDOWN frame
+                // carries a long `retry:` directive so the EventSource auto-reconnect does not
+                // immediately storm a half-stopped listener. closeForShutdown is idempotent against
+                // streams that completed between snapshot and walk (CAS short-circuit inside).
+                Set<SseStreamer> sseSnapshot = new HashSet<>(activeSseStreams);
+                for (SseStreamer streamer : sseSnapshot) {
+                    try {
+                        streamer.closeForShutdown();
+                    } catch (RuntimeException e) {
+                        LOG.debug("SSE shutdown close failed: {}", e.toString());
                     }
                 }
                 try {

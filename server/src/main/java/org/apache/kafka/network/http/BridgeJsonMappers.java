@@ -123,6 +123,17 @@ public final class BridgeJsonMappers {
         // trees via readTree, which is exactly the path this feature guards. Honest clients never send
         // duplicate keys; rejecting the request with a 400 is the correct safe-by-default behaviour.
         mapper.enable(DeserializationFeature.FAIL_ON_READING_DUP_TREE_KEY);
+        // Fail when the input stream contains tokens AFTER a valid root value. Default in Jackson 2.x is to silently
+        // accept and discard trailing tokens, so {@code mapper.readTree("{\"a\":1}garbage")} succeeds and returns the
+        // {@code {"a":1}} tree. The bridge passes the same hardened mapper to three attacker-controlled readTree call
+        // sites — HTTP body (KafkaHttpServlet), WS subscribe text frame (WsSubscribeMessageParser), and record-value
+        // envelope (ValueSerializer) — none of which document or test for trailing content. A request smuggler that
+        // wedges valid JSON followed by an arbitrary tail can: (a) pass content-aware proxies that parse only the
+        // valid prefix; (b) confuse audit / SIEM pipelines that record the raw bytes vs the bridge's accepted view;
+        // (c) sneak a second JSON object into one body that gets billed as a single request. Jackson 3.0 flips this
+        // default to {@code true} per the project's own security guidance — pin it here so the broker's behaviour
+        // does not depend on the Jackson major-version bump landing.
+        mapper.enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
         return mapper;
     }
 }

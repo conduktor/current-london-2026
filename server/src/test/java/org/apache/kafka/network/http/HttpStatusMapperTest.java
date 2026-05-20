@@ -191,6 +191,15 @@ class HttpStatusMapperTest {
             HttpStatusMapper.toHttpStatus(Errors.KAFKA_STORAGE_ERROR)));
     }
 
+    @Test
+    void inconsistentTopicIdMapsTo503() {
+        // Fetch-reachable RetriableException when metadata churns under a topic recreation. Must be 503 +
+        // Retry-After (transient), not 500 — the next fetch after metadata propagation resolves the divergence.
+        assertEquals(503, HttpStatusMapper.toHttpStatus(Errors.INCONSISTENT_TOPIC_ID));
+        assertTrue(HttpStatusMapper.statusCarriesRetryAfter(
+            HttpStatusMapper.toHttpStatus(Errors.INCONSISTENT_TOPIC_ID)));
+    }
+
     // ----- carriesRetryAfter -----
 
     @Test
