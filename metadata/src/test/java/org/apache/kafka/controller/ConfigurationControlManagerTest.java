@@ -979,4 +979,88 @@ public class ConfigurationControlManagerTest {
         assertEquals(ApiError.NONE, result.response().get(MYTOPIC),
             "idempotent backing SET (same value) must not trip the R56 gate");
     }
+
+    /**
+     * R78 (Codex Finding): reject backing topics that are themselves views.
+     * View-of-view composition is not implemented — KafkaApis walks exactly one hop from view to
+     * backing in the fetch redirect, so V2 with view.backing.topic=V1 (V1 itself a view) would
+     * silently read V1's empty placeholder log and yield zero records to the V2 consumer. Reject
+     * at config-set time so the operator gets a clear error rather than a silently-empty view.
+     */
+    @Test
+    public void testR78RejectIncrementalAlterPointingAtViewBacking() {
+        ConfigurationControlManager manager = new ConfigurationControlManager.Builder().
+            setKafkaConfigSchema(SCHEMA).
+            build();
+
+        // Seed V1 (named "v1_view") as a complete view: backing=B, predicate=true.
+        manager.replay(new ConfigRecord().setResourceType(TOPIC.id()).setResourceName("v1_view").
+            setName("view.backing.topic").setValue("B"));
+        manager.replay(new ConfigRecord().setResourceType(TOPIC.id()).setResourceName("v1_view").
+            setName("view.cel.predicate").setValue("true"));
+
+        // Try to create V2 (mytopic) pointing at V1 as its backing.
+        ControllerResult<Map<ConfigResource, ApiError>> result = manager.incrementalAlterConfigs(
+            toMap(entry(MYTOPIC, toMap(entry("view.backing.topic", entry(SET, "v1_view"))))),
+            true);
+
+        assertEquals(Collections.emptyList(), result.records(),
+            "no records should be emitted when view-of-view is rejected");
+        ApiError err = result.response().get(MYTOPIC);
+        assertEquals(Errors.INVALID_CONFIG, err.error());
+        assertTrue(err.message().contains("is itself a view"),
+            "error message must explain view-of-view rejection, got: " + err.message());
+        assertTrue(err.message().contains("v1_view"),
+            "error message must name the offending backing topic, got: " + err.message());
+    }
+
+    /**
+     * R78 companion: same threat via legacy AlterConfigs full-replace surface.
+     */
+    @Test
+    public void testR78RejectLegacyAlterPointingAtViewBacking() {
+        ConfigurationControlManager manager = new ConfigurationControlManager.Builder().
+            setKafkaConfigSchema(SCHEMA).
+            build();
+
+        // Seed V1 (named "v1_view") as a complete view.
+        manager.replay(new ConfigRecord().setResourceType(TOPIC.id()).setResourceName("v1_view").
+            setName("view.backing.topic").setValue("B"));
+        manager.replay(new ConfigRecord().setResourceType(TOPIC.id()).setResourceName("v1_view").
+            setName("view.cel.predicate").setValue("true"));
+
+        // Try to create V2 (mytopic) via legacy alter pointing at V1 as its backing.
+        ControllerResult<Map<ConfigResource, ApiError>> result = manager.legacyAlterConfigs(
+            toMap(entry(MYTOPIC, toMap(entry("view.backing.topic", "v1_view")))),
+            true);
+
+        assertEquals(Collections.emptyList(), result.records());
+        ApiError err = result.response().get(MYTOPIC);
+        assertEquals(Errors.INVALID_CONFIG, err.error());
+        assertTrue(err.message().contains("is itself a view"),
+            "legacy alter rejection must also explain view-of-view, got: " + err.message());
+    }
+
+    /**
+     * R78 negative: a view whose backing has only a {@code view.backing.topic} pointing at a
+     * non-view topic must continue to be allowed. Guards against the new check over-firing on
+     * any topic that happens to have an unrelated config set on the backing.
+     */
+    @Test
+    public void testR78AllowViewBackingPointingAtRegularTopic() {
+        ConfigurationControlManager manager = new ConfigurationControlManager.Builder().
+            setKafkaConfigSchema(SCHEMA).
+            build();
+
+        // Seed "regular_backing" as a regular (non-view) topic with a non-view config.
+        manager.replay(new ConfigRecord().setResourceType(TOPIC.id()).setResourceName("regular_backing").
+            setName("retention.ms").setValue("60000"));
+
+        ControllerResult<Map<ConfigResource, ApiError>> result = manager.incrementalAlterConfigs(
+            toMap(entry(MYTOPIC, toMap(entry("view.backing.topic", entry(SET, "regular_backing"))))),
+            true);
+
+        assertEquals(ApiError.NONE, result.response().get(MYTOPIC),
+            "view pointing at a regular (non-view) backing topic must remain allowed");
+    }
 }

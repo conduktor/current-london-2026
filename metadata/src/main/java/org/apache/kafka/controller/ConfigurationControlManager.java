@@ -437,8 +437,9 @@ public class ConfigurationControlManager {
             if (!newlyCreatedResource) {
                 existenceChecker.accept(configResource);
             }
-            if (!newlyCreatedResource && configResource.type() == Type.TOPIC) {
-                validateTopicViewInvariants(configResource, allConfigs, existingConfigsMap);
+            if (configResource.type() == Type.TOPIC) {
+                validateTopicViewInvariants(
+                    configResource, allConfigs, existingConfigsMap, newlyCreatedResource);
             }
             if (alterConfigPolicy.isPresent()) {
                 alterConfigPolicy.get().validate(new RequestMetadata(configResource, alteredConfigsForAlterConfigPolicyCheck));
@@ -485,14 +486,15 @@ public class ConfigurationControlManager {
     private void validateTopicViewInvariants(
         ConfigResource configResource,
         Map<String, String> allConfigs,
-        Map<String, String> existingConfigsMap
+        Map<String, String> existingConfigsMap,
+        boolean newlyCreatedResource
     ) {
         String backing = allConfigs.get(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG);
         String existingBacking = existingConfigsMap.get(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG);
         boolean wasView = existingBacking != null && !existingBacking.trim().isEmpty();
         boolean willBeView = backing != null && !backing.trim().isEmpty();
 
-        if (willBeView && !wasView) {
+        if (!newlyCreatedResource && willBeView && !wasView) {
             throw new ConfigException(
                 "Cannot set " + ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG +
                 " on existing non-view topic '" + configResource.name() + "': " +
@@ -532,6 +534,25 @@ public class ConfigurationControlManager {
         if (backing != null) {
             String trimmedBacking = backing.trim();
             if (!trimmedBacking.isEmpty()) {
+                // R78 (Codex Finding): reject backing topics that are themselves views. PROMPT.md
+                // lists view-of-view composition as stretch (line 21) and the broker has no
+                // recursive resolver in the fetch redirect path — KafkaApis walks exactly one
+                // hop from view to backing, so V2 with view.backing.topic=V1 (V1 itself a view)
+                // would silently read V1's empty placeholder log and yield zero records to the
+                // V2 consumer. Reject at config-set time so the operator gets a clear error
+                // instead of a silently-empty view. Drop this guard when view-of-view lands.
+                Map<String, String> backingsConfigs = currentTopicConfig(trimmedBacking);
+                String backingsBacking =
+                    backingsConfigs.get(ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG);
+                if (backingsBacking != null && !backingsBacking.trim().isEmpty()) {
+                    throw new ConfigException(
+                        "Cannot set " + ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG +
+                        "='" + trimmedBacking + "' on topic '" + configResource.name() +
+                        "': backing topic '" + trimmedBacking + "' is itself a view " +
+                        "(its " + ViewTopicConfig.VIEW_BACKING_TOPIC_CONFIG + " is set). " +
+                        "View-of-view composition is not supported. Point the view at a " +
+                        "non-view backing topic.");
+                }
                 OptionalInt viewParts = topicPartitionCountLookup.apply(configResource.name());
                 if (viewParts.isPresent()) {
                     OptionalInt backingParts = topicPartitionCountLookup.apply(trimmedBacking);
