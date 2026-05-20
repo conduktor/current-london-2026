@@ -2677,8 +2677,15 @@ class KafkaHttpServerIntegrationTest {
         // amplification vector against the broker. Mirror sseHeadRequestDoesNotAcquireLimiterSlot, but
         // assert against submitter.fetchCommandLog (the limiter slot is SSE-only — the JSON branch has
         // no admission gate, so the broker invocation count IS the leak indicator).
+        //
+        // Query must be valid (partition + offset) so the parse step preceding the HEAD short-circuit
+        // does not reject it — see RFC 9110 §9.3.2: HEAD response must match equivalent GET. Without
+        // valid params, FetchRequestParser.parse throws BadRequestException, KafkaHttpBridge.fetch
+        // catches it and returns an INVALID_REQUEST envelope WITHOUT ever calling submitter.submitFetch
+        // — so fetchCommandLog.isEmpty() would pass even if the HEAD short-circuit at
+        // KafkaHttpServlet.doGet were removed, making the invariant vacuous.
         for (int i = 0; i < 5; i++) {
-            ContentResponse head = client.newRequest(url("/v1/topics/orders/records"))
+            ContentResponse head = client.newRequest(url("/v1/topics/orders/records?partition=0&offset=0"))
                 .method(HttpMethod.HEAD)
                 .timeout(5, TimeUnit.SECONDS)
                 .send();
